@@ -1,0 +1,46 @@
+profile: embedded
+
+hot:
+  backend: builtin_hashmap
+  max_memory_bytes: 4294967296
+  default_eviction_seconds: 86400
+  eviction_overrides:
+    - prefix: "session:"
+      eviction_seconds: 3600
+    - prefix: "ephemeral:"
+      eviction_seconds: 300
+
+cold:
+  backend: builtin_rocksdb
+  data_path: /data/cold
+  write_buffer_size_bytes: 67108864
+
+queue:
+  backend: builtin_wal
+  wal_path: /data/wal
+  segment_size_bytes: 67108864
+  min_retention_seconds: 86400
+  wal_fsync_policy: group_commit
+  group_commit_interval_us: 1000
+  group_commit_max_bytes: 1048576
+
+cold_consumer:
+  quiet_threshold_seconds: 30
+  safety_margin_seconds: 300
+  deadline_jitter_ratio: 0.5
+  buffer_high_water_bytes: 536870912
+  max_flush_batch_size: 10000
+
+resp:
+  bind: 0.0.0.0
+  port: 6379
+  max_connections: 1024
+  idle_timeout_seconds: 300
+
+metrics:
+  bind: 0.0.0.0
+  port: 9090
+
+admin:
+  bind: 0.0.0.0
+  port: 8080

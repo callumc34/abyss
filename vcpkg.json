@@ -1,0 +1,5 @@
+{
+  "name": "abyss",
+  "version": "0.1.0",
+  "description": "Redis-compatible hot-cold tiered KV store"
+}

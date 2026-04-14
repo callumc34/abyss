@@ -1,0 +1,18 @@
+#pragma once
+
+#include <gmock/gmock.h>
+
+#include "abyss/core/cold_store.h"
+
+namespace abyss::testing {
+
+class MockColdStore : public core::ColdStore {
+ public:
+  MOCK_METHOD(core::Result<core::RespValue>, Exec, (const core::RespCommand& cmd), (override));
+  MOCK_METHOD(core::Result<void>, ApplyBatch, (std::span<const core::RespCommand> cmds),
+              (override));
+  MOCK_METHOD(core::Result<core::StorageStats>, Stats, (), (override));
+  MOCK_METHOD(core::Result<void>, Compact, (), (override));
+};
+
+}  // namespace abyss::testing
