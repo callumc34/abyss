@@ -1,0 +1,86 @@
+# ADP-007: Recovery
+
+**Status:** Accepted
+**Created:** 2026-04-09
+
+## Context
+
+When an Abyss pod restarts, the hot store is empty (it was in-memory) and the cold store may be stale (the cold consumer had buffered writes that weren't yet flushed). The queue is the source of truth. Recovery rebuilds both consumers' state from the queue.
+
+## Design
+
+### Recovery Process
+
+```
+Pod starts
+  │
+  ├─ 1. Determine replay point
+  │     Oldest un-acknowledged sequence ID across both consumers.
+  │
+  ├─ 2. Replay queue to cold consumer
+  │     Cold consumer absorbs entries into compaction buffer,
+  │     which deduplicates and merges per key.
+  │     Entries whose absolute TTL has expired are skipped.
+  │     Buffer is then flushed to cold store (compacted).
+  │
+  ├─ 3. Replay queue to hot consumer
+  │     Hot consumer replays entries still within eviction window.
+  │     Entries whose eviction would have expired are skipped.
+  │     Entries whose absolute TTL has expired are skipped.
+  │     Applied in order — last write wins naturally.
+  │
+  ├─ 4. Resume normal operation
+  │     Both consumers switch to real-time queue tailing.
+  │     Readiness probe goes healthy.
+  │
+  └─ During recovery: RESP port returns LOADING errors
+```
+
+### Recovery Semantics
+
+- The queue WAL or external broker retains all entries since the oldest un-acked position.
+- For the embedded profile: cold store RocksDB survives on PVC. The cold consumer only replays entries since its last ack point.
+- For the hot store: replays everything within the eviction window that hasn't absolutely expired. The hot store is fully reconstructed from the queue without reading cold.
+- **The cold store is never read during recovery.** Recovery is purely queue replay.
+- Cold replay benefits from the compaction buffer — recovery write volume to cold is bounded by unique keys, not total queue entries.
+
+### Replay Ordering
+
+Cold consumer replays first, then hot consumer. This ordering ensures the cold store is up-to-date before the hot consumer starts serving reads. Once the hot consumer finishes replay and switches to real-time tailing, the system is fully consistent.
+
+Within each consumer's replay, entries are applied in sequence order. For the hot store, last-write-wins naturally produces the correct state. For the cold consumer, the compaction buffer merges entries per key, producing the same result regardless of how many intermediate writes exist.
+
+### Queue Retention for Recovery
+
+```
+minimum_queue_retention = max(default_eviction, max(eviction_overrides))
+```
+
+This must fit on the WAL PVC (embedded) or within broker retention config (external). If the queue does not retain enough entries, recovery may be incomplete — keys that were in the eviction window but whose queue entries have been garbage collected will be lost from hot. They will still be available in cold (the cold consumer flushed them before eviction), so they are not lost entirely, but the first read post-recovery will require a cold-path lookup and promotion.
+
+### Configuration
+
+```yaml
+recovery:
+  replay_parallelism: 4
+  hot_replay_batch_size: 10000
+  cold_replay_batch_size: 50000
+```
+
+## Invariants
+
+1. Recovery is pure queue replay. The cold store is never read. Both consumers rebuild their state entirely from the queue.
+2. Entries whose absolute TTL has expired at replay time are skipped.
+3. For the hot consumer, entries whose eviction would have expired at replay time are skipped.
+4. During recovery, the RESP port returns `LOADING` errors. No reads or writes are served until recovery is complete.
+5. After recovery, the readiness probe goes healthy and normal operation resumes.
+
+## Trade-offs
+
+**Why replay cold before hot?** The cold store needs to be consistent before hot starts serving reads. If hot replayed first and a client read missed hot, the cold fallback might return stale data if cold hadn't caught up. Replaying cold first eliminates this window.
+
+**Why not read from cold during hot recovery?** Simplicity. Reading from cold during recovery would require the tiering engine to be partially operational before recovery completes. It also introduces a dependency between the hot consumer's replay and the cold store's state. Pure queue replay is deterministic and independent — each consumer rebuilds from the log without external state.
+
+**Why skip expired entries during replay?** Applying a key whose TTL has already passed wastes work and fills the hot store with data that would be immediately expired. Skipping expired entries speeds up recovery and keeps the post-recovery hot store lean.
+
+**Why use the compaction buffer during cold recovery?** Without the buffer, replaying N queue entries for a key that was written N times would produce N cold store writes. The compaction buffer collapses these into one write per key, making recovery write volume proportional to unique keys, not total queue depth. For a 24-hour queue with 1M entries but only 100K unique keys, this is a 10x reduction.
