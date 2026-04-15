@@ -1,5 +1,12 @@
 # AI
 .claude
 
+# Trash
+.DS_Store
+
 # Build
 build/
+compile_commands.json
+
+# vcpkg
+vcpkg_installed/

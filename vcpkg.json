@@ -1,5 +1,17 @@
 {
   "name": "abyss",
   "version": "0.1.0",
-  "description": "Redis-compatible hot-cold tiered KV store"
+  "description": "Redis-compatible hot-cold tiered KV store",
+  "builtin-baseline": "d13fa75214c258099923cf25a5e6311e58c07f3b",
+  "dependencies": [
+    "crc32c"
+  ],
+  "features": {
+    "benchmarks": {
+      "description": "Build micro-benchmarks",
+      "dependencies": [
+        "benchmark"
+      ]
+    }
+  }
 }

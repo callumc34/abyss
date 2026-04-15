@@ -4,6 +4,7 @@
     {
       "name": "default",
       "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "ABYSS_BUILD_TESTS": "ON"
@@ -12,6 +13,7 @@
     {
       "name": "release",
       "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "ABYSS_BUILD_TESTS": "OFF"
@@ -30,6 +32,16 @@
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-fsanitize=thread"
       }
+    },
+    {
+      "name": "bench",
+      "inherits": "default",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ABYSS_BUILD_TESTS": "OFF",
+        "ABYSS_BUILD_BENCHMARKS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "benchmarks"
+      }
     }
   ],
   "buildPresets": [
@@ -40,6 +52,10 @@
     {
       "name": "release",
       "configurePreset": "release"
+    },
+    {
+      "name": "bench",
+      "configurePreset": "bench"
     }
   ],
   "testPresets": [

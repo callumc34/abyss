@@ -46,7 +46,7 @@ Supporting types:
 struct LogEntry {
   SequenceId seq;
   RespCommand cmd;
-  SteadyTime appended_at;
+  WallTime appended_at;
 };
 
 inline constexpr ConsumerId kHotConsumer = 0;
@@ -75,6 +75,8 @@ minimum_queue_retention = max(default_eviction, max(eviction_overrides))
 ```
 
 This must fit on the WAL PVC.
+
+**Segment format:** The on-disk byte layout of segment headers and entries, including CRC-based integrity checks and schema evolution rules, is specified in [ADP-009](009-wal-format.md).
 
 ### Group Commit
 

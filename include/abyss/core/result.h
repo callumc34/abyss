@@ -13,6 +13,7 @@ enum class ErrorCode {
   kUnavailable,
   kTimeout,
   kResourceExhausted,
+  kCorruption,
 };
 
 class Error {

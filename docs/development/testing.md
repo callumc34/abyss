@@ -19,6 +19,16 @@ cmake --build build/tsan
 ctest --test-dir build/tsan
 ```
 
+## Running Benchmarks
+
+The `bench` preset enables `ABYSS_BUILD_BENCHMARKS` and pulls in `google/benchmark` via vcpkg.
+
+```bash
+cmake --preset bench
+cmake --build build/bench
+./build/bench/tests/bench/abyss_bench
+```
+
 ## Test Infrastructure
 
 ### Mock Implementations
@@ -47,6 +57,17 @@ Each interface implementation (built-in and external) is tested via parameterize
 - Malformed input handling (truncated, invalid type markers)
 - Bulk string with various lengths including zero and large
 - Array nesting
+
+### Queue / WAL
+- WAL entry round-trip: single arg, many args, large arg value, empty arg string, max sequence ID
+- WAL entry framing: length prefix, body CRC validation, back-to-back entries using `bytes_consumed` to advance
+- Crash recovery: truncation at length prefix, body, and CRC boundaries
+- Corruption detection: single-bit flip in body caught by CRC mismatch
+- Schema evolution: newer-minor entry with trailing body fields decoded correctly by older reader
+- Entry types: unknown `type` byte rejected as corruption
+- Segment header round-trip and fixed 32-byte size
+- Segment header rejects bad magic, bad header CRC, unsupported major version
+- Segment header accepts newer minor version
 
 ### Hot Store
 - SET/GET round-trip
@@ -118,6 +139,12 @@ Each interface implementation (built-in and external) is tested via parameterize
 - Recovery time vs queue depth
 - Memory stability over 24 hours
 - Hot-key workload: measure tail latency under lock contention
+
+### Micro-benchmarks
+
+Lower-level encode/decode and hash routines live under `tests/bench/` and run via the `bench` preset. Currently covers:
+
+- `wal_entry_bench.cpp` — encode/decode throughput at 3 B, 1 KiB, and 64 KiB argument sizes
 
 ## Chaos Tests
 

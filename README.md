@@ -16,6 +16,8 @@ Abyss exposes a standard Redis protocol interface backed by a Kappa architecture
 ## Quick Start
 
 ```bash
+# One-time: install vcpkg and set VCPKG_ROOT (see docs/development/building.md)
+
 # Configure and build
 cmake --preset default
 cmake --build build/default
@@ -31,6 +33,7 @@ ctest --preset default
 
 - CMake 3.25+
 - C++23 compiler (GCC 13+, Clang 17+, Apple Clang 17+)
+- vcpkg with `VCPKG_ROOT` exported in the environment
 
 ## Architecture
 
@@ -66,7 +69,7 @@ See the [architecture docs](docs/design/architecture.md) for the full design.
 |----------|-------------|
 | [Architecture](docs/design/architecture.md) | System design, component model, deployment profiles |
 | [Requirements](docs/design/requirements.md) | Performance targets, durability guarantees, milestones |
-| [Design Proposals](docs/design/proposals/) | Detailed designs for each subsystem (ADP-001 through ADP-008) |
+| [Design Proposals](docs/design/proposals/) | Detailed designs for each subsystem (ADP-001 through ADP-009) |
 | [Deployment](docs/operations/deployment.md) | Kubernetes, Helm, configuration reference |
 | [Observability](docs/operations/observability.md) | Metrics, health endpoints, logging |
 | [Failure Modes](docs/operations/failure-modes.md) | Backpressure, failure scenarios, recovery |
@@ -86,6 +89,7 @@ See [Requirements — Milestones](docs/design/requirements.md#milestones) for th
 ```bash
 git clone https://github.com/callumc34/abyss.git
 cd abyss
+# Ensure VCPKG_ROOT is set — see docs/development/building.md
 cmake --preset default
 cmake --build build/default
 ctest --preset default

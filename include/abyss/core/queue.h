@@ -12,7 +12,7 @@ namespace abyss::core {
 struct LogEntry {
   SequenceId seq;
   RespCommand cmd;
-  SteadyTime appended_at;
+  WallTime appended_at;
 };
 
 struct QueueStats {

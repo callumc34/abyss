@@ -7,20 +7,39 @@
 - **Compiler targets:** GCC 13+, Clang 17+, Apple Clang 17+
 - **Container target:** Distroless or Alpine, target < 50 MB
 
+## Prerequisites
+
+vcpkg must be installed and `VCPKG_ROOT` set in the environment before configuring the build:
+
+```bash
+git clone --depth 1 https://github.com/microsoft/vcpkg.git ~/.local/share/vcpkg
+~/.local/share/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+# fish
+set -Ux VCPKG_ROOT $HOME/.local/share/vcpkg
+fish_add_path $VCPKG_ROOT
+
+# bash / zsh
+echo 'export VCPKG_ROOT=$HOME/.local/share/vcpkg' >> ~/.profile
+echo 'export PATH="$VCPKG_ROOT:$PATH"' >> ~/.profile
+```
+
+The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies are declared in `vcpkg.json` and resolved automatically on configure.
+
 ## Dependencies
 
 | Dependency | Purpose | License |
 |------------|---------|---------|
+| crc32c | WAL entry and segment integrity checksums | BSD-3-Clause |
 | RocksDB | Built-in cold store | Apache 2.0 / GPL 2.0 |
 | xxHash | Key hashing / shard routing | BSD |
 | hiredis | RESP parsing, external Redis client | BSD |
 | liburing | io_uring async I/O (Linux) | LGPL / MIT |
 | spdlog | Structured logging | MIT |
 | prometheus-cpp | Metrics export | MIT |
-| protobuf | Queue WAL entry serialisation | BSD |
 | yaml-cpp | Configuration | MIT |
 | googletest | Testing | BSD |
-| benchmark | Microbenchmarks | Apache 2.0 |
+| benchmark | Microbenchmarks (optional, `benchmarks` feature) | Apache 2.0 |
 
 Optional (external profile):
 
@@ -53,6 +72,7 @@ ctest --preset default
 | `release` | Release | Off | Optimised build |
 | `asan` | Debug | On | Address sanitizer + undefined behaviour sanitizer |
 | `tsan` | Debug | On | Thread sanitizer |
+| `bench` | Release | Off | Benchmarks enabled (pulls in `benchmark` via vcpkg) |
 
 ```bash
 # Address sanitizer build
