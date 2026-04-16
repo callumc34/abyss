@@ -14,3 +14,7 @@ Checks: >
 
 WarningsAsErrors: ''
 HeaderFilterRegex: 'include/abyss/.*'
+
+CheckOptions:
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: '2'

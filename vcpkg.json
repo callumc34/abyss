@@ -7,6 +7,12 @@
     "crc32c"
   ],
   "features": {
+    "builtin-cold": {
+      "description": "Build the built-in RocksDB cold store backend",
+      "dependencies": [
+        "rocksdb"
+      ]
+    },
     "benchmarks": {
       "description": "Build micro-benchmarks",
       "dependencies": [
