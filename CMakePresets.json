@@ -7,7 +7,8 @@
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "ABYSS_BUILD_TESTS": "ON"
+        "ABYSS_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
       }
     },
     {
@@ -16,7 +17,8 @@
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_BUILD_TESTS": "OFF"
+        "ABYSS_BUILD_TESTS": "OFF",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
       }
     },
     {
@@ -40,7 +42,17 @@
         "CMAKE_BUILD_TYPE": "Release",
         "ABYSS_BUILD_TESTS": "OFF",
         "ABYSS_BUILD_BENCHMARKS": "ON",
-        "VCPKG_MANIFEST_FEATURES": "benchmarks"
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold;benchmarks"
+      }
+    },
+    {
+      "name": "cloud-only",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ABYSS_BUILD_TESTS": "ON",
+        "ABYSS_WITH_ROCKSDB": "OFF"
       }
     }
   ],
@@ -56,12 +68,23 @@
     {
       "name": "bench",
       "configurePreset": "bench"
+    },
+    {
+      "name": "cloud-only",
+      "configurePreset": "cloud-only"
     }
   ],
   "testPresets": [
     {
       "name": "default",
       "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cloud-only",
+      "configurePreset": "cloud-only",
       "output": {
         "outputOnFailure": true
       }
