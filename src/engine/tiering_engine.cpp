@@ -32,7 +32,7 @@ core::Result<core::RespValue> TieringEngine::HandleWrite(core::ShardId shard,
   if (!seq.has_value()) {
     return std::unexpected(seq.error());
   }
-  return core::RespValue::String("OK");
+  return core::RespValue::SimpleString("OK");
 }
 
 }  // namespace abyss::engine

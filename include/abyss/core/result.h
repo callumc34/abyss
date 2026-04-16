@@ -5,7 +5,7 @@
 
 namespace abyss::core {
 
-enum class ErrorCode {
+enum class ErrorCode : uint8_t {
   kNotFound,
   kAlreadyExists,
   kInvalidArgument,
@@ -14,6 +14,7 @@ enum class ErrorCode {
   kTimeout,
   kResourceExhausted,
   kCorruption,
+  kIncomplete,
 };
 
 class Error {

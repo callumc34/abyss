@@ -2,25 +2,62 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
+**Updated:** 2026-04-15
 
 ## Context
 
-The queue is the single source of truth in Abyss. Every write is committed to the queue before it is applied to any store. Both consumers (hot and cold) read from the queue independently and rebuild their state from it on recovery. The queue's durability and ordering guarantees are the foundation of Abyss's correctness.
+The queue is the single source of truth in Abyss. Every write is committed to the queue before it is applied to any store. All consumers (hot, cold, resolver) read from the queue independently and rebuild their state from it on recovery. The queue's durability and ordering guarantees are the foundation of Abyss's correctness.
 
 The queue interface must be shard-aware from the start to support horizontal scaling in Phase 2, even though Phase 1 runs on a single pod.
 
 ## Design
 
+### Entry Types
+
+Each log entry carries a type tag that determines how consumers process it. Phase 1 defines three variants; the set is closed and extended only by ADP:
+
+| Type | Semantics | Written by | Read by |
+|------|-----------|------------|---------|
+| `Write` | Unconditional op (SET, DEL, SADD, ...) | Frontend | Hot, Cold |
+| `Conditional` | Op + predicate (SET NX, ZADD GT, ...) | Frontend | Resolver |
+| `Resolved` | ref to a Conditional + decision + materialised op + return value | Resolver | Hot, Cold |
+
+The `Conditional` / `Resolved` pair and the block-and-scan protocol are specified in [ADP-011](011-conditional-writes-and-consumer-rpc.md). The queue itself is agnostic to the semantics — it stores entries in order, preserves the type tag, and hands them to consumers unchanged.
+
 ### Interface
 
 ```cpp
+// Values align with the on-disk type byte defined in ADP-009.
+enum class LogEntryType : uint8_t {
+  kWrite = 0x00,
+  kConditional = 0x01,
+  kResolved = 0x02,
+};
+
+struct Predicate;       // defined in ADP-011
+struct ResolvedPayload; // defined in ADP-011
+
+struct LogEntry {
+  SequenceId seq;
+  LogEntryType type;
+  RespCommand cmd;                                   // Write / Conditional
+  std::optional<Predicate> predicate;                // Conditional only
+  std::optional<ResolvedPayload> resolved;           // Resolved only
+  WallTime appended_at;
+};
+
 class Queue {
  public:
   virtual ~Queue() = default;
 
-  // Append a command to the log for a given shard.
+  // Append entries to the log for a given shard.
   // This is the commit point — once this returns OK, the write is durable.
-  virtual Result<SequenceId> Append(ShardId shard, RespCommand cmd) = 0;
+  virtual Result<SequenceId> AppendWrite(ShardId shard, RespCommand cmd) = 0;
+  virtual Result<SequenceId> AppendConditional(
+      ShardId shard, RespCommand cmd, Predicate pred) = 0;
+  virtual Result<SequenceId> AppendResolved(
+      ShardId shard, ResolvedPayload resolved) = 0;
+
   virtual Result<SequenceId> AppendBatch(
       ShardId shard, std::span<const RespCommand> cmds) = 0;
 
@@ -38,20 +75,13 @@ class Queue {
 
   virtual Result<QueueStats> Stats() = 0;
 };
-```
-
-Supporting types:
-
-```cpp
-struct LogEntry {
-  SequenceId seq;
-  RespCommand cmd;
-  WallTime appended_at;
-};
 
 inline constexpr ConsumerId kHotConsumer = 0;
 inline constexpr ConsumerId kColdConsumer = 1;
+inline constexpr ConsumerId kResolverConsumer = 2;
 ```
+
+The Frontend uses `AppendWrite` and `AppendConditional`. The Resolver uses `AppendResolved`. Hot and cold consumers are read-only against the queue.
 
 ### Embedded WAL
 
@@ -68,7 +98,7 @@ The built-in queue implementation is an append-only WAL on the PVC.
 - A background thread periodically deletes segments fully acknowledged by all consumers.
 - Consumer offsets are persisted to a metadata file on the WAL PVC.
 
-**Retention:** The queue retains entries until both consumers have acknowledged. Minimum retention is:
+**Retention:** The queue retains entries until all consumers have acknowledged. Minimum retention is:
 
 ```
 minimum_queue_retention = max(default_eviction, max(eviction_overrides))
@@ -128,11 +158,13 @@ queue:
 
 ## Invariants
 
-1. `Append` returning OK means the write is durable (for group commit: the batch containing this write has been fsynced).
+1. Any `Append*` operation returning OK means the entry is durable (for group commit: the batch containing this entry has been fsynced).
 2. `Read` returns entries in sequence order. No gaps, no reordering.
-3. The queue retains all entries until both consumers have acknowledged them.
-4. Each consumer's cursor is independent. The hot consumer and cold consumer never interfere with each other's read position.
+3. The queue retains all entries until every registered consumer has acknowledged them.
+4. Each consumer's cursor is independent. No consumer's progress affects another consumer's read position.
 5. Sequence IDs are monotonically increasing per shard.
+6. Entry type tags are immutable once appended. A `Conditional` never transforms into a `Write`; the Resolver produces a separate `Resolved` entry.
+7. For every `Conditional` entry at seq X, exactly one `Resolved` entry with `ref = X` follows it in the log. The queue itself does not enforce this — it is an invariant of the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) that the queue must preserve bit-for-bit.
 
 ## Trade-offs
 

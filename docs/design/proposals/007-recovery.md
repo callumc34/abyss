@@ -2,10 +2,13 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
+**Updated:** 2026-04-15
 
 ## Context
 
-When an Abyss pod restarts, the hot store is empty (it was in-memory) and the cold store may be stale (the cold consumer had buffered writes that weren't yet flushed). The queue is the source of truth. Recovery rebuilds both consumers' state from the queue.
+When an Abyss pod restarts, the hot store is empty (it was in-memory) and the cold store may be stale (the cold consumer had buffered writes that weren't yet flushed). The queue is the source of truth. Recovery rebuilds all consumers' state from the queue.
+
+Phase 1 has three consumers: the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)), the cold consumer ([ADP-004](004-cold-consumer.md)), and the hot consumer ([ADP-002](002-hot-store.md)). Recovery replays them in that order.
 
 ## Design
 
@@ -15,25 +18,35 @@ When an Abyss pod restarts, the hot store is empty (it was in-memory) and the co
 Pod starts
   │
   ├─ 1. Determine replay point
-  │     Oldest un-acknowledged sequence ID across both consumers.
+  │     Oldest un-acknowledged sequence ID across all consumers.
   │
-  ├─ 2. Replay queue to cold consumer
+  ├─ 2. Replay queue to resolver
+  │     Resolver rebuilds its recent-writes existence cache from
+  │     Write, Conditional, and Resolved entries.
+  │     No new Resolved entries are emitted — the log already
+  │     contains matching Resolved entries for every Conditional
+  │     from the original run.
+  │
+  ├─ 3. Replay queue to cold consumer
   │     Cold consumer absorbs entries into compaction buffer,
-  │     which deduplicates and merges per key.
-  │     Entries whose absolute TTL has expired are skipped.
+  │     which deduplicates and merges per key. Conditional entries
+  │     are handled via block-and-scan against Resolved entries
+  │     (ADP-011). Entries whose absolute TTL has expired are skipped.
   │     Buffer is then flushed to cold store (compacted).
   │
-  ├─ 3. Replay queue to hot consumer
+  ├─ 4. Replay queue to hot consumer
   │     Hot consumer replays entries still within eviction window.
+  │     Block-and-scan handles Conditional entries (ADP-011).
   │     Entries whose eviction would have expired are skipped.
   │     Entries whose absolute TTL has expired are skipped.
   │     Applied in order — last write wins naturally.
   │
-  ├─ 4. Resume normal operation
-  │     Both consumers switch to real-time queue tailing.
+  ├─ 5. Resume normal operation
+  │     All consumers switch to real-time queue tailing.
   │     Readiness probe goes healthy.
   │
   └─ During recovery: RESP port returns LOADING errors
+     (narrow admin set remains available — see ADP-005)
 ```
 
 ### Recovery Semantics
@@ -46,9 +59,14 @@ Pod starts
 
 ### Replay Ordering
 
-Cold consumer replays first, then hot consumer. This ordering ensures the cold store is up-to-date before the hot consumer starts serving reads. Once the hot consumer finishes replay and switches to real-time tailing, the system is fully consistent.
+Resolver replays first, then cold, then hot. Rationale:
 
-Within each consumer's replay, entries are applied in sequence order. For the hot store, last-write-wins naturally produces the correct state. For the cold consumer, the compaction buffer merges entries per key, producing the same result regardless of how many intermediate writes exist.
+- **Resolver first** because cold and hot use block-and-scan over `Resolved` entries. While block-and-scan works off the queue directly (not the resolver's in-memory state), replaying the resolver first re-warms its existence cache so post-recovery conditional writes do not pay cold-lookup latency on keys the resolver already knew about pre-crash.
+- **Cold before hot** ensures the cold store is up-to-date before the hot consumer starts serving reads. If hot replayed first and a client read missed hot, the cold fallback might return stale data if cold had not caught up.
+
+Once hot finishes replay and switches to real-time tailing, the system is fully consistent.
+
+Within each consumer's replay, entries are applied in sequence order. For the hot store, last-write-wins naturally produces the correct state. For the cold consumer, the compaction buffer merges entries per key, producing the same result regardless of how many intermediate writes exist. Block-and-scan semantics for `Conditional`/`Resolved` pairs are preserved during replay just as in steady state.
 
 ### Queue Retention for Recovery
 
@@ -69,11 +87,13 @@ recovery:
 
 ## Invariants
 
-1. Recovery is pure queue replay. The cold store is never read. Both consumers rebuild their state entirely from the queue.
-2. Entries whose absolute TTL has expired at replay time are skipped.
-3. For the hot consumer, entries whose eviction would have expired at replay time are skipped.
-4. During recovery, the RESP port returns `LOADING` errors. No reads or writes are served until recovery is complete.
-5. After recovery, the readiness probe goes healthy and normal operation resumes.
+1. Recovery is pure queue replay. The cold store is never read. All consumers rebuild their state entirely from the queue.
+2. Replay order is resolver → cold → hot.
+3. Entries whose absolute TTL has expired at replay time are skipped.
+4. For the hot consumer, entries whose eviction would have expired at replay time are skipped.
+5. During recovery, the RESP port returns `LOADING` errors for data-plane commands; a narrow admin set (see [ADP-005](005-resp-frontend.md)) remains available.
+6. After recovery, the readiness probe goes healthy and normal operation resumes.
+7. The resolver emits no new `Resolved` entries during replay — the log already contains matching decisions from the original run.
 
 ## Trade-offs
 

@@ -11,13 +11,21 @@ namespace abyss::resp {
 
 struct ParseResult {
   core::RespValue value;
-  size_t bytes_consumed;
+  size_t bytes_consumed = 0;
+};
+
+struct ParseCommandResult {
+  core::RespCommand command;
+  size_t bytes_consumed = 0;
 };
 
 class Parser {
  public:
+  // Parse one RESP frame from the start of `buffer`.
   static core::Result<ParseResult> Parse(std::span<const uint8_t> buffer);
-  static core::Result<core::RespCommand> ParseCommand(std::span<const uint8_t> buffer);
+
+  // Parse one command from the start of `buffer`.
+  static core::Result<ParseCommandResult> ParseCommand(std::span<const uint8_t> buffer);
 };
 
 }  // namespace abyss::resp

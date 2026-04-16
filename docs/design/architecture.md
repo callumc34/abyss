@@ -42,9 +42,11 @@ Abyss stores opaque bytes — it is data-model agnostic. The RESP frontend accep
 
 **Cold Consumer** — reads from the queue into an in-memory compaction buffer, then flushes to cold when keys go quiet or approach their eviction deadline. The most architecturally significant component. See [ADP-004](proposals/004-cold-consumer.md).
 
+**Resolver** — in-process consumer that evaluates conditional commands (`SET NX`, `ZADD GT`, `MSETNX`, etc.) against a tiered existence view and records the decision as a `Resolved` entry in the queue. Hot and cold consumers then apply the resolved decision rather than re-evaluating the predicate. Preserves Kappa semantics for conditional writes without split-brain between tiers. See [ADP-011](proposals/011-conditional-writes-and-consumer-rpc.md).
+
 **RESP Frontend** — TCP listener implementing the RESP2 wire protocol. Classifies commands as reads, writes, or admin, and routes them accordingly. See [ADP-005](proposals/005-resp-frontend.md).
 
-**Tiering Engine** — orchestrates the read path (hot → buffer → cold → nil) and write path (→ queue → hot consumer ACK → client OK). Manages write promise lifecycle. See [ADP-006](proposals/006-read-write-paths.md).
+**Tiering Engine** — orchestrates the read path (hot → buffer → cold → nil) and write path (→ queue → consumer ACK → client OK). Manages Consumer RPC lifecycle (generalised write promise; see [ADP-011](proposals/011-conditional-writes-and-consumer-rpc.md)). See [ADP-006](proposals/006-read-write-paths.md).
 
 ## Data Flow
 
@@ -132,8 +134,9 @@ Mix of embedded and external. For example: embedded hot store + NATS queue + ext
 Phase 1 uses a conventional multithreaded model within a single pod:
 
 - **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands, route to tiering engine.
-- **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils write promises.
+- **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils Consumer RPC promises for unconditional writes.
 - **Cold consumer thread** (single, dedicated) — tails queue into compaction buffer, flushes to cold.
+- **Resolver thread** (single, dedicated) — tails queue, resolves conditional writes, emits `Resolved` entries, fulfils Consumer RPC promises for conditional writes. See [ADP-011](proposals/011-conditional-writes-and-consumer-rpc.md).
 - **Background threads** — WAL segment cleanup, cold store compaction, TTL expiry scanning.
 
 Hot store access is protected by a sharded lock scheme (lock striping by key hash, using xxHash) to allow concurrent reads from I/O threads while the hot consumer applies writes. The compaction buffer uses a `shared_mutex` (concurrent reads from I/O threads, exclusive writes from cold consumer).

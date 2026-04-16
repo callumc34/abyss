@@ -1,5 +1,6 @@
 add_library(abyss_core
   resp_types.cpp
+  consumer_rpc.cpp
 )
 add_library(abyss::core ALIAS abyss_core)
 

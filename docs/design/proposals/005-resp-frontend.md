@@ -2,70 +2,383 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
+**Updated:** 2026-04-15
 
 ## Context
 
 Abyss exposes a TCP listener implementing the Redis wire protocol (RESP2). Any standard Redis client library connects without modification — no custom SDKs, no protocol extensions. The frontend is responsible for parsing commands, classifying them, and routing them to the appropriate subsystem.
 
+This ADP defines:
+
+- The wire protocol and its version lock (§Protocol Version Lock, §Inline Protocol Support).
+- The typed response contract (§RespValue Type Contract).
+- The error prefix vocabulary (§Error Prefix Table).
+- The complete Phase 1 command surface (§Command Registry).
+- Per-command dispatch classes.
+- Admin command handling: `HELLO`, `CLUSTER`, `INFO`, `DBSIZE`, `CLIENT`.
+- Unknown-command and arity-mismatch behaviour.
+
+Conditional writes (`SET NX`, `ZADD GT`, etc.) and the Consumer RPC primitive that underpins write acknowledgement are specified in [ADP-011](011-conditional-writes-and-consumer-rpc.md). This ADP references that design but does not duplicate it.
+
 ## Design
 
-### Wire Protocol
+### Protocol Version Lock
 
-RESP2 (Redis Serialisation Protocol version 2). This is the protocol spoken by every Redis client library in every language. Abyss does not implement RESP3 in Phase 1.
+RESP2 (Redis Serialisation Protocol version 2). This is the protocol spoken by every Redis client library in every language. Abyss does not implement RESP3 in Phase 1 — this is a hard invariant, not an aspiration.
 
-### Command Classification
+- `HELLO 2` is accepted and responds with server info.
+- `HELLO 3` is rejected with `NOPROTO unsupported protocol version`.
+- `HELLO` with no args returns current handshake state.
 
-Every command is classified into one of three categories:
+Parser and serializer are RESP2-only. RESP3-specific types (maps, sets, doubles, big numbers, verbatim strings, push) are not emitted on the wire. When RESP3 lands in a future phase, it will be additive — existing RESP2 clients will not break.
 
-| Class | Routing | Examples |
-|-------|---------|---------|
-| Read | Hot → Buffer → Cold | `GET`, `SMEMBERS`, `ZRANGEBYSCORE`, `EXISTS`, `TTL` |
-| Write | Append to Queue | `SET`, `DEL`, `SADD`, `ZADD`, `EXPIRE` |
-| Admin | Handled by Abyss directly | `PING`, `INFO`, `DBSIZE`, `CLUSTER SLOTS` |
+### RespValue Type Contract
 
-Unknown commands default to **write** classification. This is the safe default — an unknown command that modifies state will be captured in the queue. An unknown read command classified as a write will fail (the stores won't know how to execute it), but data integrity is preserved.
+`RespValue` (core/resp_types.h) distinguishes simple and bulk strings as separate variants:
+
+```cpp
+enum class Type { kNull, kSimpleString, kBulkString, kInteger, kError, kArray };
+```
+
+Wire serialisation:
+
+| Variant | Wire format | Use |
+|---------|-------------|-----|
+| `kNull` | `$-1\r\n` (bulk null) or `*-1\r\n` (array null) | Missing key, NX-fail, array absence |
+| `kSimpleString` | `+<value>\r\n` | Protocol constants: `OK`, `PONG`, `QUEUED` |
+| `kBulkString` | `$<len>\r\n<bytes>\r\n` | User values, binary-safe |
+| `kInteger` | `:<n>\r\n` | Counts, bool as 0/1 |
+| `kError` | `-<prefix> <message>\r\n` | See §Error Prefix Table |
+| `kArray` | `*<len>\r\n<elems>` | Multi-value responses |
+
+Parser emits the correct variant based on type byte (`+`/`-`/`:`/`$`/`*`). Serializer is deterministic — no guessing between simple and bulk.
+
+Error construction is funneled through a single helper so the prefix vocabulary is enforced at the type level:
+
+```cpp
+RespValue::Error(ErrorPrefix::kWrongType,
+                 "Operation against a key holding the wrong kind of value");
+```
+
+Hand-formatted error strings (`"-ERR ..."`) are disallowed.
+
+### Error Prefix Table
+
+| Prefix | Semantics | Owner | Emitted when |
+|--------|-----------|-------|--------------|
+| `ERR` | Generic: syntax, bad args, unknown command | Frontend | Unknown command, arity mismatch, malformed args, parse error |
+| `WRONGTYPE` | Key exists with a different type | Hot / Cold store | Type mismatch at apply time |
+| `LOADING` | Server is loading state from the queue | Frontend | Recovery gate open ([ADP-007](007-recovery.md)) |
+| `MOVED <slot> <ip>:<port>` | Key belongs to a different shard | Frontend | Phase 2+ cluster routing ([ADP-008](008-horizontal-scaling.md)); emission path exists in Phase 1 but never triggered |
+| `CROSSSLOT` | Multi-key command spans shards | Frontend | Phase 2+ multi-key across pods |
+| `OOM` | Write rejected due to memory limit | Hot store | At `max_memory_bytes` and cannot evict |
+| `NOSCRIPT` | Script not loaded / not supported | Frontend | Any script-related command in Phase 1 (`EVAL`, `EVALSHA`, `SCRIPT`) |
+| `NOPROTO` | Unsupported protocol version | Frontend | `HELLO 3` |
+| `READONLY` | (Reserved) | — | Not emitted in Phase 1. Reserved for future replica mode. |
+| `NOAUTH` | (Reserved) | — | Not emitted in Phase 1. Reserved for future AUTH support. |
+
+Error message text follows Redis's canonical formatting where a standard message exists. Clients that parse error text (some do) then behave consistently against Abyss.
+
+### Inline Protocol Support
+
+RESP accepts two input formats:
+
+1. **RESP arrays** — first byte `*`. Standard client format.
+2. **Inline** — whitespace-separated tokens ending in `\r\n` (or `\n`). Used for telnet-based debugging.
+
+The parser detects at the first non-whitespace byte: `*`/`+`/`-`/`:`/`$` → RESP; otherwise → inline. Inline tokenisation supports `"double-quoted"` and `'single-quoted'` strings with C-style escapes (`\n \t \r \" \\ \xHH`) per Redis convention.
+
+Both paths produce the same `RespCommand` and feed the same registry lookup. Inline is not a separate command space. Pipelined inline commands work through the same incremental-parse mechanism as RESP pipelining.
+
+### Command Classification and Dispatch
+
+Every command is classified along two axes.
+
+**Class** — what the command does to state:
+
+| Class | Examples |
+|-------|----------|
+| Read | `GET`, `SMEMBERS`, `ZRANGEBYSCORE`, `EXISTS`, `TTL`, `TYPE`, `MGET` |
+| Write | `SET`, `DEL`, `SADD`, `ZADD`, `EXPIRE`, `MSET` |
+| Admin | `PING`, `INFO`, `DBSIZE`, `CLUSTER SLOTS`, `HELLO`, `CLIENT` |
+
+**Dispatch** — how the frontend executes it:
+
+| Dispatch | Handling | Ack via |
+|----------|----------|---------|
+| `kStateless` | Frontend computes locally; no consumer interaction | Direct return |
+| `kTieredRead` | Read path: hot → buffer → cold ([ADP-006](006-read-write-paths.md)) | Direct sync tiered read |
+| `kWritePath` | Unconditional write: queue append → hot apply | Consumer RPC ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) |
+| `kConditionalWrite` | Conditional: resolver resolves ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) | Consumer RPC |
+| `kConsumerRpc` | Requires live consumer state (e.g. `DBSIZE`, `OBJECT IDLETIME`) | Consumer RPC |
+
+The request pipeline (issue #34) becomes a data-driven 5-way dispatch against the command registry, not a growing switch.
+
+### Command Registry (Phase 1)
+
+Phase 1 restricts the surface to **direct key access and modification only** — no enumeration (`KEYS`, `SCAN`, `RANDOMKEY`), no global operations (`FLUSHDB`, `FLUSHALL`), no pub/sub, no scripting, no transactions (groundwork exists in ADP-011; activation deferred), no streams.
+
+Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "at least |n|".
+
+**Admin — stateless:**
+
+| Command | Arity | Response |
+|---------|-------|----------|
+| `PING [msg]` | -1 | `+PONG` or bulk echo |
+| `ECHO msg` | 2 | Bulk string |
+| `QUIT` | 1 | `+OK`, then close connection |
+| `HELLO [ver [AUTH u p] [SETNAME n]]` | -1 | Array; see §HELLO and Handshake State |
+| `CLIENT ID` | 2 | Integer (monotonic per-connection id) |
+| `CLIENT GETNAME` | 2 | Bulk or nil |
+| `CLIENT SETNAME name` | 3 | `+OK` |
+| `CLIENT NO-EVICT on\|off` | 3 | `+OK` (recorded; no-op in Phase 1) |
+| `RESET` | 1 | `+RESET` (clears per-connection state) |
+| `TIME` | 1 | Array[unix_seconds, microseconds] |
+| `COMMAND` | -1 | Array of all commands' metadata |
+| `COMMAND INFO [cmd ...]` | -2 | Array of specific command metadata |
+| `COMMAND COUNT` | 2 | Integer |
+| `COMMAND DOCS [cmd ...]` | -2 | Map-as-array of docs |
+| `CONFIG GET param` | 3 | Array[key, value] pairs for matching params |
+
+**Admin — consumer RPC:**
+
+| Command | Arity | Response | Reason |
+|---------|-------|----------|--------|
+| `DBSIZE` | 1 | Integer | Needs hot + cold key count |
+| `INFO [section]` | -1 | Bulk string | Needs live stats from all consumers |
+
+**Admin — cluster (Phase 1 single-shard view; see §CLUSTER Commands):**
+
+| Command | Arity | Response |
+|---------|-------|----------|
+| `CLUSTER SLOTS` | 2 | Array of slot ranges |
+| `CLUSTER SHARDS` | 2 | Array of shard descriptors |
+| `CLUSTER NODES` | 2 | Bulk string (node list) |
+| `CLUSTER INFO` | 2 | Bulk string (cluster state) |
+| `CLUSTER MYID` | 2 | Bulk string (node UUID) |
+| `CLUSTER KEYSLOT key` | 3 | Integer (`CRC16(key) mod 16384`) |
+| `CLUSTER COUNTKEYSINSLOT slot` | 3 | Integer |
+
+**Strings (direct key only):**
+
+| Command | Arity | Class | Dispatch | Response |
+|---------|-------|-------|----------|----------|
+| `GET key` | 2 | Read | TieredRead | Bulk or nil |
+| `SET key value [options...]` | -3 | Write | Write or Conditional (§SET) | `+OK` / nil / bulk |
+| `SETNX key value` | 3 | Write | Conditional | Integer 0/1 |
+| `SETEX key seconds value` | 4 | Write | Write | `+OK` |
+| `PSETEX key ms value` | 4 | Write | Write | `+OK` |
+| `GETSET key value` | 3 | Write | Write | Bulk or nil |
+| `GETDEL key` | 2 | Write | Write | Bulk or nil |
+| `APPEND key value` | 3 | Write | Write | Integer (new length) |
+| `STRLEN key` | 2 | Read | TieredRead | Integer |
+| `INCR key` | 2 | Write | Write | Integer |
+| `DECR key` | 2 | Write | Write | Integer |
+| `INCRBY key n` | 3 | Write | Write | Integer |
+| `DECRBY key n` | 3 | Write | Write | Integer |
+| `INCRBYFLOAT key n` | 3 | Write | Write | Bulk |
+| `MGET key [key ...]` | -2 | Read | TieredRead (fan-out) | Array of bulk/nil |
+| `MSET k v [k v ...]` | -3 | Write | Write (fan-out) | `+OK` |
+| `MSETNX k v [k v ...]` | -3 | Write | Conditional (atomic) | Integer 0/1 |
+
+**Sets (direct key only):**
+
+| Command | Arity | Class | Dispatch | Response |
+|---------|-------|-------|----------|----------|
+| `SADD key m [m ...]` | -3 | Write | Write | Integer (count added) |
+| `SREM key m [m ...]` | -3 | Write | Write | Integer (count removed) |
+| `SMEMBERS key` | 2 | Read | TieredRead | Array |
+| `SISMEMBER key m` | 3 | Read | TieredRead | Integer 0/1 |
+| `SMISMEMBER key m [m ...]` | -3 | Read | TieredRead | Array of 0/1 |
+| `SCARD key` | 2 | Read | TieredRead | Integer |
+| `SPOP key [count]` | -2 | Write | Write | Bulk / array / nil |
+| `SRANDMEMBER key [count]` | -2 | Read | TieredRead | Bulk / array / nil |
+
+**Sorted sets (direct key only):**
+
+| Command | Arity | Class | Dispatch | Response |
+|---------|-------|-------|----------|----------|
+| `ZADD key [NX\|XX\|GT\|LT] [CH] [INCR] score m ...` | -4 | Write | Write or Conditional | Integer / bulk |
+| `ZREM key m [m ...]` | -3 | Write | Write | Integer |
+| `ZSCORE key m` | 3 | Read | TieredRead | Bulk or nil |
+| `ZMSCORE key m [m ...]` | -3 | Read | TieredRead | Array |
+| `ZCARD key` | 2 | Read | TieredRead | Integer |
+| `ZRANK key m [WITHSCORE]` | -3 | Read | TieredRead | Integer/array/nil |
+| `ZREVRANK key m [WITHSCORE]` | -3 | Read | TieredRead | Integer/array/nil |
+| `ZINCRBY key n m` | 4 | Write | Write | Bulk |
+| `ZRANGE key start stop [BYSCORE\|BYLEX] [REV] [LIMIT o c] [WITHSCORES]` | -4 | Read | TieredRead | Array |
+| `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT o c]` | -4 | Read | TieredRead | Array |
+| `ZRANGEBYLEX key min max [LIMIT o c]` | -4 | Read | TieredRead | Array |
+| `ZCOUNT key min max` | 4 | Read | TieredRead | Integer |
+| `ZLEXCOUNT key min max` | 4 | Read | TieredRead | Integer |
+
+**Generic / key management (direct key only):**
+
+| Command | Arity | Class | Dispatch | Response |
+|---------|-------|-------|----------|----------|
+| `DEL key [key ...]` | -2 | Write | Write | Integer (count) |
+| `UNLINK key [key ...]` | -2 | Write | Write | Integer (Phase 1: alias for DEL) |
+| `EXISTS key [key ...]` | -2 | Read | TieredRead | Integer |
+| `EXPIRE key s [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
+| `PEXPIRE key ms [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
+| `EXPIREAT key ts [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
+| `PEXPIREAT key ts-ms [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
+| `PERSIST key` | 2 | Write | Write | Integer 0/1 |
+| `TTL key` | 2 | Read | TieredRead | Integer |
+| `PTTL key` | 2 | Read | TieredRead | Integer |
+| `EXPIRETIME key` | 2 | Read | TieredRead | Integer |
+| `PEXPIRETIME key` | 2 | Read | TieredRead | Integer |
+| `TYPE key` | 2 | Read | TieredRead | Simple string |
+| `RENAME src dst` | 3 | Write | Write | `+OK` |
+| `RENAMENX src dst` | 3 | Write | Conditional | Integer 0/1 |
+| `COPY src dst [DB n] [REPLACE]` | -3 | Write | Conditional | Integer 0/1 |
+| `OBJECT ENCODING key` | 3 | Read | TieredRead | Bulk |
+| `OBJECT IDLETIME key` | 3 | Read | ConsumerRpc | Integer (from hot consumer LRU) |
+
+**Excluded in Phase 1** (reject with `ERR unknown command`):
+
+- Enumeration — `KEYS`, `SCAN`, `HSCAN`, `SSCAN`, `ZSCAN`, `RANDOMKEY`
+- Global — `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `MOVE`, `SELECT` (non-zero DB)
+- Transactions — `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` ([ADP-011](011-conditional-writes-and-consumer-rpc.md) lays the groundwork; activation deferred to Phase 2+)
+- Pub/sub — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB`
+- Scripting — `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` (`NOSCRIPT` where Redis semantics demand it)
+- Streams — `XADD`, `XREAD`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL`, `XGROUP`, `XACK`, ...
+- Debug — `DEBUG`, `MONITOR`, `LATENCY`, `SLOWLOG`
+- Dump / restore — `DUMP`, `RESTORE`, `MIGRATE`
+- Deferred types — hashes (`HGET` et al.), lists (`LPUSH` et al.), bitmaps, hyperloglog, geo. Rejected with `ERR unknown command` in Phase 1; added in Phase 2 when the hot store supports them.
+
+### SET Command Full Specification
+
+`SET key value [EX s | PX ms | EXAT ts | PXAT ts-ms | KEEPTTL] [NX | XX] [GET]`
+
+Supported options:
+
+| Option | Semantics | Interaction with two-TTL model |
+|--------|-----------|--------------------------------|
+| `EX seconds` | Set absolute TTL to `seconds` from now | Sets `ttl`. Does NOT set `eviction` — eviction remains global/per-prefix config. |
+| `PX ms` | Set absolute TTL to `ms` from now | Same, ms precision. |
+| `EXAT unix-seconds` | Set absolute TTL to a Unix timestamp | Same, absolute. |
+| `PXAT unix-ms` | Set absolute TTL to a Unix ms timestamp | Same, absolute ms. |
+| `KEEPTTL` | Preserve existing TTL on the key | Conditional — Resolver reads existing TTL ([ADP-011](011-conditional-writes-and-consumer-rpc.md)). |
+| `NX` | Only set if key does not exist | Conditional ([ADP-011](011-conditional-writes-and-consumer-rpc.md)). |
+| `XX` | Only set if key exists | Conditional. |
+| `GET` | Return prior value, set new | Conditional; value returned via Consumer RPC return value. |
+
+Excluded options:
+
+| Option | Reason |
+|--------|--------|
+| `IDLE seconds` | Redis-specific LRU knob; does not fit Abyss's eviction model (eviction is duration-based, not LRU-based except under memory pressure). |
+
+Dispatch rule:
+
+- No conditional options (no `NX`/`XX`/`KEEPTTL`/`GET`) → `kWritePath`.
+- Any conditional option present → `kConditionalWrite`.
+
+TTL option conflict detection (multiple TTL forms in one command) produces `ERR syntax error` at the frontend.
+
+### Unknown Command Behaviour
+
+Two distinct layers of "unknown":
+
+**1. Unknown command name** — name not in the registry.
+
+Frontend immediately responds `ERR unknown command '<NAME>', with args beginning with: <first-arg>` (Redis-canonical format) and does not touch the queue. This includes the Phase-1-deferred types (hashes, lists, streams, geo) — rejected at the frontend, not queued for rejection at apply time.
+
+This supersedes the prior ambiguous "classify unknown as write" language.
+
+**2. Known command name, store does not support the operation** — e.g. a future Redis module command in the registry but not yet implemented by the Phase 1 built-in hot store.
+
+Frontend classifies per the registry and routes. If it is a write, it reaches the queue; the store returns an error at apply time, which is surfaced to the client via Consumer RPC fulfillment with an error value. This preserves the "write bias for safety" intent for known commands whose store support is incomplete.
+
+**Arity mismatch** — known command with wrong argument count. Frontend rejects with `ERR wrong number of arguments for '<name>' command`, no queue interaction.
+
+### HELLO and Handshake State
+
+Per-connection state (frontend-local, not a queue concern):
+
+```
+ConnectionState {
+  uint64_t client_id;           // monotonic frontend counter
+  std::string client_name;      // set by CLIENT SETNAME
+  int protocol_version = 2;     // locked to 2 in Phase 1
+  bool authenticated = true;    // Phase 1: always true (no AUTH)
+}
+```
+
+`HELLO` responses (map-as-array per RESP2 convention — alternating key/value pairs):
+
+- `HELLO` with no args → current handshake state: `server=abyss, version=<build>, proto=2, id=<client_id>, mode=cluster|standalone, role=master, modules=[]`.
+- `HELLO 2` → same payload, confirms protocol negotiation.
+- `HELLO 3` → `NOPROTO unsupported protocol version`.
+- `HELLO 2 AUTH <user> <pass>` → Phase 1 ignores AUTH arguments (future: verify credentials).
+- `HELLO 2 SETNAME <name>` → sets `client_name`.
+
+`CLIENT ID` reads from connection state; never a queue concern. `CLIENT SETNAME` / `CLIENT GETNAME` operate on connection state. All handshake commands are `kStateless` — Consumer RPC is not involved.
+
+### CLUSTER Commands in Phase 1
+
+Phase 1 is single-pod. Cluster commands respond as if this pod owns the entire keyspace, so cluster-aware clients work against Phase 1 unchanged and migrate to Phase 2 without client-side changes.
+
+Invariant: **slot computation is phase-invariant**. `CLUSTER KEYSLOT` always returns `CRC16(key) mod 16384` (with `{hashtag}` honoured), whether Phase 1 single-pod or Phase 2 multi-pod. Only the slot-to-pod mapping differs between phases.
+
+`CLUSTER SLOTS` response (Phase 1):
+
+```
+[
+  [0, 16383, [<this-pod-ip>, <port>, <node-id>]]
+]
+```
+
+`CLUSTER SHARDS`: equivalent single-shard representation.
+
+`CLUSTER NODES`: single node entry, role `master`.
+
+`CLUSTER MYID`: a UUID generated at first startup and persisted to `<data-dir>/node.id`. Cluster-stable identity is required for Phase 2 routing; establishing it in Phase 1 costs one small file.
+
+`MOVED` redirects are not emitted in Phase 1, but the emission path exists in the frontend. Phase 2 flips a config flag (`cluster.enabled: true`) that activates the redirect logic ([ADP-008](008-horizontal-scaling.md)).
 
 ### Multi-Key Commands
 
-Commands like `MGET` and `MSET` that span multiple keys may target different shards.
+Commands like `MGET` and `MSET` span multiple keys which may target different shards.
 
-**Single-pod (Phase 1):** All keys are local. `MGET` fans out across hot, buffer, and cold per key and assembles the response. `MSET` decomposes into per-key queue entries. There is no cross-key atomicity guarantee — a crash mid-decomposition may persist some keys but not others. This matches DragonflyDB's behaviour under its internal sharding model and is consistent with how Redis Cluster clients handle cross-slot fan-out.
+**Single-pod (Phase 1):** All keys are local. `MGET` fans out across hot, buffer, and cold per key and assembles the response. `MSET` decomposes into per-key `Write` queue entries. There is no cross-key atomicity guarantee for `MSET` — a crash mid-decomposition may persist some keys but not others. This matches DragonflyDB's behaviour under internal sharding and is consistent with how Redis Cluster clients handle cross-slot fan-out.
 
-**Multi-pod (Phase 2+):** If keys in a multi-key command span pods, Abyss responds with `CROSSSLOT` error, matching Redis Cluster semantics. Clients that support Redis Cluster handle this by fanning out per-slot and assembling results client-side. Users can use hash tags (e.g., `{user123}.name`, `{user123}.email`) to co-locate related keys on the same shard.
+`MSETNX` is a conditional multi-key write — routed to the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)), which evaluates existence of all keys atomically under shard-striped locks and emits a single `Resolved` entry that either applies all sets or none.
+
+**Multi-pod (Phase 2+):** If keys span pods, Abyss responds with `CROSSSLOT` error. Clients handle this by fanning out per-slot and assembling results client-side. Users can use hash tags (e.g. `{user123}.name`, `{user123}.email`) to co-locate related keys on the same shard.
 
 ### Write Acknowledgement
 
 A write is acknowledged to the client only after two things have happened:
 
 1. The queue `Append()` completes (write is durable — for group commit, the batch fsync has completed).
-2. The hot consumer has applied the write to the hot store and acknowledged it.
+2. The responsible consumer has applied the write and fulfilled the Consumer RPC promise ([ADP-011](011-conditional-writes-and-consumer-rpc.md)).
 
-These happen in parallel: the hot consumer reads from the in-memory buffer while the fsync is in flight. The promise is fulfilled when both complete.
+For **unconditional writes** (`kWritePath`), the responsible consumer is the hot consumer. Fulfillment carries `RespValue::SimpleString("OK")` or an error.
 
-```
-Write handler                    Hot consumer (in-process thread)
-     │                                  │
-     ├─ append to queue ───────────────▶│
-     │   (blocks until fsync)           │
-     ├─ register promise(seq_id)        │ (reads from buffer concurrently)
-     ├─ await promise                   │
-     │                                  ├─ apply to hot store
-     │                                  ├─ fulfil promise(seq_id)
-     │◀─────────────────────────────────┤
-     ├─ return OK to client             │
-```
+For **conditional writes** (`kConditionalWrite`), the responsible consumer is the Resolver, which fulfils the promise with the resolved `RespValue` (`+OK` / nil / bulk for `SET GET` / integer for `SETNX` / array for `ZADD CH INCR`).
 
-The queue is the sole write path — there is no dual write. The hot consumer ACK is an in-process synchronisation: the write handler registers a `std::promise` keyed by the queue sequence ID, then awaits it. The hot consumer fulfils the promise after applying.
+These happen in parallel with the queue fsync — see [ADP-011](011-conditional-writes-and-consumer-rpc.md) for the full parallel-execution pattern and latency profile.
 
-**Timeout:** The promise has a configurable timeout (default 5s). If the hot consumer fails to ACK within this window, the write handler returns a Redis error to the client. The write is still durable in the queue and will eventually be applied.
+The queue is the sole write path — there is no dual write. Consumer RPC fulfillment is an in-process synchronisation: the write handler registers a promise keyed by the queue sequence ID, then awaits it. The responsible consumer fulfils the promise after applying.
 
-See [ADP-006](006-read-write-paths.md) for the full read and write path details.
+**Timeout:** Configurable, default 5s. If the responsible consumer fails to fulfil within this window, the handler returns a Redis error to the client. The write is still durable in the queue and will eventually be applied.
+
+See [ADP-006](006-read-write-paths.md) for read and write path details, and [ADP-011](011-conditional-writes-and-consumer-rpc.md) for Consumer RPC and conditional resolution.
+
+### Loading State
+
+During recovery ([ADP-007](007-recovery.md)), the RESP port accepts connections but responds to data-plane commands with `LOADING Abyss is loading the dataset in memory`. A narrow admin set (`PING`, `INFO`, `CLUSTER SLOTS`, `HELLO`, `QUIT`, `COMMAND`) remains available so clients and orchestrators can observe state and validate readiness.
+
+The `LOADING` gate is a frontend-level check before dispatch. It lifts automatically when recovery completes.
 
 ### Connection Handling
 
-- Async I/O via `io_uring` (Linux) with `epoll` fallback.
+- Async I/O via `io_uring` (Linux) with `epoll` fallback. macOS uses `kqueue` via the abstraction layer for development parity.
 - Max concurrent connections: configurable, default 1024.
 - Idle timeout: configurable, default 300s.
+- **Pipelining** — the parser is incremental: it returns one command plus bytes-consumed per invocation, and the caller loops until no progress. Pipelined requests are processed sequentially per connection; responses are written in arrival order. No special pipeline buffering is required beyond the per-connection socket buffer.
 
 ### Configuration
 
@@ -75,22 +388,38 @@ resp:
   port: 6379
   max_connections: 1024
   idle_timeout_seconds: 300
+  write_promise_timeout_ms: 5000
 ```
 
 ## Invariants
 
 1. Every write command is routed through the queue. There is no path that writes directly to a store.
-2. Unknown commands are classified as writes.
-3. A write is not acknowledged until both the queue append and the hot consumer apply are complete.
-4. The promise timeout returns an error to the client but does not discard the write from the queue.
-5. RESP2 protocol compliance — any standard Redis client library must be able to connect and issue commands.
+2. Unknown command names are rejected at the frontend with `ERR unknown command` and never touch the queue.
+3. Known commands whose store does not support them reach the queue and surface errors at apply time.
+4. A write is not acknowledged until the queue append is durable AND the responsible consumer (hot for `kWritePath`, Resolver for `kConditionalWrite`) has fulfilled its Consumer RPC promise.
+5. The promise timeout returns an error to the client but does not discard the write from the queue.
+6. RESP2 is the only protocol. `HELLO 3` is rejected with `NOPROTO`. RESP3-specific types are not emitted on the wire.
+7. `RespValue` simple strings and bulk strings are distinct types. Error values are constructed via the prefix-enum helper, never hand-formatted.
+8. Slot computation (`CRC16(key) mod 16384`, honouring `{hashtag}`) is phase-invariant. Only the slot-to-pod mapping changes between phases.
+9. During recovery, data-plane commands return `LOADING`; the narrow admin set remains available.
+10. Inline protocol is supported alongside RESP arrays; both produce the same `RespCommand`.
 
 ## Trade-offs
 
-**Why RESP2 and not RESP3?** RESP2 is universally supported. Every Redis client library speaks it. RESP3 adds features (client-side caching hints, attribute types) that Abyss doesn't need in Phase 1. RESP3 support can be added later without breaking existing clients.
+**Why RESP2 and not RESP3?** RESP2 is universally supported. Every Redis client library speaks it. RESP3 adds features (client-side caching hints, attribute types) Abyss does not need in Phase 1. RESP3 support can be added later without breaking existing clients.
 
-**Why `io_uring` with `epoll` fallback?** `io_uring` offers the best async I/O performance on modern Linux kernels. `epoll` is the fallback for older kernels or environments where `io_uring` is unavailable (some container runtimes restrict it). macOS development uses `kqueue` under the hood via the abstraction layer.
+**Why `io_uring` with `epoll` fallback?** `io_uring` offers the best async I/O performance on modern Linux kernels. `epoll` is the fallback for older kernels and environments where `io_uring` is unavailable (some container runtimes restrict it).
 
-**Why default unknown commands to write?** Safety. If an unknown command modifies state and we classify it as a read, the modification would bypass the queue and be lost on crash. Classifying it as a write means it goes to the queue, and the stores will return a "command not supported" error when the consumer tries to apply it. The data integrity invariant is preserved at the cost of a confusing error message for genuinely unknown read commands.
+**Why split `kString` into `kSimpleString` and `kBulkString`?** RESP2 wire format treats them differently (`+OK\r\n` vs `$2\r\nOK\r\n`). Collapsing them forces the serializer to guess, which produces wrong output for clients that distinguish simple-string protocol constants from binary-safe bulk values. The split is a one-line type change with zero runtime cost; the value is correctness.
 
-**Why no cross-key atomicity?** Redis itself doesn't guarantee atomicity for multi-key commands across slots in cluster mode. `MSET` is syntactic sugar for multiple `SET` commands. Providing atomicity would require distributed transactions, which contradicts Abyss's design principle of simplicity. Partial failures on `MSET` are explicitly acceptable — the client can retry the failed keys.
+**Why reject unknown commands at the frontend rather than queue them?** The prior "classify as write" rule was conservative, based on "unknown commands might modify state". In practice: (a) known write commands are in the registry; (b) clients sending genuinely unknown commands have always been bugs. Rejecting at the frontend gives the client an immediate, actionable error and keeps the queue clean. The "write bias for safety" is preserved for the narrower case of *known* commands whose store support is incomplete.
+
+**Why Phase 1 direct-key-only?** Enumeration commands (`KEYS`, `SCAN`) are expensive in any realistic workload and harder to implement correctly across tiered storage. Deferring them lets Phase 1 ship a smaller, more correct surface. They are Phase 2 candidates once the tiering engine is battle-tested.
+
+**Why support inline protocol?** It costs ~30 lines in the parser and enables `redis-cli`, raw telnet, and ad-hoc debugging. Zero cost for real clients since none use it.
+
+**Why single-shard CLUSTER responses in Phase 1?** Redis Cluster clients (Jedis, Lettuce, redis-py cluster mode, ioredis cluster mode) expect a topology on connect. Returning a valid single-shard topology lets cluster-aware clients work against Phase 1 unchanged. The alternative (rejecting CLUSTER commands until Phase 2) would force users to re-configure clients when migrating — a cost we avoid for a few lines now. Phase-invariant slot computation means clients hash keys identically in both phases.
+
+**Why keep unknown-command bias as write for known-but-unsupported commands?** Safety for the narrow case where the registry knows about a command but the configured store does not yet support it. Classifying it as a read would bypass the queue entirely and risk silent data divergence if the store later gains support. Classifying it as a write means it's captured durably in the queue; the store returns an error at apply time.
+
+**Why no cross-key atomicity for `MSET`?** Redis itself doesn't guarantee atomicity for multi-key commands across slots in cluster mode. `MSET` is syntactic sugar for multiple `SET` commands. Providing atomicity would require distributed transactions, contradicting Abyss's simplicity principle. Partial failures are explicitly acceptable — the client can retry failed keys. `MSETNX` is the exception: it is conditional and routes through the Resolver, which does evaluate all keys atomically under shard-striped locks.

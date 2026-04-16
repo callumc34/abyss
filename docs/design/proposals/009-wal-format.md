@@ -79,12 +79,16 @@ Fixed envelope cost: 29 bytes per entry, plus 4 bytes per argument on top of the
 
 **Entry types** (`type` byte):
 
-| Value | Meaning |
-|-------|---------|
-| `0`   | RESP command (the only entry kind at format 1.0) |
-| `1–255` | Reserved for future use |
+| Value | Meaning | Body fields beyond the common header |
+|-------|---------|--------------------------------------|
+| `0`   | `Write` — unconditional RESP command | None beyond `arg_count`/args |
+| `1`   | `Conditional` — RESP command + predicate. See [ADP-011](011-conditional-writes-and-consumer-rpc.md). | Predicate tag + predicate-specific args, appended after args |
+| `2`   | `Resolved` — decision for a prior `Conditional`. See [ADP-011](011-conditional-writes-and-consumer-rpc.md). | Ref seq (u64), decision (u8), optional materialised RESP command, optional return value (RESP2-serialised) |
+| `3–255` | Reserved for future use | |
 
-New entry types added in later minor versions must be either (a) optional/informational, where older readers can safely skip them, or (b) significant enough to warrant a major version bump. The judgment is per-change and covered in the schema evolution rules below.
+All three entry types are part of Format 1.0. Abyss is pre-alpha and greenfield — no deployed WAL exists outside development, so there is no backward-compatibility burden. The initial WAL implementation may land support for the types incrementally (type=0 first, then 1 and 2 alongside the Resolver), but the format-version surface is fixed from the start. Byte-level layouts for `Conditional` and `Resolved` are specified in a follow-up PR that lands with the Resolver implementation; the type-byte assignments are pinned here so ADP-001 and ADP-011 can reference stable values without cross-doc drift.
+
+Post-alpha, the major/minor compatibility rules in the Schema Evolution section become binding and any new entry type that older readers cannot safely skip (analogous to `Conditional`/`Resolved`'s pairing dependency) requires a major version bump.
 
 ### Integrity: CRC32C
 

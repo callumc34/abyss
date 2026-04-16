@@ -45,8 +45,9 @@ The key guarantee: any write the client received OK for is durable. Group commit
 ### Phase 1 Threading
 
 - **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands, route to tiering engine.
-- **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils write promises.
+- **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils Consumer RPC promises for unconditional writes.
 - **Cold consumer thread** (single, dedicated) — tails queue into compaction buffer, flushes to cold.
+- **Resolver thread** (single, dedicated) — tails queue, resolves conditional writes, emits `Resolved` entries, fulfils Consumer RPC promises for conditional writes.
 - **Background threads** — WAL segment cleanup, cold store compaction, TTL expiry scanning.
 
 ### Lock Discipline
@@ -55,7 +56,7 @@ The key guarantee: any write the client received OK for is durable. Group commit
 
 **Compaction buffer:** `shared_mutex`. I/O threads acquire a shared lock for reads. The cold consumer acquires an exclusive lock when absorbing new entries or removing flushed entries.
 
-**Write promise map:** `mutex`. The write handler registers a promise, the hot consumer fulfils it. Short critical section — insert or erase from an unordered map.
+**Consumer RPC registry:** `mutex`. The write handler registers a promise keyed by sequence id (or RPC id); the responsible consumer (hot for unconditional writes, Resolver for conditional writes, any consumer for admin RPCs) fulfils it. Short critical section — insert or erase from an unordered map. See [ADP-011](proposals/011-conditional-writes-and-consumer-rpc.md).
 
 ### Phase 2+ Threading
 
