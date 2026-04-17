@@ -38,9 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build
-      - run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
-      - run: cmake --build build/default --parallel
-      - run: ctest --preset default --output-on-failure
+      - name: Configure
+        run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
+      - name: Build
+        run: cmake --build build/default --parallel
+      - name: Test
+        run: ctest --preset default --output-on-failure
 
   sanitizers:
     name: Sanitizer (${{ matrix.preset }})
@@ -53,8 +56,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build
-      - run: cmake --preset ${{ matrix.preset }} -G Ninja -DABYSS_WERROR=ON
-      - run: cmake --build build/${{ matrix.preset }} --parallel
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -G Ninja -DABYSS_WERROR=ON
+      - name: Build
+        run: cmake --build build/${{ matrix.preset }} --parallel
       - name: Test
         run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
         env:
