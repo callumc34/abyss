@@ -18,10 +18,10 @@ class ColdConsumer {
   const CompactionBuffer& Buffer() const { return buffer_; }
 
  private:
-  core::Queue& queue_;
-  core::ColdStore& store_;
+  [[maybe_unused]] core::Queue& queue_;
+  [[maybe_unused]] core::ColdStore& store_;
   CompactionBuffer& buffer_;
-  core::ShardId shard_;
+  [[maybe_unused]] core::ShardId shard_;
 };
 
 }  // namespace abyss::consumer

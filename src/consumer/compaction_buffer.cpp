@@ -1,8 +1,11 @@
 #include "abyss/consumer/compaction_buffer.h"
 
+#include "abyss/core/thread_annotations.h"
+
 namespace abyss::consumer {
 
-void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op) {
+void CompactionBuffer::Absorb(const std::string& key,
+                              const core::ops::WriteOp& op) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   auto& entry = entries_[key];
   if (entry.key.empty()) {
@@ -14,7 +17,8 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
   ++entry.write_count;
 }
 
-core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const {
+core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
 
   auto it = entries_.find(key);
@@ -39,17 +43,18 @@ core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) con
       core::Error(core::ErrorCode::kNotFound, "collection read bypasses buffer"));
 }
 
-std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime /*now*/) {
+std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime /*now*/)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   return {};
 }
 
-size_t CompactionBuffer::Size() const {
+size_t CompactionBuffer::Size() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
   return entries_.size();
 }
 
-size_t CompactionBuffer::BytesEstimate() const {
+size_t CompactionBuffer::BytesEstimate() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
   return 0;
 }
