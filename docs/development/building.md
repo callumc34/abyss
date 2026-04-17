@@ -5,7 +5,7 @@
 - **Language:** C++23
 - **Build system:** CMake 3.25+ with presets, vcpkg for dependency management
 - **Compiler targets:** GCC 13+, Clang 17+, Apple Clang 17+
-- **Container target:** Distroless or Alpine, target < 50 MB
+- **Container target:** Distroless
 
 ## Prerequisites
 
@@ -73,6 +73,7 @@ ctest --preset default
 | `asan` | Debug | On | Address sanitizer + undefined behaviour sanitizer |
 | `tsan` | Debug | On | Thread sanitizer |
 | `bench` | Release | Off | Benchmarks enabled (pulls in `benchmark` via vcpkg) |
+| `container` | Release | Off | Static-linked binary for container images (Linux only) |
 
 ```bash
 # Address sanitizer build
@@ -93,10 +94,29 @@ cmake --build build/tsan
 | `ABYSS_WERROR` | `OFF` | Treat warnings as errors |
 | `ABYSS_STRICT_WARNINGS` | `OFF` | Enable additional warning flags beyond -Wall -Wextra -Wpedantic |
 
+## Container Build
+
+The `container` preset produces a statically-linked release binary for container images. It is only available on Linux.
+
+Uses a custom vcpkg triplet (`cmake/triplets/x64-linux-static-release.cmake`) that builds all dependencies as static libraries. The binary links libstdc++ and libgcc statically, leaving only glibc as a dynamic dependency.
+
+```bash
+# Build the binary directly (Linux only)
+cmake --preset container -G Ninja
+cmake --build build/container
+
+# Build the Docker image (on Apple Silicon, add --platform linux/amd64)
+docker build -f docker/Dockerfile -t abyss:local .
+docker run --rm abyss:local
+```
+
+The Docker image uses a multi-stage build with `gcc:14` as the builder and `gcr.io/distroless/cc-debian12:nonroot` as the runtime base. Target image size is under 80 MB.
+
 ## Project Structure
 
 ```
 abyss/
+├── .github/workflows/   # CI pipeline
 ├── include/abyss/       # Public headers
 │   ├── core/            # Types, interfaces, Result<T>
 │   ├── resp/            # RESP protocol
@@ -109,14 +129,17 @@ abyss/
 │   └── metrics/         # Metrics registry
 ├── src/                 # Source files + per-library CMakeLists
 ├── apps/abyss-server/   # Main binary
+├── cmake/
+│   ├── triplets/        # Custom vcpkg triplets
+│   └── *.cmake          # Build system utilities
 ├── tests/
 │   ├── support/         # Mock implementations for testing
 │   ├── unit/            # Unit tests
 │   ├── integration/     # Integration tests
 │   └── benchmark/       # Performance benchmarks
 ├── config/              # Example configuration
-├── deploy/helm/         # Helm charts
-└── docker/              # Dockerfiles
+├── docker/              # Dockerfiles
+└── deploy/helm/         # Helm charts
 ```
 
 ## Code Style

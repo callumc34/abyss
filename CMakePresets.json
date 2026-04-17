@@ -54,6 +54,22 @@
         "ABYSS_BUILD_TESTS": "ON",
         "ABYSS_WITH_ROCKSDB": "OFF"
       }
+    },
+    {
+      "name": "container",
+      "inherits": "release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "ABYSS_WERROR": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-static-release",
+        "VCPKG_HOST_TRIPLET": "x64-linux-static-release",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
+        "CMAKE_EXE_LINKER_FLAGS": "-static-libstdc++ -static-libgcc"
+      }
     }
   ],
   "buildPresets": [
@@ -72,6 +88,10 @@
     {
       "name": "cloud-only",
       "configurePreset": "cloud-only"
+    },
+    {
+      "name": "container",
+      "configurePreset": "container"
     }
   ],
   "testPresets": [
