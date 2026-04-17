@@ -17,8 +17,10 @@ jobs:
   format:
     name: Format
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout commit
+        uses: actions/checkout@v4
 
       - name: Install clang-format-19
         run: |
@@ -35,13 +37,36 @@ jobs:
   build-test:
     name: Build & Test
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-build
+      - name: Checkout commit
+        uses: actions/checkout@v4
+
+      - name: Set up build environment
+        id: setup
+        uses: ./.github/actions/setup-build
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
       - name: Configure
         run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
+
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+
       - name: Build
         run: cmake --build build/default --parallel
+
       - name: Test
         run: ctest --preset default --output-on-failure
 
@@ -49,17 +74,40 @@ jobs:
     name: Sanitizer (${{ matrix.preset }})
     needs: build-test
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         preset: [asan, tsan]
     steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-build
+      - name: Checkout commit
+        uses: actions/checkout@v4
+
+      - name: Set up build environment
+        id: setup
+        uses: ./.github/actions/setup-build
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -G Ninja -DABYSS_WERROR=ON
+
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+
       - name: Build
         run: cmake --build build/${{ matrix.preset }} --parallel
+
       - name: Test
         run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
         env:
@@ -70,13 +118,16 @@ jobs:
     name: Docker
     needs: build-test
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout commit
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

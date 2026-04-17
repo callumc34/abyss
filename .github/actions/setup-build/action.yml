@@ -1,5 +1,13 @@
 name: Setup Abyss Build Environment
-description: Install GCC 14, Ninja, vcpkg (pinned to vcpkg.json baseline), and configure binary caching
+description: Install required packages for building
+
+outputs:
+  vcpkg-cache-key:
+    description: Cache key for vcpkg binary cache
+    value: vcpkg-${{ runner.os }}-${{ steps.vcpkg-baseline.outputs.commit }}-${{ steps.vcpkg-baseline.outputs.manifest-hash }}
+  vcpkg-cache-path:
+    description: Path to vcpkg binary cache directory
+    value: ${{ steps.vcpkg-dirs.outputs.cache-path }}
 
 runs:
   using: composite
@@ -17,20 +25,17 @@ runs:
       shell: bash
       run: |
         BASELINE=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
+        MANIFEST_HASH=$(sha256sum vcpkg.json | cut -d' ' -f1)
         echo "commit=${BASELINE}" >> "${GITHUB_OUTPUT}"
+        echo "manifest-hash=${MANIFEST_HASH}" >> "${GITHUB_OUTPUT}"
 
-    - name: Create binary cache directory
+    - name: Resolve cache directory
+      id: vcpkg-dirs
       shell: bash
-      run: mkdir -p /home/runner/.cache/vcpkg/archives
-
-    - name: Restore vcpkg binary cache
-      uses: actions/cache@v4
-      with:
-        path: /home/runner/.cache/vcpkg/archives
-        key: vcpkg-${{ runner.os }}-${{ steps.vcpkg-baseline.outputs.commit }}-${{ hashFiles('vcpkg.json') }}
-        restore-keys: |
-          vcpkg-${{ runner.os }}-${{ steps.vcpkg-baseline.outputs.commit }}-
-          vcpkg-${{ runner.os }}-
+      run: |
+        CACHE_PATH="${HOME}/.cache/vcpkg/archives"
+        mkdir -p "${CACHE_PATH}"
+        echo "cache-path=${CACHE_PATH}" >> "${GITHUB_OUTPUT}"
 
     - name: Bootstrap vcpkg
       shell: bash
@@ -41,4 +46,4 @@ runs:
         git -C /opt/vcpkg checkout FETCH_HEAD
         /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
         echo "VCPKG_ROOT=/opt/vcpkg" >> "${GITHUB_ENV}"
-        echo "VCPKG_DEFAULT_BINARY_CACHE=/home/runner/.cache/vcpkg/archives" >> "${GITHUB_ENV}"
+        echo "VCPKG_DEFAULT_BINARY_CACHE=${{ steps.vcpkg-dirs.outputs.cache-path }}" >> "${GITHUB_ENV}"

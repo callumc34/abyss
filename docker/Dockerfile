@@ -8,18 +8,19 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ENV VCPKG_ROOT=/opt/vcpkg
-# Must match builtin-baseline in vcpkg.json
-ARG VCPKG_COMMIT=d13fa75214c258099923cf25a5e6311e58c07f3b
-RUN git init ${VCPKG_ROOT} && \
-    cd ${VCPKG_ROOT} && \
-    git remote add origin https://github.com/microsoft/vcpkg.git && \
-    git fetch --depth 1 origin ${VCPKG_COMMIT} && \
-    git checkout FETCH_HEAD && \
-    ./bootstrap-vcpkg.sh -disableMetrics
 
 WORKDIR /src
 
-COPY vcpkg.json CMakeLists.txt CMakePresets.json ./
+COPY vcpkg.json ./
+RUN BASELINE=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])") && \
+    git init ${VCPKG_ROOT} && \
+    cd ${VCPKG_ROOT} && \
+    git remote add origin https://github.com/microsoft/vcpkg.git && \
+    git fetch --depth 1 origin "${BASELINE}" && \
+    git checkout FETCH_HEAD && \
+    ./bootstrap-vcpkg.sh -disableMetrics
+
+COPY CMakeLists.txt CMakePresets.json ./
 COPY cmake/ cmake/
 COPY include/ include/
 COPY src/ src/
@@ -29,7 +30,7 @@ RUN cmake --preset container -G Ninja && \
     cmake --build build/container --target abyss-server
 
 RUN ldd build/container/apps/abyss-server/abyss-server || true
-RUN build/container/apps/abyss-server/abyss-server
+RUN timeout 5 build/container/apps/abyss-server/abyss-server || [ $? -eq 124 ]
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
