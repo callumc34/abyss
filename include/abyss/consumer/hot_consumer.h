@@ -15,10 +15,10 @@ class HotConsumer {
   void Stop();
 
  private:
-  core::Queue& queue_;
-  core::HotStore& store_;
-  core::ShardId shard_;
-  core::EvictionTTL default_eviction_;
+  [[maybe_unused]] core::Queue& queue_;
+  [[maybe_unused]] core::HotStore& store_;
+  [[maybe_unused]] core::ShardId shard_;
+  [[maybe_unused]] core::EvictionTTL default_eviction_;
 };
 
 }  // namespace abyss::consumer

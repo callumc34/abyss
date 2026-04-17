@@ -15,6 +15,7 @@ enum class ErrorCode : uint8_t {
   kResourceExhausted,
   kCorruption,
   kIncomplete,
+  kWrongType,
 };
 
 class Error {

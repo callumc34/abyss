@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/command_dispatcher.h"
@@ -14,7 +16,7 @@ namespace abyss::engine {
 class TieringEngine : public core::CommandDispatcher {
  public:
   TieringEngine(core::Queue& queue, core::HotStore& hot_store, core::ColdStore& cold_store,
-                consumer::CompactionBuffer& buffer, core::ConsumerRpc& rpc);
+                consumer::CompactionBuffer& buffer, core::ConsumerRpc& rpc, uint32_t shard_count);
 
   core::Result<core::RespValue> DispatchRead(std::string_view name,
                                              const core::RespCommand& cmd) override;
@@ -26,7 +28,8 @@ class TieringEngine : public core::CommandDispatcher {
   core::HotStore& hot_store_;
   core::ColdStore& cold_store_;
   consumer::CompactionBuffer& buffer_;
-  core::ConsumerRpc& rpc_;
+  [[maybe_unused]] core::ConsumerRpc& rpc_;
+  uint32_t shard_count_;
 };
 
 }  // namespace abyss::engine

@@ -10,4 +10,5 @@ target_include_directories(abyss_engine PUBLIC
 target_link_libraries(abyss_engine PUBLIC
   abyss::core
   abyss::consumer
+  abyss::hot
 )

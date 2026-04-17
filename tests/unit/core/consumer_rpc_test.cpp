@@ -35,7 +35,7 @@ TEST(ConsumerRpcTest, CancelBreaksFuture) {
   auto fut = rpc.Register(7);
   EXPECT_TRUE(rpc.Cancel(7));
   EXPECT_EQ(rpc.PendingCount(), 0U);
-  EXPECT_THROW(fut.get(), std::future_error);
+  EXPECT_THROW((void)fut.get(), std::future_error);
 }
 
 TEST(ConsumerRpcTest, CancelUnknownIdReturnsFalse) {
@@ -48,7 +48,7 @@ TEST(ConsumerRpcTest, DuplicateRegisterReturnsBrokenFutureAndDoesNotClobberPendi
   auto first = rpc.Register(1);
   auto duplicate = rpc.Register(1);
 
-  EXPECT_THROW(duplicate.get(), std::future_error);
+  EXPECT_THROW((void)duplicate.get(), std::future_error);
   EXPECT_EQ(rpc.PendingCount(), 1U);
 
   EXPECT_TRUE(rpc.Fulfill(1, RespValue::Integer(5)));

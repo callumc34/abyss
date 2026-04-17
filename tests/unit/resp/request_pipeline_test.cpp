@@ -28,7 +28,7 @@ core::RespValue ParseResponse(const std::vector<uint8_t>& bytes) {
 }
 
 TEST(RequestPipelineTest, RespPing) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n"), output);
   EXPECT_GT(result.bytes_consumed, 0U);
@@ -37,14 +37,14 @@ TEST(RequestPipelineTest, RespPing) {
 }
 
 TEST(RequestPipelineTest, PingWithMessageReturnsBulk) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"), output);
   EXPECT_EQ(ToStr(output), "$5\r\nhello\r\n");
 }
 
 TEST(RequestPipelineTest, InlinePing) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("PING\r\n"), output);
   EXPECT_EQ(result.bytes_consumed, 6U);
@@ -52,14 +52,14 @@ TEST(RequestPipelineTest, InlinePing) {
 }
 
 TEST(RequestPipelineTest, Echo) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$4\r\nECHO\r\n$3\r\nfoo\r\n"), output);
   EXPECT_EQ(ToStr(output), "$3\r\nfoo\r\n");
 }
 
 TEST(RequestPipelineTest, QuitSetsCloseRequested) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("*1\r\n$4\r\nQUIT\r\n"), output);
   EXPECT_TRUE(result.close_requested);
@@ -67,7 +67,7 @@ TEST(RequestPipelineTest, QuitSetsCloseRequested) {
 }
 
 TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$4\r\nHGET\r\n$3\r\nkey\r\n"), output);
   auto response = ParseResponse(output);
@@ -76,7 +76,7 @@ TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
 }
 
 TEST(RequestPipelineTest, ArityMismatchReturnsErr) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*1\r\n$3\r\nGET\r\n"), output);  // GET needs a key
   auto response = ParseResponse(output);
@@ -86,7 +86,7 @@ TEST(RequestPipelineTest, ArityMismatchReturnsErr) {
 }
 
 TEST(RequestPipelineTest, Hello2ReturnsHandshakeMap) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 42});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 42, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
   auto response = ParseResponse(output);
@@ -103,7 +103,7 @@ TEST(RequestPipelineTest, Hello2ReturnsHandshakeMap) {
 }
 
 TEST(RequestPipelineTest, Hello3Rejected) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"), output);
   auto response = ParseResponse(output);
@@ -112,14 +112,14 @@ TEST(RequestPipelineTest, Hello3Rejected) {
 }
 
 TEST(RequestPipelineTest, HelloSetnameUpdatesConnectionState) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*4\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$7\r\nSETNAME\r\n$3\r\nbob\r\n"), output);
   EXPECT_EQ(pipeline.state().client_name, "bob");
 }
 
 TEST(RequestPipelineTest, ClientId) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 99});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 99, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
   auto response = ParseResponse(output);
@@ -128,7 +128,7 @@ TEST(RequestPipelineTest, ClientId) {
 }
 
 TEST(RequestPipelineTest, ClientSetnameThenGetname) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> out1;
   pipeline.Process(Bytes("*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$5\r\nalice\r\n"), out1);
   EXPECT_EQ(ToStr(out1), "+OK\r\n");
@@ -142,7 +142,7 @@ TEST(RequestPipelineTest, ClientSetnameThenGetname) {
 }
 
 TEST(RequestPipelineTest, CommandCountMatchesRegistrySize) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n"), output);
   auto response = ParseResponse(output);
@@ -151,7 +151,7 @@ TEST(RequestPipelineTest, CommandCountMatchesRegistrySize) {
 }
 
 TEST(RequestPipelineTest, Time) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*1\r\n$4\r\nTIME\r\n"), output);
   auto response = ParseResponse(output);
@@ -162,7 +162,7 @@ TEST(RequestPipelineTest, Time) {
 }
 
 TEST(RequestPipelineTest, DeferredDispatchReturnsNotImplemented) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   // GET is kTieredRead → should return the not-implemented error.
   pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
@@ -172,7 +172,7 @@ TEST(RequestPipelineTest, DeferredDispatchReturnsNotImplemented) {
 }
 
 TEST(RequestPipelineTest, PartialFrameLeftForCaller) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   // Half a frame — only the length header for a bulk command.
   auto result = pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$3\r\nhe"), output);
@@ -182,7 +182,7 @@ TEST(RequestPipelineTest, PartialFrameLeftForCaller) {
 }
 
 TEST(RequestPipelineTest, PipelinedFramesAreAllProcessed) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   std::string input;
   input.append("*1\r\n$4\r\nPING\r\n");
@@ -194,7 +194,7 @@ TEST(RequestPipelineTest, PipelinedFramesAreAllProcessed) {
 }
 
 TEST(RequestPipelineTest, Reset) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   pipeline.Dispatch(core::RespCommand{{"CLIENT", "SETNAME", "foo"}});
   EXPECT_EQ(pipeline.state().client_name, "foo");
 
