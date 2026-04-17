@@ -3,7 +3,7 @@
 // Clang thread safety analysis annotations.
 // No-ops on compilers that don't support them.
 
-#if defined(__clang__)
+#ifdef __clang__
 #define ABYSS_CAPABILITY(x) __attribute__((capability(x)))
 #define ABYSS_SCOPED_CAPABILITY __attribute__((scoped_lockable))
 #define ABYSS_GUARDED_BY(x) __attribute__((guarded_by(x)))

@@ -1,5 +1,6 @@
 #include "abyss/resp/parser.h"
 
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <optional>
@@ -55,11 +56,18 @@ Result<int64_t> ParseSignedInt(std::string_view text) {
 }
 
 // All known ErrorPrefix values.
-constexpr ErrorPrefix kAllErrorPrefixes[] = {
-    ErrorPrefix::kErr,       ErrorPrefix::kWrongType, ErrorPrefix::kLoading,  ErrorPrefix::kMoved,
-    ErrorPrefix::kCrossSlot, ErrorPrefix::kOom,       ErrorPrefix::kNoScript, ErrorPrefix::kNoProto,
-    ErrorPrefix::kReadOnly,  ErrorPrefix::kNoAuth,
-};
+constexpr auto kAllErrorPrefixes = std::to_array<ErrorPrefix>({
+    ErrorPrefix::kErr,
+    ErrorPrefix::kWrongType,
+    ErrorPrefix::kLoading,
+    ErrorPrefix::kMoved,
+    ErrorPrefix::kCrossSlot,
+    ErrorPrefix::kOom,
+    ErrorPrefix::kNoScript,
+    ErrorPrefix::kNoProto,
+    ErrorPrefix::kReadOnly,
+    ErrorPrefix::kNoAuth,
+});
 
 std::optional<ErrorPrefix> LookupErrorPrefix(std::string_view text) {
   for (auto p : kAllErrorPrefixes) {
@@ -74,20 +82,20 @@ std::optional<ErrorPrefix> LookupErrorPrefix(std::string_view text) {
 Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth);
 
 Result<ParseResult> ParseSimpleString(std::span<const uint8_t> buf, size_t pos) {
-  size_t lf = FindLineEnd(buf, pos);
+  const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete simple string"));
   }
-  std::string_view body = BufSlice(buf, pos, lf - 1);
+  const std::string_view body = BufSlice(buf, pos, lf - 1);
   return ParseResult{.value = RespValue::SimpleString(std::string(body)), .bytes_consumed = lf + 1};
 }
 
 Result<ParseResult> ParseErrorValue(std::span<const uint8_t> buf, size_t pos) {
-  size_t lf = FindLineEnd(buf, pos);
+  const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete error"));
   }
-  std::string_view body = BufSlice(buf, pos, lf - 1);
+  const std::string_view body = BufSlice(buf, pos, lf - 1);
   auto space = body.find(' ');
   if (space == std::string_view::npos) {
     return ParseResult{.value = RespValue::Error(ErrorPrefix::kErr, std::string(body)),
@@ -108,7 +116,7 @@ Result<ParseResult> ParseErrorValue(std::span<const uint8_t> buf, size_t pos) {
 }
 
 Result<ParseResult> ParseInteger(std::span<const uint8_t> buf, size_t pos) {
-  size_t lf = FindLineEnd(buf, pos);
+  const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete integer"));
   }
@@ -120,7 +128,7 @@ Result<ParseResult> ParseInteger(std::span<const uint8_t> buf, size_t pos) {
 }
 
 Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos) {
-  size_t lf = FindLineEnd(buf, pos);
+  const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete bulk string length"));
   }
@@ -128,7 +136,7 @@ Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos) {
   if (!len.has_value()) {
     return std::unexpected(len.error());
   }
-  size_t body_start = lf + 1;
+  const size_t body_start = lf + 1;
   if (*len < -1) {
     return std::unexpected(Malformed("protocol error: negative bulk length"));
   }
@@ -148,7 +156,7 @@ Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos) {
 }
 
 Result<ParseResult> ParseArray(std::span<const uint8_t> buf, size_t pos, int depth) {
-  size_t lf = FindLineEnd(buf, pos);
+  const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete array length"));
   }
@@ -183,8 +191,8 @@ Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth
   if (pos >= buf.size()) {
     return std::unexpected(Incomplete("empty buffer"));
   }
-  uint8_t type_byte = buf[pos];
-  size_t after_type = pos + 1;
+  const uint8_t type_byte = buf[pos];
+  const size_t after_type = pos + 1;
   switch (type_byte) {
     case '+':
       return ParseSimpleString(buf, after_type);
@@ -224,7 +232,7 @@ Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
   size_t i = pos + 1;
   std::string token;
   while (i < buf.size()) {
-    uint8_t c = buf[i];
+    const uint8_t c = buf[i];
     if (c == '"') {
       *out_token = std::move(token);
       *new_pos = i + 1;
@@ -234,7 +242,7 @@ Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
       if (i + 1 >= buf.size()) {
         return std::unexpected(Incomplete("inline: trailing backslash"));
       }
-      uint8_t esc = buf[i + 1];
+      const uint8_t esc = buf[i + 1];
       switch (esc) {
         case 'n':
           token.push_back('\n');
@@ -268,8 +276,8 @@ Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
           if (i + 3 >= buf.size()) {
             return std::unexpected(Incomplete("inline: truncated hex escape"));
           }
-          int hi = HexValue(buf[i + 2]);
-          int lo = HexValue(buf[i + 3]);
+          const int hi = HexValue(buf[i + 2]);
+          const int lo = HexValue(buf[i + 3]);
           if (hi < 0 || lo < 0) {
             return std::unexpected(Malformed("inline: bad hex escape"));
           }
@@ -298,7 +306,7 @@ Result<void> ParseSingleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
   size_t i = pos + 1;
   std::string token;
   while (i < buf.size()) {
-    uint8_t c = buf[i];
+    const uint8_t c = buf[i];
     if (c == '\'') {
       *out_token = std::move(token);
       *new_pos = i + 1;
@@ -356,7 +364,7 @@ Result<RespCommand> ParseInlineCommand(std::span<const uint8_t> buf, size_t* byt
       }
       i = after;
     } else {
-      size_t start = i;
+      const size_t start = i;
       while (i < content_end && !IsInlineWhitespace(buf[i])) {
         ++i;
       }

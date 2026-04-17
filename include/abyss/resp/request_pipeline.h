@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/resp/command_registry.h"
 
@@ -33,7 +34,8 @@ struct ConnectionState {
 // safe to reference from many pipelines simultaneously.
 class RequestPipeline {
  public:
-  RequestPipeline(const CommandRegistry& registry, ConnectionState state);
+  RequestPipeline(const CommandRegistry& registry, ConnectionState state,
+                  core::CommandDispatcher* dispatcher = nullptr);
   ~RequestPipeline() = default;
 
   RequestPipeline(const RequestPipeline&) = delete;
@@ -69,6 +71,7 @@ class RequestPipeline {
   core::RespValue HandleReset(const core::RespCommand& cmd);
 
   const CommandRegistry& registry_;
+  core::CommandDispatcher* dispatcher_;
   ConnectionState state_;
   bool close_requested_ = false;
 };

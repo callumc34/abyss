@@ -8,11 +8,11 @@ namespace abyss::testing {
 
 class MockQueue : public core::Queue {
  public:
-  MOCK_METHOD(core::Result<core::SequenceId>, Append, (core::ShardId shard, core::RespCommand cmd),
+  MOCK_METHOD(core::Result<core::SequenceId>, Append, (core::ShardId shard, core::QueueEntry entry),
               (override));
   MOCK_METHOD(core::Result<core::SequenceId>, AppendBatch,
-              (core::ShardId shard, std::span<const core::RespCommand> cmds), (override));
-  MOCK_METHOD((core::Result<std::vector<core::LogEntry>>), Read,
+              (core::ShardId shard, std::span<const core::QueueEntry> entries), (override));
+  MOCK_METHOD((core::Result<std::vector<core::QueueEntry>>), Read,
               (core::ConsumerId consumer, core::ShardId shard, size_t max_count,
                core::Duration timeout),
               (override));

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
+#include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 
@@ -37,9 +38,7 @@ class StoreFixture : public ::testing::Test {
     return std::move(*store);
   }
 
-  static core::RespCommand Cmd(std::vector<std::string> args) {
-    return core::RespCommand{std::move(args)};
-  }
+  static core::ops::ReadOp GetOp(std::string_view key) { return core::ops::StringGet{.key = key}; }
 
   std::filesystem::path path_;
 };
@@ -47,140 +46,140 @@ class StoreFixture : public ::testing::Test {
 TEST_F(StoreFixture, SetThenGetReturnsValue) {
   auto store = OpenStore();
 
-  auto set_result = store->Exec(Cmd({"SET", "k", "hello"}));
-  ASSERT_TRUE(set_result.has_value());
-  EXPECT_TRUE(set_result->IsString());
-  EXPECT_EQ(set_result->AsString(), "OK");
+  std::string key = "k";
+  std::string val = "hello";
+  core::ops::WriteOp set_op = core::ops::StringSet{.key = key, .value = val};
+  auto set_result = store->ApplyBatch(std::span{&set_op, 1});
+  ASSERT_TRUE(set_result.has_value()) << set_result.error().message();
 
-  auto get_result = store->Exec(Cmd({"GET", "k"}));
+  auto get_result = store->Exec(GetOp(key));
   ASSERT_TRUE(get_result.has_value());
-  EXPECT_TRUE(get_result->IsString());
+  EXPECT_TRUE(get_result->IsBulkString());
   EXPECT_EQ(get_result->AsString(), "hello");
 }
 
 TEST_F(StoreFixture, GetMissingKeyReturnsNull) {
   auto store = OpenStore();
-  auto result = store->Exec(Cmd({"GET", "missing"}));
+  auto result = store->Exec(GetOp("missing"));
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsNull());
 }
 
 TEST_F(StoreFixture, SetOverwritesExistingValue) {
   auto store = OpenStore();
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", "first"})).has_value());
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", "second"})).has_value());
 
-  auto result = store->Exec(Cmd({"GET", "k"}));
+  std::string key = "k";
+  std::string val1 = "first";
+  std::string val2 = "second";
+  core::ops::WriteOp op1 = core::ops::StringSet{.key = key, .value = val1};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op1, 1}).has_value());
+
+  core::ops::WriteOp op2 = core::ops::StringSet{.key = key, .value = val2};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op2, 1}).has_value());
+
+  auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "second");
 }
 
 TEST_F(StoreFixture, SetWithEmptyValueRoundTrips) {
   auto store = OpenStore();
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", ""})).has_value());
 
-  auto result = store->Exec(Cmd({"GET", "k"}));
+  std::string key = "k";
+  std::string val;
+  core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+
+  auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
-  EXPECT_TRUE(result->IsString());
+  EXPECT_TRUE(result->IsBulkString());
   EXPECT_TRUE(result->AsString().empty());
 }
 
 TEST_F(StoreFixture, SetWithLargeValueRoundTrips) {
   auto store = OpenStore();
-  const std::string payload(64 * 1024, 'x');
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", payload})).has_value());
 
-  auto result = store->Exec(Cmd({"GET", "k"}));
+  std::string key = "k";
+  const std::string payload(64 * 1024, 'x');
+  core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = payload};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+
+  auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), payload);
 }
 
-TEST_F(StoreFixture, SetExStoresTtlButReadStillSucceeds) {
+TEST_F(StoreFixture, SetWithTtlStoresButReadsStillSucceed) {
   auto store = OpenStore();
-  // With EX set, the value still reads back — TTL enforcement is #18.
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", "v", "EX", "60"})).has_value());
 
-  auto result = store->Exec(Cmd({"GET", "k"}));
+  std::string key = "k";
+  std::string val = "v";
+  core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val, .abs_ttl_ms = 99999999};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+
+  auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "v");
-}
-
-TEST_F(StoreFixture, SetPxAcceptsMilliseconds) {
-  auto store = OpenStore();
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", "v", "PX", "60000"})).has_value());
-
-  auto result = store->Exec(Cmd({"GET", "k"}));
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->AsString(), "v");
-}
-
-TEST_F(StoreFixture, SetRejectsUnsupportedOption) {
-  auto store = OpenStore();
-  auto result = store->Exec(Cmd({"SET", "k", "v", "NX"}));
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kInvalidArgument);
-}
-
-TEST_F(StoreFixture, SetRejectsMissingTtlValue) {
-  auto store = OpenStore();
-  auto result = store->Exec(Cmd({"SET", "k", "v", "EX"}));
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kInvalidArgument);
 }
 
 TEST_F(StoreFixture, DelReturnsCountOfExistingKeys) {
   auto store = OpenStore();
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "a", "1"})).has_value());
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "b", "2"})).has_value());
 
-  auto del = store->Exec(Cmd({"DEL", "a", "b", "missing"}));
+  std::string ka = "a";
+  std::string va = "1";
+  std::string kb = "b";
+  std::string vb = "2";
+  core::ops::WriteOp op_a = core::ops::StringSet{.key = ka, .value = va};
+  core::ops::WriteOp op_b = core::ops::StringSet{.key = kb, .value = vb};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_a, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_b, 1}).has_value());
+
+  core::ops::Del del_op;
+  std::string_view keys[] = {"a", "b", "missing"};
+  del_op.keys = {std::begin(keys), std::end(keys)};
+  auto del = store->ExecDel(del_op);
   ASSERT_TRUE(del.has_value());
   EXPECT_TRUE(del->IsInteger());
   EXPECT_EQ(del->AsInteger(), 2);
 
-  EXPECT_TRUE(store->Exec(Cmd({"GET", "a"}))->IsNull());
-  EXPECT_TRUE(store->Exec(Cmd({"GET", "b"}))->IsNull());
+  EXPECT_TRUE(store->Exec(GetOp("a"))->IsNull());
+  EXPECT_TRUE(store->Exec(GetOp("b"))->IsNull());
 }
 
 TEST_F(StoreFixture, DelOnMissingKeyReturnsZero) {
   auto store = OpenStore();
-  auto del = store->Exec(Cmd({"DEL", "never-set"}));
+
+  core::ops::Del del_op;
+  std::string_view keys[] = {"never-set"};
+  del_op.keys = {std::begin(keys), std::end(keys)};
+  auto del = store->ExecDel(del_op);
   ASSERT_TRUE(del.has_value());
   EXPECT_EQ(del->AsInteger(), 0);
 }
 
 TEST_F(StoreFixture, PersistenceAcrossReopen) {
+  std::string key = "k";
+  std::string val = "persistent";
   {
     auto store = OpenStore();
-    ASSERT_TRUE(store->Exec(Cmd({"SET", "k", "persistent"})).has_value());
+    core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
+    ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
   }
   auto store = OpenStore();
-  auto result = store->Exec(Cmd({"GET", "k"}));
+  auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "persistent");
 }
 
 TEST_F(StoreFixture, BinaryUnsafeKeyRoundTrips) {
   auto store = OpenStore();
+
   const std::string key{'a', '\x00', 'b', '\xFF'};
-  ASSERT_TRUE(store->Exec(Cmd({"SET", key, "v"})).has_value());
+  std::string val = "v";
+  core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
 
-  auto result = store->Exec(Cmd({"GET", key}));
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->AsString(), "v");
-}
-
-TEST_F(StoreFixture, UnknownCommandReturnsError) {
-  auto store = OpenStore();
-  auto result = store->Exec(Cmd({"HSET", "h", "f", "v"}));
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kInvalidArgument);
-}
-
-TEST_F(StoreFixture, CommandNamesAreCaseInsensitive) {
-  auto store = OpenStore();
-  ASSERT_TRUE(store->Exec(Cmd({"set", "k", "v"})).has_value());
-  auto result = store->Exec(Cmd({"get", "k"}));
+  auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "v");
 }
@@ -190,8 +189,14 @@ TEST_F(StoreFixture, StatsReflectsWrites) {
   auto before = store->Stats();
   ASSERT_TRUE(before.has_value());
 
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "a", "1"})).has_value());
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "b", "2"})).has_value());
+  std::string ka = "a";
+  std::string va = "1";
+  std::string kb = "b";
+  std::string vb = "2";
+  core::ops::WriteOp op_a = core::ops::StringSet{.key = ka, .value = va};
+  core::ops::WriteOp op_b = core::ops::StringSet{.key = kb, .value = vb};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_a, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_b, 1}).has_value());
   ASSERT_TRUE(store->Compact().has_value());
 
   auto after = store->Stats();
@@ -201,15 +206,30 @@ TEST_F(StoreFixture, StatsReflectsWrites) {
 
 TEST_F(StoreFixture, CompactSucceeds) {
   auto store = OpenStore();
-  ASSERT_TRUE(store->Exec(Cmd({"SET", "k", "v"})).has_value());
+
+  std::string key = "k";
+  std::string val = "v";
+  core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
   EXPECT_TRUE(store->Compact().has_value());
 }
 
-TEST_F(StoreFixture, ApplyBatchStillUnimplemented) {
+TEST_F(StoreFixture, ApplyBatchMultipleOps) {
   auto store = OpenStore();
-  const std::vector<core::RespCommand> cmds;
-  auto result = store->ApplyBatch(cmds);
-  ASSERT_FALSE(result.has_value());
+
+  std::string ka = "a";
+  std::string va = "1";
+  std::string kb = "b";
+  std::string vb = "2";
+  std::vector<core::ops::WriteOp> ops = {
+      core::ops::StringSet{.key = ka, .value = va},
+      core::ops::StringSet{.key = kb, .value = vb},
+  };
+  auto result = store->ApplyBatch(ops);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+
+  EXPECT_EQ(store->Exec(GetOp("a"))->AsString(), "1");
+  EXPECT_EQ(store->Exec(GetOp("b"))->AsString(), "2");
 }
 
 }  // namespace

@@ -1,6 +1,5 @@
 add_library(abyss_engine
   tiering_engine.cpp
-  write_promise.cpp
 )
 add_library(abyss::engine ALIAS abyss_engine)
 

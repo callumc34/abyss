@@ -11,28 +11,11 @@ The hot store is the in-memory tier of Abyss. It serves the lowest-latency reads
 
 ### Interface
 
-```cpp
-class HotStore {
- public:
-  virtual ~HotStore() = default;
+The hot store interface accepts typed operations rather than raw RESP commands. Reads arrive as a `ReadOp` variant (e.g. string get, set membership check, sorted set range query). Writes arrive as a `WriteOp` variant (e.g. string set, set add, sorted set add). This decouples RESP parsing from storage — the RESP frontend parses once, and stores execute typed results without string-matching on command names.
 
-  // Execute a Redis command (reads from clients).
-  // Implementations refresh the eviction timer on read hits.
-  virtual Result<RespValue> Exec(const RespCommand& cmd) = 0;
+Read operations (`Exec`) refresh the eviction timer on hits. Write operations (`Apply`, `ApplyBatch`) set the eviction timer per the configured duration for the key's prefix.
 
-  // Apply a write from the queue consumer.
-  virtual Result<void> Apply(const RespCommand& cmd, EvictionTTL eviction) = 0;
-
-  // Bulk apply for recovery (replaying queue).
-  virtual Result<void> ApplyBatch(
-      std::span<const RespCommand> cmds, EvictionTTL eviction) = 0;
-
-  virtual Result<MemoryStats> Stats() = 0;
-  virtual Result<void> Flush() = 0;
-};
-```
-
-The interface accepts `RespCommand` as the unit of work. The hot store implementation decides which commands it supports and returns standard Redis errors for unsupported ones.
+See `include/abyss/core/hot_store.h` and `include/abyss/core/ops.h` for the current interface.
 
 Phase 1 built-in hot store supports: strings, sets, sorted sets. Hashes and lists are Phase 2 candidates. External stores (DragonflyDB, Redis, Valkey) support whatever they natively support — Abyss passes commands through.
 

@@ -3,17 +3,11 @@
 #include <span>
 #include <vector>
 
-#include "abyss/core/resp_types.h"
+#include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
 namespace abyss::core {
-
-struct LogEntry {
-  SequenceId seq;
-  RespCommand cmd;
-  WallTime appended_at;
-};
 
 struct QueueStats {
   uint64_t total_entries = 0;
@@ -24,13 +18,18 @@ struct QueueStats {
 
 class Queue {
  public:
+  Queue() = default;
   virtual ~Queue() = default;
+  Queue(const Queue&) = delete;
+  Queue& operator=(const Queue&) = delete;
+  Queue(Queue&&) = delete;
+  Queue& operator=(Queue&&) = delete;
 
-  virtual Result<SequenceId> Append(ShardId shard, RespCommand cmd) = 0;
-  virtual Result<SequenceId> AppendBatch(ShardId shard, std::span<const RespCommand> cmds) = 0;
+  virtual Result<SequenceId> Append(ShardId shard, QueueEntry entry) = 0;
+  virtual Result<SequenceId> AppendBatch(ShardId shard, std::span<const QueueEntry> entries) = 0;
 
-  virtual Result<std::vector<LogEntry>> Read(ConsumerId consumer, ShardId shard, size_t max_count,
-                                             Duration timeout) = 0;
+  virtual Result<std::vector<QueueEntry>> Read(ConsumerId consumer, ShardId shard, size_t max_count,
+                                               Duration timeout) = 0;
 
   virtual Result<void> Ack(ConsumerId consumer, ShardId shard, SequenceId seq) = 0;
   virtual Result<SequenceId> OldestRetained(ShardId shard) = 0;

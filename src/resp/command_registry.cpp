@@ -8,93 +8,95 @@ namespace abyss::resp {
 namespace {
 
 // The canonical command table.
+// Fields: {name, arity, class, dispatch, first_key, last_key, key_step}
+// Key positions mirror Redis COMMAND INFO. 0 = no keys.
 constexpr auto kCommandTable = std::to_array<CommandSpec>({
-    // ── Admin: stateless ──────────────────────────────────────────────────
-    {"PING", -1, CommandClass::kAdmin, Dispatch::kStateless},
-    {"ECHO", 2, CommandClass::kAdmin, Dispatch::kStateless},
-    {"QUIT", 1, CommandClass::kAdmin, Dispatch::kStateless},
-    {"HELLO", -1, CommandClass::kAdmin, Dispatch::kStateless},
-    {"CLIENT", -2, CommandClass::kAdmin, Dispatch::kStateless},
-    {"RESET", 1, CommandClass::kAdmin, Dispatch::kStateless},
-    {"TIME", 1, CommandClass::kAdmin, Dispatch::kStateless},
-    {"COMMAND", -1, CommandClass::kAdmin, Dispatch::kStateless},
-    {"CONFIG", -3, CommandClass::kAdmin, Dispatch::kStateless},
+    // ── Admin: stateless (no keys) ───────────────────────────────────────
+    {"PING", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"ECHO", 2, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"QUIT", 1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"HELLO", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"CLIENT", -2, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"RESET", 1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"TIME", 1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"COMMAND", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"CONFIG", -3, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
 
-    // ── Admin: consumer RPC ───────────────────────────────────────────────
-    {"DBSIZE", 1, CommandClass::kAdmin, Dispatch::kConsumerRpc},
-    {"INFO", -1, CommandClass::kAdmin, Dispatch::kConsumerRpc},
+    // ── Admin: consumer RPC (no keys) ────────────────────────────────────
+    {"DBSIZE", 1, CommandClass::kAdmin, Dispatch::kConsumerRpc, 0, 0, 0},
+    {"INFO", -1, CommandClass::kAdmin, Dispatch::kConsumerRpc, 0, 0, 0},
 
-    // ── Admin: cluster ──────────────────────────────────────────────────────
-    {"CLUSTER", -2, CommandClass::kAdmin, Dispatch::kStateless},
+    // ── Admin: cluster (no keys) ─────────────────────────────────────────
+    {"CLUSTER", -2, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
 
-    // ── Strings ───────────────────────────────────────────────────────────
-    {"GET", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"SET", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"SETNX", 3, CommandClass::kWrite, Dispatch::kConditionalWrite},
-    {"SETEX", 4, CommandClass::kWrite, Dispatch::kWritePath},
-    {"PSETEX", 4, CommandClass::kWrite, Dispatch::kWritePath},
-    {"GETSET", 3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"GETDEL", 2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"APPEND", 3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"STRLEN", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"INCR", 2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"DECR", 2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"INCRBY", 3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"DECRBY", 3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"INCRBYFLOAT", 3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"MGET", -2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"MSET", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"MSETNX", -3, CommandClass::kWrite, Dispatch::kConditionalWrite},
+    // ── Strings ──────────────────────────────────────────────────────────
+    {"GET", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"SET", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"SETNX", 3, CommandClass::kWrite, Dispatch::kConditionalWrite, 1, 1, 1},
+    {"SETEX", 4, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"PSETEX", 4, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"GETSET", 3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"GETDEL", 2, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"APPEND", 3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"STRLEN", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"INCR", 2, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"DECR", 2, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"INCRBY", 3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"DECRBY", 3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"INCRBYFLOAT", 3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"MGET", -2, CommandClass::kRead, Dispatch::kTieredRead, 1, -1, 1},
+    {"MSET", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, -1, 2},
+    {"MSETNX", -3, CommandClass::kWrite, Dispatch::kConditionalWrite, 1, -1, 2},
 
-    // ── Sets ──────────────────────────────────────────────────────────────
-    {"SADD", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"SREM", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"SMEMBERS", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"SISMEMBER", 3, CommandClass::kRead, Dispatch::kTieredRead},
-    {"SMISMEMBER", -3, CommandClass::kRead, Dispatch::kTieredRead},
-    {"SCARD", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"SPOP", -2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"SRANDMEMBER", -2, CommandClass::kRead, Dispatch::kTieredRead},
+    // ── Sets ─────────────────────────────────────────────────────────────
+    {"SADD", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"SREM", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"SMEMBERS", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"SISMEMBER", 3, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"SMISMEMBER", -3, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"SCARD", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"SPOP", -2, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"SRANDMEMBER", -2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
 
-    // ── Sorted sets ───────────────────────────────────────────────────────
-    {"ZADD", -4, CommandClass::kWrite, Dispatch::kWritePath},
-    {"ZREM", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"ZSCORE", 3, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZMSCORE", -3, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZCARD", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZRANK", -3, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZREVRANK", -3, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZINCRBY", 4, CommandClass::kWrite, Dispatch::kWritePath},
-    {"ZRANGE", -4, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZRANGEBYSCORE", -4, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZRANGEBYLEX", -4, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZCOUNT", 4, CommandClass::kRead, Dispatch::kTieredRead},
-    {"ZLEXCOUNT", 4, CommandClass::kRead, Dispatch::kTieredRead},
+    // ── Sorted sets ──────────────────────────────────────────────────────
+    {"ZADD", -4, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"ZREM", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"ZSCORE", 3, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZMSCORE", -3, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZCARD", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZRANK", -3, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZREVRANK", -3, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZINCRBY", 4, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"ZRANGE", -4, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZRANGEBYSCORE", -4, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZRANGEBYLEX", -4, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZCOUNT", 4, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"ZLEXCOUNT", 4, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
 
-    // ── Generic / key management ──────────────────────────────────────────
-    {"DEL", -2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"UNLINK", -2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"EXISTS", -2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"EXPIRE", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"PEXPIRE", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"EXPIREAT", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"PEXPIREAT", -3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"PERSIST", 2, CommandClass::kWrite, Dispatch::kWritePath},
-    {"TTL", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"PTTL", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"EXPIRETIME", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"PEXPIRETIME", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"TYPE", 2, CommandClass::kRead, Dispatch::kTieredRead},
-    {"RENAME", 3, CommandClass::kWrite, Dispatch::kWritePath},
-    {"RENAMENX", 3, CommandClass::kWrite, Dispatch::kConditionalWrite},
-    {"COPY", -3, CommandClass::kWrite, Dispatch::kConditionalWrite},
-    {"OBJECT", -3, CommandClass::kRead, Dispatch::kTieredRead},
+    // ── Generic / key management ─────────────────────────────────────────
+    {"DEL", -2, CommandClass::kWrite, Dispatch::kWritePath, 1, -1, 1},
+    {"UNLINK", -2, CommandClass::kWrite, Dispatch::kWritePath, 1, -1, 1},
+    {"EXISTS", -2, CommandClass::kRead, Dispatch::kTieredRead, 1, -1, 1},
+    {"EXPIRE", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"PEXPIRE", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"EXPIREAT", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"PEXPIREAT", -3, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"PERSIST", 2, CommandClass::kWrite, Dispatch::kWritePath, 1, 1, 1},
+    {"TTL", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"PTTL", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"EXPIRETIME", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"PEXPIRETIME", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"TYPE", 2, CommandClass::kRead, Dispatch::kTieredRead, 1, 1, 1},
+    {"RENAME", 3, CommandClass::kWrite, Dispatch::kWritePath, 1, 2, 1},
+    {"RENAMENX", 3, CommandClass::kWrite, Dispatch::kConditionalWrite, 1, 2, 1},
+    {"COPY", -3, CommandClass::kWrite, Dispatch::kConditionalWrite, 1, 2, 1},
+    {"OBJECT", -3, CommandClass::kRead, Dispatch::kTieredRead, 2, 2, 1},
 });
 
 std::string Uppercase(std::string_view s) {
   std::string out;
   out.reserve(s.size());
-  for (char c : s) {
+  for (const char c : s) {
     out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
   }
   return out;

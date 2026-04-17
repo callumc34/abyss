@@ -21,19 +21,9 @@ Raw Queue ──▶ Cold Consumer ──▶ Compaction Buffer ──▶ (flush d
 
 ### Compaction Buffer
 
-Each entry in the compaction buffer tracks:
+Each entry in the compaction buffer tracks the key, its compacted state, the time it first entered the buffer, the time of its last modification, and a count of absorbed writes. This provides the flush strategy with everything it needs to decide when to persist.
 
-```cpp
-struct BufferEntry {
-  std::string key;
-  CompactedState state;         // Merged state
-  SteadyTime first_seen;        // Anchors eviction deadline
-  SteadyTime last_modified;     // Quiet window detection
-  uint64_t write_count;         // Writes absorbed since last flush
-};
-```
-
-The buffer is protected by a `shared_mutex`. The cold consumer thread holds an exclusive lock when absorbing new entries or removing flushed entries. I/O threads performing reads hold a shared lock. This allows concurrent buffer reads with minimal contention.
+The buffer is protected by a shared mutex. The cold consumer thread holds an exclusive lock when absorbing new entries or removing flushed entries. I/O threads performing reads hold a shared lock. This allows concurrent buffer reads with minimal contention.
 
 The buffer is also part of the read path: reads that miss the hot store check the compaction buffer before falling through to cold. See [ADP-006](006-read-write-paths.md).
 
@@ -49,20 +39,9 @@ Different Redis data structures require different merge strategies:
 
 **A `DEL` for any key type resets the buffer entry entirely.** All accumulated state is discarded and replaced with a tombstone.
 
-```cpp
-class CompactedState {
- public:
-  void Absorb(const RespCommand& cmd);
-  std::vector<RespCommand> Emit() const;  // Minimal commands to apply to cold
-  void Reset();
+`CompactedState` is type-aware: it tracks which data type the key holds (string, hash, set, sorted set, or none) and maintains per-type storage internally. Absorption takes a typed write operation, not a raw RESP command. Emission produces the minimal set of typed write operations needed to materialise the compacted state in cold. Type conflicts (e.g. SADD on a string key) are handled per Redis semantics — SET and DEL override any type, other commands require a matching type or are skipped.
 
- private:
-  std::optional<RespCommand> latest_set_;              // Scalar keys
-  std::unordered_map<std::string, std::string> pending_adds_;   // Collections
-  std::unordered_set<std::string> pending_removes_;    // Collections
-  bool is_tombstone_ = false;
-};
-```
+See `include/abyss/consumer/compacted_state.h` for the current interface.
 
 ### Flush Strategy
 

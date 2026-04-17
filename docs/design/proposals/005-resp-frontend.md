@@ -388,7 +388,7 @@ resp:
   port: 6379
   max_connections: 1024
   idle_timeout_seconds: 300
-  write_promise_timeout_ms: 5000
+  consumer_rpc_timeout_ms: 5000
 ```
 
 ## Invariants

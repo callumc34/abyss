@@ -20,8 +20,15 @@ Checks: >
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-avoid-c-arrays,
   -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-const-or-ref-data-members,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-pro-type-member-init,
+  -misc-include-cleaner,
   -misc-non-private-member-variables-in-classes,
-  -misc-no-recursion
+  -misc-no-recursion,
+  -misc-use-internal-linkage,
+  -performance-enum-size,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access
 
 WarningsAsErrors: ''
 HeaderFilterRegex: 'include/abyss/.*'

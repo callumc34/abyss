@@ -32,6 +32,11 @@ struct CommandSpec {
   int arity;
   CommandClass cls;
   Dispatch dispatch;
+
+  // Key position metadata.
+  int first_key = 0;  // 0 = no keys, 1 = args[1] is first key
+  int last_key = 0;   // 0 = same as first_key, -1 = last arg is a key
+  int key_step = 1;   // step between keys (2 for MSET key val key val)
 };
 
 // Data-driven command table loaded from a static list at construction time.

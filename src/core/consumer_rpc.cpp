@@ -5,7 +5,7 @@
 namespace abyss::core {
 
 std::future<RespValue> ConsumerRpc::Register(RpcId id) {
-  std::lock_guard<std::mutex> lock(mu_);
+  const std::scoped_lock lock(mu_);
   auto [it, inserted] = pending_.try_emplace(id);
   if (!inserted) {
     std::promise<RespValue> broken;
@@ -19,7 +19,7 @@ std::future<RespValue> ConsumerRpc::Register(RpcId id) {
 bool ConsumerRpc::Fulfill(RpcId id, RespValue value) {
   std::promise<RespValue> promise;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    const std::scoped_lock lock(mu_);
     auto it = pending_.find(id);
     if (it == pending_.end()) {
       return false;
@@ -34,7 +34,7 @@ bool ConsumerRpc::Fulfill(RpcId id, RespValue value) {
 bool ConsumerRpc::Cancel(RpcId id) {
   std::promise<RespValue> promise;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    const std::scoped_lock lock(mu_);
     auto it = pending_.find(id);
     if (it == pending_.end()) {
       return false;
@@ -47,7 +47,7 @@ bool ConsumerRpc::Cancel(RpcId id) {
 }
 
 size_t ConsumerRpc::PendingCount() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  const std::scoped_lock lock(mu_);
   return pending_.size();
 }
 

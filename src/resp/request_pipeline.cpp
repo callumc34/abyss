@@ -1,5 +1,6 @@
 #include "abyss/resp/request_pipeline.h"
 
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -20,7 +21,7 @@ using core::RespValue;
 std::string Uppercase(std::string_view s) {
   std::string out;
   out.reserve(s.size());
-  for (char c : s) {
+  for (const char c : s) {
     out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
   }
   return out;
@@ -57,7 +58,7 @@ RespValue MakeArityError(std::string_view name) {
   std::string message = "wrong number of arguments for '";
   std::string lower;
   lower.reserve(name.size());
-  for (char c : name) {
+  for (const char c : name) {
     lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   }
   message.append(lower);
@@ -67,8 +68,9 @@ RespValue MakeArityError(std::string_view name) {
 
 }  // namespace
 
-RequestPipeline::RequestPipeline(const CommandRegistry& registry, ConnectionState state)
-    : registry_(registry), state_(std::move(state)) {}
+RequestPipeline::RequestPipeline(const CommandRegistry& registry, ConnectionState state,
+                                 core::CommandDispatcher* dispatcher)
+    : registry_(registry), dispatcher_(dispatcher), state_(std::move(state)) {}
 
 RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t> input,
                                                         std::vector<uint8_t>& output) {
@@ -105,7 +107,7 @@ RespValue RequestPipeline::Dispatch(const RespCommand& cmd) {
   auto result = registry_.Classify(cmd);
   if (!result.has_value()) {
     if (result.error().code() == core::ErrorCode::kNotFound) {
-      std::string_view first_arg = cmd.ArgCount() > 1 ? std::string_view(cmd.args[1]) : "";
+      const std::string_view first_arg = cmd.ArgCount() > 1 ? std::string_view(cmd.args[1]) : "";
       return MakeUnknownCommandError(cmd.Name(), first_arg);
     }
     return MakeArityError(cmd.Name());
@@ -118,9 +120,23 @@ RespValue RequestPipeline::DispatchKnown(const CommandSpec& spec, const RespComm
     case Dispatch::kStateless:
       return HandleAdminStateless(spec.name, cmd);
     case Dispatch::kTieredRead:
-      return NotImplemented(spec.name, "requires tiering engine");
+      if (dispatcher_ == nullptr) return NotImplemented(spec.name, "no engine configured");
+      {
+        auto result = dispatcher_->DispatchRead(spec.name, cmd);
+        if (!result.has_value()) {
+          return RespValue::Error(ErrorPrefix::kErr, result.error().message());
+        }
+        return std::move(*result);
+      }
     case Dispatch::kWritePath:
-      return NotImplemented(spec.name, "requires queue + hot consumer");
+      if (dispatcher_ == nullptr) return NotImplemented(spec.name, "no engine configured");
+      {
+        auto result = dispatcher_->DispatchWrite(spec.name, core::RespCommand(cmd));
+        if (!result.has_value()) {
+          return RespValue::Error(ErrorPrefix::kErr, result.error().message());
+        }
+        return std::move(*result);
+      }
     case Dispatch::kConditionalWrite:
       return NotImplemented(spec.name, "requires resolver");
     case Dispatch::kConsumerRpc:
@@ -135,12 +151,16 @@ RespValue RequestPipeline::HandleAdminStateless(std::string_view name, const Res
     std::string_view name;
     Handler handler;
   };
-  static constexpr Entry kDispatch[] = {
-      {"PING", &RequestPipeline::HandlePing},     {"ECHO", &RequestPipeline::HandleEcho},
-      {"QUIT", &RequestPipeline::HandleQuit},     {"HELLO", &RequestPipeline::HandleHello},
-      {"TIME", &RequestPipeline::HandleTime},     {"COMMAND", &RequestPipeline::HandleCommand},
-      {"CLIENT", &RequestPipeline::HandleClient}, {"RESET", &RequestPipeline::HandleReset},
-  };
+  static constexpr auto kDispatch = std::to_array<Entry>({
+      {"PING", &RequestPipeline::HandlePing},
+      {"ECHO", &RequestPipeline::HandleEcho},
+      {"QUIT", &RequestPipeline::HandleQuit},
+      {"HELLO", &RequestPipeline::HandleHello},
+      {"TIME", &RequestPipeline::HandleTime},
+      {"COMMAND", &RequestPipeline::HandleCommand},
+      {"CLIENT", &RequestPipeline::HandleClient},
+      {"RESET", &RequestPipeline::HandleReset},
+  });
   for (const auto& entry : kDispatch) {
     if (entry.name == name) {
       return (this->*entry.handler)(cmd);

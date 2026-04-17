@@ -21,12 +21,12 @@ Client ──▶ RESP Frontend ──▶ Queue.Append() ──▶ Hot Consumer �
                                   └──── BOTH done ──▶ return OK to client
 ```
 
-1. The RESP frontend receives a write command and appends it to the queue for the appropriate shard.
-2. The write handler registers a `std::promise` keyed by the returned sequence ID.
+1. The RESP frontend receives a write command, wraps it in a `QueueEntry` (Write or Conditional variant), and appends it to the queue for the appropriate shard.
+2. The write handler registers a promise in the `ConsumerRpc` registry, keyed by the returned sequence ID.
 3. The queue append blocks until the write is durable (for group commit: the batch containing this write has been fsynced).
-4. Concurrently, the hot consumer reads the entry from the queue's in-memory buffer and applies it to the hot store.
-5. After applying, the hot consumer fulfils the promise.
-6. The write handler awaits both the queue fsync and the promise fulfillment. When both are complete, it returns OK to the client.
+4. Concurrently, the hot consumer reads the entry from the queue's in-memory buffer and applies the typed operation to the hot store.
+5. After applying, the hot consumer fulfils the promise with the response value.
+6. The write handler awaits both the queue fsync and the promise fulfillment. When both are complete, it returns the response to the client.
 
 The queue is the sole write path. There is no dual write. The hot consumer ACK is an in-process synchronisation — this is why the hot consumer is always an in-process thread, even when the queue and hot store are external.
 
@@ -85,13 +85,15 @@ Promotion is a queue append, not a direct hot store write. This preserves the in
 
 ### Write Promise Lifecycle
 
-The write promise map is a `std::mutex`-protected `std::unordered_map<SequenceId, std::promise>`.
+All client-facing async operations — unconditional writes, conditional writes, and admin RPCs — use a single promise registry (`ConsumerRpc`). This replaces the earlier dual-system design where writes and consumer RPCs had separate promise maps.
 
-1. **Register:** The write handler inserts a promise keyed by the sequence ID returned from `Queue::Append`. Returns the corresponding `std::future`.
-2. **Fulfill:** The hot consumer, after calling `HotStore::Apply`, looks up the sequence ID in the map and calls `set_value`. The promise is removed from the map.
-3. **Await:** The write handler blocks on the future with a timeout. On success, it returns OK to the client. On timeout, it returns a Redis error.
+1. **Register:** The write handler registers a promise keyed by the queue sequence ID (for writes/conditionals) or a tagged counter (for admin RPCs). Returns a future.
+2. **Fulfill:** The responsible consumer (hot consumer for unconditional writes, Resolver for conditionals) fulfils the promise with a `RespValue` after applying. The promise is removed from the registry.
+3. **Await:** The write handler blocks on the future with a timeout. On success, it returns the fulfilled response to the client. On timeout, it returns a Redis error.
 
 The critical section is short: one map insert (register) or one map lookup + erase (fulfill). Lock contention is minimal.
+
+See `include/abyss/core/consumer_rpc.h` for the current interface.
 
 ### Metrics
 
@@ -109,7 +111,7 @@ Every read records which tier served the response:
 2. Hot hits refresh the eviction timer. Buffer and cold hits do not.
 3. Buffer hits do not promote. Cold hits do promote (via queue append).
 4. A write is never acknowledged until both the queue fsync and hot consumer apply are complete.
-5. The write promise map is bounded: entries are removed on fulfillment or timeout. A stalled hot consumer causes promise timeouts, not unbounded map growth.
+5. The promise registry is bounded: entries are removed on fulfillment or timeout. A stalled consumer causes promise timeouts, not unbounded registry growth.
 
 ## Trade-offs
 

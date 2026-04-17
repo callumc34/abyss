@@ -54,6 +54,28 @@ TEST(VarintTest, RejectsOverflow) {
   EXPECT_EQ(result.error().code(), core::ErrorCode::kCorruption);
 }
 
+TEST(VarintTest, RejectsTenthByteOverflow) {
+  // 9 continuation bytes (0xFF) + final byte with bit 1 set (0x02) at shift=63.
+  std::string buf;
+  for (int i = 0; i < 9; ++i) buf.push_back(static_cast<char>(0xFF));
+  buf.push_back(static_cast<char>(0x02));
+  std::string_view view = buf;
+  auto result = DecodeVarint(view);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kCorruption);
+}
+
+TEST(VarintTest, AcceptsMaxUint64TenthByte) {
+  // UINT64_MAX encoded as LEB128: 9 bytes of 0xFF + final byte 0x01.
+  std::string buf;
+  for (int i = 0; i < 9; ++i) buf.push_back(static_cast<char>(0xFF));
+  buf.push_back(static_cast<char>(0x01));
+  std::string_view view = buf;
+  auto result = DecodeVarint(view);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(*result, std::numeric_limits<uint64_t>::max());
+}
+
 // --- Sortable double --------------------------------------------------------
 
 TEST(SortableDoubleTest, PreservesOrderingAcrossSign) {

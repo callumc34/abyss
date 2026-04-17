@@ -38,18 +38,18 @@ class RocksdbStore : public core::ColdStore {
   RocksdbStore(RocksdbStore&&) = delete;
   RocksdbStore& operator=(RocksdbStore&&) = delete;
 
-  core::Result<core::RespValue> Exec(const core::RespCommand& cmd) override;
-  core::Result<void> ApplyBatch(std::span<const core::RespCommand> cmds) override;
+  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) override;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
+
+  core::Result<core::RespValue> ExecDel(const core::ops::Del& op);
 
  private:
   struct Impl;
   explicit RocksdbStore(std::unique_ptr<Impl> impl);
 
-  core::Result<core::RespValue> ExecGet(const core::RespCommand& cmd);
-  core::Result<core::RespValue> ExecSet(const core::RespCommand& cmd);
-  core::Result<core::RespValue> ExecDel(const core::RespCommand& cmd);
+  core::Result<core::RespValue> ExecStringGet(const core::ops::StringGet& op);
 
   std::unique_ptr<Impl> impl_;
 };

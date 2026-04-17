@@ -12,7 +12,7 @@ Hot and cold consumers disagree on "exists" because hot evicts values while cold
 This ADP defines a Kappa-preserving design across three mechanisms:
 
 1. **Consumer RPC** — a generalisation of the write-promise pattern ([ADP-005](005-resp-frontend.md), [ADP-006](006-read-write-paths.md)) that lets any consumer return a typed `RespValue` to the frontend.
-2. **Queue entry taxonomy** — three variants: `Write`, `Conditional`, `Resolved`. See [ADP-001](001-queue-wal.md) for the `LogEntry` interface update.
+2. **Queue entry taxonomy** — three variants: `Write`, `Conditional`, `Resolved`. See [ADP-001](001-queue-wal.md) for the `QueueEntry` interface.
 3. **The Resolver** — a new in-process consumer that turns `Conditional` intents into `Resolved` decisions recorded in the queue.
 
 Consumer block-and-scan semantics, recovery ordering, and latency characteristics follow from these three.
@@ -78,7 +78,7 @@ Resolved   { type = 0x02,
                                               // integer for SETNX, etc.
 ```
 
-`Predicate` is an enum over the conditional forms: `kNx`, `kXx`, `kKeepTtl`, `kSetGet`, `kZAddNx`, `kZAddXx`, `kZAddGt`, `kZAddLt`, `kMsetNx`, `kExpireNx/Xx/Gt/Lt`, `kRenameNx`, `kCopyNoReplace`, and any flags they combine with. This is an explicit typed enum, not a free-form predicate DSL — Phase 1 has a closed set and we enforce it at the type level.
+`Predicate` is a bitmask (`PredicateFlags`, uint16_t) over the conditional forms: NX, XX, GET, KEEPTTL, ZADD GT/LT/CH, MSETNX, EXPIRE GT/LT. Flags are combinable (e.g. SET NX GET has both kNx and kGet set). Mutually exclusive flags (NX/XX, GT/LT) are validated at parse time. The bitmask is stored as a uint16_t LE in the WAL entry body — new flags can be added in upper bits without breaking older decoders. See `include/abyss/core/predicate.h` for the current flag set.
 
 ### The Resolver
 

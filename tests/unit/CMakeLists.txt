@@ -4,6 +4,7 @@ add_executable(abyss_unit_tests
   core/result_test.cpp
   core/resp_types_test.cpp
   core/consumer_rpc_test.cpp
+  core/ops_test.cpp
   queue/wal_entry_test.cpp
   queue/segment_header_test.cpp
   resp/command_registry_test.cpp

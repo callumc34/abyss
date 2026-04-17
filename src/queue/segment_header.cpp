@@ -35,7 +35,7 @@ void EncodeSegmentHeader(const SegmentHeader& header, std::vector<std::byte>& ou
           .count();
   WriteI64LE(out, created_us);
 
-  std::span<const std::byte> header_bytes(out.data() + start, out.size() - start);
+  const std::span<const std::byte> header_bytes(out.data() + start, out.size() - start);
   WriteU32LE(out, Crc32c(header_bytes));
 }
 

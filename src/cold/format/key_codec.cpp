@@ -60,10 +60,15 @@ core::Result<uint64_t> DecodeVarint(std::string_view& bytes) {
   size_t consumed = 0;
   for (; consumed < bytes.size(); ++consumed) {
     const auto byte = static_cast<uint8_t>(bytes[consumed]);
-    // LEB128 permits at most 10 bytes for a uint64 (9 * 7 + 1 = 64 bits).
-    if (shift >= 64) {
+
+    if (shift >= 70) {
       return std::unexpected(Error(ErrorCode::kCorruption, "varint overflows uint64"));
     }
+
+    if (shift == 63 && (byte & 0x7E) != 0) {
+      return std::unexpected(Error(ErrorCode::kCorruption, "varint overflows uint64"));
+    }
+
     value |= static_cast<uint64_t>(byte & 0x7F) << shift;
     if ((byte & 0x80) == 0) {
       bytes.remove_prefix(consumed + 1);
@@ -230,7 +235,8 @@ core::Result<uint16_t> DecodeFormatVersionValue(std::string_view value) {
     return std::unexpected(
         Error(ErrorCode::kCorruption, "format version value shorter than 2 bytes"));
   }
-  return ReadU16BE(value.data());
+  return ReadU16BE(
+      value.data());  // NOLINT(bugprone-suspicious-stringview-data-usage) size validated
 }
 
 }  // namespace abyss::cold::format

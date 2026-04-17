@@ -17,9 +17,9 @@ class HashmapStore : public core::HotStore {
   explicit HashmapStore(HashmapConfig config);
   ~HashmapStore() override;
 
-  core::Result<core::RespValue> Exec(const core::RespCommand& cmd) override;
-  core::Result<void> Apply(const core::RespCommand& cmd, core::EvictionTTL eviction) override;
-  core::Result<void> ApplyBatch(std::span<const core::RespCommand> cmds,
+  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) override;
+  core::Result<void> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction) override;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::EvictionTTL eviction) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Flush() override;

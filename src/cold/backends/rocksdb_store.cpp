@@ -7,8 +7,6 @@
 #include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
 
-#include <cctype>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -16,12 +14,13 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/cold/format/key_codec.h"
+#include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
-#include "abyss/core/types.h"
 
 namespace abyss::cold::backends {
 
@@ -31,36 +30,9 @@ namespace {
 
 using core::Error;
 using core::ErrorCode;
-using core::RespCommand;
 using core::RespValue;
 
 constexpr std::string_view kZsetScoreIndexCfName = "zset_score_idx";
-
-std::string AsciiUpper(std::string_view s) {
-  std::string out(s);
-  for (char& c : out) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  return out;
-}
-
-uint64_t NowWallMs() {
-  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   core::WallClock::now().time_since_epoch())
-                                   .count());
-}
-
-core::Result<uint64_t> ParseUint64(std::string_view s) {
-  uint64_t value = 0;
-  const auto* begin = s.data();
-  const auto* end = s.data() + s.size();
-  const auto [ptr, ec] = std::from_chars(begin, end, value);
-  if (ec != std::errc{} || ptr != end) {
-    return std::unexpected(Error(ErrorCode::kInvalidArgument,
-                                 "not a valid unsigned integer: '" + std::string(s) + "'"));
-  }
-  return value;
-}
 
 ErrorCode MapStatusCode(const rocksdb::Status& status) {
   if (status.IsNotFound()) return ErrorCode::kNotFound;
@@ -71,7 +43,7 @@ ErrorCode MapStatusCode(const rocksdb::Status& status) {
 }
 
 Error FromStatus(const rocksdb::Status& status, std::string_view context) {
-  return Error(MapStatusCode(status), std::string(context) + ": " + status.ToString());
+  return {MapStatusCode(status), std::string(context) + ": " + status.ToString()};
 }
 
 rocksdb::ColumnFamilyOptions MakeCfOptions(const RocksdbConfig& config) {
@@ -107,8 +79,6 @@ using CfHandle = std::unique_ptr<rocksdb::ColumnFamilyHandle, CfHandleDeleter>;
 
 struct RocksdbStore::Impl {
   RocksdbConfig config;
-  // db declared first — destroyed last (reverse member order), ensuring CF
-  // handles are cleaned up before the DB is closed.
   std::unique_ptr<rocksdb::DB> db;
   CfHandle default_cf;
   CfHandle zset_score_idx_cf;
@@ -144,7 +114,6 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
   impl->default_cf = CfHandle(cf_handles[0], CfHandleDeleter{impl->db.get()});
   impl->zset_score_idx_cf = CfHandle(cf_handles[1], CfHandleDeleter{impl->db.get()});
 
-  // Format version: verify on existing DB, write on fresh.
   const auto format_key = fmt::EncodeFormatVersionKey();
   std::string existing;
   status = impl->db->Get(rocksdb::ReadOptions(), impl->default_cf.get(), format_key, &existing);
@@ -177,50 +146,22 @@ RocksdbStore::RocksdbStore(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) 
 
 RocksdbStore::~RocksdbStore() = default;
 
-namespace {
-
-// Parses the trailing options of SET: `EX seconds` or `PX milliseconds`.
-core::Result<void> ParseSetOptions(const RespCommand& cmd, size_t options_start,
-                                   uint64_t& abs_ttl_ms) {
-  abs_ttl_ms = 0;
-  for (size_t i = options_start; i < cmd.args.size(); ++i) {
-    const auto opt = AsciiUpper(cmd.args[i]);
-    if (opt != "EX" && opt != "PX") {
-      return std::unexpected(
-          Error(ErrorCode::kInvalidArgument, "unsupported SET option '" + cmd.args[i] + "'"));
-    }
-    if (i + 1 >= cmd.args.size()) {
-      return std::unexpected(
-          Error(ErrorCode::kInvalidArgument, "syntax error — expected value after '" + opt + "'"));
-    }
-    auto ttl_arg = ParseUint64(cmd.args[++i]);
-    if (!ttl_arg.has_value()) return std::unexpected(ttl_arg.error());
-    const uint64_t ttl_ms = (opt == "EX") ? (*ttl_arg * 1000) : *ttl_arg;
-    abs_ttl_ms = NowWallMs() + ttl_ms;
-  }
-  return {};
+core::Result<RespValue> RocksdbStore::Exec(const core::ops::ReadOp& op) {
+  return std::visit(
+      [this](const auto& o) -> core::Result<RespValue> {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, core::ops::StringGet>) {
+          return ExecStringGet(o);
+        } else {
+          return std::unexpected(
+              Error(ErrorCode::kInvalidArgument, "read op not yet supported in cold store"));
+        }
+      },
+      op);
 }
 
-}  // namespace
-
-core::Result<RespValue> RocksdbStore::Exec(const RespCommand& cmd) {
-  if (cmd.args.empty()) {
-    return std::unexpected(Error(ErrorCode::kInvalidArgument, "empty command"));
-  }
-  const auto name = AsciiUpper(cmd.Name());
-  if (name == "GET") return ExecGet(cmd);
-  if (name == "SET") return ExecSet(cmd);
-  if (name == "DEL") return ExecDel(cmd);
-  return std::unexpected(
-      Error(ErrorCode::kInvalidArgument, "unknown or unsupported command '" + cmd.Name() + "'"));
-}
-
-core::Result<RespValue> RocksdbStore::ExecGet(const RespCommand& cmd) {
-  if (cmd.args.size() != 2) {
-    return std::unexpected(
-        Error(ErrorCode::kInvalidArgument, "wrong number of arguments for 'GET'"));
-  }
-  const auto encoded_key = fmt::EncodeStringKey(cmd.args[1]);
+core::Result<RespValue> RocksdbStore::ExecStringGet(const core::ops::StringGet& op) {
+  const auto encoded_key = fmt::EncodeStringKey(op.key);
   std::string raw;
   auto status = impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded_key, &raw);
   if (status.IsNotFound()) {
@@ -233,56 +174,29 @@ core::Result<RespValue> RocksdbStore::ExecGet(const RespCommand& cmd) {
   if (!decoded.has_value()) {
     return std::unexpected(decoded.error());
   }
-  // TTL is stored but not enforced here — requires lazy expiry integration.
-  return RespValue::String(std::string(decoded->payload));
+  return RespValue::BulkString(std::string(decoded->payload));
 }
 
-core::Result<RespValue> RocksdbStore::ExecSet(const RespCommand& cmd) {
-  if (cmd.args.size() < 3) {
-    return std::unexpected(
-        Error(ErrorCode::kInvalidArgument, "wrong number of arguments for 'SET'"));
-  }
-  uint64_t abs_ttl_ms = 0;
-  if (auto r = ParseSetOptions(cmd, 3, abs_ttl_ms); !r.has_value()) {
-    return std::unexpected(r.error());
-  }
-
-  const uint8_t flags = (abs_ttl_ms == 0) ? 0 : fmt::kFlagHasTtl;
-  const auto encoded_key = fmt::EncodeStringKey(cmd.args[1]);
-  const auto encoded_value = fmt::EncodeStringValue({
-      .flags = flags,
-      .abs_ttl_ms = abs_ttl_ms,
-      .payload = cmd.args[2],
-  });
-
-  const auto status =
-      impl_->db->Put(rocksdb::WriteOptions(), impl_->default_cf.get(), encoded_key, encoded_value);
-  if (!status.ok()) {
-    return std::unexpected(FromStatus(status, "SET"));
-  }
-  return RespValue::String("OK");
-}
-
-core::Result<RespValue> RocksdbStore::ExecDel(const RespCommand& cmd) {
-  if (cmd.args.size() < 2) {
-    return std::unexpected(
-        Error(ErrorCode::kInvalidArgument, "wrong number of arguments for 'DEL'"));
-  }
-
+core::Result<RespValue> RocksdbStore::ExecDel(const core::ops::Del& op) {
   rocksdb::WriteBatch batch;
   int64_t deleted = 0;
-  for (size_t i = 1; i < cmd.args.size(); ++i) {
-    const auto encoded_key = fmt::EncodeStringKey(cmd.args[i]);
-    // Count pre-existing entries so DEL returns a meaningful count.
-    std::string sink;
-    auto status =
-        impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded_key, &sink);
-    if (status.ok()) {
-      ++deleted;
-    } else if (!status.IsNotFound()) {
-      return std::unexpected(FromStatus(status, "DEL"));
+
+  for (auto key : op.keys) {
+    auto encoded = fmt::EncodeStringKey(key);
+    std::string value;
+    bool value_found = false;
+
+    if (impl_->db->KeyMayExist(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded, &value,
+                               &value_found)) {
+      if (value_found) {
+        ++deleted;
+      } else {
+        auto s = impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded, &value);
+        if (s.ok()) ++deleted;
+      }
     }
-    auto del_status = batch.Delete(impl_->default_cf.get(), encoded_key);
+
+    auto del_status = batch.Delete(impl_->default_cf.get(), encoded);
     if (!del_status.ok()) {
       return std::unexpected(FromStatus(del_status, "DEL"));
     }
@@ -295,9 +209,45 @@ core::Result<RespValue> RocksdbStore::ExecDel(const RespCommand& cmd) {
   return RespValue::Integer(deleted);
 }
 
-core::Result<void> RocksdbStore::ApplyBatch(std::span<const RespCommand> /*cmds*/) {
-  // Requires compacted batch write support for all types.
-  return std::unexpected(Error(ErrorCode::kInternal, "RocksdbStore::ApplyBatch not implemented"));
+core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
+  rocksdb::WriteBatch batch;
+
+  for (const auto& op : ops) {
+    auto result = std::visit(
+        [this, &batch](const auto& o) -> core::Result<void> {
+          using T = std::decay_t<decltype(o)>;
+          if constexpr (std::is_same_v<T, core::ops::StringSet>) {
+            const uint8_t flags = (o.abs_ttl_ms == 0) ? 0 : fmt::kFlagHasTtl;
+            const auto encoded_key = fmt::EncodeStringKey(o.key);
+            const auto encoded_value = fmt::EncodeStringValue({
+                .flags = flags,
+                .abs_ttl_ms = o.abs_ttl_ms,
+                .payload = o.value,
+            });
+            auto s = batch.Put(impl_->default_cf.get(), encoded_key, encoded_value);
+            if (!s.ok()) return std::unexpected(FromStatus(s, "ApplyBatch SET"));
+            return {};
+          } else if constexpr (std::is_same_v<T, core::ops::Del>) {
+            for (auto key : o.keys) {
+              auto encoded = fmt::EncodeStringKey(key);
+              auto s = batch.Delete(impl_->default_cf.get(), encoded);
+              if (!s.ok()) return std::unexpected(FromStatus(s, "ApplyBatch DEL"));
+            }
+            return {};
+          } else {
+            return std::unexpected(
+                Error(ErrorCode::kInvalidArgument, "write op not yet supported in cold store"));
+          }
+        },
+        op);
+    if (!result.has_value()) return result;
+  }
+
+  const auto status = impl_->db->Write(rocksdb::WriteOptions(), &batch);
+  if (!status.ok()) {
+    return std::unexpected(FromStatus(status, "ApplyBatch"));
+  }
+  return {};
 }
 
 core::Result<core::StorageStats> RocksdbStore::Stats() {
@@ -326,7 +276,7 @@ core::Result<core::StorageStats> RocksdbStore::Stats() {
 }
 
 core::Result<void> RocksdbStore::Compact() {
-  rocksdb::CompactRangeOptions opts;
+  const rocksdb::CompactRangeOptions opts;
   auto status = impl_->db->CompactRange(opts, impl_->default_cf.get(), nullptr, nullptr);
   if (!status.ok()) {
     return std::unexpected(FromStatus(status, "Compact (default)"));

@@ -5,17 +5,19 @@
 #include <string>
 #include <vector>
 
-#include "abyss/core/queue.h"
+#include "abyss/core/queue_entry.h"
 #include "abyss/queue/wal_entry.h"
 
 namespace abyss::queue {
 namespace {
 
-core::LogEntry MakeEntry(size_t value_size) {
-  core::LogEntry e;
+core::QueueEntry MakeEntry(size_t value_size) {
+  core::QueueEntry e;
   e.seq = 1;
   e.appended_at = core::WallClock::now();
-  e.cmd.args = {"SET", "key", std::string(value_size, 'x')};
+  e.payload = core::entry::Write{
+      .cmd = core::RespCommand{{"SET", "key", std::string(value_size, 'x')}},
+  };
   return e;
 }
 

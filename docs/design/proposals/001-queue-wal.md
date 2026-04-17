@@ -26,62 +26,13 @@ The `Conditional` / `Resolved` pair and the block-and-scan protocol are specifie
 
 ### Interface
 
-```cpp
-// Values align with the on-disk type byte defined in ADP-009.
-enum class LogEntryType : uint8_t {
-  kWrite = 0x00,
-  kConditional = 0x01,
-  kResolved = 0x02,
-};
+The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wall-clock timestamp) and a payload variant that discriminates the three entry types. Common fields are direct field accesses — no visitor needed just to read a sequence number. Type dispatch uses the variant only when consumers need to act on the payload.
 
-struct Predicate;       // defined in ADP-011
-struct ResolvedPayload; // defined in ADP-011
+The queue interface provides a single `Append` method that accepts any entry type, plus `AppendBatch` for bulk appends. A `Read` method returns entries for a given consumer and shard. `Ack` marks entries as processed. `OldestRetained` reports the earliest unacknowledged entry for GC.
 
-struct LogEntry {
-  SequenceId seq;
-  LogEntryType type;
-  RespCommand cmd;                                   // Write / Conditional
-  std::optional<Predicate> predicate;                // Conditional only
-  std::optional<ResolvedPayload> resolved;           // Resolved only
-  WallTime appended_at;
-};
+The frontend creates Write and Conditional entries. The Resolver creates Resolved entries. Hot and cold consumers are read-only against the queue.
 
-class Queue {
- public:
-  virtual ~Queue() = default;
-
-  // Append entries to the log for a given shard.
-  // This is the commit point — once this returns OK, the write is durable.
-  virtual Result<SequenceId> AppendWrite(ShardId shard, RespCommand cmd) = 0;
-  virtual Result<SequenceId> AppendConditional(
-      ShardId shard, RespCommand cmd, Predicate pred) = 0;
-  virtual Result<SequenceId> AppendResolved(
-      ShardId shard, ResolvedPayload resolved) = 0;
-
-  virtual Result<SequenceId> AppendBatch(
-      ShardId shard, std::span<const RespCommand> cmds) = 0;
-
-  // Consumer interface. Each consumer maintains its own cursor per shard.
-  virtual Result<std::vector<LogEntry>> Read(
-      ConsumerId consumer, ShardId shard,
-      size_t max_count, Duration timeout) = 0;
-
-  // Acknowledge processing up to a sequence ID.
-  virtual Result<void> Ack(
-      ConsumerId consumer, ShardId shard, SequenceId seq) = 0;
-
-  // Queue retains entries until all consumers have acked.
-  virtual Result<SequenceId> OldestRetained(ShardId shard) = 0;
-
-  virtual Result<QueueStats> Stats() = 0;
-};
-
-inline constexpr ConsumerId kHotConsumer = 0;
-inline constexpr ConsumerId kColdConsumer = 1;
-inline constexpr ConsumerId kResolverConsumer = 2;
-```
-
-The Frontend uses `AppendWrite` and `AppendConditional`. The Resolver uses `AppendResolved`. Hot and cold consumers are read-only against the queue.
+See `include/abyss/core/queue.h` and `include/abyss/core/queue_entry.h` for the current interface.
 
 ### Embedded WAL
 
@@ -158,7 +109,7 @@ queue:
 
 ## Invariants
 
-1. Any `Append*` operation returning OK means the entry is durable (for group commit: the batch containing this entry has been fsynced).
+1. Any `Append` operation returning OK means the entry is durable (for group commit: the batch containing this entry has been fsynced).
 2. `Read` returns entries in sequence order. No gaps, no reordering.
 3. The queue retains all entries until every registered consumer has acknowledged them.
 4. Each consumer's cursor is independent. No consumer's progress affects another consumer's read position.

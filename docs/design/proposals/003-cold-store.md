@@ -11,23 +11,11 @@ The cold store is the durable on-disk tier of Abyss. It holds data that has been
 
 ### Interface
 
-```cpp
-class ColdStore {
- public:
-  virtual ~ColdStore() = default;
+Like the hot store, the cold store interface accepts typed operations. Reads arrive as a `ReadOp` variant, batch writes arrive as a span of `WriteOp` variants. The cold store never sees raw RESP commands — the typed operation layer centralises parsing in core, keeping storage backends free of protocol concerns.
 
-  // Execute a Redis command (reads on hot-miss + buffer-miss).
-  virtual Result<RespValue> Exec(const RespCommand& cmd) = 0;
+`Exec` handles reads that miss both hot and the compaction buffer. `ApplyBatch` is the only write path — the cold consumer always flushes compacted state in batches. `Stats` reports disk usage and key counts. `Compact` triggers manual RocksDB compaction.
 
-  // Batch write from the cold consumer.
-  virtual Result<void> ApplyBatch(std::span<const RespCommand> cmds) = 0;
-
-  virtual Result<StorageStats> Stats() = 0;
-  virtual Result<void> Compact() = 0;
-};
-```
-
-Like the hot store, the interface accepts `RespCommand` as the unit of work. The cold store implementation decides which commands it supports.
+See `include/abyss/core/cold_store.h` and `include/abyss/core/ops.h` for the current interface.
 
 ### Built-in RocksDB Store
 

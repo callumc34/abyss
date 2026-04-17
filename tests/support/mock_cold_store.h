@@ -8,8 +8,8 @@ namespace abyss::testing {
 
 class MockColdStore : public core::ColdStore {
  public:
-  MOCK_METHOD(core::Result<core::RespValue>, Exec, (const core::RespCommand& cmd), (override));
-  MOCK_METHOD(core::Result<void>, ApplyBatch, (std::span<const core::RespCommand> cmds),
+  MOCK_METHOD(core::Result<core::RespValue>, Exec, (const core::ops::ReadOp& op), (override));
+  MOCK_METHOD(core::Result<void>, ApplyBatch, (std::span<const core::ops::WriteOp> ops),
               (override));
   MOCK_METHOD(core::Result<core::StorageStats>, Stats, (), (override));
   MOCK_METHOD(core::Result<void>, Compact, (), (override));
