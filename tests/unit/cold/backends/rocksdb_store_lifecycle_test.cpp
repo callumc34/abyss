@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <filesystem>
@@ -23,7 +24,8 @@ class TempDir {
   TempDir() {
     static std::atomic<int> counter{0};
     auto base = std::filesystem::temp_directory_path();
-    path_ = base / ("abyss_cold_test_" + std::to_string(counter.fetch_add(1)));
+    path_ = base / ("abyss_cold_test_" + std::to_string(getpid()) + "_" +
+                    std::to_string(counter.fetch_add(1)));
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
     path_str_ = path_.string();

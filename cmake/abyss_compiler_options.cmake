@@ -3,6 +3,11 @@ add_library(abyss::compiler_options ALIAS abyss_compiler_options)
 
 target_compile_features(abyss_compiler_options INTERFACE cxx_std_23)
 
+target_include_directories(abyss_compiler_options INTERFACE
+  ${PROJECT_SOURCE_DIR}/include
+  ${CMAKE_BINARY_DIR}/generated
+)
+
 target_compile_options(abyss_compiler_options INTERFACE
   -Wall
   -Wextra

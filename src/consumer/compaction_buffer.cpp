@@ -10,10 +10,10 @@ void CompactionBuffer::Absorb(const std::string& key,
   auto& entry = entries_[key];
   if (entry.key.empty()) {
     entry.key = key;
-    entry.first_seen = core::SteadyClock::now();
+    entry.first_seen = clock_();
   }
   entry.state.Absorb(op);
-  entry.last_modified = core::SteadyClock::now();
+  entry.last_modified = clock_();
   ++entry.write_count;
 }
 

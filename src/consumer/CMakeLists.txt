@@ -7,10 +7,6 @@ add_library(abyss_consumer
 )
 add_library(abyss::consumer ALIAS abyss_consumer)
 
-target_include_directories(abyss_consumer PUBLIC
-  ${PROJECT_SOURCE_DIR}/include
-)
-
 target_link_libraries(abyss_consumer PUBLIC
   abyss::core
 )

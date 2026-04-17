@@ -17,6 +17,8 @@ namespace abyss::hot {
 struct ShardedHotStoreConfig {
   size_t max_memory_bytes = 4294967296;
   uint32_t shard_count = 64;
+  core::SteadyClockFn steady_clock = core::DefaultSteadyClock;
+  core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
 class ShardedHotStore : public core::HotStore {

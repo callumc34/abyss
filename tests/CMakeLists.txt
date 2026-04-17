@@ -1,8 +1,17 @@
 if(ABYSS_BUILD_TESTS)
   add_subdirectory(support)
   add_subdirectory(unit)
+  add_subdirectory(component)
+  if(ABYSS_WITH_ROCKSDB)
+    add_subdirectory(integration)
+  endif()
+  add_subdirectory(system)
 endif()
 
 if(ABYSS_BUILD_BENCHMARKS)
   add_subdirectory(bench)
+endif()
+
+if(ABYSS_BUILD_FUZZ)
+  add_subdirectory(fuzz)
 endif()

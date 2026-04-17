@@ -22,9 +22,12 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     {"COMMAND", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
     {"CONFIG", -3, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
 
+    {"FLUSHALL", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"FLUSHDB", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+    {"INFO", -1, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},
+
     // ── Admin: consumer RPC (no keys) ────────────────────────────────────
     {"DBSIZE", 1, CommandClass::kAdmin, Dispatch::kConsumerRpc, 0, 0, 0},
-    {"INFO", -1, CommandClass::kAdmin, Dispatch::kConsumerRpc, 0, 0, 0},
 
     // ── Admin: cluster (no keys) ─────────────────────────────────────────
     {"CLUSTER", -2, CommandClass::kAdmin, Dispatch::kStateless, 0, 0, 0},

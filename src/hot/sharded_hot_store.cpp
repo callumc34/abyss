@@ -12,6 +12,8 @@ namespace abyss::hot {
 ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(config) {
   SingleShardConfig shard_config{
       .max_memory_bytes = config_.max_memory_bytes / config_.shard_count,
+      .steady_clock = config_.steady_clock,
+      .wall_clock = config_.wall_clock,
   };
   shards_.reserve(config_.shard_count);
   for (uint32_t i = 0; i < config_.shard_count; ++i) {

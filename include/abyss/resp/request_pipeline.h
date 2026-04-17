@@ -69,6 +69,8 @@ class RequestPipeline {
   core::RespValue HandleCommand(const core::RespCommand& cmd);
   core::RespValue HandleClient(const core::RespCommand& cmd);
   core::RespValue HandleReset(const core::RespCommand& cmd);
+  core::RespValue HandleInfo(const core::RespCommand& cmd);
+  core::RespValue HandleFlushall(const core::RespCommand& cmd);
 
   const CommandRegistry& registry_;
   core::CommandDispatcher* dispatcher_;

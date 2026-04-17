@@ -1,11 +1,3 @@
-find_package(Crc32c CONFIG REQUIRED)
-set_package_properties(Crc32c PROPERTIES
-  TYPE REQUIRED
-  DESCRIPTION "Hardware-accelerated CRC32C integrity checksums"
-  URL "https://github.com/google/crc32c"
-  PURPOSE "WAL segment and entry integrity verification"
-)
-
 add_library(abyss_queue
   wal_queue.cpp
   segment.cpp
@@ -17,7 +9,6 @@ add_library(abyss_queue
 add_library(abyss::queue ALIAS abyss_queue)
 
 target_include_directories(abyss_queue
-  PUBLIC ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
