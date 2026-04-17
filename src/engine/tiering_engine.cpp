@@ -43,14 +43,15 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
 
 core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
                                                            core::RespCommand cmd) {
-  core::QueueEntry entry;
-  entry.appended_at = core::WallClock::now();
-  entry.payload = core::entry::Write{.cmd = std::move(cmd)};
-
   core::ShardId shard = 0;
   if (cmd.args.size() > 1) {
     shard = hot::ComputeShard(cmd.args[1], shard_count_);
   }
+
+  core::QueueEntry entry;
+  entry.appended_at = core::WallClock::now();
+  entry.payload = core::entry::Write{.cmd = std::move(cmd)};
+
   auto seq = queue_.Append(shard, std::move(entry));
   if (!seq.has_value()) {
     return std::unexpected(seq.error());

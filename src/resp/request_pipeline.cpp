@@ -160,6 +160,9 @@ RespValue RequestPipeline::HandleAdminStateless(std::string_view name, const Res
       {"COMMAND", &RequestPipeline::HandleCommand},
       {"CLIENT", &RequestPipeline::HandleClient},
       {"RESET", &RequestPipeline::HandleReset},
+      {"INFO", &RequestPipeline::HandleInfo},
+      {"FLUSHALL", &RequestPipeline::HandleFlushall},
+      {"FLUSHDB", &RequestPipeline::HandleFlushall},
   });
   for (const auto& entry : kDispatch) {
     if (entry.name == name) {
@@ -281,6 +284,23 @@ RespValue RequestPipeline::HandleClient(const RespCommand& cmd) {
 RespValue RequestPipeline::HandleReset(const RespCommand& /*cmd*/) {
   state_.client_name.clear();
   return RespValue::SimpleString("RESET");
+}
+
+RespValue RequestPipeline::HandleInfo(const RespCommand& /*cmd*/) {
+  std::string info;
+  info.append("# Server\r\n");
+  info.append("abyss_version:");
+  info.append(kVersion);
+  info.append("\r\n");
+  info.append("redis_version:7.0.0\r\n");
+  info.append("tcp_port:0\r\n");
+  info.append("# Clients\r\n");
+  info.append("connected_clients:0\r\n");
+  return RespValue::BulkString(std::move(info));
+}
+
+RespValue RequestPipeline::HandleFlushall(const RespCommand& /*cmd*/) {
+  return RespValue::SimpleString("OK");
 }
 
 RespValue RequestPipeline::NotImplemented(std::string_view name, std::string_view reason) {

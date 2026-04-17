@@ -27,7 +27,7 @@ TEST(CommandRegistryTest, UnknownCommandReturnsNull) {
   EXPECT_EQ(reg.Find("HGET"), nullptr);   // hashes not yet supported
   EXPECT_EQ(reg.Find("LPUSH"), nullptr);  // lists not yet supported
   EXPECT_EQ(reg.Find("KEYS"), nullptr);   // enumeration not yet supported
-  EXPECT_EQ(reg.Find("FLUSHDB"), nullptr);
+  EXPECT_EQ(reg.Find("WAIT"), nullptr);
   EXPECT_EQ(reg.Find("MULTI"), nullptr);
   EXPECT_EQ(reg.Find("SUBSCRIBE"), nullptr);
   EXPECT_EQ(reg.Find("EVAL"), nullptr);
@@ -54,7 +54,13 @@ TEST(CommandRegistryTest, SetHasWritePathBaseDispatch) {
 TEST(CommandRegistryTest, ConsumerRpcCommands) {
   CommandRegistry reg;
   EXPECT_EQ(reg.Find("DBSIZE")->dispatch, Dispatch::kConsumerRpc);
-  EXPECT_EQ(reg.Find("INFO")->dispatch, Dispatch::kConsumerRpc);
+}
+
+TEST(CommandRegistryTest, StatelessAdminCommands) {
+  CommandRegistry reg;
+  EXPECT_EQ(reg.Find("INFO")->dispatch, Dispatch::kStateless);
+  EXPECT_EQ(reg.Find("FLUSHALL")->dispatch, Dispatch::kStateless);
+  EXPECT_EQ(reg.Find("FLUSHDB")->dispatch, Dispatch::kStateless);
 }
 
 TEST(CommandRegistryTest, ClassifyUnknownCommandReturnsNotFound) {

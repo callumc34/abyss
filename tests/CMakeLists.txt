@@ -5,6 +5,7 @@ if(ABYSS_BUILD_TESTS)
   if(ABYSS_WITH_ROCKSDB)
     add_subdirectory(integration)
   endif()
+  add_subdirectory(system)
 endif()
 
 if(ABYSS_BUILD_BENCHMARKS)
