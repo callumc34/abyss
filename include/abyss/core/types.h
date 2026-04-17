@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 
 namespace abyss::core {
 
@@ -16,6 +17,12 @@ using WallTime = WallClock::time_point;
 
 using Duration = std::chrono::milliseconds;
 using EvictionTTL = std::chrono::seconds;
+
+using SteadyClockFn = std::function<SteadyTime()>;
+using WallClockFn = std::function<WallTime()>;
+
+inline SteadyTime DefaultSteadyClock() { return SteadyClock::now(); }
+inline WallTime DefaultWallClock() { return WallClock::now(); }
 
 inline constexpr ConsumerId kHotConsumer = 0;
 inline constexpr ConsumerId kColdConsumer = 1;

@@ -21,6 +21,8 @@ namespace abyss::hot {
 
 struct SingleShardConfig {
   size_t max_memory_bytes = 0;
+  core::SteadyClockFn steady_clock = core::DefaultSteadyClock;
+  core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
 struct SetValue {

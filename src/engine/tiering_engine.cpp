@@ -26,6 +26,9 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
   if (hot_result.has_value()) {
     return hot_result;
   }
+  if (hot_result.error().code() != core::ErrorCode::kNotFound) {
+    return hot_result;
+  }
 
   auto key = core::ops::PrimaryKey(*op);
   if (!key.empty()) {

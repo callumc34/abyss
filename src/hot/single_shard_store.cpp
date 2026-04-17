@@ -9,19 +9,13 @@ namespace abyss::hot {
 
 namespace {
 
-int64_t NowWallMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             core::WallClock::now().time_since_epoch())
-      .count();
+int64_t WallMs(const core::WallClockFn& clock) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(clock().time_since_epoch()).count();
 }
 
-bool IsExpiredByTtl(const Entry& entry) {
+bool IsExpiredByTtl(const Entry& entry, const core::WallClockFn& clock) {
   if (entry.abs_ttl_ms == 0) return false;
-  return NowWallMs() >= entry.abs_ttl_ms;
-}
-
-core::SteadyTime MakeDeadline(core::EvictionTTL eviction) {
-  return core::SteadyClock::now() + eviction;
+  return WallMs(clock) >= entry.abs_ttl_ms;
 }
 
 }  // namespace
@@ -331,16 +325,16 @@ core::Result<void> SingleShardStore::ApplyStringSet(const core::ops::StringSet& 
       TrackRemove(it->second, op.key);
       it->second.type = Entry::Type::kString;
       it->second.value = std::string(op.value);
-      it->second.eviction_deadline = MakeDeadline(eviction);
-      it->second.last_access = core::SteadyClock::now();
+      it->second.eviction_deadline = config_.steady_clock() + eviction;
+      it->second.last_access = config_.steady_clock();
       it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
       TrackInsert(it->second, op.key);
       return {};
     }
     TrackRemove(it->second, op.key);
     std::get<std::string>(it->second.value) = std::string(op.value);
-    it->second.eviction_deadline = MakeDeadline(eviction);
-    it->second.last_access = core::SteadyClock::now();
+    it->second.eviction_deadline = config_.steady_clock() + eviction;
+    it->second.last_access = config_.steady_clock();
     it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
     TrackInsert(it->second, op.key);
     return {};
@@ -364,7 +358,7 @@ core::Result<void> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
                                                  core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end() && it->second.type != Entry::Type::kSet) {
-    if (!IsExpiredByTtl(it->second) && it->second.type != Entry::Type::kSet) {
+    if (!IsExpiredByTtl(it->second, config_.wall_clock) && it->second.type != Entry::Type::kSet) {
       return std::unexpected(
           core::Error(core::ErrorCode::kWrongType,
                       "WRONGTYPE Operation against a key holding the wrong kind of value"));
@@ -378,15 +372,15 @@ core::Result<void> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
   for (auto member : op.members) {
     members.insert(std::string(member));
   }
-  entry.eviction_deadline = MakeDeadline(eviction);
-  entry.last_access = core::SteadyClock::now();
+  entry.eviction_deadline = config_.steady_clock() + eviction;
+  entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
   return {};
 }
 
 core::Result<void> SingleShardStore::ApplySetRem(const core::ops::SetRem& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || IsExpiredByTtl(it->second)) return {};
+  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
   if (it->second.type != Entry::Type::kSet) {
     return std::unexpected(
         core::Error(core::ErrorCode::kWrongType,
@@ -407,13 +401,13 @@ core::Result<void> SingleShardStore::ApplySetRem(const core::ops::SetRem& op) {
 core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
                                                   core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
-  if (it != entries_.end() && !IsExpiredByTtl(it->second) &&
+  if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
       it->second.type != Entry::Type::kZset) {
     return std::unexpected(
         core::Error(core::ErrorCode::kWrongType,
                     "WRONGTYPE Operation against a key holding the wrong kind of value"));
   }
-  if (it != entries_.end() && IsExpiredByTtl(it->second)) {
+  if (it != entries_.end() && IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
   }
 
@@ -435,15 +429,15 @@ core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
     zset.score_members[e.score].insert(std::move(member));
   }
 
-  entry.eviction_deadline = MakeDeadline(eviction);
-  entry.last_access = core::SteadyClock::now();
+  entry.eviction_deadline = config_.steady_clock() + eviction;
+  entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
   return {};
 }
 
 core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || IsExpiredByTtl(it->second)) return {};
+  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
   if (it->second.type != Entry::Type::kZset) {
     return std::unexpected(
         core::Error(core::ErrorCode::kWrongType,
@@ -475,13 +469,13 @@ core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) 
 core::Result<void> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
                                                   core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
-  if (it != entries_.end() && !IsExpiredByTtl(it->second) &&
+  if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
       it->second.type != Entry::Type::kHash) {
     return std::unexpected(
         core::Error(core::ErrorCode::kWrongType,
                     "WRONGTYPE Operation against a key holding the wrong kind of value"));
   }
-  if (it != entries_.end() && IsExpiredByTtl(it->second)) {
+  if (it != entries_.end() && IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
   }
 
@@ -491,15 +485,15 @@ core::Result<void> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
   for (const auto& fv : op.fields) {
     fields[std::string(fv.field)] = std::string(fv.value);
   }
-  entry.eviction_deadline = MakeDeadline(eviction);
-  entry.last_access = core::SteadyClock::now();
+  entry.eviction_deadline = config_.steady_clock() + eviction;
+  entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
   return {};
 }
 
 core::Result<void> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || IsExpiredByTtl(it->second)) return {};
+  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
   if (it->second.type != Entry::Type::kHash) {
     return std::unexpected(
         core::Error(core::ErrorCode::kWrongType,
@@ -539,7 +533,7 @@ void SingleShardStore::RefreshAccess(std::string_view key, core::SteadyTime now,
 size_t SingleShardStore::EvictExpired(core::SteadyTime now) {
   size_t count = 0;
   for (auto it = entries_.begin(); it != entries_.end();) {
-    if (it->second.eviction_deadline <= now || IsExpiredByTtl(it->second)) {
+    if (it->second.eviction_deadline <= now || IsExpiredByTtl(it->second, config_.wall_clock)) {
       TrackRemove(it->second, it->first);
       key_count_--;
       eviction_count_++;
@@ -594,7 +588,7 @@ const Entry* SingleShardStore::FindEntry(std::string_view key) const {
 const Entry* SingleShardStore::FindLiveEntry(std::string_view key) const {
   const auto* entry = FindEntry(key);
   if (entry == nullptr) return nullptr;
-  if (IsExpiredByTtl(*entry)) return nullptr;
+  if (IsExpiredByTtl(*entry, config_.wall_clock)) return nullptr;
   return entry;
 }
 
@@ -603,8 +597,8 @@ Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type
   auto [it, inserted] = entries_.try_emplace(std::string(key));
   if (inserted) {
     it->second.type = type;
-    it->second.eviction_deadline = MakeDeadline(eviction);
-    it->second.last_access = core::SteadyClock::now();
+    it->second.eviction_deadline = config_.steady_clock() + eviction;
+    it->second.last_access = config_.steady_clock();
     switch (type) {
       case Entry::Type::kString:
         it->second.value = std::string{};

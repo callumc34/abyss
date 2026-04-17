@@ -25,6 +25,9 @@ struct BufferEntry {
 
 class CompactionBuffer {
  public:
+  explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock)
+      : clock_(std::move(clock)) {}
+
   void Absorb(const std::string& key, const core::ops::WriteOp& op) ABYSS_EXCLUDES(mutex_);
 
   core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
@@ -35,6 +38,7 @@ class CompactionBuffer {
   size_t BytesEstimate() const ABYSS_EXCLUDES(mutex_);
 
  private:
+  core::SteadyClockFn clock_;
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, BufferEntry> entries_ ABYSS_GUARDED_BY(mutex_);
 };
