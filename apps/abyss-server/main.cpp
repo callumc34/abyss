@@ -1,8 +1,7 @@
+#include <CLI/CLI.hpp>
 #include <csignal>
 #include <cstdlib>
 #include <string>
-
-#include <CLI/CLI.hpp>
 
 #include "abyss/config/config.h"
 #include "abyss/version.h"
@@ -28,8 +27,7 @@ int main(int argc, char* argv[]) {
   abyss::config::Config config = abyss::config::Config::Defaults();
   std::string data_dir = kDefaultDataDir;
 
-  app.add_option("-p,--port", config.resp.port, "RESP listen port")
-      ->default_val(config.resp.port);
+  app.add_option("-p,--port", config.resp.port, "RESP listen port")->default_val(config.resp.port);
   app.add_option("-d,--data-dir", data_dir, "Data directory for WAL and cold store")
       ->default_val(data_dir);
 

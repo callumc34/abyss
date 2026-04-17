@@ -27,6 +27,40 @@ option(ABYSS_STRICT_WARNINGS "Enable additional warning flags" OFF)
 option(ABYSS_WITH_ROCKSDB "Build the built-in RocksDB cold store backend" ON)
 option(ABYSS_BUILD_FUZZ "Build libFuzzer fuzz targets" OFF)
 
+find_package(Crc32c CONFIG REQUIRED)
+set_package_properties(Crc32c PROPERTIES
+  TYPE REQUIRED
+  DESCRIPTION "Hardware-accelerated CRC32C integrity checksums"
+  URL "https://github.com/google/crc32c"
+  PURPOSE "WAL segment and entry integrity verification"
+)
+
+find_package(xxHash CONFIG REQUIRED)
+set_package_properties(xxHash PROPERTIES
+  TYPE REQUIRED
+  DESCRIPTION "Extremely fast hash algorithm"
+  URL "https://github.com/Cyan4973/xxHash"
+  PURPOSE "Key hashing for shard routing"
+)
+
+find_package(CLI11 CONFIG REQUIRED)
+set_package_properties(CLI11 PROPERTIES
+  TYPE REQUIRED
+  DESCRIPTION "Command line parser for C++17+"
+  URL "https://github.com/CLIUtils/CLI11"
+  PURPOSE "Server CLI argument parsing"
+)
+
+if(ABYSS_WITH_ROCKSDB)
+  find_package(RocksDB CONFIG REQUIRED)
+  set_package_properties(RocksDB PROPERTIES
+    TYPE REQUIRED
+    DESCRIPTION "Embedded LSM-based KV store"
+    URL "https://rocksdb.org"
+    PURPOSE "Built-in cold store backend"
+  )
+endif()
+
 add_feature_info(BuildTests      ABYSS_BUILD_TESTS      "Build unit and integration tests")
 add_feature_info(BuildBenchmarks ABYSS_BUILD_BENCHMARKS "Build micro-benchmarks")
 add_feature_info(StrictWarnings  ABYSS_STRICT_WARNINGS  "Enable additional compiler warning flags")
@@ -52,6 +86,16 @@ add_subdirectory(src/metrics)
 
 add_subdirectory(apps/abyss-server)
 
+if(ABYSS_BUILD_BENCHMARKS)
+  find_package(benchmark CONFIG REQUIRED)
+  set_package_properties(benchmark PROPERTIES
+    TYPE OPTIONAL
+    DESCRIPTION "Google micro-benchmark framework"
+    URL "https://github.com/google/benchmark"
+    PURPOSE "Encode/decode throughput measurements"
+  )
+endif()
+
 if(ABYSS_BUILD_TESTS)
   enable_testing()
   include(FetchContent)
@@ -61,6 +105,7 @@ if(ABYSS_BUILD_TESTS)
     GIT_TAG v1.15.2
   )
   FetchContent_MakeAvailable(googletest)
+  include(cmake/abyss_testing.cmake)
 endif()
 
 if(ABYSS_BUILD_TESTS OR ABYSS_BUILD_BENCHMARKS)

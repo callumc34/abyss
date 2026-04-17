@@ -46,31 +46,28 @@ bool Server::Initialize() {
 #ifdef ABYSS_HAVE_ROCKSDB
   std::filesystem::create_directories(config_.cold.data_path, ec);
   if (ec) {
-    std::cerr << "failed to create cold store directory: " << ec.message()
-              << "\n";
+    std::cerr << "failed to create cold store directory: " << ec.message() << "\n";
     return false;
   }
 
-  auto cold_result =
-      cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
-          .data_path = config_.cold.data_path,
-          .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
-      });
+  auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
+      .data_path = config_.cold.data_path,
+      .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
+  });
   if (!cold_result.has_value()) {
-    std::cerr << "failed to open cold store: "
-              << cold_result.error().message() << "\n";
+    std::cerr << "failed to open cold store: " << cold_result.error().message() << "\n";
     return false;
   }
   cold_store_ = std::move(*cold_result);
 
-  engine_ = std::make_unique<engine::TieringEngine>(
-      *queue_, *hot_store_, *cold_store_, *compaction_buffer_, *consumer_rpc_,
-      hot_store_->shard_count());
+  engine_ = std::make_unique<engine::TieringEngine>(*queue_, *hot_store_, *cold_store_,
+                                                    *compaction_buffer_, *consumer_rpc_,
+                                                    hot_store_->shard_count());
 
-  hot_consumer_ = std::make_unique<consumer::HotConsumer>(
-      *queue_, *hot_store_, 0, config_.hot.default_eviction);
-  cold_consumer_ = std::make_unique<consumer::ColdConsumer>(
-      *queue_, *cold_store_, *compaction_buffer_, 0);
+  hot_consumer_ = std::make_unique<consumer::HotConsumer>(*queue_, *hot_store_, 0,
+                                                          config_.hot.default_eviction);
+  cold_consumer_ =
+      std::make_unique<consumer::ColdConsumer>(*queue_, *cold_store_, *compaction_buffer_, 0);
 
   hot_consumer_->Start();
   cold_consumer_->Start();
@@ -119,8 +116,8 @@ bool Server::SetupListener() {
 void Server::Run(const std::atomic<bool>& stop) {
   if (!SetupListener()) return;
 
-  std::cerr << "abyss v" << kVersion << " listening on " << config_.resp.bind
-            << ":" << config_.resp.port << "\n";
+  std::cerr << "abyss v" << kVersion << " listening on " << config_.resp.bind << ":"
+            << config_.resp.port << "\n";
 
   while (!stop.load(std::memory_order_acquire)) {
     pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
@@ -133,8 +130,7 @@ void Server::Run(const std::atomic<bool>& stop) {
 
     sockaddr_in client_addr{};
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(
-        listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+    int client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
     if (client_fd < 0) {
       if (errno == EINTR) continue;
       break;
@@ -158,8 +154,8 @@ void Server::Run(const std::atomic<bool>& stop) {
       auto conn = std::make_unique<TrackedConnection>();
       conn->fd = client_fd;
       auto& ref = *conn;
-      conn->thread = std::thread(&Server::HandleConnection, this, client_fd,
-                                 std::ref(ref.finished));
+      conn->thread =
+          std::thread(&Server::HandleConnection, this, client_fd, std::ref(ref.finished));
       connections_.push_back(std::move(conn));
     }
   }
@@ -184,23 +180,20 @@ void Server::HandleConnection(int client_fd, std::atomic<bool>& finished) {
     auto n = recv(client_fd, read_buf.data(), read_buf.size(), 0);
     if (n <= 0) break;
 
-    pending.insert(pending.end(), read_buf.begin(),
-                   read_buf.begin() + n);
+    pending.insert(pending.end(), read_buf.begin(), read_buf.begin() + n);
     output.clear();
 
     auto result = pipeline.Process(pending, output);
 
     if (result.bytes_consumed > 0) {
-      pending.erase(
-          pending.begin(),
-          pending.begin() + static_cast<ptrdiff_t>(result.bytes_consumed));
+      pending.erase(pending.begin(),
+                    pending.begin() + static_cast<ptrdiff_t>(result.bytes_consumed));
     }
 
     if (!output.empty()) {
       size_t sent = 0;
       while (sent < output.size()) {
-        auto w =
-            send(client_fd, output.data() + sent, output.size() - sent, 0);
+        auto w = send(client_fd, output.data() + sent, output.size() - sent, 0);
         if (w <= 0) break;
         sent += static_cast<size_t>(w);
       }

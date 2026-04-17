@@ -1,5 +1,3 @@
-find_package(Crc32c CONFIG REQUIRED)
-
 add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
@@ -65,7 +63,6 @@ target_link_libraries(abyss_cold_tests PRIVATE
 )
 
 if(ABYSS_WITH_ROCKSDB)
-  find_package(RocksDB CONFIG REQUIRED)
   target_sources(abyss_cold_tests PRIVATE
     cold/backends/rocksdb_store_lifecycle_test.cpp
     cold/backends/rocksdb_store_strings_test.cpp
@@ -86,23 +83,6 @@ target_link_libraries(abyss_consumer_tests PRIVATE
   abyss::test_support
   GTest::gtest_main
 )
-
-include(GoogleTest)
-
-macro(abyss_discover_tests target labels)
-  set(_labels "${labels}")
-  if(CMAKE_CXX_FLAGS MATCHES "fsanitize")
-    gtest_discover_tests(${target}
-      DISCOVERY_MODE PRE_TEST
-      DISCOVERY_TIMEOUT 120
-      PROPERTIES LABELS "${_labels}"
-    )
-  else()
-    gtest_discover_tests(${target}
-      PROPERTIES LABELS "${_labels}"
-    )
-  endif()
-endmacro()
 
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")

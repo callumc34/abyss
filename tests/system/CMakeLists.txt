@@ -30,15 +30,4 @@ target_link_libraries(abyss_system_tests PRIVATE
 
 add_dependencies(abyss_system_tests abyss-server)
 
-include(GoogleTest)
-if(CMAKE_CXX_FLAGS MATCHES "fsanitize")
-  gtest_discover_tests(abyss_system_tests
-    DISCOVERY_MODE PRE_TEST
-    DISCOVERY_TIMEOUT 120
-    PROPERTIES LABELS "system"
-  )
-else()
-  gtest_discover_tests(abyss_system_tests
-    PROPERTIES LABELS "system"
-  )
-endif()
+abyss_discover_tests(abyss_system_tests "system")
