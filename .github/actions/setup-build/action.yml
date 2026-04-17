@@ -1,0 +1,35 @@
+name: Setup Abyss Build Environment
+description: Install GCC 14, Ninja, vcpkg (pinned to vcpkg.json baseline), and configure binary caching
+
+runs:
+  using: composite
+  steps:
+    - name: Configure binary caching
+      uses: actions/github-script@v7
+      continue-on-error: true
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Install compiler and tools
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq cmake gcc-14 g++-14 ninja-build
+        echo "CC=/usr/bin/gcc-14" >> "${GITHUB_ENV}"
+        echo "CXX=/usr/bin/g++-14" >> "${GITHUB_ENV}"
+
+    - name: Set up vcpkg
+      shell: bash
+      run: |
+        BASELINE=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
+        git init /opt/vcpkg
+        git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+        git -C /opt/vcpkg fetch --depth 1 origin "${BASELINE}"
+        git -C /opt/vcpkg checkout FETCH_HEAD
+        /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+        echo "VCPKG_ROOT=/opt/vcpkg" >> "${GITHUB_ENV}"
+        if [ -n "${ACTIONS_CACHE_URL:-}" ]; then
+          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> "${GITHUB_ENV}"
+        fi
