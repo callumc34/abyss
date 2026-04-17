@@ -26,7 +26,8 @@ COPY include/ include/
 COPY src/ src/
 COPY apps/ apps/
 
-RUN cmake --preset container -G Ninja && \
+RUN --mount=type=cache,target=/root/.cache/vcpkg/archives \
+    cmake --preset container -G Ninja && \
     cmake --build build/container --target abyss-server
 
 RUN ldd build/container/apps/abyss-server/abyss-server || true
