@@ -50,8 +50,8 @@ TEST_F(TieringEngineTest, ReadHotHitReturnsValue) {
 TEST_F(TieringEngineTest, ReadHotMissBufferHitReturnsBufferValue) {
   auto engine = MakeEngine();
 
-  buffer_.Absorb("key",
-                 core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "buffered"}});
+  buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "buffered"}},
+                 core::EvictionTTL{86400});
 
   EXPECT_CALL(hot_, Exec(_))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -101,8 +101,10 @@ TEST_F(TieringEngineTest, ReadHotErrorPropagates) {
 TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
   auto engine = MakeEngine();
 
-  buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "v"}});
-  buffer_.Absorb("key", core::ops::WriteOp{core::ops::Del{.keys = {"key"}}});
+  buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "v"}},
+                 core::EvictionTTL{86400});
+  buffer_.Absorb("key", core::ops::WriteOp{core::ops::Del{.keys = {"key"}}},
+                 core::EvictionTTL{86400});
 
   EXPECT_CALL(hot_, Exec(_))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));

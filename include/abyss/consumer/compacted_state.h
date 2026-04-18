@@ -19,6 +19,8 @@ class CompactedState {
   std::vector<core::ops::WriteOp> Emit() const;
   void Reset();
 
+  size_t EstimatedBytes() const;
+
   bool IsTombstone() const { return is_tombstone_; }
   DataType Type() const { return type_; }
 

@@ -156,6 +156,7 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
     return result;
   }
 
+  // NOLINTNEXTLINE(bugprone-branch-clone)
   switch (type_) {
     case DataType::kNone:
       break;
@@ -201,6 +202,34 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
   }
 
   return result;
+}
+
+size_t CompactedState::EstimatedBytes() const {
+  switch (type_) {
+    case DataType::kNone:
+      return 0;
+    case DataType::kString:
+      return string_value_.has_value() ? string_value_->size() : 0;
+    case DataType::kSet: {
+      size_t bytes = 0;
+      for (const auto& m : set_members_) bytes += m.size();
+      for (const auto& m : set_removed_members_) bytes += m.size();
+      return bytes;
+    }
+    case DataType::kZset: {
+      size_t bytes = 0;
+      for (const auto& [m, _] : zset_members_) bytes += m.size() + sizeof(double);
+      for (const auto& m : zset_removed_members_) bytes += m.size();
+      return bytes;
+    }
+    case DataType::kHash: {
+      size_t bytes = 0;
+      for (const auto& [f, v] : hash_fields_) bytes += f.size() + v.size();
+      for (const auto& f : hash_removed_fields_) bytes += f.size();
+      return bytes;
+    }
+  }
+  return 0;
 }
 
 void CompactedState::Reset() {

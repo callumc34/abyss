@@ -44,8 +44,8 @@ TEST_F(TieringIntegrationTest, ColdReadThroughEngine) {
 }
 
 TEST_F(TieringIntegrationTest, BufferReadThroughEngine) {
-  harness_.Buffer().Absorb("k1",
-                           core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "buf"}});
+  harness_.Buffer().Absorb(
+      "k1", core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "buf"}}, kEviction);
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
   ASSERT_TRUE(result.has_value()) << result.error().message();
@@ -71,9 +71,9 @@ TEST_F(TieringIntegrationTest, BufferTombstoneBlocksColdRead) {
   auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1});
   ASSERT_TRUE(apply_cold.has_value());
 
-  harness_.Buffer().Absorb("k1",
-                           core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "v"}});
-  harness_.Buffer().Absorb("k1", core::ops::WriteOp{core::ops::Del{.keys = {"k1"}}});
+  harness_.Buffer().Absorb(
+      "k1", core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "v"}}, kEviction);
+  harness_.Buffer().Absorb("k1", core::ops::WriteOp{core::ops::Del{.keys = {"k1"}}}, kEviction);
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
   ASSERT_TRUE(result.has_value());
@@ -135,7 +135,8 @@ TEST_F(TieringIntegrationTest, MultipleKeysTieredAcrossStores) {
   ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&cold_op, 1}).has_value());
 
   harness_.Buffer().Absorb(
-      "buf_key", core::ops::WriteOp{core::ops::StringSet{.key = "buf_key", .value = "bv"}});
+      "buf_key", core::ops::WriteOp{core::ops::StringSet{.key = "buf_key", .value = "bv"}},
+      kEviction);
 
   auto r1 = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "hot_key"}));
   ASSERT_TRUE(r1.has_value());
