@@ -221,6 +221,10 @@ core::Result<MetaValue> DecodeMetaValue(std::string_view value) {
   return out;
 }
 
+bool IsExpired(uint8_t flags, uint64_t abs_ttl_ms, uint64_t now_ms) {
+  return (flags & kFlagHasTtl) != 0 && abs_ttl_ms <= now_ms;
+}
+
 // --- Format version record codec --------------------------------------------
 
 std::string EncodeFormatVersionValue(uint16_t version) {

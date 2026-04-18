@@ -5,6 +5,8 @@
 #include <ranges>
 #include <vector>
 
+#include "abyss/core/resp_format.h"
+
 namespace abyss::hot {
 
 namespace {
@@ -140,7 +142,7 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetScore(
   if (it == zset.member_scores.end()) {
     return core::RespValue::Null();
   }
-  return core::RespValue::BulkString(std::to_string(it->second));
+  return core::RespValue::BulkString(core::FormatRespDouble(it->second));
 }
 
 core::Result<core::RespValue> SingleShardStore::ExecZsetCard(const core::ops::ZsetCard& op) const {
@@ -197,7 +199,7 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
         elements.push_back(core::RespValue::BulkString(collected[static_cast<size_t>(i)].first));
         if (op.with_scores) {
           elements.push_back(core::RespValue::BulkString(
-              std::to_string(collected[static_cast<size_t>(i)].second)));
+              core::FormatRespDouble(collected[static_cast<size_t>(i)].second)));
         }
       }
     }
@@ -227,8 +229,8 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
     for (int64_t i = min_idx; i <= max_idx; ++i) {
       elements.push_back(core::RespValue::BulkString(all[static_cast<size_t>(i)].first));
       if (op.with_scores) {
-        elements.push_back(
-            core::RespValue::BulkString(std::to_string(all[static_cast<size_t>(i)].second)));
+        elements.push_back(core::RespValue::BulkString(
+            core::FormatRespDouble(all[static_cast<size_t>(i)].second)));
       }
     }
   }

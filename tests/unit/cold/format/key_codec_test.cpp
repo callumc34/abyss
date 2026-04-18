@@ -268,5 +268,23 @@ TEST(FormatVersionValueCodecTest, RejectsShortValue) {
   EXPECT_FALSE(DecodeFormatVersionValue(too_short).has_value());
 }
 
+// --- IsExpired --------------------------------------------------------------
+
+TEST(IsExpiredTest, FlagClearMeansNoTtl) {
+  EXPECT_FALSE(IsExpired(0, 0, 0));
+  EXPECT_FALSE(IsExpired(0, 1, 1'000'000));
+  // Flag is authoritative: a non-zero timestamp with the flag clear is not a TTL.
+  EXPECT_FALSE(IsExpired(0, 1'000'000, 2'000'000));
+}
+
+TEST(IsExpiredTest, FlagSetAndExpiredInPast) { EXPECT_TRUE(IsExpired(kFlagHasTtl, 100, 200)); }
+
+TEST(IsExpiredTest, FlagSetAndNotYetExpired) { EXPECT_FALSE(IsExpired(kFlagHasTtl, 500, 200)); }
+
+TEST(IsExpiredTest, ExactlyNowIsExpired) {
+  // `abs_ttl_ms <= now_ms` — equality counts as expired.
+  EXPECT_TRUE(IsExpired(kFlagHasTtl, 1'000, 1'000));
+}
+
 }  // namespace
 }  // namespace abyss::cold::format

@@ -7,6 +7,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -124,12 +125,17 @@ TEST_F(StoreFixture, SetWithLargeValueRoundTrips) {
   EXPECT_EQ(result->AsString(), payload);
 }
 
-TEST_F(StoreFixture, SetWithTtlStoresButReadsStillSucceed) {
+TEST_F(StoreFixture, SetWithFutureTtlRoundTrips) {
   auto store = OpenStore();
 
+  const uint64_t now_ms =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
   std::string key = "k";
   std::string val = "v";
-  core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val, .abs_ttl_ms = 99999999};
+  core::ops::WriteOp op =
+      core::ops::StringSet{.key = key, .value = val, .abs_ttl_ms = now_ms + 60'000};
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
 
   auto result = store->Exec(GetOp(key));

@@ -63,6 +63,11 @@ struct MetaValue {
 std::string EncodeMetaValue(const MetaValue& v);
 core::Result<MetaValue> DecodeMetaValue(std::string_view value);
 
+// Returns true if a TTL is set and `abs_ttl_ms <= now_ms`. `kFlagHasTtl` is
+// authoritative, a zero timestamp with the flag clear is "no TTL" regardless
+// of `abs_ttl_ms`.
+bool IsExpired(uint8_t flags, uint64_t abs_ttl_ms, uint64_t now_ms);
+
 std::string EncodeFormatVersionValue(uint16_t version);
 core::Result<uint16_t> DecodeFormatVersionValue(std::string_view value);
 
