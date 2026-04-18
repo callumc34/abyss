@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <filesystem>
@@ -19,12 +24,20 @@ namespace {
 
 namespace fmt = ::abyss::cold::format;
 
+namespace {
+#ifdef _WIN32
+uint64_t GetProcessId() { return GetCurrentProcessId(); }
+#else
+uint64_t GetProcessId() { return getpid(); }
+#endif
+}  // namespace
+
 class TempDir {
  public:
   TempDir() {
     static std::atomic<int> counter{0};
     auto base = std::filesystem::temp_directory_path();
-    path_ = base / ("abyss_cold_test_" + std::to_string(getpid()) + "_" +
+    path_ = base / ("abyss_cold_test_" + std::to_string(GetProcessId()) + "_" +
                     std::to_string(counter.fetch_add(1)));
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
