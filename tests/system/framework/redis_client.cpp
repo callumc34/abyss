@@ -1,11 +1,11 @@
 #include "redis_client.h"
 
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <poll.h>
-#include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <charconv>
@@ -99,7 +99,7 @@ RedisClient::~RedisClient() { Close(); }
 
 RedisClient::RedisClient(RedisClient&& other) noexcept
     : fd_(other.fd_), buf_(std::move(other.buf_)), rpos_(other.rpos_), wpos_(other.wpos_) {
-  other.fd_ = -1;
+  other.fd_ = kInvalidSocket;
 }
 
 RedisClient& RedisClient::operator=(RedisClient&& other) noexcept {
@@ -109,7 +109,7 @@ RedisClient& RedisClient::operator=(RedisClient&& other) noexcept {
     buf_ = std::move(other.buf_);
     rpos_ = other.rpos_;
     wpos_ = other.wpos_;
-    other.fd_ = -1;
+    other.fd_ = kInvalidSocket;
   }
   return *this;
 }
@@ -119,15 +119,21 @@ bool RedisClient::Connect(const std::string& host, uint16_t port,
   Close();
 
   fd_ = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd_ < 0) return false;
+  if (fd_ == kInvalidSocket) return false;
 
+#ifndef _WIN32
 #ifdef __APPLE__
   int set = 1;
   setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
 #endif
-
+  // POSIX non-blocking setup
   int flags = fcntl(fd_, F_GETFL, 0);
   fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+#else
+  // Windows non-blocking setup
+  u_long mode = 1;
+  ioctlsocket(fd_, FIONBIO, &mode);
+#endif
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -135,31 +141,54 @@ bool RedisClient::Connect(const std::string& host, uint16_t port,
   inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
 
   int ret = connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-  if (ret < 0 && errno != EINPROGRESS) {
-    Close();
-    return false;
-  }
-
   if (ret < 0) {
+#ifndef _WIN32
+    if (errno != EINPROGRESS) {
+      Close();
+      return false;
+    }
+#else
+    if (GetSocketError() != WSAEWOULDBLOCK) {
+      Close();
+      return false;
+    }
+#endif
+
     pollfd pfd{};
     pfd.fd = fd_;
     pfd.events = POLLOUT;
+
+#ifdef _WIN32
+    int ready = WSAPoll(&pfd, 1, static_cast<int>(timeout.count()));
+#else
     int ready = poll(&pfd, 1, static_cast<int>(timeout.count()));
+#endif
+
     if (ready <= 0) {
       Close();
       return false;
     }
 
     int err = 0;
+#ifdef _WIN32
+    int errlen = sizeof(err);
+    getsockopt(fd_, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errlen);
+#else
     socklen_t errlen = sizeof(err);
     getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &errlen);
+#endif
     if (err != 0) {
       Close();
       return false;
     }
   }
 
-  fcntl(fd_, F_SETFL, flags);
+#ifndef _WIN32
+  fcntl(fd_, F_SETFL, flags);  // Restore blocking mode
+#else
+  mode = 0;
+  ioctlsocket(fd_, FIONBIO, &mode);  // Restore blocking mode
+#endif
 
   buf_.resize(8192);
   rpos_ = 0;
@@ -168,9 +197,9 @@ bool RedisClient::Connect(const std::string& host, uint16_t port,
 }
 
 void RedisClient::Close() {
-  if (fd_ >= 0) {
-    close(fd_);
-    fd_ = -1;
+  if (fd_ != kInvalidSocket) {
+    CLOSE_SOCKET(fd_);
+    fd_ = kInvalidSocket;
   }
   rpos_ = 0;
   wpos_ = 0;
@@ -194,9 +223,14 @@ std::string RedisClient::Encode(const std::vector<std::string>& args) {
 bool RedisClient::SendEncoded(const std::string& data) {
   size_t sent = 0;
   while (sent < data.size()) {
-    auto n = send(fd_, data.data() + sent, data.size() - sent, 0);
+    auto n = send(fd_, reinterpret_cast<const char*>(data.data() + sent),
+                  static_cast<int>(data.size() - sent), 0);
     if (n < 0) {
+#ifndef _WIN32
       if (errno == EINTR) continue;
+#else
+      if (GetSocketError() == WSAEINTR) continue;
+#endif
       return false;
     }
     sent += static_cast<size_t>(n);
@@ -218,9 +252,14 @@ bool RedisClient::FillBuffer() {
     buf_.resize(buf_.size() * 2);
   }
 
-  auto n = recv(fd_, buf_.data() + wpos_, buf_.size() - wpos_, 0);
+  auto n = recv(fd_, reinterpret_cast<char*>(buf_.data() + wpos_),
+                static_cast<int>(buf_.size() - wpos_), 0);
   if (n <= 0) {
+#ifndef _WIN32
     if (n < 0 && errno == EINTR) return FillBuffer();
+#else
+    if (n < 0 && GetSocketError() == WSAEINTR) return FillBuffer();
+#endif
     return false;
   }
   wpos_ += static_cast<size_t>(n);

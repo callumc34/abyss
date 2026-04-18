@@ -20,6 +20,18 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #endif
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+using socket_t = SOCKET;
+constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+#else
+using socket_t = int;
+constexpr socket_t kInvalidSocket = -1;
+#endif
+
 namespace abyss::server {
 
 class Server {
@@ -39,7 +51,7 @@ class Server {
 
  private:
   bool SetupListener();
-  void HandleConnection(int client_fd, std::atomic<bool>& finished);
+  void HandleConnection(socket_t client_fd, std::atomic<bool>& finished);
   void CleanFinishedConnections();
 
   config::Config config_;
@@ -57,14 +69,14 @@ class Server {
   std::unique_ptr<consumer::HotConsumer> hot_consumer_;
   std::unique_ptr<consumer::ColdConsumer> cold_consumer_;
 
-  int listen_fd_ = -1;
+  socket_t listen_fd_ = kInvalidSocket;
   std::atomic<bool> ready_{false};
   std::atomic<bool> shutting_down_{false};
   std::atomic<uint64_t> next_client_id_{1};
 
   struct TrackedConnection {
     std::thread thread;
-    int fd = -1;
+    socket_t fd = kInvalidSocket;
     std::atomic<bool> finished{false};
   };
   std::mutex connections_mutex_;
