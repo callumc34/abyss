@@ -14,6 +14,10 @@ target_link_libraries(abyss_core_tests PRIVATE
 add_executable(abyss_queue_tests
   queue/wal_entry_test.cpp
   queue/segment_header_test.cpp
+  queue/segment_test.cpp
+  queue/group_commit_test.cpp
+  queue/offset_store_test.cpp
+  queue/segment_reaper_test.cpp
 )
 
 target_include_directories(abyss_queue_tests PRIVATE

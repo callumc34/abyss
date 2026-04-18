@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-04-15
+**Updated:** 2026-04-18
 
 ## Context
 
@@ -41,13 +41,13 @@ The built-in queue implementation is an append-only WAL on the PVC.
 **Segment management:** The WAL is composed of fixed-size segments per shard. Each segment is a file named by shard and base offset:
 
 ```
-/data/wal/shard-00/00000000000000000000.wal
-/data/wal/shard-00/00000000000000065536.wal
+/data/wal/shard-0000/00000000000000000000.log
+/data/wal/shard-0000/00000000000000065536.log
 ```
 
 - Segment size: configurable, default 64 MiB.
-- A background thread periodically deletes segments fully acknowledged by all consumers.
-- Consumer offsets are persisted to a metadata file on the WAL PVC.
+- Segment cleanup is triggered synchronously after every `Ack` and after every rotation — the only two events that can change eligibility. Tick-based reaping is not used. Segments whose `last_seq` is below the minimum consumer offset AND whose age exceeds `min_retention` are deleted. The active segment is never eligible. See [ADP-009](009-wal-format.md) for file format details.
+- Consumer offsets are persisted to per-consumer binary files under `{wal_path}/offsets/`. Each `Set` rewrites the file atomically (tmp + fsync + rename + directory fsync) before returning, so every `Ack` is durable the instant its caller sees `OK`. See "Offset persistence" below.
 
 **Retention:** The queue retains entries until all consumers have acknowledged. Minimum retention is:
 
@@ -58,6 +58,34 @@ minimum_queue_retention = max(default_eviction, max(eviction_overrides))
 This must fit on the WAL PVC.
 
 **Segment format:** The on-disk byte layout of segment headers and entries, including CRC-based integrity checks and schema evolution rules, is specified in [ADP-009](009-wal-format.md).
+
+### Offset persistence
+
+Each (consumer, shard) pair has its own file at `{wal_path}/offsets/{consumer_id}/{shard_id:020d}.offset` containing a single `(shard, seq)` record. Format:
+
+```
+magic        8 bytes  "ABYSSOFF"
+format_major 1 byte   2
+format_minor 1 byte   0
+reserved     2 bytes  0
+shard_id     u32
+seq          u64
+crc          u32      CRC32C over all preceding bytes
+```
+
+Total file size is 28 bytes. The per-(consumer, shard) layout is load-bearing for the shard-per-core execution model: each shard is owned by a single thread, and that thread is the only writer of its own offset file. No cross-shard thread ever touches another shard's file, so there is no shared write point, no need for cross-shard serialisation on the ack path, and no lost-update race between shards acking for the same consumer.
+
+`Ack(consumer, shard, seq)` updates the in-memory cache, then rewrites that one 28-byte file via tmp + fsync + rename + directory fsync — no background flusher, no batched flush. Ack cost is therefore O(1) in active shards, not O(total shards for the consumer), which matters once Phase 2 lands with many shards per pod.
+
+Offsets missing on Open mean the consumer starts from the tail of the oldest retained segment.
+
+### Batch atomicity
+
+`AppendBatch` is atomic across crashes: every entry in a batch is either present in the WAL after recovery, or none is. The mechanism is a per-entry `batch_last_seq` field added in format minor 1.1 — recovery only advances the durable tail when it decodes an entry whose `seq == batch_last_seq` (i.e., the closing entry of a batch). Mid-batch entries left behind by a crash are truncated together with the closing entry that never landed. See [ADP-009](009-wal-format.md) §Schema evolution.
+
+### Recovery signal
+
+`WalQueue::IsRecovering()` returns `true` while the queue is being opened (segment scan, torn-tail truncation, offset load) and `false` once those steps finish. Open is synchronous today so the flag is only ever observed `false` by external callers — but the shape of the API lets the server gate RESP LOADING on a single uniform check regardless of whether the queue or a consumer is still catching up ([ADP-005](005-resp-frontend.md), [ADP-007](007-recovery.md)).
 
 ### Group Commit
 

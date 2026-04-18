@@ -57,14 +57,38 @@ bool Server::Initialize() {
     return false;
   }
 
-  queue_ = std::make_unique<queue::WalQueue>(queue::WalConfig{
-      .wal_path = config_.queue.wal_path,
-      .segment_size_bytes = config_.queue.segment_size_bytes,
-  });
-
   hot_store_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = config_.hot.max_memory_bytes,
   });
+
+  auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
+  if (!fsync_policy.has_value()) {
+    std::cerr << "invalid fsync_policy: " << fsync_policy.error().message() << "\n";
+    return false;
+  }
+
+  auto queue_result = queue::WalQueue::Open(queue::WalConfig{
+      .wal_path = config_.queue.wal_path,
+      .segment_size_bytes = config_.queue.segment_size_bytes,
+      .shard_count = hot_store_->shard_count(),
+      .commit =
+          {
+              .policy = *fsync_policy,
+              .interval = std::chrono::microseconds{config_.queue.group_commit_interval_us},
+              .max_bytes = config_.queue.group_commit_max_bytes,
+          },
+      .min_retention = config_.queue.min_retention,
+      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+  });
+  if (queue_result.has_value() && (*queue_result)->IsRecovering()) {
+    std::cerr << "queue opened but still recovering; refusing to start\n";
+    return false;
+  }
+  if (!queue_result.has_value()) {
+    std::cerr << "failed to open WAL queue: " << queue_result.error().message() << "\n";
+    return false;
+  }
+  queue_ = std::move(*queue_result);
 
   compaction_buffer_ = std::make_unique<consumer::CompactionBuffer>();
   consumer_rpc_ = std::make_unique<core::ConsumerRpc>();
@@ -82,7 +106,7 @@ bool Server::Initialize() {
   });
   if (!cold_result.has_value()) {
     std::cerr << "failed to open cold store: " << cold_result.error().message() << "\n";
-    return false;
+    return false;  // NOLINT(readability-simplify-boolean-expr)
   }
   cold_store_ = std::move(*cold_result);
 
@@ -211,6 +235,7 @@ void Server::HandleConnection(socket_t client_fd, std::atomic<bool>& finished) {
       .protocol_version = 2,
   };
   const auto& registry = resp::GlobalRegistry();
+  // NOLINTNEXTLINE(misc-const-correctness)
   resp::RequestPipeline pipeline(registry, state);
 
   std::vector<uint8_t> read_buf(4096);

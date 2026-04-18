@@ -28,7 +28,7 @@ void BM_Encode(benchmark::State& state) {
 
   for (auto _ : state) {
     buf.clear();
-    EncodeWalEntry(entry, buf);
+    EncodeWalEntry(entry, entry.seq, buf);
     benchmark::DoNotOptimize(buf.data());
   }
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) *
@@ -39,7 +39,7 @@ BENCHMARK(BM_Encode)->Arg(3)->Arg(1 << 10)->Arg(1 << 16);
 void BM_Decode(benchmark::State& state) {
   const auto entry = MakeEntry(static_cast<size_t>(state.range(0)));
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   for (auto _ : state) {
     auto result = DecodeWalEntry(buf);

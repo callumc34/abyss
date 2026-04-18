@@ -33,8 +33,8 @@ void ExpectWriteEqual(const core::QueueEntry& a, const core::QueueEntry& b) {
           .count();
   EXPECT_EQ(a_us, b_us);
 
-  auto* aw = std::get_if<core::entry::Write>(&a.payload);
-  auto* bw = std::get_if<core::entry::Write>(&b.payload);
+  const auto* aw = std::get_if<core::entry::Write>(&a.payload);
+  const auto* bw = std::get_if<core::entry::Write>(&b.payload);
   ASSERT_NE(aw, nullptr);
   ASSERT_NE(bw, nullptr);
   EXPECT_EQ(aw->cmd.args, bw->cmd.args);
@@ -44,7 +44,8 @@ TEST(WalEntryTest, RoundTripBasic) {
   auto entry = MakeWriteEntry(42, {"SET", "foo", "bar"});
 
   std::vector<std::byte> buf;
-  const size_t encoded = EncodeWalEntry(entry, buf);
+  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+  const size_t encoded = EncodeWalEntry(entry, entry.seq, buf);
   EXPECT_EQ(buf.size(), encoded);
 
   auto decoded = DecodeWalEntry(buf);
@@ -57,7 +58,7 @@ TEST(WalEntryTest, RoundTripSingleArg) {
   auto entry = MakeWriteEntry(1, {"PING"});
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -75,7 +76,7 @@ TEST(WalEntryTest, RoundTripManyArgs) {
   auto entry = MakeWriteEntry(1000, std::move(args));
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -87,7 +88,7 @@ TEST(WalEntryTest, RoundTripLargeArgValue) {
   auto entry = MakeWriteEntry(999, {"SET", "k", large});
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -98,7 +99,7 @@ TEST(WalEntryTest, RoundTripEmptyArgString) {
   auto entry = MakeWriteEntry(7, {"SET", "k", ""});
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -109,7 +110,7 @@ TEST(WalEntryTest, RoundTripMaxSequenceId) {
   auto entry = MakeWriteEntry(UINT64_MAX, {"SET", "k", "v"});
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -121,8 +122,8 @@ TEST(WalEntryTest, BackToBackEntries) {
   auto e2 = MakeWriteEntry(2, {"SET", "b", "22"});
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(e1, buf);
-  EncodeWalEntry(e2, buf);
+  EncodeWalEntry(e1, e1.seq, buf);
+  EncodeWalEntry(e2, e2.seq, buf);
 
   std::span<const std::byte> bytes = buf;
   auto d1 = DecodeWalEntry(bytes);
@@ -153,7 +154,7 @@ TEST(WalEntryTest, DecodeTruncatedLengthPrefix) {
 TEST(WalEntryTest, DecodeTruncatedBody) {
   auto entry = MakeWriteEntry(1, {"SET", "foo", "bar"});
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   buf.resize(buf.size() - 8);
 
@@ -164,7 +165,7 @@ TEST(WalEntryTest, DecodeTruncatedBody) {
 TEST(WalEntryTest, DecodeTruncatedCrc) {
   auto entry = MakeWriteEntry(1, {"SET", "foo", "bar"});
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   buf.resize(buf.size() - 2);
 
@@ -175,7 +176,7 @@ TEST(WalEntryTest, DecodeTruncatedCrc) {
 TEST(WalEntryTest, DecodeCrcMismatchDetected) {
   auto entry = MakeWriteEntry(1, {"SET", "foo", "bar"});
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   buf[4] = static_cast<std::byte>(static_cast<uint8_t>(buf[4]) ^ 0x01);
 
@@ -203,16 +204,18 @@ TEST(WalEntryTest, DecodeUnknownTypeRejected) {
 }
 
 TEST(WalEntryTest, RoundTripConditionalEntry) {
-  core::QueueEntry entry;
-  entry.seq = 10;
-  entry.appended_at = core::WallClock::now();
-  entry.payload = core::entry::Conditional{
-      .cmd = core::RespCommand{{"SET", "k", "v", "NX"}},
-      .flags = core::PredicateFlags::kNx,
+  const core::QueueEntry entry{
+      .seq = 10,
+      .appended_at = core::WallClock::now(),
+      .payload =
+          core::entry::Conditional{
+              .cmd = core::RespCommand{{"SET", "k", "v", "NX"}},
+              .flags = core::PredicateFlags::kNx,
+          },
   };
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -225,18 +228,20 @@ TEST(WalEntryTest, RoundTripConditionalEntry) {
 }
 
 TEST(WalEntryTest, RoundTripResolvedEntry) {
-  core::QueueEntry entry;
-  entry.seq = 20;
-  entry.appended_at = core::WallClock::now();
-  entry.payload = core::entry::Resolved{
-      .ref = 10,
-      .decision = core::Decision::kApply,
-      .materialised_op = core::RespCommand{{"SET", "k", "v"}},
-      .return_value = core::RespValue::SimpleString("OK"),
+  const core::QueueEntry entry{
+      .seq = 20,
+      .appended_at = core::WallClock::now(),
+      .payload =
+          core::entry::Resolved{
+              .ref = 10,
+              .decision = core::Decision::kApply,
+              .materialised_op = core::RespCommand{{"SET", "k", "v"}},
+              .return_value = core::RespValue::SimpleString("OK"),
+          },
   };
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -253,18 +258,20 @@ TEST(WalEntryTest, RoundTripResolvedEntry) {
 }
 
 TEST(WalEntryTest, RoundTripResolvedSkipNoMaterialisedOp) {
-  core::QueueEntry entry;
-  entry.seq = 21;
-  entry.appended_at = core::WallClock::now();
-  entry.payload = core::entry::Resolved{
-      .ref = 10,
-      .decision = core::Decision::kSkip,
-      .materialised_op = std::nullopt,
-      .return_value = core::RespValue::Null(),
+  const core::QueueEntry entry{
+      .seq = 21,
+      .appended_at = core::WallClock::now(),
+      .payload =
+          core::entry::Resolved{
+              .ref = 10,
+              .decision = core::Decision::kSkip,
+              .materialised_op = std::nullopt,
+              .return_value = core::RespValue::Null(),
+          },
   };
 
   std::vector<std::byte> buf;
-  EncodeWalEntry(entry, buf);
+  EncodeWalEntry(entry, entry.seq, buf);
 
   auto decoded = DecodeWalEntry(buf);
   ASSERT_TRUE(decoded.has_value());
@@ -274,6 +281,65 @@ TEST(WalEntryTest, RoundTripResolvedSkipNoMaterialisedOp) {
   EXPECT_EQ(resolved->decision, core::Decision::kSkip);
   EXPECT_FALSE(resolved->materialised_op.has_value());
   EXPECT_TRUE(resolved->return_value.IsNull());
+}
+
+TEST(WalEntryTest, BatchLastSeqEncodedAndDecoded) {
+  auto entry = MakeWriteEntry(10, {"SET", "k", "v"});
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, 15, buf);
+
+  auto decoded = DecodeWalEntry(buf);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->entry.seq, 10U);
+  EXPECT_EQ(decoded->batch_last_seq, 15U);
+}
+
+TEST(WalEntryTest, BatchLastSeqDefaultsToSelfForSingleEntry) {
+  auto entry = MakeWriteEntry(7, {"SET", "k", "v"});
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, entry.seq, buf);
+
+  auto decoded = DecodeWalEntry(buf);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->batch_last_seq, 7U);
+}
+
+TEST(WalEntryTest, DecodeMinor10OmitsBatchLastSeq) {
+  // Hand-build a pre-1.1 entry (no trailing batch_last_seq field) so we can
+  // verify the decoder still accepts it when told the segment is minor 1.0.
+  core::QueueEntry entry = MakeWriteEntry(42, {"SET", "a", "1"});
+  std::vector<std::byte> body;
+  binary::WriteU8(body, 0);
+  binary::WriteU64LE(body, entry.seq);
+  const auto us =
+      std::chrono::duration_cast<std::chrono::microseconds>(entry.appended_at.time_since_epoch())
+          .count();
+  binary::WriteI64LE(body, us);
+  binary::WriteU32LE(body, 3);
+  for (const auto& a : std::vector<std::string>{"SET", "a", "1"}) {
+    binary::WriteU32LE(body, static_cast<uint32_t>(a.size()));
+    binary::AppendBytes(body, a.data(), a.size());
+  }
+
+  std::vector<std::byte> buf;
+  binary::WriteU32LE(buf, static_cast<uint32_t>(body.size()));
+  buf.insert(buf.end(), body.begin(), body.end());
+  binary::WriteU32LE(buf, Crc32c(body));
+
+  auto decoded = DecodeWalEntry(buf, /*format_minor=*/0);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->entry.seq, 42U);
+  EXPECT_EQ(decoded->batch_last_seq, 42U);
+}
+
+TEST(WalEntryTest, BatchLastSeqLessThanSelfIsCorruption) {
+  core::QueueEntry entry = MakeWriteEntry(50, {"SET", "a", "1"});
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, 30, buf);
+
+  auto decoded = DecodeWalEntry(buf);
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
 }
 
 }  // namespace
