@@ -90,9 +90,28 @@ target_link_libraries(abyss_consumer_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_config_tests
+  config/defaults_test.cpp
+  config/parse_test.cpp
+  config/validate_test.cpp
+  config/unknown_key_test.cpp
+  config/env_override_test.cpp
+  config/example_file_test.cpp
+)
+
+target_compile_definitions(abyss_config_tests PRIVATE
+  ABYSS_EXAMPLE_CONFIG_PATH="${PROJECT_SOURCE_DIR}/config/abyss.example.yaml"
+)
+
+target_link_libraries(abyss_config_tests PRIVATE
+  abyss::config
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
 abyss_discover_tests(abyss_hot_tests      "unit\;unit-hot")
 abyss_discover_tests(abyss_cold_tests     "unit\;unit-cold")
 abyss_discover_tests(abyss_consumer_tests "unit\;unit-consumer")
+abyss_discover_tests(abyss_config_tests   "unit\;unit-config")

@@ -1,0 +1,146 @@
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <string>
+
+#include "abyss/config/config.h"
+
+namespace abyss::config {
+namespace {
+
+constexpr const char* kFullYaml = R"YAML(
+profile: embedded
+
+hot:
+  backend: builtin_hashmap
+  max_memory_bytes: 4294967296
+  default_eviction_seconds: 86400
+  eviction_overrides:
+    - prefix: "session:"
+      eviction_seconds: 3600
+    - prefix: "ephemeral:"
+      eviction_seconds: 300
+
+cold:
+  backend: builtin_rocksdb
+  data_path: /data/cold
+  write_buffer_size_bytes: 67108864
+
+queue:
+  backend: builtin_wal
+  wal_path: /data/wal
+  segment_size_bytes: 67108864
+  min_retention_seconds: 86400
+  wal_fsync_policy: group_commit
+  group_commit_interval_us: 1000
+  group_commit_max_bytes: 1048576
+
+cold_consumer:
+  quiet_threshold_seconds: 30
+  safety_margin_seconds: 300
+  deadline_jitter_ratio: 0.5
+  buffer_high_water_bytes: 536870912
+  max_flush_batch_size: 10000
+
+recovery:
+  replay_parallelism: 4
+  hot_replay_batch_size: 10000
+  cold_replay_batch_size: 50000
+
+resp:
+  bind: 0.0.0.0
+  port: 6379
+  max_connections: 1024
+  idle_timeout_seconds: 300
+
+metrics:
+  bind: 0.0.0.0
+  port: 9090
+
+admin:
+  bind: 0.0.0.0
+  port: 8080
+)YAML";
+
+TEST(ConfigParse, ParsesFullDocumentFaithfully) {
+  auto cfg = Config::ParseFromYaml(kFullYaml);
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+
+  EXPECT_EQ(cfg->profile, "embedded");
+
+  EXPECT_EQ(cfg->hot.backend, "builtin_hashmap");
+  EXPECT_EQ(cfg->hot.max_memory_bytes, 4294967296U);
+  EXPECT_EQ(cfg->hot.default_eviction, std::chrono::seconds{86400});
+  ASSERT_EQ(cfg->hot.eviction_overrides.size(), 2U);
+  EXPECT_EQ(cfg->hot.eviction_overrides[0].prefix, "session:");
+  EXPECT_EQ(cfg->hot.eviction_overrides[0].eviction, std::chrono::seconds{3600});
+  EXPECT_EQ(cfg->hot.eviction_overrides[1].prefix, "ephemeral:");
+  EXPECT_EQ(cfg->hot.eviction_overrides[1].eviction, std::chrono::seconds{300});
+
+  EXPECT_EQ(cfg->cold.backend, "builtin_rocksdb");
+  EXPECT_EQ(cfg->cold.data_path, "/data/cold");
+  EXPECT_EQ(cfg->cold.write_buffer_size_bytes, 67108864U);
+
+  EXPECT_EQ(cfg->queue.backend, "builtin_wal");
+  EXPECT_EQ(cfg->queue.wal_path, "/data/wal");
+  EXPECT_EQ(cfg->queue.segment_size_bytes, 67108864U);
+  EXPECT_EQ(cfg->queue.min_retention, std::chrono::seconds{86400});
+  EXPECT_EQ(cfg->queue.fsync_policy, "group_commit");
+  EXPECT_EQ(cfg->queue.group_commit_interval_us, 1000U);
+  EXPECT_EQ(cfg->queue.group_commit_max_bytes, 1048576U);
+
+  EXPECT_EQ(cfg->cold_consumer.quiet_threshold, std::chrono::seconds{30});
+  EXPECT_EQ(cfg->cold_consumer.safety_margin, std::chrono::seconds{300});
+  EXPECT_DOUBLE_EQ(cfg->cold_consumer.deadline_jitter_ratio, 0.5);
+  EXPECT_EQ(cfg->cold_consumer.buffer_high_water_bytes, 536870912U);
+  EXPECT_EQ(cfg->cold_consumer.max_flush_batch_size, 10000U);
+
+  EXPECT_EQ(cfg->recovery.replay_parallelism, 4U);
+  EXPECT_EQ(cfg->recovery.hot_replay_batch_size, 10000U);
+  EXPECT_EQ(cfg->recovery.cold_replay_batch_size, 50000U);
+
+  EXPECT_EQ(cfg->resp.bind, "0.0.0.0");
+  EXPECT_EQ(cfg->resp.port, 6379);
+  EXPECT_EQ(cfg->resp.max_connections, 1024U);
+  EXPECT_EQ(cfg->resp.idle_timeout, std::chrono::seconds{300});
+
+  EXPECT_EQ(cfg->metrics.bind, "0.0.0.0");
+  EXPECT_EQ(cfg->metrics.port, 9090);
+  EXPECT_EQ(cfg->admin.bind, "0.0.0.0");
+  EXPECT_EQ(cfg->admin.port, 8080);
+}
+
+TEST(ConfigParse, MissingSectionsUseDefaults) {
+  auto cfg = Config::ParseFromYaml("profile: embedded\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  const Config defaults = Config::Defaults();
+  EXPECT_EQ(cfg->hot.max_memory_bytes, defaults.hot.max_memory_bytes);
+  EXPECT_EQ(cfg->queue.fsync_policy, defaults.queue.fsync_policy);
+  EXPECT_EQ(cfg->recovery.replay_parallelism, defaults.recovery.replay_parallelism);
+}
+
+TEST(ConfigParse, PartialSectionUsesDefaultsForOmittedFields) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+resp:
+  port: 6400
+)YAML");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->resp.port, 6400);
+  EXPECT_EQ(cfg->resp.bind, Config::Defaults().resp.bind);
+  EXPECT_EQ(cfg->resp.max_connections, Config::Defaults().resp.max_connections);
+}
+
+TEST(ConfigParse, YamlParseErrorProducesActionableMessage) {
+  auto cfg = Config::ParseFromYaml("hot: {unterminated");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("YAML parse error"), std::string::npos);
+}
+
+TEST(ConfigParse, NonMapTopLevelFails) {
+  auto cfg = Config::ParseFromYaml("- just a list\n- of values\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("mapping"), std::string::npos);
+}
+
+}  // namespace
+}  // namespace abyss::config

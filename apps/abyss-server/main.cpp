@@ -1,6 +1,8 @@
 #include <CLI/CLI.hpp>
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
+#include <iostream>
 #include <string>
 
 #include "abyss/config/config.h"
@@ -15,9 +17,17 @@ extern "C" void ShutdownHandler(int /*sig*/) {
   g_shutdown_requested.store(true, std::memory_order_release);
 }
 
+std::string ResolveConfigPath(const std::string& cli_path) {
+  if (!cli_path.empty()) return cli_path;
+  if (const char* env = std::getenv("ABYSS_CONFIG_PATH"); env != nullptr && *env != '\0') {
+    return env;
+  }
+  return {};
+}
+
 }  // namespace
 
-// NOLINTNEXTLINE(modernize-avoid-c-arrays)
+// NOLINTNEXTLINE(modernize-avoid-c-arrays,bugprone-exception-escape)
 int main(int argc, char* argv[]) {
   // TODO(Callum): Set default in abyss::config
   constexpr auto kDefaultDataDir = "/tmp/abyss";
@@ -25,17 +35,39 @@ int main(int argc, char* argv[]) {
   CLI::App app{"abyss — Redis-compatible hot-cold tiered KV store"};
   app.set_version_flag("--version", abyss::kVersion);
 
-  abyss::config::Config config = abyss::config::Config::Defaults();
+  std::string config_path;
   std::string data_dir = kDefaultDataDir;
+  uint16_t port_override = 0;
 
-  app.add_option("-p,--port", config.resp.port, "RESP listen port")->default_val(config.resp.port);
-  app.add_option("-d,--data-dir", data_dir, "Data directory for WAL and cold store")
+  app.add_option("-c,--config", config_path, "Path to YAML config file (ABYSS_CONFIG_PATH)");
+  app.add_option("-p,--port", port_override, "RESP listen port (overrides config)");
+  app.add_option("-d,--data-dir", data_dir,
+                 "Data directory for WAL and cold store (used when no config file is given)")
       ->default_val(data_dir);
 
   CLI11_PARSE(app, argc, argv);
 
-  config.queue.wal_path = data_dir + "/wal";
-  config.cold.data_path = data_dir + "/cold";
+  abyss::config::Config config;
+  const std::string resolved = ResolveConfigPath(config_path);
+  if (!resolved.empty()) {
+    auto loaded = abyss::config::Config::LoadFromFile(resolved);
+    if (!loaded.has_value()) {
+      std::cerr << "config error: " << loaded.error().message() << "\n";
+      return EXIT_FAILURE;
+    }
+    config = std::move(*loaded);
+  } else {
+    config = abyss::config::Config::Defaults();
+    config.queue.wal_path = data_dir + "/wal";
+    config.cold.data_path = data_dir + "/cold";
+    config.ApplyEnvironmentOverrides();
+    if (auto r = config.Validate(); !r.has_value()) {
+      std::cerr << "config error: " << r.error().message() << "\n";
+      return EXIT_FAILURE;
+    }
+  }
+
+  if (port_override != 0) config.resp.port = port_override;
 
 #ifndef _WIN32
   struct sigaction sa{};

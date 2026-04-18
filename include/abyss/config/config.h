@@ -3,8 +3,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "abyss/core/result.h"
 
 namespace abyss::config {
 
@@ -44,6 +48,12 @@ struct ColdConsumerConfig {
   size_t max_flush_batch_size = 10000;
 };
 
+struct RecoveryConfig {
+  uint32_t replay_parallelism = 4;
+  size_t hot_replay_batch_size = 10000;
+  size_t cold_replay_batch_size = 50000;
+};
+
 struct RespConfig {
   std::string bind = "0.0.0.0";
   uint16_t port = 6379;
@@ -67,12 +77,27 @@ struct Config {
   ColdConfig cold;
   QueueConfig queue;
   ColdConsumerConfig cold_consumer;
+  RecoveryConfig recovery;
   RespConfig resp;
   MetricsConfig metrics;
   AdminConfig admin;
 
-  static Config LoadFromFile(const std::string& path);
+  // Load config from a YAML file.
+  static core::Result<Config> LoadFromFile(const std::filesystem::path& path);
+
+  // Parse config from an in-memory YAML document.
+  static core::Result<Config> ParseFromYaml(std::string_view yaml_text);
+
+  // Hard-coded defaults. Equivalent to a default-constructed Config.
   static Config Defaults();
+
+  // Apply overrides from environment variables. Currently ABYSS_PROFILE.
+  // Called automatically by LoadFromFile; exposed for callers that need to
+  // apply env overlays to a hand-built Config.
+  void ApplyEnvironmentOverrides();
+
+  // Validate the current config.
+  core::Result<void> Validate() const;
 };
 
 }  // namespace abyss::config
