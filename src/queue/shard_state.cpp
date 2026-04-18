@@ -109,8 +109,10 @@ core::Result<void> ShardState::OpenExistingSegments() {
   if (!existing.has_value()) return std::unexpected(existing.error());
 
   sealed_.clear();
-  sealed_.reserve(existing->size() > 0 ? existing->size() - 1 : 0);
+  sealed_.reserve(!existing->empty() ? existing->size() - 1 : 0);
 
+  // Enforces segment sequencing.
+  std::optional<core::SequenceId> expected_base_seq;
   for (size_t i = 0; i < existing->size(); ++i) {
     const auto path = std::filesystem::path(config_.directory) / FormatSegmentName((*existing)[i]);
     auto opened = Segment::Open(path.string(), config_.segment_size_bytes);
@@ -120,6 +122,14 @@ core::Result<void> ShardState::OpenExistingSegments() {
       return std::unexpected(core::Error{core::ErrorCode::kCorruption,
                                          "segment shard_id mismatch in " + path.string()});
     }
+
+    if (expected_base_seq.has_value() && opened->header().base_seq != *expected_base_seq) {
+      return std::unexpected(core::Error{
+          core::ErrorCode::kCorruption,
+          "segment base_seq gap: expected " + std::to_string(*expected_base_seq) + ", got " +
+              std::to_string(opened->header().base_seq) + " at " + path.string()});
+    }
+    expected_base_seq = opened->next_seq();
 
     auto segment = std::make_shared<Segment>(std::move(*opened));
     if (i + 1 == existing->size()) {
@@ -137,14 +147,9 @@ core::Result<void> ShardState::OpenExistingSegments() {
 }
 
 core::Result<void> ShardState::Rotate() {
-  auto drain = committer_->Drain();
-  if (!drain.has_value()) return std::unexpected(drain.error());
-
-  if (auto sealed = active_->Seal(); !sealed.has_value()) {
-    return std::unexpected(sealed.error());
-  }
-  sealed_.push_back(std::move(active_));
-
+  // All fallible steps run before any state mutation. If any step fails, the
+  // shard is left in its pre-rotate state: active_ still points at the old
+  // segment, committer_ still bound to it, no orphan files on disk.
   const SegmentHeader header{
       .format_major = kWalFormatMajor,
       .format_minor = kWalFormatMinor,
@@ -154,21 +159,36 @@ core::Result<void> ShardState::Rotate() {
       .created_at = core::WallClock::now(),
   };
 
-  const auto path = std::filesystem::path(config_.directory) / FormatSegmentName(next_seq_);
-  auto seg = Segment::Create(path.string(), header, config_.segment_size_bytes);
-  if (!seg.has_value()) return std::unexpected(seg.error());
+  const auto new_path = std::filesystem::path(config_.directory) / FormatSegmentName(next_seq_);
+  auto new_seg = Segment::Create(new_path.string(), header, config_.segment_size_bytes);
+  if (!new_seg.has_value()) return std::unexpected(new_seg.error());
 
-  active_ = std::make_shared<Segment>(std::move(*seg));
-  committer_->SetFsyncFn([captured = active_] { return captured->Fsync(); });
+  // If drain or seal fail after we've created the new file on disk, unlink it
+  // so a later Open doesn't see an orphan that would be misread as the active
+  // segment.
+  const auto unlink_orphan = [&new_path] {
+    std::error_code ec;
+    std::filesystem::remove(new_path, ec);
+  };
+
+  auto drain = committer_->Drain();
+  if (!drain.has_value()) {
+    unlink_orphan();
+    return std::unexpected(drain.error());
+  }
+
+  if (auto sealed = active_->Seal(); !sealed.has_value()) {
+    unlink_orphan();
+    return std::unexpected(sealed.error());
+  }
+
+  // Every fallible step has succeeded. We can commit.
+  sealed_.push_back(std::move(active_));
+  committer_.reset();
+  active_ = std::make_shared<Segment>(std::move(*new_seg));
+  committer_ = std::make_unique<GroupCommitter>(config_.commit,
+                                                [captured = active_] { return captured->Fsync(); });
   return {};
-}
-
-core::Result<size_t> ShardState::AppendUnlocked(const core::QueueEntry& entry,
-                                                core::SequenceId batch_last_seq) {
-  auto written = active_->Append(entry, batch_last_seq);
-  if (!written.has_value()) return std::unexpected(written.error());
-  next_seq_ = entry.seq + 1;
-  return written;
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
@@ -184,22 +204,24 @@ core::Result<AppendResult> ShardState::Append(core::QueueEntry entry) {
 
     entry.seq = next_seq_;
 
-    std::vector<std::byte> tmp;
-    const size_t encoded = EncodeWalEntry(entry, entry.seq, tmp);
+    // Encode once. The bytes are handed to the active segment's AppendEncoded.
+    std::vector<std::byte> buf;
+    EncodeWalEntry(entry, entry.seq, buf);
 
-    if (encoded > config_.segment_size_bytes - kSegmentHeaderSize) {
+    if (buf.size() > config_.segment_size_bytes - kSegmentHeaderSize) {
       return std::unexpected(
           core::Error{core::ErrorCode::kInvalidArgument, "entry exceeds segment capacity"});
     }
 
-    if (active_->SpaceRemaining() < encoded) {
+    if (active_->SpaceRemaining() < buf.size()) {
       auto r = Rotate();
       if (!r.has_value()) return std::unexpected(r.error());
       rotated = true;
     }
 
-    auto written = AppendUnlocked(entry, entry.seq);
+    auto written = active_->AppendEncoded(buf, entry.seq);
     if (!written.has_value()) return std::unexpected(written.error());
+    next_seq_ = entry.seq + 1;
 
     seq = entry.seq;
     read_cv_.notify_all();
@@ -234,10 +256,15 @@ core::Result<AppendBatchResult> ShardState::AppendBatch(std::span<const core::Qu
     first_seq = owned.front().seq;
     last_seq = owned.back().seq;
 
+    // Encode every entry once.
+    std::vector<std::vector<std::byte>> encoded;
+    encoded.reserve(owned.size());
     size_t total_bytes = 0;
     for (const auto& entry : owned) {
-      std::vector<std::byte> tmp;
-      total_bytes += EncodeWalEntry(entry, last_seq, tmp);
+      std::vector<std::byte> buf;
+      EncodeWalEntry(entry, last_seq, buf);
+      total_bytes += buf.size();
+      encoded.push_back(std::move(buf));
     }
 
     const size_t capacity = config_.segment_size_bytes - kSegmentHeaderSize;
@@ -253,10 +280,11 @@ core::Result<AppendBatchResult> ShardState::AppendBatch(std::span<const core::Qu
     }
 
     size_t written_bytes = 0;
-    for (const auto& entry : owned) {
-      auto w = AppendUnlocked(entry, last_seq);
+    for (size_t i = 0; i < owned.size(); ++i) {
+      auto w = active_->AppendEncoded(encoded[i], owned[i].seq);
       if (!w.has_value()) return std::unexpected(w.error());
       written_bytes += *w;
+      next_seq_ = owned[i].seq + 1;
     }
 
     read_cv_.notify_all();

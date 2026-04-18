@@ -78,11 +78,6 @@ core::Result<void> GroupCommitter::Drain() {
   return future.get();
 }
 
-void GroupCommitter::SetFsyncFn(FsyncFn fsync_fn) {
-  std::lock_guard lock(mu_);
-  fsync_fn_ = std::move(fsync_fn);
-}
-
 void GroupCommitter::Stop() {
   {
     std::lock_guard lock(mu_);

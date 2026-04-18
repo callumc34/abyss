@@ -64,8 +64,6 @@ class ShardState {
   core::Result<void> CreateInitialSegment() ABYSS_REQUIRES(append_mu_);
   core::Result<void> OpenExistingSegments() ABYSS_REQUIRES(append_mu_);
   core::Result<void> Rotate() ABYSS_REQUIRES(append_mu_);
-  core::Result<size_t> AppendUnlocked(const core::QueueEntry& entry,
-                                      core::SequenceId batch_last_seq) ABYSS_REQUIRES(append_mu_);
 
   ShardStateConfig config_;
 

@@ -208,36 +208,41 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
 // NOLINTNEXTLINE(readability-make-member-function-const)
 core::Result<size_t> Segment::Append(const core::QueueEntry& entry,
                                      core::SequenceId batch_last_seq) {
-  if (sealed_) {
-    return std::unexpected(
-        core::Error{core::ErrorCode::kInvalidArgument, "append on sealed segment"});
-  }
-  if (entry.seq != next_seq_) {
-    return std::unexpected(core::Error{
-        core::ErrorCode::kInvalidArgument,
-        "expected seq " + std::to_string(next_seq_) + ", got " + std::to_string(entry.seq)});
-  }
   if (batch_last_seq < entry.seq) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInvalidArgument, "batch_last_seq < entry.seq"});
   }
 
   std::vector<std::byte> buf;
-  size_t encoded_size = EncodeWalEntry(entry, batch_last_seq, buf);
+  EncodeWalEntry(entry, batch_last_seq, buf);
+  return AppendEncoded(buf, entry.seq);
+}
 
-  if (write_offset_ + encoded_size > max_size_) {
+// NOLINTNEXTLINE(readability-make-member-function-const)
+core::Result<size_t> Segment::AppendEncoded(std::span<const std::byte> bytes,
+                                            core::SequenceId entry_seq) {
+  if (sealed_) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "append on sealed segment"});
+  }
+  if (entry_seq != next_seq_) {
+    return std::unexpected(core::Error{
+        core::ErrorCode::kInvalidArgument,
+        "expected seq " + std::to_string(next_seq_) + ", got " + std::to_string(entry_seq)});
+  }
+  if (write_offset_ + bytes.size() > max_size_) {
     return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "segment full"});
   }
 
-  auto wr = FullPwrite(fd_, buf.data(), buf.size(), static_cast<off_t>(write_offset_));
+  auto wr = FullPwrite(fd_, bytes.data(), bytes.size(), static_cast<off_t>(write_offset_));
   if (!wr.has_value()) {
     return std::unexpected(wr.error());
   }
 
-  write_offset_ += encoded_size;
-  next_seq_ = entry.seq + 1;
+  write_offset_ += bytes.size();
+  next_seq_ = entry_seq + 1;
   entry_count_++;
-  return encoded_size;
+  return bytes.size();
 }
 
 core::Result<void> Segment::Fsync() const {

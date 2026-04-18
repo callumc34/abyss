@@ -690,5 +690,41 @@ TEST_F(SegmentTest, SealIsIdempotent) {
   EXPECT_TRUE(seg->sealed());
 }
 
+TEST_F(SegmentTest, AppendEncodedAcceptsPreEncodedBytes) {
+  // AppendEncoded is the path ShardState uses on the hot write path: encode
+  // once into a buffer, hand the bytes to the segment. Verify it produces the
+  // same on-disk state as the encode-inside wrapper.
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+
+  const auto entry = MakeWrite(0, {"SET", "key", "value"});
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, entry.seq, buf);
+
+  auto wrote = seg->AppendEncoded(buf, entry.seq);
+  ASSERT_TRUE(wrote.has_value());
+  EXPECT_EQ(*wrote, buf.size());
+  EXPECT_EQ(seg->next_seq(), 1U);
+  EXPECT_EQ(seg->entry_count(), 1U);
+
+  auto read = seg->ReadEntries(kSegmentHeaderSize, 10);
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->entries.size(), 1U);
+  ExpectWriteArgs(read->entries[0], {"SET", "key", "value"});
+}
+
+TEST_F(SegmentTest, AppendEncodedRejectsOutOfOrderSeq) {
+  auto seg = Segment::Create(SegPath(), MakeHeader(10), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+
+  const auto entry = MakeWrite(10, {"SET", "k", "v"});
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, entry.seq, buf);
+
+  auto r = seg->AppendEncoded(buf, 99);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
 }  // namespace
 }  // namespace abyss::queue

@@ -171,25 +171,6 @@ TEST(GroupCommitterTest, PerWriteFsyncFailurePropagates) {
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
 }
 
-TEST(GroupCommitterTest, SetFsyncFnSwapsCallback) {
-  std::atomic<int> first{0};
-  std::atomic<int> second{0};
-
-  GroupCommitter committer({.policy = FsyncPolicy::kGroupCommit, .interval = 10ms},
-                           MakeCounter(first));
-
-  auto f1 = committer.Submit(100);
-  EXPECT_TRUE(f1.get().has_value());
-  EXPECT_EQ(first.load(), 1);
-
-  committer.SetFsyncFn(MakeCounter(second));
-
-  auto f2 = committer.Submit(100);
-  EXPECT_TRUE(f2.get().has_value());
-  EXPECT_EQ(first.load(), 1);
-  EXPECT_EQ(second.load(), 1);
-}
-
 TEST(GroupCommitterTest, HighConcurrencyCoalescesIntoMuchFewerFsyncs) {
   std::atomic<int> fsync_count{0};
   GroupCommitter committer(

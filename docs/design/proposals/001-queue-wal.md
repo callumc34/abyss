@@ -61,21 +61,23 @@ This must fit on the WAL PVC.
 
 ### Offset persistence
 
-Each registered consumer has one file at `{wal_path}/offsets/{consumer_id}.offsets` containing all its (shard, seq) pairs. Format:
+Each (consumer, shard) pair has its own file at `{wal_path}/offsets/{consumer_id}/{shard_id:020d}.offset` containing a single `(shard, seq)` record. Format:
 
 ```
 magic        8 bytes  "ABYSSOFF"
-format_major 1 byte   1
+format_major 1 byte   2
 format_minor 1 byte   0
 reserved     2 bytes  0
-count        u32      number of (shard, seq) records that follow
-records      count × 12 bytes each:
-  shard_id   u32
-  seq        u64
+shard_id     u32
+seq          u64
 crc          u32      CRC32C over all preceding bytes
 ```
 
-`Ack(consumer, shard, seq)` updates the in-memory map, then rewrites the entire consumer file via tmp + fsync + rename + directory fsync — no background flusher, no batched flush. Acks are rare relative to appends so the per-ack durability cost is acceptable, and it closes the crash window under which a just-acknowledged offset could be rolled back by the reaper. Offsets missing on Open mean the consumer starts from the tail of the oldest retained segment.
+Total file size is 28 bytes. The per-(consumer, shard) layout is load-bearing for the shard-per-core execution model: each shard is owned by a single thread, and that thread is the only writer of its own offset file. No cross-shard thread ever touches another shard's file, so there is no shared write point, no need for cross-shard serialisation on the ack path, and no lost-update race between shards acking for the same consumer.
+
+`Ack(consumer, shard, seq)` updates the in-memory cache, then rewrites that one 28-byte file via tmp + fsync + rename + directory fsync — no background flusher, no batched flush. Ack cost is therefore O(1) in active shards, not O(total shards for the consumer), which matters once Phase 2 lands with many shards per pod.
+
+Offsets missing on Open mean the consumer starts from the tail of the oldest retained segment.
 
 ### Batch atomicity
 

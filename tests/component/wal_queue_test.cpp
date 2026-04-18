@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -233,6 +234,34 @@ TEST_F(WalQueueTest, SegmentRotationPreservesOrder) {
   }
 }
 
+TEST_F(WalQueueTest, BackToBackRotationsPreserveDurability) {
+  // Each append forces a rotation because the segment capacity holds barely
+  // one entry. The committer must be torn down and rebuilt per rotation
+  // without losing any durability future.
+  auto cfg = DefaultConfig();
+  cfg.segment_size_bytes = 140;
+  OpenWith(cfg);
+
+  constexpr int kWrites = 32;
+  std::vector<queue::DurabilityFuture> futures;
+  futures.reserve(kWrites);
+  for (int i = 0; i < kWrites; ++i) {
+    auto r = queue_->Append(0, MakeWrite({"SET", "key", std::string(20, 'x')}));
+    ASSERT_TRUE(r.has_value());
+    futures.push_back(std::move(r->durable));
+  }
+  for (auto& f : futures) {
+    EXPECT_TRUE(f.get().has_value());
+  }
+
+  auto read = queue_->Read(core::kHotConsumer, 0, 1000, 100ms);
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->size(), static_cast<size_t>(kWrites));
+  for (size_t i = 0; i < read->size(); ++i) {
+    EXPECT_EQ((*read)[i].seq, i);
+  }
+}
+
 TEST_F(WalQueueTest, ConcurrentAppendsAllDurable) {
   OpenWith(DefaultConfig());
 
@@ -297,6 +326,38 @@ TEST_F(WalQueueTest, RecoveryPreservesOffsets) {
   auto read = queue_->Read(core::kHotConsumer, 0, 100, 100ms);
   ASSERT_TRUE(read.has_value());
   EXPECT_TRUE(read->empty());
+}
+
+TEST_F(WalQueueTest, MissingMiddleSegmentRejectedAsCorruption) {
+  // ADP-009 invariant 8: base_seq[i+1] == last_seq[i] + 1. Deleting a middle
+  // segment must surface as corruption on Open rather than silently producing
+  // a gap in the sequence space that consumers would read across.
+  auto cfg = DefaultConfig();
+  cfg.segment_size_bytes = 200;
+
+  {
+    OpenWith(cfg);
+    for (int i = 0; i < 10; ++i) {
+      auto r = queue_->Append(0, MakeWrite({"SET", "key", std::string(20, 'x')}));
+      ASSERT_TRUE(r.has_value());
+      EXPECT_TRUE(r->durable.get().has_value());
+    }
+    queue_.reset();
+  }
+
+  // Find and delete a middle (non-first, non-last) segment file.
+  const auto shard_dir = std::filesystem::path(tmp_dir_) / "shard-0000";
+  std::vector<std::filesystem::path> seg_paths;
+  for (const auto& entry : std::filesystem::directory_iterator(shard_dir)) {
+    if (entry.path().extension() == ".log") seg_paths.push_back(entry.path());
+  }
+  std::ranges::sort(seg_paths);
+  ASSERT_GE(seg_paths.size(), 3U);
+  std::filesystem::remove(seg_paths[seg_paths.size() / 2]);
+
+  auto result = WalQueue::Open(cfg);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kCorruption);
 }
 
 TEST_F(WalQueueTest, RecoveryAcrossRotation) {

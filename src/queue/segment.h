@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,9 @@ class Segment {
 
   // Serialise and write an entry to the fd via pwrite. Does NOT fsync.
   core::Result<size_t> Append(const core::QueueEntry& entry, core::SequenceId batch_last_seq);
+
+  // Write pre-encoded entry bytes. Does NOT fsync.
+  core::Result<size_t> AppendEncoded(std::span<const std::byte> bytes, core::SequenceId entry_seq);
 
   // Flush the fd's in-kernel dirty pages. Blocks until storage acknowledges.
   core::Result<void> Fsync() const;

@@ -17,7 +17,11 @@ struct FileOffsetStoreConfig {
   std::string directory;
 };
 
-// Durable OffsetStore, one binary file per consumer under `directory`.
+// Durable OffsetStore. Each (consumer, shard) pair has its own file under
+// `{directory}/{consumer_id}/{shard_id:020d}.offset`, holding a single
+// sequence-id record. This layout keeps per-shard acks free of cross-shard
+// coordination so a shard-per-core execution model doesn't funnel every ack
+// through a shared file or mutex.
 class FileOffsetStore : public OffsetStore {
  public:
   static core::Result<std::unique_ptr<FileOffsetStore>> Open(FileOffsetStoreConfig config);
@@ -37,13 +41,21 @@ class FileOffsetStore : public OffsetStore {
  private:
   using ConsumerMap = std::unordered_map<core::ShardId, core::SequenceId>;
 
+  struct Record {
+    core::ShardId shard = 0;
+    core::SequenceId seq = 0;
+  };
+
   explicit FileOffsetStore(FileOffsetStoreConfig config);
 
   core::Result<void> LoadAll();
-  core::Result<ConsumerMap> LoadConsumer(core::ConsumerId consumer) const;
-  core::Result<void> WriteConsumer(core::ConsumerId consumer, const ConsumerMap& entries) const;
-  std::string FilePath(core::ConsumerId consumer) const;
-  std::string TempPath(core::ConsumerId consumer) const;
+  static core::Result<Record> LoadShardFile(const std::string& path);
+  core::Result<void> WriteShardFile(core::ConsumerId consumer, core::ShardId shard,
+                                    core::SequenceId seq) const;
+
+  std::string ConsumerDir(core::ConsumerId consumer) const;
+  std::string ShardFilePath(core::ConsumerId consumer, core::ShardId shard) const;
+  std::string ShardTempPath(core::ConsumerId consumer, core::ShardId shard) const;
 
   FileOffsetStoreConfig config_;
 

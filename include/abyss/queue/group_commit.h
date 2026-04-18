@@ -40,9 +40,6 @@ class GroupCommitter {
   // Force an immediate fsync and wait for its completion. No-op for kNone.
   core::Result<void> Drain();
 
-  // Replace the fsync callback. Caller must guarantee no Submit is in flight.
-  void SetFsyncFn(FsyncFn fsync_fn);
-
   // Signal the commit thread to stop.
   void Stop();
 
