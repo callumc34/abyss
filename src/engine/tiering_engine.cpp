@@ -6,12 +6,13 @@
 namespace abyss::engine {
 
 TieringEngine::TieringEngine(core::Queue& queue, core::HotStore& hot_store,
-                             core::ColdStore& cold_store, consumer::CompactionBuffer& buffer,
+                             core::ColdStore& cold_store,
+                             consumer::CompactionBufferRouter& buffer_router,
                              core::ConsumerRpc& rpc, uint32_t shard_count)
     : queue_(queue),
       hot_store_(hot_store),
       cold_store_(cold_store),
-      buffer_(buffer),
+      buffer_router_(buffer_router),
       rpc_(rpc),
       shard_count_(shard_count) {}
 
@@ -32,7 +33,7 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
 
   auto key = core::ops::PrimaryKey(*op);
   if (!key.empty()) {
-    auto buffer_result = buffer_.Read(std::string(key));
+    auto buffer_result = buffer_router_.Read(key);
     if (buffer_result.has_value()) {
       return buffer_result;
     }

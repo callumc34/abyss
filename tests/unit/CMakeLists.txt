@@ -3,6 +3,7 @@ add_executable(abyss_core_tests
   core/resp_types_test.cpp
   core/consumer_rpc_test.cpp
   core/ops_test.cpp
+  core/eviction_policy_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
@@ -82,6 +83,7 @@ add_executable(abyss_consumer_tests
   consumer/compacted_state_test.cpp
   consumer/flush_strategy_test.cpp
   consumer/compaction_buffer_test.cpp
+  consumer/cold_consumer_test.cpp
 )
 
 target_link_libraries(abyss_consumer_tests PRIVATE

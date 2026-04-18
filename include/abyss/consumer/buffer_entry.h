@@ -17,6 +17,7 @@ struct BufferEntry {
   uint64_t write_count = 0;
   core::EvictionTTL eviction{0};
   std::chrono::milliseconds jitter_offset{0};
+  core::SequenceId first_seen_seq = 0;
 };
 
 }  // namespace abyss::consumer

@@ -1,6 +1,9 @@
 #include "abyss/consumer/compaction_buffer.h"
 
+#include <algorithm>
+#include <limits>
 #include <mutex>
+#include <utility>
 
 #include "abyss/core/thread_annotations.h"
 
@@ -27,7 +30,8 @@ CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock)
     : CompactionBuffer(FlushStrategy{}, std::move(clock)) {}
 
 void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op,
-                              core::EvictionTTL eviction) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+                              core::EvictionTTL eviction,
+                              core::SequenceId seq) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   auto& entry = entries_[key];
   bool is_new = entry.key.empty();
@@ -38,6 +42,7 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
     entry.key = key;
     entry.first_seen = clock_();
     entry.jitter_offset = ComputeJitter();
+    entry.first_seen_seq = seq;
   }
 
   entry.eviction = eviction;
@@ -75,12 +80,13 @@ core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) con
       core::Error(core::ErrorCode::kNotFound, "collection read bypasses buffer"));
 }
 
-std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now)
+std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size_t max_count)
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   std::vector<BufferEntry> result;
 
-  while (!flush_heap_.empty() && flush_heap_.top().scheduled_time <= now) {
+  while (!flush_heap_.empty() && flush_heap_.top().scheduled_time <= now &&
+         result.size() < max_count) {
     auto heap_time = flush_heap_.top().scheduled_time;
     auto heap_key = flush_heap_.top().key;
     flush_heap_.pop();
@@ -98,6 +104,53 @@ std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now)
   }
 
   return result;
+}
+
+std::vector<BufferEntry> CompactionBuffer::FlushOldest(size_t target_bytes, size_t max_count)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::unique_lock lock(mutex_);
+  std::vector<BufferEntry> result;
+
+  while (!flush_heap_.empty() && result.size() < max_count && bytes_estimate_ > target_bytes) {
+    auto heap_time = flush_heap_.top().scheduled_time;
+    auto heap_key = flush_heap_.top().key;
+    flush_heap_.pop();
+
+    auto it = entries_.find(heap_key);
+    if (it == entries_.end()) continue;
+
+    auto& entry = it->second;
+    auto expected = strategy_.NextFlushTime(entry, entry.eviction) + entry.jitter_offset;
+    if (expected != heap_time) continue;
+
+    bytes_estimate_ -= EntryBytes(entry);
+    result.push_back(std::move(entry));
+    entries_.erase(it);
+  }
+
+  return result;
+}
+
+void CompactionBuffer::Reinsert(std::vector<BufferEntry> entries) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::unique_lock lock(mutex_);
+  for (auto& entry : entries) {
+    const std::string key = entry.key;
+    bytes_estimate_ += EntryBytes(entry);
+    auto scheduled = strategy_.NextFlushTime(entry, entry.eviction) + entry.jitter_offset;
+    entries_.insert_or_assign(key, std::move(entry));
+    flush_heap_.push({scheduled, key});
+  }
+}
+
+std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeq() const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  if (entries_.empty()) return std::nullopt;
+  core::SequenceId oldest = std::numeric_limits<core::SequenceId>::max();
+  for (const auto& [_, entry] : entries_) {
+    oldest = std::min(oldest, entry.first_seen_seq);
+  }
+  return oldest;
 }
 
 size_t CompactionBuffer::Size() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {

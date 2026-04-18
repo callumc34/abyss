@@ -64,28 +64,45 @@ Where `jitter` is a per-key random offset in the range `[0, safety_margin * 0.5]
 
 ### Consumer Thread Loop
 
+The cold consumer is **per-shard**: each shard has its own `ColdConsumer` owning its own `CompactionBuffer`, and a dedicated thread running a fused drain-flush loop. A `ColdConsumerPool` orchestrator owns the fleet and exposes a `CompactionBufferRouter` through which the tiering engine resolves key→shard→buffer for read-path lookups. This follows the shared-nothing direction described in ADP-008 and avoids the central-lock bottleneck a single shared buffer would introduce at scale.
+
+Each per-shard thread loop is:
+
 ```
 loop:
-    1. Drain new entries from queue into compaction buffer
-       (non-blocking, process whatever is available)
+    1. Drain: queue.Read(cold_consumer, shard, max_count, short_timeout)
+       - Decode each QueueEntry (Write / Conditional / Resolved-apply)
+       - Parse its RESP command into a typed WriteOp
+       - Expand multi-key ops (DEL, MSET) into per-key absorbs
+       - buffer.Absorb(key, op, eviction, seq)
 
-    2. Peek at priority queue head
-       - If flush_priority is in the past → flush it
-       - Pop entry, call cold_store.apply_batch(entry.emit())
-       - On success: remove from buffer, ack queue
-       - On failure: retry with backoff, emit alert
+    2. Flush: under normal mode, pop entries whose scheduled_time ≤ now
+       (quiet window or eviction-deadline fired). Under aggressive mode
+       (see Memory Management), pop by deadline order irrespective of now.
+       - Drop entries whose absolute TTL has expired before cold is contacted
+       - Emit typed ops (tombstones become DEL, live states emit per-type ops)
+       - cold_store.ApplyBatch(ops)
+         - Success: the flushed entries vanish from the buffer
+         - Failure: retain entries, back off exponentially, retry
 
-    3. If nothing to flush, sleep until next flush_priority
-       or until new queue entries arrive
+    3. Ack: advance queue offset to min(latest_drained_seq, oldest_pending_seq - 1).
+       This low-water-mark ack pattern keeps the WAL retaining any
+       un-flushed writes, so a crash replays them from the queue.
 ```
 
-**Post-flush:** When flushed, the entry is removed from the buffer. If a new write arrives for the same key later, it re-enters with a fresh `first_seen`.
+**Ack policy — low-water per shard.** A compacted buffer entry absorbs many seqs. The consumer must not acknowledge past any seq whose writes have not yet been flushed. Because each shard's consumer owns its own buffer and queue partition, the watermark is computed locally: the smallest `first_seen_seq` across the buffer entries, minus one, bounded by the latest drained seq. No cross-shard coordination is required.
+
+**Failure policy.** Apply failures hold the flusher on that shard — it keeps retrying with exponential backoff and records `apply_failures` / `retry_attempts`. Back-pressure is deliberate: if the cold store is unwritable, the WAL retains data and we prefer stalling over silent drops. Drain on other shards is unaffected.
+
+**Post-flush:** When flushed, the entry is removed from the buffer. If a new write arrives for the same key later, it re-enters with a fresh `first_seen` and `first_seen_seq`.
 
 **Absolute TTL interaction:** If a key's absolute `ttl` has expired by flush time, the entry is dropped without writing to cold.
 
 ### Memory Management
 
-The buffer is bounded by unique keys in the eviction window. Under normal operation this is manageable. If buffer memory exceeds a configurable high-water mark, the cold consumer switches to aggressive mode — flushing the oldest entries by deadline order regardless of quiet window. This sacrifices write efficiency for memory stability.
+The buffer is bounded by unique keys in the eviction window. Under normal operation this is manageable. If buffer memory exceeds the **high-water** mark, the cold consumer switches to `Aggressive` mode — flushing the oldest entries by deadline order regardless of quiet window. This sacrifices write efficiency for memory stability.
+
+Mode transitions use **hysteresis** to avoid thrashing: the consumer enters aggressive at `buffer_high_water_bytes`, and only returns to `Normal` once the buffer has drained below `buffer_low_water_bytes` (default: 75% of high-water). Each transition increments a `mode_transitions` counter; under a healthy workload the mode should flip at most once per burst.
 
 ### Lag Monitoring
 

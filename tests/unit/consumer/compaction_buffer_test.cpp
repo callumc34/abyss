@@ -462,5 +462,142 @@ TEST_F(CompactionBufferTest, FlushedEntryCarriesEviction) {
   EXPECT_EQ(flushed[0].eviction, eviction);
 }
 
+// ---------------------------------------------------------------------------
+// Sequence tracking + low-water ack
+// ---------------------------------------------------------------------------
+
+TEST_F(CompactionBufferTest, AbsorbRecordsFirstSeenSeq) {
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 42);
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1);
+  EXPECT_EQ(flushed[0].first_seen_seq, 42U);
+}
+
+TEST_F(CompactionBufferTest, ReAbsorbKeepsFirstSeenSeq) {
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v1"}}, kDefaultEviction, 10);
+  clock_.Advance(5s);
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v2"}}, kDefaultEviction, 11);
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1);
+  EXPECT_EQ(flushed[0].first_seen_seq, 10U);
+}
+
+TEST_F(CompactionBufferTest, OldestPendingSeqEmptyReturnsNullopt) {
+  EXPECT_FALSE(buffer_.OldestPendingSeq().has_value());
+}
+
+TEST_F(CompactionBufferTest, OldestPendingSeqReturnsMinimum) {
+  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 7);
+  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 3);
+  buffer_.Absorb("c", WriteOp{StringSet{.key = "c", .value = "v"}}, kDefaultEviction, 11);
+  auto oldest = buffer_.OldestPendingSeq();
+  ASSERT_TRUE(oldest.has_value());
+  EXPECT_EQ(*oldest, 3U);
+}
+
+TEST_F(CompactionBufferTest, OldestPendingSeqAdvancesAfterFlush) {
+  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 5);
+  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 8);
+
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 2);
+  EXPECT_FALSE(buffer_.OldestPendingSeq().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// FlushOldest (aggressive mode)
+// ---------------------------------------------------------------------------
+
+TEST_F(CompactionBufferTest, FlushOldestEmptyBufferReturnsNothing) {
+  auto flushed = buffer_.FlushOldest(0, 10);
+  EXPECT_TRUE(flushed.empty());
+}
+
+TEST_F(CompactionBufferTest, FlushOldestStopsWhenBelowTargetBytes) {
+  AbsorbString("a", "v1");
+  AbsorbString("b", "v2");
+  AbsorbString("c", "v3");
+  auto all_bytes = buffer_.BytesEstimate();
+
+  // Target is half of current: expect to flush some but not all.
+  auto flushed = buffer_.FlushOldest(all_bytes / 2, 100);
+  EXPECT_GT(flushed.size(), 0);
+  EXPECT_LT(flushed.size(), 3);
+  EXPECT_LE(buffer_.BytesEstimate(), (all_bytes / 2) + 1);  // +1 for rounding
+}
+
+TEST_F(CompactionBufferTest, FlushOldestRespectsCountCap) {
+  for (int i = 0; i < 5; ++i) {
+    AbsorbString("k" + std::to_string(i), "v");
+  }
+  auto flushed = buffer_.FlushOldest(0, 2);
+  EXPECT_EQ(flushed.size(), 2);
+}
+
+TEST_F(CompactionBufferTest, FlushOldestPopsOldestFirst) {
+  AbsorbString("first", "v");
+  clock_.Advance(5s);
+  AbsorbString("second", "v");
+  clock_.Advance(5s);
+  AbsorbString("third", "v");
+
+  auto flushed = buffer_.FlushOldest(0, 1);
+  ASSERT_EQ(flushed.size(), 1);
+  EXPECT_EQ(flushed[0].key, "first");
+}
+
+TEST_F(CompactionBufferTest, FlushOldestBypassesQuietWindow) {
+  // Entry isn't due by quiet window; FlushOldest ignores that.
+  AbsorbString("k", "v");
+  auto flushed_ready = buffer_.FlushReady(clock_.SteadyNow());
+  EXPECT_TRUE(flushed_ready.empty());
+
+  auto flushed_oldest = buffer_.FlushOldest(0, 1);
+  EXPECT_EQ(flushed_oldest.size(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Reinsert (retry path)
+// ---------------------------------------------------------------------------
+
+TEST_F(CompactionBufferTest, ReinsertRestoresEntries) {
+  AbsorbString("k", "v");
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1);
+  EXPECT_EQ(buffer_.Size(), 0);
+
+  buffer_.Reinsert(std::move(flushed));
+  EXPECT_EQ(buffer_.Size(), 1);
+  EXPECT_GT(buffer_.BytesEstimate(), 0);
+
+  auto again = buffer_.FlushReady(clock_.SteadyNow());
+  EXPECT_EQ(again.size(), 1);
+}
+
+TEST_F(CompactionBufferTest, ReinsertOverwritesNewerAbsorbForSameKey) {
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "old"}}, kDefaultEviction, 1);
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1);
+
+  // A newer write comes in while the old snapshot is "in flight".
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "new"}}, kDefaultEviction, 2);
+  EXPECT_EQ(buffer_.Size(), 1);
+
+  // Reinserting the old snapshot overwrites the newer one. This is acceptable
+  // because the cold consumer only uses Reinsert on transient retry failures
+  // that it then retries immediately — the "new" write would be re-drained
+  // from the queue on the next loop iteration and re-absorbed.
+  buffer_.Reinsert(std::move(flushed));
+  EXPECT_EQ(buffer_.Size(), 1);
+  auto read = buffer_.Read("k");
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->AsString(), "old");
+}
+
 }  // namespace
 }  // namespace abyss::consumer

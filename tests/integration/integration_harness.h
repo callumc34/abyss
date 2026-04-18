@@ -4,11 +4,14 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "abyss/cold/backends/rocksdb_store.h"
-#include "abyss/consumer/compaction_buffer.h"
+#include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/eviction_policy.h"
 #include "abyss/engine/tiering_engine.h"
+#include "abyss/hot/shard_router.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "mock_queue.h"
 #include "test_clock.h"
@@ -37,7 +40,6 @@ class IntegrationHarness {
     });
     cold_ = std::move(cold_result).value();
 
-    buffer_ = std::make_unique<consumer::CompactionBuffer>(clock_.SteadyFn());
     rpc_ = std::make_unique<core::ConsumerRpc>();
 
     ON_CALL(queue_, Append(::testing::_, ::testing::_))
@@ -47,15 +49,21 @@ class IntegrationHarness {
           return queue::AppendResult{.seq = next_seq_++, .durable = p.get_future()};
         });
 
-    engine_ = std::make_unique<engine::TieringEngine>(queue_, *hot_, *cold_, *buffer_, *rpc_,
+    core::EvictionPolicy eviction_policy{std::chrono::seconds{86400}};
+    cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
+        queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
+        eviction_policy, clock_.SteadyFn(), clock_.WallFn());
+
+    engine_ = std::make_unique<engine::TieringEngine>(queue_, *hot_, *cold_, *cold_pool_, *rpc_,
                                                       kShardCount);
   }
 
   ~IntegrationHarness() {
+    if (cold_pool_) cold_pool_->Stop();
     engine_.reset();
+    cold_pool_.reset();
     cold_.reset();
     hot_.reset();
-    buffer_.reset();
     rpc_.reset();
     std::filesystem::remove_all(tmp_dir_);
   }
@@ -68,7 +76,11 @@ class IntegrationHarness {
   engine::TieringEngine& Engine() { return *engine_; }
   core::HotStore& Hot() { return *hot_; }
   core::ColdStore& Cold() { return *cold_; }
-  consumer::CompactionBuffer& Buffer() { return *buffer_; }
+  consumer::ColdConsumerPool& ColdPool() { return *cold_pool_; }
+  consumer::CompactionBuffer& BufferFor(std::string_view key) {
+    auto shard = hot::ComputeShard(key, kShardCount);
+    return cold_pool_->ConsumerFor(shard).Buffer();
+  }
   TestClock& Clock() { return clock_; }
   ::testing::NiceMock<MockQueue>& Queue() { return queue_; }
 
@@ -80,7 +92,7 @@ class IntegrationHarness {
   ::testing::NiceMock<MockQueue> queue_;
   std::unique_ptr<hot::ShardedHotStore> hot_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
-  std::unique_ptr<consumer::CompactionBuffer> buffer_;
+  std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> rpc_;
   std::unique_ptr<engine::TieringEngine> engine_;
 };

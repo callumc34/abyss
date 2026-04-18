@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <random>
@@ -26,12 +27,21 @@ class CompactionBuffer {
 
   explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock);
 
-  void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction)
-      ABYSS_EXCLUDES(mutex_);
+  void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction,
+              core::SequenceId seq = 0) ABYSS_EXCLUDES(mutex_);
 
   core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
 
-  std::vector<BufferEntry> FlushReady(core::SteadyTime now) ABYSS_EXCLUDES(mutex_);
+  std::vector<BufferEntry> FlushReady(core::SteadyTime now,
+                                      size_t max_count = std::numeric_limits<size_t>::max())
+      ABYSS_EXCLUDES(mutex_);
+
+  std::vector<BufferEntry> FlushOldest(size_t target_bytes, size_t max_count)
+      ABYSS_EXCLUDES(mutex_);
+
+  void Reinsert(std::vector<BufferEntry> entries) ABYSS_EXCLUDES(mutex_);
+
+  std::optional<core::SequenceId> OldestPendingSeq() const ABYSS_EXCLUDES(mutex_);
 
   size_t Size() const ABYSS_EXCLUDES(mutex_);
   size_t BytesEstimate() const ABYSS_EXCLUDES(mutex_);
