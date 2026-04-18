@@ -18,18 +18,31 @@ constexpr auto kDefaultEviction = core::EvictionTTL{3600};
 
 class CompactionBufferTest : public ::testing::Test {
  protected:
+  void SetUp() override {
+    key_counter_ = 0;
+    clock_.Set(core::SteadyTime{std::chrono::seconds{1000000}});
+  }
+
+  void TearDown() override {
+    clock_.Advance(std::chrono::hours{24});
+    buffer_.FlushReady(clock_.SteadyNow());
+  }
+
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   testing::TestClock clock_;
   FlushStrategy strategy_;
   CompactionBuffer buffer_{strategy_, clock_.SteadyFn(), kTestSeed};
+  int key_counter_ = 0;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
+  std::string MakeKey() { return "k" + std::to_string(key_counter_++); }
+
   void AbsorbString(const std::string& key, const std::string& value,
-                    core::EvictionTTL eviction = kDefaultEviction) {
+                    core::EvictionTTL eviction = core::EvictionTTL{3600}) {
     buffer_.Absorb(key, WriteOp{StringSet{.key = key, .value = value}}, eviction);
   }
 
-  void AbsorbDel(const std::string& key, core::EvictionTTL eviction = kDefaultEviction) {
+  void AbsorbDel(const std::string& key, core::EvictionTTL eviction = core::EvictionTTL{3600}) {
     buffer_.Absorb(key, WriteOp{Del{.keys = {key}}}, eviction);
   }
 };
@@ -39,24 +52,25 @@ class CompactionBufferTest : public ::testing::Test {
 // ---------------------------------------------------------------------------
 
 TEST_F(CompactionBufferTest, AbsorbStringThenReadReturnsBulkString) {
-  AbsorbString("k", "v");
-  auto result = buffer_.Read("k");
+  AbsorbString("ka", "v");
+  auto result = buffer_.Read("ka");
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsBulkString());
   EXPECT_EQ(result->AsString(), "v");
 }
 
 TEST_F(CompactionBufferTest, AbsorbDelThenReadReturnsNull) {
-  AbsorbString("k", "v");
-  AbsorbDel("k");
-  auto result = buffer_.Read("k");
+  AbsorbString("ka", "v");
+  AbsorbDel("ka");
+  auto result = buffer_.Read("ka");
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsNull());
 }
 
 TEST_F(CompactionBufferTest, AbsorbCollectionReadReturnsNotFound) {
-  buffer_.Absorb("k", WriteOp{SetAdd{.key = "k", .members = {"a"}}}, kDefaultEviction);
-  auto result = buffer_.Read("k");
+  auto eviction = core::EvictionTTL{3600};
+  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"a"}}}, eviction);
+  auto result = buffer_.Read("ka");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kNotFound);
 }
@@ -75,11 +89,11 @@ TEST_F(CompactionBufferTest, SizeReflectsDistinctKeys) {
 }
 
 TEST_F(CompactionBufferTest, AbsorbSameKeyIncrementsWriteCount) {
-  AbsorbString("k", "v1");
-  AbsorbString("k", "v2");
-  AbsorbString("k", "v3");
+  AbsorbString("ka1", "v1");
+  AbsorbString("ka1", "v2");
+  AbsorbString("ka1", "v3");
 
-  auto result = buffer_.Read("k");
+  auto result = buffer_.Read("ka1");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "v3");
 }
@@ -122,11 +136,12 @@ TEST_F(CompactionBufferTest, BytesEstimateDecreasesAfterFlush) {
 }
 
 TEST_F(CompactionBufferTest, BytesEstimateReflectsCollectionSize) {
-  buffer_.Absorb("k", WriteOp{SetAdd{.key = "k", .members = {"member1"}}}, kDefaultEviction);
+  auto eviction = core::EvictionTTL{3600};
+  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"member1"}}}, eviction);
   auto after_one = buffer_.BytesEstimate();
 
-  buffer_.Absorb("k", WriteOp{SetAdd{.key = "k", .members = {"member2", "member3", "member4"}}},
-                 kDefaultEviction);
+  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"member2", "member3", "member4"}}},
+                 eviction);
   auto after_four = buffer_.BytesEstimate();
 
   EXPECT_GT(after_four, after_one);
@@ -147,23 +162,33 @@ TEST_F(CompactionBufferTest, BytesEstimateDecreasesOnDel) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CompactionBufferTest, FlushReadyReturnsNothingWhenNothingDue) {
-  AbsorbString("k", "v");
+  auto key = MakeKey();
+  AbsorbString(key, "v");
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   EXPECT_TRUE(flushed.empty());
+  clock_.Advance(60s);
+  buffer_.FlushReady(clock_.SteadyNow());
 }
 
 TEST_F(CompactionBufferTest, FlushReadyReturnsEntryAfterQuietWindow) {
-  AbsorbString("k", "v");
+  FlushStrategy no_jitter{30s, 300s, 0.0};
+  CompactionBuffer buf{no_jitter, clock_.SteadyFn(), kTestSeed};
+
+  auto key = MakeKey();
+  buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, core::EvictionTTL{3600});
   clock_.Advance(31s);
-  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  auto flushed = buf.FlushReady(clock_.SteadyNow());
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, "k");
+  EXPECT_EQ(flushed[0].key, key);
 }
 
 TEST_F(CompactionBufferTest, FlushReadyReturnsAllWhenAllDue) {
-  AbsorbString("k1", "v1");
-  AbsorbString("k2", "v2");
-  AbsorbString("k3", "v3");
+  auto k1 = MakeKey();
+  auto k2 = MakeKey();
+  auto k3 = MakeKey();
+  AbsorbString(k1, "v1");
+  AbsorbString(k2, "v2");
+  AbsorbString(k3, "v3");
 
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
@@ -171,19 +196,24 @@ TEST_F(CompactionBufferTest, FlushReadyReturnsAllWhenAllDue) {
 }
 
 TEST_F(CompactionBufferTest, FlushReadyReturnsSubsetWhenSomeDue) {
-  AbsorbString("early", "v1");
+  FlushStrategy no_jitter{30s, 300s, 0.0};
+  CompactionBuffer buf{no_jitter, clock_.SteadyFn(), kTestSeed};
+
+  auto early = MakeKey();
+  auto late = MakeKey();
+  buf.Absorb(early, WriteOp{StringSet{.key = early, .value = "v1"}}, core::EvictionTTL{3600});
   clock_.Advance(20s);
-  AbsorbString("late", "v2");
+  buf.Absorb(late, WriteOp{StringSet{.key = late, .value = "v2"}}, core::EvictionTTL{3600});
 
   // Advance past early's quiet deadline but before late's.
-  // early: absorbed at t0, quiet deadline = t0 + 30s + jitter. Now at t0 + 20s + 15s = t0 + 35s.
-  // late:  absorbed at t0+20s, quiet deadline = t0 + 50s + jitter. 35s < 50s, so not due.
+  // early: absorbed at t0, quiet deadline = t0 + 30s. Now at t0 + 20s + 15s = t0 + 35s.
+  // late:  absorbed at t0+20s, quiet deadline = t0 + 50s. 35s < 50s, so not due.
   clock_.Advance(15s);
-  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  auto flushed = buf.FlushReady(clock_.SteadyNow());
 
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, "early");
-  EXPECT_EQ(buffer_.Size(), 1);
+  EXPECT_EQ(flushed[0].key, early);
+  EXPECT_EQ(buf.Size(), 1);
 }
 
 TEST_F(CompactionBufferTest, FlushReadyReturnsNothingOnEmptyBuffer) {
@@ -208,13 +238,17 @@ TEST_F(CompactionBufferTest, FlushReadyEarliestScheduledFirst) {
 }
 
 TEST_F(CompactionBufferTest, EvictionDeadlineForcesEarlyFlush) {
-  AbsorbString("k", "v", core::EvictionTTL{310});
-  // Eviction deadline = first_seen + 310 - 300 = first_seen + 10s (+ jitter).
+  FlushStrategy strategy{30s, 300s, 0.0};
+  CompactionBuffer buf{strategy, clock_.SteadyFn(), kTestSeed};
+
+  auto key = MakeKey();
+  buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, core::EvictionTTL{310});
+  // Eviction deadline = first_seen + 310 - 300 = first_seen + 10s.
   // With quiet_threshold=30s, eviction dominates.
   clock_.Advance(15s);
-  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  auto flushed = buf.FlushReady(clock_.SteadyNow());
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, "k");
+  EXPECT_EQ(flushed[0].key, key);
 }
 
 // ---------------------------------------------------------------------------

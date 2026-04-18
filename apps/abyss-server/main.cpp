@@ -19,6 +19,7 @@ extern "C" void ShutdownHandler(int /*sig*/) {
 
 // NOLINTNEXTLINE(modernize-avoid-c-arrays)
 int main(int argc, char* argv[]) {
+  // TODO(Callum): Set default in abyss::config
   constexpr auto kDefaultDataDir = "/tmp/abyss";
 
   CLI::App app{"abyss — Redis-compatible hot-cold tiered KV store"};
@@ -36,12 +37,17 @@ int main(int argc, char* argv[]) {
   config.queue.wal_path = data_dir + "/wal";
   config.cold.data_path = data_dir + "/cold";
 
+#ifndef _WIN32
   struct sigaction sa{};
   sa.sa_handler = ShutdownHandler;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGTERM, &sa, nullptr);
   sigaction(SIGINT, &sa, nullptr);
   signal(SIGPIPE, SIG_IGN);  // NOLINT(cert-err33-c)
+#else
+  signal(SIGINT, ShutdownHandler);
+  signal(SIGTERM, ShutdownHandler);
+#endif
 
   abyss::server::Server server(config);
   if (!server.Initialize()) {

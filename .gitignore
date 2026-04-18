@@ -5,6 +5,7 @@
 .DS_Store
 
 # Build
+.vs
 build/
 compile_commands.json
 CMakeUserPresets.json

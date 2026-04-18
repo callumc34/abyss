@@ -1,16 +1,24 @@
 #include "server.h"
 
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#define CLOSE_SOCKET(s) closesocket(s)
+#define SHUTDOWN_RDWR SD_BOTH
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#define CLOSE_SOCKET(s) close(s)
+#define SHUTDOWN_RDWR SHUT_RDWR
+#endif
 
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
-#include <functional>
 #include <iostream>
 #include <utility>
 
@@ -19,11 +27,29 @@
 
 namespace abyss::server {
 
+namespace {
+#ifdef _WIN32
+std::string GetSocketError() { return std::to_string(WSAGetLastError()); }
+bool IsSocketInterrupted() { return WSAGetLastError() == WSAEINTR; }
+#else
+std::string GetSocketError() { return std::strerror(errno); }
+bool IsSocketInterrupted() { return errno == EINTR; }
+#endif
+}  // namespace
+
 Server::Server(config::Config config) : config_(std::move(config)) {}
 
 Server::~Server() { Shutdown(); }
 
 bool Server::Initialize() {
+#ifdef _WIN32
+  WSADATA wsa_data;
+  if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+    std::cerr << "WSAStartup failed\n";
+    return false;
+  }
+#endif
+
   std::error_code ec;
   std::filesystem::create_directories(config_.queue.wal_path, ec);
   if (ec) {
@@ -79,13 +105,13 @@ bool Server::Initialize() {
 
 bool Server::SetupListener() {
   listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd_ < 0) {
-    std::cerr << "socket: " << std::strerror(errno) << "\n";
+  if (listen_fd_ == kInvalidSocket) {
+    std::cerr << "socket: " << GetSocketError() << "\n";
     return false;
   }
 
   int on = 1;
-  setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on), sizeof(on));
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -97,16 +123,16 @@ bool Server::SetupListener() {
   addr.sin_port = htons(config_.resp.port);
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    std::cerr << "bind: " << std::strerror(errno) << "\n";
-    close(listen_fd_);
-    listen_fd_ = -1;
+    std::cerr << "bind: " << GetSocketError() << "\n";
+    CLOSE_SOCKET(listen_fd_);
+    listen_fd_ = kInvalidSocket;
     return false;
   }
 
   if (listen(listen_fd_, 128) < 0) {
-    std::cerr << "listen: " << std::strerror(errno) << "\n";
-    close(listen_fd_);
-    listen_fd_ = -1;
+    std::cerr << "listen: " << GetSocketError() << "\n";
+    CLOSE_SOCKET(listen_fd_);
+    listen_fd_ = kInvalidSocket;
     return false;
   }
 
@@ -121,25 +147,40 @@ void Server::Run(const std::atomic<bool>& stop) {
 
   while (!stop.load(std::memory_order_acquire)) {
     pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+
+#ifdef _WIN32
+    int ret = WSAPoll(&pfd, 1, 100);
+#else
     int ret = poll(&pfd, 1, 100);
+#endif
+
     if (ret < 0) {
-      if (errno == EINTR) continue;
+      if (IsSocketInterrupted()) continue;
       break;
     }
     if (ret == 0) continue;
 
     sockaddr_in client_addr{};
+#ifdef _WIN32
+    int client_len = sizeof(client_addr);
+    socket_t client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+    if (client_fd == kInvalidSocket) {
+#else
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-    if (client_fd < 0) {
-      if (errno == EINTR) continue;
+    socket_t client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+    if (client_fd == kInvalidSocket) {
+#endif
+      if (IsSocketInterrupted()) continue;
       break;
     }
 
     int on = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof(on));
+
+#ifndef _WIN32
 #ifdef __APPLE__
     setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
 #endif
 
     CleanFinishedConnections();
@@ -147,7 +188,7 @@ void Server::Run(const std::atomic<bool>& stop) {
     {
       std::lock_guard lock(connections_mutex_);
       if (connections_.size() >= config_.resp.max_connections) {
-        close(client_fd);
+        CLOSE_SOCKET(client_fd);
         continue;
       }
 
@@ -163,7 +204,7 @@ void Server::Run(const std::atomic<bool>& stop) {
   Shutdown();
 }
 
-void Server::HandleConnection(int client_fd, std::atomic<bool>& finished) {
+void Server::HandleConnection(socket_t client_fd, std::atomic<bool>& finished) {
   resp::ConnectionState state{
       .client_id = next_client_id_.fetch_add(1),
       .client_name = {},
@@ -177,7 +218,8 @@ void Server::HandleConnection(int client_fd, std::atomic<bool>& finished) {
   std::vector<uint8_t> output;
 
   for (;;) {
-    auto n = recv(client_fd, read_buf.data(), read_buf.size(), 0);
+    auto n = recv(client_fd, reinterpret_cast<char*>(read_buf.data()),
+                  static_cast<int>(read_buf.size()), 0);
     if (n <= 0) break;
 
     pending.insert(pending.end(), read_buf.begin(), read_buf.begin() + n);
@@ -193,7 +235,8 @@ void Server::HandleConnection(int client_fd, std::atomic<bool>& finished) {
     if (!output.empty()) {
       size_t sent = 0;
       while (sent < output.size()) {
-        auto w = send(client_fd, output.data() + sent, output.size() - sent, 0);
+        auto w = send(client_fd, reinterpret_cast<const char*>(output.data() + sent),
+                      static_cast<int>(output.size() - sent), 0);
         if (w <= 0) break;
         sent += static_cast<size_t>(w);
       }
@@ -203,7 +246,7 @@ void Server::HandleConnection(int client_fd, std::atomic<bool>& finished) {
     if (result.close_requested) break;
   }
 
-  close(client_fd);
+  CLOSE_SOCKET(client_fd);
   finished.store(true, std::memory_order_release);
 }
 
@@ -223,16 +266,16 @@ void Server::CleanFinishedConnections() {
 void Server::Shutdown() {
   if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
-  if (listen_fd_ >= 0) {
-    close(listen_fd_);
-    listen_fd_ = -1;
+  if (listen_fd_ != kInvalidSocket) {
+    CLOSE_SOCKET(listen_fd_);
+    listen_fd_ = kInvalidSocket;
   }
 
   {
     std::lock_guard lock(connections_mutex_);
     for (auto& conn : connections_) {
       if (!conn->finished.load(std::memory_order_acquire)) {
-        ::shutdown(conn->fd, SHUT_RDWR);
+        ::shutdown(conn->fd, SHUTDOWN_RDWR);
       }
     }
   }
@@ -249,6 +292,10 @@ void Server::Shutdown() {
 
   if (cold_consumer_) cold_consumer_->Stop();
   if (hot_consumer_) hot_consumer_->Stop();
+
+#ifdef _WIN32
+  WSACleanup();
+#endif
 
   ready_.store(false, std::memory_order_release);
 }

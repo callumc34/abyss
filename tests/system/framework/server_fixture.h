@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 
+#include "platform_compat.h"
 #include "redis_client.h"
 
 namespace abyss::system_test {
@@ -24,7 +25,7 @@ class TestServer {
   bool Start();
   void Stop();
   void Kill();
-  bool IsRunning() const { return pid_ > 0; }
+  bool IsRunning() const;
   uint16_t Port() const { return port_; }
   const std::string& SkipReason() const { return skip_reason_; }
 
@@ -32,7 +33,11 @@ class TestServer {
   static uint16_t AllocatePort();
   bool WaitForReady(std::chrono::seconds timeout) const;
 
+#ifdef _WIN32
+  HANDLE process_handle_ = nullptr;
+#else
   pid_t pid_ = -1;
+#endif
   uint16_t port_ = 0;
   std::filesystem::path data_dir_;
   std::string skip_reason_;

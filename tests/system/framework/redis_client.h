@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "platform_compat.h"
+
 namespace abyss::system_test {
 
 class Reply {
@@ -56,7 +58,7 @@ class RedisClient {
   bool Connect(const std::string& host, uint16_t port,
                std::chrono::milliseconds timeout = std::chrono::milliseconds{5000});
   void Close();
-  bool IsConnected() const { return fd_ >= 0; }
+  bool IsConnected() const { return fd_ != kInvalidSocket; }
 
   Reply Command(std::initializer_list<std::string> args);
   std::vector<Reply> Pipeline(const std::vector<std::vector<std::string>>& commands);
@@ -70,7 +72,7 @@ class RedisClient {
 
   static std::string Encode(const std::vector<std::string>& args);
 
-  int fd_ = -1;
+  socket_t fd_ = kInvalidSocket;
   std::vector<char> buf_;
   size_t rpos_ = 0;
   size_t wpos_ = 0;
