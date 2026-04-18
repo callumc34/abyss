@@ -31,6 +31,11 @@ cold_consumer:
   buffer_high_water_bytes: 536870912
   max_flush_batch_size: 10000
 
+recovery:
+  replay_parallelism: 4
+  hot_replay_batch_size: 10000
+  cold_replay_batch_size: 50000
+
 resp:
   bind: 0.0.0.0
   port: 6379

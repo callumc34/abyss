@@ -51,6 +51,14 @@ set_package_properties(CLI11 PROPERTIES
   PURPOSE "Server CLI argument parsing"
 )
 
+find_package(yaml-cpp CONFIG REQUIRED)
+set_package_properties(yaml-cpp PROPERTIES
+  TYPE REQUIRED
+  DESCRIPTION "YAML parser for C++"
+  URL "https://github.com/jbeder/yaml-cpp"
+  PURPOSE "Configuration file parsing"
+)
+
 if(ABYSS_WITH_ROCKSDB)
   find_package(RocksDB CONFIG REQUIRED)
   set_package_properties(RocksDB PROPERTIES
