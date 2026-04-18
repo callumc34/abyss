@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include "abyss/consumer/compaction_buffer.h"
+#include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/ops.h"
 #include "mock_cold_store.h"
@@ -15,6 +18,17 @@ namespace {
 using ::testing::_;
 using ::testing::Return;
 
+class SingleBufferRouter : public consumer::CompactionBufferRouter {
+ public:
+  explicit SingleBufferRouter(consumer::CompactionBuffer& buffer) : buffer_(buffer) {}
+  core::Result<core::RespValue> Read(std::string_view key) const override {
+    return buffer_.Read(std::string(key));
+  }
+
+ private:
+  consumer::CompactionBuffer& buffer_;
+};
+
 class TieringEngineTest : public ::testing::Test {
  protected:
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -22,11 +36,12 @@ class TieringEngineTest : public ::testing::Test {
   testing::MockHotStore hot_;
   testing::MockColdStore cold_;
   consumer::CompactionBuffer buffer_;
+  SingleBufferRouter router_{buffer_};
   core::ConsumerRpc rpc_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr uint32_t kShardCount = 16;
 
-  TieringEngine MakeEngine() { return {queue_, hot_, cold_, buffer_, rpc_, kShardCount}; }
+  TieringEngine MakeEngine() { return {queue_, hot_, cold_, router_, rpc_, kShardCount}; }
 
   core::RespCommand MakeCmd(std::initializer_list<std::string> args) {
     return core::RespCommand{.args = std::vector<std::string>(args)};

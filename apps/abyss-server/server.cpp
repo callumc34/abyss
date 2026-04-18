@@ -90,7 +90,6 @@ bool Server::Initialize() {
   }
   queue_ = std::move(*queue_result);
 
-  compaction_buffer_ = std::make_unique<consumer::CompactionBuffer>();
   consumer_rpc_ = std::make_unique<core::ConsumerRpc>();
 
 #ifdef ABYSS_HAVE_ROCKSDB
@@ -110,17 +109,36 @@ bool Server::Initialize() {
   }
   cold_store_ = std::move(*cold_result);
 
-  engine_ = std::make_unique<engine::TieringEngine>(*queue_, *hot_store_, *cold_store_,
-                                                    *compaction_buffer_, *consumer_rpc_,
-                                                    hot_store_->shard_count());
+  std::vector<core::EvictionRule> overrides;
+  overrides.reserve(config_.hot.eviction_overrides.size());
+  for (const auto& o : config_.hot.eviction_overrides) {
+    overrides.push_back({.prefix = o.prefix, .eviction = o.eviction});
+  }
+  core::EvictionPolicy eviction_policy{config_.hot.default_eviction, std::move(overrides)};
+
+  cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
+      *queue_, *cold_store_,
+      consumer::ColdConsumerPool::Config{
+          .shard_count = hot_store_->shard_count(),
+          .consumer =
+              consumer::ColdConsumer::Config{
+                  .quiet_threshold = config_.cold_consumer.quiet_threshold,
+                  .safety_margin = config_.cold_consumer.safety_margin,
+                  .jitter_fraction = config_.cold_consumer.deadline_jitter_ratio,
+                  .buffer_high_water_bytes = config_.cold_consumer.buffer_high_water_bytes,
+                  .max_flush_batch_size = config_.cold_consumer.max_flush_batch_size,
+              },
+      },
+      eviction_policy);
+
+  engine_ = std::make_unique<engine::TieringEngine>(*queue_, *hot_store_, *cold_store_, *cold_pool_,
+                                                    *consumer_rpc_, hot_store_->shard_count());
 
   hot_consumer_ = std::make_unique<consumer::HotConsumer>(*queue_, *hot_store_, 0,
                                                           config_.hot.default_eviction);
-  cold_consumer_ =
-      std::make_unique<consumer::ColdConsumer>(*queue_, *cold_store_, *compaction_buffer_, 0);
 
   hot_consumer_->Start();
-  cold_consumer_->Start();
+  cold_pool_->Start();
 #endif
 
   ready_.store(true, std::memory_order_release);
@@ -315,7 +333,7 @@ void Server::Shutdown() {
     connections_.clear();
   }
 
-  if (cold_consumer_) cold_consumer_->Stop();
+  if (cold_pool_) cold_pool_->Stop();
   if (hot_consumer_) hot_consumer_->Stop();
 
 #ifdef _WIN32
