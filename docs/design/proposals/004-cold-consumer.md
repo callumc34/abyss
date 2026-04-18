@@ -134,3 +134,21 @@ cold_consumer:
 **Why jitter on the deadline flush?** Without jitter, keys that enter the buffer at similar times would all hit their deadlines simultaneously, causing a thundering herd of flushes. The jitter spreads deadline flushes across `safety_margin * 0.5` seconds.
 
 **Why `shared_mutex` instead of a concurrent map?** The compaction buffer has asymmetric access: one writer (cold consumer thread) doing absorb/remove, many readers (I/O threads) doing lookups. A `shared_mutex` with shared read locks and exclusive write locks matches this pattern well. A concurrent map would be over-engineered given that the cold consumer is a single thread.
+
+## Flush Machinery Design Decisions
+
+Decided during flush implementation (#25, #26). These are locked in and should not be revisited without measurement data.
+
+### 1. Lazy staleness for heap entries
+
+When a key is re-absorbed, its quiet deadline slides forward. Rather than finding and updating the existing heap entry (O(N) for a binary heap), we insert a new heap entry and let stale entries be discarded on pop. The staleness check compares the heap entry's scheduled time against `NextFlushTime(entry, entry.eviction) + entry.jitter_offset` recomputed from the entry's current state. If they differ, the heap entry is stale and is discarded.
+
+This is simpler and cheaper than eager updates. The only cost is extra heap entries — one per re-absorb — but these are cheap (a time point + string key) and are lazily cleaned on the next FlushReady call. Pathological rewrite-heavy workloads could accumulate many stale entries, but the cold consumer calls FlushReady regularly, bounding the accumulation.
+
+### 2. Eviction stored on BufferEntry
+
+The flush strategy needs the per-key eviction TTL to compute the eviction deadline. Storing it on BufferEntry at Absorb time makes the heap self-contained — no additional lookups needed when popping entries. The eviction is updated on every re-absorb to reflect the latest TTL from the queue.
+
+### 3. Jitter: 10% of quiet_threshold
+
+Jitter is a per-entry random offset in `[0, quiet_threshold * jitter_fraction]`, computed once when the entry first enters the buffer. At default values (quiet_threshold=30s, jitter_fraction=0.1), the range is [0, 3s]. The jitter is stable across re-absorbs so the staleness check remains valid. The jitter is added to the result of `NextFlushTime`, spreading both quiet-window and deadline flushes. The fraction is configurable via `FlushStrategy` but the default should not be tuned until measured under production load.

@@ -9,6 +9,7 @@ using namespace std::chrono_literals;
 
 class FlushStrategyTest : public ::testing::Test {
  protected:
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   FlushStrategy strategy_;
 
   BufferEntry MakeEntry(core::SteadyTime first_seen, core::SteadyTime last_modified) {
@@ -68,6 +69,34 @@ TEST_F(FlushStrategyTest, EqualQuietAndDeadlineReturnsSharedTime) {
 
   auto flush = strategy_.NextFlushTime(entry, eviction);
   EXPECT_EQ(flush, quiet_deadline);
+}
+
+// ---------------------------------------------------------------------------
+// MaxJitter
+// ---------------------------------------------------------------------------
+
+TEST_F(FlushStrategyTest, DefaultMaxJitterIsTenPercentOfQuietThreshold) {
+  auto max_jitter = strategy_.MaxJitter();
+  EXPECT_EQ(max_jitter, 3000ms);
+}
+
+TEST_F(FlushStrategyTest, MaxJitterWithCustomConfig) {
+  FlushStrategy custom{60s, 300s, 0.2};
+  EXPECT_EQ(custom.MaxJitter(), 12000ms);
+}
+
+TEST_F(FlushStrategyTest, MaxJitterZeroFraction) {
+  FlushStrategy zero_jitter{30s, 300s, 0.0};
+  EXPECT_EQ(zero_jitter.MaxJitter(), 0ms);
+}
+
+TEST_F(FlushStrategyTest, CustomThresholdsAffectDeadlines) {
+  FlushStrategy custom{10s, 60s};
+  auto t0 = core::SteadyTime{100s};
+  auto entry = MakeEntry(t0, t0);
+
+  auto flush = custom.NextFlushTime(entry, 3600s);
+  EXPECT_EQ(flush, t0 + 10s);
 }
 
 }  // namespace
