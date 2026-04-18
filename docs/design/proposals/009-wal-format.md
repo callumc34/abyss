@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Created:** 2026-04-15
+**Updated:** 2026-04-18
 
 ## Context
 
@@ -70,12 +71,15 @@ Each entry consists of a length prefix, a body, and a body CRC:
 │    for each arg:                                │
 │      arg_len     u32                            │
 │      arg_bytes   raw bytes                      │
-│    [future additive fields may follow here]     │
+│    batch_last_seq u64   (format ≥1.1) closing   │
+│                         seq of this entry's     │
+│                         batch; equals `seq` for │
+│                         single-entry appends    │
 │  body_crc   u32   CRC32C over body              │
 └─────────────────────────────────────────────────┘
 ```
 
-Fixed envelope cost: 29 bytes per entry, plus 4 bytes per argument on top of the argument payload. A typical `SET foo bar` (three 3-byte args) costs 50 bytes on disk; a `SET key <1 KiB value>` costs ~1071 bytes (~4% overhead).
+Fixed envelope cost: 37 bytes per entry at format 1.1, plus 4 bytes per argument on top of the argument payload. A typical `SET foo bar` (three 3-byte args) costs 58 bytes on disk; a `SET key <1 KiB value>` costs ~1079 bytes (~5% overhead).
 
 **Entry types** (`type` byte):
 
@@ -110,6 +114,8 @@ The format supports two axes of versioning:
 
 - **`format_major` (u8)** — breaking changes. Readers refuse to open segments with a different major version than they understand.
 - **`format_minor` (u8)** — additive changes. Readers of the same major version can read any minor version, higher or lower.
+
+**Format 1.1** adds `batch_last_seq: u64` at the end of the body, before `body_crc`. Its value is the sequence ID of the final entry of the batch this entry belongs to. Single-entry appends set it to `entry.seq`. `AppendBatch` assigns the same value — the batch's last seq — to every entry in the batch. Recovery advances the segment's durable tail only at entries where `seq == batch_last_seq`; mid-batch entries whose closer failed to land are truncated together with the closer, so consumers never observe a partial batch. Readers at minor 1.0 ignore the trailing field (ADP-009 skip-unknown rule); they still parse 1.1 segments correctly but lose the batch-atomicity invariant for entries older than their own minor. This is acceptable pre-alpha — there is no deployed 1.0 WAL.
 
 The minor-version compatibility guarantee rests on two layout invariants:
 
@@ -203,6 +209,7 @@ This gives the Abyss durability guarantee: any entry whose `Append` returned OK 
 6. Within the same `format_major`, readers can process segments written by any `format_minor`.
 7. Sequence IDs are monotonically increasing across entries within a segment and across segments for a given shard.
 8. `base_seq` of segment N+1 equals `last_seq` of segment N plus 1 — there are no gaps at segment boundaries.
+9. (format ≥1.1) After recovery, for every batch appended via `AppendBatch`, either every entry of the batch is present or none is. Recovery never exposes a proper subset of a batch's entries.
 
 ## Trade-offs
 

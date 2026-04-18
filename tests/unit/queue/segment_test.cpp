@@ -21,6 +21,13 @@ namespace {
 
 constexpr size_t kDefaultMaxSize = size_t{4} * 1024 * 1024;
 
+// Most tests write single-entry appends where batch_last_seq == entry.seq.
+// This wrapper keeps test expressions tidy; tests that exercise batches
+// call Segment::Append(entry, last_seq) directly.
+core::Result<size_t> AppendSingle(Segment& seg, const core::QueueEntry& entry) {
+  return seg.Append(entry, entry.seq);
+}
+
 class SegmentTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -108,9 +115,9 @@ TEST_F(SegmentTest, CreateAndReadBack) {
   EXPECT_EQ(seg->entry_count(), 0U);
   EXPECT_EQ(seg->write_offset(), kSegmentHeaderSize);
 
-  ASSERT_TRUE(seg->Append(MakeWrite(100, {"SET", "a", "1"})).has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(101, {"SET", "b", "2"})).has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(102, {"DEL", "c"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(100, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(101, {"SET", "b", "2"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(102, {"DEL", "c"})).has_value());
 
   EXPECT_EQ(seg->next_seq(), 103U);
   EXPECT_EQ(seg->entry_count(), 3U);
@@ -134,8 +141,8 @@ TEST_F(SegmentTest, OpenExistingRoundTrip) {
   {
     auto seg = Segment::Create(path, MakeHeader(50), kDefaultMaxSize);
     ASSERT_TRUE(seg.has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(50, {"SET", "x", "hello"})).has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(51, {"SET", "y", "world"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(50, {"SET", "x", "hello"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(51, {"SET", "y", "world"})).has_value());
     expected_offset = seg->write_offset();
   }
 
@@ -159,15 +166,15 @@ TEST_F(SegmentTest, OpenAndContinueAppending) {
   {
     auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
     ASSERT_TRUE(seg.has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
   }
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
   EXPECT_EQ(seg->next_seq(), 2U);
 
-  ASSERT_TRUE(seg->Append(MakeWrite(2, {"SET", "c", "3"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(2, {"SET", "c", "3"})).has_value());
   EXPECT_EQ(seg->next_seq(), 3U);
   EXPECT_EQ(seg->entry_count(), 3U);
 
@@ -183,9 +190,9 @@ TEST_F(SegmentTest, TornTail_TruncatedBody) {
   {
     auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
     ASSERT_TRUE(seg.has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
     good_offset = seg->write_offset();
-    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
   }
 
   // Truncate mid-way through the second entry's body.
@@ -214,9 +221,9 @@ TEST_F(SegmentTest, TornTail_TruncatedCrc) {
   {
     auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
     ASSERT_TRUE(seg.has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
     good_offset = seg->write_offset();
-    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
   }
 
   // Read file to find where the second entry's CRC starts, then truncate there.
@@ -237,13 +244,13 @@ TEST_F(SegmentTest, TornTail_CrcMismatch) {
   {
     auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
     ASSERT_TRUE(seg.has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
     good_offset = seg->write_offset();
-    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
   }
 
   // Corrupt a byte in the second entry's body.
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
   int fd = ::open(path.c_str(), O_RDWR);
   ASSERT_GE(fd, 0);
   uint8_t byte = 0;
@@ -269,8 +276,8 @@ TEST_F(SegmentTest, AppendAfterRecovery) {
   {
     auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
     ASSERT_TRUE(seg.has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
-    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
   }
 
   // Truncate mid-second-entry.
@@ -283,8 +290,8 @@ TEST_F(SegmentTest, AppendAfterRecovery) {
   EXPECT_EQ(seg->entry_count(), 1U);
   EXPECT_EQ(seg->next_seq(), 1U);
 
-  ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "c", "3"})).has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(2, {"SET", "d", "4"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "c", "3"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(2, {"SET", "d", "4"})).has_value());
   EXPECT_EQ(seg->entry_count(), 3U);
   EXPECT_EQ(seg->next_seq(), 3U);
 
@@ -300,10 +307,10 @@ TEST_F(SegmentTest, ReadFromMiddleOffset) {
   auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
 
-  ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
   const size_t second_offset = seg->write_offset();
-  ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(2, {"SET", "c", "3"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(2, {"SET", "c", "3"})).has_value());
 
   auto read = seg->ReadEntries(second_offset, 10);
   ASSERT_TRUE(read.has_value());
@@ -318,7 +325,7 @@ TEST_F(SegmentTest, ReadFromSequenceId) {
   ASSERT_TRUE(seg.has_value());
 
   for (core::SequenceId s = 100; s < 105; ++s) {
-    ASSERT_TRUE(seg->Append(MakeWrite(s, {"SET", "k", std::to_string(s)})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(s, {"SET", "k", std::to_string(s)})).has_value());
   }
 
   auto read = seg->ReadEntriesFrom(102, 10);
@@ -332,7 +339,7 @@ TEST_F(SegmentTest, ReadFromSequenceId) {
 TEST_F(SegmentTest, ReadEntriesFromBeforeSegment) {
   auto seg = Segment::Create(SegPath(), MakeHeader(100), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(100, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(100, {"SET", "a", "1"})).has_value());
 
   auto read = seg->ReadEntriesFrom(50, 10);
   ASSERT_TRUE(read.has_value());
@@ -343,7 +350,7 @@ TEST_F(SegmentTest, ReadEntriesFromBeforeSegment) {
 TEST_F(SegmentTest, ReadEntriesFromPastSegment) {
   auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
 
   auto read = seg->ReadEntriesFrom(999, 10);
   ASSERT_TRUE(read.has_value());
@@ -353,7 +360,7 @@ TEST_F(SegmentTest, ReadEntriesFromPastSegment) {
 TEST_F(SegmentTest, ReadAtWriteOffset) {
   auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
 
   auto read = seg->ReadEntries(seg->write_offset(), 10);
   ASSERT_TRUE(read.has_value());
@@ -387,10 +394,10 @@ TEST_F(SegmentTest, SegmentFullRejectsAppend) {
   auto seg = Segment::Create(SegPath(), MakeHeader(0), kSegmentHeaderSize + 60);
   ASSERT_TRUE(seg.has_value());
 
-  auto r1 = seg->Append(MakeWrite(0, {"SET", "k", "v"}));
+  auto r1 = AppendSingle(*seg, MakeWrite(0, {"SET", "k", "v"}));
   ASSERT_TRUE(r1.has_value());
 
-  auto r2 = seg->Append(MakeWrite(1, {"SET", "k2", "v2"}));
+  auto r2 = AppendSingle(*seg, MakeWrite(1, {"SET", "k2", "v2"}));
   ASSERT_FALSE(r2.has_value());
   EXPECT_EQ(r2.error().code(), core::ErrorCode::kResourceExhausted);
 
@@ -402,30 +409,30 @@ TEST_F(SegmentTest, SequenceOrderingEnforced) {
   auto seg = Segment::Create(SegPath(), MakeHeader(5), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
 
-  ASSERT_TRUE(seg->Append(MakeWrite(5, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(5, {"SET", "a", "1"})).has_value());
 
-  auto bad = seg->Append(MakeWrite(3, {"SET", "b", "2"}));
+  auto bad = AppendSingle(*seg, MakeWrite(3, {"SET", "b", "2"}));
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error().code(), core::ErrorCode::kInvalidArgument);
 
-  auto gap = seg->Append(MakeWrite(7, {"SET", "c", "3"}));
+  auto gap = AppendSingle(*seg, MakeWrite(7, {"SET", "c", "3"}));
   ASSERT_FALSE(gap.has_value());
   EXPECT_EQ(gap.error().code(), core::ErrorCode::kInvalidArgument);
 
-  ASSERT_TRUE(seg->Append(MakeWrite(6, {"SET", "d", "4"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(6, {"SET", "d", "4"})).has_value());
   EXPECT_EQ(seg->next_seq(), 7U);
 }
 
 TEST_F(SegmentTest, MoveSemantics) {
   auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
-  ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
 
   Segment moved = std::move(*seg);
   EXPECT_EQ(moved.next_seq(), 1U);
   EXPECT_EQ(moved.entry_count(), 1U);
 
-  ASSERT_TRUE(moved.Append(MakeWrite(1, {"SET", "b", "2"})).has_value());
+  ASSERT_TRUE(AppendSingle(moved, MakeWrite(1, {"SET", "b", "2"})).has_value());
 
   auto read = moved.ReadEntries(kSegmentHeaderSize, 10);
   ASSERT_TRUE(read.has_value());
@@ -438,7 +445,7 @@ TEST_F(SegmentTest, MoveAssignment) {
   ASSERT_TRUE(seg1.has_value());
   ASSERT_TRUE(seg2.has_value());
 
-  ASSERT_TRUE(seg1->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(AppendSingle(*seg1, MakeWrite(0, {"SET", "a", "1"})).has_value());
 
   *seg2 = std::move(*seg1);
   EXPECT_EQ(seg2->base_seq(), 0U);
@@ -449,10 +456,11 @@ TEST_F(SegmentTest, AllEntryTypes) {
   auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
 
-  ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"})).has_value());
-  ASSERT_TRUE(seg->Append(MakeConditional(1, {"SET", "b", "2", "NX"}, core::PredicateFlags::kNx))
-                  .has_value());
-  ASSERT_TRUE(seg->Append(MakeResolved(2, 1, core::Decision::kApply)).has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(
+      AppendSingle(*seg, MakeConditional(1, {"SET", "b", "2", "NX"}, core::PredicateFlags::kNx))
+          .has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeResolved(2, 1, core::Decision::kApply)).has_value());
 
   auto read = seg->ReadEntries(kSegmentHeaderSize, 10);
   ASSERT_TRUE(read.has_value());
@@ -480,7 +488,7 @@ TEST_F(SegmentTest, MaxCountRespected) {
   ASSERT_TRUE(seg.has_value());
 
   for (core::SequenceId s = 0; s < 10; ++s) {
-    ASSERT_TRUE(seg->Append(MakeWrite(s, {"SET", "k", std::to_string(s)})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(s, {"SET", "k", std::to_string(s)})).has_value());
   }
 
   auto read = seg->ReadEntries(kSegmentHeaderSize, 3);
@@ -504,7 +512,7 @@ TEST_F(SegmentTest, SpaceRemainingTracksWrites) {
   const size_t initial = seg->SpaceRemaining();
   EXPECT_EQ(initial, kDefaultMaxSize - kSegmentHeaderSize);
 
-  auto result = seg->Append(MakeWrite(0, {"SET", "a", "1"}));
+  auto result = AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(seg->SpaceRemaining(), initial - *result);
 }
@@ -548,7 +556,7 @@ TEST_F(SegmentTest, ReadEntriesFromWithBaseSeq) {
   ASSERT_TRUE(seg.has_value());
 
   for (core::SequenceId s = 100; s < 105; ++s) {
-    ASSERT_TRUE(seg->Append(MakeWrite(s, {"SET", "k", std::to_string(s)})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(s, {"SET", "k", std::to_string(s)})).has_value());
   }
 
   auto read = seg->ReadEntriesFrom(100, 10);
@@ -568,6 +576,118 @@ TEST_F(SegmentTest, InvalidFileOffsetRejected) {
   auto too_high = seg->ReadEntries(seg->write_offset() + 100, 10);
   ASSERT_FALSE(too_high.has_value());
   EXPECT_EQ(too_high.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+TEST_F(SegmentTest, FsyncSucceedsOnOpenSegment) {
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+  EXPECT_TRUE(seg->Fsync().has_value());
+}
+
+TEST_F(SegmentTest, SealTruncatesToWriteOffset) {
+  const auto path = SegPath();
+  size_t sealed_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
+    sealed_offset = seg->write_offset();
+    ASSERT_TRUE(seg->Seal().has_value());
+    EXPECT_TRUE(seg->sealed());
+  }
+
+  struct stat st{};
+  ASSERT_EQ(::stat(path.c_str(), &st), 0);
+  EXPECT_EQ(static_cast<size_t>(st.st_size), sealed_offset);
+}
+
+TEST_F(SegmentTest, AppendRejectedAfterSeal) {
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+  ASSERT_TRUE(seg->Seal().has_value());
+
+  auto appended = AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"}));
+  ASSERT_FALSE(appended.has_value());
+  EXPECT_EQ(appended.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+TEST_F(SegmentTest, RecoveryKeepsCompleteBatch) {
+  const auto path = SegPath();
+  size_t expected_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    // Batch of 3 entries with batch_last_seq = 2 shared.
+    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"}), 2).has_value());
+    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"}), 2).has_value());
+    ASSERT_TRUE(seg->Append(MakeWrite(2, {"SET", "c", "3"}), 2).has_value());
+    expected_offset = seg->write_offset();
+  }
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  EXPECT_EQ(seg->entry_count(), 3U);
+  EXPECT_EQ(seg->next_seq(), 3U);
+  EXPECT_EQ(seg->write_offset(), expected_offset);
+}
+
+TEST_F(SegmentTest, RecoveryTruncatesIncompleteBatch) {
+  const auto path = SegPath();
+  size_t before_batch_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    // One complete single-entry write, then a 3-entry batch we crash mid-way
+    // through by writing just the first entry of the batch.
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "pre", "ok"})).has_value());
+    before_batch_offset = seg->write_offset();
+    // Only the first entry of a 3-entry batch lands.
+    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "a", "1"}), 3).has_value());
+  }
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  // The incomplete batch entry is truncated; only the pre-batch entry remains.
+  EXPECT_EQ(seg->entry_count(), 1U);
+  EXPECT_EQ(seg->next_seq(), 1U);
+  EXPECT_EQ(seg->write_offset(), before_batch_offset);
+
+  // File was physically truncated.
+  struct stat st{};
+  ASSERT_EQ(::stat(path.c_str(), &st), 0);
+  EXPECT_EQ(static_cast<size_t>(st.st_size), before_batch_offset);
+}
+
+TEST_F(SegmentTest, RecoveryKeepsCompleteBatchesAfterIncompleteTruncation) {
+  const auto path = SegPath();
+  size_t checkpoint_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    // Complete batch of 2.
+    ASSERT_TRUE(seg->Append(MakeWrite(0, {"SET", "a", "1"}), 1).has_value());
+    ASSERT_TRUE(seg->Append(MakeWrite(1, {"SET", "b", "2"}), 1).has_value());
+    checkpoint_offset = seg->write_offset();
+    // Begin a batch of 3, only the first entry lands.
+    ASSERT_TRUE(seg->Append(MakeWrite(2, {"SET", "c", "3"}), 4).has_value());
+  }
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  EXPECT_EQ(seg->entry_count(), 2U);
+  EXPECT_EQ(seg->next_seq(), 2U);
+  EXPECT_EQ(seg->write_offset(), checkpoint_offset);
+}
+
+TEST_F(SegmentTest, SealIsIdempotent) {
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  ASSERT_TRUE(seg->Seal().has_value());
+  EXPECT_TRUE(seg->Seal().has_value());
+  EXPECT_TRUE(seg->sealed());
 }
 
 }  // namespace

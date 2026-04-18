@@ -74,7 +74,8 @@ WalEntryType EntryType(const core::QueueEntry& entry) {
 
 }  // namespace
 
-size_t EncodeWalEntry(const core::QueueEntry& entry, std::vector<std::byte>& out) {
+size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last_seq,
+                      std::vector<std::byte>& out) {
   using namespace binary;
   const size_t start = out.size();
 
@@ -111,6 +112,8 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, std::vector<std::byte>& out
       },
       entry.payload);
 
+  WriteU64LE(out, batch_last_seq);
+
   const size_t body_len = out.size() - body_start;
   PatchU32LE(out, start, static_cast<uint32_t>(body_len));
 
@@ -120,7 +123,8 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, std::vector<std::byte>& out
   return out.size() - start;
 }
 
-core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes) {
+core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
+                                             uint8_t format_minor) {
   using namespace binary;
   const size_t initial_size = bytes.size();
 
@@ -204,7 +208,6 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes) {
         if (!cmd.has_value()) return std::unexpected(cmd.error());
         mat_op = std::move(*cmd);
       }
-      // Read inline RESP-encoded return value.
       uint32_t resp_len = 0;
       if (!ReadU32LE(cursor, resp_len)) {
         return std::unexpected(Corrupted("missing return_value length"));
@@ -233,7 +236,23 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes) {
       return std::unexpected(Corrupted("unknown entry type"));
   }
 
-  return DecodedWalEntry{.entry = std::move(qe), .bytes_consumed = initial_size - bytes.size()};
+  core::SequenceId batch_last_seq = qe.seq;
+  if (format_minor >= 1) {
+    uint64_t raw = 0;
+    if (!ReadU64LE(cursor, raw)) {
+      return std::unexpected(Corrupted("missing batch_last_seq"));
+    }
+    if (raw < qe.seq) {
+      return std::unexpected(Corrupted("batch_last_seq < seq"));
+    }
+    batch_last_seq = raw;
+  }
+
+  return DecodedWalEntry{
+      .entry = std::move(qe),
+      .bytes_consumed = initial_size - bytes.size(),
+      .batch_last_seq = batch_last_seq,
+  };
 }
 
 }  // namespace abyss::queue

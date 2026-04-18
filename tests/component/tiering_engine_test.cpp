@@ -119,7 +119,11 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
 TEST_F(TieringEngineTest, WriteAppendsToQueueAndReturnsOk) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(queue_, Append(_, _)).WillOnce(Return(core::SequenceId{1}));
+  EXPECT_CALL(queue_, Append(_, _)).WillOnce([](core::ShardId, core::QueueEntry) {
+    std::promise<core::Result<void>> p;
+    p.set_value(core::Result<void>{});
+    return queue::AppendResult{.seq = 1, .durable = p.get_future()};
+  });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
   ASSERT_TRUE(result.has_value());

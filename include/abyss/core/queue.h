@@ -6,6 +6,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/queue/append_result.h"
 
 namespace abyss::core {
 
@@ -25,8 +26,9 @@ class Queue {
   Queue(Queue&&) = delete;
   Queue& operator=(Queue&&) = delete;
 
-  virtual Result<SequenceId> Append(ShardId shard, QueueEntry entry) = 0;
-  virtual Result<SequenceId> AppendBatch(ShardId shard, std::span<const QueueEntry> entries) = 0;
+  virtual Result<queue::AppendResult> Append(ShardId shard, QueueEntry entry) = 0;
+  virtual Result<queue::AppendBatchResult> AppendBatch(ShardId shard,
+                                                       std::span<const QueueEntry> entries) = 0;
 
   virtual Result<std::vector<QueueEntry>> Read(ConsumerId consumer, ShardId shard, size_t max_count,
                                                Duration timeout) = 0;

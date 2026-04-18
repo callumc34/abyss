@@ -41,7 +41,11 @@ class IntegrationHarness {
     rpc_ = std::make_unique<core::ConsumerRpc>();
 
     ON_CALL(queue_, Append(::testing::_, ::testing::_))
-        .WillByDefault(::testing::Return(core::SequenceId{next_seq_++}));
+        .WillByDefault([this](core::ShardId, const core::QueueEntry&) {
+          std::promise<core::Result<void>> p;
+          p.set_value(core::Result<void>{});
+          return queue::AppendResult{.seq = next_seq_++, .durable = p.get_future()};
+        });
 
     engine_ = std::make_unique<engine::TieringEngine>(queue_, *hot_, *cold_, *buffer_, *rpc_,
                                                       kShardCount);

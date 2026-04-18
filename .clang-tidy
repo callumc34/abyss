@@ -26,6 +26,7 @@ Checks: >
   -misc-include-cleaner,
   -misc-non-private-member-variables-in-classes,
   -misc-no-recursion,
+  -misc-override-with-different-visibility,
   -misc-use-internal-linkage,
   -performance-enum-size,
   -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access

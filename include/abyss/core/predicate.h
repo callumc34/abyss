@@ -19,10 +19,12 @@ enum class PredicateFlags : uint16_t {
 };
 
 constexpr PredicateFlags operator|(PredicateFlags a, PredicateFlags b) {
+  // NOLINTNEXTLINE(readability-redundant-casting)
   return static_cast<PredicateFlags>(static_cast<uint16_t>(a) | static_cast<uint16_t>(b));
 }
 
 constexpr PredicateFlags operator&(PredicateFlags a, PredicateFlags b) {
+  // NOLINTNEXTLINE(readability-redundant-casting)
   return static_cast<PredicateFlags>(static_cast<uint16_t>(a) & static_cast<uint16_t>(b));
 }
 

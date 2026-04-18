@@ -80,7 +80,8 @@ Segment::Segment(Segment&& other) noexcept
       fd_(other.fd_),
       write_offset_(other.write_offset_),
       next_seq_(other.next_seq_),
-      entry_count_(other.entry_count_) {
+      entry_count_(other.entry_count_),
+      sealed_(other.sealed_) {
   other.fd_ = -1;
 }
 
@@ -96,6 +97,7 @@ Segment& Segment::operator=(Segment&& other) noexcept {
     write_offset_ = other.write_offset_;
     next_seq_ = other.next_seq_;
     entry_count_ = other.entry_count_;
+    sealed_ = other.sealed_;
     other.fd_ = -1;
   }
   return *this;
@@ -168,15 +170,29 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
       return std::unexpected(data_read.error());
     }
 
+    // Scan the body. Advance the "durable" watermark only at batch-closing.
     std::span<const std::byte> view(data.data(), *data_read);
+    size_t cursor_offset = 0;
+    size_t durable_offset = 0;
+    core::SequenceId pending_next_seq = header->base_seq;
+    size_t pending_entry_count = 0;
+
     while (!view.empty()) {
-      auto decoded = DecodeWalEntry(view);
+      auto decoded = DecodeWalEntry(view, header->format_minor);
       if (!decoded.has_value()) break;
-      next_seq = decoded->entry.seq + 1;
-      entry_count++;
+      cursor_offset += decoded->bytes_consumed;
+      pending_next_seq = decoded->entry.seq + 1;
+      ++pending_entry_count;
+
+      if (decoded->entry.seq == decoded->batch_last_seq) {
+        durable_offset = cursor_offset;
+        next_seq = pending_next_seq;
+        entry_count = pending_entry_count;
+      }
       view = view.subspan(decoded->bytes_consumed);
     }
-    write_offset = kSegmentHeaderSize + (*data_read - view.size());
+
+    write_offset = kSegmentHeaderSize + durable_offset;
   }
 
   if (write_offset < file_size) {
@@ -189,15 +205,25 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
   return Segment(path, *header, max_size, fd, write_offset, next_seq, entry_count);
 }
 
-core::Result<size_t> Segment::Append(const core::QueueEntry& entry) {
+// NOLINTNEXTLINE(readability-make-member-function-const)
+core::Result<size_t> Segment::Append(const core::QueueEntry& entry,
+                                     core::SequenceId batch_last_seq) {
+  if (sealed_) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "append on sealed segment"});
+  }
   if (entry.seq != next_seq_) {
     return std::unexpected(core::Error{
         core::ErrorCode::kInvalidArgument,
         "expected seq " + std::to_string(next_seq_) + ", got " + std::to_string(entry.seq)});
   }
+  if (batch_last_seq < entry.seq) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "batch_last_seq < entry.seq"});
+  }
 
   std::vector<std::byte> buf;
-  size_t encoded_size = EncodeWalEntry(entry, buf);
+  size_t encoded_size = EncodeWalEntry(entry, batch_last_seq, buf);
 
   if (write_offset_ + encoded_size > max_size_) {
     return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "segment full"});
@@ -212,6 +238,31 @@ core::Result<size_t> Segment::Append(const core::QueueEntry& entry) {
   next_seq_ = entry.seq + 1;
   entry_count_++;
   return encoded_size;
+}
+
+core::Result<void> Segment::Fsync() const {
+  if (fd_ < 0) {
+    return std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync on closed segment"});
+  }
+  if (::fsync(fd_) < 0) {
+    return std::unexpected(IoError("fsync"));
+  }
+  return {};
+}
+
+core::Result<void> Segment::Seal() {
+  if (sealed_) return {};
+  if (fd_ < 0) {
+    return std::unexpected(core::Error{core::ErrorCode::kInternal, "seal on closed segment"});
+  }
+  if (::ftruncate(fd_, static_cast<off_t>(write_offset_)) < 0) {
+    return std::unexpected(IoError("ftruncate"));
+  }
+  if (::fsync(fd_) < 0) {
+    return std::unexpected(IoError("fsync"));
+  }
+  sealed_ = true;
+  return {};
 }
 
 core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_t max_count) const {
@@ -243,7 +294,7 @@ core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_
     size_t chunk_consumed = 0;
 
     while (!view.empty() && result.entries.size() < max_count) {
-      auto decoded = DecodeWalEntry(view);
+      auto decoded = DecodeWalEntry(view, header_.format_minor);
       if (!decoded.has_value()) break;
       result.entries.push_back(std::move(decoded->entry));
       view = view.subspan(decoded->bytes_consumed);
@@ -267,7 +318,7 @@ core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_
       auto entry_read = FullPread(fd_, entry_buf.data(), entry_size, static_cast<off_t>(cursor));
       if (!entry_read.has_value() || *entry_read < entry_size) break;
 
-      auto decoded = DecodeWalEntry(std::span<const std::byte>(entry_buf));
+      auto decoded = DecodeWalEntry(std::span<const std::byte>(entry_buf), header_.format_minor);
       if (!decoded.has_value()) break;
 
       result.entries.push_back(std::move(decoded->entry));

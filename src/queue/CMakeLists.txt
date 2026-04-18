@@ -5,6 +5,11 @@ add_library(abyss_queue
   crc32c.cpp
   wal_entry.cpp
   segment_header.cpp
+  fsync_policy.cpp
+  memory_offset_store.cpp
+  file_offset_store.cpp
+  segment_reaper.cpp
+  shard_state.cpp
 )
 add_library(abyss::queue ALIAS abyss_queue)
 

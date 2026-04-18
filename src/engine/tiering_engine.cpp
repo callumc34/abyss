@@ -48,13 +48,19 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
     shard = hot::ComputeShard(cmd.args[1], shard_count_);
   }
 
-  core::QueueEntry entry;
-  entry.appended_at = core::WallClock::now();
-  entry.payload = core::entry::Write{.cmd = std::move(cmd)};
+  core::QueueEntry entry{
+      .appended_at = core::WallClock::now(),
+      .payload = core::entry::Write{.cmd = std::move(cmd)},
+  };
 
-  auto seq = queue_.Append(shard, std::move(entry));
-  if (!seq.has_value()) {
-    return std::unexpected(seq.error());
+  auto appended = queue_.Append(shard, std::move(entry));
+  if (!appended.has_value()) {
+    return std::unexpected(appended.error());
+  }
+
+  auto durable = appended->durable.get();
+  if (!durable.has_value()) {
+    return std::unexpected(durable.error());
   }
 
   return core::RespValue::SimpleString("OK");

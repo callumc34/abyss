@@ -26,8 +26,15 @@ class Segment {
   Segment& operator=(const Segment&) = delete;
 
   // Serialise and write an entry to the fd via pwrite. Does NOT fsync.
-  // Returns the number of bytes written on success.
-  core::Result<size_t> Append(const core::QueueEntry& entry);
+  core::Result<size_t> Append(const core::QueueEntry& entry, core::SequenceId batch_last_seq);
+
+  // Flush the fd's in-kernel dirty pages. Blocks until storage acknowledges.
+  core::Result<void> Fsync() const;
+
+  // Seal the segment.
+  core::Result<void> Seal();
+
+  bool sealed() const { return sealed_; }
 
   struct ReadResult {
     std::vector<core::QueueEntry> entries;
@@ -60,6 +67,7 @@ class Segment {
   size_t write_offset_ = 0;
   core::SequenceId next_seq_ = 0;
   size_t entry_count_ = 0;
+  bool sealed_ = false;
 };
 
 }  // namespace abyss::queue
