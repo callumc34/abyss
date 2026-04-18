@@ -11,6 +11,7 @@
 #include <string>
 
 #include "abyss/core/cold_store.h"
+#include "abyss/core/types.h"
 
 namespace abyss::cold::backends {
 
@@ -25,8 +26,10 @@ struct RocksdbConfig {
   uint32_t max_write_buffer_number = 4;
   uint32_t bloom_filter_bits_per_key = 10;
   CompactionStyle compaction_style = CompactionStyle::kLevel;
+  core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
+// RocksDB-backed cold store.
 class RocksdbStore : public core::ColdStore {
  public:
   static core::Result<std::unique_ptr<RocksdbStore>> Create(RocksdbConfig config);
@@ -43,13 +46,12 @@ class RocksdbStore : public core::ColdStore {
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
 
+  // DEL returns the count of keys that existed before deletion.
   core::Result<core::RespValue> ExecDel(const core::ops::Del& op);
 
  private:
   struct Impl;
   explicit RocksdbStore(std::unique_ptr<Impl> impl);
-
-  core::Result<core::RespValue> ExecStringGet(const core::ops::StringGet& op);
 
   std::unique_ptr<Impl> impl_;
 };

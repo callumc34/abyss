@@ -70,6 +70,8 @@ if(ABYSS_WITH_ROCKSDB)
   target_sources(abyss_cold_tests PRIVATE
     cold/backends/rocksdb_store_lifecycle_test.cpp
     cold/backends/rocksdb_store_strings_test.cpp
+    cold/backends/rocksdb_store_collections_test.cpp
+    cold/backends/rocksdb_store_ttl_test.cpp
   )
   target_include_directories(abyss_cold_tests SYSTEM PRIVATE
     $<TARGET_PROPERTY:RocksDB::rocksdb,INTERFACE_INCLUDE_DIRECTORIES>

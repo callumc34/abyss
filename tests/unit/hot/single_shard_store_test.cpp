@@ -145,7 +145,7 @@ TEST_F(SingleShardStoreTest, ZsetAddAndScore) {
   core::ops::ZsetScore score_op{.key = "zs", .member = "m1"};
   auto result = store_.Exec(core::ops::ReadOp{score_op});
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->AsString(), "1.500000");
+  EXPECT_EQ(result->AsString(), "1.5");
 }
 
 TEST_F(SingleShardStoreTest, ZsetScoreNonMember) {
@@ -179,7 +179,7 @@ TEST_F(SingleShardStoreTest, ZsetAddUpdatesScore) {
   core::ops::ZsetScore score_op{.key = "zs", .member = "m"};
   auto result = store_.Exec(core::ops::ReadOp{score_op});
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->AsString(), "5.000000");
+  EXPECT_EQ(result->AsString(), "5");
 
   core::ops::ZsetCard card_op{.key = "zs"};
   auto card = store_.Exec(core::ops::ReadOp{card_op});

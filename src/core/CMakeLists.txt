@@ -1,5 +1,6 @@
 add_library(abyss_core
   resp_types.cpp
+  resp_format.cpp
   consumer_rpc.cpp
   ops.cpp
 )
