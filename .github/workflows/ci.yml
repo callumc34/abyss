@@ -54,6 +54,12 @@ jobs:
           key: ${{ steps.setup.outputs.vcpkg-cache-key }}
           restore-keys: vcpkg-${{ runner.os }}-
 
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: default
+          max-size: 500M
+
       - name: Configure
         run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
 
@@ -94,6 +100,12 @@ jobs:
           path: ${{ steps.setup.outputs.vcpkg-cache-path }}
           key: ${{ steps.setup.outputs.vcpkg-cache-key }}
           restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.preset }}
+          max-size: 500M
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -G Ninja -DABYSS_WERROR=ON
