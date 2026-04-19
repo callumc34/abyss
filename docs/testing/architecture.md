@@ -10,7 +10,7 @@ Abyss tests are organised into five layers, each with distinct cost and value pr
                  │   Fuzz              │  Crash recovery, parser fuzzing.
                  ├─────────────────────┤
                  │   System            │  Seconds. Full server over TCP.
-                 │                     │  Real Redis client, acceptance tests.
+                 │                     │  Real Redis client, protocol coverage.
                  ├─────────────────────┤
                  │   Integration       │  Seconds. Multi-component, in-process.
                  │                     │  Real stores in temp dirs, real WAL.
@@ -65,7 +65,8 @@ Test multiple real components wired together, in-process. Uses real file-backed 
 Test the full `abyss-server` binary over TCP using a real Redis client. The server starts as a subprocess on a random port. Tests connect with hiredis and send real Redis commands.
 
 **What belongs here:**
-- Acceptance tests (#71–#75): basic CRUD, eviction, TTL, cold promotion, crash recovery.
+- Per-type command coverage: strings, sets, hashes, sorted sets, generic key ops.
+- End-to-end behaviours: eviction, TTL, cold promotion, crash recovery.
 - Redis protocol compliance: verify responses match Redis for the supported command set.
 - Connection lifecycle: HELLO handshake, CLIENT commands, pipelining, QUIT.
 - Error responses: unknown commands, arity mismatches, WRONGTYPE.

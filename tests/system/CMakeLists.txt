@@ -16,7 +16,7 @@ target_compile_definitions(abyss_system_test_framework PRIVATE
 )
 
 add_executable(abyss_system_tests
-  acceptance_test.cpp
+  commands_test.cpp
   protocol_test.cpp
   tiering_test.cpp
   durability_test.cpp
