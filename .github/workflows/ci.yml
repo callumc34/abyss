@@ -1,158 +1,158 @@
-# name: CI
+name: CI
 
-# on:
-#   push:
-#     branches: [main]
-#   pull_request:
-#     branches: [main]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
-# permissions:
-#   contents: read
+permissions:
+  contents: read
 
-# concurrency:
-#   group: ci-${{ github.ref }}
-#   cancel-in-progress: true
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
-# jobs:
-#   format:
-#     name: Format
-#     runs-on: ubuntu-24.04
-#     timeout-minutes: 5
-#     steps:
-#       - name: Checkout commit
-#         uses: actions/checkout@v4
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v4
 
-#       - name: Install clang-format-19
-#         run: |
-#           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
-#             sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-#           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | \
-#             sudo tee /etc/apt/sources.list.d/llvm-19.list >/dev/null
-#           sudo apt-get update -qq
-#           sudo apt-get install -y -qq clang-format-19
+      - name: Install clang-format-19
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm-19.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format-19
 
-#       - name: Check formatting
-#         run: git ls-files '*.cpp' '*.h' | xargs clang-format-19 --dry-run --Werror
+      - name: Check formatting
+        run: git ls-files '*.cpp' '*.h' | xargs clang-format-19 --dry-run --Werror
 
-#   build-test:
-#     name: Build & Test
-#     runs-on: ubuntu-24.04
-#     timeout-minutes: 60
-#     steps:
-#       - name: Checkout commit
-#         uses: actions/checkout@v4
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v4
 
-#       - name: Set up build environment
-#         id: setup
-#         uses: ./.github/actions/setup-build
+      - name: Set up build environment
+        id: setup
+        uses: ./.github/actions/setup-build
 
-#       - name: Restore vcpkg binary cache
-#         id: vcpkg-cache
-#         uses: actions/cache/restore@v4
-#         with:
-#           path: ${{ steps.setup.outputs.vcpkg-cache-path }}
-#           key: ${{ steps.setup.outputs.vcpkg-cache-key }}
-#           restore-keys: vcpkg-${{ runner.os }}-
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+          restore-keys: vcpkg-${{ runner.os }}-
 
-#       - name: Configure
-#         run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
+      - name: Configure
+        run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
 
-#       - name: Save vcpkg binary cache
-#         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-#         uses: actions/cache/save@v4
-#         with:
-#           path: ${{ steps.setup.outputs.vcpkg-cache-path }}
-#           key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
 
-#       - name: Build
-#         run: cmake --build build/default --parallel
+      - name: Build
+        run: cmake --build build/default --parallel
 
-#       - name: Test
-#         run: ctest --preset default --output-on-failure
+      - name: Test
+        run: ctest --preset default --output-on-failure
 
-#   sanitizers:
-#     name: Sanitizer (${{ matrix.preset }})
-#     needs: build-test
-#     runs-on: ubuntu-24.04
-#     timeout-minutes: 60
-#     strategy:
-#       fail-fast: false
-#       matrix:
-#         preset: [asan, tsan]
-#     steps:
-#       - name: Checkout commit
-#         uses: actions/checkout@v4
+  sanitizers:
+    name: Sanitizer (${{ matrix.preset }})
+    needs: build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan, tsan]
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v4
 
-#       - name: Set up build environment
-#         id: setup
-#         uses: ./.github/actions/setup-build
+      - name: Set up build environment
+        id: setup
+        uses: ./.github/actions/setup-build
 
-#       - name: Restore vcpkg binary cache
-#         id: vcpkg-cache
-#         uses: actions/cache/restore@v4
-#         with:
-#           path: ${{ steps.setup.outputs.vcpkg-cache-path }}
-#           key: ${{ steps.setup.outputs.vcpkg-cache-key }}
-#           restore-keys: vcpkg-${{ runner.os }}-
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+          restore-keys: vcpkg-${{ runner.os }}-
 
-#       - name: Configure
-#         run: cmake --preset ${{ matrix.preset }} -G Ninja -DABYSS_WERROR=ON
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -G Ninja -DABYSS_WERROR=ON
 
-#       - name: Save vcpkg binary cache
-#         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-#         uses: actions/cache/save@v4
-#         with:
-#           path: ${{ steps.setup.outputs.vcpkg-cache-path }}
-#           key: ${{ steps.setup.outputs.vcpkg-cache-key }}
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.vcpkg-cache-path }}
+          key: ${{ steps.setup.outputs.vcpkg-cache-key }}
 
-#       - name: Build
-#         run: cmake --build build/${{ matrix.preset }} --parallel
+      - name: Build
+        run: cmake --build build/${{ matrix.preset }} --parallel
 
-#       - name: Test
-#         run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
-#         env:
-#           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-#           TSAN_OPTIONS: halt_on_error=1
+      - name: Test
+        run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
 
-#   docker:
-#     name: Docker
-#     needs: build-test
-#     runs-on: ubuntu-24.04
-#     timeout-minutes: 60
-#     permissions:
-#       contents: read
-#       packages: write
-#     steps:
-#       - name: Checkout commit
-#         uses: actions/checkout@v4
+  docker:
+    name: Docker
+    needs: build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v4
 
-#       - name: Setup Docker Buildx
-#         uses: docker/setup-buildx-action@v3
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-#       - name: Log in to GHCR
-#         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-#         uses: docker/login-action@v3
-#         with:
-#           registry: ghcr.io
-#           username: ${{ github.actor }}
-#           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-#       - name: Docker metadata
-#         id: meta
-#         uses: docker/metadata-action@v5
-#         with:
-#           images: ghcr.io/${{ github.repository }}
-#           tags: |
-#             type=sha,prefix=
-#             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
-#       - name: Build and push
-#         uses: docker/build-push-action@v6
-#         with:
-#           context: .
-#           file: docker/Dockerfile
-#           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-#           tags: ${{ steps.meta.outputs.tags }}
-#           labels: ${{ steps.meta.outputs.labels }}
-#           cache-from: type=gha
-#           cache-to: type=gha,mode=max
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
