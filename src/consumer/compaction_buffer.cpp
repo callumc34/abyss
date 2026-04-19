@@ -53,7 +53,9 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
   bytes_estimate_ -= old_entry_bytes;
   bytes_estimate_ += EntryBytes(entry);
 
-  auto scheduled = strategy_.NextFlushTime(entry, entry.eviction) + entry.jitter_offset;
+  auto next = strategy_.NextFlushTime(entry, entry.eviction);
+  entry.last_trigger = next.trigger;
+  const auto scheduled = next.time + entry.jitter_offset;
   flush_heap_.push({scheduled, key});
 }
 
@@ -95,8 +97,10 @@ std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size
     if (it == entries_.end()) continue;
 
     auto& entry = it->second;
-    auto expected = strategy_.NextFlushTime(entry, entry.eviction) + entry.jitter_offset;
+    const auto next = strategy_.NextFlushTime(entry, entry.eviction);
+    const auto expected = next.time + entry.jitter_offset;
     if (expected != heap_time) continue;
+    entry.last_trigger = next.trigger;
 
     bytes_estimate_ -= EntryBytes(entry);
     result.push_back(std::move(entry));
@@ -120,8 +124,10 @@ std::vector<BufferEntry> CompactionBuffer::FlushOldest(size_t target_bytes, size
     if (it == entries_.end()) continue;
 
     auto& entry = it->second;
-    auto expected = strategy_.NextFlushTime(entry, entry.eviction) + entry.jitter_offset;
+    const auto next = strategy_.NextFlushTime(entry, entry.eviction);
+    const auto expected = next.time + entry.jitter_offset;
     if (expected != heap_time) continue;
+    entry.last_trigger = next.trigger;
 
     bytes_estimate_ -= EntryBytes(entry);
     result.push_back(std::move(entry));
@@ -136,7 +142,9 @@ void CompactionBuffer::Reinsert(std::vector<BufferEntry> entries) ABYSS_NO_THREA
   for (auto& entry : entries) {
     const std::string key = entry.key;
     bytes_estimate_ += EntryBytes(entry);
-    auto scheduled = strategy_.NextFlushTime(entry, entry.eviction) + entry.jitter_offset;
+    const auto next = strategy_.NextFlushTime(entry, entry.eviction);
+    entry.last_trigger = next.trigger;
+    const auto scheduled = next.time + entry.jitter_offset;
     entries_.insert_or_assign(key, std::move(entry));
     flush_heap_.push({scheduled, key});
   }

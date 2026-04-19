@@ -414,5 +414,157 @@ TEST_F(ColdConsumerTest, AckBoundedByOldestPendingSeq) {
   EXPECT_EQ(ack_seq, 1U);
 }
 
+// --- Queue-read error handling (C2) ------------------------------------------
+
+TEST_F(ColdConsumerTest, QueueReadUnavailableStopsLoop) {
+  auto c = MakeConsumer();
+
+  std::atomic<int> read_call_count{0};
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillRepeatedly([&read_call_count](
+                          core::ConsumerId, core::ShardId, size_t,
+                          core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+        read_call_count.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
+      });
+
+  c->Start();
+  // A healthy consumer would spin on Read every queue_read_timeout (default 50ms).
+  // With C2, it bails after the first kUnavailable.
+  std::this_thread::sleep_for(300ms);
+  c->Stop();
+
+  EXPECT_LE(read_call_count.load(), 3)
+      << "Consumer kept polling after kUnavailable — loop did not exit";
+}
+
+TEST_F(ColdConsumerTest, QueueReadTransientErrorIncrementsCounter) {
+  auto c = MakeConsumer();
+
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(std::unexpected(core::Error{core::ErrorCode::kInternal, "transient"})))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  c->Drain();
+  EXPECT_EQ(c->Snapshot().queue_read_failures, 1U);
+}
+
+// --- Terminal retry classification (C3) --------------------------------------
+
+TEST_F(ColdConsumerTest, FlushDoesNotRetryOnTerminalError) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  cfg.retry_initial_backoff = 0ms;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
+
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  // kCorruption is terminal — retrying won't help.
+  EXPECT_CALL(cold_, ApplyBatch(_))
+      .WillOnce(Return(std::unexpected(core::Error{core::ErrorCode::kCorruption, "bad data"})));
+
+  c->Drain();
+  c->Flush();
+  clock_.Advance(31s);
+  c->Drain();
+  c->Flush();
+
+  const auto snap = c->Snapshot();
+  EXPECT_EQ(snap.apply_poisoned, 1U);
+  EXPECT_EQ(snap.retry_attempts, 0U);
+  EXPECT_EQ(snap.ops_flushed, 0U);
+  // Entries reinserted into buffer so the failure is re-surfaced.
+  EXPECT_GT(c->Buffer().Size(), 0U);
+}
+
+// --- Flush trigger classification (O4) ---------------------------------------
+
+TEST_F(ColdConsumerTest, QuietFlushIncrementsQuietCounter) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.safety_margin = 300s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
+
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  c->Drain();
+  c->Flush();  // quiet window not yet elapsed — nothing flushes
+  clock_.Advance(31s);
+  c->Drain();
+  c->Flush();
+
+  const auto snap = c->Snapshot();
+  EXPECT_EQ(snap.flushes_quiet, 1U);
+  EXPECT_EQ(snap.flushes_deadline, 0U);
+  EXPECT_EQ(snap.flushes_aggressive, 0U);
+}
+
+TEST_F(ColdConsumerTest, DeadlineFlushIncrementsDeadlineCounter) {
+  // Short eviction + long quiet_threshold → eviction_deadline always dominates.
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 1000s;
+  cfg.safety_margin = 10s;
+  cfg.jitter_fraction = 0.0;
+  auto c = std::make_unique<ColdConsumer>(queue_, cold_, kShard, cfg,
+                                          core::EvictionPolicy{core::EvictionTTL{20}},
+                                          clock_.SteadyFn(), clock_.WallFn());
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
+
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  c->Drain();
+  c->Flush();  // deadline is t=10s (first_seen + 20s eviction - 10s safety margin)
+  clock_.Advance(11s);
+  c->Drain();
+  c->Flush();
+
+  const auto snap = c->Snapshot();
+  EXPECT_EQ(snap.flushes_deadline, 1U);
+  EXPECT_EQ(snap.flushes_quiet, 0U);
+  EXPECT_EQ(snap.flushes_aggressive, 0U);
+}
+
+// --- Thread lifecycle (C4) ---------------------------------------------------
+
+TEST_F(ColdConsumerTest, StopIsIdempotent) {
+  auto c = MakeConsumer();
+  c->Start();
+  EXPECT_TRUE(c->IsRunning());
+  c->Stop();
+  EXPECT_FALSE(c->IsRunning());
+  c->Stop();  // second call is a no-op
+  EXPECT_FALSE(c->IsRunning());
+}
+
+TEST_F(ColdConsumerTest, DoubleStartIsNoop) {
+  auto c = MakeConsumer();
+  c->Start();
+  c->Start();  // Second call returns early.
+  EXPECT_TRUE(c->IsRunning());
+  c->Stop();
+}
+
+TEST_F(ColdConsumerTest, StopBeforeStartIsSafe) {
+  auto c = MakeConsumer();
+  c->Stop();
+  EXPECT_FALSE(c->IsRunning());
+}
+
 }  // namespace
 }  // namespace abyss::consumer

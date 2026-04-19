@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -58,6 +59,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   // True while Open is in progress; false once all shards have been loaded.
   bool IsRecovering() const { return recovering_.load(std::memory_order_acquire); }
 
+  uint64_t ReaperFailures() const { return reaper_failures_.load(std::memory_order_relaxed); }
+
  private:
   explicit WalQueue(WalConfig config);
   core::Result<void> Initialize();
@@ -67,6 +70,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   WalConfig config_;
   std::atomic<bool> recovering_{true};
+  std::atomic<uint64_t> reaper_failures_{0};
   std::vector<std::unique_ptr<ShardState>> shards_;
   std::unique_ptr<OffsetStore> offsets_;
   std::unique_ptr<SegmentReaper> reaper_;

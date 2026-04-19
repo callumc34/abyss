@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <ranges>
+#include <utility>
 #include <vector>
 
 #include "abyss/core/resp_format.h"
@@ -47,7 +48,7 @@ size_t Entry::ApproximateBytes() const {
   return bytes;
 }
 
-SingleShardStore::SingleShardStore(SingleShardConfig config) : config_(config) {}
+SingleShardStore::SingleShardStore(SingleShardConfig config) : config_(std::move(config)) {}
 
 // --- Read operations (const) ---
 
@@ -166,7 +167,9 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
   std::vector<core::RespValue> elements;
 
   if (op.by_score) {
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     double min_score = -std::numeric_limits<double>::infinity();
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     double max_score = std::numeric_limits<double>::infinity();
     if (!op.min.empty() && op.min != "-inf") {
       min_score = std::stod(std::string(op.min));
@@ -226,6 +229,7 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
     min_idx = std::max(min_idx, int64_t{0});
     max_idx = std::min(max_idx, static_cast<int64_t>(all.size()) - 1);
 
+    // NOLINTNEXTLINE(bugprone-infinite-loop)
     for (int64_t i = min_idx; i <= max_idx; ++i) {
       elements.push_back(core::RespValue::BulkString(all[static_cast<size_t>(i)].first));
       if (op.with_scores) {

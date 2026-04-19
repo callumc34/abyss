@@ -28,7 +28,8 @@ TEST_F(FlushStrategyTest, QuietWindowDominatesWhenEvictionIsLong) {
 
   auto flush = strategy_.NextFlushTime(entry, 3600s);
   auto quiet_deadline = entry.last_modified + 30s;
-  EXPECT_EQ(flush, quiet_deadline);
+  EXPECT_EQ(flush.time, quiet_deadline);
+  EXPECT_EQ(flush.trigger, FlushTrigger::kQuiet);
 }
 
 TEST_F(FlushStrategyTest, EvictionDeadlineDominatesWhenQuietIsLong) {
@@ -37,7 +38,8 @@ TEST_F(FlushStrategyTest, EvictionDeadlineDominatesWhenQuietIsLong) {
 
   auto flush = strategy_.NextFlushTime(entry, 60s);
   auto eviction_deadline = entry.first_seen + 60s - 300s;
-  EXPECT_EQ(flush, eviction_deadline);
+  EXPECT_EQ(flush.time, eviction_deadline);
+  EXPECT_EQ(flush.trigger, FlushTrigger::kDeadline);
 }
 
 TEST_F(FlushStrategyTest, VeryShortEvictionDeadlineInPast) {
@@ -46,8 +48,9 @@ TEST_F(FlushStrategyTest, VeryShortEvictionDeadlineInPast) {
 
   auto flush = strategy_.NextFlushTime(entry, 10s);
   auto eviction_deadline = entry.first_seen + 10s - 300s;
-  EXPECT_EQ(flush, eviction_deadline);
-  EXPECT_LT(flush, t0);
+  EXPECT_EQ(flush.time, eviction_deadline);
+  EXPECT_LT(flush.time, t0);
+  EXPECT_EQ(flush.trigger, FlushTrigger::kDeadline);
 }
 
 TEST_F(FlushStrategyTest, FreshEntryFlushesAtLastModifiedPlusQuiet) {
@@ -55,10 +58,11 @@ TEST_F(FlushStrategyTest, FreshEntryFlushesAtLastModifiedPlusQuiet) {
   auto entry = MakeEntry(t0, t0);
 
   auto flush = strategy_.NextFlushTime(entry, 86400s);
-  EXPECT_EQ(flush, t0 + 30s);
+  EXPECT_EQ(flush.time, t0 + 30s);
+  EXPECT_EQ(flush.trigger, FlushTrigger::kQuiet);
 }
 
-TEST_F(FlushStrategyTest, EqualQuietAndDeadlineReturnsSharedTime) {
+TEST_F(FlushStrategyTest, EqualQuietAndDeadlineReturnsQuietTrigger) {
   auto t0 = core::SteadyTime{100s};
   auto eviction = 330s;
   auto entry = MakeEntry(t0, t0);
@@ -68,7 +72,10 @@ TEST_F(FlushStrategyTest, EqualQuietAndDeadlineReturnsSharedTime) {
   EXPECT_EQ(quiet_deadline, eviction_deadline);
 
   auto flush = strategy_.NextFlushTime(entry, eviction);
-  EXPECT_EQ(flush, quiet_deadline);
+  EXPECT_EQ(flush.time, quiet_deadline);
+  // Tie-break: when equal, we treat it as a quiet flush since the quiet window
+  // has elapsed and the deadline is merely coincidental.
+  EXPECT_EQ(flush.trigger, FlushTrigger::kQuiet);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +103,7 @@ TEST_F(FlushStrategyTest, CustomThresholdsAffectDeadlines) {
   auto entry = MakeEntry(t0, t0);
 
   auto flush = custom.NextFlushTime(entry, 3600s);
-  EXPECT_EQ(flush, t0 + 10s);
+  EXPECT_EQ(flush.time, t0 + 10s);
 }
 
 }  // namespace

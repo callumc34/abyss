@@ -240,5 +240,50 @@ TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
   EXPECT_EQ(rpc_.PendingCount(), 0U);
 }
 
+// C5: a slow durable wait must not leave the RPC wait starved. The guaranteed
+// min RPC budget is write_timeout * min_rpc_wait_fraction. Without C5, a
+// durable completion near the original deadline would give the RPC ~0 budget.
+TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
+  TieringEngineConfig cfg{
+      .shard_count = kShardCount,
+      .write_timeout = 200ms,
+      .min_rpc_wait_fraction = 0.5,  // ≥100ms of RPC budget, even if durable is slow.
+  };
+  TieringEngine engine(queue_, hot_, cold_, router_, rpc_, cfg);
+
+  constexpr core::SequenceId kSeq = 201;
+  std::promise<core::Result<void>> durable_p;
+  auto durable_fut = durable_p.get_future();
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([&durable_fut](core::ShardId, core::QueueEntry) {
+        return queue::PendingAppend{kSeq, std::move(durable_fut),
+                                    std::make_unique<testing::NoopAppendPublisher>()};
+      });
+
+  // Durable completes at ~150ms — close to the original 200ms deadline.
+  std::thread durable_releaser([&durable_p]() {
+    std::this_thread::sleep_for(150ms);
+    durable_p.set_value(core::Result<void>{});
+  });
+  // RPC fulfilled at ~220ms — past the original deadline but inside the
+  // guaranteed RPC floor (150ms + 100ms = 250ms).
+  std::thread rpc_releaser([this]() {
+    std::this_thread::sleep_for(220ms);
+    while (!rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK"))) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+
+  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  durable_releaser.join();
+  rpc_releaser.join();
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsSimpleString());
+  EXPECT_EQ(result->AsString(), "OK");
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
 }  // namespace
 }  // namespace abyss::engine

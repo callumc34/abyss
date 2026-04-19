@@ -1,10 +1,13 @@
 #include "abyss/engine/tiering_engine.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <utility>
 
+#include "abyss/core/fire_and_forget.h"
 #include "abyss/core/ops.h"
-#include "abyss/hot/shard_router.h"
+#include "abyss/core/shard_router.h"
 
 namespace abyss::engine {
 
@@ -57,16 +60,22 @@ void TieringEngine::PromoteThroughQueue(std::string_view key) {
       .appended_at = core::WallClock::now(),
       .payload = core::entry::Write{.cmd = std::move(**promotion)},
   };
-  const core::ShardId shard = hot::ComputeShard(key, config_.shard_count);
-  // Fire-and-forget: nothing awaits this promotion's apply.
-  [[maybe_unused]] auto appended = queue_.Append(shard, std::move(entry));
+  const core::ShardId shard = core::ComputeShard(key, config_.shard_count);
+  // Fire-and-forget: client already has the cold value; promotion is best-effort.
+  core::FireAndForget(queue_.Append(shard, std::move(entry)), promotion_append_failures_);
+}
+
+TieringEngineMetrics TieringEngine::Snapshot() const {
+  return TieringEngineMetrics{
+      .promotion_append_failures = promotion_append_failures_.load(std::memory_order_relaxed),
+  };
 }
 
 core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
                                                            core::RespCommand cmd) {
   core::ShardId shard = 0;
   if (cmd.args.size() > 1) {
-    shard = hot::ComputeShard(cmd.args[1], config_.shard_count);
+    shard = core::ComputeShard(cmd.args[1], config_.shard_count);
   }
 
   core::QueueEntry entry{
@@ -83,10 +92,10 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
   queue::DurabilityFuture durable_future = std::move(pending->durable());
   pending->Publish();
 
-  const auto deadline = std::chrono::steady_clock::now() + config_.write_timeout;
+  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
 
   // fsync first: a durable-layer failure takes precedence over consumer error.
-  if (durable_future.wait_until(deadline) == std::future_status::timeout) {
+  if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
     rpc_.Cancel(seq);
     return core::RespValue::Error(
         core::ErrorPrefix::kErr,
@@ -98,7 +107,12 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
     return std::unexpected(durable.error());
   }
 
-  if (rpc_future.wait_until(deadline) == std::future_status::timeout) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto min_rpc_budget = std::chrono::milliseconds{static_cast<int64_t>(
+      static_cast<double>(config_.write_timeout.count()) * config_.min_rpc_wait_fraction)};
+  const auto rpc_deadline = std::max(durable_deadline, now + min_rpc_budget);
+
+  if (rpc_future.wait_until(rpc_deadline) == std::future_status::timeout) {
     rpc_.Cancel(seq);
     return core::RespValue::Error(
         core::ErrorPrefix::kErr,

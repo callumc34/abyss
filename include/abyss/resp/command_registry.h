@@ -53,12 +53,7 @@ class CommandRegistry {
   // Case-insensitive lookup. Returns nullptr if the name is not registered.
   const CommandSpec* Find(std::string_view name) const;
 
-  // Classify a parsed command.
-  //
-  // Returns:
-  //   kNotFound            — unknown command name.
-  //   kInvalidArgument     — arity mismatch.
-  //   CommandSpec*         — on success.
+  // kNotFound on unknown name, kInvalidArgument on arity mismatch.
   core::Result<const CommandSpec*> Classify(const core::RespCommand& cmd) const;
 
   size_t Size() const { return by_name_.size(); }

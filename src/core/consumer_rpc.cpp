@@ -19,8 +19,6 @@ ConsumerRpc::ConsumerRpc(ConsumerRpcConfig config) : default_timeout_(config.def
   }
 }
 
-ConsumerRpc::~ConsumerRpc() = default;
-
 ConsumerRpc::Shard& ConsumerRpc::ShardFor(RpcId id) const { return *shards_[id % shards_.size()]; }
 
 std::future<RespValue> ConsumerRpc::Register(RpcId id) {

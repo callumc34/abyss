@@ -67,6 +67,8 @@ The hot consumer runs as a dedicated thread **per shard owned by this pod**. Eac
 
 **Eviction refresh vs queue retention:** Read refreshes extend a key's life in the hot store indefinitely, but the key's queue entry is subject to normal retention (`min_retention_seconds`). If the pod crashes and the key has outlived its queue entry, it is lost from hot but present in cold (the cold consumer flushed it before the eviction deadline). The first read post-recovery hits cold, triggers a promotion (fresh queue entry), and the key returns to hot. Cost: one cold-path read per such key after recovery.
 
+**Eviction worker:** A dedicated maintenance thread (`hot::EvictionWorker`) periodically drains the per-shard access buffers (applying deferred timer refreshes from the last tick) and evicts keys whose eviction deadline has passed. The tick interval is operator-configurable (`hot.eviction_tick_ms`, default 1s). This is also the natural home for future LRU-under-memory-pressure enforcement.
+
 ### Configuration
 
 ```yaml
@@ -74,12 +76,17 @@ hot:
   backend: builtin_hashmap
   max_memory_bytes: 4294967296        # 4 GiB
   default_eviction_seconds: 86400     # 24 hours
+  eviction_tick_ms: 1000              # EvictionWorker drain+evict interval
   eviction_policy: lru
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
     - prefix: "ephemeral:"
       eviction_seconds: 300
+
+hot_consumer:
+  read_batch_size: 256                # max queue entries per Read call
+  read_timeout_ms: 100                # bounds Stop() latency; loop wakes at this cadence
 ```
 
 ## Invariants

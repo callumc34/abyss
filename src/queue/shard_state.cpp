@@ -218,6 +218,7 @@ core::Result<void> ShardState::Rotate() {
   return {};
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 core::Result<PendingAppend> ShardState::BeginAppend(core::QueueEntry entry) {
   std::unique_lock lock(append_mu_);
   if (shutting_down_) {

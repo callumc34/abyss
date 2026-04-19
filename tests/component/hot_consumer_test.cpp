@@ -151,6 +151,21 @@ TEST_F(HotConsumerTest, StopIsIdempotentAndSafeAfterWrites) {
   consumer_->Stop();  // idempotent
 }
 
+TEST_F(HotConsumerTest, MetricsAdvanceOnApply) {
+  StartConsumer();
+  auto f_ok = AppendWithRpc({"SET", "k", "v"});
+  EXPECT_EQ(f_ok.get().AsString(), "OK");
+  auto f_wrong = AppendWithRpc({"SADD", "k", "m"});
+  EXPECT_TRUE(f_wrong.get().IsError());
+
+  const auto snap = consumer_->Snapshot();
+  EXPECT_EQ(snap.applied, 1U);
+  EXPECT_EQ(snap.apply_failures, 1U);
+  EXPECT_EQ(snap.parse_failures, 0U);
+  EXPECT_EQ(snap.queue_read_failures, 0U);
+  EXPECT_EQ(snap.ack_failures, 0U);
+}
+
 TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {
   StartConsumer();
   auto f1 = AppendWithRpc({"SET", "a", "1"});

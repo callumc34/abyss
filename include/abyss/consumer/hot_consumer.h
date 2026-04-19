@@ -9,12 +9,13 @@
 #include "abyss/core/hot_store.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/consumer_metrics.h"
 
 namespace abyss::consumer {
 
 // One thread per shard: tails the queue, applies writes to the hot store,
-// fulfills the associated RPC, acks. Errors (parse, WRONGTYPE, etc.) flow
-// through Fulfill rather than wedging the loop.
+// fulfills the associated RPC, acks. Errors flow through Fulfill rather than
+// wedging the loop.
 class HotConsumer {
  public:
   struct Config {
@@ -39,6 +40,8 @@ class HotConsumer {
   bool Running() const { return running_.load(std::memory_order_acquire); }
   core::ShardId shard() const { return config_.shard; }
 
+  metrics::ConsumerSnapshot Snapshot() const { return metrics::SnapshotOf(counters_); }
+
  private:
   void Run();
   void ProcessEntry(core::QueueEntry& entry);
@@ -53,6 +56,8 @@ class HotConsumer {
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> running_{false};
   std::thread thread_;
+
+  metrics::ConsumerCounters counters_;
 };
 
 }  // namespace abyss::consumer

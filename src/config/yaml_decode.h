@@ -136,13 +136,7 @@ struct DecoderFor<std::chrono::microseconds> {
 };
 
 // Fluent builder for parsing a YAML map into a typed destination struct.
-//
-// Invariants:
-//   - The allowed-key set is derived from .Optional / .Required / .OptionalSequence
-//     calls; an unknown key in the YAML fails the parse in Finish().
-//   - The first error sticks: subsequent calls are no-ops.
-//   - Calling Finish() without RequireMap-ing first is safe; the map shape
-//     is checked in the constructor.
+// First error sticks; unknown keys fail the parse in Finish().
 class SectionDecoder {
  public:
   explicit SectionDecoder(YamlCursor cur);

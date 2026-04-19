@@ -11,7 +11,9 @@ namespace {
 class ScopedEnv {
  public:
   ScopedEnv(const char* name, const char* value) : name_(name) {
-    if (const char* prev = std::getenv(name); prev != nullptr) {
+    const char* prev = nullptr;
+    prev = std::getenv(name);
+    if (prev != nullptr) {
       had_previous_ = true;
       previous_ = prev;
     }

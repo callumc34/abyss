@@ -53,6 +53,9 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
   if (auto r = RequireNonEmpty("hot.backend", hot.backend); !r) return r;
   if (auto r = RequirePositive("hot.max_memory_bytes", hot.max_memory_bytes); !r) return r;
   if (auto r = RequirePositive("hot.default_eviction_seconds", hot.default_eviction); !r) return r;
+  if (hot.eviction_tick.count() <= 0) {
+    return std::unexpected(InvalidArg("hot.eviction_tick_ms", "must be > 0 milliseconds"));
+  }
 
   std::unordered_set<std::string> seen;
   for (size_t i = 0; i < hot.eviction_overrides.size(); ++i) {
@@ -98,20 +101,49 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
   return {};
 }
 
+core::Result<void> ValidateHotConsumer(const HotConsumerConfig& c) {
+  if (auto r = RequirePositive("hot_consumer.read_batch_size", c.read_batch_size); !r) return r;
+  if (c.read_timeout.count() <= 0) {
+    return std::unexpected(InvalidArg("hot_consumer.read_timeout_ms", "must be > 0 milliseconds"));
+  }
+  return {};
+}
+
 core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
   if (auto r = RequirePositive("cold_consumer.quiet_threshold_seconds", c.quiet_threshold); !r)
     return r;
   if (auto r = RequirePositive("cold_consumer.safety_margin_seconds", c.safety_margin); !r)
     return r;
-  if (c.deadline_jitter_ratio < 0.0 || c.deadline_jitter_ratio > 1.0) {
-    return std::unexpected(
-        InvalidArg("cold_consumer.deadline_jitter_ratio", "must be in [0.0, 1.0]"));
+  if (c.jitter_fraction < 0.0 || c.jitter_fraction > 1.0) {
+    return std::unexpected(InvalidArg("cold_consumer.jitter_fraction", "must be in [0.0, 1.0]"));
   }
   if (auto r = RequirePositive("cold_consumer.buffer_high_water_bytes", c.buffer_high_water_bytes);
       !r)
     return r;
+  if (c.buffer_low_water_bytes > 0 && c.buffer_low_water_bytes > c.buffer_high_water_bytes) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.buffer_low_water_bytes", "must be <= buffer_high_water_bytes"));
+  }
   if (auto r = RequirePositive("cold_consumer.max_flush_batch_size", c.max_flush_batch_size); !r)
     return r;
+  if (auto r = RequirePositive("cold_consumer.queue_read_max_count", c.queue_read_max_count); !r)
+    return r;
+  if (c.queue_read_timeout.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.queue_read_timeout_ms", "must be > 0 milliseconds"));
+  }
+  if (c.retry_initial_backoff.count() < 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.retry_initial_backoff_ms", "must be >= 0 milliseconds"));
+  }
+  if (c.retry_max_backoff.count() < 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.retry_max_backoff_ms", "must be >= 0 milliseconds"));
+  }
+  if (c.retry_initial_backoff > c.retry_max_backoff) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.retry_initial_backoff_ms", "must be <= retry_max_backoff_ms"));
+  }
   return {};
 }
 
@@ -128,6 +160,9 @@ core::Result<void> ValidateConsumerRpc(const ConsumerRpcConfig& c) {
 core::Result<void> ValidateEngine(const EngineConfig& e) {
   if (e.write_timeout.count() <= 0) {
     return std::unexpected(InvalidArg("engine.write_timeout_ms", "must be > 0 milliseconds"));
+  }
+  if (e.min_rpc_wait_fraction <= 0.0 || e.min_rpc_wait_fraction >= 1.0) {
+    return std::unexpected(InvalidArg("engine.min_rpc_wait_fraction", "must be in (0.0, 1.0)"));
   }
   return {};
 }
@@ -162,6 +197,7 @@ core::Result<void> ValidateAdmin(const AdminConfig& a) {
   return {};
 }
 
+// NOLINTNEXTLINE(misc-unused-parameters)
 core::Result<void> ValidatePortCollisions(const Config& c) {
   const std::array<std::pair<uint16_t, std::string_view>, 3> ports = {{
       {c.resp.port, "resp.port"},
@@ -190,6 +226,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateHot(config.hot); !r) return r;
   if (auto r = ValidateCold(config.cold); !r) return r;
   if (auto r = ValidateQueue(config.queue); !r) return r;
+  if (auto r = ValidateHotConsumer(config.hot_consumer); !r) return r;
   if (auto r = ValidateColdConsumer(config.cold_consumer); !r) return r;
   if (auto r = ValidateConsumerRpc(config.consumer_rpc); !r) return r;
   if (auto r = ValidateEngine(config.engine); !r) return r;

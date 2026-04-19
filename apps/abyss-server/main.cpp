@@ -19,7 +19,9 @@ extern "C" void ShutdownHandler(int /*sig*/) {
 
 std::string ResolveConfigPath(const std::string& cli_path) {
   if (!cli_path.empty()) return cli_path;
-  if (const char* env = std::getenv("ABYSS_CONFIG_PATH"); env != nullptr && *env != '\0') {
+  const char* env = nullptr;
+  env = std::getenv("ABYSS_CONFIG_PATH");
+  if (env != nullptr && *env != '\0') {
     return env;
   }
   return {};

@@ -33,26 +33,22 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
 ColdConsumer::~ColdConsumer() { Stop(); }
 
 void ColdConsumer::Start() {
-  if (running_.exchange(true, std::memory_order_acq_rel)) {
-    return;
-  }
+  if (running_.exchange(true, std::memory_order_acq_rel)) return;
   stop_requested_.store(false, std::memory_order_release);
-  thread_ = std::make_unique<std::thread>([this] { RunLoop(running_); });
+  thread_ = std::thread(&ColdConsumer::RunLoop, this);
 }
 
 void ColdConsumer::Stop() {
-  if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+  if (!running_.load(std::memory_order_acquire)) return;
   stop_requested_.store(true, std::memory_order_release);
-  if (thread_ && thread_->joinable()) {
-    thread_->join();
-  }
-  thread_.reset();
+  if (thread_.joinable()) thread_.join();
+  running_.store(false, std::memory_order_release);
 }
 
-void ColdConsumer::RunLoop(std::atomic<bool>& keep_running) {
-  while (keep_running.load(std::memory_order_acquire)) {
+void ColdConsumer::RunLoop() {
+  while (!stop_requested_.load(std::memory_order_acquire)) {
     Drain();
-    if (!keep_running.load(std::memory_order_acquire)) break;
+    if (stop_requested_.load(std::memory_order_acquire)) break;
     Flush();
   }
 }
@@ -61,6 +57,12 @@ size_t ColdConsumer::Drain() {
   auto result = queue_.Read(core::kColdConsumer, shard_, config_.queue_read_max_count,
                             config_.queue_read_timeout);
   if (!result.has_value()) {
+    if (result.error().code() == core::ErrorCode::kUnavailable) {
+      // Queue has shut down; signal loop exit rather than spinning on the same error.
+      stop_requested_.store(true, std::memory_order_release);
+      return 0;
+    }
+    counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
 
@@ -73,28 +75,22 @@ size_t ColdConsumer::Drain() {
 }
 
 bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
-  const core::RespCommand* cmd = nullptr;
-  if (const auto* w = std::get_if<core::entry::Write>(&entry.payload)) {
-    cmd = &w->cmd;
-  } else if (const auto* c = std::get_if<core::entry::Conditional>(&entry.payload)) {
-    cmd = &c->cmd;
-  } else if (const auto* r = std::get_if<core::entry::Resolved>(&entry.payload)) {
-    if (r->decision == core::Decision::kSkip || !r->materialised_op.has_value()) {
-      return false;
-    }
-    cmd = &*r->materialised_op;
+  auto extracted = core::entry::ExtractApplicableCommand(entry);
+  if (!extracted.has_value()) {
+    if (extracted.error().code() == core::ErrorCode::kNotFound) return false;
+    // Conditional or other parse-level failure.
+    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
+    return false;
   }
-
-  if (cmd == nullptr || cmd->args.empty()) {
-    const std::lock_guard lock(metrics_mutex_);
-    ++metrics_.parse_failures;
+  const core::RespCommand* cmd = *extracted;
+  if (cmd->args.empty()) {
+    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
   auto op = core::ops::ParseWriteOp(cmd->Name(), *cmd);
   if (!op.has_value()) {
-    const std::lock_guard lock(metrics_mutex_);
-    ++metrics_.parse_failures;
+    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
@@ -121,8 +117,7 @@ bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
 
   auto key = core::ops::PrimaryKey(*op);
   if (key.empty()) {
-    const std::lock_guard lock(metrics_mutex_);
-    ++metrics_.parse_failures;
+    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
@@ -133,22 +128,12 @@ bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
 }
 
 bool ColdConsumer::Flush() {
-  const auto current_bytes = buffer_.BytesEstimate();
-  {
-    const std::lock_guard lock(metrics_mutex_);
-    UpdateMode(current_bytes);
-  }
+  UpdateMode(buffer_.BytesEstimate());
 
   const auto now = steady_clock_();
-  std::vector<BufferEntry> to_flush;
   const bool aggressive = CurrentMode() == Mode::kAggressive;
-
-  // NOLINTNEXTLINE(bugprone-branch-clone)
-  if (aggressive) {
-    to_flush = buffer_.FlushOldest(LowWaterBytes(), config_.max_flush_batch_size);
-  } else {
-    to_flush = buffer_.FlushReady(now, config_.max_flush_batch_size);
-  }
+  auto to_flush = aggressive ? buffer_.FlushOldest(LowWaterBytes(), config_.max_flush_batch_size)
+                             : buffer_.FlushReady(now, config_.max_flush_batch_size);
 
   if (to_flush.empty()) {
     TryAdvanceAck();
@@ -159,17 +144,23 @@ bool ColdConsumer::Flush() {
   std::vector<BufferEntry> surviving;
   surviving.reserve(to_flush.size());
   uint64_t dropped = 0;
+  uint64_t quiet_count = 0;
+  uint64_t deadline_count = 0;
   for (auto& entry : to_flush) {
     if (AbsTtlExpired(entry, wall_now)) {
       ++dropped;
       continue;
     }
+    if (entry.last_trigger == FlushTrigger::kQuiet) {
+      ++quiet_count;
+    } else {
+      ++deadline_count;
+    }
     surviving.push_back(std::move(entry));
   }
 
   if (dropped > 0) {
-    const std::lock_guard lock(metrics_mutex_);
-    metrics_.entries_dropped_abs_ttl += dropped;
+    entries_dropped_abs_ttl_.fetch_add(dropped, std::memory_order_relaxed);
   }
 
   const size_t surviving_count = surviving.size();
@@ -179,13 +170,13 @@ bool ColdConsumer::Flush() {
   }
 
   if (applied && surviving_count > 0) {
-    const std::lock_guard lock(metrics_mutex_);
-    // Quiet vs deadline breakdown waits for metrics wiring; aggressive is distinct.
-    // NOLINTNEXTLINE(bugprone-branch-clone)
     if (aggressive) {
-      metrics_.flushes_aggressive += surviving_count;
+      flushes_aggressive_.fetch_add(surviving_count, std::memory_order_relaxed);
     } else {
-      metrics_.flushes_quiet += surviving_count;
+      if (quiet_count > 0) flushes_quiet_.fetch_add(quiet_count, std::memory_order_relaxed);
+      if (deadline_count > 0) {
+        flushes_deadline_.fetch_add(deadline_count, std::memory_order_relaxed);
+      }
     }
   }
 
@@ -232,16 +223,21 @@ bool ColdConsumer::ApplyBatchWithRetry(std::vector<BufferEntry> entries) {
   while (!stop_requested_.load(std::memory_order_acquire)) {
     auto result = cold_store_.ApplyBatch(std::span<const core::ops::WriteOp>(ops));
     if (result.has_value()) {
-      const std::lock_guard lock(metrics_mutex_);
-      metrics_.ops_flushed += ops.size();
+      ops_flushed_.fetch_add(ops.size(), std::memory_order_relaxed);
       return true;
     }
 
-    {
-      const std::lock_guard lock(metrics_mutex_);
-      ++metrics_.apply_failures;
-      ++metrics_.retry_attempts;
+    const auto code = result.error().code();
+    const bool terminal =
+        code == core::ErrorCode::kCorruption || code == core::ErrorCode::kInvalidArgument;
+    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+    if (terminal) {
+      apply_poisoned_.fetch_add(1, std::memory_order_relaxed);
+      // Retrying a poisoned batch burns CPU without progressing; reinsert and bail.
+      buffer_.Reinsert(std::move(entries));
+      return false;
     }
+    retry_attempts_.fetch_add(1, std::memory_order_relaxed);
 
     std::this_thread::sleep_for(backoff);
     backoff = std::min(backoff * 2, config_.retry_max_backoff);
@@ -266,23 +262,16 @@ size_t ColdConsumer::LowWaterBytes() const {
 }
 
 void ColdConsumer::UpdateMode(size_t current_bytes) {
-  metrics_.buffer_bytes = current_bytes;
   const size_t high = config_.buffer_high_water_bytes;
   const size_t low = LowWaterBytes();
+  const auto current = mode_.load(std::memory_order_acquire);
 
-  if (mode_ == Mode::kNormal && high > 0 && current_bytes >= high) {
-    mode_ = Mode::kAggressive;
-    ++metrics_.mode_transitions;
-  } else if (mode_ == Mode::kAggressive && current_bytes <= low) {
-    mode_ = Mode::kNormal;
-    ++metrics_.mode_transitions;
-  }
-  metrics_.mode = mode_;
-}
+  const bool promote = current == Mode::kNormal && high > 0 && current_bytes >= high;
+  const bool demote = current == Mode::kAggressive && current_bytes <= low;
+  if (!promote && !demote) return;
 
-ColdConsumer::Mode ColdConsumer::CurrentMode() const {
-  const std::lock_guard lock(metrics_mutex_);
-  return mode_;
+  mode_.store(promote ? Mode::kAggressive : Mode::kNormal, std::memory_order_release);
+  mode_transitions_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ColdConsumer::TryAdvanceAck() {
@@ -299,22 +288,33 @@ void ColdConsumer::TryAdvanceAck() {
   if (target == 0) return;
 
   auto ack = queue_.Ack(core::kColdConsumer, shard_, target);
-  if (!ack.has_value()) return;
+  if (!ack.has_value()) {
+    counters_.ack_failures.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
 
   last_ack_seq_.store(target, std::memory_order_release);
-  const std::lock_guard lock(metrics_mutex_);
-  metrics_.last_ack_seq = target;
-  metrics_.latest_drained_seq = drained;
 }
 
 ColdConsumer::Metrics ColdConsumer::Snapshot() const {
-  const std::lock_guard lock(metrics_mutex_);
-  Metrics out = metrics_;
+  const auto common = metrics::SnapshotOf(counters_);
+  Metrics out;
   out.buffer_entries = buffer_.Size();
   out.buffer_bytes = buffer_.BytesEstimate();
-  out.mode = mode_;
-  out.latest_drained_seq = latest_drained_seq_.load(std::memory_order_acquire);
+  out.mode = mode_.load(std::memory_order_acquire);
+  out.flushes_quiet = flushes_quiet_.load(std::memory_order_relaxed);
+  out.flushes_deadline = flushes_deadline_.load(std::memory_order_relaxed);
+  out.flushes_aggressive = flushes_aggressive_.load(std::memory_order_relaxed);
+  out.ops_flushed = ops_flushed_.load(std::memory_order_relaxed);
+  out.entries_dropped_abs_ttl = entries_dropped_abs_ttl_.load(std::memory_order_relaxed);
+  out.apply_failures = common.apply_failures;
+  out.apply_poisoned = apply_poisoned_.load(std::memory_order_relaxed);
+  out.retry_attempts = retry_attempts_.load(std::memory_order_relaxed);
+  out.parse_failures = common.parse_failures;
+  out.queue_read_failures = common.queue_read_failures;
   out.last_ack_seq = last_ack_seq_.load(std::memory_order_acquire);
+  out.latest_drained_seq = latest_drained_seq_.load(std::memory_order_acquire);
+  out.mode_transitions = mode_transitions_.load(std::memory_order_relaxed);
   return out;
 }
 

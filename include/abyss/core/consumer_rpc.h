@@ -28,7 +28,7 @@ struct ConsumerRpcConfig {
 class ConsumerRpc {
  public:
   explicit ConsumerRpc(ConsumerRpcConfig config = {});
-  ~ConsumerRpc();
+  ~ConsumerRpc() = default;
 
   ConsumerRpc(const ConsumerRpc&) = delete;
   ConsumerRpc& operator=(const ConsumerRpc&) = delete;

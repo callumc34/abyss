@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "abyss/hot/shard_router.h"
+#include "abyss/core/shard_router.h"
 
 namespace abyss::consumer {
 
@@ -48,7 +48,7 @@ core::Result<core::RespValue> ColdConsumerPool::Read(std::string_view key) const
 }
 
 core::ShardId ColdConsumerPool::ShardForKey(std::string_view key) const {
-  return hot::ComputeShard(key, static_cast<uint32_t>(consumers_.size()));
+  return core::ComputeShard(key, static_cast<uint32_t>(consumers_.size()));
 }
 
 ColdConsumerPool::AggregateMetrics ColdConsumerPool::Snapshot() const {

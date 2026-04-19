@@ -47,6 +47,7 @@ void AppendLengthPrefixedKey(std::string& out, std::string_view key) {
 // --- Varint -----------------------------------------------------------------
 
 void AppendVarint(std::string& out, uint64_t value) {
+  // NOLINTNEXTLINE(bugprone-infinite-loop)
   while (value >= 0x80) {
     out.push_back(static_cast<char>((value & 0x7F) | 0x80));
     value >>= 7;

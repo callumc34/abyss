@@ -4,6 +4,7 @@ hot:
   backend: builtin_hashmap
   max_memory_bytes: 4294967296
   default_eviction_seconds: 86400
+  eviction_tick_ms: 1000
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
@@ -24,12 +25,21 @@ queue:
   group_commit_interval_us: 1000
   group_commit_max_bytes: 1048576
 
+hot_consumer:
+  read_batch_size: 256
+  read_timeout_ms: 100
+
 cold_consumer:
   quiet_threshold_seconds: 30
   safety_margin_seconds: 300
-  deadline_jitter_ratio: 0.5
+  jitter_fraction: 0.1
   buffer_high_water_bytes: 536870912
+  buffer_low_water_bytes: 0             # 0 = auto, 3/4 of high_water
   max_flush_batch_size: 10000
+  queue_read_max_count: 1024
+  queue_read_timeout_ms: 50
+  retry_initial_backoff_ms: 50
+  retry_max_backoff_ms: 30000
 
 recovery:
   replay_parallelism: 4

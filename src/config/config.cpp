@@ -35,6 +35,7 @@ core::Result<void> ParseHot(const YamlCursor& cur, HotConfig& out) {
       .Optional("backend", out.backend)
       .Optional("max_memory_bytes", out.max_memory_bytes)
       .Optional("default_eviction_seconds", out.default_eviction)
+      .Optional("eviction_tick_ms", out.eviction_tick)
       .OptionalSequence("eviction_overrides", out.eviction_overrides, ParseEvictionOverride)
       .Finish();
 }
@@ -61,13 +62,25 @@ core::Result<void> ParseQueue(const YamlCursor& cur, QueueConfig& out) {
       .Finish();
 }
 
+core::Result<void> ParseHotConsumer(const YamlCursor& cur, HotConsumerConfig& out) {
+  return SectionDecoder(cur)
+      .Optional("read_batch_size", out.read_batch_size)
+      .Optional("read_timeout_ms", out.read_timeout)
+      .Finish();
+}
+
 core::Result<void> ParseColdConsumer(const YamlCursor& cur, ColdConsumerConfig& out) {
   return SectionDecoder(cur)
       .Optional("quiet_threshold_seconds", out.quiet_threshold)
       .Optional("safety_margin_seconds", out.safety_margin)
-      .Optional("deadline_jitter_ratio", out.deadline_jitter_ratio)
+      .Optional("jitter_fraction", out.jitter_fraction)
       .Optional("buffer_high_water_bytes", out.buffer_high_water_bytes)
+      .Optional("buffer_low_water_bytes", out.buffer_low_water_bytes)
       .Optional("max_flush_batch_size", out.max_flush_batch_size)
+      .Optional("queue_read_max_count", out.queue_read_max_count)
+      .Optional("queue_read_timeout_ms", out.queue_read_timeout)
+      .Optional("retry_initial_backoff_ms", out.retry_initial_backoff)
+      .Optional("retry_max_backoff_ms", out.retry_max_backoff)
       .Finish();
 }
 
@@ -87,7 +100,10 @@ core::Result<void> ParseConsumerRpc(const YamlCursor& cur, ConsumerRpcConfig& ou
 }
 
 core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
-  return SectionDecoder(cur).Optional("write_timeout_ms", out.write_timeout).Finish();
+  return SectionDecoder(cur)
+      .Optional("write_timeout_ms", out.write_timeout)
+      .Optional("min_rpc_wait_fraction", out.min_rpc_wait_fraction)
+      .Finish();
 }
 
 core::Result<void> ParseResp(const YamlCursor& cur, RespConfig& out) {
@@ -127,9 +143,9 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
 
   const YamlCursor root_cur(root);
   if (auto r = root_cur.RequireMap(); !r) return std::unexpected(r.error());
-  if (auto r = root_cur.RejectUnknownKeys({"profile", "hot", "cold", "queue", "cold_consumer",
-                                           "consumer_rpc", "engine", "recovery", "resp", "metrics",
-                                           "admin"});
+  if (auto r = root_cur.RejectUnknownKeys({"profile", "hot", "cold", "queue", "hot_consumer",
+                                           "cold_consumer", "consumer_rpc", "engine", "recovery",
+                                           "resp", "metrics", "admin"});
       !r) {
     return std::unexpected(r.error());
   }
@@ -146,10 +162,12 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
     core::Result<void> (*parse)(const YamlCursor&, Config&);
   };
 
-  const std::array<Section, 10> sections = {{
+  const std::array<Section, 11> sections = {{
       {"hot", [](const YamlCursor& c, Config& cfg) { return ParseHot(c, cfg.hot); }},
       {"cold", [](const YamlCursor& c, Config& cfg) { return ParseCold(c, cfg.cold); }},
       {"queue", [](const YamlCursor& c, Config& cfg) { return ParseQueue(c, cfg.queue); }},
+      {"hot_consumer",
+       [](const YamlCursor& c, Config& cfg) { return ParseHotConsumer(c, cfg.hot_consumer); }},
       {"cold_consumer",
        [](const YamlCursor& c, Config& cfg) { return ParseColdConsumer(c, cfg.cold_consumer); }},
       {"consumer_rpc",
@@ -195,7 +213,9 @@ core::Result<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 }
 
 void Config::ApplyEnvironmentOverrides() {
-  if (const char* profile = std::getenv("ABYSS_PROFILE"); profile != nullptr && *profile != '\0') {
+  const char* profile = nullptr;
+  profile = std::getenv("ABYSS_PROFILE");
+  if (profile != nullptr && *profile != '\0') {
     this->profile = profile;
   }
 }

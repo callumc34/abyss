@@ -241,7 +241,7 @@ struct RocksdbStore::Impl {
   // Generic prefix scan.
   template <typename Fn>
   core::Result<void> ScanPrefix(rocksdb::WriteBatchWithIndex* wb, rocksdb::ColumnFamilyHandle* cf,
-                                std::string_view prefix, Fn&& fn) const;
+                                std::string_view prefix, const Fn& fn) const;
 };
 
 // --- Factory & lifecycle ----------------------------------------------------
@@ -584,6 +584,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetRange& o
   }
 
   std::vector<RespValue> out;
+  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   int64_t offset = std::max<int64_t>(op.offset, 0);
   int64_t count = op.count;
   auto end = static_cast<int64_t>(ordered.size());
@@ -1072,7 +1073,7 @@ core::Result<bool> RocksdbStore::Impl::AnyLiveRecord(std::string_view key) const
 template <typename Fn>
 core::Result<void> RocksdbStore::Impl::ScanPrefix(rocksdb::WriteBatchWithIndex* wb,
                                                   rocksdb::ColumnFamilyHandle* cf,
-                                                  std::string_view prefix, Fn&& fn) const {
+                                                  std::string_view prefix, const Fn& fn) const {
   std::string upper_storage = LexicographicSuccessor(prefix);
   rocksdb::Slice upper_slice(upper_storage);
   rocksdb::ReadOptions ro;
@@ -1091,7 +1092,7 @@ core::Result<void> RocksdbStore::Impl::ScanPrefix(rocksdb::WriteBatchWithIndex* 
   for (it->Seek(ToSlice(prefix)); it->Valid(); it->Next()) {
     auto k = ToSv(it->key());
     if (!k.starts_with(prefix)) break;
-    auto cont = std::forward<Fn>(fn)(k, ToSv(it->value()));
+    auto cont = fn(k, ToSv(it->value()));
     if (!cont.has_value()) return std::unexpected(cont.error());
     if (!*cont) break;
   }

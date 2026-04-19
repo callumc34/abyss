@@ -355,6 +355,7 @@ TEST_F(WalQueueTest, MissingMiddleSegmentRejectedAsCorruption) {
   }
   std::ranges::sort(seg_paths);
   ASSERT_GE(seg_paths.size(), 3U);
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)
   std::filesystem::remove(seg_paths[seg_paths.size() / 2]);
 
   auto result = WalQueue::Open(cfg);

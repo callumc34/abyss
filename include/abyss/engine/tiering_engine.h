@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string_view>
@@ -23,6 +24,15 @@ struct TieringEngineConfig {
   // durable in the queue and will eventually apply; the client just did not
   // observe the outcome within this bound.
   std::chrono::milliseconds write_timeout{5000};
+
+  // Lower bound on the consumer-apply budget after the durable wait completes.
+  // Keeps a slow fsync from leaving ~0ms for the RPC wait. Total latency is
+  // bounded by write_timeout * (1 + min_rpc_wait_fraction).
+  double min_rpc_wait_fraction = 0.5;
+};
+
+struct TieringEngineMetrics {
+  uint64_t promotion_append_failures = 0;
 };
 
 class TieringEngine : public core::CommandDispatcher {
@@ -36,6 +46,8 @@ class TieringEngine : public core::CommandDispatcher {
   core::Result<core::RespValue> DispatchWrite(std::string_view name,
                                               core::RespCommand cmd) override;
 
+  TieringEngineMetrics Snapshot() const;
+
  private:
   void PromoteThroughQueue(std::string_view key);
 
@@ -45,6 +57,8 @@ class TieringEngine : public core::CommandDispatcher {
   consumer::CompactionBufferRouter& buffer_router_;
   core::ConsumerRpc& rpc_;
   TieringEngineConfig config_;
+
+  std::atomic<uint64_t> promotion_append_failures_{0};
 };
 
 }  // namespace abyss::engine

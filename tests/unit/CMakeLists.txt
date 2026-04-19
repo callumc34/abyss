@@ -2,12 +2,14 @@ add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
   core/consumer_rpc_test.cpp
+  core/fire_and_forget_test.cpp
   core/ops_test.cpp
   core/eviction_policy_test.cpp
+  core/queue_entry_test.cpp
+  core/shard_router_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
-  abyss::core
   abyss::test_support
   GTest::gtest_main
 )
@@ -46,9 +48,9 @@ target_link_libraries(abyss_resp_tests PRIVATE
 )
 
 add_executable(abyss_hot_tests
-  hot/shard_router_test.cpp
   hot/single_shard_store_test.cpp
   hot/sharded_hot_store_test.cpp
+  hot/eviction_worker_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE

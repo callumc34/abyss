@@ -21,6 +21,7 @@ Result<double> ParseDouble(std::string_view s) {
     return std::unexpected(
         Error(ErrorCode::kInvalidArgument, "not a valid float: '" + std::string(s) + "'"));
   }
+  // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
   return value;
 }
 
@@ -120,13 +121,21 @@ Result<WriteOp> ParseSet(const RespCommand& cmd) {
   uint64_t abs_ttl_ms = 0;
   for (size_t i = 3; i < cmd.args.size(); ++i) {
     const auto opt = AsciiUpper(cmd.args[i]);
-    if (opt == "EX" || opt == "PX") {
+    if (opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") {
       if (i + 1 >= cmd.args.size()) {
         return std::unexpected(SyntaxError("syntax error — expected value after '" + opt + "'"));
       }
       auto ttl_arg = ParseUint64(cmd.args[++i]);
       if (!ttl_arg.has_value()) return std::unexpected(ttl_arg.error());
-      abs_ttl_ms = NowWallMs() + ((opt == "EX") ? (*ttl_arg * 1000) : (*ttl_arg));
+      if (opt == "EX") {
+        abs_ttl_ms = NowWallMs() + (*ttl_arg * 1000);
+      } else if (opt == "PX") {
+        abs_ttl_ms = NowWallMs() + *ttl_arg;
+      } else if (opt == "EXAT") {
+        abs_ttl_ms = *ttl_arg * 1000;
+      } else {
+        abs_ttl_ms = *ttl_arg;
+      }
     }
   }
   return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[2], .abs_ttl_ms = abs_ttl_ms}};

@@ -6,6 +6,7 @@
 #include <sstream>
 #include <utility>
 
+#include "abyss/core/fire_and_forget.h"
 #include "abyss/queue/file_offset_store.h"
 #include "shard_state.h"
 
@@ -95,7 +96,8 @@ core::Result<void> WalQueue::Initialize() {
 
 void WalQueue::RunReaper() {
   if (!reaper_) return;
-  [[maybe_unused]] auto ignored = reaper_->RunOnce();
+  // Reaper runs on a timer; record failures rather than let them go silent.
+  core::FireAndForget(reaper_->RunOnce(), reaper_failures_);
 }
 
 core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {

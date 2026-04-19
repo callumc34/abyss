@@ -3,7 +3,9 @@
 #include <utility>
 #include <variant>
 
+#include "abyss/core/fire_and_forget.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/queue_entry.h"
 
 namespace abyss::consumer {
 
@@ -51,59 +53,52 @@ void HotConsumer::Run() {
                             config_.read_timeout);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) return;
+      counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     for (auto& entry : *read) {
       ProcessEntry(entry);
-      // Ack is high-water-mark: a later entry's Ack supersedes this one, so
-      // swallowing a single-entry Ack failure is safe. The write itself is
-      // already durable.
-      [[maybe_unused]] auto ack = queue_.Ack(core::kHotConsumer, config_.shard, entry.seq);
+      // Ack is high-water-mark: a later ack supersedes this one on drop.
+      core::FireAndForget(queue_.Ack(core::kHotConsumer, config_.shard, entry.seq),
+                          counters_.ack_failures);
     }
   }
 }
 
 void HotConsumer::ProcessEntry(core::QueueEntry& entry) {
   const auto seq = entry.seq;
-  core::RespValue result = std::visit(
-      [this, seq]<typename T>(T& payload) -> core::RespValue {
-        if constexpr (std::is_same_v<T, core::entry::Write>) {
-          return ApplyWriteEntry(payload.cmd);
-        } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-          (void)seq;
-          return core::RespValue::Error(
-              core::ErrorPrefix::kErr,
-              "conditional writes require resolver; not yet wired in this deployment");
-        } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          (void)seq;
-          // Resolved entries are applied via block-and-scan once the Resolver
-          // ships; standalone application is a no-op in this deployment.
-          if (payload.decision == core::Decision::kApply && payload.materialised_op.has_value()) {
-            return ApplyWriteEntry(*payload.materialised_op);
-          }
-          return payload.return_value;
-        } else {
-          static_assert(sizeof(T) == 0, "unhandled QueueEntry payload variant");
-        }
-      },
-      entry.payload);
+  auto extracted = core::entry::ExtractApplicableCommand(entry);
+  core::RespValue result;
+  if (extracted.has_value()) {
+    result = ApplyWriteEntry(**extracted);
+  } else if (extracted.error().code() == core::ErrorCode::kNotFound) {
+    // Resolved-skip: no apply, use the pre-computed return_value from the resolver.
+    result = std::get<core::entry::Resolved>(entry.payload).return_value;
+  } else {
+    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+    result = core::RespValue::Error(core::ErrorPrefix::kErr, extracted.error().message());
+  }
 
   (void)rpc_.Fulfill(seq, std::move(result));
 }
 
 core::RespValue HotConsumer::ApplyWriteEntry(const core::RespCommand& cmd) {
   if (cmd.args.empty()) {
+    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return core::RespValue::Error(core::ErrorPrefix::kErr, "empty command payload in queue entry");
   }
   auto op = core::ops::ParseWriteOp(cmd.args[0], cmd);
   if (!op.has_value()) {
+    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return core::RespValue::Error(core::ErrorPrefix::kErr, op.error().message());
   }
   const auto eviction = eviction_policy_.Resolve(core::ops::PrimaryKey(*op));
   auto applied = store_.Apply(*op, eviction);
   if (!applied.has_value()) {
+    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
     return MapApplyError(applied.error());
   }
+  counters_.applied.fetch_add(1, std::memory_order_relaxed);
   return core::RespValue::SimpleString("OK");
 }
 

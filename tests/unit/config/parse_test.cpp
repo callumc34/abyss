@@ -35,12 +35,21 @@ queue:
   group_commit_interval_us: 1000
   group_commit_max_bytes: 1048576
 
+hot_consumer:
+  read_batch_size: 128
+  read_timeout_ms: 50
+
 cold_consumer:
   quiet_threshold_seconds: 30
   safety_margin_seconds: 300
-  deadline_jitter_ratio: 0.5
+  jitter_fraction: 0.25
   buffer_high_water_bytes: 536870912
+  buffer_low_water_bytes: 400000000
   max_flush_batch_size: 10000
+  queue_read_max_count: 2048
+  queue_read_timeout_ms: 25
+  retry_initial_backoff_ms: 100
+  retry_max_backoff_ms: 5000
 
 recovery:
   replay_parallelism: 4
@@ -89,11 +98,19 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->queue.group_commit_interval_us, 1000U);
   EXPECT_EQ(cfg->queue.group_commit_max_bytes, 1048576U);
 
+  EXPECT_EQ(cfg->hot_consumer.read_batch_size, 128U);
+  EXPECT_EQ(cfg->hot_consumer.read_timeout, std::chrono::milliseconds{50});
+
   EXPECT_EQ(cfg->cold_consumer.quiet_threshold, std::chrono::seconds{30});
   EXPECT_EQ(cfg->cold_consumer.safety_margin, std::chrono::seconds{300});
-  EXPECT_DOUBLE_EQ(cfg->cold_consumer.deadline_jitter_ratio, 0.5);
+  EXPECT_DOUBLE_EQ(cfg->cold_consumer.jitter_fraction, 0.25);
   EXPECT_EQ(cfg->cold_consumer.buffer_high_water_bytes, 536870912U);
+  EXPECT_EQ(cfg->cold_consumer.buffer_low_water_bytes, 400000000U);
   EXPECT_EQ(cfg->cold_consumer.max_flush_batch_size, 10000U);
+  EXPECT_EQ(cfg->cold_consumer.queue_read_max_count, 2048U);
+  EXPECT_EQ(cfg->cold_consumer.queue_read_timeout, std::chrono::milliseconds{25});
+  EXPECT_EQ(cfg->cold_consumer.retry_initial_backoff, std::chrono::milliseconds{100});
+  EXPECT_EQ(cfg->cold_consumer.retry_max_backoff, std::chrono::milliseconds{5000});
 
   EXPECT_EQ(cfg->recovery.replay_parallelism, 4U);
   EXPECT_EQ(cfg->recovery.hot_replay_batch_size, 10000U);
