@@ -12,6 +12,8 @@ set(ABYSS_GCC_CLANG_WARNINGS
   -Wall
   -Wextra
   -Wpedantic
+  # GCC warns on C++20 designated init with omitted class-type members; Clang doesn't.
+  -Wno-missing-field-initializers
 )
 
 set(ABYSS_MSVC_WARNINGS

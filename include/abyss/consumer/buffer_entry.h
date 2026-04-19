@@ -12,10 +12,10 @@ namespace abyss::consumer {
 enum class FlushTrigger : uint8_t { kQuiet = 0, kDeadline = 1 };
 
 struct BufferEntry {
-  std::string key = {};
-  CompactedState state = {};
-  core::SteadyTime first_seen = {};
-  core::SteadyTime last_modified = {};
+  std::string key;
+  CompactedState state;
+  core::SteadyTime first_seen;
+  core::SteadyTime last_modified;
   uint64_t write_count = 0;
   core::EvictionTTL eviction{0};
   std::chrono::milliseconds jitter_offset{0};
