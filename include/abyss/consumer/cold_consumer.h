@@ -31,7 +31,7 @@ class ColdConsumer {
     std::chrono::milliseconds queue_read_timeout{50};
     std::chrono::milliseconds retry_initial_backoff{50};
     std::chrono::milliseconds retry_max_backoff{30000};
-    std::optional<uint64_t> rng_seed;
+    std::optional<uint64_t> rng_seed = std::nullopt;
   };
 
   enum class Mode : uint8_t { kNormal = 0, kAggressive = 1 };
