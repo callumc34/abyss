@@ -361,9 +361,8 @@ core::Result<void> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end() && it->second.type != Entry::Type::kSet) {
     if (!IsExpiredByTtl(it->second, config_.wall_clock) && it->second.type != Entry::Type::kSet) {
-      return std::unexpected(
-          core::Error(core::ErrorCode::kWrongType,
-                      "WRONGTYPE Operation against a key holding the wrong kind of value"));
+      return std::unexpected(core::Error(
+          core::ErrorCode::kWrongType, "Operation against a key holding the wrong kind of value"));
     }
     RemoveEntry(std::string(op.key));
   }
@@ -384,9 +383,8 @@ core::Result<void> SingleShardStore::ApplySetRem(const core::ops::SetRem& op) {
   auto it = entries_.find(std::string(op.key));
   if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
   if (it->second.type != Entry::Type::kSet) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kWrongType,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"));
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
   }
   TrackRemove(it->second, op.key);
   auto& members = std::get<SetValue>(it->second.value).members;
@@ -405,9 +403,8 @@ core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
       it->second.type != Entry::Type::kZset) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kWrongType,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"));
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
   }
   if (it != entries_.end() && IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
@@ -441,9 +438,8 @@ core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) 
   auto it = entries_.find(std::string(op.key));
   if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
   if (it->second.type != Entry::Type::kZset) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kWrongType,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"));
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
   }
   TrackRemove(it->second, op.key);
   auto& zset = std::get<ZsetValue>(it->second.value);
@@ -473,9 +469,8 @@ core::Result<void> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
       it->second.type != Entry::Type::kHash) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kWrongType,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"));
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
   }
   if (it != entries_.end() && IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
@@ -497,9 +492,8 @@ core::Result<void> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op) 
   auto it = entries_.find(std::string(op.key));
   if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
   if (it->second.type != Entry::Type::kHash) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kWrongType,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"));
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
   }
   TrackRemove(it->second, op.key);
   auto& fields = std::get<HashValue>(it->second.value).fields;
@@ -625,9 +619,8 @@ core::Result<const Entry*> SingleShardStore::FindTypedEntry(std::string_view key
   const auto* entry = FindLiveEntry(key);
   if (entry == nullptr) return nullptr;
   if (entry->type != expected) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kWrongType,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"));
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
   }
   return entry;
 }

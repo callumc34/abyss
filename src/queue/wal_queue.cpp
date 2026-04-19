@@ -106,6 +106,17 @@ core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
   return {};
 }
 
+core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->BeginAppend(std::move(entry));
+}
+
+core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
+    core::ShardId shard, std::span<const core::QueueEntry> entries) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->BeginAppendBatch(entries);
+}
+
 core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
   return shards_[shard]->Append(std::move(entry));

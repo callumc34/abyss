@@ -37,6 +37,10 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   WalQueue(WalQueue&&) = delete;
   WalQueue& operator=(WalQueue&&) = delete;
 
+  core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry) override;
+  core::Result<PendingBatchAppend> BeginAppendBatch(
+      core::ShardId shard, std::span<const core::QueueEntry> entries) override;
+
   core::Result<AppendResult> Append(core::ShardId shard, core::QueueEntry entry) override;
   core::Result<AppendBatchResult> AppendBatch(core::ShardId shard,
                                               std::span<const core::QueueEntry> entries) override;

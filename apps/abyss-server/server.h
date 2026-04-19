@@ -65,7 +65,7 @@ class Server {
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
   std::unique_ptr<engine::TieringEngine> engine_;
-  std::unique_ptr<consumer::HotConsumer> hot_consumer_;
+  std::vector<std::unique_ptr<consumer::HotConsumer>> hot_consumers_;
 
   socket_t listen_fd_ = kInvalidSocket;
   std::atomic<bool> ready_{false};

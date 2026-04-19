@@ -11,6 +11,7 @@ target_link_libraries(abyss_integration_tests PRIVATE
   abyss::consumer
   abyss::hot
   abyss::cold
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )

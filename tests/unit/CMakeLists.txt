@@ -88,6 +88,7 @@ add_executable(abyss_consumer_tests
 
 target_link_libraries(abyss_consumer_tests PRIVATE
   abyss::consumer
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )

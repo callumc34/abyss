@@ -1,12 +1,19 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <future>
+#include <optional>
+#include <span>
 #include <string>
+#include <thread>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/types.h"
+#include "abyss/queue/append_result.h"
 #include "integration_harness.h"
 
 namespace abyss::engine {
@@ -110,11 +117,80 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
   EXPECT_EQ(after->AsString(), "cold_fallback");
 }
 
-TEST_F(TieringIntegrationTest, WritePathReturnsOk) {
+TEST_F(TieringIntegrationTest, WritePathAwaitsConsumerAck) {
+  // Simulate the hot consumer: fulfil the RPC for the seq about to be used.
+  const core::SequenceId expected_seq = harness_.PeekNextSeq();
+  std::thread fulfiller([this, expected_seq]() {
+    while (!harness_.Rpc().Fulfill(expected_seq, core::RespValue::SimpleString("OK"))) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+
   auto result = harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "k1", "v1"}));
+  fulfiller.join();
+
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsSimpleString());
   EXPECT_EQ(result->AsString(), "OK");
+  EXPECT_EQ(harness_.Rpc().PendingCount(), 0U);
+}
+
+TEST_F(TieringIntegrationTest, ColdHitStringTriggersPromotion) {
+  core::ops::WriteOp set_op{core::ops::StringSet{.key = "cold_only", .value = "cv"}};
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}).has_value());
+
+  bool promote_appended = false;
+  ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillByDefault([&promote_appended](core::ShardId, core::QueueEntry entry) {
+        if (std::holds_alternative<core::entry::Write>(entry.payload)) {
+          const auto& cmd = std::get<core::entry::Write>(entry.payload).cmd;
+          if (cmd.args.size() >= 3 && cmd.args[0] == "SET" && cmd.args[1] == "cold_only") {
+            promote_appended = true;
+          }
+        }
+        std::promise<core::Result<void>> p;
+        p.set_value(core::Result<void>{});
+        return queue::AppendResult{.seq = 99, .durable = p.get_future()};
+      });
+
+  auto read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "cold_only"}));
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->AsString(), "cv");
+  EXPECT_TRUE(promote_appended);
+}
+
+TEST_F(TieringIntegrationTest, ColdHitTtlPreservedInPromotionCommand) {
+  auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          harness_.Clock().WallNow().time_since_epoch())
+                                          .count());
+  const uint64_t abs_ttl_ms = now_ms + 3600000;
+
+  core::ops::WriteOp set_op{
+      core::ops::StringSet{.key = "ttl_key", .value = "v", .abs_ttl_ms = abs_ttl_ms}};
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}).has_value());
+
+  std::optional<core::RespCommand> promoted;
+  ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillByDefault([&promoted](core::ShardId, core::QueueEntry entry) {
+        if (std::holds_alternative<core::entry::Write>(entry.payload)) {
+          promoted = std::get<core::entry::Write>(entry.payload).cmd;
+        }
+        std::promise<core::Result<void>> p;
+        p.set_value(core::Result<void>{});
+        return queue::AppendResult{.seq = 99, .durable = p.get_future()};
+      });
+
+  auto read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ttl_key"}));
+  ASSERT_TRUE(read.has_value());
+  ASSERT_TRUE(promoted.has_value());
+  ASSERT_GE(promoted->args.size(), 5U);
+  EXPECT_EQ(promoted->args[0], "SET");
+  EXPECT_EQ(promoted->args[1], "ttl_key");
+  EXPECT_EQ(promoted->args[2], "v");
+  EXPECT_EQ(promoted->args[3], "PXAT");
+  EXPECT_EQ(promoted->args[4], std::to_string(abs_ttl_ms));
 }
 
 TEST_F(TieringIntegrationTest, ColdDeleteRemovesKey) {

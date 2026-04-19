@@ -28,11 +28,18 @@ The `Conditional` / `Resolved` pair and the block-and-scan protocol are specifie
 
 The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wall-clock timestamp) and a payload variant that discriminates the three entry types. Common fields are direct field accesses — no visitor needed just to read a sequence number. Type dispatch uses the variant only when consumers need to act on the payload.
 
-The queue interface provides a single `Append` method that accepts any entry type, plus `AppendBatch` for bulk appends. A `Read` method returns entries for a given consumer and shard. `Ack` marks entries as processed. `OldestRetained` reports the earliest unacknowledged entry for GC.
+The queue interface offers two append flavours:
+
+- **Two-phase** — `BeginAppend` / `BeginAppendBatch` allocate a sequence id, encode the entry, and submit it to the group-commit fsync window, but leave the entry invisible to consumers until the caller runs `Publish()` on the returned RAII handle. The handle holds the per-shard append mutex for the duration of the window, bounding the critical section to the caller's per-seq setup (e.g. registering a Consumer RPC promise). The destructor auto-publishes if the caller drops the handle without calling `Publish()`, so a forgotten publish degrades to a latency bug, never a lost write.
+- **One-shot** — `Append` / `AppendBatch` are `BeginAppend` + `Publish()` inline. Safe only for fire-and-forget callers that do not register per-seq state before publication. Used by cold-hit promotion and by the Resolver when emitting `Resolved` entries.
+
+Callers that await consumer apply (the tiering engine's write path) MUST use the two-phase primitive. Publishing before the producer has registered its RPC promise would race with the consumer's Fulfill — the producer could miss the response. Two-phase closes this structurally by letting the producer register under the same lock that gates visibility.
+
+A `Read` method returns entries for a given consumer and shard. `Ack` marks entries as processed. `OldestRetained` reports the earliest unacknowledged entry for GC.
 
 The frontend creates Write and Conditional entries. The Resolver creates Resolved entries. Hot and cold consumers are read-only against the queue.
 
-See `include/abyss/core/queue.h` and `include/abyss/core/queue_entry.h` for the current interface.
+See `include/abyss/core/queue.h`, `include/abyss/core/queue_entry.h`, and `include/abyss/queue/pending_append.h` for the current interface.
 
 ### Embedded WAL
 

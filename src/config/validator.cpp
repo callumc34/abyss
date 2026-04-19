@@ -115,6 +115,23 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
   return {};
 }
 
+core::Result<void> ValidateConsumerRpc(const ConsumerRpcConfig& c) {
+  if (auto r = RequirePositive("consumer_rpc.registry_shard_count", c.registry_shard_count); !r)
+    return r;
+  if (c.default_timeout.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("consumer_rpc.default_timeout_ms", "must be > 0 milliseconds"));
+  }
+  return {};
+}
+
+core::Result<void> ValidateEngine(const EngineConfig& e) {
+  if (e.write_timeout.count() <= 0) {
+    return std::unexpected(InvalidArg("engine.write_timeout_ms", "must be > 0 milliseconds"));
+  }
+  return {};
+}
+
 core::Result<void> ValidateRecovery(const RecoveryConfig& r) {
   if (auto res = RequirePositive("recovery.replay_parallelism", r.replay_parallelism); !res)
     return res;
@@ -174,6 +191,8 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateCold(config.cold); !r) return r;
   if (auto r = ValidateQueue(config.queue); !r) return r;
   if (auto r = ValidateColdConsumer(config.cold_consumer); !r) return r;
+  if (auto r = ValidateConsumerRpc(config.consumer_rpc); !r) return r;
+  if (auto r = ValidateEngine(config.engine); !r) return r;
   if (auto r = ValidateRecovery(config.recovery); !r) return r;
   if (auto r = ValidateResp(config.resp); !r) return r;
   if (auto r = ValidateMetrics(config.metrics); !r) return r;

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
@@ -28,6 +30,11 @@ class ColdStore {
 
   virtual Result<StorageStats> Stats() = 0;
   virtual Result<void> Compact() = 0;
+
+  // Returns the RESP command that reconstructs `key`'s hot-side view from
+  // cold, or nullopt if the key does not exist or its type isn't promotable
+  // in this implementation. Preserves absolute TTL.
+  virtual Result<std::optional<RespCommand>> GetPromotionCommand(std::string_view key) = 0;
 };
 
 }  // namespace abyss::core

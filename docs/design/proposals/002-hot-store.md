@@ -54,13 +54,14 @@ hot:
 
 ### Hot Consumer
 
-The hot consumer runs as a dedicated thread that tails the queue and applies writes to the hot store.
+The hot consumer runs as a dedicated thread **per shard owned by this pod**. Each thread tails its shard's queue partition and applies writes to the hot store. Phase 1 (single pod) owns every shard; Phase 2+ owns a subset; the per-shard ownership model is invariant across phases and migrates cleanly to a thread-per-core runtime in Phase 4. One consumer per shard matches how external brokers (Kafka, NATS) model partition consumption and keeps per-shard state independent — a stalled shard never blocks another.
 
 **Behaviour:**
-- Always at or near the head of the queue.
+- Always at or near the head of its shard's queue.
 - Applies writes immediately as they arrive via `HotStore::Apply`.
 - Sets the eviction duration on each key (from global default or per-prefix config).
 - Fulfils the write handler's promise after each successful apply, unblocking the client response. See [ADP-006](006-read-write-paths.md) for the write promise lifecycle.
+- Error policy: the consumer never wedges on a poison entry. Parse errors, `WRONGTYPE`, and similar apply-time failures flow to the client through the Consumer RPC fulfilment (`ErrorPrefix` routed appropriately); the entry is acked and the loop proceeds. Only a queue-shutdown signal exits.
 
 **Lag budget:** Effectively zero. The hot consumer must keep up with the write rate. If it falls behind, write latency increases because clients are awaiting their promises. This is self-regulating — rising latency naturally reduces write throughput via client backpressure.
 

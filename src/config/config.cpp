@@ -79,6 +79,17 @@ core::Result<void> ParseRecovery(const YamlCursor& cur, RecoveryConfig& out) {
       .Finish();
 }
 
+core::Result<void> ParseConsumerRpc(const YamlCursor& cur, ConsumerRpcConfig& out) {
+  return SectionDecoder(cur)
+      .Optional("registry_shard_count", out.registry_shard_count)
+      .Optional("default_timeout_ms", out.default_timeout)
+      .Finish();
+}
+
+core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
+  return SectionDecoder(cur).Optional("write_timeout_ms", out.write_timeout).Finish();
+}
+
 core::Result<void> ParseResp(const YamlCursor& cur, RespConfig& out) {
   return SectionDecoder(cur)
       .Optional("bind", out.bind)
@@ -117,7 +128,8 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
   const YamlCursor root_cur(root);
   if (auto r = root_cur.RequireMap(); !r) return std::unexpected(r.error());
   if (auto r = root_cur.RejectUnknownKeys({"profile", "hot", "cold", "queue", "cold_consumer",
-                                           "recovery", "resp", "metrics", "admin"});
+                                           "consumer_rpc", "engine", "recovery", "resp", "metrics",
+                                           "admin"});
       !r) {
     return std::unexpected(r.error());
   }
@@ -134,12 +146,15 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
     core::Result<void> (*parse)(const YamlCursor&, Config&);
   };
 
-  const std::array<Section, 8> sections = {{
+  const std::array<Section, 10> sections = {{
       {"hot", [](const YamlCursor& c, Config& cfg) { return ParseHot(c, cfg.hot); }},
       {"cold", [](const YamlCursor& c, Config& cfg) { return ParseCold(c, cfg.cold); }},
       {"queue", [](const YamlCursor& c, Config& cfg) { return ParseQueue(c, cfg.queue); }},
       {"cold_consumer",
        [](const YamlCursor& c, Config& cfg) { return ParseColdConsumer(c, cfg.cold_consumer); }},
+      {"consumer_rpc",
+       [](const YamlCursor& c, Config& cfg) { return ParseConsumerRpc(c, cfg.consumer_rpc); }},
+      {"engine", [](const YamlCursor& c, Config& cfg) { return ParseEngine(c, cfg.engine); }},
       {"recovery", [](const YamlCursor& c, Config& cfg) { return ParseRecovery(c, cfg.recovery); }},
       {"resp", [](const YamlCursor& c, Config& cfg) { return ParseResp(c, cfg.resp); }},
       {"metrics", [](const YamlCursor& c,

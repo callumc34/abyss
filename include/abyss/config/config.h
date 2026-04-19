@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/result.h"
 
 namespace abyss::config {
@@ -61,6 +62,12 @@ struct RespConfig {
   std::chrono::seconds idle_timeout{300};
 };
 
+using ConsumerRpcConfig = core::ConsumerRpcConfig;
+
+struct EngineConfig {
+  std::chrono::milliseconds write_timeout{5000};
+};
+
 struct MetricsConfig {
   std::string bind = "0.0.0.0";
   uint16_t port = 9090;
@@ -77,6 +84,8 @@ struct Config {
   ColdConfig cold;
   QueueConfig queue;
   ColdConsumerConfig cold_consumer;
+  ConsumerRpcConfig consumer_rpc;
+  EngineConfig engine;
   RecoveryConfig recovery;
   RespConfig resp;
   MetricsConfig metrics;

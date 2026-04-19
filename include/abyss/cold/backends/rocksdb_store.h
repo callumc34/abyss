@@ -7,8 +7,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "abyss/core/cold_store.h"
 #include "abyss/core/types.h"
@@ -45,6 +47,7 @@ class RocksdbStore : public core::ColdStore {
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
+  core::Result<std::optional<core::RespCommand>> GetPromotionCommand(std::string_view key) override;
 
   // DEL returns the count of keys that existed before deletion.
   core::Result<core::RespValue> ExecDel(const core::ops::Del& op);

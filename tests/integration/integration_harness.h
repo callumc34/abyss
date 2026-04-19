@@ -37,25 +37,37 @@ class IntegrationHarness {
     auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
         .data_path = (tmp_dir_ / "cold").string(),
         .write_buffer_size_bytes = 1024UL * 1024UL,
+        .wall_clock = clock_.WallFn(),
     });
     cold_ = std::move(cold_result).value();
 
     rpc_ = std::make_unique<core::ConsumerRpc>();
 
+    // NOLINTBEGIN(performance-unnecessary-value-param) — gmock forces by-value
+    // lambda params to match the MOCK_METHOD signature.
+    ON_CALL(queue_, BeginAppend(::testing::_, ::testing::_))
+        .WillByDefault([this](core::ShardId, core::QueueEntry) {
+          std::promise<core::Result<void>> p;
+          p.set_value(core::Result<void>{});
+          return queue::PendingAppend{next_seq_++, p.get_future(),
+                                      std::make_unique<NoopAppendPublisher>()};
+        });
     ON_CALL(queue_, Append(::testing::_, ::testing::_))
-        .WillByDefault([this](core::ShardId, const core::QueueEntry&) {
+        .WillByDefault([this](core::ShardId, core::QueueEntry) {
           std::promise<core::Result<void>> p;
           p.set_value(core::Result<void>{});
           return queue::AppendResult{.seq = next_seq_++, .durable = p.get_future()};
         });
+    // NOLINTEND(performance-unnecessary-value-param)
 
     core::EvictionPolicy eviction_policy{std::chrono::seconds{86400}};
     cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
         eviction_policy, clock_.SteadyFn(), clock_.WallFn());
 
-    engine_ = std::make_unique<engine::TieringEngine>(queue_, *hot_, *cold_, *cold_pool_, *rpc_,
-                                                      kShardCount);
+    engine_ = std::make_unique<engine::TieringEngine>(
+        queue_, *hot_, *cold_, *cold_pool_, *rpc_,
+        engine::TieringEngineConfig{.shard_count = kShardCount});
   }
 
   ~IntegrationHarness() {
@@ -81,8 +93,10 @@ class IntegrationHarness {
     auto shard = hot::ComputeShard(key, kShardCount);
     return cold_pool_->ConsumerFor(shard).Buffer();
   }
+  core::ConsumerRpc& Rpc() { return *rpc_; }
   TestClock& Clock() { return clock_; }
   ::testing::NiceMock<MockQueue>& Queue() { return queue_; }
+  core::SequenceId PeekNextSeq() const { return next_seq_; }
 
  private:
   std::filesystem::path tmp_dir_;

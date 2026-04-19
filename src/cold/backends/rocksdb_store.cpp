@@ -358,6 +358,33 @@ core::Result<void> RocksdbStore::Compact() {
   return {};
 }
 
+core::Result<std::optional<core::RespCommand>> RocksdbStore::GetPromotionCommand(
+    std::string_view key) {
+  // Strings only for now; collection promotion is additive here.
+  const auto encoded_key = fmt::EncodeStringKey(key);
+  std::string raw;
+  auto status = impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded_key, &raw);
+  if (status.IsNotFound()) return std::optional<core::RespCommand>{};
+  if (!status.ok()) return std::unexpected(FromStatus(status, "GetPromotionCommand"));
+
+  auto decoded = fmt::DecodeStringValue(raw);
+  if (!decoded.has_value()) return std::unexpected(decoded.error());
+  if (fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, impl_->NowMs())) {
+    return std::optional<core::RespCommand>{};
+  }
+
+  core::RespCommand cmd;
+  cmd.args.reserve(5);
+  cmd.args.emplace_back("SET");
+  cmd.args.emplace_back(key);
+  cmd.args.emplace_back(decoded->payload);
+  if ((decoded->flags & fmt::kFlagHasTtl) != 0) {
+    cmd.args.emplace_back("PXAT");
+    cmd.args.emplace_back(std::to_string(decoded->abs_ttl_ms));
+  }
+  return std::optional<core::RespCommand>{std::move(cmd)};
+}
+
 // --- Dispatch ---------------------------------------------------------------
 
 core::Result<RespValue> RocksdbStore::Impl::Exec(const core::ops::ReadOp& op) const {
