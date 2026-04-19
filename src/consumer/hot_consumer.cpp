@@ -23,8 +23,12 @@ core::RespValue MapApplyError(const core::Error& err) {
 }  // namespace
 
 HotConsumer::HotConsumer(core::Queue& queue, core::HotStore& store, core::ConsumerRpc& rpc,
-                         HotConsumerConfig config)
-    : queue_(queue), store_(store), rpc_(rpc), config_(config) {}
+                         Config config, core::EvictionPolicy eviction_policy)
+    : queue_(queue),
+      store_(store),
+      rpc_(rpc),
+      config_(config),
+      eviction_policy_(std::move(eviction_policy)) {}
 
 HotConsumer::~HotConsumer() { Stop(); }
 
@@ -95,7 +99,8 @@ core::RespValue HotConsumer::ApplyWriteEntry(const core::RespCommand& cmd) {
   if (!op.has_value()) {
     return core::RespValue::Error(core::ErrorPrefix::kErr, op.error().message());
   }
-  auto applied = store_.Apply(*op, config_.default_eviction);
+  const auto eviction = eviction_policy_.Resolve(core::ops::PrimaryKey(*op));
+  auto applied = store_.Apply(*op, eviction);
   if (!applied.has_value()) {
     return MapApplyError(applied.error());
   }

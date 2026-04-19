@@ -5,27 +5,27 @@
 #include <thread>
 
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/eviction_policy.h"
 #include "abyss/core/hot_store.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/types.h"
 
 namespace abyss::consumer {
 
-struct HotConsumerConfig {
-  core::ShardId shard = 0;
-  core::EvictionTTL default_eviction{86400};
-  size_t read_batch_size = 256;
-  // Bounds Stop() latency; loop wakes at this cadence to check stop flag.
-  core::Duration read_timeout{100};
-};
-
 // One thread per shard: tails the queue, applies writes to the hot store,
 // fulfills the associated RPC, acks. Errors (parse, WRONGTYPE, etc.) flow
 // through Fulfill rather than wedging the loop.
 class HotConsumer {
  public:
-  HotConsumer(core::Queue& queue, core::HotStore& store, core::ConsumerRpc& rpc,
-              HotConsumerConfig config);
+  struct Config {
+    core::ShardId shard = 0;
+    size_t read_batch_size = 256;
+    // Bounds Stop() latency; loop wakes at this cadence to check stop flag.
+    core::Duration read_timeout{100};
+  };
+
+  HotConsumer(core::Queue& queue, core::HotStore& store, core::ConsumerRpc& rpc, Config config,
+              core::EvictionPolicy eviction_policy);
   ~HotConsumer();
 
   HotConsumer(const HotConsumer&) = delete;
@@ -47,7 +47,8 @@ class HotConsumer {
   core::Queue& queue_;
   core::HotStore& store_;
   core::ConsumerRpc& rpc_;
-  HotConsumerConfig config_;
+  Config config_;
+  core::EvictionPolicy eviction_policy_;
 
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> running_{false};

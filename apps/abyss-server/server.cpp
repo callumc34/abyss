@@ -138,17 +138,11 @@ bool Server::Initialize() {
           .write_timeout = config_.engine.write_timeout,
       });
 
-  hot_consumers_.reserve(hot_store_->shard_count());
-  for (uint32_t s = 0; s < hot_store_->shard_count(); ++s) {
-    hot_consumers_.push_back(std::make_unique<consumer::HotConsumer>(
-        *queue_, *hot_store_, *consumer_rpc_,
-        consumer::HotConsumerConfig{
-            .shard = s,
-            .default_eviction = config_.hot.default_eviction,
-        }));
-    hot_consumers_.back()->Start();
-  }
+  hot_pool_ = std::make_unique<consumer::HotConsumerPool>(
+      *queue_, *hot_store_, *consumer_rpc_,
+      consumer::HotConsumerPool::Config{.shard_count = hot_store_->shard_count()}, eviction_policy);
 
+  hot_pool_->Start();
   cold_pool_->Start();
 #endif
 
@@ -345,10 +339,7 @@ void Server::Shutdown() {
   }
 
   if (cold_pool_) cold_pool_->Stop();
-  for (auto& c : hot_consumers_) {
-    if (c) c->Stop();
-  }
-  hot_consumers_.clear();
+  if (hot_pool_) hot_pool_->Stop();
 
 #ifdef _WIN32
   WSACleanup();

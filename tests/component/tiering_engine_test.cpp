@@ -48,12 +48,10 @@ class TieringEngineTest : public ::testing::Test {
   static constexpr std::chrono::milliseconds kWriteTimeout = 1s;
 
   TieringEngine MakeEngine() {
-    return {queue_,
-            hot_,
-            cold_,
-            router_,
-            rpc_,
-            TieringEngineConfig{.shard_count = kShardCount, .write_timeout = kWriteTimeout}};
+    return {
+        queue_, hot_,
+        cold_,  router_,
+        rpc_,   TieringEngineConfig{.shard_count = kShardCount, .write_timeout = kWriteTimeout}};
   }
 
   core::RespCommand MakeCmd(std::initializer_list<std::string> args) {

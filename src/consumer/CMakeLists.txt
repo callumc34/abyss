@@ -1,5 +1,6 @@
 add_library(abyss_consumer
   hot_consumer.cpp
+  hot_consumer_pool.cpp
   cold_consumer.cpp
   cold_consumer_pool.cpp
   compaction_buffer.cpp

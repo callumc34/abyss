@@ -62,12 +62,12 @@ class HotConsumerTest : public ::testing::Test {
   // Start a consumer on the shared queue/store pointing at shard 0.
   void StartConsumer(core::EvictionTTL eviction = core::EvictionTTL{86400}) {
     consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_,
-                                              HotConsumerConfig{
+                                              HotConsumer::Config{
                                                   .shard = 0,
-                                                  .default_eviction = eviction,
                                                   .read_batch_size = 32,
                                                   .read_timeout = core::Duration{10},
-                                              });
+                                              },
+                                              core::EvictionPolicy{eviction});
     consumer_->Start();
   }
 
