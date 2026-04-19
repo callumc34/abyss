@@ -26,7 +26,17 @@ COPY include/ include/
 COPY src/ src/
 COPY apps/ apps/
 
-RUN --mount=type=cache,target=/root/.cache/vcpkg/archives \
+RUN --mount=type=secret,id=actions_cache_url \
+    --mount=type=secret,id=actions_results_url \
+    --mount=type=secret,id=actions_runtime_token \
+    --mount=type=cache,target=/root/.cache/vcpkg/archives \
+    set -e; \
+    if [ -s /run/secrets/actions_runtime_token ]; then \
+      export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)"; \
+      export ACTIONS_RESULTS_URL="$(cat /run/secrets/actions_results_url 2>/dev/null || true)"; \
+      export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token)"; \
+      export VCPKG_BINARY_SOURCES="clear;x-gha,readwrite"; \
+    fi; \
     cmake --preset container -G Ninja && \
     cmake --build build/container --target abyss-server
 

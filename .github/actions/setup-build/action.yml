@@ -1,13 +1,5 @@
 name: Setup Abyss Build Environment
-description: Install required packages for building
-
-outputs:
-  vcpkg-cache-key:
-    description: Cache key for vcpkg binary cache
-    value: vcpkg-${{ runner.os }}-${{ steps.vcpkg-baseline.outputs.commit }}-${{ steps.vcpkg-baseline.outputs.manifest-hash }}
-  vcpkg-cache-path:
-    description: Path to vcpkg binary cache directory
-    value: ${{ steps.vcpkg-dirs.outputs.cache-path }}
+description: Install compiler and bootstrap vcpkg at the manifest baseline.
 
 runs:
   using: composite
@@ -20,30 +12,13 @@ runs:
         echo "CC=/usr/bin/gcc-14" >> "${GITHUB_ENV}"
         echo "CXX=/usr/bin/g++-14" >> "${GITHUB_ENV}"
 
-    - name: Read vcpkg baseline
-      id: vcpkg-baseline
-      shell: bash
-      run: |
-        BASELINE=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
-        MANIFEST_HASH=$(sha256sum vcpkg.json | cut -d' ' -f1)
-        echo "commit=${BASELINE}" >> "${GITHUB_OUTPUT}"
-        echo "manifest-hash=${MANIFEST_HASH}" >> "${GITHUB_OUTPUT}"
-
-    - name: Resolve cache directory
-      id: vcpkg-dirs
-      shell: bash
-      run: |
-        CACHE_PATH="${HOME}/.cache/vcpkg/archives"
-        mkdir -p "${CACHE_PATH}"
-        echo "cache-path=${CACHE_PATH}" >> "${GITHUB_OUTPUT}"
-
     - name: Bootstrap vcpkg
       shell: bash
       run: |
+        BASELINE=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
         git init /opt/vcpkg
         git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git
-        git -C /opt/vcpkg fetch --depth 1 origin "${{ steps.vcpkg-baseline.outputs.commit }}"
+        git -C /opt/vcpkg fetch --depth 1 origin "${BASELINE}"
         git -C /opt/vcpkg checkout FETCH_HEAD
         /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
         echo "VCPKG_ROOT=/opt/vcpkg" >> "${GITHUB_ENV}"
-        echo "VCPKG_DEFAULT_BINARY_CACHE=${{ steps.vcpkg-dirs.outputs.cache-path }}" >> "${GITHUB_ENV}"
