@@ -15,7 +15,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
-#include <iostream>
+#include <string>
 #include <utility>
 
 #include "abyss/log/log.h"
@@ -260,11 +260,42 @@ bool Server::SetupListener() {
   return true;
 }
 
+void Server::NotifyReady() {
+  if (ready_fd_ < 0) return;
+
+  std::string line = R"({"bind":")";
+  line += config_.resp.bind;
+  line += R"(","port":)";
+  line += std::to_string(config_.resp.port);
+  line += "}\n";
+
+#ifdef _WIN32
+  auto handle = reinterpret_cast<HANDLE>(ready_fd_);
+  DWORD written = 0;
+  WriteFile(handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+  CloseHandle(handle);
+#else
+  const int fd = static_cast<int>(ready_fd_);
+  const char* data = line.data();
+  size_t remaining = line.size();
+  while (remaining > 0) {
+    const auto n = ::write(fd, data, remaining);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    data += n;
+    remaining -= static_cast<size_t>(n);
+  }
+  ::close(fd);
+#endif
+  ready_fd_ = -1;
+}
+
 void Server::Run(const std::atomic<bool>& stop) {
   if (!SetupListener()) return;
 
-  std::cout << "abyss-ready bind=" << config_.resp.bind << " port=" << config_.resp.port << "\n"
-            << std::flush;
+  NotifyReady();
   ABYSS_LOG_INFO(ListenerLog(), "listening", {"version", std::string_view{kVersion}},
                  {"bind", std::string_view{config_.resp.bind}},
                  {"port", static_cast<int64_t>(config_.resp.port)});

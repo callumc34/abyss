@@ -27,21 +27,21 @@ namespace abyss::system_test {
 
 namespace {
 
-constexpr std::string_view kReadyPrefix = "abyss-ready";
-constexpr std::string_view kPortTag = "port=";
+constexpr std::string_view kPortKey = "\"port\":";
 
 uint16_t ParseReadyLine(std::string_view line) {
-  if (!line.starts_with(kReadyPrefix)) return 0;
-  const auto tag = line.find(kPortTag);
-  if (tag == std::string_view::npos) return 0;
-  line.remove_prefix(tag + kPortTag.size());
+  const auto key = line.find(kPortKey);
+  if (key == std::string_view::npos) return 0;
+  line.remove_prefix(key + kPortKey.size());
   uint32_t port = 0;
+  bool any = false;
   for (char c : line) {
     if (c < '0' || c > '9') break;
     port = (port * 10) + static_cast<uint32_t>(c - '0');
+    any = true;
     if (port > 65535) return 0;
   }
-  return static_cast<uint16_t>(port);
+  return any ? static_cast<uint16_t>(port) : 0;
 }
 
 #ifdef _WIN32
@@ -59,7 +59,7 @@ struct WsaGuard {
 const WsaGuard kWsaGuard;
 
 std::string BuildCommandLine(const char* binary, const std::string& data_dir,
-                             const std::string& shard_count) {
+                             const std::string& shard_count, const std::string& ready_fd) {
   std::string cmd;
   cmd.reserve(256);
   cmd += '"';
@@ -68,6 +68,8 @@ std::string BuildCommandLine(const char* binary, const std::string& data_dir,
   cmd += data_dir;
   cmd += "\" --shard-count ";
   cmd += shard_count;
+  cmd += " --ready-fd ";
+  cmd += ready_fd;
   return cmd;
 }
 
@@ -104,7 +106,7 @@ TestServer::TestServer(Config config) : config_(config), data_dir_("system_test"
 
 TestServer::~TestServer() {
   if (IsRunning()) Kill();
-  ClosePipe(&stdout_read_);
+  ClosePipe(&ready_read_);
 }
 
 bool TestServer::Start() {
@@ -129,7 +131,6 @@ bool TestServer::Start() {
     skip_reason_ = "CreatePipe failed: " + std::to_string(GetLastError());
     return false;
   }
-  // The parent keeps the read end; ensure it is not inherited by the child.
   if (!SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0)) {
     CloseHandle(read_handle);
     CloseHandle(write_handle);
@@ -137,16 +138,12 @@ bool TestServer::Start() {
     return false;
   }
 
-  STARTUPINFOA si{};
-  si.cb = sizeof(si);
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-  si.hStdOutput = write_handle;
-  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  const std::string ready_str = std::to_string(reinterpret_cast<intptr_t>(write_handle));  // NOLINT
 
   PROCESS_INFORMATION pi{};
-  std::string cmd_line = BuildCommandLine(binary, data_str, shard_str);
-  // CreateProcessA needs a writable command line buffer.
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  std::string cmd_line = BuildCommandLine(binary, data_str, shard_str, ready_str);
   const BOOL ok = CreateProcessA(binary, cmd_line.data(), nullptr, nullptr, TRUE, 0, nullptr,
                                  nullptr, &si, &pi);
   CloseHandle(write_handle);
@@ -158,7 +155,7 @@ bool TestServer::Start() {
 
   CloseHandle(pi.hThread);
   proc_ = pi.hProcess;
-  stdout_read_ = read_handle;
+  ready_read_ = read_handle;
 
 #else
   std::array<int, 2> pipe_fds{-1, -1};
@@ -167,6 +164,8 @@ bool TestServer::Start() {
     skip_reason_ += std::strerror(errno);
     return false;
   }
+
+  const std::string ready_str = std::to_string(pipe_fds[1]);
 
   const pid_t pid = ::fork();
   if (pid < 0) {
@@ -179,19 +178,16 @@ bool TestServer::Start() {
   }
 
   if (pid == 0) {
-    ::dup2(pipe_fds[1], STDOUT_FILENO);
     ::close(pipe_fds[0]);
-    ::close(pipe_fds[1]);
-
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
     ::execl(binary, "abyss-server", "--port", "0", "--data-dir", data_str.c_str(), "--shard-count",
-            shard_str.c_str(), nullptr);
+            shard_str.c_str(), "--ready-fd", ready_str.c_str(), nullptr);
     ::_exit(127);
   }
 
   ClosePipe(&pipe_fds[1]);
   proc_ = pid;
-  stdout_read_ = pipe_fds[0];
+  ready_read_ = pipe_fds[0];
 #endif
 
   if (!WaitForReady()) {
@@ -222,10 +218,10 @@ bool TestServer::WaitForReady() {
     }
 
     DWORD bytes_avail = 0;
-    if (!PeekNamedPipe(stdout_read_, nullptr, 0, nullptr, &bytes_avail, nullptr)) {
+    if (!PeekNamedPipe(ready_read_, nullptr, 0, nullptr, &bytes_avail, nullptr)) {
       const DWORD err = GetLastError();
       if (err == ERROR_BROKEN_PIPE) {
-        skip_reason_ = "server stdout closed before ready line";
+        skip_reason_ = "ready pipe closed before ready line";
         return false;
       }
       skip_reason_ = "PeekNamedPipe failed: " + std::to_string(err);
@@ -238,12 +234,12 @@ bool TestServer::WaitForReady() {
 
     DWORD nread = 0;
     const DWORD to_read = static_cast<DWORD>(std::min<DWORD>(bytes_avail, chunk.size()));
-    if (!ReadFile(stdout_read_, chunk.data(), to_read, &nread, nullptr)) {
+    if (!ReadFile(ready_read_, chunk.data(), to_read, &nread, nullptr)) {
       skip_reason_ = "ReadFile failed: " + std::to_string(GetLastError());
       return false;
     }
     if (nread == 0) {
-      skip_reason_ = "server stdout closed before ready line";
+      skip_reason_ = "ready pipe closed before ready line";
       return false;
     }
     buffer.append(chunk.data(), static_cast<size_t>(nread));
@@ -268,7 +264,7 @@ bool TestServer::WaitForReady() {
         1, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
     const int poll_ms = static_cast<int>(std::min<long>(remaining_ms, 100));
 
-    pollfd pfd{.fd = stdout_read_, .events = POLLIN, .revents = 0};
+    pollfd pfd{.fd = ready_read_, .events = POLLIN, .revents = 0};
     const int pr = ::poll(&pfd, 1, poll_ms);
     if (pr < 0) {
       if (errno == EINTR) continue;
@@ -278,7 +274,7 @@ bool TestServer::WaitForReady() {
     }
     if (pr == 0) continue;
 
-    const auto nread = ::read(stdout_read_, chunk.data(), chunk.size());
+    const auto nread = ::read(ready_read_, chunk.data(), chunk.size());
     if (nread < 0) {
       if (errno == EINTR) continue;
       skip_reason_ = "read failed: ";
@@ -286,26 +282,24 @@ bool TestServer::WaitForReady() {
       return false;
     }
     if (nread == 0) {
-      skip_reason_ = "server stdout closed before ready line";
+      skip_reason_ = "ready pipe closed before ready line";
       return false;
     }
     buffer.append(chunk.data(), static_cast<size_t>(nread));
 #endif
 
-    for (auto nl = buffer.find('\n'); nl != std::string::npos; nl = buffer.find('\n')) {
-      const std::string_view line(buffer.data(), nl);
-      if (line.starts_with(kReadyPrefix)) {
-        const uint16_t port = ParseReadyLine(line);
-        if (port == 0) {
-          skip_reason_ = "malformed ready line: ";
-          skip_reason_.append(line);
-          return false;
-        }
-        port_ = port;
-        return true;
-      }
-      buffer.erase(0, nl + 1);
+    const auto nl = buffer.find('\n');
+    if (nl == std::string::npos) continue;
+
+    const std::string_view line(buffer.data(), nl);
+    const uint16_t port = ParseReadyLine(line);
+    if (port == 0) {
+      skip_reason_ = "malformed ready line: ";
+      skip_reason_.append(line);
+      return false;
     }
+    port_ = port;
+    return true;
   }
 
   skip_reason_ = "timed out waiting for server ready line";
@@ -350,7 +344,7 @@ void TestServer::WaitChild() {
   }
   proc_ = kInvalidProcHandle;
 #endif
-  ClosePipe(&stdout_read_);
+  ClosePipe(&ready_read_);
   port_ = 0;
 }
 

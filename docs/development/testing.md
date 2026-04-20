@@ -74,7 +74,7 @@ Two fixtures, in `tests/system/framework/server_fixture.h`:
 | `SystemTest` | Stateless or data-path-only tests. `FLUSHALL` runs between tests; no restart. Derived `DataCommandTest` adds a probe that skips the test if data commands aren't wired yet. |
 | `IsolatedServerTest` | Anything that restarts the server, asserts metrics from a clean baseline, or tests durability across shutdown. Derived `IsolatedDataServerTest` adds the same probe. |
 
-`TestServer` spawns `abyss-server` via `fork + dup2 + execl`, pipes stdout, parses the `abyss-ready port=N` announcement line, and connects over loopback. Unix only; Windows is gated off at CMake.
+`TestServer` spawns `abyss-server`, passes an inheritable pipe via `--ready-fd`, reads one JSON line (`{"bind":"...","port":N}`) once the listener is bound, and connects over loopback. Same contract on POSIX (fd) and Windows (HANDLE cast to `intptr_t`).
 
 ### Known limitation
 
@@ -82,7 +82,7 @@ Two fixtures, in `tests/system/framework/server_fixture.h`:
 
 ## Fixture writing rules
 
-- No `sleep_for` except `TestServer::WaitForReady` polling the child process's stdout.
+- No `sleep_for` except `TestServer::WaitForReady` polling the readiness pipe.
 - No hardcoded ports. Use `--port 0` and parse the port the OS picked.
 - No hardcoded paths. Use `TempDir`.
 - No `static` non-const state across tests.

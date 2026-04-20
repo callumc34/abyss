@@ -44,17 +44,22 @@ int main(int argc, char* argv[]) {
   std::string data_dir = kDefaultDataDir;
   std::optional<uint16_t> port_override;
   std::optional<uint32_t> shard_count_override;
+  intptr_t ready_fd = -1;
 
   app.add_option("-c,--config", config_path, "Path to YAML config file (ABYSS_CONFIG_PATH)");
   app.add_option("-p,--port", port_override,
                  "RESP listen port (overrides config). Pass 0 to let the OS pick an ephemeral "
-                 "port; the bound port is announced on the stdout ready line.");
+                 "port; the bound port is emitted via --ready-fd when set.");
   app.add_option("-d,--data-dir", data_dir,
                  "Data directory for WAL and cold store (used when no config file is given)")
       ->default_val(data_dir);
   app.add_option("--shard-count", shard_count_override,
                  "Hot-store shard count (overrides config). The queue and consumer pools are "
                  "opened with the same count.");
+  app.add_option("--ready-fd", ready_fd,
+                 "Readiness pipe. POSIX fd, or Windows HANDLE cast to intptr_t. Once the "
+                 "listener is bound, one JSON line ({\"bind\":\"...\",\"port\":N}) is written "
+                 "and the handle is closed.");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -114,6 +119,7 @@ int main(int argc, char* argv[]) {
 #endif
 
   abyss::server::Server server(config);
+  server.set_ready_fd(ready_fd);
   if (!server.Initialize()) {
     ABYSS_LOG_CRITICAL(bootstrap_logger, "server initialize failed");
     return EXIT_FAILURE;
