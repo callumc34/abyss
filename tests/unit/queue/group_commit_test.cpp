@@ -67,6 +67,13 @@ TEST(GroupCommitterTest, GroupCommitCoalescesConcurrentSubmits) {
 }
 
 TEST(GroupCommitterTest, GroupCommitTripsOnByteThreshold) {
+  // Verify the byte threshold trips a flush well before the configured
+  // interval. Two submits totalling exactly max_bytes: the second takes
+  // pending_bytes to the threshold, which wakes the commit thread out of
+  // its wait_for and batches both into a single fsync. A trailing submit
+  // below the threshold would start a fresh batch and wait the full
+  // interval — that is correct behaviour, but unrelated to what this
+  // test asserts.
   std::atomic<int> fsync_count{0};
   GroupCommitter committer(
       {.policy = FsyncPolicy::kGroupCommit, .interval = 10s, .max_bytes = 1024},
@@ -75,14 +82,12 @@ TEST(GroupCommitterTest, GroupCommitTripsOnByteThreshold) {
   auto start = std::chrono::steady_clock::now();
   auto f1 = committer.Submit(512);
   auto f2 = committer.Submit(512);
-  auto f3 = committer.Submit(512);
 
   EXPECT_TRUE(f1.get().has_value());
   EXPECT_TRUE(f2.get().has_value());
-  EXPECT_TRUE(f3.get().has_value());
 
   auto elapsed = std::chrono::steady_clock::now() - start;
-  EXPECT_LT(elapsed, 5s);
+  EXPECT_LT(elapsed, 1s);
   EXPECT_EQ(fsync_count.load(), 1);
 }
 
