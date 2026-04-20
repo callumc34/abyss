@@ -25,6 +25,8 @@ option(ABYSS_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(ABYSS_WERROR "Treat warnings as errors" OFF)
 option(ABYSS_STRICT_WARNINGS "Enable additional warning flags" OFF)
 option(ABYSS_WITH_ROCKSDB "Build the built-in RocksDB cold store backend" ON)
+option(ABYSS_WITH_LOGGING "Enable spdlog-backed structured logging" ON)
+option(ABYSS_WITH_METRICS "Enable prometheus-cpp-backed metrics" ON)
 option(ABYSS_BUILD_FUZZ "Build libFuzzer fuzz targets" OFF)
 option(ABYSS_USE_CCACHE "Use ccache as compiler launcher if available" ON)
 
@@ -69,6 +71,26 @@ set_package_properties(yaml-cpp PROPERTIES
   PURPOSE "Configuration file parsing"
 )
 
+if(ABYSS_WITH_LOGGING)
+  find_package(spdlog CONFIG REQUIRED)
+  set_package_properties(spdlog PROPERTIES
+    TYPE REQUIRED
+    DESCRIPTION "Fast C++ logging library"
+    URL "https://github.com/gabime/spdlog"
+    PURPOSE "Structured logging backend"
+  )
+endif()
+
+if(ABYSS_WITH_METRICS)
+  find_package(prometheus-cpp CONFIG REQUIRED)
+  set_package_properties(prometheus-cpp PROPERTIES
+    TYPE REQUIRED
+    DESCRIPTION "Prometheus metrics client library for C++"
+    URL "https://github.com/jupp0r/prometheus-cpp"
+    PURPOSE "Metrics registry and text-format exposition"
+  )
+endif()
+
 if(ABYSS_WITH_ROCKSDB)
   find_package(RocksDB CONFIG REQUIRED)
   set_package_properties(RocksDB PROPERTIES
@@ -84,6 +106,8 @@ add_feature_info(BuildBenchmarks ABYSS_BUILD_BENCHMARKS "Build micro-benchmarks"
 add_feature_info(StrictWarnings  ABYSS_STRICT_WARNINGS  "Enable additional compiler warning flags")
 add_feature_info(Werror          ABYSS_WERROR           "Treat compiler warnings as errors")
 add_feature_info(WithRocksDB     ABYSS_WITH_ROCKSDB     "Build the built-in RocksDB cold store backend")
+add_feature_info(WithLogging     ABYSS_WITH_LOGGING     "Enable spdlog-backed structured logging")
+add_feature_info(WithMetrics     ABYSS_WITH_METRICS     "Enable prometheus-cpp-backed metrics")
 add_feature_info(BuildFuzz       ABYSS_BUILD_FUZZ       "Build libFuzzer fuzz targets")
 add_feature_info(UseCcache       ABYSS_USE_CCACHE       "Use ccache as compiler launcher if available")
 
@@ -94,6 +118,8 @@ configure_file(
 )
 
 add_subdirectory(src/core)
+add_subdirectory(src/log)
+add_subdirectory(src/metrics)
 add_subdirectory(src/resp)
 add_subdirectory(src/queue)
 add_subdirectory(src/hot)
@@ -101,7 +127,6 @@ add_subdirectory(src/cold)
 add_subdirectory(src/consumer)
 add_subdirectory(src/engine)
 add_subdirectory(src/config)
-add_subdirectory(src/metrics)
 
 add_subdirectory(apps/abyss-server)
 

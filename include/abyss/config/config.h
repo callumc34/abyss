@@ -10,6 +10,7 @@
 
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/result.h"
+#include "abyss/log/log.h"
 
 namespace abyss::config {
 
@@ -87,8 +88,25 @@ struct EngineConfig {
 };
 
 struct MetricsConfig {
+  bool enabled = true;
   std::string bind = "0.0.0.0";
   uint16_t port = 9090;
+};
+
+struct ComponentLevel {
+  std::string component;
+  log::Level level;
+};
+
+struct LogConfig {
+#ifdef NDEBUG
+  log::Level default_level = log::Level::kInfo;
+#else
+  log::Level default_level = log::Level::kDebug;
+#endif
+  std::string format = "json";
+  std::string sink = "stdout";
+  std::vector<ComponentLevel> component_levels;
 };
 
 struct AdminConfig {
@@ -109,6 +127,7 @@ struct Config {
   RespConfig resp;
   MetricsConfig metrics;
   AdminConfig admin;
+  LogConfig log;
 
   // Load config from a YAML file.
   static core::Result<Config> LoadFromFile(const std::filesystem::path& path);

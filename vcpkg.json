@@ -6,6 +6,8 @@
   "dependencies": [
     "cli11",
     "crc32c",
+    "prometheus-cpp",
+    "spdlog",
     "xxhash",
     "yaml-cpp"
   ],

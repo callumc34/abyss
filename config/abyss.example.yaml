@@ -53,9 +53,18 @@ resp:
   idle_timeout_seconds: 300
 
 metrics:
+  enabled: true
   bind: 0.0.0.0
   port: 9090
 
 admin:
   bind: 0.0.0.0
   port: 8080
+
+log:
+  level: info               # trace | debug | info | warn | error | critical | off
+  format: json              # json | text
+  sink: stdout              # stdout | stderr
+  component_levels:
+    - component: queue.segment
+      level: debug

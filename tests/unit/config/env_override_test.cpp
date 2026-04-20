@@ -67,5 +67,47 @@ TEST(ConfigEnvOverride, ApplyEnvironmentOverridesIsIdempotent) {
   EXPECT_EQ(cfg.profile, "hybrid");
 }
 
+TEST(ConfigEnvOverride, AbyssLogLevelOverridesYaml) {
+  const ScopedEnv env("ABYSS_LOG_LEVEL", "error");
+  auto cfg = Config::ParseFromYaml("log:\n  level: debug\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->log.default_level, log::Level::kError);
+}
+
+TEST(ConfigEnvOverride, AbyssLogFormatOverridesYaml) {
+  const ScopedEnv env("ABYSS_LOG_FORMAT", "text");
+  auto cfg = Config::ParseFromYaml("log:\n  format: json\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->log.format, "text");
+}
+
+TEST(ConfigEnvOverride, AbyssLogSinkOverridesYaml) {
+  const ScopedEnv env("ABYSS_LOG_SINK", "stderr");
+  auto cfg = Config::ParseFromYaml("log:\n  sink: stdout\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->log.sink, "stderr");
+}
+
+TEST(ConfigEnvOverride, AbyssMetricsEnabledOverridesYaml) {
+  const ScopedEnv env("ABYSS_METRICS_ENABLED", "false");
+  auto cfg = Config::ParseFromYaml("metrics:\n  enabled: true\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_FALSE(cfg->metrics.enabled);
+}
+
+TEST(ConfigEnvOverride, AbyssMetricsPortOverridesYaml) {
+  const ScopedEnv env("ABYSS_METRICS_PORT", "9100");
+  auto cfg = Config::ParseFromYaml("metrics:\n  port: 9090\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->metrics.port, 9100);
+}
+
+TEST(ConfigEnvOverride, AbyssMetricsBindOverridesYaml) {
+  const ScopedEnv env("ABYSS_METRICS_BIND", "127.0.0.1");
+  auto cfg = Config::ParseFromYaml("metrics:\n  bind: 0.0.0.0\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->metrics.bind, "127.0.0.1");
+}
+
 }  // namespace
 }  // namespace abyss::config

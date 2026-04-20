@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "abyss/core/result.h"
+#include "abyss/log/log.h"
 #include "validator.h"
 #include "yaml_decode.h"
 
@@ -120,6 +121,81 @@ core::Result<void> ParseBindPort(const YamlCursor& cur, std::string& bind, uint1
   return SectionDecoder(cur).Optional("bind", bind).Optional("port", port).Finish();
 }
 
+core::Result<void> ParseMetrics(const YamlCursor& cur, MetricsConfig& out) {
+  return SectionDecoder(cur)
+      .Optional("enabled", out.enabled)
+      .Optional("bind", out.bind)
+      .Optional("port", out.port)
+      .Finish();
+}
+
+core::Result<log::Level> DecodeLogLevel(const YamlCursor& cur) {
+  auto text = internal::DecodeString(cur);
+  if (!text.has_value()) return std::unexpected(text.error());
+  log::Level level = log::Level::kInfo;
+  if (!log::ParseLevel(*text, level)) {
+    return std::unexpected(cur.MakeError("unknown log level"));
+  }
+  return level;
+}
+
+core::Result<void> ParseComponentLevel(const YamlCursor& cur, ComponentLevel& out) {
+  if (auto r = cur.RequireMap(); !r) return r;
+  if (auto r = cur.RejectUnknownKeys({"component", "level"}); !r) return r;
+
+  auto comp_cur = cur.Child("component");
+  if (!comp_cur.node().IsDefined() || comp_cur.node().IsNull()) {
+    return std::unexpected(comp_cur.MakeError("required field is missing"));
+  }
+  auto comp_str = internal::DecodeString(comp_cur);
+  if (!comp_str.has_value()) return std::unexpected(comp_str.error());
+  out.component = std::move(*comp_str);
+
+  auto level_cur = cur.Child("level");
+  if (!level_cur.node().IsDefined() || level_cur.node().IsNull()) {
+    return std::unexpected(level_cur.MakeError("required field is missing"));
+  }
+  auto level = DecodeLogLevel(level_cur);
+  if (!level.has_value()) return std::unexpected(level.error());
+  out.level = *level;
+  return {};
+}
+
+core::Result<void> ParseLog(const YamlCursor& cur, LogConfig& out) {
+  if (auto r = cur.RequireMap(); !r) return r;
+  if (auto r = cur.RejectUnknownKeys({"level", "format", "sink", "component_levels"}); !r) {
+    return r;
+  }
+
+  if (auto n = cur.Child("level"); n.node().IsDefined() && !n.node().IsNull()) {
+    auto level = DecodeLogLevel(n);
+    if (!level.has_value()) return std::unexpected(level.error());
+    out.default_level = *level;
+  }
+  if (auto n = cur.Child("format"); n.node().IsDefined() && !n.node().IsNull()) {
+    auto s = internal::DecodeString(n);
+    if (!s.has_value()) return std::unexpected(s.error());
+    out.format = std::move(*s);
+  }
+  if (auto n = cur.Child("sink"); n.node().IsDefined() && !n.node().IsNull()) {
+    auto s = internal::DecodeString(n);
+    if (!s.has_value()) return std::unexpected(s.error());
+    out.sink = std::move(*s);
+  }
+  if (auto n = cur.Child("component_levels"); n.node().IsDefined() && !n.node().IsNull()) {
+    if (!n.node().IsSequence()) {
+      return std::unexpected(n.MakeError("expected a sequence"));
+    }
+    out.component_levels.clear();
+    for (size_t i = 0; i < n.node().size(); ++i) {
+      ComponentLevel entry;
+      if (auto r = ParseComponentLevel(n.Index(i), entry); !r) return r;
+      out.component_levels.push_back(std::move(entry));
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 Config Config::Defaults() { return {}; }
@@ -146,7 +222,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
   if (auto r = root_cur.RequireMap(); !r) return std::unexpected(r.error());
   if (auto r = root_cur.RejectUnknownKeys({"profile", "hot", "cold", "queue", "hot_consumer",
                                            "cold_consumer", "consumer_rpc", "engine", "recovery",
-                                           "resp", "metrics", "admin"});
+                                           "resp", "metrics", "admin", "log"});
       !r) {
     return std::unexpected(r.error());
   }
@@ -163,7 +239,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
     core::Result<void> (*parse)(const YamlCursor&, Config&);
   };
 
-  const std::array<Section, 11> sections = {{
+  const std::array<Section, 12> sections = {{
       {"hot", [](const YamlCursor& c, Config& cfg) { return ParseHot(c, cfg.hot); }},
       {"cold", [](const YamlCursor& c, Config& cfg) { return ParseCold(c, cfg.cold); }},
       {"queue", [](const YamlCursor& c, Config& cfg) { return ParseQueue(c, cfg.queue); }},
@@ -176,10 +252,10 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
       {"engine", [](const YamlCursor& c, Config& cfg) { return ParseEngine(c, cfg.engine); }},
       {"recovery", [](const YamlCursor& c, Config& cfg) { return ParseRecovery(c, cfg.recovery); }},
       {"resp", [](const YamlCursor& c, Config& cfg) { return ParseResp(c, cfg.resp); }},
-      {"metrics", [](const YamlCursor& c,
-                     Config& cfg) { return ParseBindPort(c, cfg.metrics.bind, cfg.metrics.port); }},
+      {"metrics", [](const YamlCursor& c, Config& cfg) { return ParseMetrics(c, cfg.metrics); }},
       {"admin", [](const YamlCursor& c,
                    Config& cfg) { return ParseBindPort(c, cfg.admin.bind, cfg.admin.port); }},
+      {"log", [](const YamlCursor& c, Config& cfg) { return ParseLog(c, cfg.log); }},
   }};
 
   for (const auto& section : sections) {
@@ -213,11 +289,53 @@ core::Result<Config> Config::LoadFromFile(const std::filesystem::path& path) {
   return ParseFromYaml(buffer.str());
 }
 
+namespace {
+
+const char* GetEnv(const char* name) {
+  // NOLINTNEXTLINE(concurrency-mt-unsafe,cppcoreguidelines-init-variables)
+  const char* v = std::getenv(name);
+  return (v != nullptr && *v != '\0') ? v : nullptr;
+}
+
+// NOLINTNEXTLINE(misc-unused-parameters)
+bool ParseEnvBool(const char* text, bool& out) {
+  std::string s(text);
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (s == "1" || s == "true" || s == "yes" || s == "on") {
+    out = true;
+    return true;
+  }
+  if (s == "0" || s == "false" || s == "no" || s == "off") {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 void Config::ApplyEnvironmentOverrides() {
-  const char* profile = nullptr;
-  profile = std::getenv("ABYSS_PROFILE");
-  if (profile != nullptr && *profile != '\0') {
-    this->profile = profile;
+  if (const char* v = GetEnv("ABYSS_PROFILE")) this->profile = v;
+
+  if (const char* v = GetEnv("ABYSS_LOG_LEVEL")) {
+    log::Level parsed = log::Level::kInfo;
+    if (log::ParseLevel(v, parsed)) this->log.default_level = parsed;
+  }
+  if (const char* v = GetEnv("ABYSS_LOG_FORMAT")) this->log.format = v;
+  if (const char* v = GetEnv("ABYSS_LOG_SINK")) this->log.sink = v;
+
+  if (const char* v = GetEnv("ABYSS_METRICS_ENABLED")) {
+    bool b = true;
+    if (ParseEnvBool(v, b)) this->metrics.enabled = b;
+  }
+  if (const char* v = GetEnv("ABYSS_METRICS_BIND")) this->metrics.bind = v;
+  if (const char* v = GetEnv("ABYSS_METRICS_PORT")) {
+    char* end = nullptr;
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+    const long port = std::strtol(v, &end, 10);
+    if (end != v && *end == '\0' && port > 0 && port <= 0xFFFF) {
+      this->metrics.port = static_cast<uint16_t>(port);
+    }
   }
 }
 
