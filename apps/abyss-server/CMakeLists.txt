@@ -3,6 +3,7 @@ add_executable(abyss-server main.cpp server.cpp)
 target_link_libraries(abyss-server PRIVATE
   abyss::config
   abyss::engine
+  abyss::log
   abyss::metrics
   abyss::queue
   abyss::resp

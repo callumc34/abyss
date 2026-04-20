@@ -2,7 +2,16 @@
 
 #include <utility>
 
+#include "abyss/log/log.h"
+
 namespace abyss::queue {
+
+namespace {
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.queue.reaper");
+  return l;
+}
+}  // namespace
 
 SegmentReaper::SegmentReaper(SegmentRegistry& registry, const OffsetStore& offsets,
                              SegmentReaperConfig config)
@@ -20,6 +29,9 @@ core::Result<size_t> SegmentReaper::RunOnce() {
     if (!removed.has_value()) {
       return std::unexpected(removed.error());
     }
+    ABYSS_LOG_DEBUG(Log(), "segment removed", {"shard", static_cast<int64_t>(info.shard)},
+                    {"base_seq", static_cast<uint64_t>(info.base_seq)},
+                    {"last_seq", static_cast<uint64_t>(info.last_seq)});
     ++deleted;
   }
   return deleted;

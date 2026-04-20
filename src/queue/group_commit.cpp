@@ -1,10 +1,20 @@
 #include "abyss/queue/group_commit.h"
 
+#include <chrono>
 #include <utility>
+
+#include "abyss/log/log.h"
 
 namespace abyss::queue {
 
 namespace {
+
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.queue.group_commit");
+  return l;
+}
+
+constexpr std::chrono::milliseconds kSlowFsyncThreshold{50};
 
 DurabilityFuture MakeReadyFuture(core::Result<void> value) {
   std::promise<core::Result<void>> p;
@@ -111,12 +121,26 @@ void GroupCommitter::Run() {
     }
 
     auto batch = std::exchange(pending_, {});
+    const size_t batch_bytes = pending_bytes_;
     pending_bytes_ = 0;
     flush_requested_ = false;
     auto fsync_fn = fsync_fn_;
     lock.unlock();
 
+    const auto start = std::chrono::steady_clock::now();
     core::Result<void> result = fsync_fn();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    if (!result.has_value()) {
+      ABYSS_LOG_ERROR(Log(), "fsync failed", {"batch", static_cast<uint64_t>(batch.size())},
+                      {"bytes", static_cast<uint64_t>(batch_bytes)},
+                      {"err", std::string_view{result.error().message()}});
+    } else if (elapsed > kSlowFsyncThreshold) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+      ABYSS_LOG_WARN(Log(), "slow fsync", {"batch", static_cast<uint64_t>(batch.size())},
+                     {"bytes", static_cast<uint64_t>(batch_bytes)},
+                     {"duration_ms", static_cast<int64_t>(ms)});
+    }
 
     for (auto& entry : batch) {
       entry.promise.set_value(result);

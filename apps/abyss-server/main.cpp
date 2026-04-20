@@ -2,19 +2,21 @@
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
-#include <iostream>
 #include <optional>
 #include <string>
 
 #include "abyss/config/config.h"
+#include "abyss/log/log.h"
 #include "abyss/version.h"
 #include "server.h"
 
 namespace {
 
 std::atomic<bool> g_shutdown_requested{false};
+std::atomic<int> g_shutdown_signal{0};
 
-extern "C" void ShutdownHandler(int /*sig*/) {
+extern "C" void ShutdownHandler(int sig) {
+  g_shutdown_signal.store(sig, std::memory_order_release);
   g_shutdown_requested.store(true, std::memory_order_release);
 }
 
@@ -56,12 +58,16 @@ int main(int argc, char* argv[]) {
 
   CLI11_PARSE(app, argc, argv);
 
+  const auto bootstrap_logger = abyss::log::Get("abyss.server.bootstrap");
+
   abyss::config::Config config;
   const std::string resolved = ResolveConfigPath(config_path);
   if (!resolved.empty()) {
     auto loaded = abyss::config::Config::LoadFromFile(resolved);
     if (!loaded.has_value()) {
-      std::cerr << "config error: " << loaded.error().message() << "\n";
+      ABYSS_LOG_CRITICAL(bootstrap_logger, "config load failed",
+                         {"path", std::string_view{resolved}},
+                         {"err", std::string_view{loaded.error().message()}});
       return EXIT_FAILURE;
     }
     config = std::move(*loaded);
@@ -71,7 +77,8 @@ int main(int argc, char* argv[]) {
     config.cold.data_path = data_dir + "/cold";
     config.ApplyEnvironmentOverrides();
     if (auto r = config.Validate(); !r.has_value()) {
-      std::cerr << "config error: " << r.error().message() << "\n";
+      ABYSS_LOG_CRITICAL(bootstrap_logger, "config invalid",
+                         {"err", std::string_view{r.error().message()}});
       return EXIT_FAILURE;
     }
   }
@@ -80,9 +87,19 @@ int main(int argc, char* argv[]) {
   if (shard_count_override.has_value()) config.hot.shard_count = *shard_count_override;
 
   if (auto r = config.Validate(); !r.has_value()) {
-    std::cerr << "config error: " << r.error().message() << "\n";
+    ABYSS_LOG_CRITICAL(bootstrap_logger, "config invalid after overrides",
+                       {"err", std::string_view{r.error().message()}});
     return EXIT_FAILURE;
   }
+
+  abyss::log::Init(config.log);
+
+  ABYSS_LOG_INFO(bootstrap_logger, "abyss starting", {"version", std::string_view{abyss::kVersion}},
+                 {"profile", std::string_view{config.profile}},
+                 {"bind", std::string_view{config.resp.bind}},
+                 {"port", static_cast<int64_t>(config.resp.port)},
+                 {"config_path",
+                  resolved.empty() ? std::string_view{"<defaults>"} : std::string_view{resolved}});
 
 #ifndef _WIN32
   struct sigaction sa{};
@@ -98,9 +115,13 @@ int main(int argc, char* argv[]) {
 
   abyss::server::Server server(config);
   if (!server.Initialize()) {
+    ABYSS_LOG_CRITICAL(bootstrap_logger, "server initialize failed");
     return EXIT_FAILURE;
   }
 
   server.Run(g_shutdown_requested);
+
+  ABYSS_LOG_INFO(bootstrap_logger, "abyss stopped",
+                 {"signal", static_cast<int64_t>(g_shutdown_signal.load())});
   return EXIT_SUCCESS;
 }

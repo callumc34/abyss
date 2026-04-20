@@ -3,8 +3,7 @@ add_library(abyss_engine
 )
 add_library(abyss::engine ALIAS abyss_engine)
 
-target_link_libraries(abyss_engine PUBLIC
-  abyss::core
-  abyss::consumer
-  abyss::hot
+target_link_libraries(abyss_engine
+  PUBLIC abyss::core abyss::consumer abyss::hot
+  PRIVATE abyss::log
 )

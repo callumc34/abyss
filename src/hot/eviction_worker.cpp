@@ -2,7 +2,16 @@
 
 #include <utility>
 
+#include "abyss/log/log.h"
+
 namespace abyss::hot {
+
+namespace {
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.hot.eviction");
+  return l;
+}
+}  // namespace
 
 EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
                                core::SteadyClockFn steady_clock)
@@ -14,6 +23,8 @@ void EvictionWorker::Start() {
   if (running_.exchange(true, std::memory_order_acq_rel)) return;
   stop_requested_.store(false, std::memory_order_release);
   thread_ = std::thread(&EvictionWorker::Run, this);
+  ABYSS_LOG_INFO(Log(), "eviction worker started",
+                 {"tick_ms", static_cast<int64_t>(config_.tick.count())});
 }
 
 void EvictionWorker::Stop() {

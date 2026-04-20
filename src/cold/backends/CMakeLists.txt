@@ -6,7 +6,7 @@ if(ABYSS_WITH_ROCKSDB)
 
   target_link_libraries(abyss_cold_rocksdb
     PUBLIC abyss::core abyss::cold_format
-    PRIVATE RocksDB::rocksdb
+    PRIVATE RocksDB::rocksdb abyss::log
   )
 
   target_compile_definitions(abyss_cold_rocksdb PUBLIC ABYSS_HAVE_ROCKSDB)

@@ -2,7 +2,16 @@
 
 #include <stdexcept>
 
+#include "abyss/log/log.h"
+
 namespace abyss::consumer {
+
+namespace {
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.hot.consumer");
+  return l;
+}
+}  // namespace
 
 HotConsumerPool::HotConsumerPool(core::Queue& queue, core::HotStore& hot_store,
                                  core::ConsumerRpc& rpc, Config config,
@@ -25,6 +34,8 @@ void HotConsumerPool::Start() {
   for (auto& consumer : consumers_) {
     consumer->Start();
   }
+  ABYSS_LOG_INFO(Log(), "hot consumers started",
+                 {"count", static_cast<int64_t>(consumers_.size())});
 }
 
 void HotConsumerPool::Stop() {

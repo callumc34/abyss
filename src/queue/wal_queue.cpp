@@ -6,13 +6,18 @@
 #include <sstream>
 #include <utility>
 
-#include "abyss/core/fire_and_forget.h"
+#include "abyss/log/log.h"
 #include "abyss/queue/file_offset_store.h"
 #include "shard_state.h"
 
 namespace abyss::queue {
 
 namespace {
+
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.queue.wal");
+  return l;
+}
 
 constexpr int kShardNameWidth = 4;
 
@@ -43,6 +48,16 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
   auto init = queue->Initialize();
   if (!init.has_value()) return std::unexpected(init.error());
   queue->recovering_.store(false, std::memory_order_release);
+
+  core::SequenceId max_head = 0;
+  for (const auto& shard : queue->shards_) {
+    max_head = std::max(max_head, shard->head_seq());
+  }
+  ABYSS_LOG_INFO(Log(), "WAL opened", {"path", std::string_view{queue->config_.wal_path}},
+                 {"shard_count", static_cast<int64_t>(queue->config_.shard_count)},
+                 {"segment_size_bytes", static_cast<uint64_t>(queue->config_.segment_size_bytes)},
+                 {"min_retention_s", static_cast<int64_t>(queue->config_.min_retention.count())},
+                 {"head_seq", static_cast<uint64_t>(max_head)});
   return queue;
 }
 
@@ -76,6 +91,11 @@ core::Result<void> WalQueue::Initialize() {
     for (auto consumer : config_.retention_consumers) {
       if (auto persisted = offsets_->Get(consumer, shard); persisted.has_value()) {
         if (*persisted > (*state)->head_seq()) {
+          ABYSS_LOG_CRITICAL(Log(), "persisted offset exceeds WAL head",
+                             {"consumer", static_cast<uint64_t>(consumer)},
+                             {"shard", static_cast<int64_t>(shard)},
+                             {"persisted", static_cast<uint64_t>(*persisted)},
+                             {"head_seq", static_cast<uint64_t>((*state)->head_seq())});
           return std::unexpected(
               core::Error{core::ErrorCode::kCorruption,
                           "persisted offset exceeds WAL head for consumer/shard"});
@@ -96,8 +116,12 @@ core::Result<void> WalQueue::Initialize() {
 
 void WalQueue::RunReaper() {
   if (!reaper_) return;
-  // Reaper runs on a timer; record failures rather than let them go silent.
-  core::FireAndForget(reaper_->RunOnce(), reaper_failures_);
+  auto result = reaper_->RunOnce();
+  if (!result.has_value()) {
+    reaper_failures_.fetch_add(1, std::memory_order_relaxed);
+    ABYSS_LOG_WARN(Log(), "segment reaper failed",
+                   {"err", std::string_view{result.error().message()}});
+  }
 }
 
 core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
