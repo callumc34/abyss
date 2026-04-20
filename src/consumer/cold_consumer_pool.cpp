@@ -4,8 +4,16 @@
 #include <string>
 
 #include "abyss/core/shard_router.h"
+#include "abyss/log/log.h"
 
 namespace abyss::consumer {
+
+namespace {
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.cold.consumer");
+  return l;
+}
+}  // namespace
 
 ColdConsumerPool::ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
                                    const core::EvictionPolicy& eviction_policy,
@@ -27,6 +35,8 @@ void ColdConsumerPool::Start() {
   for (auto& consumer : consumers_) {
     consumer->Start();
   }
+  ABYSS_LOG_INFO(Log(), "cold consumers started",
+                 {"count", static_cast<int64_t>(consumers_.size())});
 }
 
 void ColdConsumerPool::Stop() {

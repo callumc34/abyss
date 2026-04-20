@@ -49,8 +49,12 @@ class Server {
   void Shutdown();
   bool IsReady() const { return ready_.load(std::memory_order_acquire); }
 
+  // POSIX: file descriptor. Windows: HANDLE reinterpreted as intptr_t.
+  void set_ready_fd(intptr_t fd) { ready_fd_ = fd; }
+
  private:
   bool SetupListener();
+  void NotifyReady();
   void HandleConnection(socket_t client_fd, std::atomic<bool>& finished);
   void CleanFinishedConnections();
 
@@ -70,6 +74,7 @@ class Server {
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 
   socket_t listen_fd_ = kInvalidSocket;
+  intptr_t ready_fd_ = -1;
   std::atomic<bool> ready_{false};
   std::atomic<bool> shutting_down_{false};
   std::atomic<uint64_t> next_client_id_{1};

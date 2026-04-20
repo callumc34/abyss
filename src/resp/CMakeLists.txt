@@ -6,6 +6,7 @@ add_library(abyss_resp
 )
 add_library(abyss::resp ALIAS abyss_resp)
 
-target_link_libraries(abyss_resp PUBLIC
-  abyss::core
+target_link_libraries(abyss_resp
+  PUBLIC abyss::core
+  PRIVATE abyss::log
 )

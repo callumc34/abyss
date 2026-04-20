@@ -102,6 +102,7 @@ add_executable(abyss_config_tests
   config/unknown_key_test.cpp
   config/env_override_test.cpp
   config/example_file_test.cpp
+  config/log_config_test.cpp
 )
 
 target_compile_definitions(abyss_config_tests PRIVATE
@@ -122,6 +123,40 @@ target_link_libraries(abyss_support_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_log_tests
+  log/level_test.cpp
+  log/logger_test.cpp
+  log/json_sink_test.cpp
+  log/text_sink_test.cpp
+  log/pre_init_test.cpp
+  log/capturing_sink_test.cpp
+  log/key_hash_test.cpp
+  log/threaded_test.cpp
+  log/reset_test.cpp
+)
+
+target_link_libraries(abyss_log_tests PRIVATE
+  abyss::log
+  abyss::config
+  GTest::gtest_main
+)
+
+add_executable(abyss_metrics_tests
+  metrics/register_test.cpp
+  metrics/idempotent_test.cpp
+  metrics/conflict_test.cpp
+  metrics/scrape_test.cpp
+  metrics/enabled_test.cpp
+  metrics/names_test.cpp
+  metrics/threaded_test.cpp
+  metrics/reset_test.cpp
+)
+
+target_link_libraries(abyss_metrics_tests PRIVATE
+  abyss::metrics
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -130,3 +165,5 @@ abyss_discover_tests(abyss_cold_tests     "unit\;unit-cold")
 abyss_discover_tests(abyss_consumer_tests "unit\;unit-consumer")
 abyss_discover_tests(abyss_config_tests   "unit\;unit-config")
 abyss_discover_tests(abyss_support_tests  "unit\;unit-support")
+abyss_discover_tests(abyss_log_tests      "unit\;unit-log")
+abyss_discover_tests(abyss_metrics_tests  "unit\;unit-metrics")

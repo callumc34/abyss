@@ -21,6 +21,7 @@ Checks: >
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-do-while,
   -bugprone-easily-swappable-parameters,
   -bugprone-branch-clone,
   -cppcoreguidelines-avoid-const-or-ref-data-members,

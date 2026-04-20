@@ -8,6 +8,7 @@ add_library(abyss::config ALIAS abyss_config)
 target_link_libraries(abyss_config PUBLIC
   abyss::compiler_options
   abyss::core
+  abyss::log
 )
 
 target_link_libraries(abyss_config PRIVATE

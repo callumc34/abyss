@@ -3,9 +3,16 @@
 #include <algorithm>
 #include <utility>
 
+#include "abyss/log/log.h"
+
 namespace abyss::core {
 
 namespace {
+
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.rpc");
+  return l;
+}
 
 uint32_t ClampShardCount(uint32_t requested) { return std::max<uint32_t>(requested, 1U); }
 
@@ -28,6 +35,7 @@ std::future<RespValue> ConsumerRpc::Register(RpcId id) {
   if (!inserted) {
     // Duplicate registration. The original waiter is preserved; return a
     // broken future so the duplicate caller observes the misuse.
+    ABYSS_LOG_CRITICAL(Log(), "duplicate RPC registration", {"rpc_id", static_cast<uint64_t>(id)});
     std::promise<RespValue> broken;
     broken.set_exception(
         std::make_exception_ptr(std::future_error(std::future_errc::broken_promise)));

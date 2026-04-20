@@ -192,6 +192,27 @@ core::Result<void> ValidateMetrics(const MetricsConfig& m) {
   return {};
 }
 
+core::Result<void> ValidateLog(const LogConfig& l) {
+  if (!OneOf(l.format, {"json", "text"})) {
+    return std::unexpected(InvalidArg("log.format", "must be one of: json, text"));
+  }
+  if (!OneOf(l.sink, {"stdout", "stderr"})) {
+    return std::unexpected(InvalidArg("log.sink", "must be one of: stdout, stderr"));
+  }
+  std::unordered_set<std::string> seen;
+  for (size_t i = 0; i < l.component_levels.size(); ++i) {
+    const auto& entry = l.component_levels[i];
+    std::string base = "log.component_levels[";
+    base += std::to_string(i);
+    base += ']';
+    if (auto r = RequireNonEmpty(base + ".component", entry.component); !r) return r;
+    if (!seen.insert(entry.component).second) {
+      return std::unexpected(InvalidArg(base + ".component", "duplicate component"));
+    }
+  }
+  return {};
+}
+
 core::Result<void> ValidateAdmin(const AdminConfig& a) {
   if (auto r = RequireNonEmpty("admin.bind", a.bind); !r) return r;
   if (auto r = RequirePort("admin.port", a.port); !r) return r;
@@ -236,6 +257,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateResp(config.resp); !r) return r;
   if (auto r = ValidateMetrics(config.metrics); !r) return r;
   if (auto r = ValidateAdmin(config.admin); !r) return r;
+  if (auto r = ValidateLog(config.log); !r) return r;
   if (auto r = ValidatePortCollisions(config); !r) return r;
   return {};
 }

@@ -52,14 +52,97 @@
 
 ## Logging
 
-JSON structured logs via spdlog. Key events:
+JSON-Lines structured logs via spdlog, through the `abyss::log` facade (see ADP-012).
 
-- Cold consumer flush cycles (reason, batch size, latency)
-- Consumer lag transitions (normal → warning → critical)
-- Queue/disk space warnings
-- Recovery progress (entries replayed, estimated time remaining)
-- TTL expiry scan results (keys scanned, keys expired, adaptive rate changes)
-- Cluster topology changes (shard assignments, MOVED redirects)
+### Schema
+
+Every record carries, at minimum:
+
+| Field | Meaning |
+|-------|---------|
+| `ts` | Wall-clock timestamp, ISO 8601 UTC. |
+| `level` | One of `trace`, `debug`, `info`, `warn`, `error`, `critical`. |
+| `component` | The logger name (e.g. `queue.segment`, `cold.flush`). |
+| `msg` | A short, static, low-cardinality phrase. |
+
+Dynamic values are emitted as additional top-level JSON fields supplied at the call site. `msg` itself is always static — dynamic values belong in fields, never interpolated into `msg`. This keeps `msg` useful as a filter term in log aggregation.
+
+### Level guidance
+
+- **`info` and above** — state transitions and errors only. Recovery milestones, consumer lag crossings, flush cycles, component start/stop, disk warnings, TTL scan summaries, cluster topology changes.
+- **`debug`** — per-request or per-key tracing. Compiled into the binary but filtered out at runtime unless the debug level is set.
+- **`trace`** — highest-volume instrumentation; use sparingly.
+
+### Key events at INFO and above
+
+- Cold consumer flush cycles (reason, batch size, latency).
+- Consumer lag transitions (normal → warning → critical).
+- Queue and disk space warnings.
+- Recovery progress (entries replayed, estimated time remaining).
+- TTL expiry scan results (keys scanned, keys expired, adaptive rate changes).
+- Cluster topology changes (shard assignments, MOVED redirects).
+
+### No raw keys
+
+Log records **must not** contain raw Redis keys or values at any level. Keys are PII-equivalent. When a record needs to identify a key, emit `key_hash` — produced via `abyss::log::KeyHash(key)` — instead. The helper is part of the facade so the rule is trivial to follow at the call site.
+
+## Metric naming and cardinality
+
+### Catalogue
+
+Every metric name is declared in `include/abyss/metrics/names.h` as a `constexpr` descriptor. The metrics registry API accepts only descriptors — there is no overload that takes a free-form name string. Adding a metric is therefore a change to the catalogue, which forces deliberate review of name, help, labels, and cardinality.
+
+### Label whitelist
+
+The only permitted label keys are:
+
+| Key | Meaning | Value space |
+|-----|---------|-------------|
+| `tier` | Hot / buffer / cold tier. | `hot`, `buffer`, `cold`. |
+| `shard` | Shard identifier. | Bounded by shard count (single shard in the non-sharded profile). |
+| `cmd` | RESP command name. | Bounded by the server's command registry. |
+| `reason` | Operation trigger reason. | Enumerated per metric. |
+| `status` | Operation outcome. | Enumerated per metric. |
+| `op` | Generic operation discriminator. | Reserved; enumerated per metric when used. |
+
+Label values **must not** be raw Redis keys, client identifiers, IP addresses, or any other unbounded cardinality source.
+
+## How to instrument a component
+
+A component registers its metrics and acquires its logger in its constructor and caches both as members. The hot path then does an atomic metric update and, optionally, a level-gated structured log.
+
+```cpp
+#include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
+
+namespace abyss::example {
+
+class FlushEngine {
+ public:
+  FlushEngine()
+      : logger_(log::Get("cold.flush")),
+        flushes_success_(metrics::Registry::Instance().Counter(
+            metrics::names::kColdFlushTotal, metrics::FlushStatus::kSuccess)),
+        batch_size_(metrics::Registry::Instance().Histogram(
+            metrics::names::kColdFlushBatchSize)) {}
+
+  void Flush(size_t batch_size) {
+    batch_size_.Observe(static_cast<double>(batch_size));
+    flushes_success_.Increment();
+    ABYSS_LOG_INFO(logger_, "cold flush complete",
+                   {"reason", "quiet"},
+                   {"batch_size", static_cast<int64_t>(batch_size)});
+  }
+
+ private:
+  log::Logger logger_;
+  metrics::CounterHandle flushes_success_;
+  metrics::HistogramHandle batch_size_;
+};
+
+}  // namespace abyss::example
+```
 
 ## Alerting Guidance
 

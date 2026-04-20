@@ -9,7 +9,7 @@ add_library(abyss_consumer
 )
 add_library(abyss::consumer ALIAS abyss_consumer)
 
-target_link_libraries(abyss_consumer PUBLIC
-  abyss::core
-  abyss::hot
+target_link_libraries(abyss_consumer
+  PUBLIC abyss::core abyss::hot
+  PRIVATE abyss::log
 )

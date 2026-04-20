@@ -7,6 +7,7 @@
 #include <variant>
 
 #include "abyss/core/ops.h"
+#include "abyss/log/log.h"
 
 namespace abyss::consumer {
 
@@ -14,6 +15,11 @@ namespace {
 
 constexpr size_t kDefaultLowWaterNumerator = 3;
 constexpr size_t kDefaultLowWaterDenominator = 4;
+
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.cold.consumer");
+  return l;
+}
 
 }  // namespace
 
@@ -52,11 +58,15 @@ void ColdConsumer::Stop() {
 }
 
 void ColdConsumer::RunLoop() {
+  ABYSS_LOG_DEBUG(Log(), "cold consumer started", {"shard", static_cast<int64_t>(shard_)});
   while (!stop_requested_.load(std::memory_order_acquire)) {
     Drain();
     if (stop_requested_.load(std::memory_order_acquire)) break;
     Flush();
   }
+  ABYSS_LOG_DEBUG(Log(), "cold consumer stopped", {"shard", static_cast<int64_t>(shard_)},
+                  {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())},
+                  {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
 }
 
 size_t ColdConsumer::Drain() {
@@ -65,6 +75,8 @@ size_t ColdConsumer::Drain() {
   if (!result.has_value()) {
     if (result.error().code() == core::ErrorCode::kUnavailable) {
       // Queue has shut down; signal loop exit rather than spinning on the same error.
+      ABYSS_LOG_WARN(Log(), "cold consumer stopping: queue unavailable",
+                     {"shard", static_cast<int64_t>(shard_)});
       stop_requested_.store(true, std::memory_order_release);
       return 0;
     }
@@ -138,6 +150,7 @@ bool ColdConsumer::Flush() {
 
   const auto now = steady_clock_();
   const bool aggressive = CurrentMode() == Mode::kAggressive;
+  const auto flush_start = std::chrono::steady_clock::now();
   auto to_flush = aggressive ? buffer_.FlushOldest(LowWaterBytes(), config_.max_flush_batch_size)
                              : buffer_.FlushReady(now, config_.max_flush_batch_size);
 
@@ -184,6 +197,16 @@ bool ColdConsumer::Flush() {
         flushes_deadline_.fetch_add(deadline_count, std::memory_order_relaxed);
       }
     }
+
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - flush_start)
+                                .count();
+    ABYSS_LOG_DEBUG(Log(), "cold flush", {"shard", static_cast<int64_t>(shard_)},
+                    {"entries", static_cast<uint64_t>(surviving_count)},
+                    {"quiet", static_cast<uint64_t>(quiet_count)},
+                    {"deadline", static_cast<uint64_t>(deadline_count)}, {"aggressive", aggressive},
+                    {"dropped_ttl", static_cast<uint64_t>(dropped)},
+                    {"duration_ms", static_cast<int64_t>(elapsed_ms)});
   }
 
   TryAdvanceAck();
@@ -226,6 +249,7 @@ bool ColdConsumer::ApplyBatchWithRetry(std::vector<BufferEntry> entries) {
   auto ops = BuildBatchOps(entries, del_storage);
 
   auto backoff = config_.retry_initial_backoff;
+  bool logged_first_failure = false;
   while (!stop_requested_.load(std::memory_order_acquire)) {
     auto result = cold_store_.ApplyBatch(std::span<const core::ops::WriteOp>(ops));
     if (result.has_value()) {
@@ -239,11 +263,22 @@ bool ColdConsumer::ApplyBatchWithRetry(std::vector<BufferEntry> entries) {
     counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
     if (terminal) {
       apply_poisoned_.fetch_add(1, std::memory_order_relaxed);
+      ABYSS_LOG_CRITICAL(Log(), "cold apply batch poisoned",
+                         {"shard", static_cast<int64_t>(shard_)},
+                         {"batch", static_cast<uint64_t>(ops.size())},
+                         {"err", std::string_view{result.error().message()}});
       // Retrying a poisoned batch burns CPU without progressing; reinsert and bail.
       buffer_.Reinsert(std::move(entries));
       return false;
     }
     retry_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (!logged_first_failure) {
+      logged_first_failure = true;
+      ABYSS_LOG_ERROR(Log(), "cold apply batch failed; retrying",
+                      {"shard", static_cast<int64_t>(shard_)},
+                      {"batch", static_cast<uint64_t>(ops.size())},
+                      {"err", std::string_view{result.error().message()}});
+    }
 
     std::this_thread::sleep_for(backoff);
     backoff = std::min(backoff * 2, config_.retry_max_backoff);
@@ -278,6 +313,18 @@ void ColdConsumer::UpdateMode(size_t current_bytes) {
 
   mode_.store(promote ? Mode::kAggressive : Mode::kNormal, std::memory_order_release);
   mode_transitions_.fetch_add(1, std::memory_order_relaxed);
+
+  if (promote) {
+    ABYSS_LOG_WARN(Log(), "cold buffer aggressive mode entered; high water breached",
+                   {"shard", static_cast<int64_t>(shard_)},
+                   {"bytes", static_cast<uint64_t>(current_bytes)},
+                   {"high_water_bytes", static_cast<uint64_t>(high)});
+  } else {
+    ABYSS_LOG_INFO(Log(), "cold buffer back to normal mode",
+                   {"shard", static_cast<int64_t>(shard_)},
+                   {"bytes", static_cast<uint64_t>(current_bytes)},
+                   {"low_water_bytes", static_cast<uint64_t>(low)});
+  }
 }
 
 void ColdConsumer::TryAdvanceAck() {

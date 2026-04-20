@@ -44,7 +44,7 @@ class TestServer {
   Config config_;
   testing::TempDir data_dir_;
   proc_handle_t proc_ = kInvalidProcHandle;
-  pipe_handle_t stdout_read_ = kInvalidPipeHandle;
+  pipe_handle_t ready_read_ = kInvalidPipeHandle;
   uint16_t port_ = 0;
   std::string skip_reason_;
 };

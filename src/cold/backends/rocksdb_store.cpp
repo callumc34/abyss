@@ -31,6 +31,7 @@
 #include "abyss/core/resp_format.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/log/log.h"
 
 namespace abyss::cold::backends {
 
@@ -44,6 +45,11 @@ using core::RespValue;
 
 constexpr std::string_view kZsetScoreIndexCfName = "zset_score_idx";
 
+const log::Logger& Log() {
+  static const log::Logger l = log::Get("abyss.cold.store");
+  return l;
+}
+
 ErrorCode MapStatusCode(const rocksdb::Status& status) {
   if (status.IsNotFound()) return ErrorCode::kNotFound;
   if (status.IsCorruption()) return ErrorCode::kCorruption;
@@ -53,7 +59,13 @@ ErrorCode MapStatusCode(const rocksdb::Status& status) {
 }
 
 Error FromStatus(const rocksdb::Status& status, std::string_view context) {
-  return {MapStatusCode(status), std::string(context) + ": " + status.ToString()};
+  Error err{MapStatusCode(status), std::string(context) + ": " + status.ToString()};
+  // NotFound is a normal GET outcome; everything else is operator-actionable.
+  if (err.code() != ErrorCode::kNotFound) {
+    ABYSS_LOG_ERROR(Log(), "rocksdb operation failed", {"op", std::string_view{context}},
+                    {"status", status.ToString()});
+  }
+  return err;
 }
 
 rocksdb::ColumnFamilyOptions MakeCfOptions(const RocksdbConfig& config) {
@@ -301,6 +313,8 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
     return std::unexpected(FromStatus(status, "RocksdbStore::Create: Get format version"));
   }
 
+  ABYSS_LOG_INFO(Log(), "cold store opened", {"path", std::string_view{impl->config.data_path}},
+                 {"format_version", static_cast<int64_t>(fmt::kFormatVersion)});
   return std::unique_ptr<RocksdbStore>(new RocksdbStore(std::move(impl)));
 }
 

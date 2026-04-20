@@ -15,15 +15,29 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
-#include <iostream>
+#include <string>
 #include <utility>
 
+#include "abyss/log/log.h"
 #include "abyss/resp/request_pipeline.h"
 #include "abyss/version.h"
 
 namespace abyss::server {
 
 namespace {
+
+const log::Logger& ServerLog() {
+  static const log::Logger l = log::Get("abyss.server");
+  return l;
+}
+const log::Logger& ListenerLog() {
+  static const log::Logger l = log::Get("abyss.server.listener");
+  return l;
+}
+const log::Logger& ConnLog() {
+  static const log::Logger l = log::Get("abyss.server.conn");
+  return l;
+}
 
 inline int CloseSocket(socket_t s) {
 #ifdef _WIN32
@@ -55,7 +69,7 @@ bool Server::Initialize() {
 #ifdef _WIN32
   WSADATA wsa_data;
   if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-    std::cerr << "WSAStartup failed\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "WSAStartup failed");
     return false;
   }
 #endif
@@ -63,7 +77,8 @@ bool Server::Initialize() {
   std::error_code ec;
   std::filesystem::create_directories(config_.queue.wal_path, ec);
   if (ec) {
-    std::cerr << "failed to create WAL directory: " << ec.message() << "\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "create WAL directory failed",
+                       {"path", std::string_view{config_.queue.wal_path}}, {"err", ec.message()});
     return false;
   }
 
@@ -74,7 +89,9 @@ bool Server::Initialize() {
 
   auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
   if (!fsync_policy.has_value()) {
-    std::cerr << "invalid fsync_policy: " << fsync_policy.error().message() << "\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "invalid fsync_policy",
+                       {"value", std::string_view{config_.queue.fsync_policy}},
+                       {"err", std::string_view{fsync_policy.error().message()}});
     return false;
   }
 
@@ -92,11 +109,13 @@ bool Server::Initialize() {
       .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
   });
   if (queue_result.has_value() && (*queue_result)->IsRecovering()) {
-    std::cerr << "queue opened but still recovering; refusing to start\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "WAL opened but still recovering; refusing to start");
     return false;
   }
   if (!queue_result.has_value()) {
-    std::cerr << "failed to open WAL queue: " << queue_result.error().message() << "\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "WAL open failed",
+                       {"path", std::string_view{config_.queue.wal_path}},
+                       {"err", std::string_view{queue_result.error().message()}});
     return false;
   }
   queue_ = std::move(*queue_result);
@@ -106,7 +125,8 @@ bool Server::Initialize() {
 #ifdef ABYSS_HAVE_ROCKSDB
   std::filesystem::create_directories(config_.cold.data_path, ec);
   if (ec) {
-    std::cerr << "failed to create cold store directory: " << ec.message() << "\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "create cold store directory failed",
+                       {"path", std::string_view{config_.cold.data_path}}, {"err", ec.message()});
     return false;
   }
 
@@ -115,7 +135,9 @@ bool Server::Initialize() {
       .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
   });
   if (!cold_result.has_value()) {
-    std::cerr << "failed to open cold store: " << cold_result.error().message() << "\n";
+    ABYSS_LOG_CRITICAL(ServerLog(), "cold store open failed",
+                       {"path", std::string_view{config_.cold.data_path}},
+                       {"err", std::string_view{cold_result.error().message()}});
     return false;  // NOLINT(readability-simplify-boolean-expr)
   }
   cold_store_ = std::move(*cold_result);
@@ -181,13 +203,15 @@ bool Server::Initialize() {
 #endif
 
   ready_.store(true, std::memory_order_release);
+  ABYSS_LOG_INFO(ServerLog(), "server ready",
+                 {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
   return true;
 }
 
 bool Server::SetupListener() {
   listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ == kInvalidSocket) {
-    std::cerr << "socket: " << GetSocketError() << "\n";
+    ABYSS_LOG_CRITICAL(ListenerLog(), "socket creation failed", {"err", GetSocketError()});
     return false;
   }
 
@@ -204,7 +228,9 @@ bool Server::SetupListener() {
   addr.sin_port = htons(config_.resp.port);
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    std::cerr << "bind: " << GetSocketError() << "\n";
+    ABYSS_LOG_CRITICAL(ListenerLog(), "bind failed", {"bind", std::string_view{config_.resp.bind}},
+                       {"port", static_cast<int64_t>(config_.resp.port)},
+                       {"err", GetSocketError()});
     CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
     return false;
@@ -217,7 +243,7 @@ bool Server::SetupListener() {
   socklen_t bound_len = sizeof(bound_addr);
 #endif
   if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound_addr), &bound_len) < 0) {
-    std::cerr << "getsockname: " << GetSocketError() << "\n";
+    ABYSS_LOG_CRITICAL(ListenerLog(), "getsockname failed", {"err", GetSocketError()});
     CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
     return false;
@@ -225,7 +251,7 @@ bool Server::SetupListener() {
   config_.resp.port = ntohs(bound_addr.sin_port);
 
   if (listen(listen_fd_, 128) < 0) {
-    std::cerr << "listen: " << GetSocketError() << "\n";
+    ABYSS_LOG_CRITICAL(ListenerLog(), "listen failed", {"err", GetSocketError()});
     CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
     return false;
@@ -234,13 +260,47 @@ bool Server::SetupListener() {
   return true;
 }
 
+void Server::NotifyReady() {
+  if (ready_fd_ < 0) return;
+
+  std::string line = R"({"bind":")";
+  line += config_.resp.bind;
+  line += R"(","port":)";
+  line += std::to_string(config_.resp.port);
+  line += "}\n";
+
+#ifdef _WIN32
+  auto handle = reinterpret_cast<HANDLE>(ready_fd_);
+  DWORD written = 0;
+  WriteFile(handle, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+  CloseHandle(handle);
+#else
+  const int fd = static_cast<int>(ready_fd_);
+  const char* data = line.data();
+  size_t remaining = line.size();
+  while (remaining > 0) {
+    const auto n = ::write(fd, data, remaining);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    data += n;
+    remaining -= static_cast<size_t>(n);
+  }
+  ::close(fd);
+#endif
+  ready_fd_ = -1;
+}
+
 void Server::Run(const std::atomic<bool>& stop) {
   if (!SetupListener()) return;
 
-  std::cout << "abyss-ready bind=" << config_.resp.bind << " port=" << config_.resp.port << "\n"
-            << std::flush;
-  std::cerr << "abyss v" << kVersion << " listening on " << config_.resp.bind << ":"
-            << config_.resp.port << "\n";
+  NotifyReady();
+  ABYSS_LOG_INFO(ListenerLog(), "listening", {"version", std::string_view{kVersion}},
+                 {"bind", std::string_view{config_.resp.bind}},
+                 {"port", static_cast<int64_t>(config_.resp.port)});
+
+  bool saturated = false;
 
   while (!stop.load(std::memory_order_acquire)) {
     pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
@@ -253,6 +313,7 @@ void Server::Run(const std::atomic<bool>& stop) {
 
     if (ret < 0) {
       if (IsSocketInterrupted()) continue;
+      ABYSS_LOG_ERROR(ListenerLog(), "poll failed", {"err", GetSocketError()});
       break;
     }
     if (ret == 0) continue;
@@ -268,6 +329,7 @@ void Server::Run(const std::atomic<bool>& stop) {
     if (client_fd == kInvalidSocket) {
 #endif
       if (IsSocketInterrupted()) continue;
+      ABYSS_LOG_ERROR(ListenerLog(), "accept failed", {"err", GetSocketError()});
       break;
     }
 
@@ -285,8 +347,18 @@ void Server::Run(const std::atomic<bool>& stop) {
     {
       std::lock_guard lock(connections_mutex_);
       if (connections_.size() >= config_.resp.max_connections) {
+        if (!saturated) {
+          saturated = true;
+          ABYSS_LOG_WARN(ListenerLog(), "max_connections reached; rejecting new clients",
+                         {"limit", static_cast<int64_t>(config_.resp.max_connections)});
+        }
         CloseSocket(client_fd);
         continue;
+      }
+      if (saturated) {
+        saturated = false;
+        ABYSS_LOG_INFO(ListenerLog(), "connection pressure cleared",
+                       {"in_use", static_cast<int64_t>(connections_.size())});
       }
 
       auto conn = std::make_unique<TrackedConnection>();
@@ -302,14 +374,17 @@ void Server::Run(const std::atomic<bool>& stop) {
 }
 
 void Server::HandleConnection(socket_t client_fd, std::atomic<bool>& finished) {
+  const auto client_id = next_client_id_.fetch_add(1);
   resp::ConnectionState state{
-      .client_id = next_client_id_.fetch_add(1),
+      .client_id = client_id,
       .client_name = {},
       .protocol_version = 2,
   };
   const auto& registry = resp::GlobalRegistry();
   // NOLINTNEXTLINE(misc-const-correctness)
   resp::RequestPipeline pipeline(registry, state);
+
+  ABYSS_LOG_DEBUG(ConnLog(), "client connected", {"client_id", static_cast<uint64_t>(client_id)});
 
   std::vector<uint8_t> read_buf(4096);
   std::vector<uint8_t> pending;
@@ -345,6 +420,8 @@ void Server::HandleConnection(socket_t client_fd, std::atomic<bool>& finished) {
   }
 
   CloseSocket(client_fd);
+  ABYSS_LOG_DEBUG(ConnLog(), "client disconnected",
+                  {"client_id", static_cast<uint64_t>(client_id)});
   finished.store(true, std::memory_order_release);
 }
 
@@ -364,18 +441,26 @@ void Server::CleanFinishedConnections() {
 void Server::Shutdown() {
   if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
+  ABYSS_LOG_INFO(ServerLog(), "shutdown starting");
+
   if (listen_fd_ != kInvalidSocket) {
     CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
   }
 
+  size_t draining = 0;
   {
     std::lock_guard lock(connections_mutex_);
     for (auto& conn : connections_) {
       if (!conn->finished.load(std::memory_order_acquire)) {
         ::shutdown(conn->fd, kShutdownRdwr);
+        ++draining;
       }
     }
+  }
+  if (draining > 0) {
+    ABYSS_LOG_INFO(ServerLog(), "draining in-flight connections",
+                   {"count", static_cast<int64_t>(draining)});
   }
 
   {
@@ -397,6 +482,7 @@ void Server::Shutdown() {
 #endif
 
   ready_.store(false, std::memory_order_release);
+  ABYSS_LOG_INFO(ServerLog(), "shutdown complete");
 }
 
 }  // namespace abyss::server
