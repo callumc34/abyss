@@ -1,18 +1,21 @@
 #include "server_fixture.h"
 
 #ifdef _WIN32
-#include <windows.h>
+#include <process.h>
 #else
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include <csignal>
 #endif
 
+#include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstring>
-#include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -22,317 +25,411 @@
 
 namespace abyss::system_test {
 
-// --- TestServer -------------------------------------------------------------
+namespace {
 
-TestServer::TestServer() {
-  uint64_t proc_id = 0;
-#ifdef _WIN32
-  proc_id = static_cast<uint64_t>(GetCurrentProcessId());
-#else
-  proc_id = static_cast<uint64_t>(getpid());
-#endif
+constexpr std::string_view kReadyPrefix = "abyss-ready";
+constexpr std::string_view kPortTag = "port=";
 
-  data_dir_ = std::filesystem::temp_directory_path() /
-              ("abyss_system_test_" + std::to_string(proc_id) + "_" +
-               std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+uint16_t ParseReadyLine(std::string_view line) {
+  if (!line.starts_with(kReadyPrefix)) return 0;
+  const auto tag = line.find(kPortTag);
+  if (tag == std::string_view::npos) return 0;
+  line.remove_prefix(tag + kPortTag.size());
+  uint32_t port = 0;
+  for (char c : line) {
+    if (c < '0' || c > '9') break;
+    port = (port * 10) + static_cast<uint32_t>(c - '0');
+    if (port > 65535) return 0;
+  }
+  return static_cast<uint16_t>(port);
 }
+
+#ifdef _WIN32
+
+struct WsaGuard {
+  WsaGuard() {
+    WSADATA data;
+    WSAStartup(MAKEWORD(2, 2), &data);
+  }
+  ~WsaGuard() { WSACleanup(); }
+  WsaGuard(const WsaGuard&) = delete;
+  WsaGuard& operator=(const WsaGuard&) = delete;
+};
+
+const WsaGuard kWsaGuard;
+
+std::string BuildCommandLine(const char* binary, const std::string& data_dir,
+                             const std::string& shard_count) {
+  std::string cmd;
+  cmd.reserve(256);
+  cmd += '"';
+  cmd += binary;
+  cmd += "\" --port 0 --data-dir \"";
+  cmd += data_dir;
+  cmd += "\" --shard-count ";
+  cmd += shard_count;
+  return cmd;
+}
+
+void ClosePipe(pipe_handle_t* h) {
+  if (*h != kInvalidPipeHandle) {
+    CloseHandle(*h);
+    *h = kInvalidPipeHandle;
+  }
+}
+
+void CloseProc(proc_handle_t* h) {
+  if (*h != kInvalidProcHandle) {
+    CloseHandle(*h);
+    *h = kInvalidProcHandle;
+  }
+}
+
+#else
+
+void ClosePipe(pipe_handle_t* h) {
+  if (*h < 0) return;
+  const int saved_errno = errno;
+  while (::close(*h) < 0 && errno == EINTR) {
+  }
+  errno = saved_errno;
+  *h = kInvalidPipeHandle;
+}
+
+#endif  // _WIN32
+
+}  // namespace
+
+TestServer::TestServer(Config config) : config_(config), data_dir_("system_test") {}
 
 TestServer::~TestServer() {
-  if (IsRunning()) Stop();
-  std::error_code ec;
-  std::filesystem::remove_all(data_dir_, ec);
-
-#ifdef _WIN32
-  WSACleanup();
-#endif
-}
-
-bool TestServer::IsRunning() const {
-#ifdef _WIN32
-  return process_handle_ != nullptr;
-#else
-  return pid_ > 0;
-#endif
-}
-
-uint16_t TestServer::AllocatePort() {
-  socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd == kInvalidSocket) return 0;
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
-
-  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    CLOSE_SOCKET(fd);
-    return 0;
-  }
-
-  socklen_t len = sizeof(addr);
-  if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
-    CLOSE_SOCKET(fd);
-    return 0;
-  }
-
-  uint16_t port = ntohs(addr.sin_port);
-  CLOSE_SOCKET(fd);
-  return port;
+  if (IsRunning()) Kill();
+  ClosePipe(&stdout_read_);
 }
 
 bool TestServer::Start() {
-#ifdef _WIN32
-  WSADATA wsa_data;
-  if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-    skip_reason_ = "WSAStartup failed in test fixture";
-    return false;
-  }
-#endif
-
   const char* binary = ABYSS_SERVER_BINARY;
-  if (binary[0] == '\0' || !std::filesystem::exists(binary)) {
-    skip_reason_ = "abyss-server binary not found";
+  if (binary[0] == '\0') {
+    skip_reason_ = "ABYSS_SERVER_BINARY macro not set at compile time";
     return false;
   }
 
-  std::filesystem::create_directories(data_dir_);
-
-  port_ = AllocatePort();
-  if (port_ == 0) {
-    skip_reason_ = "failed to allocate port";
-    return false;
-  }
+  const std::string data_str = data_dir_.String();
+  const std::string shard_str = std::to_string(config_.shard_count);
 
 #ifdef _WIN32
-  STARTUPINFOA si;
-  PROCESS_INFORMATION pi;
-  ZeroMemory(&si, sizeof(si));
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = nullptr;
+
+  HANDLE read_handle = nullptr;
+  HANDLE write_handle = nullptr;
+  if (!CreatePipe(&read_handle, &write_handle, &sa, 0)) {
+    skip_reason_ = "CreatePipe failed: " + std::to_string(GetLastError());
+    return false;
+  }
+  // The parent keeps the read end; ensure it is not inherited by the child.
+  if (!SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0)) {
+    CloseHandle(read_handle);
+    CloseHandle(write_handle);
+    skip_reason_ = "SetHandleInformation failed: " + std::to_string(GetLastError());
+    return false;
+  }
+
+  STARTUPINFOA si{};
   si.cb = sizeof(si);
-  ZeroMemory(&pi, sizeof(pi));
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = write_handle;
+  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 
-  std::string port_str = std::to_string(port_);
-  std::string data_str = data_dir_.string();
-
-  // CreateProcessA expects a mutable string. Quote paths to handle spaces safely.
-  std::string cmd_line =
-      "\"" + std::string(binary) + "\" --port " + port_str + " --data-dir \"" + data_str + "\"";
-
-  if (!CreateProcessA(nullptr, &cmd_line[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
-                      &pi)) {
-    skip_reason_ = "CreateProcess failed";
+  PROCESS_INFORMATION pi{};
+  std::string cmd_line = BuildCommandLine(binary, data_str, shard_str);
+  // CreateProcessA needs a writable command line buffer.
+  const BOOL ok = CreateProcessA(binary, cmd_line.data(), nullptr, nullptr, TRUE, 0, nullptr,
+                                 nullptr, &si, &pi);
+  CloseHandle(write_handle);
+  if (!ok) {
+    CloseHandle(read_handle);
+    skip_reason_ = "CreateProcess failed: " + std::to_string(GetLastError());
     return false;
   }
 
-  CloseHandle(pi.hThread);  // We don't need the main thread handle
-  process_handle_ = pi.hProcess;
+  CloseHandle(pi.hThread);
+  proc_ = pi.hProcess;
+  stdout_read_ = read_handle;
 
-  if (!WaitForReady(std::chrono::seconds{2})) {
-    DWORD exit_code = 0;
-    if (GetExitCodeProcess(process_handle_, &exit_code) && exit_code != STILL_ACTIVE) {
-      skip_reason_ = "server exited with code " + std::to_string(exit_code);
-    } else {
-      skip_reason_ = "server not accepting connections within timeout";
-      TerminateProcess(process_handle_, 1);
-      WaitForSingleObject(process_handle_, INFINITE);
-    }
-    CloseHandle(process_handle_);
-    process_handle_ = nullptr;
-    return false;
-  }
 #else
-  pid_t pid = fork();
+  std::array<int, 2> pipe_fds{-1, -1};
+  if (::pipe(pipe_fds.data()) < 0) {
+    skip_reason_ = "pipe failed: ";
+    skip_reason_ += std::strerror(errno);
+    return false;
+  }
+
+  const pid_t pid = ::fork();
   if (pid < 0) {
-    skip_reason_ = "fork failed: " + std::string(std::strerror(errno));
+    const int err = errno;
+    ClosePipe(pipe_fds.data());
+    ClosePipe(&pipe_fds[1]);
+    skip_reason_ = "fork failed: ";
+    skip_reason_ += std::strerror(err);
     return false;
   }
 
   if (pid == 0) {
-    std::string port_str = std::to_string(port_);
-    std::string data_str = data_dir_.string();
+    ::dup2(pipe_fds[1], STDOUT_FILENO);
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-    execl(binary, "abyss-server", "--port", port_str.c_str(), "--data-dir", data_str.c_str(),
-          nullptr);
-    _exit(127);
+    ::execl(binary, "abyss-server", "--port", "0", "--data-dir", data_str.c_str(), "--shard-count",
+            shard_str.c_str(), nullptr);
+    ::_exit(127);
   }
 
-  pid_ = pid;
-
-  if (!WaitForReady(std::chrono::seconds{2})) {
-    int status = 0;
-    pid_t wr = waitpid(pid_, &status, WNOHANG);
-    if (wr > 0 && WIFEXITED(status)) {
-      skip_reason_ = "server exited with code " + std::to_string(WEXITSTATUS(status));
-    } else {
-      skip_reason_ = "server not accepting connections within timeout";
-      if (wr == 0) {
-        kill(pid_, SIGKILL);
-        waitpid(pid_, &status, 0);
-      }
-    }
-    pid_ = -1;
-    return false;
-  }
+  ClosePipe(&pipe_fds[1]);
+  proc_ = pid;
+  stdout_read_ = pipe_fds[0];
 #endif
 
+  if (!WaitForReady()) {
+    Kill();
+    return false;
+  }
   return true;
 }
 
-bool TestServer::WaitForReady(std::chrono::seconds timeout) const {
-  auto deadline = std::chrono::steady_clock::now() + timeout;
+bool TestServer::WaitForReady() {
+  const auto deadline = std::chrono::steady_clock::now() + config_.ready_timeout;
+  std::string buffer;
+  buffer.reserve(256);
+  std::array<char, 256> chunk{};
 
   while (std::chrono::steady_clock::now() < deadline) {
-    // Check if process crashed prematurely
 #ifdef _WIN32
     DWORD exit_code = 0;
-    if (GetExitCodeProcess(process_handle_, &exit_code) && exit_code != STILL_ACTIVE) {
+    if (!GetExitCodeProcess(proc_, &exit_code)) {
+      skip_reason_ = "GetExitCodeProcess failed: " + std::to_string(GetLastError());
       return false;
     }
+    if (exit_code != STILL_ACTIVE) {
+      skip_reason_ =
+          "server exited before emitting ready line (exit code " + std::to_string(exit_code) + ")";
+      CloseProc(&proc_);
+      return false;
+    }
+
+    DWORD bytes_avail = 0;
+    if (!PeekNamedPipe(stdout_read_, nullptr, 0, nullptr, &bytes_avail, nullptr)) {
+      const DWORD err = GetLastError();
+      if (err == ERROR_BROKEN_PIPE) {
+        skip_reason_ = "server stdout closed before ready line";
+        return false;
+      }
+      skip_reason_ = "PeekNamedPipe failed: " + std::to_string(err);
+      return false;
+    }
+    if (bytes_avail == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+      continue;
+    }
+
+    DWORD nread = 0;
+    const DWORD to_read = static_cast<DWORD>(std::min<DWORD>(bytes_avail, chunk.size()));
+    if (!ReadFile(stdout_read_, chunk.data(), to_read, &nread, nullptr)) {
+      skip_reason_ = "ReadFile failed: " + std::to_string(GetLastError());
+      return false;
+    }
+    if (nread == 0) {
+      skip_reason_ = "server stdout closed before ready line";
+      return false;
+    }
+    buffer.append(chunk.data(), static_cast<size_t>(nread));
 #else
     int status = 0;
-    pid_t result = waitpid(pid_, &status, WNOHANG);
-    if (result > 0) {
+    const pid_t waited = ::waitpid(proc_, &status, WNOHANG);
+    if (waited > 0) {
+      skip_reason_ = "server exited before emitting ready line (status ";
+      skip_reason_ += std::to_string(status);
+      skip_reason_ += ")";
+      proc_ = kInvalidProcHandle;
       return false;
     }
-#endif
-
-    // Attempt TCP connection
-    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd != kInvalidSocket) {
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      addr.sin_port = htons(port_);
-
-      if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-        CLOSE_SOCKET(fd);
-        return true;
-      }
-      CLOSE_SOCKET(fd);
+    if (waited < 0 && errno != ECHILD) {
+      skip_reason_ = "waitpid failed: ";
+      skip_reason_ += std::strerror(errno);
+      return false;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining_ms = std::max<long>(
+        1, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    const int poll_ms = static_cast<int>(std::min<long>(remaining_ms, 100));
+
+    pollfd pfd{.fd = stdout_read_, .events = POLLIN, .revents = 0};
+    const int pr = ::poll(&pfd, 1, poll_ms);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      skip_reason_ = "poll failed: ";
+      skip_reason_ += std::strerror(errno);
+      return false;
+    }
+    if (pr == 0) continue;
+
+    const auto nread = ::read(stdout_read_, chunk.data(), chunk.size());
+    if (nread < 0) {
+      if (errno == EINTR) continue;
+      skip_reason_ = "read failed: ";
+      skip_reason_ += std::strerror(errno);
+      return false;
+    }
+    if (nread == 0) {
+      skip_reason_ = "server stdout closed before ready line";
+      return false;
+    }
+    buffer.append(chunk.data(), static_cast<size_t>(nread));
+#endif
+
+    for (auto nl = buffer.find('\n'); nl != std::string::npos; nl = buffer.find('\n')) {
+      const std::string_view line(buffer.data(), nl);
+      if (line.starts_with(kReadyPrefix)) {
+        const uint16_t port = ParseReadyLine(line);
+        if (port == 0) {
+          skip_reason_ = "malformed ready line: ";
+          skip_reason_.append(line);
+          return false;
+        }
+        port_ = port;
+        return true;
+      }
+      buffer.erase(0, nl + 1);
+    }
   }
 
+  skip_reason_ = "timed out waiting for server ready line";
   return false;
 }
 
 void TestServer::Stop() {
   if (!IsRunning()) return;
 #ifdef _WIN32
-  // NOTE(Callum): Windows lacks a SIGTERM equivalent for detached processes.
-  // TerminateProcess is a hard kill.
-  TerminateProcess(process_handle_, 0);
-  WaitForSingleObject(process_handle_, INFINITE);
-  CloseHandle(process_handle_);
-  process_handle_ = nullptr;
+  // Windows has no SIGTERM equivalent we can deliver without the child
+  // installing a SetConsoleCtrlHandler in a dedicated process group. Hard
+  // termination still validates the property the tests care about: data
+  // acked by the client must survive any termination.
+  TerminateProcess(proc_, 0);
 #else
-  kill(pid_, SIGTERM);
-  int status = 0;
-  waitpid(pid_, &status, 0);
-  pid_ = -1;
+  ::kill(proc_, SIGTERM);
 #endif
+  WaitChild();
 }
 
 void TestServer::Kill() {
   if (!IsRunning()) return;
 #ifdef _WIN32
-  TerminateProcess(process_handle_, 1);
-  WaitForSingleObject(process_handle_, INFINITE);
-  CloseHandle(process_handle_);
-  process_handle_ = nullptr;
+  TerminateProcess(proc_, 1);
 #else
-  kill(pid_, SIGKILL);
-  int status = 0;
-  waitpid(pid_, &status, 0);
-  pid_ = -1;
+  ::kill(proc_, SIGKILL);
 #endif
+  WaitChild();
 }
 
-// --- SystemTest -------------------------------------------------------------
-
-TestServer& SystemTest::SharedServer() {
-  static TestServer server;
-  static bool attempted = false;
-  if (!attempted) {
-    attempted = true;
-    server.Start();
+void TestServer::WaitChild() {
+#ifdef _WIN32
+  WaitForSingleObject(proc_, INFINITE);
+  CloseProc(&proc_);
+#else
+  int status = 0;
+  while (true) {
+    const pid_t r = ::waitpid(proc_, &status, 0);
+    if (r == proc_) break;
+    if (r < 0 && errno == EINTR) continue;
+    break;
   }
-  return server;
+  proc_ = kInvalidProcHandle;
+#endif
+  ClosePipe(&stdout_read_);
+  port_ = 0;
+}
+
+std::unique_ptr<TestServer> SystemTest::shared_server_;
+
+void SystemTest::SetUpTestSuite() {
+  shared_server_ = std::make_unique<TestServer>();
+  if (!shared_server_->Start()) {
+    GTEST_SKIP() << shared_server_->SkipReason();
+  }
+}
+
+void SystemTest::TearDownTestSuite() {
+  if (shared_server_) {
+    shared_server_->Stop();
+    shared_server_.reset();
+  }
 }
 
 void SystemTest::SetUp() {
-  auto& server = SharedServer();
-  if (!server.IsRunning()) {
-    GTEST_SKIP() << server.SkipReason();
+  if (shared_server_ == nullptr || !shared_server_->IsRunning()) {
+    GTEST_SKIP() << (shared_server_ != nullptr ? shared_server_->SkipReason()
+                                               : "shared server not started");
   }
 
-  client_.emplace();
-  if (!client_->Connect("127.0.0.1", server.Port())) {
-    GTEST_SKIP() << "cannot connect to server on port " << server.Port();
+  if (!client_.Connect("127.0.0.1", shared_server_->Port())) {
+    GTEST_SKIP() << "cannot connect to shared server on port " << shared_server_->Port();
   }
 
-  client_->Command({"FLUSHALL"});
+  client_.Command({"FLUSHALL"});
 }
 
-void SystemTest::TearDown() { client_.reset(); }
+void SystemTest::TearDown() { client_.Close(); }
 
-RedisClient& SystemTest::Client() { return *client_; }
-
-uint16_t SystemTest::ServerPort() { return SharedServer().Port(); }
-
-// --- DurabilityTest ---------------------------------------------------------
-
-void DurabilityTest::SetUp() {
-  if (!server_.Start()) {
-    GTEST_SKIP() << server_.SkipReason();
-  }
-
-  client_.emplace();
-  if (!client_->Connect("127.0.0.1", server_.Port())) {
-    GTEST_SKIP() << "cannot connect to server on port " << server_.Port();
-  }
-}
-
-void DurabilityTest::TearDown() {
-  client_.reset();
-  if (server_.IsRunning()) server_.Stop();
-}
-
-RedisClient& DurabilityTest::Client() { return *client_; }
-
-void DurabilityTest::RestartServer() {
-  client_->Close();
-  server_.Stop();
-  ASSERT_TRUE(server_.Start()) << server_.SkipReason();
-  ASSERT_TRUE(client_->Connect("127.0.0.1", server_.Port()));
-}
-
-void DurabilityTest::KillAndRestartServer() {
-  client_->Close();
-  server_.Kill();
-  ASSERT_TRUE(server_.Start()) << server_.SkipReason();
-  ASSERT_TRUE(client_->Connect("127.0.0.1", server_.Port()));
-}
-
-// --- DataCommandTest --------------------------------------------------------
+uint16_t SystemTest::ServerPort() { return shared_server_->Port(); }
 
 void DataCommandTest::SetUp() {
   SystemTest::SetUp();
   if (IsSkipped()) return;
-  auto r = Client().Command({"SET", "__probe__", "1"});
-  if (r.IsError() && r.String().contains("not implemented")) {
+  const auto probe = Client().Command({"SET", "__probe__", "1"});
+  if (probe.IsError() && probe.String().contains("not implemented")) {
     GTEST_SKIP() << "data commands not yet implemented";
   }
   Client().Command({"DEL", "__probe__"});
 }
 
-// --- DataDurabilityTest -----------------------------------------------------
+void IsolatedServerTest::SetUp() {
+  if (!server_.Start()) {
+    GTEST_SKIP() << server_.SkipReason();
+  }
+  if (!client_.Connect("127.0.0.1", server_.Port())) {
+    GTEST_SKIP() << "cannot connect to server on port " << server_.Port();
+  }
+}
 
-void DataDurabilityTest::SetUp() {
-  DurabilityTest::SetUp();
+void IsolatedServerTest::TearDown() {
+  client_.Close();
+  server_.Stop();
+}
+
+void IsolatedServerTest::RestartServer() {
+  client_.Close();
+  server_.Stop();
+  ASSERT_TRUE(server_.Start()) << server_.SkipReason();
+  ASSERT_TRUE(client_.Connect("127.0.0.1", server_.Port()));
+}
+
+void IsolatedServerTest::KillAndRestartServer() {
+  client_.Close();
+  server_.Kill();
+  ASSERT_TRUE(server_.Start()) << server_.SkipReason();
+  ASSERT_TRUE(client_.Connect("127.0.0.1", server_.Port()));
+}
+
+void IsolatedDataServerTest::SetUp() {
+  IsolatedServerTest::SetUp();
   if (IsSkipped()) return;
-  auto r = Client().Command({"SET", "__probe__", "1"});
-  if (r.IsError() && r.String().contains("not implemented")) {
+  const auto probe = Client().Command({"SET", "__probe__", "1"});
+  if (probe.IsError() && probe.String().contains("not implemented")) {
     GTEST_SKIP() << "data commands not yet implemented";
   }
   Client().Command({"DEL", "__probe__"});

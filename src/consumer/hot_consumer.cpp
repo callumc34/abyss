@@ -40,11 +40,17 @@ void HotConsumer::Start() {
   thread_ = std::thread(&HotConsumer::Run, this);
 }
 
-void HotConsumer::Stop() {
+void HotConsumer::RequestStop() { stop_requested_.store(true, std::memory_order_release); }
+
+void HotConsumer::Join() {
   if (!running_.load(std::memory_order_acquire)) return;
-  stop_requested_.store(true, std::memory_order_release);
   if (thread_.joinable()) thread_.join();
   running_.store(false, std::memory_order_release);
+}
+
+void HotConsumer::Stop() {
+  RequestStop();
+  Join();
 }
 
 void HotConsumer::Run() {

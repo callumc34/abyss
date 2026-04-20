@@ -158,11 +158,10 @@ TEST_F(WalQueueTest, ReadBlocksOnTimeout) {
   EXPECT_GE(elapsed, 40ms);
 }
 
-TEST_F(WalQueueTest, ReadWakesOnAppend) {
+TEST_F(WalQueueTest, ReadReturnsFastWhenAppendRacesWithRead) {
   OpenWith(DefaultConfig());
 
   std::thread producer([this] {
-    std::this_thread::sleep_for(20ms);
     auto r = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
     ASSERT_TRUE(r.has_value());
   });

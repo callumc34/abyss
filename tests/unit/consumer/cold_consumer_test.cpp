@@ -428,13 +428,13 @@ TEST_F(ColdConsumerTest, QueueReadUnavailableStopsLoop) {
         return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
       });
 
+  // The mock always returns kUnavailable, which makes the loop self-terminate.
+  // Stop()'s Join blocks until the thread exits, so if the loop were spinning
+  // this test would time out at the ctest TIMEOUT rather than pass.
   c->Start();
-  // A healthy consumer would spin on Read every queue_read_timeout (default 50ms).
-  // With C2, it bails after the first kUnavailable.
-  std::this_thread::sleep_for(300ms);
   c->Stop();
 
-  EXPECT_LE(read_call_count.load(), 3)
+  EXPECT_LE(read_call_count.load(), 1)
       << "Consumer kept polling after kUnavailable — loop did not exit";
 }
 

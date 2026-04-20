@@ -113,6 +113,15 @@ target_link_libraries(abyss_config_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_support_tests
+  support/temp_dir_test.cpp
+)
+
+target_link_libraries(abyss_support_tests PRIVATE
+  abyss::test_support
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -120,3 +129,4 @@ abyss_discover_tests(abyss_hot_tests      "unit\;unit-hot")
 abyss_discover_tests(abyss_cold_tests     "unit\;unit-cold")
 abyss_discover_tests(abyss_consumer_tests "unit\;unit-consumer")
 abyss_discover_tests(abyss_config_tests   "unit\;unit-config")
+abyss_discover_tests(abyss_support_tests  "unit\;unit-support")

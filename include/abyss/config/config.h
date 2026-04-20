@@ -23,6 +23,8 @@ struct HotConfig {
   size_t max_memory_bytes = 4294967296;
   std::chrono::seconds default_eviction{86400};
   std::chrono::milliseconds eviction_tick{1000};
+  // Queue and consumer pools are opened with the same count.
+  uint32_t shard_count = 64;
   std::vector<EvictionOverride> eviction_overrides;
 };
 

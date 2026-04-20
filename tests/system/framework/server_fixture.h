@@ -2,19 +2,26 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
-#include <filesystem>
-#include <optional>
+#include <memory>
 #include <string>
 
 #include "platform_compat.h"
 #include "redis_client.h"
+#include "temp_dir.h"
 
 namespace abyss::system_test {
 
 class TestServer {
  public:
-  TestServer();
+  struct Config {
+    uint32_t shard_count = 4;
+    std::chrono::milliseconds ready_timeout{5000};
+  };
+
+  TestServer() : TestServer(Config{}) {}
+  explicit TestServer(Config config);
   ~TestServer();
 
   TestServer(const TestServer&) = delete;
@@ -25,34 +32,42 @@ class TestServer {
   bool Start();
   void Stop();
   void Kill();
-  bool IsRunning() const;
+
+  bool IsRunning() const { return proc_ != kInvalidProcHandle; }
   uint16_t Port() const { return port_; }
   const std::string& SkipReason() const { return skip_reason_; }
 
  private:
-  static uint16_t AllocatePort();
-  bool WaitForReady(std::chrono::seconds timeout) const;
+  bool WaitForReady();
+  void WaitChild();
 
-#ifdef _WIN32
-  HANDLE process_handle_ = nullptr;
-#else
-  pid_t pid_ = -1;
-#endif
+  Config config_;
+  testing::TempDir data_dir_;
+  proc_handle_t proc_ = kInvalidProcHandle;
+  pipe_handle_t stdout_read_ = kInvalidPipeHandle;
   uint16_t port_ = 0;
-  std::filesystem::path data_dir_;
   std::string skip_reason_;
 };
 
+// Class-scoped shared server via SetUpTestSuite / TearDownTestSuite. One
+// server per TEST_F class; different classes parallelize. Use
+// IsolatedServerTest instead when a test restarts the server or asserts
+// against non-keyspace state.
 class SystemTest : public ::testing::Test {
+ public:
+  static void SetUpTestSuite();
+  static void TearDownTestSuite();
+
  protected:
   void SetUp() override;
   void TearDown() override;
-  RedisClient& Client();
+
+  RedisClient& Client() { return client_; }
   uint16_t ServerPort();
 
  private:
-  static TestServer& SharedServer();
-  std::optional<RedisClient> client_;
+  static std::unique_ptr<TestServer> shared_server_;
+  RedisClient client_;
 };
 
 class DataCommandTest : public SystemTest {
@@ -60,20 +75,25 @@ class DataCommandTest : public SystemTest {
   void SetUp() override;
 };
 
-class DurabilityTest : public ::testing::Test {
+// Per-test isolated server. Required for tests that restart/kill the server
+// or assert metrics from a clean baseline.
+class IsolatedServerTest : public ::testing::Test {
  protected:
   void SetUp() override;
   void TearDown() override;
-  RedisClient& Client();
+
+  RedisClient& Client() { return client_; }
+  const TestServer& Server() const { return server_; }
+
   void RestartServer();
   void KillAndRestartServer();
 
  private:
   TestServer server_;
-  std::optional<RedisClient> client_;
+  RedisClient client_;
 };
 
-class DataDurabilityTest : public DurabilityTest {
+class IsolatedDataServerTest : public IsolatedServerTest {
  protected:
   void SetUp() override;
 };

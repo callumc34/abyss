@@ -3,7 +3,7 @@
 namespace abyss::system_test {
 namespace {
 
-using DurabilityTestFixture = DataDurabilityTest;
+using DurabilityTestFixture = IsolatedDataServerTest;
 
 TEST_F(DurabilityTestFixture, DataSurvivesCleanRestart) {
   EXPECT_TRUE(Client().Command({"SET", "persist", "value"}).IsOk());

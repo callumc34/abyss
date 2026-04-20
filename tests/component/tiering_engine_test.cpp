@@ -162,9 +162,8 @@ TEST_F(TieringEngineTest, WriteSuccessReturnsConsumerResult) {
       .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
 
   std::thread fulfiller([this]() {
-    while (!rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK"))) {
-      std::this_thread::sleep_for(1ms);
-    }
+    while (rpc_.PendingCount() == 0) std::this_thread::yield();
+    EXPECT_TRUE(rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK")));
   });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
@@ -185,10 +184,9 @@ TEST_F(TieringEngineTest, WriteConsumerErrorPropagates) {
       .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
 
   std::thread fulfiller([this]() {
-    while (!rpc_.Fulfill(kSeq, core::RespValue::Error(core::ErrorPrefix::kWrongType,
-                                                      "operation against wrong type"))) {
-      std::this_thread::sleep_for(1ms);
-    }
+    while (rpc_.PendingCount() == 0) std::this_thread::yield();
+    EXPECT_TRUE(rpc_.Fulfill(kSeq, core::RespValue::Error(core::ErrorPrefix::kWrongType,
+                                                          "operation against wrong type")));
   });
 
   auto result = engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}));
@@ -244,10 +242,16 @@ TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
 // min RPC budget is write_timeout * min_rpc_wait_fraction. Without C5, a
 // durable completion near the original deadline would give the RPC ~0 budget.
 TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
+  // Real-time test of deadline math. Timings chosen so durable fires past the
+  // T*(1-fraction) boundary where the floor actually extends the deadline,
+  // and with CI jitter margin at each step:
+  //   write_timeout=100ms, fraction=0.5
+  //   durable@75ms   — 25ms below T, 25ms above T*(1-f)=50ms
+  //   rpc@115ms      — 15ms past T, 10ms inside the extended floor 75+50=125ms
   TieringEngineConfig cfg{
       .shard_count = kShardCount,
-      .write_timeout = 200ms,
-      .min_rpc_wait_fraction = 0.5,  // ≥100ms of RPC budget, even if durable is slow.
+      .write_timeout = 100ms,
+      .min_rpc_wait_fraction = 0.5,
   };
   TieringEngine engine(queue_, hot_, cold_, router_, rpc_, cfg);
 
@@ -261,18 +265,15 @@ TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
                                     std::make_unique<testing::NoopAppendPublisher>()};
       });
 
-  // Durable completes at ~150ms — close to the original 200ms deadline.
   std::thread durable_releaser([&durable_p]() {
-    std::this_thread::sleep_for(150ms);
+    std::this_thread::sleep_for(75ms);
     durable_p.set_value(core::Result<void>{});
   });
-  // RPC fulfilled at ~220ms — past the original deadline but inside the
-  // guaranteed RPC floor (150ms + 100ms = 250ms).
   std::thread rpc_releaser([this]() {
-    std::this_thread::sleep_for(220ms);
-    while (!rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK"))) {
-      std::this_thread::sleep_for(1ms);
-    }
+    std::this_thread::sleep_for(115ms);
+    // Fulfill either succeeds (promise is still pending) or fails because the
+    // RPC was cancelled on a timeout path — either way, no retry loop.
+    (void)rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK"));
   });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));

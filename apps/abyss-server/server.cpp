@@ -69,6 +69,7 @@ bool Server::Initialize() {
 
   hot_store_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = config_.hot.max_memory_bytes,
+      .shard_count = config_.hot.shard_count,
   });
 
   auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
@@ -209,6 +210,20 @@ bool Server::SetupListener() {
     return false;
   }
 
+  sockaddr_in bound_addr{};
+#ifdef _WIN32
+  int bound_len = sizeof(bound_addr);
+#else
+  socklen_t bound_len = sizeof(bound_addr);
+#endif
+  if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound_addr), &bound_len) < 0) {
+    std::cerr << "getsockname: " << GetSocketError() << "\n";
+    CloseSocket(listen_fd_);
+    listen_fd_ = kInvalidSocket;
+    return false;
+  }
+  config_.resp.port = ntohs(bound_addr.sin_port);
+
   if (listen(listen_fd_, 128) < 0) {
     std::cerr << "listen: " << GetSocketError() << "\n";
     CloseSocket(listen_fd_);
@@ -222,6 +237,8 @@ bool Server::SetupListener() {
 void Server::Run(const std::atomic<bool>& stop) {
   if (!SetupListener()) return;
 
+  std::cout << "abyss-ready bind=" << config_.resp.bind << " port=" << config_.resp.port << "\n"
+            << std::flush;
   std::cerr << "abyss v" << kVersion << " listening on " << config_.resp.bind << ":"
             << config_.resp.port << "\n";
 

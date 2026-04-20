@@ -53,6 +53,7 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
   if (auto r = RequireNonEmpty("hot.backend", hot.backend); !r) return r;
   if (auto r = RequirePositive("hot.max_memory_bytes", hot.max_memory_bytes); !r) return r;
   if (auto r = RequirePositive("hot.default_eviction_seconds", hot.default_eviction); !r) return r;
+  if (auto r = RequirePositive("hot.shard_count", hot.shard_count); !r) return r;
   if (hot.eviction_tick.count() <= 0) {
     return std::unexpected(InvalidArg("hot.eviction_tick_ms", "must be > 0 milliseconds"));
   }
@@ -179,7 +180,7 @@ core::Result<void> ValidateRecovery(const RecoveryConfig& r) {
 
 core::Result<void> ValidateResp(const RespConfig& r) {
   if (auto res = RequireNonEmpty("resp.bind", r.bind); !res) return res;
-  if (auto res = RequirePort("resp.port", r.port); !res) return res;
+  // port == 0 requests a kernel-assigned ephemeral port, reported on stdout.
   if (auto res = RequirePositive("resp.max_connections", r.max_connections); !res) return res;
   if (auto res = RequirePositive("resp.idle_timeout_seconds", r.idle_timeout); !res) return res;
   return {};
@@ -205,6 +206,7 @@ core::Result<void> ValidatePortCollisions(const Config& c) {
       {c.admin.port, "admin.port"},
   }};
   for (const auto* lhs = ports.begin(); lhs != ports.end(); ++lhs) {
+    if (lhs->first == 0) continue;  // ephemeral; resolved at bind time
     for (const auto* rhs = std::next(lhs); rhs != ports.end(); ++rhs) {
       if (lhs->first == rhs->first) {
         std::string msg = "collides with ";

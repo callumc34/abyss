@@ -31,7 +31,10 @@ void ColdConsumerPool::Start() {
 
 void ColdConsumerPool::Stop() {
   for (auto& consumer : consumers_) {
-    consumer->Stop();
+    consumer->RequestStop();
+  }
+  for (auto& consumer : consumers_) {
+    consumer->Join();
   }
 }
 

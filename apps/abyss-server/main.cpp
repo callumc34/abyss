@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 
 #include "abyss/config/config.h"
@@ -39,13 +40,19 @@ int main(int argc, char* argv[]) {
 
   std::string config_path;
   std::string data_dir = kDefaultDataDir;
-  uint16_t port_override = 0;
+  std::optional<uint16_t> port_override;
+  std::optional<uint32_t> shard_count_override;
 
   app.add_option("-c,--config", config_path, "Path to YAML config file (ABYSS_CONFIG_PATH)");
-  app.add_option("-p,--port", port_override, "RESP listen port (overrides config)");
+  app.add_option("-p,--port", port_override,
+                 "RESP listen port (overrides config). Pass 0 to let the OS pick an ephemeral "
+                 "port; the bound port is announced on the stdout ready line.");
   app.add_option("-d,--data-dir", data_dir,
                  "Data directory for WAL and cold store (used when no config file is given)")
       ->default_val(data_dir);
+  app.add_option("--shard-count", shard_count_override,
+                 "Hot-store shard count (overrides config). The queue and consumer pools are "
+                 "opened with the same count.");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -69,7 +76,13 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (port_override != 0) config.resp.port = port_override;
+  if (port_override.has_value()) config.resp.port = *port_override;
+  if (shard_count_override.has_value()) config.hot.shard_count = *shard_count_override;
+
+  if (auto r = config.Validate(); !r.has_value()) {
+    std::cerr << "config error: " << r.error().message() << "\n";
+    return EXIT_FAILURE;
+  }
 
 #ifndef _WIN32
   struct sigaction sa{};

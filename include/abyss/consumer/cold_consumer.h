@@ -67,7 +67,18 @@ class ColdConsumer {
   ColdConsumer& operator=(ColdConsumer&&) = delete;
 
   void Start();
+
+  // Signal the worker to exit. Non-blocking; the thread wakes from its next
+  // queue Read (bounded by config.queue_read_timeout) and returns.
+  void RequestStop();
+
+  // Wait for the worker thread. Must be preceded by RequestStop.
+  void Join();
+
+  // RequestStop + Join. Pools owning many consumers should call the split
+  // pair to avoid O(N * queue_read_timeout) serial teardown.
   void Stop();
+
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
   CompactionBuffer& Buffer() { return buffer_; }

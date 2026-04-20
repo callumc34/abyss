@@ -38,11 +38,17 @@ void ColdConsumer::Start() {
   thread_ = std::thread(&ColdConsumer::RunLoop, this);
 }
 
-void ColdConsumer::Stop() {
+void ColdConsumer::RequestStop() { stop_requested_.store(true, std::memory_order_release); }
+
+void ColdConsumer::Join() {
   if (!running_.load(std::memory_order_acquire)) return;
-  stop_requested_.store(true, std::memory_order_release);
   if (thread_.joinable()) thread_.join();
   running_.store(false, std::memory_order_release);
+}
+
+void ColdConsumer::Stop() {
+  RequestStop();
+  Join();
 }
 
 void ColdConsumer::RunLoop() {

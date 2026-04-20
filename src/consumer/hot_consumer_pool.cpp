@@ -29,7 +29,10 @@ void HotConsumerPool::Start() {
 
 void HotConsumerPool::Stop() {
   for (auto& consumer : consumers_) {
-    consumer->Stop();
+    consumer->RequestStop();
+  }
+  for (auto& consumer : consumers_) {
+    consumer->Join();
   }
 }
 
