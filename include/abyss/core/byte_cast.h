@@ -13,8 +13,10 @@ inline const uint8_t* AsBytes(const char* p) noexcept {
   return reinterpret_cast<const uint8_t*>(p);
 }
 
+// NOLINTNEXTLINE(readability-non-const-parameter)
 inline char* AsChars(uint8_t* p) noexcept { return reinterpret_cast<char*>(p); }
 
+// NOLINTNEXTLINE(readability-non-const-parameter)
 inline uint8_t* AsBytes(char* p) noexcept { return reinterpret_cast<uint8_t*>(p); }
 // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
 

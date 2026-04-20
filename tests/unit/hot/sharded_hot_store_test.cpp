@@ -6,6 +6,8 @@
 #include <thread>
 #include <vector>
 
+#include "test_clock.h"
+
 namespace abyss::hot {
 namespace {
 
@@ -13,11 +15,15 @@ using namespace std::chrono_literals;
 
 class ShardedHotStoreTest : public ::testing::Test {
  protected:
-  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  abyss::testing::TestClock clock_;
   ShardedHotStore store_{ShardedHotStoreConfig{
       .max_memory_bytes = 64UL * 1024 * 1024,
       .shard_count = 8,
+      .steady_clock = clock_.SteadyFn(),
+      .wall_clock = clock_.WallFn(),
   }};
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr core::EvictionTTL kEviction{86400};
 
   void SetString(std::string_view key, std::string_view value) {
@@ -154,8 +160,8 @@ TEST_F(ShardedHotStoreTest, EvictExpiredAcrossShards) {
   core::ops::StringSet op{.key = "temp", .value = "v"};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
 
-  std::this_thread::sleep_for(1100ms);
-  auto evicted = store_.EvictExpired(core::SteadyClock::now());
+  clock_.Advance(1100ms);
+  auto evicted = store_.EvictExpired(clock_.SteadyNow());
   EXPECT_GE(evicted, 1U);
 }
 
@@ -210,7 +216,7 @@ TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
     }
   });
 
-  std::thread drainer([this]() { store_.DrainAccessBuffers(core::SteadyClock::now(), kEviction); });
+  std::thread drainer([this]() { store_.DrainAccessBuffers(clock_.SteadyNow(), kEviction); });
 
   reader.join();
   drainer.join();

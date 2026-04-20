@@ -9,6 +9,8 @@
 
 namespace abyss::consumer {
 
+enum class FlushTrigger : uint8_t { kQuiet = 0, kDeadline = 1 };
+
 struct BufferEntry {
   std::string key;
   CompactedState state;
@@ -18,6 +20,7 @@ struct BufferEntry {
   core::EvictionTTL eviction{0};
   std::chrono::milliseconds jitter_offset{0};
   core::SequenceId first_seen_seq = 0;
+  FlushTrigger last_trigger = FlushTrigger::kQuiet;
 };
 
 }  // namespace abyss::consumer

@@ -25,8 +25,9 @@ void AppendU64BE(std::string& out, uint64_t v) {
 }
 
 uint16_t ReadU16BE(const char* p) {
-  return (static_cast<uint16_t>(static_cast<uint8_t>(p[0])) << 8) |
-         static_cast<uint16_t>(static_cast<uint8_t>(p[1]));
+  const auto hi = static_cast<uint16_t>(static_cast<uint8_t>(p[0]));
+  const auto lo = static_cast<uint16_t>(static_cast<uint8_t>(p[1]));
+  return static_cast<uint16_t>((hi << 8) | lo);
 }
 
 uint64_t ReadU64BE(const char* p) {
@@ -47,6 +48,7 @@ void AppendLengthPrefixedKey(std::string& out, std::string_view key) {
 // --- Varint -----------------------------------------------------------------
 
 void AppendVarint(std::string& out, uint64_t value) {
+  // NOLINTNEXTLINE(bugprone-infinite-loop)
   while (value >= 0x80) {
     out.push_back(static_cast<char>((value & 0x7F) | 0x80));
     value >>= 7;

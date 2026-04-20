@@ -177,7 +177,7 @@ TEST_F(FileOffsetStoreTest, CrcMismatchDetected) {
 
   // Flip a byte in the seq field (offset 16).
   const auto path = ShardFilePath(0, 0);
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
   const int fd = ::open(path.c_str(), O_RDWR);
   ASSERT_GE(fd, 0);
   uint8_t byte = 0;

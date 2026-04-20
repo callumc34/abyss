@@ -21,17 +21,7 @@ struct ConnectionState {
 };
 
 // Orchestrates parse, classify, dispatch, serialize for a single connection.
-//
-// Currently handles kStateless admin commands directly (PING, ECHO, QUIT,
-// HELLO, TIME, COMMAND COUNT, CLIENT ID|GETNAME|SETNAME). Other dispatch
-// classes (kTieredRead, kWritePath, kConditionalWrite, kConsumerRpc) return a
-// not-implemented error — they will route to the tiering engine / Resolver
-// when those components land.
-//
-// Thread safety: NOT thread-safe. One RequestPipeline instance belongs to one
-// connection and is driven by one I/O thread at a time. Concurrent connections
-// each have their own pipeline. The shared `CommandRegistry` is read-only and
-// safe to reference from many pipelines simultaneously.
+// Not thread-safe; one pipeline per connection.
 class RequestPipeline {
  public:
   RequestPipeline(const CommandRegistry& registry, ConnectionState state,

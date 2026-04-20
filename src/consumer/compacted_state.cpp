@@ -156,7 +156,6 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
     return result;
   }
 
-  // NOLINTNEXTLINE(bugprone-branch-clone)
   switch (type_) {
     case DataType::kNone:
       break;

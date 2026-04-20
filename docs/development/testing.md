@@ -1,157 +1,90 @@
 # Testing
 
-## Running Tests
+## Running
 
 ```bash
-# Build and run all unit tests
 cmake --preset default
 cmake --build build/default
 ctest --preset default
-
-# Run with address sanitizer
-cmake --preset asan
-cmake --build build/asan
-ctest --test-dir build/asan
-
-# Run with thread sanitizer
-cmake --preset tsan
-cmake --build build/tsan
-ctest --test-dir build/tsan
 ```
 
-## Running Benchmarks
+The `default` test preset enables parallelism, randomised scheduling, `--output-on-failure`, and a 30-second per-test timeout ceiling. To override parallelism without editing the preset, set `CTEST_PARALLEL_LEVEL` in the environment.
 
-The `bench` preset enables `ABYSS_BUILD_BENCHMARKS` and pulls in `google/benchmark` via vcpkg.
+Scoped runs:
 
 ```bash
-cmake --preset bench
-cmake --build build/bench
-./build/bench/tests/bench/abyss_bench
+ctest --preset default -L unit          # unit tier only
+ctest --preset default -L unit-hot      # one library's unit tests
+ctest --preset default -R '.*Recovery.*' # name regex
 ```
 
-## Test Infrastructure
+Sanitizers run in CI via dedicated presets (`asan`, `tsan`) with `jobs: 2` to avoid OOM under sanitizer memory inflation. They are not reliable on Apple Silicon locally; trust CI.
 
-### Mock Implementations
+Micro-benchmarks are not run via ctest. Build with the `bench` preset and run the binary directly.
 
-The `tests/support/` directory provides googlemock implementations of the core interfaces:
+## Principles
 
-- `MockQueue` — mock of `core::Queue`
-- `MockHotStore` — mock of `core::HotStore`
-- `MockColdStore` — mock of `core::ColdStore`
+**P1 — Every test is parallel-safe.** Tests never assume a specific port, PID, path, or execution order. Use `TempDir` for filesystem state and let the OS or kernel assign ports (`--port 0` on the server, discovered via stdout).
 
-These are linked via the `abyss::test_support` target. Any test binary can depend on it.
+**P2 — Tests own time.** Components that take a clock function inject `abyss::testing::TestClock` in tests. Real wall-clock sleeps are a code smell: they make tests slow, flaky, or both.
 
-### Parameterized Interface Tests
+**P3 — Events, not durations.** When waiting for an observable effect, wait for the signal (atomic flag, `std::future`, condition variable, `ConsumerRpc::PendingCount`) rather than sleeping for "long enough". The one legitimate exception is `TestServer::WaitForReady`, which polls the server's stdout for a single real external event.
 
-Each interface implementation (built-in and external) is tested via parameterized test suites. The same tests run against every implementation, ensuring behavioural equivalence. Tests are parameterized by implementation factory, not by concrete type.
+**P4 — Lifecycle is proportional.** Unit tests hold no external state. Integration tests use per-test temp dirs. System tests share a server across a suite when the test neither restarts nor asserts against server-wide baselines; otherwise `IsolatedServerTest` spawns a fresh server per test.
 
-## Unit Tests
+**P5 — Tier determines isolation.** The tier a test belongs to is determined by what it exercises, not where it's convenient to put it. A test that needs a RocksDB directory is integration, not unit. A test that binds a socket is system.
 
-### Core Types
-- `Result<T>` success and error paths
-- `RespValue` construction and type checking
-- `RespCommand` argument access
+## Tiers
 
-### RESP Parser
-- Protocol conformance vectors (valid RESP2 messages)
-- Malformed input handling (truncated, invalid type markers)
-- Bulk string with various lengths including zero and large
-- Array nesting
+| Tier | Exercises | Dependencies | Isolation | Target runtime |
+|------|-----------|--------------|-----------|----------------|
+| Unit | One class in isolation | Mocks, fakes | `::testing::Test` | < 1s total per binary |
+| Component | One subsystem wiring two or three classes | Mocks at subsystem boundaries | `::testing::Test` | < 5s total |
+| Integration | Real stores + queue; in-process | Per-test `TempDir` (RocksDB, WAL) | Ad-hoc fixture + `TempDir` | < 10s total |
+| System | `abyss-server` over TCP | Child process | `SystemTest` (shared) or `IsolatedServerTest` (per-test) | < 30s total |
+| Bench | Encode/hash micro-benchmarks | — | `google/benchmark` | Out of ctest |
+| Fuzz | Parser, format decoders | libFuzzer | Fuzz build | Out of ctest |
 
-### Queue / WAL
-- WAL entry round-trip: single arg, many args, large arg value, empty arg string, max sequence ID
-- WAL entry framing: length prefix, body CRC validation, back-to-back entries using `bytes_consumed` to advance
-- Crash recovery: truncation at length prefix, body, and CRC boundaries
-- Corruption detection: single-bit flip in body caught by CRC mismatch
-- Schema evolution: newer-minor entry with trailing body fields decoded correctly by older reader
-- Entry types: unknown `type` byte rejected as corruption
-- Segment header round-trip and fixed 32-byte size
-- Segment header rejects bad magic, bad header CRC, unsupported major version
-- Segment header accepts newer minor version
+The 30-second default `TIMEOUT` is a safety net for runaway tests, not a target. A component test that creeps toward 30s is a design problem to investigate.
 
-### Hot Store
-- SET/GET round-trip
-- Eviction timer refresh on read
-- LRU eviction under memory pressure
-- Absolute TTL expiry (distinct from eviction)
-- Concurrent read/write under sharded locks
+## Fixtures
 
-### Cold Store
-- Batch apply and read-back
-- Lazy TTL expiry on read
-- Active TTL expiry (sampling, adaptive rate)
+### Unit / component
 
-### Compaction Buffer
-- Scalar last-write-wins: SET overwrites SET, SET overwrites DEL
-- Set merge-accumulate: SADD/SREM interleaving produces correct net state
-- Sorted set merge: ZADD/ZREM, latest score wins for duplicate members
-- DEL resets all prior accumulated state
-- Buffer read returns current compacted state
+`::testing::Test` with mocks from `tests/support/`:
 
-### Flush Strategy
-- Quiet window detection: key goes quiet → flush triggers after threshold
-- Deadline flush: key written continuously → flush triggers before eviction deadline
-- Deadline jitter: flush times for keys with similar first_seen are spread across the jitter range
-- Memory pressure: buffer exceeds high-water mark → aggressive flush mode
+| Mock | Interface |
+|------|-----------|
+| `MockQueue` | `core::Queue` |
+| `MockHotStore` | `core::HotStore` |
+| `MockColdStore` | `core::ColdStore` |
 
-### Consumers
-- Hot consumer applies writes in sequence order
-- Hot consumer fulfils write promises after apply
-- Cold consumer drains queue into compaction buffer
-- Cold consumer flushes buffer entries to cold store
+Link via `abyss::test_support`. `TestClock` (also in `tests/support/`) provides `SteadyClockFn` and `WallClockFn` for components that accept injectable clocks.
 
-### Tiering Engine
-- Read routing: hot hit → returns from hot, refreshes eviction
-- Read routing: hot miss, buffer hit → returns from buffer, no promotion
-- Read routing: hot miss, buffer miss, cold hit → returns from cold, promotes via queue
-- Read routing: all miss → returns nil
-- Write routing: append to queue, register promise
+### Integration
 
-### Write Promise
-- Promise-based write ACK lifecycle
-- Timeout returns error, write remains durable
+No named base class. Declare a local fixture, allocate an `abyss::testing::TempDir` member, and hand its path to `WalQueue::Open` / `RocksdbStore::Create`. `TempDir` cleans up on destruction.
 
-### Shard Routing
-- xxHash consistency: same key always maps to same shard
-- Even distribution across shard range
+### System
 
-### Consumer Lag
-- Lag detection with synthetic clock
-- Warning and critical threshold transitions
+Two fixtures, in `tests/system/framework/server_fixture.h`:
 
-## Integration Tests
+| Fixture | When to use |
+|---------|-------------|
+| `SystemTest` | Stateless or data-path-only tests. `FLUSHALL` runs between tests; no restart. Derived `DataCommandTest` adds a probe that skips the test if data commands aren't wired yet. |
+| `IsolatedServerTest` | Anything that restarts the server, asserts metrics from a clean baseline, or tests durability across shutdown. Derived `IsolatedDataServerTest` adds the same probe. |
 
-- End-to-end: Redis client → Abyss → verify read-after-write
-- Recovery: write, kill, restart, verify all non-expired keys available
-- Cold consumer quiet window: write rapidly, stop, verify flush after threshold
-- Cold consumer deadline: write continuously, verify deadline flush fires
-- Cold consumer compaction: write same key 10K times, verify single cold write
-- Buffer reads: verify reads hit buffer for keys evicted from hot but not yet cold
-- WAL segment rotation: verify old segments cleaned up after ack
-- Profile switching: same suite against embedded, external, hybrid
-- Promotion: cold hit generates queue entry, hot consumer applies, key survives restart
-- Multi-key fan-out: MGET across hot/buffer/cold tiers
+`TestServer` spawns `abyss-server` via `fork + dup2 + execl`, pipes stdout, parses the `abyss-ready port=N` announcement line, and connects over loopback. Unix only; Windows is gated off at CMake.
 
-## Performance Tests
+### Known limitation
 
-- Sustained throughput at target ops/s for 1 hour
-- Cold consumer batching efficiency under various write rates
-- Recovery time vs queue depth
-- Memory stability over 24 hours
-- Hot-key workload: measure tail latency under lock contention
+`gtest_discover_tests` creates one CTest entry per test, so `SetUpTestSuite` fires once per binary invocation. Under CTest parallelism this means shared-server fixtures don't share across tests. The system tier uses `abyss_add_binary_test` instead — one CTest entry for the whole binary, so GoogleTest's per-suite lifecycle amortises server spawns across tests in the same class. If other tiers develop per-suite expensive setup, the same macro applies.
 
-### Micro-benchmarks
+## Fixture writing rules
 
-Lower-level encode/decode and hash routines live under `tests/bench/` and run via the `bench` preset. Currently covers:
-
-- `wal_entry_bench.cpp` — encode/decode throughput at 3 B, 1 KiB, and 64 KiB argument sizes
-
-## Chaos Tests
-
-- Kill pod mid-flush, verify recovery correctness
-- Kill pod during compaction buffer flush
-- Corrupt WAL segment, verify graceful skip to next valid segment
-- Fill cold store PVC, verify error propagation
-- Fill queue WAL PVC, verify error propagation
-- Slow disk on cold store, verify lag metrics and buffer growth
-- Memory pressure: push buffer past high-water, verify aggressive flush
+- No `sleep_for` except `TestServer::WaitForReady` polling the child process's stdout.
+- No hardcoded ports. Use `--port 0` and parse the port the OS picked.
+- No hardcoded paths. Use `TempDir`.
+- No `static` non-const state across tests.
+- Do not assume test ordering. `scheduleRandom: true` in the preset will surface leaks.
+- Prefer value-typed fixture members over `std::optional<T>` to avoid `bugprone-unchecked-optional-access` noise.

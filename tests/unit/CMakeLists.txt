@@ -2,12 +2,14 @@ add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
   core/consumer_rpc_test.cpp
+  core/fire_and_forget_test.cpp
   core/ops_test.cpp
   core/eviction_policy_test.cpp
+  core/queue_entry_test.cpp
+  core/shard_router_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
-  abyss::core
   abyss::test_support
   GTest::gtest_main
 )
@@ -46,9 +48,9 @@ target_link_libraries(abyss_resp_tests PRIVATE
 )
 
 add_executable(abyss_hot_tests
-  hot/shard_router_test.cpp
   hot/single_shard_store_test.cpp
   hot/sharded_hot_store_test.cpp
+  hot/eviction_worker_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE
@@ -88,6 +90,7 @@ add_executable(abyss_consumer_tests
 
 target_link_libraries(abyss_consumer_tests PRIVATE
   abyss::consumer
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )
@@ -110,6 +113,15 @@ target_link_libraries(abyss_config_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_support_tests
+  support/temp_dir_test.cpp
+)
+
+target_link_libraries(abyss_support_tests PRIVATE
+  abyss::test_support
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -117,3 +129,4 @@ abyss_discover_tests(abyss_hot_tests      "unit\;unit-hot")
 abyss_discover_tests(abyss_cold_tests     "unit\;unit-cold")
 abyss_discover_tests(abyss_consumer_tests "unit\;unit-consumer")
 abyss_discover_tests(abyss_config_tests   "unit\;unit-config")
+abyss_discover_tests(abyss_support_tests  "unit\;unit-support")

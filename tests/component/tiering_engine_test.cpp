@@ -2,7 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <future>
+#include <memory>
 #include <string>
+#include <thread>
 
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
@@ -17,6 +21,7 @@ namespace {
 
 using ::testing::_;
 using ::testing::Return;
+using namespace std::chrono_literals;
 
 class SingleBufferRouter : public consumer::CompactionBufferRouter {
  public:
@@ -40,11 +45,28 @@ class TieringEngineTest : public ::testing::Test {
   core::ConsumerRpc rpc_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr uint32_t kShardCount = 16;
+  static constexpr std::chrono::milliseconds kWriteTimeout = 1s;
 
-  TieringEngine MakeEngine() { return {queue_, hot_, cold_, router_, rpc_, kShardCount}; }
+  TieringEngine MakeEngine() {
+    return {
+        queue_, hot_,
+        cold_,  router_,
+        rpc_,   TieringEngineConfig{.shard_count = kShardCount, .write_timeout = kWriteTimeout}};
+  }
 
   core::RespCommand MakeCmd(std::initializer_list<std::string> args) {
     return core::RespCommand{.args = std::vector<std::string>(args)};
+  }
+
+  static queue::PendingAppend MakePending(core::SequenceId seq, bool fsync_ok) {
+    std::promise<core::Result<void>> p;
+    if (fsync_ok) {
+      p.set_value(core::Result<void>{});
+    } else {
+      p.set_value(std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync failed"}));
+    }
+    return queue::PendingAppend{seq, p.get_future(),
+                                std::make_unique<testing::NoopAppendPublisher>()};
   }
 };
 
@@ -131,30 +153,137 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
 
 // --- Write path ---
 
-TEST_F(TieringEngineTest, WriteAppendsToQueueAndReturnsOk) {
+TEST_F(TieringEngineTest, WriteSuccessReturnsConsumerResult) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(queue_, Append(_, _)).WillOnce([](core::ShardId, core::QueueEntry) {
-    std::promise<core::Result<void>> p;
-    p.set_value(core::Result<void>{});
-    return queue::AppendResult{.seq = 1, .durable = p.get_future()};
+  constexpr core::SequenceId kSeq = 42;
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
+
+  std::thread fulfiller([this]() {
+    while (rpc_.PendingCount() == 0) std::this_thread::yield();
+    EXPECT_TRUE(rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK")));
   });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  fulfiller.join();
+
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsSimpleString());
   EXPECT_EQ(result->AsString(), "OK");
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+TEST_F(TieringEngineTest, WriteConsumerErrorPropagates) {
+  auto engine = MakeEngine();
+
+  constexpr core::SequenceId kSeq = 43;
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
+
+  std::thread fulfiller([this]() {
+    while (rpc_.PendingCount() == 0) std::this_thread::yield();
+    EXPECT_TRUE(rpc_.Fulfill(kSeq, core::RespValue::Error(core::ErrorPrefix::kWrongType,
+                                                          "operation against wrong type")));
+  });
+
+  auto result = engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}));
+  fulfiller.join();
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsError());
+  EXPECT_EQ(result->AsString(), "WRONGTYPE operation against wrong type");
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
 }
 
 TEST_F(TieringEngineTest, WriteQueueFailureReturnsError) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(queue_, Append(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kResourceExhausted, "full"))));
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+TEST_F(TieringEngineTest, WriteFsyncFailureCancelsRpcAndPropagates) {
+  auto engine = MakeEngine();
+
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(99, false); });
+
+  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
+  TieringEngineConfig fast{.shard_count = kShardCount, .write_timeout = 50ms};
+  TieringEngine engine(queue_, hot_, cold_, router_, rpc_, fast);
+
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(100, true); });
+
+  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsError());
+  EXPECT_TRUE(result->AsString().starts_with("ERR "));
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+// C5: a slow durable wait must not leave the RPC wait starved. The guaranteed
+// min RPC budget is write_timeout * min_rpc_wait_fraction. Without C5, a
+// durable completion near the original deadline would give the RPC ~0 budget.
+TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
+  // Real-time test of deadline math. Timings chosen so durable fires past the
+  // T*(1-fraction) boundary where the floor actually extends the deadline,
+  // and with CI jitter margin at each step:
+  //   write_timeout=100ms, fraction=0.5
+  //   durable@75ms   — 25ms below T, 25ms above T*(1-f)=50ms
+  //   rpc@115ms      — 15ms past T, 10ms inside the extended floor 75+50=125ms
+  TieringEngineConfig cfg{
+      .shard_count = kShardCount,
+      .write_timeout = 100ms,
+      .min_rpc_wait_fraction = 0.5,
+  };
+  TieringEngine engine(queue_, hot_, cold_, router_, rpc_, cfg);
+
+  constexpr core::SequenceId kSeq = 201;
+  std::promise<core::Result<void>> durable_p;
+  auto durable_fut = durable_p.get_future();
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([&durable_fut](core::ShardId, core::QueueEntry) {
+        return queue::PendingAppend{kSeq, std::move(durable_fut),
+                                    std::make_unique<testing::NoopAppendPublisher>()};
+      });
+
+  std::thread durable_releaser([&durable_p]() {
+    std::this_thread::sleep_for(75ms);
+    durable_p.set_value(core::Result<void>{});
+  });
+  std::thread rpc_releaser([this]() {
+    std::this_thread::sleep_for(115ms);
+    // Fulfill either succeeds (promise is still pending) or fails because the
+    // RPC was cancelled on a timeout path — either way, no retry loop.
+    (void)rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK"));
+  });
+
+  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  durable_releaser.join();
+  rpc_releaser.join();
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsSimpleString());
+  EXPECT_EQ(result->AsString(), "OK");
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
 }
 
 }  // namespace

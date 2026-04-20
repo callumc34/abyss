@@ -82,6 +82,14 @@
       "configurePreset": "release"
     },
     {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
       "name": "bench",
       "configurePreset": "bench"
     },
@@ -100,6 +108,13 @@
       "configurePreset": "default",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 8,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 30,
+        "stopOnFailure": false
       }
     },
     {
@@ -107,6 +122,38 @@
       "configurePreset": "cloud-only",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 8,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 30
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 2,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 300
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 2,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 300
       }
     }
   ]

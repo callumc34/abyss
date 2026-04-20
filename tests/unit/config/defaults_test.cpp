@@ -12,6 +12,7 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.hot.backend, "builtin_hashmap");
   EXPECT_GT(defaults.hot.max_memory_bytes, 0U);
   EXPECT_GT(defaults.hot.default_eviction.count(), 0);
+  EXPECT_GT(defaults.hot.eviction_tick.count(), 0);
   EXPECT_TRUE(defaults.hot.eviction_overrides.empty());
 
   EXPECT_EQ(defaults.cold.backend, "builtin_rocksdb");
@@ -21,9 +22,21 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.queue.fsync_policy, "group_commit");
   EXPECT_GT(defaults.queue.group_commit_interval_us, 0U);
 
+  EXPECT_GT(defaults.hot_consumer.read_batch_size, 0U);
+  EXPECT_GT(defaults.hot_consumer.read_timeout.count(), 0);
+
   EXPECT_GT(defaults.cold_consumer.quiet_threshold.count(), 0);
-  EXPECT_GE(defaults.cold_consumer.deadline_jitter_ratio, 0.0);
-  EXPECT_LE(defaults.cold_consumer.deadline_jitter_ratio, 1.0);
+  // ADP-004 §Flush Machinery Design Decisions §3: default jitter_fraction = 0.1.
+  // Regression guard: C1 fixed a bug where the default was 0.5 (5× the
+  // documented value) due to a config-field-name mismatch.
+  EXPECT_DOUBLE_EQ(defaults.cold_consumer.jitter_fraction, 0.1);
+  EXPECT_GT(defaults.cold_consumer.buffer_high_water_bytes, 0U);
+  EXPECT_EQ(defaults.cold_consumer.buffer_low_water_bytes, 0U);  // auto
+  EXPECT_GT(defaults.cold_consumer.queue_read_max_count, 0U);
+  EXPECT_GT(defaults.cold_consumer.queue_read_timeout.count(), 0);
+  EXPECT_GE(defaults.cold_consumer.retry_initial_backoff.count(), 0);
+  EXPECT_GE(defaults.cold_consumer.retry_max_backoff.count(),
+            defaults.cold_consumer.retry_initial_backoff.count());
 
   EXPECT_GT(defaults.recovery.replay_parallelism, 0U);
   EXPECT_GT(defaults.recovery.hot_replay_batch_size, 0U);

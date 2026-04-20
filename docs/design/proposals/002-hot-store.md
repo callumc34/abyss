@@ -54,17 +54,20 @@ hot:
 
 ### Hot Consumer
 
-The hot consumer runs as a dedicated thread that tails the queue and applies writes to the hot store.
+The hot consumer runs as a dedicated thread **per shard owned by this pod**. Each thread tails its shard's queue partition and applies writes to the hot store. Phase 1 (single pod) owns every shard; Phase 2+ owns a subset; the per-shard ownership model is invariant across phases and migrates cleanly to a thread-per-core runtime in Phase 4. One consumer per shard matches how external brokers (Kafka, NATS) model partition consumption and keeps per-shard state independent — a stalled shard never blocks another.
 
 **Behaviour:**
-- Always at or near the head of the queue.
+- Always at or near the head of its shard's queue.
 - Applies writes immediately as they arrive via `HotStore::Apply`.
 - Sets the eviction duration on each key (from global default or per-prefix config).
 - Fulfils the write handler's promise after each successful apply, unblocking the client response. See [ADP-006](006-read-write-paths.md) for the write promise lifecycle.
+- Error policy: the consumer never wedges on a poison entry. Parse errors, `WRONGTYPE`, and similar apply-time failures flow to the client through the Consumer RPC fulfilment (`ErrorPrefix` routed appropriately); the entry is acked and the loop proceeds. Only a queue-shutdown signal exits.
 
 **Lag budget:** Effectively zero. The hot consumer must keep up with the write rate. If it falls behind, write latency increases because clients are awaiting their promises. This is self-regulating — rising latency naturally reduces write throughput via client backpressure.
 
 **Eviction refresh vs queue retention:** Read refreshes extend a key's life in the hot store indefinitely, but the key's queue entry is subject to normal retention (`min_retention_seconds`). If the pod crashes and the key has outlived its queue entry, it is lost from hot but present in cold (the cold consumer flushed it before the eviction deadline). The first read post-recovery hits cold, triggers a promotion (fresh queue entry), and the key returns to hot. Cost: one cold-path read per such key after recovery.
+
+**Eviction worker:** A dedicated maintenance thread (`hot::EvictionWorker`) periodically drains the per-shard access buffers (applying deferred timer refreshes from the last tick) and evicts keys whose eviction deadline has passed. The tick interval is operator-configurable (`hot.eviction_tick_ms`, default 1s). This is also the natural home for future LRU-under-memory-pressure enforcement.
 
 ### Configuration
 
@@ -73,12 +76,17 @@ hot:
   backend: builtin_hashmap
   max_memory_bytes: 4294967296        # 4 GiB
   default_eviction_seconds: 86400     # 24 hours
+  eviction_tick_ms: 1000              # EvictionWorker drain+evict interval
   eviction_policy: lru
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
     - prefix: "ephemeral:"
       eviction_seconds: 300
+
+hot_consumer:
+  read_batch_size: 256                # max queue entries per Read call
+  read_timeout_ms: 100                # bounds Stop() latency; loop wakes at this cadence
 ```
 
 ## Invariants

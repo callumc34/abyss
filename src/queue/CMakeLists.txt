@@ -10,6 +10,7 @@ add_library(abyss_queue
   file_offset_store.cpp
   segment_reaper.cpp
   shard_state.cpp
+  pending_append.cpp
 )
 add_library(abyss::queue ALIAS abyss_queue)
 

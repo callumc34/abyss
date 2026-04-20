@@ -9,9 +9,10 @@
 
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer.h"
+#include "abyss/consumer/hot_consumer_pool.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/engine/tiering_engine.h"
+#include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/wal_queue.h"
 
@@ -62,10 +63,11 @@ class Server {
 #ifdef ABYSS_HAVE_ROCKSDB
   std::unique_ptr<cold::backends::RocksdbStore> cold_store_;
 #endif
+  std::unique_ptr<hot::EvictionWorker> hot_eviction_worker_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
   std::unique_ptr<engine::TieringEngine> engine_;
-  std::unique_ptr<consumer::HotConsumer> hot_consumer_;
+  std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 
   socket_t listen_fd_ = kInvalidSocket;
   std::atomic<bool> ready_{false};

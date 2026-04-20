@@ -3,8 +3,6 @@
 #ifdef _WIN32
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
-#define CLOSE_SOCKET(s) closesocket(s)
-#define SHUTDOWN_RDWR SD_BOTH
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -12,8 +10,6 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#define CLOSE_SOCKET(s) close(s)
-#define SHUTDOWN_RDWR SHUT_RDWR
 #endif
 
 #include <cerrno>
@@ -28,6 +24,20 @@
 namespace abyss::server {
 
 namespace {
+
+inline int CloseSocket(socket_t s) {
+#ifdef _WIN32
+  return closesocket(s);
+#else
+  return close(s);
+#endif
+}
+
+#ifdef _WIN32
+constexpr int kShutdownRdwr = SD_BOTH;
+#else
+constexpr int kShutdownRdwr = SHUT_RDWR;
+#endif
 #ifdef _WIN32
 std::string GetSocketError() { return std::to_string(WSAGetLastError()); }
 bool IsSocketInterrupted() { return WSAGetLastError() == WSAEINTR; }
@@ -59,6 +69,7 @@ bool Server::Initialize() {
 
   hot_store_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = config_.hot.max_memory_bytes,
+      .shard_count = config_.hot.shard_count,
   });
 
   auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
@@ -90,7 +101,7 @@ bool Server::Initialize() {
   }
   queue_ = std::move(*queue_result);
 
-  consumer_rpc_ = std::make_unique<core::ConsumerRpc>();
+  consumer_rpc_ = std::make_unique<core::ConsumerRpc>(config_.consumer_rpc);
 
 #ifdef ABYSS_HAVE_ROCKSDB
   std::filesystem::create_directories(config_.cold.data_path, ec);
@@ -124,20 +135,48 @@ bool Server::Initialize() {
               consumer::ColdConsumer::Config{
                   .quiet_threshold = config_.cold_consumer.quiet_threshold,
                   .safety_margin = config_.cold_consumer.safety_margin,
-                  .jitter_fraction = config_.cold_consumer.deadline_jitter_ratio,
+                  .jitter_fraction = config_.cold_consumer.jitter_fraction,
                   .buffer_high_water_bytes = config_.cold_consumer.buffer_high_water_bytes,
+                  .buffer_low_water_bytes = config_.cold_consumer.buffer_low_water_bytes,
                   .max_flush_batch_size = config_.cold_consumer.max_flush_batch_size,
+                  .queue_read_max_count = config_.cold_consumer.queue_read_max_count,
+                  .queue_read_timeout = config_.cold_consumer.queue_read_timeout,
+                  .retry_initial_backoff = config_.cold_consumer.retry_initial_backoff,
+                  .retry_max_backoff = config_.cold_consumer.retry_max_backoff,
               },
       },
       eviction_policy);
 
-  engine_ = std::make_unique<engine::TieringEngine>(*queue_, *hot_store_, *cold_store_, *cold_pool_,
-                                                    *consumer_rpc_, hot_store_->shard_count());
+  engine_ = std::make_unique<engine::TieringEngine>(
+      *queue_, *hot_store_, *cold_store_, *cold_pool_, *consumer_rpc_,
+      engine::TieringEngineConfig{
+          .shard_count = hot_store_->shard_count(),
+          .write_timeout = config_.engine.write_timeout,
+          .min_rpc_wait_fraction = config_.engine.min_rpc_wait_fraction,
+      });
 
-  hot_consumer_ = std::make_unique<consumer::HotConsumer>(*queue_, *hot_store_, 0,
-                                                          config_.hot.default_eviction);
+  hot_pool_ = std::make_unique<consumer::HotConsumerPool>(
+      *queue_, *hot_store_, *consumer_rpc_,
+      consumer::HotConsumerPool::Config{
+          .shard_count = hot_store_->shard_count(),
+          .consumer =
+              consumer::HotConsumer::Config{
+                  .read_batch_size = config_.hot_consumer.read_batch_size,
+                  .read_timeout = config_.hot_consumer.read_timeout,
+              },
+      },
+      eviction_policy);
 
-  hot_consumer_->Start();
+  hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
+      *hot_store_,
+      hot::EvictionWorker::Config{
+          .tick = config_.hot.eviction_tick,
+          .default_eviction =
+              core::EvictionTTL{static_cast<uint64_t>(config_.hot.default_eviction.count())},
+      });
+  hot_eviction_worker_->Start();
+
+  hot_pool_->Start();
   cold_pool_->Start();
 #endif
 
@@ -166,14 +205,28 @@ bool Server::SetupListener() {
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
     std::cerr << "bind: " << GetSocketError() << "\n";
-    CLOSE_SOCKET(listen_fd_);
+    CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
     return false;
   }
 
+  sockaddr_in bound_addr{};
+#ifdef _WIN32
+  int bound_len = sizeof(bound_addr);
+#else
+  socklen_t bound_len = sizeof(bound_addr);
+#endif
+  if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound_addr), &bound_len) < 0) {
+    std::cerr << "getsockname: " << GetSocketError() << "\n";
+    CloseSocket(listen_fd_);
+    listen_fd_ = kInvalidSocket;
+    return false;
+  }
+  config_.resp.port = ntohs(bound_addr.sin_port);
+
   if (listen(listen_fd_, 128) < 0) {
     std::cerr << "listen: " << GetSocketError() << "\n";
-    CLOSE_SOCKET(listen_fd_);
+    CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
     return false;
   }
@@ -184,6 +237,8 @@ bool Server::SetupListener() {
 void Server::Run(const std::atomic<bool>& stop) {
   if (!SetupListener()) return;
 
+  std::cout << "abyss-ready bind=" << config_.resp.bind << " port=" << config_.resp.port << "\n"
+            << std::flush;
   std::cerr << "abyss v" << kVersion << " listening on " << config_.resp.bind << ":"
             << config_.resp.port << "\n";
 
@@ -230,7 +285,7 @@ void Server::Run(const std::atomic<bool>& stop) {
     {
       std::lock_guard lock(connections_mutex_);
       if (connections_.size() >= config_.resp.max_connections) {
-        CLOSE_SOCKET(client_fd);
+        CloseSocket(client_fd);
         continue;
       }
 
@@ -289,7 +344,7 @@ void Server::HandleConnection(socket_t client_fd, std::atomic<bool>& finished) {
     if (result.close_requested) break;
   }
 
-  CLOSE_SOCKET(client_fd);
+  CloseSocket(client_fd);
   finished.store(true, std::memory_order_release);
 }
 
@@ -310,7 +365,7 @@ void Server::Shutdown() {
   if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
   if (listen_fd_ != kInvalidSocket) {
-    CLOSE_SOCKET(listen_fd_);
+    CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
   }
 
@@ -318,7 +373,7 @@ void Server::Shutdown() {
     std::lock_guard lock(connections_mutex_);
     for (auto& conn : connections_) {
       if (!conn->finished.load(std::memory_order_acquire)) {
-        ::shutdown(conn->fd, SHUTDOWN_RDWR);
+        ::shutdown(conn->fd, kShutdownRdwr);
       }
     }
   }
@@ -334,7 +389,8 @@ void Server::Shutdown() {
   }
 
   if (cold_pool_) cold_pool_->Stop();
-  if (hot_consumer_) hot_consumer_->Stop();
+  if (hot_pool_) hot_pool_->Stop();
+  if (hot_eviction_worker_) hot_eviction_worker_->Stop();
 
 #ifdef _WIN32
   WSACleanup();

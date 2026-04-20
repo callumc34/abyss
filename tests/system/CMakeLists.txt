@@ -8,6 +8,7 @@ target_include_directories(abyss_system_test_framework PUBLIC
 )
 
 target_link_libraries(abyss_system_test_framework PUBLIC
+  abyss::test_support
   GTest::gtest
 )
 
@@ -16,7 +17,7 @@ target_compile_definitions(abyss_system_test_framework PRIVATE
 )
 
 add_executable(abyss_system_tests
-  acceptance_test.cpp
+  commands_test.cpp
   protocol_test.cpp
   tiering_test.cpp
   durability_test.cpp
@@ -30,4 +31,4 @@ target_link_libraries(abyss_system_tests PRIVATE
 
 add_dependencies(abyss_system_tests abyss-server)
 
-abyss_discover_tests(abyss_system_tests "system")
+abyss_add_binary_test(abyss_system_tests "system")

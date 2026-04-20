@@ -1,14 +1,5 @@
-// Scaffolds the #71 acceptance test: "Redis client SETs 1000 keys, all
-// receive OK, kill the pod, restart, GET all 1000 keys — every key that
-// received OK is present."
-//
-// Here we verify the WAL layer's half: after a child process writes a known
-// number of durable entries (each fsynced via kPerWrite) and then _exit()s
-// mid-way through an un-fsynced batch, the parent reopens the WAL and reads
-// back exactly the durable entries — no gaps, no partial batches, no
-// spurious extras.
-//
-// End-to-end coverage via RESP waits for the Server to land (#42).
+// Verifies WAL durability across a kill -9: fsynced entries survive, the
+// mid-batch un-fsynced ones don't, no partial batches.
 
 #include <gtest/gtest.h>
 #include <sys/wait.h>

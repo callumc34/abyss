@@ -87,7 +87,7 @@ core::Result<std::vector<std::byte>> ReadAll(const std::string& path) {
 }
 
 core::Result<void> FsyncDir(const std::string& dir) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
   const int fd = ::open(dir.c_str(), O_RDONLY);
   if (fd < 0) return std::unexpected(IoError("open dir"));
   if (::fsync(fd) < 0) {
@@ -136,11 +136,7 @@ std::optional<core::SequenceId> FileOffsetStore::Get(core::ConsumerId consumer,
 
 core::Result<void> FileOffsetStore::Set(core::ConsumerId consumer, core::ShardId shard,
                                         core::SequenceId seq) {
-  // The shard-per-core execution model guarantees a (consumer, shard) pair is
-  // only written by one thread at a time, so the shard file itself has no
-  // cross-thread writer contention. The in-memory cache is still shared by
-  // reader threads querying arbitrary (consumer, shard) keys, so we guard it
-  // for the in-memory update only.
+  // (consumer, shard) has one writer; only the shared cache needs locking.
   {
     const std::scoped_lock lock(mu_);
     offsets_[consumer][shard] = seq;
@@ -268,7 +264,7 @@ core::Result<void> FileOffsetStore::WriteShardFile(core::ConsumerId consumer, co
   binary::WriteU32LE(buf, crc);
 
   const auto tmp = ShardTempPath(consumer, shard);
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
   const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) return std::unexpected(IoError("open tmp"));
 

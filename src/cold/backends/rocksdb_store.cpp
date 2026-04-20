@@ -241,7 +241,7 @@ struct RocksdbStore::Impl {
   // Generic prefix scan.
   template <typename Fn>
   core::Result<void> ScanPrefix(rocksdb::WriteBatchWithIndex* wb, rocksdb::ColumnFamilyHandle* cf,
-                                std::string_view prefix, Fn&& fn) const;
+                                std::string_view prefix, const Fn& fn) const;
 };
 
 // --- Factory & lifecycle ----------------------------------------------------
@@ -356,6 +356,33 @@ core::Result<void> RocksdbStore::Compact() {
     return std::unexpected(FromStatus(status, "Compact (zset_score_idx)"));
   }
   return {};
+}
+
+core::Result<std::optional<core::RespCommand>> RocksdbStore::GetPromotionCommand(
+    std::string_view key) {
+  // Strings only for now; collection promotion is additive here.
+  const auto encoded_key = fmt::EncodeStringKey(key);
+  std::string raw;
+  auto status = impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded_key, &raw);
+  if (status.IsNotFound()) return std::optional<core::RespCommand>{};
+  if (!status.ok()) return std::unexpected(FromStatus(status, "GetPromotionCommand"));
+
+  auto decoded = fmt::DecodeStringValue(raw);
+  if (!decoded.has_value()) return std::unexpected(decoded.error());
+  if (fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, impl_->NowMs())) {
+    return std::optional<core::RespCommand>{};
+  }
+
+  core::RespCommand cmd;
+  cmd.args.reserve(5);
+  cmd.args.emplace_back("SET");
+  cmd.args.emplace_back(key);
+  cmd.args.emplace_back(decoded->payload);
+  if ((decoded->flags & fmt::kFlagHasTtl) != 0) {
+    cmd.args.emplace_back("PXAT");
+    cmd.args.emplace_back(std::to_string(decoded->abs_ttl_ms));
+  }
+  return std::optional<core::RespCommand>{std::move(cmd)};
 }
 
 // --- Dispatch ---------------------------------------------------------------
@@ -557,6 +584,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetRange& o
   }
 
   std::vector<RespValue> out;
+  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   int64_t offset = std::max<int64_t>(op.offset, 0);
   int64_t count = op.count;
   auto end = static_cast<int64_t>(ordered.size());
@@ -1045,7 +1073,7 @@ core::Result<bool> RocksdbStore::Impl::AnyLiveRecord(std::string_view key) const
 template <typename Fn>
 core::Result<void> RocksdbStore::Impl::ScanPrefix(rocksdb::WriteBatchWithIndex* wb,
                                                   rocksdb::ColumnFamilyHandle* cf,
-                                                  std::string_view prefix, Fn&& fn) const {
+                                                  std::string_view prefix, const Fn& fn) const {
   std::string upper_storage = LexicographicSuccessor(prefix);
   rocksdb::Slice upper_slice(upper_storage);
   rocksdb::ReadOptions ro;
@@ -1064,7 +1092,7 @@ core::Result<void> RocksdbStore::Impl::ScanPrefix(rocksdb::WriteBatchWithIndex* 
   for (it->Seek(ToSlice(prefix)); it->Valid(); it->Next()) {
     auto k = ToSv(it->key());
     if (!k.starts_with(prefix)) break;
-    auto cont = std::forward<Fn>(fn)(k, ToSv(it->value()));
+    auto cont = fn(k, ToSv(it->value()));
     if (!cont.has_value()) return std::unexpected(cont.error());
     if (!*cont) break;
   }

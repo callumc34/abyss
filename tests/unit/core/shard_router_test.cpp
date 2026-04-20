@@ -1,4 +1,4 @@
-#include "abyss/hot/shard_router.h"
+#include "abyss/core/shard_router.h"
 
 #include <gtest/gtest.h>
 
@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace abyss::hot {
+namespace abyss::core {
 namespace {
 
 TEST(ShardRouterTest, ConsistentForSameKey) {
@@ -18,7 +18,7 @@ TEST(ShardRouterTest, ConsistentForSameKey) {
 
 TEST(ShardRouterTest, DeterministicKnownValue) {
   auto shard = ComputeShard("hello", 64);
-  EXPECT_LT(shard, 64u);
+  EXPECT_LT(shard, 64U);
   auto shard2 = ComputeShard("hello", 64);
   EXPECT_EQ(shard, shard2);
 }
@@ -27,7 +27,7 @@ TEST(ShardRouterTest, ResultWithinRange) {
   for (int i = 0; i < 1000; ++i) {
     auto key = "key:" + std::to_string(i);
     auto shard = ComputeShard(key, 64);
-    EXPECT_LT(shard, 64u);
+    EXPECT_LT(shard, 64U);
   }
 }
 
@@ -52,26 +52,26 @@ TEST(ShardRouterTest, ReasonableDistribution) {
 
 TEST(ShardRouterTest, EmptyKey) {
   auto shard = ComputeShard("", 64);
-  EXPECT_LT(shard, 64u);
+  EXPECT_LT(shard, 64U);
 }
 
 TEST(ShardRouterTest, SingleByteKeys) {
   for (int c = 0; c < 256; ++c) {
     std::string key(1, static_cast<char>(c));
     auto shard = ComputeShard(key, 64);
-    EXPECT_LT(shard, 64u);
+    EXPECT_LT(shard, 64U);
   }
 }
 
 TEST(ShardRouterTest, LargeKey) {
   std::string key(65536, 'x');
   auto shard = ComputeShard(key, 64);
-  EXPECT_LT(shard, 64u);
+  EXPECT_LT(shard, 64U);
 }
 
 TEST(ShardRouterTest, ShardCountOne) {
-  EXPECT_EQ(ComputeShard("any_key", 1), 0u);
-  EXPECT_EQ(ComputeShard("another", 1), 0u);
+  EXPECT_EQ(ComputeShard("any_key", 1), 0U);
+  EXPECT_EQ(ComputeShard("another", 1), 0U);
 }
 
 TEST(ShardRouterTest, ShardCountTwo) {
@@ -79,7 +79,7 @@ TEST(ShardRouterTest, ShardCountTwo) {
   bool seen_one = false;
   for (int i = 0; i < 100; ++i) {
     auto shard = ComputeShard("key:" + std::to_string(i), 2);
-    EXPECT_LT(shard, 2u);
+    EXPECT_LT(shard, 2U);
     if (shard == 0) seen_zero = true;
     if (shard == 1) seen_one = true;
   }
@@ -88,12 +88,13 @@ TEST(ShardRouterTest, ShardCountTwo) {
 }
 
 TEST(ShardRouterTest, BinaryKeyWithNullBytes) {
-  std::string key = "hello\0world";
+  using namespace std::string_literals;
+  auto key = "hello\0world"s;  // string-literal suffix preserves embedded NUL
   key.push_back('\0');
   key += "more";
-  auto shard = ComputeShard(key, 64);
-  EXPECT_LT(shard, 64u);
+  auto shard = ComputeShard(key, 64U);
+  EXPECT_LT(shard, 64U);
 }
 
 }  // namespace
-}  // namespace abyss::hot
+}  // namespace abyss::core

@@ -1,7 +1,5 @@
 #include "abyss/consumer/flush_strategy.h"
 
-#include <algorithm>
-
 namespace abyss::consumer {
 
 FlushStrategy::FlushStrategy(std::chrono::seconds quiet_threshold,
@@ -10,11 +8,13 @@ FlushStrategy::FlushStrategy(std::chrono::seconds quiet_threshold,
       safety_margin_(safety_margin),
       jitter_fraction_(jitter_fraction) {}
 
-core::SteadyTime FlushStrategy::NextFlushTime(const BufferEntry& entry,
-                                              core::EvictionTTL eviction) const {
-  auto quiet_deadline = entry.last_modified + quiet_threshold_;
-  auto eviction_deadline = entry.first_seen + eviction - safety_margin_;
-  return std::min(quiet_deadline, eviction_deadline);
+NextFlush FlushStrategy::NextFlushTime(const BufferEntry& entry, core::EvictionTTL eviction) const {
+  const auto quiet_deadline = entry.last_modified + quiet_threshold_;
+  const auto eviction_deadline = entry.first_seen + eviction - safety_margin_;
+  if (quiet_deadline <= eviction_deadline) {
+    return {quiet_deadline, FlushTrigger::kQuiet};
+  }
+  return {eviction_deadline, FlushTrigger::kDeadline};
 }
 
 std::chrono::milliseconds FlushStrategy::MaxJitter() const {

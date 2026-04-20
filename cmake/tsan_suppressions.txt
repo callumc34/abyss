@@ -1,0 +1,14 @@
+# ThreadSanitizer suppressions for the abyss test binaries.
+#
+# Entries match any frame in the race's stack. Prefer narrow patterns so that
+# genuine races in our own code remain visible.
+
+# RocksDB's default memtable uses a lock-free skiplist for concurrent reads and
+# writes. The algorithm is correct by construction (release-sequence reasoning
+# on skiplist links) but TSAN cannot prove the invariants and flags the raw
+# memory accesses. This is a long-standing, well-known RocksDB+TSAN issue:
+# https://github.com/facebook/rocksdb/wiki/ThreadSanitizer
+#
+# Our usage (concurrent Get + Delete, concurrent Get + WriteBatch) is within
+# RocksDB's supported thread-safety contract.
+race:rocksdb::

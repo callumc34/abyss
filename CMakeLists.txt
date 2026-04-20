@@ -26,6 +26,16 @@ option(ABYSS_WERROR "Treat warnings as errors" OFF)
 option(ABYSS_STRICT_WARNINGS "Enable additional warning flags" OFF)
 option(ABYSS_WITH_ROCKSDB "Build the built-in RocksDB cold store backend" ON)
 option(ABYSS_BUILD_FUZZ "Build libFuzzer fuzz targets" OFF)
+option(ABYSS_USE_CCACHE "Use ccache as compiler launcher if available" ON)
+
+if(ABYSS_USE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
+  endif()
+endif()
 
 find_package(Crc32c CONFIG REQUIRED)
 set_package_properties(Crc32c PROPERTIES
@@ -75,6 +85,7 @@ add_feature_info(StrictWarnings  ABYSS_STRICT_WARNINGS  "Enable additional compi
 add_feature_info(Werror          ABYSS_WERROR           "Treat compiler warnings as errors")
 add_feature_info(WithRocksDB     ABYSS_WITH_ROCKSDB     "Build the built-in RocksDB cold store backend")
 add_feature_info(BuildFuzz       ABYSS_BUILD_FUZZ       "Build libFuzzer fuzz targets")
+add_feature_info(UseCcache       ABYSS_USE_CCACHE       "Use ccache as compiler launcher if available")
 
 configure_file(
   cmake/version.h.in

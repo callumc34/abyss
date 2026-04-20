@@ -4,8 +4,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -15,8 +13,8 @@
 #include "abyss/core/cold_store.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
-#include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/consumer_metrics.h"
 
 namespace abyss::consumer {
 
@@ -33,7 +31,7 @@ class ColdConsumer {
     std::chrono::milliseconds queue_read_timeout{50};
     std::chrono::milliseconds retry_initial_backoff{50};
     std::chrono::milliseconds retry_max_backoff{30000};
-    std::optional<uint64_t> rng_seed;
+    std::optional<uint64_t> rng_seed = std::nullopt;
   };
 
   enum class Mode : uint8_t { kNormal = 0, kAggressive = 1 };
@@ -49,8 +47,10 @@ class ColdConsumer {
     uint64_t ops_flushed = 0;
     uint64_t entries_dropped_abs_ttl = 0;
     uint64_t apply_failures = 0;
+    uint64_t apply_poisoned = 0;
     uint64_t retry_attempts = 0;
     uint64_t parse_failures = 0;
+    uint64_t queue_read_failures = 0;
     core::SequenceId last_ack_seq = 0;
     core::SequenceId latest_drained_seq = 0;
     uint32_t mode_transitions = 0;
@@ -67,7 +67,18 @@ class ColdConsumer {
   ColdConsumer& operator=(ColdConsumer&&) = delete;
 
   void Start();
+
+  // Signal the worker to exit. Non-blocking; the thread wakes from its next
+  // queue Read (bounded by config.queue_read_timeout) and returns.
+  void RequestStop();
+
+  // Wait for the worker thread. Must be preceded by RequestStop.
+  void Join();
+
+  // RequestStop + Join. Pools owning many consumers should call the split
+  // pair to avoid O(N * queue_read_timeout) serial teardown.
   void Stop();
+
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
   CompactionBuffer& Buffer() { return buffer_; }
@@ -81,10 +92,10 @@ class ColdConsumer {
   bool Flush();
 
   Metrics Snapshot() const;
-  Mode CurrentMode() const;
+  Mode CurrentMode() const { return mode_.load(std::memory_order_acquire); }
 
  private:
-  void RunLoop(std::atomic<bool>& keep_running);
+  void RunLoop();
 
   bool AbsorbQueueEntry(const core::QueueEntry& entry);
 
@@ -97,7 +108,7 @@ class ColdConsumer {
 
   bool AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const;
   size_t LowWaterBytes() const;
-  void UpdateMode(size_t current_bytes) ABYSS_REQUIRES(metrics_mutex_);
+  void UpdateMode(size_t current_bytes);
   void TryAdvanceAck();
 
   core::Queue& queue_;
@@ -110,16 +121,23 @@ class ColdConsumer {
   FlushStrategy strategy_;
   CompactionBuffer buffer_;
 
-  std::atomic<bool> running_{false};
   std::atomic<bool> stop_requested_{false};
-  std::unique_ptr<std::thread> thread_;
+  std::atomic<bool> running_{false};
+  std::thread thread_;
 
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   std::atomic<core::SequenceId> last_ack_seq_{0};
 
-  mutable std::mutex metrics_mutex_;
-  Metrics metrics_ ABYSS_GUARDED_BY(metrics_mutex_);
-  Mode mode_ ABYSS_GUARDED_BY(metrics_mutex_) = Mode::kNormal;
+  metrics::ConsumerCounters counters_;
+  std::atomic<uint64_t> retry_attempts_{0};
+  std::atomic<uint64_t> apply_poisoned_{0};
+  std::atomic<uint64_t> flushes_quiet_{0};
+  std::atomic<uint64_t> flushes_deadline_{0};
+  std::atomic<uint64_t> flushes_aggressive_{0};
+  std::atomic<uint64_t> ops_flushed_{0};
+  std::atomic<uint64_t> entries_dropped_abs_ttl_{0};
+  std::atomic<uint32_t> mode_transitions_{0};
+  std::atomic<Mode> mode_{Mode::kNormal};
 };
 
 }  // namespace abyss::consumer

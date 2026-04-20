@@ -12,6 +12,8 @@ set(ABYSS_GCC_CLANG_WARNINGS
   -Wall
   -Wextra
   -Wpedantic
+  # GCC warns on C++20 designated init with omitted class-type members; Clang doesn't.
+  -Wno-missing-field-initializers
 )
 
 set(ABYSS_MSVC_WARNINGS
@@ -20,7 +22,7 @@ set(ABYSS_MSVC_WARNINGS
 )
 
 target_compile_options(abyss_compiler_options INTERFACE
-  $<$<CXX_COMPILER_ID:GNU,Clang>:${ABYSS_GCC_CLANG_WARNINGS}>
+  $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:${ABYSS_GCC_CLANG_WARNINGS}>
   $<$<CXX_COMPILER_ID:MSVC>:${ABYSS_MSVC_WARNINGS}>
 )
 
@@ -58,14 +60,14 @@ if(ABYSS_STRICT_WARNINGS)
     /w14906
   )
   target_compile_options(abyss_compiler_options INTERFACE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:${ABYSS_GCC_CLANG_STRICT}>
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:${ABYSS_GCC_CLANG_STRICT}>
     $<$<CXX_COMPILER_ID:MSVC>:${ABYSS_MSVC_STRICT}>
   )
 endif()
 
 if(ABYSS_WERROR)
   target_compile_options(abyss_compiler_options INTERFACE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Werror>
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Werror>
     $<$<CXX_COMPILER_ID:MSVC>:/WX>
   )
 endif()

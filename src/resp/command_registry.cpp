@@ -115,6 +115,7 @@ bool ArityMatches(const CommandSpec& spec, size_t arg_count) {
 
 }  // namespace
 
+// NOLINTNEXTLINE(modernize-use-equals-default)
 CommandRegistry::CommandRegistry() {
   by_name_.reserve(kCommandTable.size());
   for (const auto& spec : kCommandTable) {

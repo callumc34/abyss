@@ -4,8 +4,9 @@
 
 #include <chrono>
 #include <string>
-#include <thread>
 #include <vector>
+
+#include "test_clock.h"
 
 namespace abyss::hot {
 namespace {
@@ -14,8 +15,14 @@ using namespace std::chrono_literals;
 
 class SingleShardStoreTest : public ::testing::Test {
  protected:
-  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
-  SingleShardStore store_{SingleShardConfig{.max_memory_bytes = 1024UL * 1024}};
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  abyss::testing::TestClock clock_;
+  SingleShardStore store_{SingleShardConfig{
+      .max_memory_bytes = 1024UL * 1024,
+      .steady_clock = clock_.SteadyFn(),
+      .wall_clock = clock_.WallFn(),
+  }};
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr core::EvictionTTL kEviction{86400};
 
   void SetString(std::string_view key, std::string_view value, uint64_t ttl_ms = 0) {
@@ -319,11 +326,11 @@ TEST_F(SingleShardStoreTest, EvictExpiredRemovesOldKeys) {
   auto short_eviction = core::EvictionTTL{1};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
-  auto before = store_.EvictExpired(core::SteadyClock::now());
+  auto before = store_.EvictExpired(clock_.SteadyNow());
   EXPECT_EQ(before, 0U);
 
-  std::this_thread::sleep_for(1100ms);
-  auto after = store_.EvictExpired(core::SteadyClock::now());
+  clock_.Advance(1100ms);
+  auto after = store_.EvictExpired(clock_.SteadyNow());
   EXPECT_EQ(after, 1U);
 
   auto result = GetString("k");
@@ -335,17 +342,17 @@ TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
   auto short_eviction = core::EvictionTTL{1};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
-  std::this_thread::sleep_for(500ms);
-  store_.RefreshAccess("k", core::SteadyClock::now(), short_eviction);
+  clock_.Advance(500ms);
+  store_.RefreshAccess("k", clock_.SteadyNow(), short_eviction);
 
-  std::this_thread::sleep_for(700ms);
-  auto evicted = store_.EvictExpired(core::SteadyClock::now());
+  clock_.Advance(700ms);
+  auto evicted = store_.EvictExpired(clock_.SteadyNow());
   EXPECT_EQ(evicted, 0U);
 }
 
 TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {
   SetString("old", std::string(512, 'x'));
-  store_.RefreshAccess("old", core::SteadyClock::now() - 100s, kEviction);
+  store_.RefreshAccess("old", clock_.SteadyNow() - 100s, kEviction);
 
   SetString("new", std::string(512, 'y'));
 
@@ -363,11 +370,10 @@ TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {
 // --- TTL ---
 
 TEST_F(SingleShardStoreTest, TtlExpiredKeyNotFound) {
-  auto past_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                     core::WallClock::now().time_since_epoch())
-                     .count() -
-                 1000;
-  SetString("k", "v", static_cast<uint64_t>(past_ms));
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  SetString("k", "v", static_cast<uint64_t>(now_ms - 1000));
 
   auto result = GetString("k");
   EXPECT_FALSE(result.has_value());
@@ -375,11 +381,10 @@ TEST_F(SingleShardStoreTest, TtlExpiredKeyNotFound) {
 }
 
 TEST_F(SingleShardStoreTest, TtlFutureKeyFound) {
-  auto future_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                       core::WallClock::now().time_since_epoch())
-                       .count() +
-                   60000;
-  SetString("k", "v", static_cast<uint64_t>(future_ms));
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  SetString("k", "v", static_cast<uint64_t>(now_ms + 60000));
 
   auto result = GetString("k");
   ASSERT_TRUE(result.has_value());

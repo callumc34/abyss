@@ -43,6 +43,33 @@ core::Result<std::vector<core::SequenceId>> EnumerateSegmentBaseSeqs(const std::
   return result;
 }
 
+class ShardStatePublisher final : public AppendPublisher {
+ public:
+  ShardStatePublisher(std::condition_variable& cv, std::unique_lock<std::mutex> lock,
+                      std::function<void()> on_rotate, bool rotated) noexcept
+      : cv_(cv), lock_(std::move(lock)), on_rotate_(std::move(on_rotate)), rotated_(rotated) {}
+
+  void Publish() noexcept override {
+    if (!lock_.owns_lock()) return;
+    cv_.notify_all();
+    lock_.unlock();
+    if (rotated_ && on_rotate_) {
+      // Swallow: on_rotate is contractually noexcept; don't terminate from
+      // the handle's destructor path.
+      try {
+        on_rotate_();
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+  }
+
+ private:
+  std::condition_variable& cv_;
+  std::unique_lock<std::mutex> lock_;
+  std::function<void()> on_rotate_;
+  bool rotated_ = false;
+};
+
 }  // namespace
 
 core::Result<std::unique_ptr<ShardState>> ShardState::Open(ShardStateConfig config) {
@@ -192,110 +219,114 @@ core::Result<void> ShardState::Rotate() {
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
-core::Result<AppendResult> ShardState::Append(core::QueueEntry entry) {
+core::Result<PendingAppend> ShardState::BeginAppend(core::QueueEntry entry) {
+  std::unique_lock lock(append_mu_);
+  if (shutting_down_) {
+    return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
+  }
+
+  entry.seq = next_seq_;
+
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, entry.seq, buf);
+
+  if (buf.size() > config_.segment_size_bytes - kSegmentHeaderSize) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "entry exceeds segment capacity"});
+  }
+
   bool rotated = false;
-  core::SequenceId seq = 0;
-  DurabilityFuture future;
-  {
-    std::unique_lock lock(append_mu_);
-    if (shutting_down_) {
-      return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
-    }
-
-    entry.seq = next_seq_;
-
-    // Encode once. The bytes are handed to the active segment's AppendEncoded.
-    std::vector<std::byte> buf;
-    EncodeWalEntry(entry, entry.seq, buf);
-
-    if (buf.size() > config_.segment_size_bytes - kSegmentHeaderSize) {
-      return std::unexpected(
-          core::Error{core::ErrorCode::kInvalidArgument, "entry exceeds segment capacity"});
-    }
-
-    if (active_->SpaceRemaining() < buf.size()) {
-      auto r = Rotate();
-      if (!r.has_value()) return std::unexpected(r.error());
-      rotated = true;
-    }
-
-    auto written = active_->AppendEncoded(buf, entry.seq);
-    if (!written.has_value()) return std::unexpected(written.error());
-    next_seq_ = entry.seq + 1;
-
-    seq = entry.seq;
-    read_cv_.notify_all();
-    future = committer_->Submit(*written);
+  if (active_->SpaceRemaining() < buf.size()) {
+    auto r = Rotate();
+    if (!r.has_value()) return std::unexpected(r.error());
+    rotated = true;
   }
 
-  if (rotated && config_.on_rotate) {
-    config_.on_rotate();
-  }
-  return AppendResult{.seq = seq, .durable = std::move(future)};
+  auto written = active_->AppendEncoded(buf, entry.seq);
+  if (!written.has_value()) return std::unexpected(written.error());
+  next_seq_ = entry.seq + 1;
+
+  const core::SequenceId seq = entry.seq;
+  DurabilityFuture future = committer_->Submit(*written);
+
+  auto publisher =
+      std::make_unique<ShardStatePublisher>(read_cv_, std::move(lock), config_.on_rotate, rotated);
+  return PendingAppend{seq, std::move(future), std::move(publisher)};
 }
 
-core::Result<AppendBatchResult> ShardState::AppendBatch(std::span<const core::QueueEntry> entries) {
+core::Result<PendingBatchAppend> ShardState::BeginAppendBatch(
+    std::span<const core::QueueEntry> entries) {
   if (entries.empty()) {
     return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument, "empty batch"});
   }
 
+  std::unique_lock lock(append_mu_);
+  if (shutting_down_) {
+    return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
+  }
+
+  std::vector<core::QueueEntry> owned(entries.begin(), entries.end());
+  for (size_t i = 0; i < owned.size(); ++i) {
+    owned[i].seq = next_seq_ + i;
+  }
+  const core::SequenceId first_seq = owned.front().seq;
+  const core::SequenceId last_seq = owned.back().seq;
+
+  std::vector<std::vector<std::byte>> encoded;
+  encoded.reserve(owned.size());
+  size_t total_bytes = 0;
+  for (const auto& entry : owned) {
+    std::vector<std::byte> buf;
+    EncodeWalEntry(entry, last_seq, buf);
+    total_bytes += buf.size();
+    encoded.push_back(std::move(buf));
+  }
+
+  const size_t capacity = config_.segment_size_bytes - kSegmentHeaderSize;
+  if (total_bytes > capacity) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "batch exceeds segment capacity"});
+  }
+
   bool rotated = false;
-  core::SequenceId first_seq = 0;
-  core::SequenceId last_seq = 0;
-  DurabilityFuture future;
-  {
-    std::unique_lock lock(append_mu_);
-    if (shutting_down_) {
-      return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
-    }
-
-    std::vector<core::QueueEntry> owned(entries.begin(), entries.end());
-    for (size_t i = 0; i < owned.size(); ++i) {
-      owned[i].seq = next_seq_ + i;
-    }
-    first_seq = owned.front().seq;
-    last_seq = owned.back().seq;
-
-    // Encode every entry once.
-    std::vector<std::vector<std::byte>> encoded;
-    encoded.reserve(owned.size());
-    size_t total_bytes = 0;
-    for (const auto& entry : owned) {
-      std::vector<std::byte> buf;
-      EncodeWalEntry(entry, last_seq, buf);
-      total_bytes += buf.size();
-      encoded.push_back(std::move(buf));
-    }
-
-    const size_t capacity = config_.segment_size_bytes - kSegmentHeaderSize;
-    if (total_bytes > capacity) {
-      return std::unexpected(
-          core::Error{core::ErrorCode::kInvalidArgument, "batch exceeds segment capacity"});
-    }
-
-    if (active_->SpaceRemaining() < total_bytes) {
-      auto r = Rotate();
-      if (!r.has_value()) return std::unexpected(r.error());
-      rotated = true;
-    }
-
-    size_t written_bytes = 0;
-    for (size_t i = 0; i < owned.size(); ++i) {
-      auto w = active_->AppendEncoded(encoded[i], owned[i].seq);
-      if (!w.has_value()) return std::unexpected(w.error());
-      written_bytes += *w;
-      next_seq_ = owned[i].seq + 1;
-    }
-
-    read_cv_.notify_all();
-    future = committer_->Submit(written_bytes);
+  if (active_->SpaceRemaining() < total_bytes) {
+    auto r = Rotate();
+    if (!r.has_value()) return std::unexpected(r.error());
+    rotated = true;
   }
 
-  if (rotated && config_.on_rotate) {
-    config_.on_rotate();
+  size_t written_bytes = 0;
+  for (size_t i = 0; i < owned.size(); ++i) {
+    auto w = active_->AppendEncoded(encoded[i], owned[i].seq);
+    if (!w.has_value()) return std::unexpected(w.error());
+    written_bytes += *w;
+    next_seq_ = owned[i].seq + 1;
   }
-  return AppendBatchResult{
-      .first_seq = first_seq, .last_seq = last_seq, .durable = std::move(future)};
+
+  DurabilityFuture future = committer_->Submit(written_bytes);
+
+  auto publisher =
+      std::make_unique<ShardStatePublisher>(read_cv_, std::move(lock), config_.on_rotate, rotated);
+  return PendingBatchAppend{first_seq, last_seq, std::move(future), std::move(publisher)};
+}
+
+core::Result<AppendResult> ShardState::Append(core::QueueEntry entry) {
+  auto pending = BeginAppend(std::move(entry));
+  if (!pending.has_value()) return std::unexpected(pending.error());
+  const core::SequenceId seq = pending->seq();
+  DurabilityFuture durable = std::move(pending->durable());
+  pending->Publish();
+  return AppendResult{.seq = seq, .durable = std::move(durable)};
+}
+
+core::Result<AppendBatchResult> ShardState::AppendBatch(std::span<const core::QueueEntry> entries) {
+  auto pending = BeginAppendBatch(entries);
+  if (!pending.has_value()) return std::unexpected(pending.error());
+  const core::SequenceId first = pending->first_seq();
+  const core::SequenceId last = pending->last_seq();
+  DurabilityFuture durable = std::move(pending->durable());
+  pending->Publish();
+  return AppendBatchResult{.first_seq = first, .last_seq = last, .durable = std::move(durable)};
 }
 
 core::Result<std::vector<core::QueueEntry>> ShardState::Read(core::SequenceId from_seq,

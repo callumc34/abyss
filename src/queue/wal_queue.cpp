@@ -6,6 +6,7 @@
 #include <sstream>
 #include <utility>
 
+#include "abyss/core/fire_and_forget.h"
 #include "abyss/queue/file_offset_store.h"
 #include "shard_state.h"
 
@@ -95,7 +96,8 @@ core::Result<void> WalQueue::Initialize() {
 
 void WalQueue::RunReaper() {
   if (!reaper_) return;
-  [[maybe_unused]] auto ignored = reaper_->RunOnce();
+  // Reaper runs on a timer; record failures rather than let them go silent.
+  core::FireAndForget(reaper_->RunOnce(), reaper_failures_);
 }
 
 core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
@@ -104,6 +106,17 @@ core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
                                        "shard " + std::to_string(shard) + " out of range"});
   }
   return {};
+}
+
+core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->BeginAppend(std::move(entry));
+}
+
+core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
+    core::ShardId shard, std::span<const core::QueueEntry> entries) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->BeginAppendBatch(entries);
 }
 
 core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry) {

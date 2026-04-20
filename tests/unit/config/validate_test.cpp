@@ -13,10 +13,18 @@ TEST(ConfigValidate, RejectsUnknownProfile) {
   EXPECT_NE(cfg.error().message().find("profile"), std::string::npos);
 }
 
-TEST(ConfigValidate, RejectsZeroPort) {
+TEST(ConfigValidate, AcceptsZeroRespPortAsEphemeral) {
+  // resp.port == 0 is a valid request for a kernel-assigned ephemeral port.
+  // The server reports the bound port on its stdout ready line.
   auto cfg = Config::ParseFromYaml("resp:\n  port: 0\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->resp.port, 0);
+}
+
+TEST(ConfigValidate, RejectsZeroMetricsPort) {
+  auto cfg = Config::ParseFromYaml("metrics:\n  port: 0\n");
   ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("resp.port"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("metrics.port"), std::string::npos);
 }
 
 TEST(ConfigValidate, RejectsPortAboveSixteenBit) {
@@ -31,16 +39,66 @@ TEST(ConfigValidate, RejectsZeroMaxMemory) {
   EXPECT_NE(cfg.error().message().find("hot.max_memory_bytes"), std::string::npos);
 }
 
-TEST(ConfigValidate, RejectsNegativeJitterRatio) {
-  auto cfg = Config::ParseFromYaml("cold_consumer:\n  deadline_jitter_ratio: -0.1\n");
+TEST(ConfigValidate, RejectsNonPositiveHotEvictionTick) {
+  auto cfg = Config::ParseFromYaml("hot:\n  eviction_tick_ms: 0\n");
   ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("deadline_jitter_ratio"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("hot.eviction_tick_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsNegativeJitterRatio) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  jitter_fraction: -0.1\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("jitter_fraction"), std::string::npos);
 }
 
 TEST(ConfigValidate, RejectsJitterRatioAboveOne) {
-  auto cfg = Config::ParseFromYaml("cold_consumer:\n  deadline_jitter_ratio: 1.5\n");
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  jitter_fraction: 1.5\n");
   ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("deadline_jitter_ratio"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("jitter_fraction"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroHotConsumerBatchSize) {
+  auto cfg = Config::ParseFromYaml("hot_consumer:\n  read_batch_size: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("hot_consumer.read_batch_size"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsNonPositiveHotConsumerReadTimeout) {
+  auto cfg = Config::ParseFromYaml("hot_consumer:\n  read_timeout_ms: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("hot_consumer.read_timeout_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsColdConsumerLowWaterAboveHigh) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+cold_consumer:
+  buffer_high_water_bytes: 1000
+  buffer_low_water_bytes: 2000
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("buffer_low_water_bytes"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroColdConsumerQueueReadMaxCount) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  queue_read_max_count: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("cold_consumer.queue_read_max_count"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsNonPositiveColdConsumerQueueReadTimeout) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  queue_read_timeout_ms: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("cold_consumer.queue_read_timeout_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsColdConsumerInitialBackoffAboveMax) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+cold_consumer:
+  retry_initial_backoff_ms: 1000
+  retry_max_backoff_ms: 500
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("retry_initial_backoff"), std::string::npos);
 }
 
 TEST(ConfigValidate, RejectsUnknownFsyncPolicy) {
@@ -115,7 +173,7 @@ metrics:
 }
 
 TEST(ConfigValidate, ErrorIncludesLineAndColumn) {
-  auto cfg = Config::ParseFromYaml("resp:\n  port: 0\n");
+  auto cfg = Config::ParseFromYaml("resp:\n  port: 70000\n");
   ASSERT_FALSE(cfg.has_value());
   // "line 2:9" is not guaranteed stable across yaml-cpp versions, so just
   // check that a "line" annotation is attached when available.

@@ -12,7 +12,9 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/queue_entry.h"
+#include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
 #include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/group_commit.h"
@@ -156,11 +158,10 @@ TEST_F(WalQueueTest, ReadBlocksOnTimeout) {
   EXPECT_GE(elapsed, 40ms);
 }
 
-TEST_F(WalQueueTest, ReadWakesOnAppend) {
+TEST_F(WalQueueTest, ReadReturnsFastWhenAppendRacesWithRead) {
   OpenWith(DefaultConfig());
 
   std::thread producer([this] {
-    std::this_thread::sleep_for(20ms);
     auto r = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
     ASSERT_TRUE(r.has_value());
   });
@@ -353,6 +354,7 @@ TEST_F(WalQueueTest, MissingMiddleSegmentRejectedAsCorruption) {
   }
   std::ranges::sort(seg_paths);
   ASSERT_GE(seg_paths.size(), 3U);
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)
   std::filesystem::remove(seg_paths[seg_paths.size() / 2]);
 
   auto result = WalQueue::Open(cfg);
@@ -550,6 +552,108 @@ TEST_F(WalQueueTest, ActiveSegmentNeverDeleted) {
   auto read = queue_->Read(core::kHotConsumer, 0, 10, 10ms);
   ASSERT_TRUE(read.has_value());
   EXPECT_TRUE(read->empty());  // all ack'd already.
+}
+
+TEST_F(WalQueueTest, BeginAppendPublishMakesEntryVisible) {
+  OpenWith(DefaultConfig());
+
+  auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "k", "v"}));
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(pending->seq(), 0U);
+
+  pending->Publish();
+  ASSERT_TRUE(pending->durable().get().has_value());
+
+  auto read = queue_->Read(core::kHotConsumer, 0, 10, 100ms);
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->size(), 1U);
+  EXPECT_EQ(read->front().seq, 0U);
+}
+
+// Auto-publish on drop: forgetting Publish() is a latency bug, not data loss.
+TEST_F(WalQueueTest, DroppingPendingAppendAutoPublishes) {
+  OpenWith(DefaultConfig());
+
+  DurabilityFuture durable_future;
+  core::SequenceId seq = 0;
+  {
+    auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "k", "v"}));
+    ASSERT_TRUE(pending.has_value());
+    seq = pending->seq();
+    durable_future = std::move(pending->durable());
+    // No Publish() — destructor runs as the scope ends.
+  }
+
+  ASSERT_TRUE(durable_future.get().has_value());
+  auto read = queue_->Read(core::kHotConsumer, 0, 10, 100ms);
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->size(), 1U);
+  EXPECT_EQ(read->front().seq, seq);
+}
+
+TEST_F(WalQueueTest, BeginAppendBatchPublishMakesEntriesVisible) {
+  OpenWith(DefaultConfig());
+
+  std::vector<core::QueueEntry> batch;
+  batch.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    batch.push_back(MakeWrite({"SET", "k", std::to_string(i)}));
+  }
+
+  auto pending = queue_->BeginAppendBatch(0, batch);
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(pending->first_seq(), 0U);
+  EXPECT_EQ(pending->last_seq(), 2U);
+  EXPECT_EQ(pending->size(), 3U);
+  EXPECT_EQ(pending->seq_at(1), 1U);
+
+  pending->Publish();
+  ASSERT_TRUE(pending->durable().get().has_value());
+
+  auto read = queue_->Read(core::kHotConsumer, 0, 10, 100ms);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->size(), 3U);
+}
+
+// Hangs or fails if Publish ever became visible to readers before Register.
+TEST_F(WalQueueTest, TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace) {
+  OpenWith(DefaultConfig());
+  core::ConsumerRpc rpc;
+
+  constexpr int kWrites = 500;
+  std::atomic<bool> stop_consumer{false};
+
+  std::thread consumer([&]() {
+    core::SequenceId next = 0;
+    auto drain = [&]() -> bool {
+      auto read = queue_->Read(core::kHotConsumer, 0, 32, 10ms);
+      if (!read.has_value() || read->empty()) return false;
+      for (auto& e : *read) {
+        EXPECT_EQ(e.seq, next++);
+        rpc.Fulfill(e.seq, core::RespValue::SimpleString("OK"));
+        [[maybe_unused]] auto ack = queue_->Ack(core::kHotConsumer, 0, e.seq);
+      }
+      return true;
+    };
+    while (!stop_consumer.load(std::memory_order_acquire)) (void)drain();
+    while (drain()) {
+    }
+  });
+
+  for (int i = 0; i < kWrites; ++i) {
+    auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "k", std::to_string(i)}));
+    ASSERT_TRUE(pending.has_value());
+    auto future = rpc.Register(pending->seq());
+    pending->Publish();
+
+    ASSERT_TRUE(pending->durable().get().has_value());
+    auto value = future.get();
+    EXPECT_TRUE(value.IsSimpleString());
+  }
+
+  stop_consumer.store(true, std::memory_order_release);
+  consumer.join();
+  EXPECT_EQ(rpc.PendingCount(), 0U);
 }
 
 TEST_F(WalQueueTest, AppendBatchCrashMidBatchLosesWholeBatch) {

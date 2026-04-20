@@ -7,13 +7,18 @@
 
 namespace abyss::consumer {
 
+struct NextFlush {
+  core::SteadyTime time;
+  FlushTrigger trigger = FlushTrigger::kQuiet;
+};
+
 class FlushStrategy {
  public:
   FlushStrategy() = default;
   FlushStrategy(std::chrono::seconds quiet_threshold, std::chrono::seconds safety_margin,
                 double jitter_fraction = 0.1);
 
-  core::SteadyTime NextFlushTime(const BufferEntry& entry, core::EvictionTTL eviction) const;
+  NextFlush NextFlushTime(const BufferEntry& entry, core::EvictionTTL eviction) const;
   std::chrono::milliseconds MaxJitter() const;
 
  private:

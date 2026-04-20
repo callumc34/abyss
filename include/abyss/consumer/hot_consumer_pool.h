@@ -1,0 +1,44 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include "abyss/consumer/hot_consumer.h"
+#include "abyss/core/consumer_rpc.h"
+#include "abyss/core/eviction_policy.h"
+#include "abyss/core/hot_store.h"
+#include "abyss/core/queue.h"
+#include "abyss/core/types.h"
+
+namespace abyss::consumer {
+
+class HotConsumerPool {
+ public:
+  struct Config {
+    uint32_t shard_count = 0;
+    HotConsumer::Config consumer;
+  };
+
+  HotConsumerPool(core::Queue& queue, core::HotStore& hot_store, core::ConsumerRpc& rpc,
+                  Config config, const core::EvictionPolicy& eviction_policy);
+  ~HotConsumerPool();
+  HotConsumerPool(const HotConsumerPool&) = delete;
+  HotConsumerPool& operator=(const HotConsumerPool&) = delete;
+  HotConsumerPool(HotConsumerPool&&) = delete;
+  HotConsumerPool& operator=(HotConsumerPool&&) = delete;
+
+  void Start();
+  void Stop();
+  bool IsRunning() const;
+
+  uint32_t ShardCount() const { return static_cast<uint32_t>(consumers_.size()); }
+
+  HotConsumer& ConsumerFor(core::ShardId shard) { return *consumers_[shard]; }
+  const HotConsumer& ConsumerFor(core::ShardId shard) const { return *consumers_[shard]; }
+
+ private:
+  std::vector<std::unique_ptr<HotConsumer>> consumers_;
+};
+
+}  // namespace abyss::consumer

@@ -4,8 +4,8 @@
 #include <utility>
 
 #include "abyss/core/ops.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/thread_annotations.h"
-#include "abyss/hot/shard_router.h"
 
 namespace abyss::hot {
 
@@ -24,7 +24,7 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(config)
 ShardedHotStore::~ShardedHotStore() = default;
 
 ShardedHotStore::Shard& ShardedHotStore::ShardFor(std::string_view key) {
-  return *shards_[ComputeShard(key, config_.shard_count)];
+  return *shards_[core::ComputeShard(key, config_.shard_count)];
 }
 
 core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op)
@@ -57,7 +57,7 @@ core::Result<core::RespValue> ShardedHotStore::ExecMultiStringGet(
 
   std::map<uint32_t, std::vector<size_t>> shard_indices;
   for (size_t i = 0; i < op.keys.size(); ++i) {
-    auto shard_id = ComputeShard(op.keys[i], config_.shard_count);
+    auto shard_id = core::ComputeShard(op.keys[i], config_.shard_count);
     shard_indices[shard_id].push_back(i);
   }
 
@@ -83,7 +83,7 @@ core::Result<core::RespValue> ShardedHotStore::ExecExists(const core::ops::Exist
 
   std::map<uint32_t, std::vector<std::string_view>> shard_keys;
   for (auto key : op.keys) {
-    auto shard_id = ComputeShard(key, config_.shard_count);
+    auto shard_id = core::ComputeShard(key, config_.shard_count);
     shard_keys[shard_id].push_back(key);
   }
 
@@ -122,7 +122,7 @@ core::Result<void> ShardedHotStore::Apply(const core::ops::WriteOp& op, core::Ev
 core::Result<void> ShardedHotStore::ApplyDel(const core::ops::Del& op) {
   std::map<uint32_t, std::vector<std::string_view>> shard_keys;
   for (auto key : op.keys) {
-    auto shard_id = ComputeShard(key, config_.shard_count);
+    auto shard_id = core::ComputeShard(key, config_.shard_count);
     shard_keys[shard_id].push_back(key);
   }
 
@@ -140,7 +140,7 @@ core::Result<void> ShardedHotStore::ApplyMultiStringSet(const core::ops::MultiSt
                                                         core::EvictionTTL eviction) {
   std::map<uint32_t, std::vector<const core::ops::MultiStringSet::Entry*>> shard_entries;
   for (const auto& entry : op.entries) {
-    auto shard_id = ComputeShard(entry.key, config_.shard_count);
+    auto shard_id = core::ComputeShard(entry.key, config_.shard_count);
     shard_entries[shard_id].push_back(&entry);
   }
 

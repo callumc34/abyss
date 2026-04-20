@@ -60,7 +60,7 @@ flush_priority = min(
 )
 ```
 
-Where `jitter` is a per-key random offset in the range `[0, safety_margin * 0.5]`, computed once when the entry enters the buffer and stable across priority queue reorderings.
+Where `jitter` is a per-key random offset in the range `[0, quiet_threshold * jitter_fraction]`, computed once when the entry enters the buffer and stable across priority queue reorderings. See "Flush Machinery Design Decisions §3" below for the defaults and rationale.
 
 ### Consumer Thread Loop
 
@@ -123,15 +123,30 @@ cold_consumer_queue_lag = hot_consumer_seq - cold_consumer_seq
 
 Where `cold_consumer_seq` reflects the latest entry read into the buffer, not the latest entry flushed to cold.
 
+The two flush-trigger counters are a leading indicator of buffer churn:
+
+```
+deadline_ratio = flushes_deadline / (flushes_quiet + flushes_deadline)
+
+WARN if deadline_ratio > 0.1 over a 5-minute window
+```
+
+A healthy workload should flush via the quiet trigger the vast majority of the time. A rising deadline ratio means keys are being rewritten too frequently for the quiet window to elapse, so the buffer is holding entries longer than necessary and the cold gap is creeping toward the eviction deadline.
+
 ### Configuration
 
 ```yaml
 cold_consumer:
   quiet_threshold_seconds: 30
   safety_margin_seconds: 300
-  deadline_jitter_ratio: 0.5
-  buffer_high_water_bytes: 536870912  # 512 MiB
+  jitter_fraction: 0.1
+  buffer_high_water_bytes: 536870912    # 512 MiB
+  buffer_low_water_bytes: 0             # 0 = auto, 3/4 of high_water
   max_flush_batch_size: 10000
+  queue_read_max_count: 1024
+  queue_read_timeout_ms: 50
+  retry_initial_backoff_ms: 50
+  retry_max_backoff_ms: 30000
 ```
 
 ## Invariants

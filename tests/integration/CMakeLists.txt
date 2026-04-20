@@ -2,15 +2,12 @@ add_executable(abyss_integration_tests
   tiering_integration_test.cpp
 )
 
-target_include_directories(abyss_integration_tests PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
 target_link_libraries(abyss_integration_tests PRIVATE
   abyss::engine
   abyss::consumer
   abyss::hot
   abyss::cold
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )

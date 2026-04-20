@@ -17,11 +17,8 @@ struct FileOffsetStoreConfig {
   std::string directory;
 };
 
-// Durable OffsetStore. Each (consumer, shard) pair has its own file under
-// `{directory}/{consumer_id}/{shard_id:020d}.offset`, holding a single
-// sequence-id record. This layout keeps per-shard acks free of cross-shard
-// coordination so a shard-per-core execution model doesn't funnel every ack
-// through a shared file or mutex.
+// Durable OffsetStore with one file per (consumer, shard) pair to avoid
+// cross-shard coordination.
 class FileOffsetStore : public OffsetStore {
  public:
   static core::Result<std::unique_ptr<FileOffsetStore>> Open(FileOffsetStoreConfig config);

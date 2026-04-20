@@ -15,6 +15,7 @@
 #include "abyss/core/types.h"
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/group_commit.h"
+#include "abyss/queue/pending_append.h"
 #include "abyss/queue/segment_registry.h"
 #include "segment.h"
 
@@ -39,6 +40,9 @@ class ShardState {
   ShardState& operator=(const ShardState&) = delete;
   ShardState(ShardState&&) = delete;
   ShardState& operator=(ShardState&&) = delete;
+
+  core::Result<PendingAppend> BeginAppend(core::QueueEntry entry);
+  core::Result<PendingBatchAppend> BeginAppendBatch(std::span<const core::QueueEntry> entries);
 
   core::Result<AppendResult> Append(core::QueueEntry entry);
   core::Result<AppendBatchResult> AppendBatch(std::span<const core::QueueEntry> entries);
