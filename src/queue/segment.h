@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -51,12 +52,13 @@ class Segment {
   const std::string& path() const { return path_; }
   const SegmentHeader& header() const { return header_; }
   core::SequenceId base_seq() const { return header_.base_seq; }
-  core::SequenceId next_seq() const { return next_seq_; }
-  size_t write_offset() const { return write_offset_; }
+  core::SequenceId next_seq() const { return next_seq_.load(std::memory_order_acquire); }
+  size_t write_offset() const { return write_offset_.load(std::memory_order_acquire); }
   size_t max_size() const { return max_size_; }
   size_t entry_count() const { return entry_count_; }
   size_t SpaceRemaining() const {
-    return max_size_ > write_offset_ ? max_size_ - write_offset_ : 0;
+    const size_t offset = write_offset_.load(std::memory_order_acquire);
+    return max_size_ > offset ? max_size_ - offset : 0;
   }
   int fd() const { return fd_; }
 
@@ -68,8 +70,11 @@ class Segment {
   SegmentHeader header_;
   size_t max_size_;
   int fd_ = -1;
-  size_t write_offset_ = 0;
-  core::SequenceId next_seq_ = 0;
+  // Mutated in AppendEncoded under the owning ShardState's append_mu_; read by
+  // consumers without that lock via ReadEntries/ReadEntriesFrom. Acquire/release
+  // synchronises the published watermark with the preceding pwrite.
+  std::atomic<size_t> write_offset_{0};
+  std::atomic<core::SequenceId> next_seq_{0};
   size_t entry_count_ = 0;
   bool sealed_ = false;
 };

@@ -78,8 +78,8 @@ Segment::Segment(Segment&& other) noexcept
       header_(other.header_),
       max_size_(other.max_size_),
       fd_(other.fd_),
-      write_offset_(other.write_offset_),
-      next_seq_(other.next_seq_),
+      write_offset_(other.write_offset_.load(std::memory_order_relaxed)),
+      next_seq_(other.next_seq_.load(std::memory_order_relaxed)),
       entry_count_(other.entry_count_),
       sealed_(other.sealed_) {
   other.fd_ = -1;
@@ -94,8 +94,9 @@ Segment& Segment::operator=(Segment&& other) noexcept {
     header_ = other.header_;
     max_size_ = other.max_size_;
     fd_ = other.fd_;
-    write_offset_ = other.write_offset_;
-    next_seq_ = other.next_seq_;
+    write_offset_.store(other.write_offset_.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+    next_seq_.store(other.next_seq_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     entry_count_ = other.entry_count_;
     sealed_ = other.sealed_;
     other.fd_ = -1;
@@ -174,7 +175,7 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
     std::span<const std::byte> view(data.data(), *data_read);
     size_t cursor_offset = 0;
     size_t durable_offset = 0;
-    core::SequenceId pending_next_seq = header->base_seq;
+    core::SequenceId pending_next_seq = 0;
     size_t pending_entry_count = 0;
 
     while (!view.empty()) {
@@ -225,22 +226,24 @@ core::Result<size_t> Segment::AppendEncoded(std::span<const std::byte> bytes,
     return std::unexpected(
         core::Error{core::ErrorCode::kInvalidArgument, "append on sealed segment"});
   }
-  if (entry_seq != next_seq_) {
+  const core::SequenceId current_next_seq = next_seq_.load(std::memory_order_relaxed);
+  if (entry_seq != current_next_seq) {
     return std::unexpected(core::Error{
         core::ErrorCode::kInvalidArgument,
-        "expected seq " + std::to_string(next_seq_) + ", got " + std::to_string(entry_seq)});
+        "expected seq " + std::to_string(current_next_seq) + ", got " + std::to_string(entry_seq)});
   }
-  if (write_offset_ + bytes.size() > max_size_) {
+  const size_t current_offset = write_offset_.load(std::memory_order_relaxed);
+  if (current_offset + bytes.size() > max_size_) {
     return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "segment full"});
   }
 
-  auto wr = FullPwrite(fd_, bytes.data(), bytes.size(), static_cast<off_t>(write_offset_));
+  auto wr = FullPwrite(fd_, bytes.data(), bytes.size(), static_cast<off_t>(current_offset));
   if (!wr.has_value()) {
     return std::unexpected(wr.error());
   }
 
-  write_offset_ += bytes.size();
-  next_seq_ = entry_seq + 1;
+  write_offset_.store(current_offset + bytes.size(), std::memory_order_release);
+  next_seq_.store(entry_seq + 1, std::memory_order_release);
   entry_count_++;
   return bytes.size();
 }
@@ -260,7 +263,8 @@ core::Result<void> Segment::Seal() {
   if (fd_ < 0) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "seal on closed segment"});
   }
-  if (::ftruncate(fd_, static_cast<off_t>(write_offset_)) < 0) {
+  const size_t offset = write_offset_.load(std::memory_order_relaxed);
+  if (::ftruncate(fd_, static_cast<off_t>(offset)) < 0) {
     return std::unexpected(IoError("ftruncate"));
   }
   if (::fsync(fd_) < 0) {
@@ -271,7 +275,8 @@ core::Result<void> Segment::Seal() {
 }
 
 core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_t max_count) const {
-  if (file_offset < kSegmentHeaderSize || file_offset > write_offset_) {
+  const size_t end = write_offset_.load(std::memory_order_acquire);
+  if (file_offset < kSegmentHeaderSize || file_offset > end) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInvalidArgument, "file_offset out of range"});
   }
@@ -279,14 +284,14 @@ core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_
   ReadResult result;  // NOLINT(misc-const-correctness)
   result.next_offset = file_offset;
 
-  if (file_offset == write_offset_ || max_count == 0) {
+  if (file_offset == end || max_count == 0) {
     return result;
   }
 
   size_t cursor = file_offset;
 
-  while (result.entries.size() < max_count && cursor < write_offset_) {
-    const size_t remaining = write_offset_ - cursor;
+  while (result.entries.size() < max_count && cursor < end) {
+    const size_t remaining = end - cursor;
     const size_t to_read = std::min(remaining, kReadChunkSize);
 
     std::vector<std::byte> buf(to_read);
@@ -340,8 +345,11 @@ core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_
 
 core::Result<Segment::ReadResult> Segment::ReadEntriesFrom(core::SequenceId seq,
                                                            size_t max_count) const {
-  if (seq >= next_seq_) {
-    return ReadResult{.entries = {}, .next_offset = write_offset_};
+  const core::SequenceId end_seq = next_seq_.load(std::memory_order_acquire);
+  const size_t end_offset = write_offset_.load(std::memory_order_acquire);
+
+  if (seq >= end_seq) {
+    return ReadResult{.entries = {}, .next_offset = end_offset};
   }
   if (seq <= header_.base_seq) {
     return ReadEntries(kSegmentHeaderSize, max_count);
@@ -351,7 +359,7 @@ core::Result<Segment::ReadResult> Segment::ReadEntriesFrom(core::SequenceId seq,
   size_t skipped = 0;
   size_t offset = kSegmentHeaderSize;
 
-  while (skipped < skip_count && offset < write_offset_) {
+  while (skipped < skip_count && offset < end_offset) {
     const size_t batch = std::min(skip_count - skipped, static_cast<size_t>(1024));
     auto read = ReadEntries(offset, batch);
     if (!read.has_value()) return std::unexpected(read.error());

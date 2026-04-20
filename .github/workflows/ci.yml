@@ -112,7 +112,7 @@ jobs:
         run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-          TSAN_OPTIONS: halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:suppressions=${{ github.workspace }}/cmake/tsan_suppressions.txt
 
   docker:
     name: Docker
