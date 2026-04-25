@@ -1,0 +1,41 @@
+name: Build & Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,readwrite"
+
+jobs:
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v4
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_owner: ${{ github.repository_owner }}
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: default
+          max-size: 500M
+
+      - name: Configure
+        run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
+
+      - name: Build
+        run: cmake --build build/default --parallel
+
+      - name: Test
+        run: ctest --preset default
