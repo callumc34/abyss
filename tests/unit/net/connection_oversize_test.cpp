@@ -71,17 +71,14 @@ TEST(ConnectionOversizeTest, ClosesOnReadBufferOverflow) {
     const ssize_t n = ::send(pair.client, blob.data() + off, blob.size() - off, 0);
     if (n > 0) {
       off += static_cast<size_t>(n);
-      conn.OnReadable();
-      if (conn.IsClosed()) break;
       continue;
     }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-      conn.OnReadable();
-      if (conn.IsClosed()) break;
-      continue;
-    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+    if (n < 0 && errno == EINTR) continue;
     FAIL() << "send failed: " << std::strerror(errno);
   }
+
+  for (int i = 0; i < 8 && !conn.IsClosed(); ++i) conn.OnReadable();
 
   ASSERT_TRUE(conn.IsClosed());
   ASSERT_TRUE(conn.CloseReasonValue().has_value());
