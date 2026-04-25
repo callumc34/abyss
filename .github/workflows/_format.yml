@@ -1,0 +1,28 @@
+name: Format
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v6
+
+      - name: Install clang-format-19
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm-19.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format-19
+
+      - name: Check formatting
+        run: git ls-files '*.cpp' '*.h' | xargs clang-format-19 --dry-run --Werror

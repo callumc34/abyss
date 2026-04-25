@@ -1,5 +1,13 @@
 name: Setup Abyss Build Environment
-description: Install compiler and bootstrap vcpkg at the manifest baseline.
+description: Install compiler and mono, bootstrap vcpkg at the manifest baseline, and wire up the GitHub Packages NuGet feed as the vcpkg binary cache.
+
+inputs:
+  github_token:
+    description: GITHUB_TOKEN with packages:write to authenticate with the NuGet feed.
+    required: true
+  github_owner:
+    description: Repository owner whose GitHub Packages NuGet feed hosts the vcpkg binary cache.
+    required: true
 
 runs:
   using: composite
@@ -8,7 +16,9 @@ runs:
       shell: bash
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq cmake gcc-14 g++-14 ninja-build
+        sudo apt-get install -y -qq \
+          cmake gcc-14 g++-14 ninja-build \
+          mono-complete ca-certificates-mono
         echo "CC=/usr/bin/gcc-14" >> "${GITHUB_ENV}"
         echo "CXX=/usr/bin/g++-14" >> "${GITHUB_ENV}"
 
@@ -22,3 +32,20 @@ runs:
         git -C /opt/vcpkg checkout FETCH_HEAD
         /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
         echo "VCPKG_ROOT=/opt/vcpkg" >> "${GITHUB_ENV}"
+
+    - name: Configure GitHub Packages NuGet feed
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        GITHUB_OWNER: ${{ inputs.github_owner }}
+      run: |
+        set -eu
+        NUGET="$(/opt/vcpkg/vcpkg fetch nuget | tail -n1)"
+        FEED="https://nuget.pkg.github.com/${GITHUB_OWNER}/index.json"
+        mono "${NUGET}" sources add \
+          -Source "${FEED}" \
+          -StorePasswordInClearText \
+          -Name GitHub \
+          -Username "${GITHUB_OWNER}" \
+          -Password "${GITHUB_TOKEN}"
+        mono "${NUGET}" setapikey "${GITHUB_TOKEN}" -Source "${FEED}"
