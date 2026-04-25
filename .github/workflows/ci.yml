@@ -8,16 +8,22 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,readwrite"
 
 jobs:
   format:
     name: Format
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - name: Checkout commit
         uses: actions/checkout@v4
@@ -38,22 +44,15 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
       - name: Checkout commit
         uses: actions/checkout@v4
 
       - name: Set up build environment
         uses: ./.github/actions/setup-build
-
-      - name: Export GitHub Actions cache env for vcpkg
-        uses: actions/github-script@v7
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_owner: ${{ github.repository_owner }}
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -75,8 +74,6 @@ jobs:
     needs: build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     strategy:
       fail-fast: false
       matrix:
@@ -87,14 +84,9 @@ jobs:
 
       - name: Set up build environment
         uses: ./.github/actions/setup-build
-
-      - name: Export GitHub Actions cache env for vcpkg
-        uses: actions/github-script@v7
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_owner: ${{ github.repository_owner }}
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -147,14 +139,6 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Export GitHub Actions cache env for vcpkg
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
       - name: Extract vcpkg baseline
         id: vcpkg
         run: |
@@ -172,9 +156,8 @@ jobs:
           build-args: |
             CI_REQUIRE_BINARY_CACHE=1
             VCPKG_BASELINE=${{ steps.vcpkg.outputs.baseline }}
+            NUGET_FEED_OWNER=${{ github.repository_owner }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max,ignore-error=true
           secrets: |
-            actions_cache_url=${{ env.ACTIONS_CACHE_URL }}
-            actions_results_url=${{ env.ACTIONS_RESULTS_URL }}
-            actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}
+            github_token=${{ secrets.GITHUB_TOKEN }}
