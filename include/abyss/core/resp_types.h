@@ -45,11 +45,17 @@ class RespValue {
   int64_t AsInteger() const { return integer_; }
   const std::vector<RespValue>& AsArray() const { return elements_; }
 
+  // Defined only when IsError(); other types return kErr.
+  ErrorPrefix ErrorPrefixOf() const { return error_prefix_; }
+  // The message body without the prefix token. Defined only when IsError().
+  std::string_view ErrorMessage() const;
+
  private:
   Type type_ = Type::kNull;
   std::string str_;
   int64_t integer_ = 0;
   std::vector<RespValue> elements_;
+  ErrorPrefix error_prefix_ = ErrorPrefix::kErr;
 };
 
 struct RespCommand {

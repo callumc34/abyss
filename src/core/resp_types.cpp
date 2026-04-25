@@ -61,7 +61,16 @@ RespValue RespValue::Error(ErrorPrefix prefix, std::string message) {
   RespValue v;
   v.type_ = Type::kError;
   v.str_ = std::move(message);
+  v.error_prefix_ = prefix;
   return v;
+}
+
+std::string_view RespValue::ErrorMessage() const {
+  if (type_ != Type::kError) return {};
+  const std::string_view full(str_);
+  const auto space = full.find(' ');
+  if (space == std::string_view::npos) return {};
+  return full.substr(space + 1);
 }
 
 RespValue RespValue::Array(std::vector<RespValue> elements) {

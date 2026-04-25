@@ -7,7 +7,6 @@
 #include <optional>
 #include <vector>
 
-#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
@@ -55,7 +54,7 @@ struct ConnectionConfig {
 class Connection {
  public:
   Connection(Fd fd, uint32_t remote_ipv4, uint16_t remote_port, uint64_t client_id, Poller& poller,
-             const resp::CommandRegistry& registry, core::CommandDispatcher& dispatcher,
+             const resp::CommandRegistry& registry, resp::PipelineDependencies deps,
              ConnectionConfig config, NetMetrics& net_metrics,
              core::SteadyClockFn clock = core::DefaultSteadyClock);
   ~Connection();

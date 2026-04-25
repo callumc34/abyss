@@ -138,10 +138,10 @@ void Reactor::DrainHandoff() {
   }
 
   for (auto& entry : drained) {
-    auto conn = std::make_unique<Connection>(
-        std::move(entry.fd), entry.remote_ipv4, entry.remote_port, entry.client_id, *poller_,
-        server_.registry_, server_.dispatcher_, server_.config_.connection, server_.metrics_,
-        server_.clock_);
+    auto conn =
+        std::make_unique<Connection>(std::move(entry.fd), entry.remote_ipv4, entry.remote_port,
+                                     entry.client_id, *poller_, server_.registry_, server_.deps_,
+                                     server_.config_.connection, server_.metrics_, server_.clock_);
 
     if (auto r = conn->Arm(); !r) {
       ABYSS_LOG_WARN(Log(), "arm failed; dropping connection", {"client_id", entry.client_id},

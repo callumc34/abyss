@@ -9,7 +9,7 @@
 namespace abyss::metrics {
 
 // Closed whitelist of permitted label keys.
-enum class LabelKey : uint8_t { kTier, kShard, kCmd, kReason, kStatus, kOp };
+enum class LabelKey : uint8_t { kTier, kShard, kCmd, kReason, kStatus, kOp, kProto };
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
   switch (k) {
@@ -25,6 +25,8 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "status";
     case LabelKey::kOp:
       return "op";
+    case LabelKey::kProto:
+      return "proto";
   }
   return {};
 }
@@ -56,6 +58,31 @@ constexpr std::string_view ToStringView(FlushStatus s) noexcept {
 }
 
 enum class FlushReason : uint8_t { kQuiet, kDeadline, kPressure };
+
+enum class RequestStatus : uint8_t { kOk, kError, kLoading, kUnknown, kArity, kNoProto };
+
+constexpr std::string_view ToStringView(RequestStatus s) noexcept {
+  switch (s) {
+    case RequestStatus::kOk:
+      return "ok";
+    case RequestStatus::kError:
+      return "error";
+    case RequestStatus::kLoading:
+      return "loading";
+    case RequestStatus::kUnknown:
+      return "unknown";
+    case RequestStatus::kArity:
+      return "arity";
+    case RequestStatus::kNoProto:
+      return "noproto";
+  }
+  return {};
+}
+
+// Bounded to {2, 3}; RESP3 is rejected in Phase 1 but still observed.
+struct ProtoLabel {
+  uint8_t version;
+};
 
 constexpr std::string_view ToStringView(FlushReason r) noexcept {
   switch (r) {
@@ -153,6 +180,14 @@ template <>
 struct LabelKeyOf<ShardLabel> {
   static constexpr LabelKey value = LabelKey::kShard;
 };
+template <>
+struct LabelKeyOf<RequestStatus> {
+  static constexpr LabelKey value = LabelKey::kStatus;
+};
+template <>
+struct LabelKeyOf<ProtoLabel> {
+  static constexpr LabelKey value = LabelKey::kProto;
+};
 
 // Produces the string value written into a Prometheus series for a typed
 // label value. Registration-time only; never called on the hot path.
@@ -163,6 +198,8 @@ inline std::string ToLabelString(CloseReason r) { return std::string(ToStringVie
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
+inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
+inline std::string ToLabelString(ProtoLabel p) { return std::to_string(p.version); }
 
 template <class... Ts>
 struct CounterDesc {
@@ -224,6 +261,21 @@ inline constexpr HistogramDesc<CmdLabel> kRespRequestDurationSeconds{
     .name = "abyss_resp_request_duration_seconds",
     .help = "End-to-end RESP request latency per command.",
     .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr CounterDesc<CmdLabel, RequestStatus> kRespRequestsTotal{
+    .name = "abyss_resp_requests_total",
+    .help = "RESP requests by command and outcome.",
+};
+
+inline constexpr CounterDesc<> kRespParseErrorsTotal{
+    .name = "abyss_resp_parse_errors_total",
+    .help = "RESP parse errors.",
+};
+
+inline constexpr CounterDesc<ProtoLabel> kRespProtocolVersionTotal{
+    .name = "abyss_resp_protocol_version_total",
+    .help = "HELLO handshakes by negotiated protocol version.",
 };
 
 inline constexpr HistogramDesc<> kQueueAppendDurationSeconds{

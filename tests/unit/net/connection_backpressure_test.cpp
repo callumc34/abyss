@@ -108,7 +108,8 @@ class ConnectionBackpressureTest : public ::testing::Test {
 TEST_F(ConnectionBackpressureTest, PauseEntered) {
   dispatcher_.read_payload.assign(32 * 1024, 'a');
   Connection conn(std::move(pair_.server), 0, 0, /*client_id=*/1, poller_, resp::GlobalRegistry(),
-                  dispatcher_, SmallBuffersConfig(), metrics_);
+                  resp::PipelineDependencies{.dispatcher = &dispatcher_}, SmallBuffersConfig(),
+                  metrics_);
   ASSERT_TRUE(conn.Arm().has_value());
   ASSERT_FALSE(conn.ReadingPaused());
 
@@ -123,8 +124,9 @@ TEST_F(ConnectionBackpressureTest, PauseEntered) {
 
 TEST_F(ConnectionBackpressureTest, ResumeAfterDrain) {
   dispatcher_.read_payload.assign(32 * 1024, 'b');
-  Connection conn(std::move(pair_.server), 0, 0, 1, poller_, resp::GlobalRegistry(), dispatcher_,
-                  SmallBuffersConfig(), metrics_);
+  Connection conn(std::move(pair_.server), 0, 0, 1, poller_, resp::GlobalRegistry(),
+                  resp::PipelineDependencies{.dispatcher = &dispatcher_}, SmallBuffersConfig(),
+                  metrics_);
   ASSERT_TRUE(conn.Arm().has_value());
 
   WriteAll(pair_.client, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
@@ -146,8 +148,9 @@ TEST_F(ConnectionBackpressureTest, ResumeAfterDrain) {
 
 TEST_F(ConnectionBackpressureTest, HardLimitClosesConnection) {
   dispatcher_.read_payload.assign(96 * 1024, 'c');
-  Connection conn(std::move(pair_.server), 0, 0, 1, poller_, resp::GlobalRegistry(), dispatcher_,
-                  SmallBuffersConfig(), metrics_);
+  Connection conn(std::move(pair_.server), 0, 0, 1, poller_, resp::GlobalRegistry(),
+                  resp::PipelineDependencies{.dispatcher = &dispatcher_}, SmallBuffersConfig(),
+                  metrics_);
   ASSERT_TRUE(conn.Arm().has_value());
 
   WriteAll(pair_.client, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");

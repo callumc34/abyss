@@ -10,6 +10,12 @@
 - `abyss_resp_request_duration_seconds{cmd="..."}` — end-to-end request latency per command
 - `abyss_queue_append_duration_seconds` — queue append latency (includes fsync for group commit)
 
+### RESP Frontend
+
+- `abyss_resp_requests_total{cmd="...",status="ok|error|loading|unknown|arity|noproto"}` — request outcomes per command
+- `abyss_resp_parse_errors_total` — malformed RESP inputs rejected at the parser
+- `abyss_resp_protocol_version_total{proto="2|3"}` — HELLO handshakes by negotiated protocol version
+
 ### Consumer Lag
 
 - `abyss_hot_consumer_lag_entries` — entries between hot consumer position and queue head
@@ -111,10 +117,11 @@ The only permitted label keys are:
 |-----|---------|-------------|
 | `tier` | Hot / buffer / cold tier. | `hot`, `buffer`, `cold`. |
 | `shard` | Shard identifier. | Bounded by shard count (single shard in the non-sharded profile). |
-| `cmd` | RESP command name. | Bounded by the server's command registry. |
+| `cmd` | RESP command name. | Bounded by the server's command registry plus the `unknown` sentinel. |
 | `reason` | Operation trigger reason. | Enumerated per metric. |
 | `status` | Operation outcome. | Enumerated per metric. |
 | `op` | Generic operation discriminator. | Reserved; enumerated per metric when used. |
+| `proto` | Negotiated RESP protocol version. | `2`, `3`. |
 
 Label values **must not** be raw Redis keys, client identifiers, IP addresses, or any other unbounded cardinality source.
 

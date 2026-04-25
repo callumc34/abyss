@@ -1,12 +1,16 @@
 #include "abyss/resp/request_pipeline.h"
 
-#include <array>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <string>
 #include <utility>
 
+#include "abyss/core/ascii.h"
+#include "abyss/log/log.h"
+#include "abyss/metrics/names.h"
+#include "abyss/resp/admin_handlers.h"
+#include "abyss/resp/loading_state.h"
+#include "abyss/resp/metrics.h"
 #include "abyss/resp/parser.h"
 #include "abyss/resp/serializer.h"
 #include "abyss/version.h"
@@ -17,60 +21,18 @@ namespace {
 using core::ErrorPrefix;
 using core::RespCommand;
 using core::RespValue;
+using metrics::RequestStatus;
 
-std::string Uppercase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
-
-bool IEquals(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) {
-    return false;
-  }
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (std::toupper(static_cast<unsigned char>(a[i])) !=
-        std::toupper(static_cast<unsigned char>(b[i]))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-RespValue MakeUnknownCommandError(std::string_view name, std::string_view first_arg) {
-  std::string message = "unknown command '";
-  message.append(name);
-  message.append("'");
-  if (!first_arg.empty()) {
-    message.append(", with args beginning with: '");
-    message.append(first_arg);
-    message.append("'");
-  } else {
-    message.append(", with args beginning with: ");
-  }
-  return RespValue::Error(ErrorPrefix::kErr, std::move(message));
-}
-
-RespValue MakeArityError(std::string_view name) {
-  std::string message = "wrong number of arguments for '";
-  std::string lower;
-  lower.reserve(name.size());
-  for (const char c : name) {
-    lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  }
-  message.append(lower);
-  message.append("' command");
-  return RespValue::Error(ErrorPrefix::kErr, std::move(message));
+const log::Logger& Logger() {
+  static const log::Logger l = log::Get("abyss.resp");
+  return l;
 }
 
 }  // namespace
 
 RequestPipeline::RequestPipeline(const CommandRegistry& registry, ConnectionState state,
-                                 core::CommandDispatcher* dispatcher)
-    : registry_(registry), dispatcher_(dispatcher), state_(std::move(state)) {}
+                                 Dependencies deps)
+    : registry_(registry), deps_(deps), state_(std::move(state)) {}
 
 RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t> input,
                                                         std::vector<uint8_t>& output) {
@@ -82,12 +44,14 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
       if (parsed.error().code() == core::ErrorCode::kIncomplete) {
         break;
       }
+      ABYSS_LOG_DEBUG(Logger(), "parse error", {"client_id", state_.client_id},
+                      {"err", std::string_view{parsed.error().message()}});
+      if (deps_.metrics != nullptr) deps_.metrics->RecordParseError();
       auto response = RespValue::Error(ErrorPrefix::kErr,
                                        std::string("Protocol error: ") + parsed.error().message());
       auto bytes = Serializer::Serialize(response);
       output.insert(output.end(), bytes.begin(), bytes.end());
-      // Malformed input: we can't know how far to advance. Consume everything
-      // and let the caller decide whether to close the connection.
+      // Cannot resync on malformed input; consume the lot and let the caller close.
       consumed = input.size();
       break;
     }
@@ -104,79 +68,179 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
 }
 
 RespValue RequestPipeline::Dispatch(const RespCommand& cmd) {
-  auto result = registry_.Classify(cmd);
-  if (!result.has_value()) {
-    if (result.error().code() == core::ErrorCode::kNotFound) {
+  const auto start = std::chrono::steady_clock::now();
+  auto outcome = DispatchImpl(cmd);
+
+  if (deps_.metrics != nullptr) {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const double seconds = std::chrono::duration<double>(elapsed).count();
+    deps_.metrics->RecordDuration(outcome.cmd_name, seconds);
+    deps_.metrics->RecordRequest(outcome.cmd_name, outcome.status);
+  }
+  return std::move(outcome.response);
+}
+
+RequestPipeline::DispatchOutcome RequestPipeline::DispatchImpl(const RespCommand& cmd) {
+  const auto resolution = registry_.Resolve(cmd);
+
+  switch (resolution.status) {
+    case CommandRegistry::ResolveStatus::kUnknownCommand: {
+      const std::string_view name = cmd.ArgCount() > 0 ? std::string_view(cmd.Name()) : "";
       const std::string_view first_arg = cmd.ArgCount() > 1 ? std::string_view(cmd.args[1]) : "";
-      return MakeUnknownCommandError(cmd.Name(), first_arg);
+      return {MakeUnknownCommand(name, first_arg), RequestStatus::kUnknown, kUnknownCmdLabel};
     }
-    return MakeArityError(cmd.Name());
+
+    case CommandRegistry::ResolveStatus::kArityMismatch:
+      return {MakeArityError(resolution.resolved), RequestStatus::kArity,
+              resolution.resolved.parent->name};
+
+    case CommandRegistry::ResolveStatus::kUnknownSubcommand: {
+      const std::string_view raw = cmd.ArgCount() > 1 ? std::string_view(cmd.args[1]) : "";
+      return {MakeUnknownSubcommand(*resolution.resolved.parent, raw), RequestStatus::kError,
+              resolution.resolved.parent->name};
+    }
+
+    case CommandRegistry::ResolveStatus::kOk:
+      break;
   }
-  return DispatchKnown(**result, cmd);
+
+  const auto& resolved = resolution.resolved;
+  if (deps_.loading != nullptr && deps_.loading->IsLoading() && !resolved.LoadingSafe()) {
+    return {MakeLoading(), RequestStatus::kLoading, resolved.parent->name};
+  }
+
+  return DispatchResolved(resolved, cmd);
 }
 
-RespValue RequestPipeline::DispatchKnown(const CommandSpec& spec, const RespCommand& cmd) {
-  switch (spec.dispatch) {
-    case Dispatch::kStateless:
-      return HandleAdminStateless(spec.name, cmd);
-    case Dispatch::kTieredRead:
-      if (dispatcher_ == nullptr) return NotImplemented(spec.name, "no engine configured");
-      {
-        auto result = dispatcher_->DispatchRead(spec.name, cmd);
-        if (!result.has_value()) {
-          return RespValue::Error(ErrorPrefix::kErr, result.error().message());
-        }
-        return std::move(*result);
-      }
-    case Dispatch::kWritePath:
-      if (dispatcher_ == nullptr) return NotImplemented(spec.name, "no engine configured");
-      {
-        auto result = dispatcher_->DispatchWrite(spec.name, core::RespCommand(cmd));
-        if (!result.has_value()) {
-          return RespValue::Error(ErrorPrefix::kErr, result.error().message());
-        }
-        return std::move(*result);
-      }
-    case Dispatch::kConditionalWrite:
-      return NotImplemented(spec.name, "requires resolver");
-    case Dispatch::kConsumerRpc:
-      return NotImplemented(spec.name, "requires consumer RPC integration");
-  }
-  return NotImplemented(spec.name, "unreachable dispatch");
-}
-
-RespValue RequestPipeline::HandleAdminStateless(std::string_view name, const RespCommand& cmd) {
-  using Handler = RespValue (RequestPipeline::*)(const RespCommand&);
-  struct Entry {
-    std::string_view name;
-    Handler handler;
+RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const ResolvedCommand& resolved,
+                                                                   const RespCommand& cmd) {
+  const auto& parent = *resolved.parent;
+  auto finish = [&parent](RespValue response) -> DispatchOutcome {
+    const auto status = response.IsError() ? RequestStatus::kError : RequestStatus::kOk;
+    return {std::move(response), status, parent.name};
   };
-  static constexpr auto kDispatch = std::to_array<Entry>({
-      {"PING", &RequestPipeline::HandlePing},
-      {"ECHO", &RequestPipeline::HandleEcho},
-      {"QUIT", &RequestPipeline::HandleQuit},
-      {"HELLO", &RequestPipeline::HandleHello},
-      {"TIME", &RequestPipeline::HandleTime},
-      {"COMMAND", &RequestPipeline::HandleCommand},
-      {"CLIENT", &RequestPipeline::HandleClient},
-      {"RESET", &RequestPipeline::HandleReset},
-      {"INFO", &RequestPipeline::HandleInfo},
-      {"FLUSHALL", &RequestPipeline::HandleFlushall},
-      {"FLUSHDB", &RequestPipeline::HandleFlushall},
-  });
-  for (const auto& entry : kDispatch) {
-    if (entry.name == name) {
-      return (this->*entry.handler)(cmd);
+
+  switch (resolved.DispatchClass()) {
+    case Dispatch::kStateless:
+      return HandleAdminStateless(resolved, cmd);
+
+    case Dispatch::kTieredRead:
+      if (deps_.dispatcher == nullptr) {
+        return finish(InternalServerError("dispatcher missing for tiered read", parent.name));
+      }
+      {
+        auto result = deps_.dispatcher->DispatchRead(parent.name, cmd);
+        if (!result.has_value()) {
+          ABYSS_LOG_WARN(Logger(), "engine read error", {"client_id", state_.client_id},
+                         {"cmd", std::string_view{parent.name}},
+                         {"err", std::string_view{result.error().message()}});
+          return finish(RespValue::Error(ErrorPrefix::kErr, result.error().message()));
+        }
+        return finish(std::move(*result));
+      }
+
+    case Dispatch::kWritePath:
+      if (deps_.dispatcher == nullptr) {
+        return finish(InternalServerError("dispatcher missing for write path", parent.name));
+      }
+      {
+        auto result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
+        if (!result.has_value()) {
+          ABYSS_LOG_WARN(Logger(), "engine write error", {"client_id", state_.client_id},
+                         {"cmd", std::string_view{parent.name}},
+                         {"err", std::string_view{result.error().message()}});
+          return finish(RespValue::Error(ErrorPrefix::kErr, result.error().message()));
+        }
+        return finish(std::move(*result));
+      }
+
+    case Dispatch::kConditionalWrite: {
+      std::string msg = "conditional writes are not supported in this build (";
+      msg.append(parent.name);
+      msg.append("); tracked in abyss#97");
+      return finish(RespValue::Error(ErrorPrefix::kErr, std::move(msg)));
     }
+
+    case Dispatch::kConsumerRpc:
+      if (parent.name == "DBSIZE") {
+        if (deps_.stats == nullptr) {
+          return finish(InternalServerError("stats missing for DBSIZE", parent.name));
+        }
+        return finish(HandleDbsize(*deps_.stats));
+      }
+      {
+        std::string label{parent.name};
+        if (resolved.subcommand != nullptr) {
+          label.push_back('|');
+          label.append(resolved.subcommand->name);
+        }
+        std::string msg = "consumer RPC commands are not supported in this build (";
+        msg.append(label);
+        msg.append("); tracked in abyss#97");
+        return finish(RespValue::Error(ErrorPrefix::kErr, std::move(msg)));
+      }
   }
-  return NotImplemented(name, "stateless admin handler not yet wired");
+  return finish(InternalServerError("unhandled dispatch class", parent.name));
+}
+
+RequestPipeline::DispatchOutcome RequestPipeline::HandleAdminStateless(
+    const ResolvedCommand& resolved, const RespCommand& cmd) {
+  const auto& parent = *resolved.parent;
+  const std::string_view sub_name =
+      resolved.subcommand != nullptr ? resolved.subcommand->name : std::string_view{};
+
+  auto finish = [&parent](RespValue response, RequestStatus status) -> DispatchOutcome {
+    return {std::move(response), status, parent.name};
+  };
+  auto ok_or_err = [&finish](RespValue response) -> DispatchOutcome {
+    const auto status = response.IsError() ? RequestStatus::kError : RequestStatus::kOk;
+    return finish(std::move(response), status);
+  };
+
+  if (parent.name == "PING") return ok_or_err(HandlePing(cmd));
+  if (parent.name == "ECHO") return ok_or_err(HandleEcho(cmd));
+  if (parent.name == "QUIT") return ok_or_err(HandleQuit());
+  if (parent.name == "HELLO") return HandleHello(parent, cmd);
+  if (parent.name == "TIME") return ok_or_err(HandleTime());
+  if (parent.name == "RESET") return ok_or_err(HandleReset());
+
+  if (parent.name == "CLIENT") {
+    return ok_or_err(HandleClient(sub_name, cmd));
+  }
+  if (parent.name == "COMMAND") {
+    return ok_or_err(HandleCommandIntrospect(sub_name, cmd, registry_));
+  }
+
+  if (parent.name == "INFO") {
+    if (deps_.stats == nullptr) {
+      return finish(InternalServerError("stats missing for INFO", parent.name),
+                    RequestStatus::kError);
+    }
+    return ok_or_err(HandleInfo(cmd, *deps_.stats));
+  }
+
+  if (parent.name == "CLUSTER") {
+    if (deps_.stats == nullptr || deps_.identity == nullptr) {
+      return finish(InternalServerError("stats/identity missing for CLUSTER", parent.name),
+                    RequestStatus::kError);
+    }
+    return ok_or_err(HandleCluster(sub_name, cmd, *deps_.stats, *deps_.identity));
+  }
+
+  if (parent.name == "CONFIG") {
+    if (deps_.config == nullptr) {
+      return finish(InternalServerError("config missing for CONFIG", parent.name),
+                    RequestStatus::kError);
+    }
+    return ok_or_err(HandleConfig(sub_name, cmd, *deps_.config));
+  }
+
+  return finish(InternalServerError("unhandled stateless command", parent.name),
+                RequestStatus::kError);
 }
 
 RespValue RequestPipeline::HandlePing(const RespCommand& cmd) {
-  if (cmd.ArgCount() == 1) {
-    return RespValue::SimpleString("PONG");
-  }
-  // PING with a message echoes it as a bulk string.
+  if (cmd.ArgCount() == 1) return RespValue::SimpleString("PONG");
   return RespValue::BulkString(cmd.args[1]);
 }
 
@@ -184,43 +248,68 @@ RespValue RequestPipeline::HandleEcho(const RespCommand& cmd) {
   return RespValue::BulkString(cmd.args[1]);
 }
 
-RespValue RequestPipeline::HandleQuit(const RespCommand& /*cmd*/) {
+RespValue RequestPipeline::HandleQuit() {
   close_requested_ = true;
   return RespValue::SimpleString("OK");
 }
 
-RespValue RequestPipeline::HandleHello(const RespCommand& cmd) {
-  if (cmd.ArgCount() >= 2) {
-    const auto& proto = cmd.args[1];
-    if (proto != "2") {
-      return RespValue::Error(ErrorPrefix::kNoProto, "unsupported protocol version");
+RequestPipeline::DispatchOutcome RequestPipeline::HandleHello(const CommandSpec& spec,
+                                                              const RespCommand& cmd) {
+  auto record_response = [&spec](RespValue response) -> DispatchOutcome {
+    if (response.IsError()) {
+      const auto status = response.ErrorPrefixOf() == ErrorPrefix::kNoProto
+                              ? RequestStatus::kNoProto
+                              : RequestStatus::kError;
+      return {std::move(response), status, spec.name};
     }
+    return {std::move(response), RequestStatus::kOk, spec.name};
+  };
 
+  uint8_t negotiated = state_.protocol_version;
+  if (cmd.ArgCount() >= 2) {
+    const auto& proto_arg = cmd.args[1];
+    if (proto_arg != "2") {
+      // Record the asked-for version on rejection so v3 attempts are visible.
+      if (proto_arg == "3" && deps_.metrics != nullptr) {
+        deps_.metrics->RecordProtocol(3);
+      }
+      return record_response(
+          RespValue::Error(ErrorPrefix::kNoProto, "unsupported protocol version"));
+    }
+    negotiated = 2;
+
+    // AUTH args are accepted and discarded until AUTH/ACL is implemented.
     for (size_t i = 2; i < cmd.ArgCount(); ++i) {
-      if (IEquals(cmd.args[i], "AUTH")) {
+      if (core::AsciiEqualsIgnoreCase(cmd.args[i], "AUTH")) {
         if (i + 2 >= cmd.ArgCount()) {
-          return RespValue::Error(ErrorPrefix::kErr, "syntax error in HELLO AUTH");
+          return record_response(RespValue::Error(ErrorPrefix::kErr, "syntax error in HELLO AUTH"));
         }
-        i += 2;  // TODO: AUthentication
-      } else if (IEquals(cmd.args[i], "SETNAME")) {
+        i += 2;
+      } else if (core::AsciiEqualsIgnoreCase(cmd.args[i], "SETNAME")) {
         if (i + 1 >= cmd.ArgCount()) {
-          return RespValue::Error(ErrorPrefix::kErr, "syntax error in HELLO SETNAME");
+          return record_response(
+              RespValue::Error(ErrorPrefix::kErr, "syntax error in HELLO SETNAME"));
         }
         state_.client_name = cmd.args[i + 1];
         ++i;
       } else {
-        return RespValue::Error(ErrorPrefix::kErr, "syntax error");
+        return record_response(RespValue::Error(ErrorPrefix::kErr, "syntax error"));
       }
     }
   }
 
-  return RespValue::Array({
+  state_.protocol_version = negotiated;
+  if (deps_.metrics != nullptr) deps_.metrics->RecordProtocol(negotiated);
+  ABYSS_LOG_DEBUG(Logger(), "hello handshake", {"client_id", state_.client_id},
+                  {"proto", static_cast<int64_t>(negotiated)});
+
+  return record_response(RespValue::Array({
       RespValue::BulkString("server"),
       RespValue::BulkString("abyss"),
       RespValue::BulkString("version"),
       RespValue::BulkString(kVersion),
       RespValue::BulkString("proto"),
-      RespValue::Integer(2),
+      RespValue::Integer(negotiated),
       RespValue::BulkString("id"),
       RespValue::Integer(static_cast<int64_t>(state_.client_id)),
       RespValue::BulkString("mode"),
@@ -229,10 +318,10 @@ RespValue RequestPipeline::HandleHello(const RespCommand& cmd) {
       RespValue::BulkString("master"),
       RespValue::BulkString("modules"),
       RespValue::Array({}),
-  });
+  }));
 }
 
-RespValue RequestPipeline::HandleTime(const RespCommand& /*cmd*/) {
+RespValue RequestPipeline::HandleTime() {
   auto now = std::chrono::system_clock::now().time_since_epoch();
   auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now).count();
   auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count() % 1'000'000;
@@ -242,72 +331,75 @@ RespValue RequestPipeline::HandleTime(const RespCommand& /*cmd*/) {
   });
 }
 
-RespValue RequestPipeline::HandleCommand(const RespCommand& cmd) {
-  if (cmd.ArgCount() == 1) {
-    // TODO: Implement
-    return RespValue::Array({});
-  }
-  if (IEquals(cmd.args[1], "COUNT")) {
-    return RespValue::Integer(static_cast<int64_t>(registry_.Size()));
-  }
-  return NotImplemented("COMMAND", "only COMMAND COUNT is wired; INFO/DOCS pending");
-}
-
-RespValue RequestPipeline::HandleClient(const RespCommand& cmd) {
-  if (cmd.ArgCount() < 2) {
-    return MakeArityError("CLIENT");
-  }
-  auto sub = Uppercase(cmd.args[1]);
-  if (sub == "ID") {
-    return RespValue::Integer(static_cast<int64_t>(state_.client_id));
-  }
-  if (sub == "GETNAME") {
-    if (state_.client_name.empty()) {
-      return RespValue::Null();
-    }
+RespValue RequestPipeline::HandleClient(std::string_view subcommand, const RespCommand& cmd) {
+  if (subcommand == "ID") return RespValue::Integer(static_cast<int64_t>(state_.client_id));
+  if (subcommand == "GETNAME") {
+    if (state_.client_name.empty()) return RespValue::Null();
     return RespValue::BulkString(state_.client_name);
   }
-  if (sub == "SETNAME") {
-    if (cmd.ArgCount() != 3) {
-      return MakeArityError("CLIENT SETNAME");
-    }
+  if (subcommand == "SETNAME") {
     state_.client_name = cmd.args[2];
     return RespValue::SimpleString("OK");
   }
-  if (sub == "NO-EVICT") {
-    // TODO: Enforce
+  if (subcommand == "NO-EVICT") {
+    // Accepted and acked; per-client eviction opt-out is not honoured.
     return RespValue::SimpleString("OK");
   }
-  return NotImplemented("CLIENT", "subcommand not implemented");
+  return RespValue::Error(
+      ErrorPrefix::kErr,
+      std::string("internal: unhandled CLIENT subcommand '").append(subcommand).append("'"));
 }
 
-RespValue RequestPipeline::HandleReset(const RespCommand& /*cmd*/) {
+RespValue RequestPipeline::HandleReset() {
   state_.client_name.clear();
+  state_.protocol_version = 2;
   return RespValue::SimpleString("RESET");
 }
 
-RespValue RequestPipeline::HandleInfo(const RespCommand& /*cmd*/) {
-  std::string info;
-  info.append("# Server\r\n");
-  info.append("abyss_version:");
-  info.append(kVersion);
-  info.append("\r\n");
-  info.append("redis_version:7.0.0\r\n");
-  info.append("tcp_port:0\r\n");
-  info.append("# Clients\r\n");
-  info.append("connected_clients:0\r\n");
-  return RespValue::BulkString(std::move(info));
+RespValue RequestPipeline::InternalServerError(std::string_view context,
+                                               std::string_view cmd_name) {
+  ABYSS_LOG_ERROR(Logger(), "request pipeline internal error", {"client_id", state_.client_id},
+                  {"cmd", std::string_view{cmd_name}}, {"context", context});
+  return RespValue::Error(ErrorPrefix::kErr, "internal server error");
 }
 
-RespValue RequestPipeline::HandleFlushall(const RespCommand& /*cmd*/) {
-  return RespValue::SimpleString("OK");
+RespValue RequestPipeline::MakeLoading() {
+  return RespValue::Error(ErrorPrefix::kLoading, "Abyss is loading the dataset in memory");
 }
 
-RespValue RequestPipeline::NotImplemented(std::string_view name, std::string_view reason) {
-  std::string message = "not implemented (";
-  message.append(reason);
-  message.append("): ");
+RespValue RequestPipeline::MakeUnknownCommand(std::string_view name, std::string_view first_arg) {
+  std::string message = "unknown command '";
   message.append(name);
+  message.append("'");
+  if (!first_arg.empty()) {
+    message.append(", with args beginning with: '");
+    message.append(first_arg);
+    message.append("'");
+  } else {
+    message.append(", with args beginning with: ");
+  }
+  return RespValue::Error(ErrorPrefix::kErr, std::move(message));
+}
+
+RespValue RequestPipeline::MakeArityError(const ResolvedCommand& resolved) {
+  std::string label = core::AsciiLower(resolved.parent->name);
+  if (resolved.subcommand != nullptr) {
+    label.push_back('|');
+    label.append(core::AsciiLower(resolved.subcommand->name));
+  }
+  std::string message = "wrong number of arguments for '";
+  message.append(label);
+  message.append("' command");
+  return RespValue::Error(ErrorPrefix::kErr, std::move(message));
+}
+
+RespValue RequestPipeline::MakeUnknownSubcommand(const CommandSpec& parent,
+                                                 std::string_view raw_sub) {
+  std::string message = "Unknown ";
+  message.append(parent.name);
+  message.append(" subcommand or wrong number of arguments for '");
+  message.append(raw_sub);
+  message.push_back('\'');
   return RespValue::Error(ErrorPrefix::kErr, std::move(message));
 }
 

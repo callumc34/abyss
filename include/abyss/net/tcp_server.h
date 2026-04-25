@@ -8,12 +8,12 @@
 #include <string>
 #include <vector>
 
-#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
 #include "abyss/net/connection.h"
 #include "abyss/net/socket_ops.h"
 #include "abyss/resp/command_registry.h"
+#include "abyss/resp/request_pipeline.h"
 
 namespace abyss::net {
 
@@ -35,8 +35,7 @@ struct TcpServerConfig {
 class TcpServer {
  public:
   TcpServer(TcpServerConfig config, const resp::CommandRegistry& registry,
-            core::CommandDispatcher& dispatcher,
-            core::SteadyClockFn clock = core::DefaultSteadyClock);
+            resp::PipelineDependencies deps, core::SteadyClockFn clock = core::DefaultSteadyClock);
   ~TcpServer();
 
   TcpServer(const TcpServer&) = delete;
@@ -61,7 +60,7 @@ class TcpServer {
 
   TcpServerConfig config_;
   const resp::CommandRegistry& registry_;
-  core::CommandDispatcher& dispatcher_;
+  resp::PipelineDependencies deps_;
   core::SteadyClockFn clock_;
   NetMetrics metrics_;
 

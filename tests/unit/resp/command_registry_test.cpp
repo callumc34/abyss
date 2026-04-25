@@ -2,8 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <string_view>
+
 namespace abyss::resp {
 namespace {
+
+using Status = CommandRegistry::ResolveStatus;
 
 TEST(CommandRegistryTest, FindsKnownCommand) {
   CommandRegistry reg;
@@ -24,15 +28,21 @@ TEST(CommandRegistryTest, LookupIsCaseInsensitive) {
 
 TEST(CommandRegistryTest, UnknownCommandReturnsNull) {
   CommandRegistry reg;
-  EXPECT_EQ(reg.Find("HGET"), nullptr);   // hashes not yet supported
-  EXPECT_EQ(reg.Find("LPUSH"), nullptr);  // lists not yet supported
-  EXPECT_EQ(reg.Find("KEYS"), nullptr);   // enumeration not yet supported
+  EXPECT_EQ(reg.Find("HGET"), nullptr);
+  EXPECT_EQ(reg.Find("LPUSH"), nullptr);
+  EXPECT_EQ(reg.Find("KEYS"), nullptr);
   EXPECT_EQ(reg.Find("WAIT"), nullptr);
   EXPECT_EQ(reg.Find("MULTI"), nullptr);
   EXPECT_EQ(reg.Find("SUBSCRIBE"), nullptr);
   EXPECT_EQ(reg.Find("EVAL"), nullptr);
   EXPECT_EQ(reg.Find("XADD"), nullptr);
   EXPECT_EQ(reg.Find("GIBBERISH"), nullptr);
+}
+
+TEST(CommandRegistryTest, FlushallAndFlushdbAreNotRegistered) {
+  CommandRegistry reg;
+  EXPECT_EQ(reg.Find("FLUSHALL"), nullptr);
+  EXPECT_EQ(reg.Find("FLUSHDB"), nullptr);
 }
 
 TEST(CommandRegistryTest, ConditionalWritesAreMarked) {
@@ -44,8 +54,6 @@ TEST(CommandRegistryTest, ConditionalWritesAreMarked) {
 }
 
 TEST(CommandRegistryTest, SetHasWritePathBaseDispatch) {
-  // SET itself is base kWritePath; the request pipeline upgrades to
-  // kConditionalWrite after parsing NX/XX/KEEPTTL/GET options.
   CommandRegistry reg;
   EXPECT_EQ(reg.Find("SET")->dispatch, Dispatch::kWritePath);
   EXPECT_EQ(reg.Find("ZADD")->dispatch, Dispatch::kWritePath);
@@ -59,69 +67,162 @@ TEST(CommandRegistryTest, ConsumerRpcCommands) {
 TEST(CommandRegistryTest, StatelessAdminCommands) {
   CommandRegistry reg;
   EXPECT_EQ(reg.Find("INFO")->dispatch, Dispatch::kStateless);
-  EXPECT_EQ(reg.Find("FLUSHALL")->dispatch, Dispatch::kStateless);
-  EXPECT_EQ(reg.Find("FLUSHDB")->dispatch, Dispatch::kStateless);
+  EXPECT_EQ(reg.Find("CLUSTER")->dispatch, Dispatch::kStateless);
+  EXPECT_EQ(reg.Find("CONFIG")->dispatch, Dispatch::kStateless);
 }
 
-TEST(CommandRegistryTest, ClassifyUnknownCommandReturnsNotFound) {
+TEST(CommandRegistryTest, ParentLoadingSafeOnlyAppliesAbsentSubcommand) {
+  CommandRegistry reg;
+  // PING has no subcommands; loading_safe is authoritative on the parent.
+  EXPECT_TRUE(reg.Find("PING")->loading_safe);
+  EXPECT_TRUE(reg.Find("HELLO")->loading_safe);
+  EXPECT_TRUE(reg.Find("QUIT")->loading_safe);
+  EXPECT_TRUE(reg.Find("INFO")->loading_safe);
+  // CLUSTER's per-subcommand allowlist is the source of truth during loading.
+  EXPECT_FALSE(reg.Find("CLUSTER")->loading_safe);
+  EXPECT_FALSE(reg.Find("CLIENT")->loading_safe);
+  EXPECT_FALSE(reg.Find("CONFIG")->loading_safe);
+  // COMMAND with no subcommand is permitted during loading.
+  EXPECT_TRUE(reg.Find("COMMAND")->loading_safe);
+  // Data-plane commands are never loading-safe.
+  EXPECT_FALSE(reg.Find("GET")->loading_safe);
+  EXPECT_FALSE(reg.Find("SET")->loading_safe);
+  EXPECT_FALSE(reg.Find("DEL")->loading_safe);
+}
+
+TEST(CommandRegistryTest, ClusterSubcommandsCarryLoadingAllowlist) {
+  CommandRegistry reg;
+  const auto* cluster = reg.Find("CLUSTER");
+  ASSERT_NE(cluster, nullptr);
+  ASSERT_FALSE(cluster->subcommands.empty());
+
+  for (const auto* allow : {"SLOTS", "INFO", "MYID"}) {
+    const auto* sub = reg.FindSubcommand(*cluster, allow);
+    ASSERT_NE(sub, nullptr) << allow;
+    EXPECT_TRUE(sub->loading_safe) << allow;
+  }
+  for (const auto* deny : {"SHARDS", "NODES", "KEYSLOT", "COUNTKEYSINSLOT"}) {
+    const auto* sub = reg.FindSubcommand(*cluster, deny);
+    ASSERT_NE(sub, nullptr) << deny;
+    EXPECT_FALSE(sub->loading_safe) << deny;
+  }
+}
+
+TEST(CommandRegistryTest, ObjectSubcommandsHaveDistinctDispatch) {
+  CommandRegistry reg;
+  const auto* object = reg.Find("OBJECT");
+  ASSERT_NE(object, nullptr);
+  const auto* enc = reg.FindSubcommand(*object, "encoding");
+  const auto* idle = reg.FindSubcommand(*object, "IDLETIME");
+  ASSERT_NE(enc, nullptr);
+  ASSERT_NE(idle, nullptr);
+  EXPECT_EQ(enc->dispatch, Dispatch::kTieredRead);
+  EXPECT_EQ(idle->dispatch, Dispatch::kConsumerRpc);
+}
+
+TEST(CommandRegistryTest, ConfigOnlyExposesGetSubcommand) {
+  CommandRegistry reg;
+  const auto* config = reg.Find("CONFIG");
+  ASSERT_NE(config, nullptr);
+  EXPECT_NE(reg.FindSubcommand(*config, "GET"), nullptr);
+  EXPECT_EQ(reg.FindSubcommand(*config, "SET"), nullptr);
+  EXPECT_EQ(reg.FindSubcommand(*config, "REWRITE"), nullptr);
+  EXPECT_EQ(reg.FindSubcommand(*config, "RESETSTAT"), nullptr);
+}
+
+TEST(CommandRegistryTest, DocsPopulatedForEveryCommandAndSubcommand) {
+  CommandRegistry reg;
+  for (const auto& spec : reg.All()) {
+    EXPECT_FALSE(spec.docs.summary.empty()) << spec.name;
+    EXPECT_FALSE(spec.docs.since.empty()) << spec.name;
+    EXPECT_FALSE(spec.docs.group.empty()) << spec.name;
+    EXPECT_FALSE(spec.docs.complexity.empty()) << spec.name;
+    for (const auto& sub : spec.subcommands) {
+      EXPECT_FALSE(sub.docs.summary.empty()) << spec.name << "|" << sub.name;
+      EXPECT_FALSE(sub.docs.since.empty()) << spec.name << "|" << sub.name;
+    }
+  }
+}
+
+TEST(CommandRegistryTest, ResolveUnknownCommand) {
   CommandRegistry reg;
   core::RespCommand cmd{{"HGET", "myhash", "field"}};
-  auto result = reg.Classify(cmd);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kNotFound);
-  EXPECT_EQ(result.error().message(), "HGET");
+  const auto r = reg.Resolve(cmd);
+  EXPECT_EQ(r.status, Status::kUnknownCommand);
 }
 
-TEST(CommandRegistryTest, ClassifyExactArityMatch) {
+TEST(CommandRegistryTest, ResolveExactArityMatch) {
   CommandRegistry reg;
   core::RespCommand cmd{{"GET", "key"}};
-  auto result = reg.Classify(cmd);
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ((*result)->name, "GET");
+  const auto r = reg.Resolve(cmd);
+  ASSERT_EQ(r.status, Status::kOk);
+  EXPECT_EQ(r.resolved.parent->name, "GET");
+  EXPECT_EQ(r.resolved.subcommand, nullptr);
 }
 
-TEST(CommandRegistryTest, ClassifyExactArityMismatchIsInvalidArgument) {
+TEST(CommandRegistryTest, ResolveExactArityMismatchOnParent) {
   CommandRegistry reg;
-  core::RespCommand cmd{{"GET"}};  // GET requires exactly 2 args (GET + key)
-  auto result = reg.Classify(cmd);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kInvalidArgument);
-  EXPECT_EQ(result.error().message(), "GET");
-
+  core::RespCommand cmd{{"GET"}};
+  EXPECT_EQ(reg.Resolve(cmd).status, Status::kArityMismatch);
   core::RespCommand too_many{{"GET", "key", "extra"}};
-  auto result2 = reg.Classify(too_many);
-  ASSERT_FALSE(result2.has_value());
-  EXPECT_EQ(result2.error().code(), core::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(reg.Resolve(too_many).status, Status::kArityMismatch);
 }
 
-TEST(CommandRegistryTest, ClassifyVariadicArityAccepted) {
+TEST(CommandRegistryTest, ResolveSubcommandMatchAndArityCheck) {
   CommandRegistry reg;
-  // MGET: arity -2 (at least 2 args including command name).
+  core::RespCommand setname{{"CLIENT", "SETNAME", "alice"}};
+  const auto r = reg.Resolve(setname);
+  ASSERT_EQ(r.status, Status::kOk);
+  ASSERT_NE(r.resolved.subcommand, nullptr);
+  EXPECT_EQ(r.resolved.subcommand->name, "SETNAME");
+
+  core::RespCommand setname_bad{{"CLIENT", "SETNAME"}};
+  EXPECT_EQ(reg.Resolve(setname_bad).status, Status::kArityMismatch);
+}
+
+TEST(CommandRegistryTest, ResolveUnknownSubcommandReportsError) {
+  CommandRegistry reg;
+  core::RespCommand cmd{{"CLUSTER", "NOSUCH"}};
+  const auto r = reg.Resolve(cmd);
+  EXPECT_EQ(r.status, Status::kUnknownSubcommand);
+  ASSERT_NE(r.resolved.parent, nullptr);
+  EXPECT_EQ(r.resolved.parent->name, "CLUSTER");
+}
+
+TEST(CommandRegistryTest, ResolveContainerWithoutSubArgUsesParent) {
+  CommandRegistry reg;
+  // COMMAND alone (arity -1) resolves with no subcommand and uses parent dispatch.
+  core::RespCommand cmd{{"COMMAND"}};
+  const auto r = reg.Resolve(cmd);
+  ASSERT_EQ(r.status, Status::kOk);
+  ASSERT_NE(r.resolved.parent, nullptr);
+  EXPECT_EQ(r.resolved.parent->name, "COMMAND");
+  EXPECT_EQ(r.resolved.subcommand, nullptr);
+  EXPECT_TRUE(r.resolved.LoadingSafe());
+}
+
+TEST(CommandRegistryTest, ResolveVariadicArityAccepted) {
+  CommandRegistry reg;
   core::RespCommand two{{"MGET", "k1"}};
   core::RespCommand many{{"MGET", "k1", "k2", "k3", "k4"}};
-  EXPECT_TRUE(reg.Classify(two).has_value());
-  EXPECT_TRUE(reg.Classify(many).has_value());
-
+  EXPECT_EQ(reg.Resolve(two).status, Status::kOk);
+  EXPECT_EQ(reg.Resolve(many).status, Status::kOk);
   core::RespCommand too_few{{"MGET"}};
-  auto result = reg.Classify(too_few);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(reg.Resolve(too_few).status, Status::kArityMismatch);
 }
 
-TEST(CommandRegistryTest, ClassifyCaseInsensitiveName) {
+TEST(CommandRegistryTest, ResolveCaseInsensitiveName) {
   CommandRegistry reg;
   core::RespCommand cmd{{"set", "k", "v"}};
-  auto result = reg.Classify(cmd);
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ((*result)->name, "SET");
+  const auto r = reg.Resolve(cmd);
+  ASSERT_EQ(r.status, Status::kOk);
+  EXPECT_EQ(r.resolved.parent->name, "SET");
 }
 
-TEST(CommandRegistryTest, ClassifyEmptyCommandIsInvalidArgument) {
+TEST(CommandRegistryTest, ResolveEmptyCommandIsUnknown) {
   CommandRegistry reg;
   core::RespCommand cmd{{}};
-  auto result = reg.Classify(cmd);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(reg.Resolve(cmd).status, Status::kUnknownCommand);
 }
 
 TEST(CommandRegistryTest, GlobalRegistryIsSharedInstance) {
@@ -132,7 +233,6 @@ TEST(CommandRegistryTest, GlobalRegistryIsSharedInstance) {
 
 TEST(CommandRegistryTest, CoverageIncludesStringsSetsSortedSetsAndGeneric) {
   CommandRegistry reg;
-  // Spot-check a representative from each family.
   EXPECT_NE(reg.Find("SADD"), nullptr);
   EXPECT_NE(reg.Find("SMEMBERS"), nullptr);
   EXPECT_NE(reg.Find("ZADD"), nullptr);

@@ -57,6 +57,21 @@ TEST(RespValueTest, ErrorMovedCarriesSlotAndAddress) {
   EXPECT_EQ(v.AsString(), "MOVED 3999 127.0.0.1:6380");
 }
 
+TEST(RespValueTest, ErrorPrefixOfReturnsTypedEnum) {
+  auto v = RespValue::Error(ErrorPrefix::kNoProto, "unsupported protocol version");
+  EXPECT_EQ(v.ErrorPrefixOf(), ErrorPrefix::kNoProto);
+}
+
+TEST(RespValueTest, ErrorMessageStripsPrefix) {
+  auto v = RespValue::Error(ErrorPrefix::kWrongType, "operation against a wrong type");
+  EXPECT_EQ(v.ErrorMessage(), "operation against a wrong type");
+}
+
+TEST(RespValueTest, ErrorMessageEmptyForNonError) {
+  EXPECT_EQ(RespValue::Null().ErrorMessage(), "");
+  EXPECT_EQ(RespValue::SimpleString("OK").ErrorMessage(), "");
+}
+
 TEST(RespValueTest, Array) {
   auto v = RespValue::Array({
       RespValue::BulkString("one"),
