@@ -147,6 +147,8 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 | `DBSIZE` | 1 | Integer | Needs hot + cold key count |
 | `INFO [section]` | -1 | Bulk string | Needs live stats from all consumers |
 
+> **Phase 1 note.** Both commands are served from a synchronous `ServerStatsProvider` snapshot rather than a live Consumer RPC round-trip. The same stats already feed Prometheus gauges so a second query path would be redundant. When the Resolver lands, the plumbing can move to RPC without changing the command contract.
+
 **Admin — cluster (Phase 1 single-shard view; see §CLUSTER Commands):**
 
 | Command | Arity | Response |

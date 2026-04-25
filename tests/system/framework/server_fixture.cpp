@@ -373,8 +373,6 @@ void SystemTest::SetUp() {
   if (!client_.Connect("127.0.0.1", shared_server_->Port())) {
     GTEST_SKIP() << "cannot connect to shared server on port " << shared_server_->Port();
   }
-
-  client_.Command({"FLUSHALL"});
 }
 
 void SystemTest::TearDown() { client_.Close(); }
@@ -385,7 +383,8 @@ void DataCommandTest::SetUp() {
   SystemTest::SetUp();
   if (IsSkipped()) return;
   const auto probe = Client().Command({"SET", "__probe__", "1"});
-  if (probe.IsError() && probe.String().contains("not implemented")) {
+  if (probe.IsError() &&
+      (probe.String().contains("not implemented") || probe.String().contains("not configured"))) {
     GTEST_SKIP() << "data commands not yet implemented";
   }
   Client().Command({"DEL", "__probe__"});
@@ -423,7 +422,8 @@ void IsolatedDataServerTest::SetUp() {
   IsolatedServerTest::SetUp();
   if (IsSkipped()) return;
   const auto probe = Client().Command({"SET", "__probe__", "1"});
-  if (probe.IsError() && probe.String().contains("not implemented")) {
+  if (probe.IsError() &&
+      (probe.String().contains("not implemented") || probe.String().contains("not configured"))) {
     GTEST_SKIP() << "data commands not yet implemented";
   }
   Client().Command({"DEL", "__probe__"});

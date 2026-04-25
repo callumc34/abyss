@@ -7,6 +7,7 @@ add_executable(abyss_core_tests
   core/eviction_policy_test.cpp
   core/queue_entry_test.cpp
   core/shard_router_test.cpp
+  core/slot_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
@@ -39,6 +40,7 @@ add_executable(abyss_resp_tests
   resp/serializer_test.cpp
   resp/command_registry_test.cpp
   resp/request_pipeline_test.cpp
+  resp/node_identity_test.cpp
 )
 
 target_link_libraries(abyss_resp_tests PRIVATE

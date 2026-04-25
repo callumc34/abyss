@@ -6,6 +6,7 @@ add_library(abyss_core
   eviction_policy.cpp
   queue_entry.cpp
   shard_router.cpp
+  slot.cpp
 )
 add_library(abyss::core ALIAS abyss_core)
 
