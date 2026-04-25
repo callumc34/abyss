@@ -69,11 +69,21 @@ struct RecoveryConfig {
   size_t cold_replay_batch_size = 50000;
 };
 
-struct RespConfig {
+struct NetConfig {
   std::string bind = "0.0.0.0";
   uint16_t port = 6379;
   uint32_t max_connections = 1024;
   std::chrono::seconds idle_timeout{300};
+  // 0 = auto: min(hardware_concurrency, 16). All threads run identical
+  // reactor loops; reactor 0 also owns the listening fd.
+  uint32_t io_threads = 0;
+  uint32_t accept_queue = 128;
+  size_t max_read_buffer_bytes = 67108864;
+  size_t write_backpressure_bytes = 4194304;
+  size_t write_resume_bytes = 1048576;
+  size_t write_hard_limit_bytes = 16777216;
+  std::chrono::seconds shutdown_grace{30};
+  std::chrono::milliseconds reaper_tick{1000};
 };
 
 using ConsumerRpcConfig = core::ConsumerRpcConfig;
@@ -124,7 +134,7 @@ struct Config {
   ConsumerRpcConfig consumer_rpc;
   EngineConfig engine;
   RecoveryConfig recovery;
-  RespConfig resp;
+  NetConfig net;
   MetricsConfig metrics;
   AdminConfig admin;
   LogConfig log;

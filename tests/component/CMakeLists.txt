@@ -15,3 +15,19 @@ target_link_libraries(abyss_component_tests PRIVATE
 )
 
 abyss_discover_tests(abyss_component_tests "component")
+
+add_executable(abyss_component_net_tests
+  net/tcp_server_test.cpp
+  net/sync_redis_client.cpp
+)
+
+target_include_directories(abyss_component_net_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/net
+)
+
+target_link_libraries(abyss_component_net_tests PRIVATE
+  abyss::net
+  GTest::gtest_main
+)
+
+abyss_discover_tests(abyss_component_net_tests "component\;component-net")

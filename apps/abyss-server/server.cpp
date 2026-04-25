@@ -220,17 +220,16 @@ bool Server::SetupListener() {
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  if (config_.resp.bind == "0.0.0.0") {
+  if (config_.net.bind == "0.0.0.0") {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
   } else {
-    inet_pton(AF_INET, config_.resp.bind.c_str(), &addr.sin_addr);
+    inet_pton(AF_INET, config_.net.bind.c_str(), &addr.sin_addr);
   }
-  addr.sin_port = htons(config_.resp.port);
+  addr.sin_port = htons(config_.net.port);
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    ABYSS_LOG_CRITICAL(ListenerLog(), "bind failed", {"bind", std::string_view{config_.resp.bind}},
-                       {"port", static_cast<int64_t>(config_.resp.port)},
-                       {"err", GetSocketError()});
+    ABYSS_LOG_CRITICAL(ListenerLog(), "bind failed", {"bind", std::string_view{config_.net.bind}},
+                       {"port", static_cast<int64_t>(config_.net.port)}, {"err", GetSocketError()});
     CloseSocket(listen_fd_);
     listen_fd_ = kInvalidSocket;
     return false;
@@ -248,7 +247,7 @@ bool Server::SetupListener() {
     listen_fd_ = kInvalidSocket;
     return false;
   }
-  config_.resp.port = ntohs(bound_addr.sin_port);
+  config_.net.port = ntohs(bound_addr.sin_port);
 
   if (listen(listen_fd_, 128) < 0) {
     ABYSS_LOG_CRITICAL(ListenerLog(), "listen failed", {"err", GetSocketError()});
@@ -264,9 +263,9 @@ void Server::NotifyReady() {
   if (ready_fd_ < 0) return;
 
   std::string line = R"({"bind":")";
-  line += config_.resp.bind;
+  line += config_.net.bind;
   line += R"(","port":)";
-  line += std::to_string(config_.resp.port);
+  line += std::to_string(config_.net.port);
   line += "}\n";
 
 #ifdef _WIN32
@@ -297,8 +296,8 @@ void Server::Run(const std::atomic<bool>& stop) {
 
   NotifyReady();
   ABYSS_LOG_INFO(ListenerLog(), "listening", {"version", std::string_view{kVersion}},
-                 {"bind", std::string_view{config_.resp.bind}},
-                 {"port", static_cast<int64_t>(config_.resp.port)});
+                 {"bind", std::string_view{config_.net.bind}},
+                 {"port", static_cast<int64_t>(config_.net.port)});
 
   bool saturated = false;
 
@@ -346,11 +345,11 @@ void Server::Run(const std::atomic<bool>& stop) {
 
     {
       std::lock_guard lock(connections_mutex_);
-      if (connections_.size() >= config_.resp.max_connections) {
+      if (connections_.size() >= config_.net.max_connections) {
         if (!saturated) {
           saturated = true;
           ABYSS_LOG_WARN(ListenerLog(), "max_connections reached; rejecting new clients",
-                         {"limit", static_cast<int64_t>(config_.resp.max_connections)});
+                         {"limit", static_cast<int64_t>(config_.net.max_connections)});
         }
         CloseSocket(client_fd);
         continue;

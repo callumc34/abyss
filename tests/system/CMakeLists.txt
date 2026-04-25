@@ -32,3 +32,25 @@ target_link_libraries(abyss_system_tests PRIVATE
 add_dependencies(abyss_system_tests abyss-server)
 
 abyss_add_binary_test(abyss_system_tests "system")
+
+if(ABYSS_WITH_ROCKSDB)
+  add_executable(abyss_system_net_tests
+    net/tcp_server_smoke_test.cpp
+    ${CMAKE_SOURCE_DIR}/tests/component/net/sync_redis_client.cpp
+  )
+
+  target_include_directories(abyss_system_net_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/component/net
+  )
+
+  target_link_libraries(abyss_system_net_tests PRIVATE
+    abyss::net
+    abyss::engine
+    abyss::queue
+    abyss::cold_rocksdb
+    abyss::test_support
+    GTest::gtest_main
+  )
+
+  abyss_discover_tests(abyss_system_net_tests "system\;system-net")
+endif()

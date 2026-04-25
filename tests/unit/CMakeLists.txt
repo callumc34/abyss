@@ -157,6 +157,22 @@ target_link_libraries(abyss_metrics_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_net_tests
+  net/poller_test.cpp
+  net/connection_backpressure_test.cpp
+  net/connection_idle_test.cpp
+  net/connection_oversize_test.cpp
+)
+
+target_include_directories(abyss_net_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/net
+)
+
+target_link_libraries(abyss_net_tests PRIVATE
+  abyss::net
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -167,3 +183,4 @@ abyss_discover_tests(abyss_config_tests   "unit\;unit-config")
 abyss_discover_tests(abyss_support_tests  "unit\;unit-support")
 abyss_discover_tests(abyss_log_tests      "unit\;unit-log")
 abyss_discover_tests(abyss_metrics_tests  "unit\;unit-metrics")
+abyss_discover_tests(abyss_net_tests      "unit\;unit-net")

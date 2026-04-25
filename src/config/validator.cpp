@@ -178,11 +178,40 @@ core::Result<void> ValidateRecovery(const RecoveryConfig& r) {
   return {};
 }
 
-core::Result<void> ValidateResp(const RespConfig& r) {
-  if (auto res = RequireNonEmpty("resp.bind", r.bind); !res) return res;
+core::Result<void> ValidateNet(const NetConfig& n) {
+  if (auto res = RequireNonEmpty("net.bind", n.bind); !res) return res;
   // port == 0 requests a kernel-assigned ephemeral port, reported on stdout.
-  if (auto res = RequirePositive("resp.max_connections", r.max_connections); !res) return res;
-  if (auto res = RequirePositive("resp.idle_timeout_seconds", r.idle_timeout); !res) return res;
+  if (auto res = RequirePositive("net.max_connections", n.max_connections); !res) return res;
+  if (auto res = RequirePositive("net.idle_timeout_seconds", n.idle_timeout); !res) return res;
+  if (auto res = RequirePositive("net.accept_queue", n.accept_queue); !res) return res;
+  // io_threads == 0 means "auto" — TcpServer resolves it at startup.
+  if (auto res = RequirePositive("net.max_read_buffer_bytes", n.max_read_buffer_bytes); !res) {
+    return res;
+  }
+  if (auto res = RequirePositive("net.write_backpressure_bytes", n.write_backpressure_bytes);
+      !res) {
+    return res;
+  }
+  if (auto res = RequirePositive("net.write_resume_bytes", n.write_resume_bytes); !res) return res;
+  if (auto res = RequirePositive("net.write_hard_limit_bytes", n.write_hard_limit_bytes); !res) {
+    return res;
+  }
+  // The pause/resume/hard-limit ordering is the back-pressure invariant. A
+  // misconfigured ordering silently disables back-pressure, so reject loudly.
+  if (n.write_resume_bytes >= n.write_backpressure_bytes) {
+    return std::unexpected(
+        InvalidArg("net.write_resume_bytes", "must be < write_backpressure_bytes"));
+  }
+  if (n.write_backpressure_bytes >= n.write_hard_limit_bytes) {
+    return std::unexpected(
+        InvalidArg("net.write_backpressure_bytes", "must be < write_hard_limit_bytes"));
+  }
+  if (n.shutdown_grace.count() <= 0) {
+    return std::unexpected(InvalidArg("net.shutdown_grace_seconds", "must be > 0 seconds"));
+  }
+  if (n.reaper_tick.count() <= 0) {
+    return std::unexpected(InvalidArg("net.reaper_tick_ms", "must be > 0 milliseconds"));
+  }
   return {};
 }
 
@@ -222,7 +251,7 @@ core::Result<void> ValidateAdmin(const AdminConfig& a) {
 // NOLINTNEXTLINE(misc-unused-parameters)
 core::Result<void> ValidatePortCollisions(const Config& c) {
   const std::array<std::pair<uint16_t, std::string_view>, 3> ports = {{
-      {c.resp.port, "resp.port"},
+      {c.net.port, "net.port"},
       {c.metrics.port, "metrics.port"},
       {c.admin.port, "admin.port"},
   }};
@@ -254,7 +283,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateConsumerRpc(config.consumer_rpc); !r) return r;
   if (auto r = ValidateEngine(config.engine); !r) return r;
   if (auto r = ValidateRecovery(config.recovery); !r) return r;
-  if (auto r = ValidateResp(config.resp); !r) return r;
+  if (auto r = ValidateNet(config.net); !r) return r;
   if (auto r = ValidateMetrics(config.metrics); !r) return r;
   if (auto r = ValidateAdmin(config.admin); !r) return r;
   if (auto r = ValidateLog(config.log); !r) return r;

@@ -36,9 +36,9 @@ hot:
 }
 
 TEST(ConfigUnknownKey, PathIncludesSectionAndField) {
-  auto cfg = Config::ParseFromYaml("resp:\n  porttt: 6380\n");
+  auto cfg = Config::ParseFromYaml("net:\n  porttt: 6380\n");
   ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("resp.porttt"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("net.porttt"), std::string::npos);
 }
 
 }  // namespace

@@ -126,6 +126,7 @@ add_subdirectory(src/hot)
 add_subdirectory(src/cold)
 add_subdirectory(src/consumer)
 add_subdirectory(src/engine)
+add_subdirectory(src/net)
 add_subdirectory(src/config)
 
 add_subdirectory(apps/abyss-server)

@@ -42,7 +42,7 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_GT(defaults.recovery.hot_replay_batch_size, 0U);
   EXPECT_GT(defaults.recovery.cold_replay_batch_size, 0U);
 
-  EXPECT_EQ(defaults.resp.port, 6379);
+  EXPECT_EQ(defaults.net.port, 6379);
   EXPECT_EQ(defaults.metrics.port, 9090);
   EXPECT_EQ(defaults.admin.port, 8080);
 }
@@ -57,7 +57,7 @@ TEST(ConfigDefaults, EmptyYamlEqualsDefaults) {
   ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
   const Config defaults = Config::Defaults();
   EXPECT_EQ(cfg->profile, defaults.profile);
-  EXPECT_EQ(cfg->resp.port, defaults.resp.port);
+  EXPECT_EQ(cfg->net.port, defaults.net.port);
   EXPECT_EQ(cfg->queue.fsync_policy, defaults.queue.fsync_policy);
 }
 
