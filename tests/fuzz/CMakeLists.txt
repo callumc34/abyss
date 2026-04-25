@@ -11,3 +11,10 @@ target_link_libraries(fuzz_wal_decoder PRIVATE
   -fsanitize=fuzzer
 )
 target_compile_options(fuzz_wal_decoder PRIVATE -fsanitize=fuzzer)
+
+add_executable(fuzz_net_connection net/connection_fuzz.cpp)
+target_link_libraries(fuzz_net_connection PRIVATE
+  abyss::net
+  -fsanitize=fuzzer
+)
+target_compile_options(fuzz_net_connection PRIVATE -fsanitize=fuzzer)

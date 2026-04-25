@@ -13,12 +13,12 @@ TEST(ConfigValidate, RejectsUnknownProfile) {
   EXPECT_NE(cfg.error().message().find("profile"), std::string::npos);
 }
 
-TEST(ConfigValidate, AcceptsZeroRespPortAsEphemeral) {
-  // resp.port == 0 is a valid request for a kernel-assigned ephemeral port.
+TEST(ConfigValidate, AcceptsZeroNetPortAsEphemeral) {
+  // net.port == 0 is a valid request for a kernel-assigned ephemeral port.
   // The server reports the bound port on its stdout ready line.
-  auto cfg = Config::ParseFromYaml("resp:\n  port: 0\n");
+  auto cfg = Config::ParseFromYaml("net:\n  port: 0\n");
   ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
-  EXPECT_EQ(cfg->resp.port, 0);
+  EXPECT_EQ(cfg->net.port, 0);
 }
 
 TEST(ConfigValidate, RejectsZeroMetricsPort) {
@@ -28,9 +28,9 @@ TEST(ConfigValidate, RejectsZeroMetricsPort) {
 }
 
 TEST(ConfigValidate, RejectsPortAboveSixteenBit) {
-  auto cfg = Config::ParseFromYaml("resp:\n  port: 70000\n");
+  auto cfg = Config::ParseFromYaml("net:\n  port: 70000\n");
   ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("resp.port"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("net.port"), std::string::npos);
 }
 
 TEST(ConfigValidate, RejectsZeroMaxMemory) {
@@ -161,9 +161,9 @@ hot:
   EXPECT_NE(cfg.error().message().find("eviction_seconds"), std::string::npos);
 }
 
-TEST(ConfigValidate, RejectsColliding_RespAndMetricsPort) {
+TEST(ConfigValidate, RejectsColliding_NetAndMetricsPort) {
   auto cfg = Config::ParseFromYaml(R"YAML(
-resp:
+net:
   port: 7000
 metrics:
   port: 7000
@@ -173,7 +173,7 @@ metrics:
 }
 
 TEST(ConfigValidate, ErrorIncludesLineAndColumn) {
-  auto cfg = Config::ParseFromYaml("resp:\n  port: 70000\n");
+  auto cfg = Config::ParseFromYaml("net:\n  port: 70000\n");
   ASSERT_FALSE(cfg.has_value());
   // "line 2:9" is not guaranteed stable across yaml-cpp versions, so just
   // check that a "line" annotation is attached when available.
@@ -188,9 +188,55 @@ TEST(ConfigValidate, NegativeIntegerInUnsignedFieldRejected) {
 }
 
 TEST(ConfigValidate, IntegerOverflowOnNarrowFieldRejected) {
-  auto cfg = Config::ParseFromYaml("resp:\n  port: 99999999999\n");
+  auto cfg = Config::ParseFromYaml("net:\n  port: 99999999999\n");
   ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("resp.port"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("net.port"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsResumeAtOrAboveBackpressure) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+net:
+  write_resume_bytes: 4194304
+  write_backpressure_bytes: 4194304
+  write_hard_limit_bytes: 16777216
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("write_resume_bytes"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsBackpressureAtOrAboveHardLimit) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+net:
+  write_resume_bytes: 1048576
+  write_backpressure_bytes: 16777216
+  write_hard_limit_bytes: 16777216
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("write_backpressure_bytes"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroAcceptQueue) {
+  auto cfg = Config::ParseFromYaml("net:\n  accept_queue: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("net.accept_queue"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroShutdownGrace) {
+  auto cfg = Config::ParseFromYaml("net:\n  shutdown_grace_seconds: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("net.shutdown_grace_seconds"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroReaperTick) {
+  auto cfg = Config::ParseFromYaml("net:\n  reaper_tick_ms: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("net.reaper_tick_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, AcceptsZeroIoThreadsAsAuto) {
+  auto cfg = Config::ParseFromYaml("net:\n  io_threads: 0\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->net.io_threads, 0U);
 }
 
 }  // namespace

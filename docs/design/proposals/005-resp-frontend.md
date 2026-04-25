@@ -380,6 +380,17 @@ The `LOADING` gate is a frontend-level check before dispatch. It lifts automatic
 - Idle timeout: configurable, default 300s.
 - **Pipelining** — the parser is incremental: it returns one command plus bytes-consumed per invocation, and the caller loops until no progress. Pipelined requests are processed sequentially per connection; responses are written in arrival order. No special pipeline buffering is required beyond the per-connection socket buffer.
 
+#### TCP server implementation
+
+Implementation-level commentary on the listener that drives the per-connection `RequestPipeline`. The interface contract above is unchanged; this section records the choices a reviewer should expect to see in `include/abyss/net/`.
+
+- **Concurrency.** A pool of reactor threads, sized by the `net.io_threads` config (default `min(hardware_concurrency, 16)`). Each reactor owns a `Poller` (epoll on Linux, kqueue on macOS) and a sticky set of connections — connections do not migrate across reactors after accept. The shared `CommandDispatcher` (the tiering engine) handles the cross-reactor synchronisation. Phase 4 shared-nothing per-core (#59-#63) tightens reactor count to shard count and removes the shared dispatcher.
+- **Head-of-line trade-off.** `RequestPipeline::Dispatch` is synchronous from the reactor's view. A slow dispatch (group-commit fsync stall, cold-store p99 spike) blocks one reactor's other connections for the duration of that call, but not the other reactors. Operators tune `net.io_threads` to bound the blast radius of a single slow dispatch.
+- **Back-pressure.** Per-connection write buffer with three thresholds: `write_backpressure_bytes` (default 4 MiB) pauses reading on the connection; `write_resume_bytes` (default 1 MiB) re-enables it; `write_hard_limit_bytes` (default 16 MiB) closes the connection. TCP's own receive-window flow control then propagates the pressure back to the client. The pause/resume transitions are fd-level — the reactor disarms `kReadable` on the offending connection without affecting siblings.
+- **Shutdown grace.** `RequestStop` is non-blocking: it flips a flag and wakes every reactor. Each reactor disarms its listener registration (acceptor only), then continues to drain in-flight responses for `net.shutdown_grace_seconds` (default 30, aligned with Kubernetes' `terminationGracePeriodSeconds`). On expiry the reactor force-closes remaining connections with `reason=server_shutdown`. `Join` waits for every reactor to exit; the split mirrors the per-shard `RequestStop`/`Join` pattern from #94 — never call a blocking join inside a stop loop.
+- **Idle reaper.** A wall-clock-cheap sweep on every Poll-Wait cycle (default 1 s) closes connections whose `last_activity` is older than `idle_timeout`. Activity refers to either successful recv or successful send, so a client paused on back-pressure but still receiving the server's drain is not idle.
+- **Phase 4 migration path.** The `Poller` interface stays as the kernel-abstraction boundary; an `IoUringPoller` becomes a third backend without touching reactor or connection code. The reactor pool collapses to one reactor per shard, the connection-to-reactor binding moves from round-robin to key-hash, and the shared dispatcher decomposes into per-shard state — none of which require changes to the surface defined in this ADP.
+
 ### Configuration
 
 ```yaml

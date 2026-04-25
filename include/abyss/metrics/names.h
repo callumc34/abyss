@@ -69,6 +69,45 @@ constexpr std::string_view ToStringView(FlushReason r) noexcept {
   return {};
 }
 
+enum class CloseReason : uint8_t {
+  kClient,
+  kIdle,
+  kOversize,
+  kBackpressure,
+  kServerShutdown,
+};
+
+constexpr std::string_view ToStringView(CloseReason r) noexcept {
+  switch (r) {
+    case CloseReason::kClient:
+      return "client";
+    case CloseReason::kIdle:
+      return "idle";
+    case CloseReason::kOversize:
+      return "oversize";
+    case CloseReason::kBackpressure:
+      return "backpressure";
+    case CloseReason::kServerShutdown:
+      return "server_shutdown";
+  }
+  return {};
+}
+
+enum class RejectReason : uint8_t {
+  kMaxConnections,
+  kBindFamily,
+};
+
+constexpr std::string_view ToStringView(RejectReason r) noexcept {
+  switch (r) {
+    case RejectReason::kMaxConnections:
+      return "max_connections";
+    case RejectReason::kBindFamily:
+      return "bind_family";
+  }
+  return {};
+}
+
 // Command-name label value. Values are expected to be views into the command
 // registry; never client-supplied strings.
 struct CmdLabel {
@@ -99,6 +138,14 @@ struct LabelKeyOf<FlushReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<CloseReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
+struct LabelKeyOf<RejectReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
 struct LabelKeyOf<CmdLabel> {
   static constexpr LabelKey value = LabelKey::kCmd;
 };
@@ -112,6 +159,8 @@ struct LabelKeyOf<ShardLabel> {
 inline std::string ToLabelString(Tier t) { return std::string(ToStringView(t)); }
 inline std::string ToLabelString(FlushStatus s) { return std::string(ToStringView(s)); }
 inline std::string ToLabelString(FlushReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 
@@ -293,6 +342,56 @@ inline constexpr CounterDesc<> kEvictedTotal{
 inline constexpr CounterDesc<> kPromotionsTotal{
     .name = "abyss_promotions_total",
     .help = "Cold hits promoted back to the hot store.",
+};
+
+inline constexpr GaugeDesc<> kNetConnectionsActive{
+    .name = "abyss_net_connections_active",
+    .help = "Currently open TCP connections.",
+};
+
+inline constexpr CounterDesc<> kNetConnectionsAcceptedTotal{
+    .name = "abyss_net_connections_accepted_total",
+    .help = "TCP connections accepted since startup.",
+};
+
+inline constexpr CounterDesc<CloseReason> kNetConnectionsClosedTotal{
+    .name = "abyss_net_connections_closed_total",
+    .help = "TCP connections closed by server-observed reason.",
+};
+
+inline constexpr CounterDesc<RejectReason> kNetConnectionsRejectedTotal{
+    .name = "abyss_net_connections_rejected_total",
+    .help = "TCP accept attempts rejected before becoming a connection.",
+};
+
+inline constexpr CounterDesc<> kNetBytesInTotal{
+    .name = "abyss_net_bytes_in_total",
+    .help = "Bytes received from clients.",
+};
+
+inline constexpr CounterDesc<> kNetBytesOutTotal{
+    .name = "abyss_net_bytes_out_total",
+    .help = "Bytes sent to clients.",
+};
+
+inline constexpr GaugeDesc<> kNetReadBufferHighWaterBytes{
+    .name = "abyss_net_read_buffer_high_water_bytes",
+    .help = "Largest read-buffer size observed across active connections.",
+};
+
+inline constexpr GaugeDesc<> kNetBackpressureActive{
+    .name = "abyss_net_backpressure_active",
+    .help = "Connections currently paused for write back-pressure.",
+};
+
+inline constexpr CounterDesc<> kNetBackpressureEnteredTotal{
+    .name = "abyss_net_backpressure_entered_total",
+    .help = "Times a connection entered the back-pressure paused state.",
+};
+
+inline constexpr CounterDesc<> kNetBackpressureExitedTotal{
+    .name = "abyss_net_backpressure_exited_total",
+    .help = "Times a connection exited the back-pressure paused state.",
 };
 
 }  // namespace names

@@ -41,6 +41,17 @@
 - `abyss_cold_buffer_entries` — number of keys in compaction buffer
 - `abyss_cold_buffer_bytes` — estimated memory usage of compaction buffer
 
+### TCP server
+
+- `abyss_net_connections_active` (gauge) — currently open TCP connections
+- `abyss_net_connections_accepted_total` (counter) — connections accepted since startup
+- `abyss_net_connections_closed_total{reason}` (counter) — connections closed; `reason` ∈ `client | idle | oversize | backpressure | server_shutdown`
+- `abyss_net_connections_rejected_total{reason}` (counter) — accepts rejected before becoming a connection; `reason` ∈ `max_connections | bind_family`
+- `abyss_net_bytes_in_total` / `abyss_net_bytes_out_total` (counters) — wire-level traffic
+- `abyss_net_read_buffer_high_water_bytes` (gauge) — largest read-buffer size observed across active connections
+- `abyss_net_backpressure_active` (gauge) — connections currently paused for write back-pressure
+- `abyss_net_backpressure_entered_total` / `abyss_net_backpressure_exited_total` (counters) — back-pressure transitions
+
 ## Health Endpoints
 
 | Endpoint | Port | Purpose |

@@ -46,11 +46,19 @@ recovery:
   hot_replay_batch_size: 10000
   cold_replay_batch_size: 50000
 
-resp:
+net:
   bind: 0.0.0.0
   port: 6379
   max_connections: 1024
   idle_timeout_seconds: 300
+  io_threads: 0                       # 0 = auto: min(hardware_concurrency, 16)
+  accept_queue: 128
+  max_read_buffer_bytes: 67108864     # 64 MiB
+  write_backpressure_bytes: 4194304   # 4 MiB — pause reading
+  write_resume_bytes: 1048576         # 1 MiB — resume reading
+  write_hard_limit_bytes: 16777216    # 16 MiB — close
+  shutdown_grace_seconds: 30
+  reaper_tick_ms: 1000
 
 metrics:
   enabled: true

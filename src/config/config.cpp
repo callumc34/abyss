@@ -108,12 +108,20 @@ core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
       .Finish();
 }
 
-core::Result<void> ParseResp(const YamlCursor& cur, RespConfig& out) {
+core::Result<void> ParseNet(const YamlCursor& cur, NetConfig& out) {
   return SectionDecoder(cur)
       .Optional("bind", out.bind)
       .Optional("port", out.port)
       .Optional("max_connections", out.max_connections)
       .Optional("idle_timeout_seconds", out.idle_timeout)
+      .Optional("io_threads", out.io_threads)
+      .Optional("accept_queue", out.accept_queue)
+      .Optional("max_read_buffer_bytes", out.max_read_buffer_bytes)
+      .Optional("write_backpressure_bytes", out.write_backpressure_bytes)
+      .Optional("write_resume_bytes", out.write_resume_bytes)
+      .Optional("write_hard_limit_bytes", out.write_hard_limit_bytes)
+      .Optional("shutdown_grace_seconds", out.shutdown_grace)
+      .Optional("reaper_tick_ms", out.reaper_tick)
       .Finish();
 }
 
@@ -222,7 +230,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
   if (auto r = root_cur.RequireMap(); !r) return std::unexpected(r.error());
   if (auto r = root_cur.RejectUnknownKeys({"profile", "hot", "cold", "queue", "hot_consumer",
                                            "cold_consumer", "consumer_rpc", "engine", "recovery",
-                                           "resp", "metrics", "admin", "log"});
+                                           "net", "metrics", "admin", "log"});
       !r) {
     return std::unexpected(r.error());
   }
@@ -251,7 +259,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
        [](const YamlCursor& c, Config& cfg) { return ParseConsumerRpc(c, cfg.consumer_rpc); }},
       {"engine", [](const YamlCursor& c, Config& cfg) { return ParseEngine(c, cfg.engine); }},
       {"recovery", [](const YamlCursor& c, Config& cfg) { return ParseRecovery(c, cfg.recovery); }},
-      {"resp", [](const YamlCursor& c, Config& cfg) { return ParseResp(c, cfg.resp); }},
+      {"net", [](const YamlCursor& c, Config& cfg) { return ParseNet(c, cfg.net); }},
       {"metrics", [](const YamlCursor& c, Config& cfg) { return ParseMetrics(c, cfg.metrics); }},
       {"admin", [](const YamlCursor& c,
                    Config& cfg) { return ParseBindPort(c, cfg.admin.bind, cfg.admin.port); }},

@@ -88,7 +88,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (port_override.has_value()) config.resp.port = *port_override;
+  if (port_override.has_value()) config.net.port = *port_override;
   if (shard_count_override.has_value()) config.hot.shard_count = *shard_count_override;
 
   if (auto r = config.Validate(); !r.has_value()) {
@@ -101,8 +101,8 @@ int main(int argc, char* argv[]) {
 
   ABYSS_LOG_INFO(bootstrap_logger, "abyss starting", {"version", std::string_view{abyss::kVersion}},
                  {"profile", std::string_view{config.profile}},
-                 {"bind", std::string_view{config.resp.bind}},
-                 {"port", static_cast<int64_t>(config.resp.port)},
+                 {"bind", std::string_view{config.net.bind}},
+                 {"port", static_cast<int64_t>(config.net.port)},
                  {"config_path",
                   resolved.empty() ? std::string_view{"<defaults>"} : std::string_view{resolved}});
 

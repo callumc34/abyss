@@ -56,11 +56,19 @@ recovery:
   hot_replay_batch_size: 10000
   cold_replay_batch_size: 50000
 
-resp:
+net:
   bind: 0.0.0.0
   port: 6379
   max_connections: 1024
   idle_timeout_seconds: 300
+  io_threads: 4
+  accept_queue: 256
+  max_read_buffer_bytes: 67108864
+  write_backpressure_bytes: 4194304
+  write_resume_bytes: 1048576
+  write_hard_limit_bytes: 16777216
+  shutdown_grace_seconds: 30
+  reaper_tick_ms: 1000
 
 metrics:
   bind: 0.0.0.0
@@ -116,10 +124,18 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->recovery.hot_replay_batch_size, 10000U);
   EXPECT_EQ(cfg->recovery.cold_replay_batch_size, 50000U);
 
-  EXPECT_EQ(cfg->resp.bind, "0.0.0.0");
-  EXPECT_EQ(cfg->resp.port, 6379);
-  EXPECT_EQ(cfg->resp.max_connections, 1024U);
-  EXPECT_EQ(cfg->resp.idle_timeout, std::chrono::seconds{300});
+  EXPECT_EQ(cfg->net.bind, "0.0.0.0");
+  EXPECT_EQ(cfg->net.port, 6379);
+  EXPECT_EQ(cfg->net.max_connections, 1024U);
+  EXPECT_EQ(cfg->net.idle_timeout, std::chrono::seconds{300});
+  EXPECT_EQ(cfg->net.io_threads, 4U);
+  EXPECT_EQ(cfg->net.accept_queue, 256U);
+  EXPECT_EQ(cfg->net.max_read_buffer_bytes, 67108864U);
+  EXPECT_EQ(cfg->net.write_backpressure_bytes, 4194304U);
+  EXPECT_EQ(cfg->net.write_resume_bytes, 1048576U);
+  EXPECT_EQ(cfg->net.write_hard_limit_bytes, 16777216U);
+  EXPECT_EQ(cfg->net.shutdown_grace, std::chrono::seconds{30});
+  EXPECT_EQ(cfg->net.reaper_tick, std::chrono::milliseconds{1000});
 
   EXPECT_EQ(cfg->metrics.bind, "0.0.0.0");
   EXPECT_EQ(cfg->metrics.port, 9090);
@@ -138,13 +154,13 @@ TEST(ConfigParse, MissingSectionsUseDefaults) {
 
 TEST(ConfigParse, PartialSectionUsesDefaultsForOmittedFields) {
   auto cfg = Config::ParseFromYaml(R"YAML(
-resp:
+net:
   port: 6400
 )YAML");
   ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
-  EXPECT_EQ(cfg->resp.port, 6400);
-  EXPECT_EQ(cfg->resp.bind, Config::Defaults().resp.bind);
-  EXPECT_EQ(cfg->resp.max_connections, Config::Defaults().resp.max_connections);
+  EXPECT_EQ(cfg->net.port, 6400);
+  EXPECT_EQ(cfg->net.bind, Config::Defaults().net.bind);
+  EXPECT_EQ(cfg->net.max_connections, Config::Defaults().net.max_connections);
 }
 
 TEST(ConfigParse, YamlParseErrorProducesActionableMessage) {
