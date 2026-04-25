@@ -3,9 +3,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <thread>
-#include <vector>
 
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
@@ -14,22 +11,14 @@
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/net/tcp_server.h"
 #include "abyss/queue/wal_queue.h"
+#include "abyss/resp/metrics.h"
+#include "abyss/resp/node_identity.h"
+#include "providers.h"
 
 #ifdef ABYSS_HAVE_ROCKSDB
 #include "abyss/cold/backends/rocksdb_store.h"
-#endif
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-using socket_t = SOCKET;
-constexpr socket_t kInvalidSocket = INVALID_SOCKET;
-#else
-using socket_t = int;
-constexpr socket_t kInvalidSocket = -1;
 #endif
 
 namespace abyss::server {
@@ -53,10 +42,7 @@ class Server {
   void set_ready_fd(intptr_t fd) { ready_fd_ = fd; }
 
  private:
-  bool SetupListener();
   void NotifyReady();
-  void HandleConnection(socket_t client_fd, std::atomic<bool>& finished);
-  void CleanFinishedConnections();
 
   config::Config config_;
 
@@ -73,19 +59,18 @@ class Server {
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 
-  socket_t listen_fd_ = kInvalidSocket;
+  // Frontend providers — outlive the TCP server.
+  std::unique_ptr<resp::NodeIdentity> node_identity_;
+  std::unique_ptr<ServerStatsImpl> stats_;
+  std::unique_ptr<ConfigProviderImpl> config_provider_;
+  std::unique_ptr<LoadingStateImpl> loading_;
+  std::unique_ptr<resp::RespMetrics> resp_metrics_;
+
+  std::unique_ptr<net::TcpServer> tcp_server_;
+
   intptr_t ready_fd_ = -1;
   std::atomic<bool> ready_{false};
   std::atomic<bool> shutting_down_{false};
-  std::atomic<uint64_t> next_client_id_{1};
-
-  struct TrackedConnection {
-    std::thread thread;
-    socket_t fd = kInvalidSocket;
-    std::atomic<bool> finished{false};
-  };
-  std::mutex connections_mutex_;
-  std::vector<std::unique_ptr<TrackedConnection>> connections_;
 };
 
 }  // namespace abyss::server

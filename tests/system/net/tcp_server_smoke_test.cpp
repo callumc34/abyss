@@ -23,7 +23,8 @@ class TcpServerSmokeTest : public ::testing::Test {
     cfg.reaper_tick = std::chrono::milliseconds{100};
     cfg.connection.idle_timeout = std::chrono::seconds{30};
 
-    server_ = std::make_unique<TcpServer>(cfg, resp::GlobalRegistry(), harness_.Engine());
+    server_ = std::make_unique<TcpServer>(
+        cfg, resp::GlobalRegistry(), resp::PipelineDependencies{.dispatcher = &harness_.Engine()});
     ASSERT_TRUE(server_->Start().has_value());
     ASSERT_TRUE(client_.Connect(server_->BoundPort()));
   }

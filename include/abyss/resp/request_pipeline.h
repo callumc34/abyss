@@ -20,14 +20,14 @@ class NodeIdentity;
 class RespMetrics;
 class ServerStatsProvider;
 
-// Per-connection state maintained by the frontend. Not persisted.
 struct ConnectionState {
   uint64_t client_id = 0;
   std::string client_name;
-  int protocol_version = 2;  // RESP2 only.
+  uint8_t protocol_version = 2;
 };
 
-// Nullable non-owning pointers; unconfigured services yield a client error.
+// Non-owning. A null required dependency surfaces as ERR internal server error
+// (logged at ERROR); see RequestPipeline::InternalServerError.
 struct PipelineDependencies {
   core::CommandDispatcher* dispatcher = nullptr;
   const LoadingStateProvider* loading = nullptr;
@@ -51,7 +51,6 @@ class RequestPipeline {
   RequestPipeline(RequestPipeline&&) = delete;
   RequestPipeline& operator=(RequestPipeline&&) = delete;
 
-  // Signals whether the connection should be closed after this batch.
   struct ProcessResult {
     size_t bytes_consumed = 0;
     bool close_requested = false;
@@ -71,19 +70,26 @@ class RequestPipeline {
   };
 
   DispatchOutcome DispatchImpl(const core::RespCommand& cmd);
-  DispatchOutcome DispatchKnown(const CommandSpec& spec, const core::RespCommand& cmd);
-  DispatchOutcome HandleAdminStateless(const CommandSpec& spec, const core::RespCommand& cmd);
+  DispatchOutcome DispatchResolved(const ResolvedCommand& resolved, const core::RespCommand& cmd);
+  DispatchOutcome HandleAdminStateless(const ResolvedCommand& resolved,
+                                       const core::RespCommand& cmd);
 
   core::RespValue HandlePing(const core::RespCommand& cmd);
   core::RespValue HandleEcho(const core::RespCommand& cmd);
-  core::RespValue HandleHello(const core::RespCommand& cmd);
-  core::RespValue HandleQuit(const core::RespCommand& cmd);
-  core::RespValue HandleTime(const core::RespCommand& cmd);
-  core::RespValue HandleClient(const core::RespCommand& cmd);
-  core::RespValue HandleReset(const core::RespCommand& cmd);
+  DispatchOutcome HandleHello(const CommandSpec& spec, const core::RespCommand& cmd);
+  core::RespValue HandleQuit();
+  core::RespValue HandleTime();
+  core::RespValue HandleClient(std::string_view subcommand, const core::RespCommand& cmd);
+  core::RespValue HandleReset();
 
-  static core::RespValue MakeUnsupported(std::string_view category, std::string_view cmd_name);
+  // Logs `context` at ERROR; returns ERR internal server error to the wire so
+  // dependency identity isn't leaked to clients.
+  core::RespValue InternalServerError(std::string_view context, std::string_view cmd_name);
+
   static core::RespValue MakeLoading();
+  static core::RespValue MakeUnknownCommand(std::string_view name, std::string_view first_arg);
+  static core::RespValue MakeArityError(const ResolvedCommand& resolved);
+  static core::RespValue MakeUnknownSubcommand(const CommandSpec& parent, std::string_view raw_sub);
 
   const CommandRegistry& registry_;
   Dependencies deps_;

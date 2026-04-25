@@ -80,7 +80,7 @@ NetMetrics NetMetrics::Register() {
 
 Connection::Connection(Fd fd, uint32_t remote_ipv4, uint16_t remote_port, uint64_t client_id,
                        Poller& poller, const resp::CommandRegistry& registry,
-                       core::CommandDispatcher& dispatcher, ConnectionConfig config,
+                       resp::PipelineDependencies deps, ConnectionConfig config,
                        NetMetrics& net_metrics, core::SteadyClockFn clock)
     : fd_(std::move(fd)),
       remote_ipv4_(remote_ipv4),
@@ -91,8 +91,7 @@ Connection::Connection(Fd fd, uint32_t remote_ipv4, uint16_t remote_port, uint64
       metrics_(net_metrics),
       clock_(std::move(clock)),
       pipeline_(std::make_unique<resp::RequestPipeline>(
-          registry, resp::ConnectionState{.client_id = client_id, .protocol_version = 2},
-          &dispatcher)),
+          registry, resp::ConnectionState{.client_id = client_id, .protocol_version = 2}, deps)),
       last_activity_(clock_()) {
   metrics_.connections_active.Increment();
   metrics_.connections_accepted.Increment();

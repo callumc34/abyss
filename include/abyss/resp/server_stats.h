@@ -15,6 +15,10 @@ struct ServerStats {
   uint16_t tcp_port = 0;
   std::string_view version;
   std::string_view bind_address;
+
+  // Falls back to bind_address when empty. Set this when bind is wildcard.
+  std::string_view advertise_address;
+
   std::string_view mode;  // "standalone" or "cluster"
   std::string_view role;  // "master"
 };

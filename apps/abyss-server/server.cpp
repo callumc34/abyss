@@ -1,25 +1,23 @@
 #include "server.h"
 
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <thread>
+#include <utility>
+#include <vector>
+
 #ifdef _WIN32
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
+#include <windows.h>
 #else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
-#include <cerrno>
-#include <cstring>
-#include <filesystem>
-#include <string>
-#include <utility>
-
 #include "abyss/log/log.h"
-#include "abyss/resp/request_pipeline.h"
+#include "abyss/resp/command_registry.h"
 #include "abyss/version.h"
 
 namespace abyss::server {
@@ -30,35 +28,9 @@ const log::Logger& ServerLog() {
   static const log::Logger l = log::Get("abyss.server");
   return l;
 }
-const log::Logger& ListenerLog() {
-  static const log::Logger l = log::Get("abyss.server.listener");
-  return l;
-}
-const log::Logger& ConnLog() {
-  static const log::Logger l = log::Get("abyss.server.conn");
-  return l;
-}
 
-inline int CloseSocket(socket_t s) {
-#ifdef _WIN32
-  return closesocket(s);
-#else
-  return close(s);
-#endif
-}
+constexpr std::chrono::milliseconds kStopPollInterval{100};
 
-#ifdef _WIN32
-constexpr int kShutdownRdwr = SD_BOTH;
-#else
-constexpr int kShutdownRdwr = SHUT_RDWR;
-#endif
-#ifdef _WIN32
-std::string GetSocketError() { return std::to_string(WSAGetLastError()); }
-bool IsSocketInterrupted() { return WSAGetLastError() == WSAEINTR; }
-#else
-std::string GetSocketError() { return std::strerror(errno); }
-bool IsSocketInterrupted() { return errno == EINTR; }
-#endif
 }  // namespace
 
 Server::Server(config::Config config) : config_(std::move(config)) {}
@@ -66,14 +38,6 @@ Server::Server(config::Config config) : config_(std::move(config)) {}
 Server::~Server() { Shutdown(); }
 
 bool Server::Initialize() {
-#ifdef _WIN32
-  WSADATA wsa_data;
-  if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "WSAStartup failed");
-    return false;
-  }
-#endif
-
   std::error_code ec;
   std::filesystem::create_directories(config_.queue.wal_path, ec);
   if (ec) {
@@ -202,61 +166,87 @@ bool Server::Initialize() {
   cold_pool_->Start();
 #endif
 
+  auto identity = resp::NodeIdentity::Open(config_.queue.wal_path);
+  if (!identity.has_value()) {
+    ABYSS_LOG_CRITICAL(ServerLog(), "node identity load failed",
+                       {"err", std::string_view{identity.error().message()}});
+    return false;
+  }
+  node_identity_ = std::make_unique<resp::NodeIdentity>(std::move(*identity));
+
+  core::ColdStore* cold_ptr = nullptr;
+#ifdef ABYSS_HAVE_ROCKSDB
+  cold_ptr = cold_store_.get();
+#endif
+
+  stats_ = std::make_unique<ServerStatsImpl>(*queue_, *hot_store_, cold_ptr, std::string{kVersion},
+                                             config_.net.bind,
+                                             /*advertise_address=*/std::string{},
+                                             /*mode=*/"standalone", config_.net.port);
+  config_provider_ = std::make_unique<ConfigProviderImpl>(config_);
+  loading_ = std::make_unique<LoadingStateImpl>(
+      [q = queue_.get()] { return q != nullptr && q->IsRecovering(); });
+  resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
+
+  // The dispatcher (engine_) stays unwired in the pipeline until the consumer
+  // surfaces typed write returns; wiring it today would reply +OK to
+  // SADD/ZADD/etc. instead of the integer count clients expect. Admin
+  // providers are fully wired so INFO, CLUSTER, CONFIG, and COMMAND function.
+  resp::PipelineDependencies pipeline_deps{
+      .dispatcher = nullptr,
+      .loading = loading_.get(),
+      .stats = stats_.get(),
+      .config = config_provider_.get(),
+      .identity = node_identity_.get(),
+      .metrics = resp_metrics_.get(),
+  };
+
+  net::TcpServerConfig tcp_config{
+      .bind = config_.net.bind,
+      .port = config_.net.port,
+      .max_connections = config_.net.max_connections,
+      .accept_queue = config_.net.accept_queue,
+      .io_threads = config_.net.io_threads,
+      .connection =
+          net::ConnectionConfig{
+              .max_read_buffer_bytes = config_.net.max_read_buffer_bytes,
+              .write_backpressure_bytes = config_.net.write_backpressure_bytes,
+              .write_resume_bytes = config_.net.write_resume_bytes,
+              .write_hard_limit_bytes = config_.net.write_hard_limit_bytes,
+              .idle_timeout = config_.net.idle_timeout,
+          },
+      .shutdown_grace = config_.net.shutdown_grace,
+      .reaper_tick = config_.net.reaper_tick,
+  };
+  tcp_server_ = std::make_unique<net::TcpServer>(tcp_config, resp::GlobalRegistry(), pipeline_deps);
+
   ready_.store(true, std::memory_order_release);
   ABYSS_LOG_INFO(ServerLog(), "server ready",
                  {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
   return true;
 }
 
-bool Server::SetupListener() {
-  listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd_ == kInvalidSocket) {
-    ABYSS_LOG_CRITICAL(ListenerLog(), "socket creation failed", {"err", GetSocketError()});
-    return false;
+void Server::Run(const std::atomic<bool>& stop) {
+  if (!tcp_server_) return;
+  if (auto r = tcp_server_->Start(); !r.has_value()) {
+    ABYSS_LOG_CRITICAL(ServerLog(), "tcp server start failed",
+                       {"err", std::string_view{r.error().message()}});
+    return;
   }
 
-  int on = 1;
-  setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on), sizeof(on));
+  config_.net.port = tcp_server_->BoundPort();
+  if (stats_) stats_->SetTcpPort(config_.net.port);
 
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  if (config_.net.bind == "0.0.0.0") {
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  } else {
-    inet_pton(AF_INET, config_.net.bind.c_str(), &addr.sin_addr);
-  }
-  addr.sin_port = htons(config_.net.port);
+  NotifyReady();
+  ABYSS_LOG_INFO(ServerLog(), "listening", {"version", std::string_view{kVersion}},
+                 {"bind", std::string_view{config_.net.bind}},
+                 {"port", static_cast<int64_t>(config_.net.port)});
 
-  if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    ABYSS_LOG_CRITICAL(ListenerLog(), "bind failed", {"bind", std::string_view{config_.net.bind}},
-                       {"port", static_cast<int64_t>(config_.net.port)}, {"err", GetSocketError()});
-    CloseSocket(listen_fd_);
-    listen_fd_ = kInvalidSocket;
-    return false;
+  while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning()) {
+    std::this_thread::sleep_for(kStopPollInterval);
   }
 
-  sockaddr_in bound_addr{};
-#ifdef _WIN32
-  int bound_len = sizeof(bound_addr);
-#else
-  socklen_t bound_len = sizeof(bound_addr);
-#endif
-  if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound_addr), &bound_len) < 0) {
-    ABYSS_LOG_CRITICAL(ListenerLog(), "getsockname failed", {"err", GetSocketError()});
-    CloseSocket(listen_fd_);
-    listen_fd_ = kInvalidSocket;
-    return false;
-  }
-  config_.net.port = ntohs(bound_addr.sin_port);
-
-  if (listen(listen_fd_, 128) < 0) {
-    ABYSS_LOG_CRITICAL(ListenerLog(), "listen failed", {"err", GetSocketError()});
-    CloseSocket(listen_fd_);
-    listen_fd_ = kInvalidSocket;
-    return false;
-  }
-
-  return true;
+  Shutdown();
 }
 
 void Server::NotifyReady() {
@@ -291,194 +281,18 @@ void Server::NotifyReady() {
   ready_fd_ = -1;
 }
 
-void Server::Run(const std::atomic<bool>& stop) {
-  if (!SetupListener()) return;
-
-  NotifyReady();
-  ABYSS_LOG_INFO(ListenerLog(), "listening", {"version", std::string_view{kVersion}},
-                 {"bind", std::string_view{config_.net.bind}},
-                 {"port", static_cast<int64_t>(config_.net.port)});
-
-  bool saturated = false;
-
-  while (!stop.load(std::memory_order_acquire)) {
-    pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
-
-#ifdef _WIN32
-    int ret = WSAPoll(&pfd, 1, 100);
-#else
-    int ret = poll(&pfd, 1, 100);
-#endif
-
-    if (ret < 0) {
-      if (IsSocketInterrupted()) continue;
-      ABYSS_LOG_ERROR(ListenerLog(), "poll failed", {"err", GetSocketError()});
-      break;
-    }
-    if (ret == 0) continue;
-
-    sockaddr_in client_addr{};
-#ifdef _WIN32
-    int client_len = sizeof(client_addr);
-    socket_t client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-    if (client_fd == kInvalidSocket) {
-#else
-    socklen_t client_len = sizeof(client_addr);
-    socket_t client_fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-    if (client_fd == kInvalidSocket) {
-#endif
-      if (IsSocketInterrupted()) continue;
-      ABYSS_LOG_ERROR(ListenerLog(), "accept failed", {"err", GetSocketError()});
-      break;
-    }
-
-    int on = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof(on));
-
-#ifndef _WIN32
-#ifdef __APPLE__
-    setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
-#endif
-#endif
-
-    CleanFinishedConnections();
-
-    {
-      std::lock_guard lock(connections_mutex_);
-      if (connections_.size() >= config_.net.max_connections) {
-        if (!saturated) {
-          saturated = true;
-          ABYSS_LOG_WARN(ListenerLog(), "max_connections reached; rejecting new clients",
-                         {"limit", static_cast<int64_t>(config_.net.max_connections)});
-        }
-        CloseSocket(client_fd);
-        continue;
-      }
-      if (saturated) {
-        saturated = false;
-        ABYSS_LOG_INFO(ListenerLog(), "connection pressure cleared",
-                       {"in_use", static_cast<int64_t>(connections_.size())});
-      }
-
-      auto conn = std::make_unique<TrackedConnection>();
-      conn->fd = client_fd;
-      auto& ref = *conn;
-      conn->thread =
-          std::thread(&Server::HandleConnection, this, client_fd, std::ref(ref.finished));
-      connections_.push_back(std::move(conn));
-    }
-  }
-
-  Shutdown();
-}
-
-void Server::HandleConnection(socket_t client_fd, std::atomic<bool>& finished) {
-  const auto client_id = next_client_id_.fetch_add(1);
-  resp::ConnectionState state{
-      .client_id = client_id,
-      .client_name = {},
-      .protocol_version = 2,
-  };
-  const auto& registry = resp::GlobalRegistry();
-  // NOLINTNEXTLINE(misc-const-correctness)
-  resp::RequestPipeline pipeline(registry, state);
-
-  ABYSS_LOG_DEBUG(ConnLog(), "client connected", {"client_id", static_cast<uint64_t>(client_id)});
-
-  std::vector<uint8_t> read_buf(4096);
-  std::vector<uint8_t> pending;
-  std::vector<uint8_t> output;
-
-  for (;;) {
-    auto n = recv(client_fd, reinterpret_cast<char*>(read_buf.data()),
-                  static_cast<int>(read_buf.size()), 0);
-    if (n <= 0) break;
-
-    pending.insert(pending.end(), read_buf.begin(), read_buf.begin() + n);
-    output.clear();
-
-    auto result = pipeline.Process(pending, output);
-
-    if (result.bytes_consumed > 0) {
-      pending.erase(pending.begin(),
-                    pending.begin() + static_cast<ptrdiff_t>(result.bytes_consumed));
-    }
-
-    if (!output.empty()) {
-      size_t sent = 0;
-      while (sent < output.size()) {
-        auto w = send(client_fd, reinterpret_cast<const char*>(output.data() + sent),
-                      static_cast<int>(output.size() - sent), 0);
-        if (w <= 0) break;
-        sent += static_cast<size_t>(w);
-      }
-      if (sent < output.size()) break;
-    }
-
-    if (result.close_requested) break;
-  }
-
-  CloseSocket(client_fd);
-  ABYSS_LOG_DEBUG(ConnLog(), "client disconnected",
-                  {"client_id", static_cast<uint64_t>(client_id)});
-  finished.store(true, std::memory_order_release);
-}
-
-void Server::CleanFinishedConnections() {
-  std::lock_guard lock(connections_mutex_);
-  auto it = connections_.begin();
-  while (it != connections_.end()) {
-    if ((*it)->finished.load(std::memory_order_acquire)) {
-      (*it)->thread.join();
-      it = connections_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
-
 void Server::Shutdown() {
   if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
   ABYSS_LOG_INFO(ServerLog(), "shutdown starting");
 
-  if (listen_fd_ != kInvalidSocket) {
-    CloseSocket(listen_fd_);
-    listen_fd_ = kInvalidSocket;
-  }
-
-  size_t draining = 0;
-  {
-    std::lock_guard lock(connections_mutex_);
-    for (auto& conn : connections_) {
-      if (!conn->finished.load(std::memory_order_acquire)) {
-        ::shutdown(conn->fd, kShutdownRdwr);
-        ++draining;
-      }
-    }
-  }
-  if (draining > 0) {
-    ABYSS_LOG_INFO(ServerLog(), "draining in-flight connections",
-                   {"count", static_cast<int64_t>(draining)});
-  }
-
-  {
-    std::lock_guard lock(connections_mutex_);
-    for (auto& conn : connections_) {
-      if (conn->thread.joinable()) {
-        conn->thread.join();
-      }
-    }
-    connections_.clear();
+  if (tcp_server_) {
+    tcp_server_->Stop();
   }
 
   if (cold_pool_) cold_pool_->Stop();
   if (hot_pool_) hot_pool_->Stop();
   if (hot_eviction_worker_) hot_eviction_worker_->Stop();
-
-#ifdef _WIN32
-  WSACleanup();
-#endif
 
   ready_.store(false, std::memory_order_release);
   ABYSS_LOG_INFO(ServerLog(), "shutdown complete");

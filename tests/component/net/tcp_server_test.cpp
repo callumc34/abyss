@@ -53,12 +53,12 @@ TEST(TcpServerComponentTest, BindFailureSurfacesAsError) {
   TcpServerConfig good = DefaultTestConfig();
   good.port = 0;
   StubDispatcher dispatcher;
-  TcpServer s1(good, resp::GlobalRegistry(), dispatcher);
+  TcpServer s1(good, resp::GlobalRegistry(), resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(s1.Start().has_value());
 
   TcpServerConfig dup = DefaultTestConfig();
   dup.port = s1.BoundPort();
-  TcpServer s2(dup, resp::GlobalRegistry(), dispatcher);
+  TcpServer s2(dup, resp::GlobalRegistry(), resp::PipelineDependencies{.dispatcher = &dispatcher});
   auto r = s2.Start();
   EXPECT_FALSE(r.has_value());
 
@@ -67,7 +67,8 @@ TEST(TcpServerComponentTest, BindFailureSurfacesAsError) {
 
 TEST(TcpServerComponentTest, PingRoundTrip) {
   StubDispatcher dispatcher;
-  TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(), dispatcher);
+  TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   component_test::SyncRedisClient client;
@@ -80,7 +81,8 @@ TEST(TcpServerComponentTest, PingRoundTrip) {
 
 TEST(TcpServerComponentTest, GetAndSetExerciseDispatcher) {
   StubDispatcher dispatcher;
-  TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(), dispatcher);
+  TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   component_test::SyncRedisClient client;
@@ -95,7 +97,8 @@ TEST(TcpServerComponentTest, GetAndSetExerciseDispatcher) {
 
 TEST(TcpServerComponentTest, PipeliningPreservesOrder) {
   StubDispatcher dispatcher;
-  TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(), dispatcher);
+  TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   component_test::SyncRedisClient client;
@@ -128,7 +131,8 @@ TEST(TcpServerComponentTest, StopJoinIsBoundedWithActiveConnections) {
   cfg.shutdown_grace = std::chrono::seconds{1};
   cfg.io_threads = 4;
   StubDispatcher dispatcher;
-  TcpServer server(cfg, resp::GlobalRegistry(), dispatcher);
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   std::vector<component_test::SyncRedisClient> clients(8);
@@ -147,7 +151,8 @@ TEST(TcpServerComponentTest, MaxConnectionsRejectsNewClients) {
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.max_connections = 2;
   StubDispatcher dispatcher;
-  TcpServer server(cfg, resp::GlobalRegistry(), dispatcher);
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   component_test::SyncRedisClient c1;
@@ -176,7 +181,8 @@ TEST(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
   StubDispatcher dispatcher;
   // Payload large enough to overflow loopback kernel buffers on every platform.
   dispatcher.read_payload.assign(4 * 1024 * 1024, 'z');
-  TcpServer server(cfg, resp::GlobalRegistry(), dispatcher);
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   component_test::SyncRedisClient slow;
@@ -210,7 +216,8 @@ TEST(TcpServerComponentTest, AcceptBurstHandledWithoutDrops) {
   cfg.max_connections = 64;
   cfg.io_threads = 2;
   StubDispatcher dispatcher;
-  TcpServer server(cfg, resp::GlobalRegistry(), dispatcher);
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   std::vector<component_test::SyncRedisClient> clients(16);
@@ -230,7 +237,8 @@ TEST(TcpServerComponentTest, IdleConnectionsClosedByReaper) {
   cfg.connection.idle_timeout = std::chrono::seconds{1};
   cfg.reaper_tick = std::chrono::milliseconds{100};
   StubDispatcher dispatcher;
-  TcpServer server(cfg, resp::GlobalRegistry(), dispatcher);
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
   component_test::SyncRedisClient client;

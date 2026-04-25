@@ -61,7 +61,7 @@ TEST(ConnectionOversizeTest, ClosesOnReadBufferOverflow) {
       .idle_timeout = std::chrono::seconds{60},
   };
   Connection conn(std::move(pair.server), 0, 0, /*client_id=*/1, poller, resp::GlobalRegistry(),
-                  dispatcher, config, metrics);
+                  resp::PipelineDependencies{.dispatcher = &dispatcher}, config, metrics);
   ASSERT_TRUE(conn.Arm().has_value());
 
   // Bytes that don't form a complete RESP command — parser can't drain.
@@ -97,8 +97,8 @@ TEST(ConnectionOversizeTest, RecordsHighWaterAcrossReads) {
       .write_hard_limit_bytes = 16384,
       .idle_timeout = std::chrono::seconds{60},
   };
-  Connection conn(std::move(pair.server), 0, 0, 1, poller, resp::GlobalRegistry(), dispatcher,
-                  config, metrics);
+  Connection conn(std::move(pair.server), 0, 0, 1, poller, resp::GlobalRegistry(),
+                  resp::PipelineDependencies{.dispatcher = &dispatcher}, config, metrics);
   ASSERT_TRUE(conn.Arm().has_value());
 
   // Truncated frame: bytes stay in read_buf_ so high-water lifts.

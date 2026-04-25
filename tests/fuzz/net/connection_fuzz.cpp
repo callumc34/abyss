@@ -16,6 +16,7 @@
 #include "abyss/net/poller.h"
 #include "abyss/net/socket_ops.h"
 #include "abyss/resp/command_registry.h"
+#include "abyss/resp/request_pipeline.h"
 
 namespace {
 
@@ -75,8 +76,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
       .idle_timeout = std::chrono::seconds{60},
   };
 
-  abyss::net::Connection conn(abyss::net::Fd(sv[0]), 0, 0, /*client_id=*/1, poller,
-                              abyss::resp::GlobalRegistry(), dispatcher, config, metrics);
+  abyss::net::Connection conn(
+      abyss::net::Fd(sv[0]), 0, 0, /*client_id=*/1, poller, abyss::resp::GlobalRegistry(),
+      abyss::resp::PipelineDependencies{.dispatcher = &dispatcher}, config, metrics);
   // NOLINTNEXTLINE(bugprone-unused-return-value)
   (void)conn.Arm();
 

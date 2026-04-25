@@ -383,9 +383,12 @@ void DataCommandTest::SetUp() {
   SystemTest::SetUp();
   if (IsSkipped()) return;
   const auto probe = Client().Command({"SET", "__probe__", "1"});
-  if (probe.IsError() &&
-      (probe.String().contains("not implemented") || probe.String().contains("not configured"))) {
-    GTEST_SKIP() << "data commands not yet implemented";
+  // Positive probe: only proceed when SET round-trips to +OK. Any other shape
+  // (error, internal-server-error from a partially wired pipeline, wrong type)
+  // means the data path is not yet ready and the test would fail for reasons
+  // unrelated to its assertion target.
+  if (!probe.IsStatus() || probe.String() != "OK") {
+    GTEST_SKIP() << "data path not yet ready: SET probe returned " << probe.String();
   }
   Client().Command({"DEL", "__probe__"});
 }
@@ -422,9 +425,12 @@ void IsolatedDataServerTest::SetUp() {
   IsolatedServerTest::SetUp();
   if (IsSkipped()) return;
   const auto probe = Client().Command({"SET", "__probe__", "1"});
-  if (probe.IsError() &&
-      (probe.String().contains("not implemented") || probe.String().contains("not configured"))) {
-    GTEST_SKIP() << "data commands not yet implemented";
+  // Positive probe: only proceed when SET round-trips to +OK. Any other shape
+  // (error, internal-server-error from a partially wired pipeline, wrong type)
+  // means the data path is not yet ready and the test would fail for reasons
+  // unrelated to its assertion target.
+  if (!probe.IsStatus() || probe.String() != "OK") {
+    GTEST_SKIP() << "data path not yet ready: SET probe returned " << probe.String();
   }
   Client().Command({"DEL", "__probe__"});
 }

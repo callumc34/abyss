@@ -1,10 +1,11 @@
 #include "abyss/resp/command_registry.h"
 
 #include <array>
-#include <cctype>
 #include <cstddef>
 #include <span>
 #include <string>
+
+#include "abyss/core/ascii.h"
 
 namespace abyss::resp {
 namespace {
@@ -12,22 +13,188 @@ namespace {
 using C = CommandClass;
 using D = Dispatch;
 
+constexpr std::array<SubcommandSpec, 4> kClientSubs{{
+    {.name = "ID",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns the connection's client ID.",
+              .since = "5.0.0",
+              .group = "connection",
+              .complexity = "O(1)"}},
+    {.name = "GETNAME",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns the connection's name.",
+              .since = "2.6.9",
+              .group = "connection",
+              .complexity = "O(1)"}},
+    {.name = "SETNAME",
+     .arity = 3,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Sets the connection's name.",
+              .since = "2.6.9",
+              .group = "connection",
+              .complexity = "O(1)"}},
+    {.name = "NO-EVICT",
+     .arity = 3,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Records the connection's no-evict preference.",
+              .since = "7.0.0",
+              .group = "connection",
+              .complexity = "O(1)"}},
+}};
+
+constexpr std::array<SubcommandSpec, 7> kClusterSubs{{
+    {.name = "SLOTS",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .loading_safe = true,
+     .docs = {.summary = "Returns the cluster slot map.",
+              .since = "3.0.0",
+              .group = "cluster",
+              .complexity = "O(N) over slot ranges"}},
+    {.name = "SHARDS",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns the cluster shard descriptors.",
+              .since = "7.0.0",
+              .group = "cluster",
+              .complexity = "O(N) over shards"}},
+    {.name = "NODES",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns the cluster nodes table.",
+              .since = "3.0.0",
+              .group = "cluster",
+              .complexity = "O(N) over nodes"}},
+    {.name = "INFO",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .loading_safe = true,
+     .docs = {.summary = "Returns cluster state information.",
+              .since = "3.0.0",
+              .group = "cluster",
+              .complexity = "O(1)"}},
+    {.name = "MYID",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .loading_safe = true,
+     .docs = {.summary = "Returns this node's UUID.",
+              .since = "3.0.0",
+              .group = "cluster",
+              .complexity = "O(1)"}},
+    {.name = "KEYSLOT",
+     .arity = 3,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns the slot a key hashes to.",
+              .since = "3.0.0",
+              .group = "cluster",
+              .complexity = "O(N) in key length"}},
+    {.name = "COUNTKEYSINSLOT",
+     .arity = 3,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns the count of keys in a slot.",
+              .since = "3.0.0",
+              .group = "cluster",
+              .complexity = "O(1)"}},
+}};
+
+constexpr std::array<SubcommandSpec, 1> kConfigSubs{{
+    {.name = "GET",
+     .arity = 3,
+     .dispatch = D::kStateless,
+     .docs = {.summary = "Returns config values matching a glob pattern.",
+              .since = "2.0.0",
+              .group = "server",
+              .complexity = "O(N) over config entries"}},
+}};
+
+constexpr std::array<SubcommandSpec, 3> kCommandSubs{{
+    {.name = "COUNT",
+     .arity = 2,
+     .dispatch = D::kStateless,
+     .loading_safe = true,
+     .docs = {.summary = "Returns the number of registered commands.",
+              .since = "2.8.13",
+              .group = "server",
+              .complexity = "O(1)"}},
+    {.name = "INFO",
+     .arity = -2,
+     .dispatch = D::kStateless,
+     .loading_safe = true,
+     .docs = {.summary = "Returns metadata for the requested commands.",
+              .since = "2.8.13",
+              .group = "server",
+              .complexity = "O(N) over commands requested"}},
+    {.name = "DOCS",
+     .arity = -2,
+     .dispatch = D::kStateless,
+     .loading_safe = true,
+     .docs = {.summary = "Returns documentation for the requested commands.",
+              .since = "7.0.0",
+              .group = "server",
+              .complexity = "O(N) over commands requested"}},
+}};
+
+constexpr std::array<SubcommandSpec, 2> kObjectSubs{{
+    {.name = "ENCODING",
+     .arity = 3,
+     .dispatch = D::kTieredRead,
+     .docs = {.summary = "Returns the internal encoding of a key's value.",
+              .since = "2.2.3",
+              .group = "generic",
+              .complexity = "O(1)"}},
+    {.name = "IDLETIME",
+     .arity = 3,
+     .dispatch = D::kConsumerRpc,
+     .docs = {.summary = "Returns the seconds since the key was last accessed.",
+              .since = "2.2.3",
+              .group = "generic",
+              .complexity = "O(1)"}},
+}};
+
 constexpr CommandSpec Admin(std::string_view name, int arity, Dispatch dispatch, bool loading_safe,
-                            CommandDocs docs) {
-  return {name, arity, C::kAdmin, dispatch, 0, 0, 1, loading_safe, docs};
+                            CommandDocs docs, std::span<const SubcommandSpec> subs = {}) {
+  return {.name = name,
+          .arity = arity,
+          .cls = C::kAdmin,
+          .dispatch = dispatch,
+          .first_key = 0,
+          .last_key = 0,
+          .key_step = 1,
+          .loading_safe = loading_safe,
+          .docs = docs,
+          .subcommands = subs};
 }
 
 constexpr CommandSpec Read(std::string_view name, int arity, int first_key, int last_key,
-                           int key_step, CommandDocs docs) {
-  return {name, arity, C::kRead, D::kTieredRead, first_key, last_key, key_step, false, docs};
+                           int key_step, CommandDocs docs,
+                           std::span<const SubcommandSpec> subs = {}) {
+  return {.name = name,
+          .arity = arity,
+          .cls = C::kRead,
+          .dispatch = D::kTieredRead,
+          .first_key = first_key,
+          .last_key = last_key,
+          .key_step = key_step,
+          .loading_safe = false,
+          .docs = docs,
+          .subcommands = subs};
 }
 
 constexpr CommandSpec Write(std::string_view name, int arity, Dispatch dispatch, int first_key,
                             int last_key, int key_step, CommandDocs docs) {
-  return {name, arity, C::kWrite, dispatch, first_key, last_key, key_step, false, docs};
+  return {.name = name,
+          .arity = arity,
+          .cls = C::kWrite,
+          .dispatch = dispatch,
+          .first_key = first_key,
+          .last_key = last_key,
+          .key_step = key_step,
+          .loading_safe = false,
+          .docs = docs};
 }
 
-// Metadata surfaces through COMMAND INFO / DOCS; see ADP-005 for classification.
 constexpr auto kCommandTable = std::to_array<CommandSpec>({
     // Admin — stateless
     Admin("PING", -1, D::kStateless, true,
@@ -41,20 +208,24 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
            "O(1)"}),
     Admin("CLIENT", -2, D::kStateless, false,
           {"A container for client-connection commands.", "2.4.0", "connection",
-           "Depends on subcommand."}),
+           "Depends on subcommand."},
+          kClientSubs),
     Admin("RESET", 1, D::kStateless, false,
           {"Resets the connection.", "6.2.0", "connection", "O(1)"}),
     Admin("TIME", 1, D::kStateless, false, {"Returns the server time.", "2.6.0", "server", "O(1)"}),
     Admin("COMMAND", -1, D::kStateless, true,
           {"A container for command metadata inspection.", "2.8.13", "server",
-           "Depends on subcommand."}),
+           "Depends on subcommand."},
+          kCommandSubs),
     Admin("CONFIG", -3, D::kStateless, false,
-          {"A container for server configuration.", "2.0.0", "server", "Depends on subcommand."}),
+          {"A container for server configuration.", "2.0.0", "server", "Depends on subcommand."},
+          kConfigSubs),
     Admin("INFO", -1, D::kStateless, true,
           {"Returns information and statistics about the server.", "1.0.0", "server", "O(1)"}),
-    Admin("CLUSTER", -2, D::kStateless, true,
+    Admin("CLUSTER", -2, D::kStateless, false,
           {"A container for cluster-introspection commands.", "3.0.0", "cluster",
-           "Depends on subcommand."}),
+           "Depends on subcommand."},
+          kClusterSubs),
 
     // Admin — consumer RPC
     Admin("DBSIZE", 1, D::kConsumerRpc, false,
@@ -152,7 +323,7 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Write("DEL", -2, D::kWritePath, 1, -1, 1,
           {"Deletes one or more keys.", "1.0.0", "generic", "O(N) over keys deleted"}),
     Write("UNLINK", -2, D::kWritePath, 1, -1, 1,
-          {"Deletes one or more keys; synonym of DEL in Phase 1.", "4.0.0", "generic",
+          {"Deletes one or more keys; treated as a synonym of DEL.", "4.0.0", "generic",
            "O(N) over keys deleted"}),
     Read("EXISTS", -2, 1, -1, 1,
          {"Tests whether keys exist.", "1.0.0", "generic", "O(N) over keys requested"}),
@@ -184,24 +355,14 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
           {"Copies the value of a key to another key.", "6.2.0", "generic", "O(N)"}),
     Read("OBJECT", -3, 2, 2, 1,
          {"A container for object-introspection commands.", "2.2.3", "generic",
-          "Depends on subcommand."}),
+          "Depends on subcommand."},
+         kObjectSubs),
 });
 
-std::string Uppercase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
-
-bool ArityMatches(const CommandSpec& spec, size_t arg_count) {
+bool ArityMatches(int arity, size_t arg_count) {
   const auto arg_count_int = static_cast<int>(arg_count);
-  if (spec.arity >= 0) {
-    return arg_count_int == spec.arity;
-  }
-  return arg_count_int >= -spec.arity;
+  if (arity >= 0) return arg_count_int == arity;
+  return arg_count_int >= -arity;
 }
 
 }  // namespace
@@ -215,7 +376,7 @@ CommandRegistry::CommandRegistry() {
 }
 
 const CommandSpec* CommandRegistry::Find(std::string_view name) const {
-  auto upper = Uppercase(name);
+  auto upper = core::AsciiUpper(name);
   auto it = by_name_.find(upper);
   if (it == by_name_.end()) {
     return nullptr;
@@ -223,18 +384,43 @@ const CommandSpec* CommandRegistry::Find(std::string_view name) const {
   return it->second;
 }
 
-core::Result<const CommandSpec*> CommandRegistry::Classify(const core::RespCommand& cmd) const {
+const SubcommandSpec* CommandRegistry::FindSubcommand(const CommandSpec& parent,
+                                                      std::string_view name) const {
+  if (parent.subcommands.empty()) return nullptr;
+  const auto upper = core::AsciiUpper(name);
+  for (const auto& sub : parent.subcommands) {
+    if (sub.name == upper) return &sub;
+  }
+  return nullptr;
+}
+
+CommandRegistry::ResolveResult CommandRegistry::Resolve(const core::RespCommand& cmd) const {
   if (cmd.ArgCount() == 0) {
-    return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument, "empty command"));
+    return {.status = ResolveStatus::kUnknownCommand, .resolved = {nullptr, nullptr}};
   }
-  const auto* spec = Find(cmd.Name());
-  if (spec == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, std::string(cmd.Name())));
+  const auto* parent = Find(cmd.Name());
+  if (parent == nullptr) {
+    return {.status = ResolveStatus::kUnknownCommand, .resolved = {nullptr, nullptr}};
   }
-  if (!ArityMatches(*spec, cmd.ArgCount())) {
-    return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument, std::string(spec->name)));
+
+  // Enforce parent arity first; failure here matches Redis's "wrong number of
+  // arguments for '<cmd>' command" path.
+  if (!ArityMatches(parent->arity, cmd.ArgCount())) {
+    return {.status = ResolveStatus::kArityMismatch, .resolved = {parent, nullptr}};
   }
-  return spec;
+
+  if (!parent->subcommands.empty() && cmd.ArgCount() >= 2) {
+    const auto* sub = FindSubcommand(*parent, cmd.args[1]);
+    if (sub == nullptr) {
+      return {.status = ResolveStatus::kUnknownSubcommand, .resolved = {parent, nullptr}};
+    }
+    if (!ArityMatches(sub->arity, cmd.ArgCount())) {
+      return {.status = ResolveStatus::kArityMismatch, .resolved = {parent, sub}};
+    }
+    return {.status = ResolveStatus::kOk, .resolved = {parent, sub}};
+  }
+
+  return {.status = ResolveStatus::kOk, .resolved = {parent, nullptr}};
 }
 
 std::span<const CommandSpec> CommandRegistry::All() const { return kCommandTable; }

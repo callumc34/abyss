@@ -114,6 +114,19 @@ Every command is classified along two axes.
 
 The request pipeline (issue #34) becomes a data-driven 5-way dispatch against the command registry, not a growing switch.
 
+### Container Commands and Subcommands
+
+`CLUSTER`, `CLIENT`, `CONFIG`, `COMMAND`, and `OBJECT` are container commands: their first argument selects a subcommand whose semantics may differ from the parent (different arity, dispatch class, or recovery-time visibility). The registry models these explicitly. Each container command's `CommandSpec` carries a list of `SubcommandSpec` entries, and the pipeline resolves the subcommand against that list before applying arity, dispatch, and `loading_safe` rules.
+
+This means:
+
+- The set of accepted subcommands is the registry's truth. Unknown subcommands surface `ERR Unknown <PARENT> subcommand` at the frontend and never reach the queue or any handler.
+- Per-subcommand `loading_safe` is authoritative when a subcommand resolves. The narrow recovery-time allowlist (`CLUSTER SLOTS`, `CLUSTER INFO`, `CLUSTER MYID`, `COMMAND` / `COMMAND COUNT|INFO|DOCS`, `PING`, `INFO`, `HELLO`, `QUIT`) lives on the spec, not in handler-side `if` chains.
+- `OBJECT ENCODING` (read) and `OBJECT IDLETIME` (consumer RPC) carry distinct `Dispatch` values on their respective subspecs; the parent's dispatch is unused when a subcommand resolves.
+- Arity on `SubcommandSpec` is the total RESP arg count including the parent token, so `CLUSTER KEYSLOT key` is arity 3 and `COMMAND INFO [name ...]` is arity -2.
+
+When a container is invoked with no subcommand argument (e.g. `COMMAND` alone), parent dispatch applies. Containers whose parent arity rules out the no-subcommand form (e.g. `CONFIG` with arity -3) cannot reach this fallback.
+
 ### Command Registry (Phase 1)
 
 Phase 1 restricts the surface to **direct key access and modification only** — no enumeration (`KEYS`, `SCAN`, `RANDOMKEY`), no global operations (`FLUSHDB`, `FLUSHALL`), no pub/sub, no scripting, no transactions (groundwork exists in ADP-011; activation deferred), no streams.

@@ -2,11 +2,12 @@
 
 #include <array>
 #include <cstdint>
-#include <cstdio>
 #include <fstream>
 #include <random>
 #include <string>
 #include <system_error>
+
+#include "abyss/core/atomic_file.h"
 
 namespace abyss::resp {
 namespace {
@@ -88,28 +89,6 @@ core::Result<std::string> ReadExisting(const std::filesystem::path& path) {
   return content;
 }
 
-core::Result<void> WriteAtomic(const std::filesystem::path& path, std::string_view content) {
-  const auto tmp = path.string() + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-      return std::unexpected(core::Error(core::ErrorCode::kInternal, "node.id tmp open: " + tmp));
-    }
-    out.write(content.data(), static_cast<std::streamsize>(content.size()));
-    out.put('\n');
-    if (!out.good()) {
-      return std::unexpected(core::Error(core::ErrorCode::kInternal, "node.id tmp write: " + tmp));
-    }
-  }
-  std::error_code ec;
-  std::filesystem::rename(tmp, path, ec);
-  if (ec) {
-    std::filesystem::remove(tmp, ec);  // best-effort cleanup
-    return std::unexpected(FsError(path, "node.id rename", ec));
-  }
-  return {};
-}
-
 }  // namespace
 
 core::Result<NodeIdentity> NodeIdentity::Open(const std::filesystem::path& data_dir) {
@@ -129,7 +108,9 @@ core::Result<NodeIdentity> NodeIdentity::Open(const std::filesystem::path& data_
   }
 
   auto fresh = GenerateUuidV4();
-  if (auto r = WriteAtomic(path, fresh); !r.has_value()) {
+  std::string buf = fresh;
+  buf.push_back('\n');
+  if (auto r = core::WriteFileAtomic(path, buf); !r.has_value()) {
     return std::unexpected(r.error());
   }
   return NodeIdentity(std::move(fresh));

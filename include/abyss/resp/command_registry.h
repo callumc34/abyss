@@ -8,18 +8,15 @@
 #include <unordered_map>
 
 #include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
 
 namespace abyss::resp {
 
-// What the command does to state.
 enum class CommandClass : uint8_t {
   kRead,
   kWrite,
   kAdmin,
 };
 
-// How the frontend executes the command.
 enum class Dispatch : uint8_t {
   kStateless,
   kTieredRead,
@@ -35,25 +32,49 @@ struct CommandDocs {
   std::string_view complexity;
 };
 
-struct CommandSpec {
-  std::string_view name;  // Canonical uppercase name (e.g. "GET", "ZADD").
+// Arity is the total RESP arg count including parent and sub tokens
+// (`CLUSTER KEYSLOT foo` is arity 3).
+struct SubcommandSpec {
+  std::string_view name;
+  int arity;
+  Dispatch dispatch;
+  bool loading_safe = false;
+  CommandDocs docs{};
+};
 
+struct CommandSpec {
+  std::string_view name;
   int arity;
   CommandClass cls;
   Dispatch dispatch;
 
-  // Key position metadata.
-  int first_key = 0;  // 0 = no keys, 1 = args[1] is first key
-  int last_key = 0;   // 0 = same as first_key, -1 = last arg is a key
-  int key_step = 1;   // step between keys (2 for MSET key val key val)
+  // Key positions apply to the parent only; per-subcommand keys aren't modelled.
+  int first_key = 0;
+  int last_key = 0;
+  int key_step = 1;
 
-  // Subcommand handlers may narrow this further during loading.
+  // For container commands the subcommand's loading_safe overrides this.
   bool loading_safe = false;
 
-  CommandDocs docs;
+  CommandDocs docs{};
+
+  std::span<const SubcommandSpec> subcommands{};
 };
 
-// Data-driven command table loaded from a static list at construction time.
+// `subcommand` is null when the parent applies directly.
+struct ResolvedCommand {
+  const CommandSpec* parent;
+  const SubcommandSpec* subcommand;
+
+  int Arity() const { return subcommand != nullptr ? subcommand->arity : parent->arity; }
+  Dispatch DispatchClass() const {
+    return subcommand != nullptr ? subcommand->dispatch : parent->dispatch;
+  }
+  bool LoadingSafe() const {
+    return subcommand != nullptr ? subcommand->loading_safe : parent->loading_safe;
+  }
+};
+
 class CommandRegistry {
  public:
   CommandRegistry();
@@ -64,22 +85,31 @@ class CommandRegistry {
   CommandRegistry(CommandRegistry&&) = delete;
   CommandRegistry& operator=(CommandRegistry&&) = delete;
 
-  // Case-insensitive lookup. Returns nullptr if the name is not registered.
+  // Case-insensitive; returns nullptr if absent.
   const CommandSpec* Find(std::string_view name) const;
+  const SubcommandSpec* FindSubcommand(const CommandSpec& parent, std::string_view name) const;
 
-  // kNotFound on unknown name, kInvalidArgument on arity mismatch.
-  core::Result<const CommandSpec*> Classify(const core::RespCommand& cmd) const;
+  enum class ResolveStatus : uint8_t {
+    kOk,
+    kUnknownCommand,
+    kArityMismatch,
+    kUnknownSubcommand,
+  };
+
+  struct ResolveResult {
+    ResolveStatus status;
+    ResolvedCommand resolved;
+  };
+
+  ResolveResult Resolve(const core::RespCommand& cmd) const;
 
   size_t Size() const { return by_name_.size(); }
-
   std::span<const CommandSpec> All() const;
 
  private:
-  // Values point into a process-lifetime static table; lookup-stable.
   std::unordered_map<std::string, const CommandSpec*> by_name_;
 };
 
-// Process-wide registry singleton.
 const CommandRegistry& GlobalRegistry();
 
 }  // namespace abyss::resp

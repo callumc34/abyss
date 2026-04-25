@@ -27,10 +27,10 @@ uint32_t ResolveIoThreads(uint32_t configured) {
 }  // namespace
 
 TcpServer::TcpServer(TcpServerConfig config, const resp::CommandRegistry& registry,
-                     core::CommandDispatcher& dispatcher, core::SteadyClockFn clock)
+                     resp::PipelineDependencies deps, core::SteadyClockFn clock)
     : config_(std::move(config)),
       registry_(registry),
-      dispatcher_(dispatcher),
+      deps_(deps),
       clock_(std::move(clock)),
       metrics_(NetMetrics::Register()) {}
 

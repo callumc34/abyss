@@ -1,8 +1,8 @@
-#include <cctype>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "abyss/core/ascii.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/resp/admin_handlers.h"
 #include "abyss/resp/command_registry.h"
@@ -12,24 +12,6 @@ namespace {
 
 using core::ErrorPrefix;
 using core::RespValue;
-
-std::string Uppercase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
-
-std::string Lowercase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
 
 std::vector<RespValue> FlagsFor(const CommandSpec& spec) {
   std::vector<RespValue> flags;
@@ -52,7 +34,7 @@ std::vector<RespValue> FlagsFor(const CommandSpec& spec) {
 
 RespValue SpecAsInfo(const CommandSpec& spec) {
   return RespValue::Array({
-      RespValue::BulkString(Lowercase(spec.name)),
+      RespValue::BulkString(core::AsciiLower(spec.name)),
       RespValue::Integer(spec.arity),
       RespValue::Array(FlagsFor(spec)),
       RespValue::Integer(spec.first_key),
@@ -111,7 +93,7 @@ RespValue HandleDocsSub(const core::RespCommand& cmd, const CommandRegistry& reg
   if (cmd.ArgCount() == 2) {
     out.reserve(registry.All().size() * 2);
     for (const auto& spec : registry.All()) {
-      out.push_back(RespValue::BulkString(Lowercase(spec.name)));
+      out.push_back(RespValue::BulkString(core::AsciiLower(spec.name)));
       out.push_back(SpecAsDocs(spec));
     }
     return RespValue::Array(std::move(out));
@@ -120,7 +102,7 @@ RespValue HandleDocsSub(const core::RespCommand& cmd, const CommandRegistry& reg
   for (size_t i = 2; i < cmd.ArgCount(); ++i) {
     const auto* spec = registry.Find(cmd.args[i]);
     if (spec == nullptr) continue;
-    out.push_back(RespValue::BulkString(Lowercase(spec->name)));
+    out.push_back(RespValue::BulkString(core::AsciiLower(spec->name)));
     out.push_back(SpecAsDocs(*spec));
   }
   return RespValue::Array(std::move(out));
@@ -128,20 +110,16 @@ RespValue HandleDocsSub(const core::RespCommand& cmd, const CommandRegistry& reg
 
 }  // namespace
 
-core::RespValue HandleCommandIntrospect(const core::RespCommand& cmd,
+core::RespValue HandleCommandIntrospect(std::string_view subcommand, const core::RespCommand& cmd,
                                         const CommandRegistry& registry) {
-  if (cmd.ArgCount() == 1) {
-    return HandleList(registry);
-  }
-  const auto sub = Uppercase(cmd.args[1]);
-  if (sub == "COUNT") return HandleCount(registry);
-  if (sub == "INFO") return HandleInfoSub(cmd, registry);
-  if (sub == "DOCS") return HandleDocsSub(cmd, registry);
+  if (subcommand.empty()) return HandleList(registry);
+  if (subcommand == "COUNT") return HandleCount(registry);
+  if (subcommand == "INFO") return HandleInfoSub(cmd, registry);
+  if (subcommand == "DOCS") return HandleDocsSub(cmd, registry);
 
-  std::string msg = "Unknown COMMAND subcommand or wrong number of arguments for '";
-  msg.append(cmd.args[1]);
-  msg.push_back('\'');
-  return RespValue::Error(ErrorPrefix::kErr, std::move(msg));
+  return RespValue::Error(
+      ErrorPrefix::kErr,
+      std::string("internal: unhandled COMMAND subcommand '").append(subcommand).append("'"));
 }
 
 }  // namespace abyss::resp

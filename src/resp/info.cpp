@@ -1,8 +1,8 @@
-#include <cctype>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
+#include "abyss/core/ascii.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/resp/admin_handlers.h"
 #include "abyss/resp/server_stats.h"
@@ -21,18 +21,9 @@ constexpr uint8_t kDefaultSections =
     static_cast<uint8_t>(Section::kServer) | static_cast<uint8_t>(Section::kClients) |
     static_cast<uint8_t>(Section::kMemory) | static_cast<uint8_t>(Section::kKeyspace);
 
-std::string Lowercase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  }
-  return out;
-}
-
-// Returns the section bitmask, or 0 when the caller passed an unrecognised name.
+// 0 means the section name was not recognised.
 uint8_t ResolveSection(std::string_view requested) {
-  const auto lower = Lowercase(requested);
+  const auto lower = core::AsciiLower(requested);
   if (lower == "all" || lower == "everything" || lower == "default" || lower.empty()) {
     return kDefaultSections;
   }

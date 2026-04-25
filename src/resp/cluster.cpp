@@ -1,4 +1,3 @@
-#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <string>
@@ -18,31 +17,15 @@ namespace {
 using core::ErrorPrefix;
 using core::RespValue;
 
-std::string Uppercase(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (const char c : s) {
-    out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-  }
-  return out;
+// Redis convention: cluster bus port = client port + 10000.
+constexpr uint16_t kClusterBusPortOffset = 10000;
+
+std::string_view AdvertiseAddress(const ServerStats& s) {
+  return s.advertise_address.empty() ? s.bind_address : s.advertise_address;
 }
 
-RespValue UnknownSubcommand(std::string_view sub) {
-  std::string msg = "Unknown CLUSTER subcommand or wrong number of arguments for '";
-  msg.append(sub);
-  msg.push_back('\'');
-  return RespValue::Error(ErrorPrefix::kErr, std::move(msg));
-}
-
-RespValue Loading() {
-  return RespValue::Error(ErrorPrefix::kLoading, "Abyss is loading the dataset in memory");
-}
-
-RespValue WrongArity(std::string_view sub) {
-  std::string msg = "Wrong number of arguments for 'CLUSTER ";
-  msg.append(sub);
-  msg.append("'");
-  return RespValue::Error(ErrorPrefix::kErr, std::move(msg));
+uint16_t BusPort(uint16_t tcp_port) {
+  return static_cast<uint16_t>(tcp_port + kClusterBusPortOffset);
 }
 
 RespValue HandleSlots(const ServerStats& stats, const NodeIdentity& identity) {
@@ -51,7 +34,7 @@ RespValue HandleSlots(const ServerStats& stats, const NodeIdentity& identity) {
           RespValue::Integer(0),
           RespValue::Integer(static_cast<int64_t>(core::kSlotCount) - 1),
           RespValue::Array({
-              RespValue::BulkString(std::string(stats.bind_address)),
+              RespValue::BulkString(std::string(AdvertiseAddress(stats))),
               RespValue::Integer(stats.tcp_port),
               RespValue::BulkString(std::string(identity.Id())),
           }),
@@ -60,6 +43,7 @@ RespValue HandleSlots(const ServerStats& stats, const NodeIdentity& identity) {
 }
 
 RespValue HandleShards(const ServerStats& stats, const NodeIdentity& identity) {
+  const auto addr = AdvertiseAddress(stats);
   return RespValue::Array({
       RespValue::Array({
           RespValue::BulkString("slots"),
@@ -73,9 +57,9 @@ RespValue HandleShards(const ServerStats& stats, const NodeIdentity& identity) {
                   RespValue::BulkString("id"),
                   RespValue::BulkString(std::string(identity.Id())),
                   RespValue::BulkString("endpoint"),
-                  RespValue::BulkString(std::string(stats.bind_address)),
+                  RespValue::BulkString(std::string(addr)),
                   RespValue::BulkString("ip"),
-                  RespValue::BulkString(std::string(stats.bind_address)),
+                  RespValue::BulkString(std::string(addr)),
                   RespValue::BulkString("port"),
                   RespValue::Integer(stats.tcp_port),
                   RespValue::BulkString("role"),
@@ -92,10 +76,12 @@ RespValue HandleNodes(const ServerStats& stats, const NodeIdentity& identity) {
   std::string line;
   line.append(identity.Id());
   line.push_back(' ');
-  line.append(stats.bind_address);
+  line.append(AdvertiseAddress(stats));
   line.push_back(':');
   line.append(std::to_string(stats.tcp_port));
-  line.append("@0 myself,master - 0 0 0 connected 0-");
+  line.push_back('@');
+  line.append(std::to_string(BusPort(stats.tcp_port)));
+  line.append(" myself,master - 0 0 0 connected 0-");
   line.append(std::to_string(core::kSlotCount - 1));
   line.push_back('\n');
   return RespValue::BulkString(std::move(line));
@@ -123,12 +109,10 @@ RespValue HandleMyId(const NodeIdentity& identity) {
 }
 
 RespValue HandleKeyslot(const core::RespCommand& cmd) {
-  if (cmd.ArgCount() != 3) return WrongArity("KEYSLOT");
   return RespValue::Integer(core::KeySlot(cmd.args[2]));
 }
 
 RespValue HandleCountKeysInSlot(const core::RespCommand& cmd, const ServerStats& stats) {
-  if (cmd.ArgCount() != 3) return WrongArity("COUNTKEYSINSLOT");
   uint32_t slot = 0;
   const auto& arg = cmd.args[2];
   auto [ptr, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), slot);
@@ -140,26 +124,21 @@ RespValue HandleCountKeysInSlot(const core::RespCommand& cmd, const ServerStats&
 
 }  // namespace
 
-core::RespValue HandleCluster(const core::RespCommand& cmd, const ServerStatsProvider& stats_prov,
-                              const NodeIdentity& identity, bool loading) {
-  if (cmd.ArgCount() < 2) return WrongArity("");
-  const auto sub = Uppercase(cmd.args[1]);
-
-  // Narrower loading allowlist per ADP-005.
-  if (loading && sub != "SLOTS" && sub != "INFO" && sub != "MYID") {
-    return Loading();
-  }
-
+core::RespValue HandleCluster(std::string_view subcommand, const core::RespCommand& cmd,
+                              const ServerStatsProvider& stats_prov, const NodeIdentity& identity) {
   const auto snap = stats_prov.Snapshot();
 
-  if (sub == "SLOTS") return HandleSlots(snap, identity);
-  if (sub == "SHARDS") return HandleShards(snap, identity);
-  if (sub == "NODES") return HandleNodes(snap, identity);
-  if (sub == "INFO") return HandleInfo();
-  if (sub == "MYID") return HandleMyId(identity);
-  if (sub == "KEYSLOT") return HandleKeyslot(cmd);
-  if (sub == "COUNTKEYSINSLOT") return HandleCountKeysInSlot(cmd, snap);
-  return UnknownSubcommand(cmd.args[1]);
+  if (subcommand == "SLOTS") return HandleSlots(snap, identity);
+  if (subcommand == "SHARDS") return HandleShards(snap, identity);
+  if (subcommand == "NODES") return HandleNodes(snap, identity);
+  if (subcommand == "INFO") return HandleInfo();
+  if (subcommand == "MYID") return HandleMyId(identity);
+  if (subcommand == "KEYSLOT") return HandleKeyslot(cmd);
+  if (subcommand == "COUNTKEYSINSLOT") return HandleCountKeysInSlot(cmd, snap);
+
+  return RespValue::Error(
+      ErrorPrefix::kErr,
+      std::string("internal: unhandled CLUSTER subcommand '").append(subcommand).append("'"));
 }
 
 }  // namespace abyss::resp

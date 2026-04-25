@@ -8,6 +8,7 @@ add_executable(abyss_core_tests
   core/queue_entry_test.cpp
   core/shard_router_test.cpp
   core/slot_test.cpp
+  core/atomic_file_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE

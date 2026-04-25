@@ -70,6 +70,7 @@ ServerStats StandardStats() {
       .tcp_port = 6379,
       .version = "0.1.0-test",
       .bind_address = "127.0.0.1",
+      .advertise_address = {},
       .mode = "standalone",
       .role = "master",
   };
@@ -119,8 +120,9 @@ TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$4\r\nHGET\r\n$3\r\nkey\r\n"), output);
   auto response = ParseResponse(output);
-  EXPECT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("ERR unknown command 'HGET'"), std::string::npos);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
+  EXPECT_NE(response.AsString().find("unknown command 'HGET'"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, FlushallFallsThroughToUnknownCommand) {
@@ -146,9 +148,18 @@ TEST(RequestPipelineTest, ArityMismatchReturnsErr) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*1\r\n$3\r\nGET\r\n"), output);
   auto response = ParseResponse(output);
-  EXPECT_TRUE(response.IsError());
+  ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("wrong number of arguments"), std::string::npos);
   EXPECT_NE(response.AsString().find("'get'"), std::string::npos);
+}
+
+TEST(RequestPipelineTest, SubcommandArityMismatchUsesPipeForm) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("'client|setname'"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, Hello2ReturnsHandshakeMap) {
@@ -167,13 +178,29 @@ TEST(RequestPipelineTest, Hello2ReturnsHandshakeMap) {
   EXPECT_EQ(elements[7].AsInteger(), 42);
 }
 
-TEST(RequestPipelineTest, Hello3Rejected) {
+TEST(RequestPipelineTest, Hello2UpdatesProtocolVersionInState) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
+  EXPECT_EQ(pipeline.state().protocol_version, 2);
+}
+
+TEST(RequestPipelineTest, Hello3RejectedWithNoProtoPrefix) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"), output);
   auto response = ParseResponse(output);
-  EXPECT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("NOPROTO"), std::string::npos);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kNoProto);
+}
+
+TEST(RequestPipelineTest, HelloUnsupportedNonNumericRejected) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$3\r\nfoo\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kNoProto);
 }
 
 TEST(RequestPipelineTest, HelloSetnameUpdatesConnectionState) {
@@ -206,7 +233,7 @@ TEST(RequestPipelineTest, ClientId) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
   auto response = ParseResponse(output);
-  EXPECT_TRUE(response.IsInteger());
+  ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), 99);
 }
 
@@ -215,6 +242,15 @@ TEST(RequestPipelineTest, ClientNoEvictAck) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-EVICT\r\n$2\r\nON\r\n"), output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
+}
+
+TEST(RequestPipelineTest, ClientUnknownSubcommandIsRejectedByRegistry) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$5\r\nMAGIC\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("Unknown CLIENT subcommand"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, ClientSetnameThenGetname) {
@@ -227,7 +263,7 @@ TEST(RequestPipelineTest, ClientSetnameThenGetname) {
   std::vector<uint8_t> out2;
   pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$7\r\nGETNAME\r\n"), out2);
   auto response = ParseResponse(out2);
-  EXPECT_TRUE(response.IsBulkString());
+  ASSERT_TRUE(response.IsBulkString());
   EXPECT_EQ(response.AsString(), "alice");
 }
 
@@ -236,7 +272,7 @@ TEST(RequestPipelineTest, CommandCountMatchesRegistrySize) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n"), output);
   auto response = ParseResponse(output);
-  EXPECT_TRUE(response.IsInteger());
+  ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), static_cast<int64_t>(GlobalRegistry().Size()));
 }
 
@@ -285,6 +321,15 @@ TEST(RequestPipelineTest, CommandDocsReturnsSummary) {
   ASSERT_TRUE(response.AsArray()[1].IsArray());
 }
 
+TEST(RequestPipelineTest, CommandDocsSkipsUnknownNames) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$7\r\nBOGUSCC\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsArray());
+  EXPECT_TRUE(response.AsArray().empty());
+}
+
 TEST(RequestPipelineTest, Time) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
@@ -295,13 +340,16 @@ TEST(RequestPipelineTest, Time) {
   EXPECT_GT(std::stoll(response.AsArray()[0].AsString()), 0);
 }
 
-TEST(RequestPipelineTest, TieredReadWithoutDispatcherReturnsErr) {
+TEST(RequestPipelineTest, TieredReadWithoutDispatcherReturnsInternalError) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
-  EXPECT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("tiered read not configured"), std::string::npos);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
+  EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
+  // Internal config terminology must not leak to the wire.
+  EXPECT_EQ(response.AsString().find("dispatcher"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, ConditionalWriteRejectedWithIssueReference) {
@@ -315,18 +363,34 @@ TEST(RequestPipelineTest, ConditionalWriteRejectedWithIssueReference) {
   EXPECT_NE(response.AsString().find("abyss#97"), std::string::npos);
 }
 
-TEST(RequestPipelineTest, ConsumerRpcRejectedWithIssueReference) {
+TEST(RequestPipelineTest, ObjectIdletimeRoutedToConsumerRpcRejection) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  // DBSIZE without a stats provider returns a config error (not the abyss#97
-  // path); OBJECT IDLETIME is kTieredRead in Phase 1 so we stage via raw SETNX
-  // path above. Assert the abyss#97 marker is present for SETNX (already
-  // covered) and that DBSIZE without provider yields a clear configuration
-  // error rather than the generic abyss#97 message.
+  pipeline.Process(Bytes("*3\r\n$6\r\nOBJECT\r\n$8\r\nIDLETIME\r\n$1\r\nk\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("consumer RPC commands are not supported"), std::string::npos);
+  EXPECT_NE(response.AsString().find("OBJECT|IDLETIME"), std::string::npos);
+  EXPECT_NE(response.AsString().find("abyss#97"), std::string::npos);
+}
+
+TEST(RequestPipelineTest, ObjectEncodingDispatchesAsTieredRead) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nk\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  // No dispatcher injected → internal server error path, not the abyss#97 path.
+  EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
+}
+
+TEST(RequestPipelineTest, DbsizeWithoutStatsReturnsInternalError) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
   pipeline.Process(Bytes("*1\r\n$6\r\nDBSIZE\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("server stats provider not configured"), std::string::npos);
+  EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, LoadingGateBlocksDataPlaneCommands) {
@@ -338,7 +402,7 @@ TEST(RequestPipelineTest, LoadingGateBlocksDataPlaneCommands) {
   pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("LOADING"), std::string::npos);
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kLoading);
 }
 
 TEST(RequestPipelineTest, LoadingGateAllowsPing) {
@@ -373,7 +437,19 @@ TEST(RequestPipelineTest, LoadingGateAllowsCommandCount) {
   EXPECT_TRUE(response.IsInteger());
 }
 
-TEST(RequestPipelineTest, LoadingGateRejectsNonAllowlistedClusterSubcommands) {
+TEST(RequestPipelineTest, LoadingGateRejectsClientCommands) {
+  ToggleLoading loading;
+  loading.Set(true);
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.loading = &loading});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kLoading);
+}
+
+TEST(RequestPipelineTest, LoadingGateRejectsClusterKeyslot) {
   ToggleLoading loading;
   loading.Set(true);
   FakeStats stats(StandardStats());
@@ -384,7 +460,7 @@ TEST(RequestPipelineTest, LoadingGateRejectsNonAllowlistedClusterSubcommands) {
   pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("LOADING"), std::string::npos);
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kLoading);
 }
 
 TEST(RequestPipelineTest, LoadingGateAllowsClusterSlots) {
@@ -398,6 +474,19 @@ TEST(RequestPipelineTest, LoadingGateAllowsClusterSlots) {
   pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
+}
+
+TEST(RequestPipelineTest, LoadingGateAllowsClusterMyId) {
+  ToggleLoading loading;
+  loading.Set(true);
+  FakeStats stats(StandardStats());
+  NodeIdentity identity("11111111-1111-4111-8111-111111111111");
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.loading = &loading, .stats = &stats, .identity = &identity});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n"), output);
+  auto response = ParseResponse(output);
+  EXPECT_TRUE(response.IsBulkString());
 }
 
 TEST(RequestPipelineTest, InfoReturnsStatsSections) {
@@ -453,8 +542,10 @@ TEST(RequestPipelineTest, DbsizeSumsHotAndCold) {
   EXPECT_EQ(response.AsInteger(), 10);
 }
 
-TEST(RequestPipelineTest, ClusterSlotsReturnsSingleRange) {
-  FakeStats stats(StandardStats());
+TEST(RequestPipelineTest, ClusterSlotsUsesAdvertiseAddressWhenSet) {
+  auto stats_data = StandardStats();
+  stats_data.advertise_address = "10.0.0.5";
+  FakeStats stats(stats_data);
   NodeIdentity identity("11111111-1111-4111-8111-111111111111");
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
@@ -462,18 +553,21 @@ TEST(RequestPipelineTest, ClusterSlotsReturnsSingleRange) {
   pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
-  ASSERT_EQ(response.AsArray().size(), 1U);
-  const auto& range = response.AsArray()[0];
-  ASSERT_TRUE(range.IsArray());
-  ASSERT_EQ(range.AsArray().size(), 3U);
-  EXPECT_EQ(range.AsArray()[0].AsInteger(), 0);
-  EXPECT_EQ(range.AsArray()[1].AsInteger(), 16383);
-  const auto& node = range.AsArray()[2];
-  ASSERT_TRUE(node.IsArray());
-  ASSERT_EQ(node.AsArray().size(), 3U);
+  const auto& node = response.AsArray()[0].AsArray()[2];
+  EXPECT_EQ(node.AsArray()[0].AsString(), "10.0.0.5");
+}
+
+TEST(RequestPipelineTest, ClusterSlotsFallsBackToBindAddress) {
+  FakeStats stats(StandardStats());  // advertise empty
+  NodeIdentity identity("11111111-1111-4111-8111-111111111111");
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.stats = &stats, .identity = &identity});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsArray());
+  const auto& node = response.AsArray()[0].AsArray()[2];
   EXPECT_EQ(node.AsArray()[0].AsString(), "127.0.0.1");
-  EXPECT_EQ(node.AsArray()[1].AsInteger(), 6379);
-  EXPECT_EQ(node.AsArray()[2].AsString(), "11111111-1111-4111-8111-111111111111");
 }
 
 TEST(RequestPipelineTest, ClusterKeyslotMatchesCore) {
@@ -500,8 +594,10 @@ TEST(RequestPipelineTest, ClusterMyIdReturnsIdentity) {
   EXPECT_EQ(response.AsString(), "22222222-2222-4222-8222-222222222222");
 }
 
-TEST(RequestPipelineTest, ClusterNodesReturnsSingleLine) {
-  FakeStats stats(StandardStats());
+TEST(RequestPipelineTest, ClusterNodesUsesBusPortAndAdvertiseAddress) {
+  auto stats_data = StandardStats();
+  stats_data.advertise_address = "10.0.0.5";
+  FakeStats stats(stats_data);
   NodeIdentity identity("33333333-3333-4333-8333-333333333333");
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
@@ -509,10 +605,11 @@ TEST(RequestPipelineTest, ClusterNodesReturnsSingleLine) {
   pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
-  EXPECT_NE(response.AsString().find("33333333-3333-4333-8333-333333333333"), std::string::npos);
-  EXPECT_NE(response.AsString().find("127.0.0.1:6379"), std::string::npos);
-  EXPECT_NE(response.AsString().find("master"), std::string::npos);
-  EXPECT_NE(response.AsString().find("0-16383"), std::string::npos);
+  const auto& body = response.AsString();
+  EXPECT_NE(body.find("33333333-3333-4333-8333-333333333333"), std::string::npos);
+  EXPECT_NE(body.find("10.0.0.5:6379@16379"), std::string::npos);
+  EXPECT_NE(body.find("master"), std::string::npos);
+  EXPECT_NE(body.find("0-16383"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, ClusterInfoReportsOk) {
@@ -589,7 +686,18 @@ TEST(RequestPipelineTest, ConfigGetGlobMatchesMultiple) {
   EXPECT_EQ(response.AsArray().size(), 4U);
 }
 
-TEST(RequestPipelineTest, ConfigSetRejected) {
+TEST(RequestPipelineTest, ConfigGetEmptyResultIsEmptyArray) {
+  FakeConfig config({{"port", "6379"}});
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.config = &config});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$5\r\nbogus\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsArray());
+  EXPECT_TRUE(response.AsArray().empty());
+}
+
+TEST(RequestPipelineTest, ConfigSetIsRejectedAsUnknownSubcommand) {
   FakeConfig config({});
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.config = &config});
@@ -628,6 +736,7 @@ TEST(RequestPipelineTest, Reset) {
   pipeline.Process(Bytes("*1\r\n$5\r\nRESET\r\n"), out);
   EXPECT_EQ(ToStr(out), "+RESET\r\n");
   EXPECT_TRUE(pipeline.state().client_name.empty());
+  EXPECT_EQ(pipeline.state().protocol_version, 2);
 }
 
 }  // namespace

@@ -30,8 +30,9 @@ TEST(ConnectionIdleTest, IdleAfterTimeout) {
       .idle_timeout = std::chrono::seconds{30},
   };
 
-  Connection conn(MakePeerFd(), 0, 0, /*client_id=*/42, poller, resp::GlobalRegistry(), dispatcher,
-                  config, metrics, [&] { return fake_now; });
+  Connection conn(MakePeerFd(), 0, 0, /*client_id=*/42, poller, resp::GlobalRegistry(),
+                  resp::PipelineDependencies{.dispatcher = &dispatcher}, config, metrics,
+                  [&] { return fake_now; });
 
   EXPECT_FALSE(conn.IsIdle(fake_now));
   EXPECT_FALSE(conn.IsIdle(fake_now + std::chrono::seconds{29}));
@@ -46,8 +47,9 @@ TEST(ConnectionIdleTest, NotIdleAtExactTimeout) {
   auto fake_now = core::SteadyTime{std::chrono::seconds{1000}};
   ConnectionConfig config{.idle_timeout = std::chrono::seconds{30}};
 
-  Connection conn(MakePeerFd(), 0, 0, 1, poller, resp::GlobalRegistry(), dispatcher, config,
-                  metrics, [&] { return fake_now; });
+  Connection conn(MakePeerFd(), 0, 0, 1, poller, resp::GlobalRegistry(),
+                  resp::PipelineDependencies{.dispatcher = &dispatcher}, config, metrics,
+                  [&] { return fake_now; });
 
   EXPECT_FALSE(conn.IsIdle(fake_now + std::chrono::seconds{30}));
 }
