@@ -66,12 +66,12 @@ jobs:
     uses: ./.github/workflows/_build.yml
     secrets: inherit
 
-  # build-windows:
-  #   name: Build (Windows)
-  #   needs: changes
-  #   if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
-  #   uses: ./.github/workflows/_build-windows.yml
-  #   secrets: inherit
+  build-windows:
+    name: Build (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
+    uses: ./.github/workflows/_build-windows.yml
+    secrets: inherit
 
   sanitizer:
     name: Sanitizer
