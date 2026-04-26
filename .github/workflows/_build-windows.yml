@@ -25,13 +25,22 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_owner: ${{ github.repository_owner }}
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
       - name: Configure
         shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
         run: cmake --preset windows -G Ninja
 
       - name: Build
         shell: pwsh
-        run: cmake --build build/windows --parallel
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          cmake --build build/windows --parallel
+          sccache --show-stats
 
       - name: Test
         shell: pwsh
