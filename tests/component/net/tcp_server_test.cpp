@@ -188,23 +188,22 @@ TEST_F(TcpServerComponentTest, MaxConnectionsRejectsNewClients) {
 }
 
 TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows TCP loopback ignores SO_SNDBUF; backpressure can't fire.";
+#endif
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.connection.write_backpressure_bytes = 4096;
   cfg.connection.write_resume_bytes = 1024;
   cfg.connection.write_hard_limit_bytes = 8192;
   cfg.io_threads = 2;
   StubDispatcher dispatcher;
-  // 32 MiB exceeds even Windows' maximum autotuned TCP send buffer (~16 MiB),
-  // guaranteeing write_buf_ stays well above write_hard_limit_bytes (8 KiB).
   dispatcher.read_payload.assign(32 * 1024 * 1024, 'z');
   TcpServer server(cfg, resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
-  // Slow client: small SO_RCVBUF set pre-connect, and crucially we never call
-  // recv() on it. On Windows TCP loopback, an actively-reading client drains
-  // the kernel buffer at full speed regardless of SO_RCVBUF — backpressure
-  // only surfaces when the receiver app is genuinely idle.
+  // Small SO_RCVBUF + never reading: receive window stays tight, the server's
+  // write_buf_ accumulates past the hard limit, and the close path fires.
   component_test::SyncRedisClient slow;
   ASSERT_TRUE(slow.Connect(server.BoundPort(), component_test::SyncRedisClient::ConnectOptions{
                                                    .timeout = std::chrono::milliseconds{2000},

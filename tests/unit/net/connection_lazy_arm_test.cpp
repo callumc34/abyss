@@ -74,14 +74,15 @@ TEST_F(ConnectionLazyArmTest, ArmReadableOnlyOnIdle) {
 // When the pipeline produces output that doesn't fully drain into the kernel
 // send buffer, the connection arms kWritable so the reactor wakes it again.
 TEST_F(ConnectionLazyArmTest, ArmsWritableWhenOutputPending) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows TCP loopback ignores SO_SNDBUF; can't leave bytes pending.";
+#endif
   auto pair = SocketPair::Make(/*small_buffers=*/true);
   ASSERT_TRUE(pair.has_value()) << pair.error().message();
   testing::FakePoller poller;
   EchoDispatcher dispatcher;
-  // Sized to overflow the kernel send buffer on both POSIX (small_buffers)
-  // and Windows (which may floor SO_SNDBUF up to ~4-64 KiB). 256 KiB stays
-  // well under WideBackpressureConfig::write_backpressure_bytes (1 MiB) so
-  // the pause path is not exercised here.
+  // 256 KiB stays well under WideBackpressureConfig::write_backpressure_bytes
+  // (1 MiB) so the pause path is not exercised here.
   dispatcher.read_payload.assign(256 * 1024, 'x');
   NetMetrics metrics;
 
@@ -102,6 +103,9 @@ TEST_F(ConnectionLazyArmTest, ArmsWritableWhenOutputPending) {
 
 // After the write buffer fully drains, kWritable is dropped — back to lazy.
 TEST_F(ConnectionLazyArmTest, DropsWritableAfterFullDrain) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows TCP loopback ignores SO_SNDBUF; can't leave bytes pending.";
+#endif
   auto pair = SocketPair::Make(/*small_buffers=*/true);
   ASSERT_TRUE(pair.has_value()) << pair.error().message();
   testing::FakePoller poller;
