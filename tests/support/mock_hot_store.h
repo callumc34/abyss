@@ -8,7 +8,8 @@ namespace abyss::testing {
 
 class MockHotStore : public core::HotStore {
  public:
-  MOCK_METHOD(core::Result<core::RespValue>, Exec, (const core::ops::ReadOp& op), (override));
+  MOCK_METHOD(core::Result<core::RespValue>, Exec,
+              (const core::ops::ReadOp& op, std::optional<core::Duration> deadline), (override));
   MOCK_METHOD(core::Result<void>, Apply, (const core::ops::WriteOp& op, core::EvictionTTL eviction),
               (override));
   MOCK_METHOD(core::Result<void>, ApplyBatch,

@@ -147,15 +147,27 @@ Ordering invariant: the effective application sequence preserves queue order. Th
 
 Under Resolver stalls (e.g. cold-lookup backlog), hot/cold block. The hot consumer's lag budget ([ADP-002](002-hot-store.md)) degrades gracefully — write latency rises as block-and-scan waits, providing natural backpressure.
 
+### Decision determinism
+
+The resolver's `Decide` function is a **pure function of the log state up to (not including) the `Conditional`'s seq, plus the `Conditional`'s `appended_at` wall time**. No `now()` reads, no random number generation, no consumer-state inspection. This invariant is required by recovery: a re-decision against the same log state must produce the same outcome.
+
+Specifically:
+
+- TTL comparisons use `entry.appended_at`, not the resolver thread's local `now()`.
+- Tiered lookups produce the same answer at any time after the Conditional's seq, because the cache, buffer, and cold tiers reflect the log entries < seq (in eventually-consistent steady state, all three converge to the same canonical view).
+- Multi-key conditionals sort their stripe locks by stripe index, ensuring deterministic acquisition order.
+
+A test in `tests/unit/consumer/resolver_test.cpp` exercises the dangling-Conditional path of recovery, asserting the re-emitted `Resolved` matches the canonical decision from the same log inputs.
+
 ### Recovery Ordering
 
 [ADP-007](007-recovery.md) defines recovery as `cold replay → hot replay`. This extends to **`resolver replay → cold replay → hot replay`**:
 
-1. **Resolver replay** — rebuilds the recent-writes cache from queue entries since the resolver's ack point. Does not emit new `Resolved` entries during replay; the log already contains matching `Resolved` entries for every `Conditional` from the original run.
+1. **Resolver replay** — rebuilds the recent-writes cache from queue entries since the resolver's ack point. For every `Conditional` whose matching `Resolved` is already in the log, no new emission happens. For every `Conditional` whose `Resolved` is *missing* from the log — the rare case of a crash between the Conditional fsync and the Resolved fsync — the resolver re-decides and emits the `Resolved` now. Determinism (§Decision determinism) guarantees the re-emitted decision matches what would have been emitted pre-crash.
 2. **Cold replay** — unchanged from ADP-007. Cold consumer sees `Write` and `Resolved` entries; block-and-scan handles `Conditional` transparently.
 3. **Hot replay** — unchanged from ADP-007.
 
-Resolver replay is fast: existence cache only, no cold lookups needed during replay (the log already carries the decisions). Adds negligible recovery time relative to cold and hot.
+Resolver replay is fast in the common case: existence-cache rebuild only, no cold lookups needed (the log carries the decisions). The dangling-Conditional case pays the same tiered-lookup cost as a fresh decision — bounded by `cold_lookup_timeout_ms` per key.
 
 ### Configuration
 

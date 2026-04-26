@@ -128,13 +128,25 @@ struct MultiStringSet {
   std::vector<Entry> entries;
 };
 
+// abs_ttl_ms is computed at parse time from EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT
+// so replay sees a single unambiguous timestamp.
+struct Expire {
+  std::string_view key;
+  uint64_t abs_ttl_ms = 0;
+};
+
+// Distinct from Expire{abs_ttl_ms=0} so the WAL reader tells "clear TTL"
+// apart from "expire immediately".
+struct Persist {
+  std::string_view key;
+};
+
 using WriteOp = std::variant<StringSet, Del, SetAdd, SetRem, ZsetAdd, ZsetRem, HashSet, HashDel,
-                             MultiStringSet>;
+                             MultiStringSet, Expire, Persist>;
 
 Result<ReadOp> ParseReadOp(std::string_view name, const RespCommand& cmd);
 Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd);
 
-// Extract the primary key from a typed operation.
 std::string_view PrimaryKey(const ReadOp& op);
 std::string_view PrimaryKey(const WriteOp& op);
 

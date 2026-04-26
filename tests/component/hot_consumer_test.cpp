@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
@@ -56,7 +57,7 @@ class HotConsumerTest : public ::testing::Test {
 
   // Start a consumer on the shared queue/store pointing at shard 0.
   void StartConsumer(core::EvictionTTL eviction = core::EvictionTTL{86400}) {
-    consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_,
+    consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_, apply_notifier_,
                                               HotConsumer::Config{
                                                   .shard = 0,
                                                   .read_batch_size = 32,
@@ -88,6 +89,7 @@ class HotConsumerTest : public ::testing::Test {
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<hot::ShardedHotStore> hot_;
   core::ConsumerRpc rpc_;
+  core::ApplyNotifier apply_notifier_;
   std::unique_ptr<HotConsumer> consumer_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };

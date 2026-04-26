@@ -26,5 +26,6 @@ inline WallTime DefaultWallClock() { return WallClock::now(); }
 
 inline constexpr ConsumerId kHotConsumer = 0;
 inline constexpr ConsumerId kColdConsumer = 1;
+inline constexpr ConsumerId kResolverConsumer = 2;
 
 }  // namespace abyss::core

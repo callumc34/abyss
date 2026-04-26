@@ -5,6 +5,7 @@
 #include <mutex>
 #include <utility>
 
+#include "abyss/core/resp_format.h"
 #include "abyss/core/thread_annotations.h"
 
 namespace abyss::consumer {
@@ -59,27 +60,137 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
   flush_heap_.push({scheduled, key});
 }
 
-core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const
+namespace {
+
+constexpr std::string_view kBufferMissMsg = "buffer has no state for key";
+
+}  // namespace
+
+core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op) const
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
 
-  auto it = entries_.find(key);
-  if (it == entries_.end()) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, "buffer has no state for key"));
-  }
+  return std::visit(
+      [&](const auto& read) -> core::Result<core::RespValue> {
+        using T = std::decay_t<decltype(read)>;
 
-  const auto& state = it->second.state;
+        if constexpr (std::is_same_v<T, core::ops::Exists>) {
+          int64_t count = 0;
+          for (auto key : read.keys) {
+            auto it = entries_.find(std::string(key));
+            if (it == entries_.end()) continue;
+            if (it->second.state.IsTombstone()) continue;
+            ++count;
+          }
+          return core::RespValue::Integer(count);
+        }
 
-  if (state.IsTombstone()) {
-    return core::RespValue::Null();
-  }
+        if constexpr (std::is_same_v<T, core::ops::MultiStringGet>) {
+          std::vector<core::RespValue> out;
+          out.reserve(read.keys.size());
+          bool any_definitive = false;
+          for (auto key : read.keys) {
+            auto it = entries_.find(std::string(key));
+            if (it == entries_.end()) {
+              // Any miss → engine composes per-element across tiers.
+              return std::unexpected(
+                  core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
+            }
+            const auto& state = it->second.state;
+            if (state.IsTombstone()) {
+              out.push_back(core::RespValue::Null());
+            } else if (state.Type() == CompactedState::DataType::kString) {
+              out.push_back(core::RespValue::BulkString(state.StringValue()));
+            } else {
+              return std::unexpected(
+                  core::Error(core::ErrorCode::kWrongType, "buffered key is not a string"));
+            }
+            any_definitive = true;
+          }
+          if (!any_definitive) {
+            return std::unexpected(
+                core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
+          }
+          return core::RespValue::Array(std::move(out));
+        }
 
-  if (state.Type() == CompactedState::DataType::kString) {
-    return core::RespValue::BulkString(state.StringValue());
-  }
+        auto key = core::ops::PrimaryKey(core::ops::ReadOp{read});
+        auto it = entries_.find(std::string(key));
+        if (it == entries_.end()) {
+          return std::unexpected(
+              core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
+        }
+        const auto& state = it->second.state;
 
-  return std::unexpected(
-      core::Error(core::ErrorCode::kNotFound, "collection read bypasses buffer"));
+        if (state.IsTombstone()) return core::RespValue::Null();
+
+        if constexpr (std::is_same_v<T, core::ops::StringGet>) {
+          if (state.Type() != CompactedState::DataType::kString) {
+            // Defer to cold for the canonical WRONGTYPE against live state.
+            return std::unexpected(
+                core::Error(core::ErrorCode::kNotFound, "buffer key is not a string"));
+          }
+          return core::RespValue::BulkString(state.StringValue());
+        } else if constexpr (std::is_same_v<T, core::ops::HashGet>) {
+          auto value = state.HashFieldValue(read.field);
+          if (!value.has_value()) return core::RespValue::Null();
+          return core::RespValue::BulkString(*value);
+        } else if constexpr (std::is_same_v<T, core::ops::HashGetAll>) {
+          if (state.Type() != CompactedState::DataType::kHash) {
+            return std::unexpected(
+                core::Error(core::ErrorCode::kWrongType,
+                            "Operation against a key holding the wrong kind of value"));
+          }
+          // Buffer's collection view is partial; full reads merge in cold.
+          return std::unexpected(core::Error(core::ErrorCode::kNotFound,
+                                             "buffer defers full-collection reads to cold"));
+        } else if constexpr (std::is_same_v<T, core::ops::SetIsMember>) {
+          if (state.Type() != CompactedState::DataType::kSet) {
+            return std::unexpected(
+                core::Error(core::ErrorCode::kWrongType,
+                            "Operation against a key holding the wrong kind of value"));
+          }
+          return core::RespValue::Integer(state.SetHasMember(read.member) ? 1 : 0);
+        } else if constexpr (std::is_same_v<T, core::ops::SetMembers>) {
+          return std::unexpected(core::Error(core::ErrorCode::kNotFound,
+                                             "buffer defers full-collection reads to cold"));
+        } else if constexpr (std::is_same_v<T, core::ops::SetCard>) {
+          if (state.Type() != CompactedState::DataType::kSet) {
+            return std::unexpected(
+                core::Error(core::ErrorCode::kWrongType,
+                            "Operation against a key holding the wrong kind of value"));
+          }
+          return core::RespValue::Integer(static_cast<int64_t>(state.SetCardinality()));
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetScore>) {
+          if (state.Type() != CompactedState::DataType::kZset) {
+            return std::unexpected(
+                core::Error(core::ErrorCode::kWrongType,
+                            "Operation against a key holding the wrong kind of value"));
+          }
+          auto score = state.ZsetMemberScore(read.member);
+          if (!score.has_value()) return core::RespValue::Null();
+          return core::RespValue::BulkString(core::FormatRespDouble(*score));
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetCard>) {
+          if (state.Type() != CompactedState::DataType::kZset) {
+            return std::unexpected(
+                core::Error(core::ErrorCode::kWrongType,
+                            "Operation against a key holding the wrong kind of value"));
+          }
+          return core::RespValue::Integer(static_cast<int64_t>(state.ZsetCardinality()));
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetRange>) {
+          // Range needs cold's score-index; buffer's hash view can't iterate.
+          return std::unexpected(
+              core::Error(core::ErrorCode::kNotFound, "buffer defers ZRANGE to cold"));
+        } else {
+          return std::unexpected(
+              core::Error(core::ErrorCode::kInternal, "unsupported buffer read op"));
+        }
+      },
+      op);
+}
+
+core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const {
+  return Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
 }
 
 std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size_t max_count)

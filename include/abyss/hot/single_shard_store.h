@@ -91,6 +91,8 @@ class SingleShardStore {
   core::Result<void> ApplyHashDel(const core::ops::HashDel& op);
   core::Result<void> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
                                          core::EvictionTTL eviction);
+  core::Result<void> ApplyExpire(const core::ops::Expire& op);
+  core::Result<void> ApplyPersist(const core::ops::Persist& op);
 
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;

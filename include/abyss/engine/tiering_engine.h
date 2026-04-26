@@ -45,6 +45,8 @@ class TieringEngine : public core::CommandDispatcher {
                                              const core::RespCommand& cmd) override;
   core::Result<core::RespValue> DispatchWrite(std::string_view name,
                                               core::RespCommand cmd) override;
+  core::Result<core::RespValue> DispatchConditional(std::string_view name, core::RespCommand cmd,
+                                                    core::PredicateFlags flags) override;
 
   TieringEngineMetrics Snapshot() const;
 

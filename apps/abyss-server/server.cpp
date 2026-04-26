@@ -70,7 +70,7 @@ bool Server::Initialize() {
               .max_bytes = config_.queue.group_commit_max_bytes,
           },
       .min_retention = config_.queue.min_retention,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {core::kHotConsumer, core::kColdConsumer, core::kResolverConsumer},
   });
   if (queue_result.has_value() && (*queue_result)->IsRecovering()) {
     ABYSS_LOG_CRITICAL(ServerLog(), "WAL opened but still recovering; refusing to start");
@@ -85,6 +85,7 @@ bool Server::Initialize() {
   queue_ = std::move(*queue_result);
 
   consumer_rpc_ = std::make_unique<core::ConsumerRpc>(config_.consumer_rpc);
+  apply_notifier_ = std::make_unique<core::ApplyNotifier>();
 
 #ifdef ABYSS_HAVE_ROCKSDB
   std::filesystem::create_directories(config_.cold.data_path, ec);
@@ -142,7 +143,7 @@ bool Server::Initialize() {
       });
 
   hot_pool_ = std::make_unique<consumer::HotConsumerPool>(
-      *queue_, *hot_store_, *consumer_rpc_,
+      *queue_, *hot_store_, *consumer_rpc_, *apply_notifier_,
       consumer::HotConsumerPool::Config{
           .shard_count = hot_store_->shard_count(),
           .consumer =
@@ -160,8 +161,23 @@ bool Server::Initialize() {
           .default_eviction =
               core::EvictionTTL{static_cast<uint64_t>(config_.hot.default_eviction.count())},
       });
+  resolver_pool_ = std::make_unique<consumer::ResolverPool>(
+      *queue_, *cold_store_, *cold_pool_, *consumer_rpc_, *apply_notifier_,
+      consumer::ResolverPool::Config{
+          .shard_count = hot_store_->shard_count(),
+          .consumer = consumer::Resolver::Config{},
+      });
+
+  // Resolver replay must finish before any consumer starts. ADP-011 §Recovery.
+  if (auto r = resolver_pool_->ReplayForRecovery(); !r.has_value()) {
+    ABYSS_LOG_CRITICAL(ServerLog(), "resolver replay failed",
+                       {"err", std::string_view{r.error().message()}});
+    return false;
+  }
+
   hot_eviction_worker_->Start();
 
+  resolver_pool_->Start();
   hot_pool_->Start();
   cold_pool_->Start();
 #endif
@@ -188,10 +204,8 @@ bool Server::Initialize() {
       [q = queue_.get()] { return q != nullptr && q->IsRecovering(); });
   resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
 
-  // The dispatcher (engine_) stays unwired in the pipeline until the consumer
-  // surfaces typed write returns; wiring it today would reply +OK to
-  // SADD/ZADD/etc. instead of the integer count clients expect. Admin
-  // providers are fully wired so INFO, CLUSTER, CONFIG, and COMMAND function.
+  // Dispatcher stays unwired until the hot consumer surfaces typed write
+  // returns; wiring it today would reply +OK to SADD/ZADD/DEL/etc.
   resp::PipelineDependencies pipeline_deps{
       .dispatcher = nullptr,
       .loading = loading_.get(),
@@ -292,6 +306,7 @@ void Server::Shutdown() {
 
   if (cold_pool_) cold_pool_->Stop();
   if (hot_pool_) hot_pool_->Stop();
+  if (resolver_pool_) resolver_pool_->Stop();
   if (hot_eviction_worker_) hot_eviction_worker_->Stop();
 
   ready_.store(false, std::memory_order_release);

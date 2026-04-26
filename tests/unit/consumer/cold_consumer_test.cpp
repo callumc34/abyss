@@ -45,7 +45,7 @@ core::QueueEntry MakeResolvedEntry(core::SequenceId seq, core::Decision decision
   core::entry::Resolved r;
   r.decision = decision;
   if (materialised.has_value()) {
-    r.materialised_op = core::RespCommand{.args = std::move(*materialised)};
+    r.materialised_ops.push_back(core::RespCommand{.args = std::move(*materialised)});
   }
   return core::QueueEntry{
       .seq = seq,

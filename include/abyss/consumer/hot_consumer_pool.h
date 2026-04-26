@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "abyss/consumer/hot_consumer.h"
+#include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/hot_store.h"
@@ -21,7 +22,8 @@ class HotConsumerPool {
   };
 
   HotConsumerPool(core::Queue& queue, core::HotStore& hot_store, core::ConsumerRpc& rpc,
-                  Config config, const core::EvictionPolicy& eviction_policy);
+                  core::ApplyNotifier& apply_notifier, Config config,
+                  const core::EvictionPolicy& eviction_policy);
   ~HotConsumerPool();
   HotConsumerPool(const HotConsumerPool&) = delete;
   HotConsumerPool& operator=(const HotConsumerPool&) = delete;

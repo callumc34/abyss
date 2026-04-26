@@ -13,7 +13,7 @@ struct AbsorbVisitor {
   CompactedState::DataType& type;
   bool& is_tombstone;
   std::optional<std::string>& string_value;
-  uint64_t& string_ttl_ms;
+  uint64_t& abs_ttl_ms;
   std::unordered_set<std::string>& set_members;
   std::unordered_set<std::string>& set_removed_members;
   std::unordered_map<std::string, double>& zset_members;
@@ -26,7 +26,7 @@ struct AbsorbVisitor {
     type = CompactedState::DataType::kString;
     is_tombstone = false;
     string_value = std::string(s.value);
-    string_ttl_ms = s.abs_ttl_ms;
+    abs_ttl_ms = s.abs_ttl_ms;
     set_members.clear();
     set_removed_members.clear();
     zset_members.clear();
@@ -39,7 +39,7 @@ struct AbsorbVisitor {
     type = CompactedState::DataType::kNone;
     is_tombstone = true;
     string_value.reset();
-    string_ttl_ms = 0;
+    abs_ttl_ms = 0;
     set_members.clear();
     set_removed_members.clear();
     zset_members.clear();
@@ -47,6 +47,10 @@ struct AbsorbVisitor {
     hash_fields.clear();
     hash_removed_fields.clear();
   }
+
+  void operator()(const core::ops::Expire& e) { abs_ttl_ms = e.abs_ttl_ms; }
+
+  void operator()(const core::ops::Persist& /*unused*/) { abs_ttl_ms = 0; }
 
   void operator()(const core::ops::SetAdd& s) {
     if (type != CompactedState::DataType::kSet && type != CompactedState::DataType::kNone) {
@@ -138,7 +142,7 @@ void CompactedState::Absorb(const core::ops::WriteOp& op) {
       .type = type_,
       .is_tombstone = is_tombstone_,
       .string_value = string_value_,
-      .string_ttl_ms = string_ttl_ms_,
+      .abs_ttl_ms = abs_ttl_ms_,
       .set_members = set_members_,
       .set_removed_members = set_removed_members_,
       .zset_members = zset_members_,
@@ -164,7 +168,7 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
         result.emplace_back(core::ops::StringSet{
             .key = {},
             .value = *string_value_,
-            .abs_ttl_ms = string_ttl_ms_,
+            .abs_ttl_ms = abs_ttl_ms_,
         });
       }
       break;
@@ -176,6 +180,9 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           members.emplace_back(m);
         }
         result.emplace_back(core::ops::SetAdd{.key = {}, .members = std::move(members)});
+        if (abs_ttl_ms_ > 0) {
+          result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
+        }
       }
       break;
     case DataType::kZset:
@@ -186,6 +193,9 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           entries.push_back({.score = score, .member = member});
         }
         result.emplace_back(core::ops::ZsetAdd{.key = {}, .entries = std::move(entries)});
+        if (abs_ttl_ms_ > 0) {
+          result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
+        }
       }
       break;
     case DataType::kHash:
@@ -196,6 +206,9 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           fields.push_back({.field = field, .value = value});
         }
         result.emplace_back(core::ops::HashSet{.key = {}, .fields = std::move(fields)});
+        if (abs_ttl_ms_ > 0) {
+          result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
+        }
       }
       break;
   }
@@ -231,10 +244,34 @@ size_t CompactedState::EstimatedBytes() const {
   return 0;
 }
 
+bool CompactedState::HashHasField(std::string_view field) const {
+  if (type_ != DataType::kHash || is_tombstone_) return false;
+  return hash_fields_.contains(std::string(field));
+}
+
+std::optional<std::string> CompactedState::HashFieldValue(std::string_view field) const {
+  if (type_ != DataType::kHash || is_tombstone_) return std::nullopt;
+  auto it = hash_fields_.find(std::string(field));
+  if (it == hash_fields_.end()) return std::nullopt;
+  return it->second;
+}
+
+bool CompactedState::SetHasMember(std::string_view member) const {
+  if (type_ != DataType::kSet || is_tombstone_) return false;
+  return set_members_.contains(std::string(member));
+}
+
+std::optional<double> CompactedState::ZsetMemberScore(std::string_view member) const {
+  if (type_ != DataType::kZset || is_tombstone_) return std::nullopt;
+  auto it = zset_members_.find(std::string(member));
+  if (it == zset_members_.end()) return std::nullopt;
+  return it->second;
+}
+
 void CompactedState::Reset() {
   type_ = DataType::kNone;
   string_value_.reset();
-  string_ttl_ms_ = 0;
+  abs_ttl_ms_ = 0;
   hash_fields_.clear();
   hash_removed_fields_.clear();
   set_members_.clear();

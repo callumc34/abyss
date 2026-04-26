@@ -21,6 +21,11 @@ class StubDispatcher : public core::CommandDispatcher {
                                               core::RespCommand /*cmd*/) override {
     return core::RespValue::SimpleString("OK");
   }
+  core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
+                                                    core::RespCommand /*cmd*/,
+                                                    core::PredicateFlags /*flags*/) override {
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 }  // namespace abyss::net::testing

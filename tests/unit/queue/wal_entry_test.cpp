@@ -235,7 +235,7 @@ TEST(WalEntryTest, RoundTripResolvedEntry) {
           core::entry::Resolved{
               .ref = 10,
               .decision = core::Decision::kApply,
-              .materialised_op = core::RespCommand{{"SET", "k", "v"}},
+              .materialised_ops = {core::RespCommand{{"SET", "k", "v"}}},
               .return_value = core::RespValue::SimpleString("OK"),
           },
   };
@@ -251,8 +251,8 @@ TEST(WalEntryTest, RoundTripResolvedEntry) {
   ASSERT_NE(resolved, nullptr);
   EXPECT_EQ(resolved->ref, 10U);
   EXPECT_EQ(resolved->decision, core::Decision::kApply);
-  ASSERT_TRUE(resolved->materialised_op.has_value());
-  EXPECT_EQ(resolved->materialised_op->args, (std::vector<std::string>{"SET", "k", "v"}));
+  ASSERT_EQ(resolved->materialised_ops.size(), 1U);
+  EXPECT_EQ(resolved->materialised_ops[0].args, (std::vector<std::string>{"SET", "k", "v"}));
   EXPECT_TRUE(resolved->return_value.IsSimpleString());
   EXPECT_EQ(resolved->return_value.AsString(), "OK");
 }
@@ -265,7 +265,7 @@ TEST(WalEntryTest, RoundTripResolvedSkipNoMaterialisedOp) {
           core::entry::Resolved{
               .ref = 10,
               .decision = core::Decision::kSkip,
-              .materialised_op = std::nullopt,
+              .materialised_ops = {},
               .return_value = core::RespValue::Null(),
           },
   };
@@ -279,8 +279,37 @@ TEST(WalEntryTest, RoundTripResolvedSkipNoMaterialisedOp) {
   auto* resolved = std::get_if<core::entry::Resolved>(&decoded->entry.payload);
   ASSERT_NE(resolved, nullptr);
   EXPECT_EQ(resolved->decision, core::Decision::kSkip);
-  EXPECT_FALSE(resolved->materialised_op.has_value());
+  EXPECT_TRUE(resolved->materialised_ops.empty());
   EXPECT_TRUE(resolved->return_value.IsNull());
+}
+
+TEST(WalEntryTest, RoundTripResolvedMultipleMaterialisedOps) {
+  const core::QueueEntry entry{
+      .seq = 30,
+      .appended_at = core::WallClock::now(),
+      .payload =
+          core::entry::Resolved{
+              .ref = 25,
+              .decision = core::Decision::kApply,
+              .materialised_ops = {core::RespCommand{{"DEL", "src"}},
+                                   core::RespCommand{{"SET", "dst", "v"}},
+                                   core::RespCommand{{"PEXPIREAT", "dst", "1700000000000"}}},
+              .return_value = core::RespValue::Integer(1),
+          },
+  };
+
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, entry.seq, buf);
+
+  auto decoded = DecodeWalEntry(buf);
+  ASSERT_TRUE(decoded.has_value());
+
+  auto* resolved = std::get_if<core::entry::Resolved>(&decoded->entry.payload);
+  ASSERT_NE(resolved, nullptr);
+  ASSERT_EQ(resolved->materialised_ops.size(), 3U);
+  EXPECT_EQ(resolved->materialised_ops[0].args[0], "DEL");
+  EXPECT_EQ(resolved->materialised_ops[1].args[0], "SET");
+  EXPECT_EQ(resolved->materialised_ops[2].args[0], "PEXPIREAT");
 }
 
 TEST(WalEntryTest, BatchLastSeqEncodedAndDecoded) {

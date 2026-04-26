@@ -26,6 +26,10 @@ using namespace std::chrono_literals;
 class SingleBufferRouter : public consumer::CompactionBufferRouter {
  public:
   explicit SingleBufferRouter(consumer::CompactionBuffer& buffer) : buffer_(buffer) {}
+  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
+                                     std::optional<core::Duration> /*deadline*/) override {
+    return buffer_.Exec(op);
+  }
   core::Result<core::RespValue> Read(std::string_view key) const override {
     return buffer_.Read(std::string(key));
   }
@@ -76,7 +80,7 @@ TEST_F(TieringEngineTest, ReadHotHitReturnsValue) {
   auto engine = MakeEngine();
   auto expected = core::RespValue::BulkString("value");
 
-  EXPECT_CALL(hot_, Exec(_)).WillOnce(Return(expected));
+  EXPECT_CALL(hot_, Exec(_, _)).WillOnce(Return(expected));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
@@ -90,7 +94,7 @@ TEST_F(TieringEngineTest, ReadHotMissBufferHitReturnsBufferValue) {
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "buffered"}},
                  core::EvictionTTL{86400});
 
-  EXPECT_CALL(hot_, Exec(_))
+  EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
@@ -102,9 +106,9 @@ TEST_F(TieringEngineTest, ReadHotMissBufferMissColdHitReturnsColdValue) {
   auto engine = MakeEngine();
   auto cold_value = core::RespValue::BulkString("cold_value");
 
-  EXPECT_CALL(hot_, Exec(_))
+  EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
-  EXPECT_CALL(cold_, Exec(_)).WillOnce(Return(cold_value));
+  EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(cold_value));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
@@ -114,9 +118,9 @@ TEST_F(TieringEngineTest, ReadHotMissBufferMissColdHitReturnsColdValue) {
 TEST_F(TieringEngineTest, ReadAllTiersMissReturnsColdError) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(hot_, Exec(_))
+  EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
-  EXPECT_CALL(cold_, Exec(_))
+  EXPECT_CALL(cold_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "missing"}));
@@ -127,7 +131,7 @@ TEST_F(TieringEngineTest, ReadAllTiersMissReturnsColdError) {
 TEST_F(TieringEngineTest, ReadHotErrorPropagates) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(hot_, Exec(_))
+  EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kWrongType, "wrong type"))));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
@@ -143,7 +147,7 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::Del{.keys = {"key"}}},
                  core::EvictionTTL{86400});
 
-  EXPECT_CALL(hot_, Exec(_))
+  EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));

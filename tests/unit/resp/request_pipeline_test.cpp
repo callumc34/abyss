@@ -352,15 +352,15 @@ TEST(RequestPipelineTest, TieredReadWithoutDispatcherReturnsInternalError) {
   EXPECT_EQ(response.AsString().find("dispatcher"), std::string::npos);
 }
 
-TEST(RequestPipelineTest, ConditionalWriteRejectedWithIssueReference) {
+TEST(RequestPipelineTest, ConditionalWriteWithoutDispatcherReturnsInternalServerError) {
+  // No dispatcher injected — the conditional path surfaces an internal
+  // server error rather than leaking dependency identity to the client.
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*3\r\n$5\r\nSETNX\r\n$1\r\nk\r\n$1\r\nv\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("conditional writes are not supported"), std::string::npos);
-  EXPECT_NE(response.AsString().find("SETNX"), std::string::npos);
-  EXPECT_NE(response.AsString().find("abyss#97"), std::string::npos);
+  EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, ObjectIdletimeRoutedToConsumerRpcRejection) {

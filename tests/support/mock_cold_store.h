@@ -11,7 +11,8 @@ namespace abyss::testing {
 
 class MockColdStore : public core::ColdStore {
  public:
-  MOCK_METHOD(core::Result<core::RespValue>, Exec, (const core::ops::ReadOp& op), (override));
+  MOCK_METHOD(core::Result<core::RespValue>, Exec,
+              (const core::ops::ReadOp& op, std::optional<core::Duration> deadline), (override));
   MOCK_METHOD(core::Result<void>, ApplyBatch, (std::span<const core::ops::WriteOp> ops),
               (override));
   MOCK_METHOD(core::Result<core::StorageStats>, Stats, (), (override));

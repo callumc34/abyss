@@ -84,12 +84,18 @@ TieringEngineMetrics TieringEngine::Snapshot() const {
   };
 }
 
+namespace {
+
+core::ShardId ShardForCmd(const core::RespCommand& cmd, uint32_t shard_count) {
+  if (cmd.args.size() <= 1) return 0;
+  return core::ComputeShard(cmd.args[1], shard_count);
+}
+
+}  // namespace
+
 core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
                                                            core::RespCommand cmd) {
-  core::ShardId shard = 0;
-  if (cmd.args.size() > 1) {
-    shard = core::ComputeShard(cmd.args[1], config_.shard_count);
-  }
+  const core::ShardId shard = ShardForCmd(cmd, config_.shard_count);
 
   core::QueueEntry entry{
       .appended_at = core::WallClock::now(),
@@ -138,6 +144,52 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
     return core::RespValue::Error(
         core::ErrorPrefix::kErr,
         "write durable in queue but consumer did not apply within timeout");
+  }
+  return rpc_future.get();
+}
+
+core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_view /*name*/,
+                                                                 core::RespCommand cmd,
+                                                                 core::PredicateFlags flags) {
+  const core::ShardId shard = ShardForCmd(cmd, config_.shard_count);
+
+  core::QueueEntry entry{
+      .appended_at = core::WallClock::now(),
+      .payload = core::entry::Conditional{.cmd = std::move(cmd), .flags = flags},
+  };
+
+  auto pending = queue_.BeginAppend(shard, std::move(entry));
+  if (!pending.has_value()) {
+    return std::unexpected(pending.error());
+  }
+  const core::SequenceId seq = pending->seq();
+  auto rpc_future = rpc_.Register(seq);
+  queue::DurabilityFuture durable_future = std::move(pending->durable());
+  pending->Publish();
+
+  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
+  if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
+    rpc_.Cancel(seq);
+    return core::RespValue::Error(
+        core::ErrorPrefix::kErr,
+        "conditional durable wait exceeded server timeout; will resolve on resolver catch-up");
+  }
+  auto durable = durable_future.get();
+  if (!durable.has_value()) {
+    rpc_.Cancel(seq);
+    return std::unexpected(durable.error());
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto min_rpc_budget = std::chrono::milliseconds{static_cast<int64_t>(
+      static_cast<double>(config_.write_timeout.count()) * config_.min_rpc_wait_fraction)};
+  const auto rpc_deadline = std::max(durable_deadline, now + min_rpc_budget);
+
+  if (rpc_future.wait_until(rpc_deadline) == std::future_status::timeout) {
+    rpc_.Cancel(seq);
+    return core::RespValue::Error(
+        core::ErrorPrefix::kErr,
+        "conditional durable in queue but resolver did not decide within timeout");
   }
   return rpc_future.get();
 }

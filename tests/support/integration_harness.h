@@ -12,6 +12,7 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/consumer/hot_consumer_pool.h"
+#include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
@@ -48,6 +49,7 @@ class IntegrationHarness {
     cold_ = std::move(cold_result).value();
 
     rpc_ = std::make_unique<core::ConsumerRpc>();
+    apply_notifier_ = std::make_unique<core::ApplyNotifier>();
 
     InstallQueueMocks();
 
@@ -61,7 +63,7 @@ class IntegrationHarness {
         engine::TieringEngineConfig{.shard_count = kShardCount});
 
     hot_pool_ =
-        std::make_unique<consumer::HotConsumerPool>(queue_, *hot_, *rpc_,
+        std::make_unique<consumer::HotConsumerPool>(queue_, *hot_, *rpc_, *apply_notifier_,
                                                     consumer::HotConsumerPool::Config{
                                                         .shard_count = kShardCount,
                                                         .consumer =
@@ -175,6 +177,7 @@ class IntegrationHarness {
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> rpc_;
+  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 };

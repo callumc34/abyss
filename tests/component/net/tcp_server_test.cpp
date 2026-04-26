@@ -50,6 +50,12 @@ class StubDispatcher : public core::CommandDispatcher {
     write_calls.fetch_add(1);
     return core::RespValue::SimpleString("OK");
   }
+  core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
+                                                    core::RespCommand /*cmd*/,
+                                                    core::PredicateFlags /*flags*/) override {
+    write_calls.fetch_add(1);
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 TcpServerConfig DefaultTestConfig() {
@@ -197,7 +203,7 @@ TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
   cfg.connection.write_hard_limit_bytes = 8192;
   cfg.io_threads = 2;
   StubDispatcher dispatcher;
-  dispatcher.read_payload.assign(32 * 1024 * 1024, 'z');
+  dispatcher.read_payload.assign(static_cast<size_t>(32) * 1024 * 1024, 'z');
   TcpServer server(cfg, resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());

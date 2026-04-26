@@ -1,11 +1,10 @@
 #pragma once
 
-#include <optional>
 #include <variant>
+#include <vector>
 
 #include "abyss/core/predicate.h"
 #include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
 namespace abyss::core {
@@ -23,10 +22,12 @@ struct Conditional {
   PredicateFlags flags = PredicateFlags::kNone;
 };
 
+// `materialised_ops` is empty for Skip; one or more for Apply (compound
+// conditionals like RENAMENX expand into Del + recreate + Expire).
 struct Resolved {
   SequenceId ref = 0;
   Decision decision = Decision::kSkip;
-  std::optional<RespCommand> materialised_op = std::nullopt;
+  std::vector<RespCommand> materialised_ops;
   RespValue return_value;
 };
 
@@ -37,13 +38,5 @@ struct QueueEntry {
   WallTime appended_at;
   std::variant<entry::Write, entry::Conditional, entry::Resolved> payload;
 };
-
-namespace entry {
-
-// Returns the RespCommand a consumer should dispatch.
-// kNotFound signals an intentional skip; kInvalidArgument a parse-level failure.
-Result<const RespCommand*> ExtractApplicableCommand(const QueueEntry& entry);
-
-}  // namespace entry
 
 }  // namespace abyss::core

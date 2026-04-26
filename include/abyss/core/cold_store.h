@@ -6,8 +6,10 @@
 #include <string_view>
 
 #include "abyss/core/ops.h"
+#include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/types.h"
 
 namespace abyss::core {
 
@@ -16,16 +18,18 @@ struct StorageStats {
   uint64_t key_count = 0;
 };
 
-class ColdStore {
+class ColdStore : public Reader {
  public:
   ColdStore() = default;
-  virtual ~ColdStore() = default;
+  ~ColdStore() override = default;
   ColdStore(const ColdStore&) = delete;
   ColdStore& operator=(const ColdStore&) = delete;
   ColdStore(ColdStore&&) = delete;
   ColdStore& operator=(ColdStore&&) = delete;
 
-  virtual Result<RespValue> Exec(const ops::ReadOp& op) = 0;
+  Result<RespValue> Exec(const ops::ReadOp& op,
+                         std::optional<Duration> deadline = std::nullopt) override = 0;
+
   virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops) = 0;
 
   virtual Result<StorageStats> Stats() = 0;

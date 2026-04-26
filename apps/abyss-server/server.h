@@ -7,6 +7,8 @@
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/consumer/hot_consumer_pool.h"
+#include "abyss/consumer/resolver_pool.h"
+#include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
@@ -56,8 +58,10 @@ class Server {
   std::unique_ptr<hot::EvictionWorker> hot_eviction_worker_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
+  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
+  std::unique_ptr<consumer::ResolverPool> resolver_pool_;
 
   // Frontend providers — outlive the TCP server.
   std::unique_ptr<resp::NodeIdentity> node_identity_;
