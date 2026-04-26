@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "abyss/platform/types.h"
+
 namespace abyss::component_test {
 
 // Synchronous RESP2 client over a blocking TCP socket.
@@ -21,19 +23,19 @@ class SyncRedisClient {
 
   bool Connect(uint16_t port, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
   void Close();
-  bool IsConnected() const noexcept { return fd_ >= 0; }
+  bool IsConnected() const noexcept { return fd_ != ::abyss::platform::kInvalidSocket; }
 
-  std::string Command(std::initializer_list<std::string> args);
-  bool SendRaw(const std::string& bytes);
+  std::string Command(std::initializer_list<std::string> args) const;
+  bool SendRaw(const std::string& bytes) const;
   std::string ReadSome(size_t n,
-                       std::chrono::milliseconds timeout = std::chrono::milliseconds{500});
+                       std::chrono::milliseconds timeout = std::chrono::milliseconds{500}) const;
 
-  int Fd() const noexcept { return fd_; }
+  ::abyss::platform::Socket Fd() const noexcept { return fd_; }
 
  private:
   static std::string Encode(const std::vector<std::string>& args);
 
-  int fd_ = -1;
+  ::abyss::platform::Socket fd_ = ::abyss::platform::kInvalidSocket;
 };
 
 }  // namespace abyss::component_test

@@ -28,7 +28,7 @@ Reactor::~Reactor() {
   }
 }
 
-core::Result<void> Reactor::AdoptListener(int listen_fd) {
+core::Result<void> Reactor::AdoptListener(Socket listen_fd) {
   if (!is_acceptor_) {
     return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument,
                                        "Reactor::AdoptListener called on a non-acceptor reactor"});

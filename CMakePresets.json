@@ -70,6 +70,32 @@
         "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
         "CMAKE_EXE_LINKER_FLAGS": "-static-libstdc++ -static-libgcc"
       }
+    },
+    {
+      "name": "windows-default",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ABYSS_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-release",
+        "VCPKG_HOST_TRIPLET": "x64-windows-static-release",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets"
+      }
+    },
+    {
+      "name": "windows-release",
+      "inherits": "windows-default",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ABYSS_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -100,6 +126,14 @@
     {
       "name": "container",
       "configurePreset": "container"
+    },
+    {
+      "name": "windows-default",
+      "configurePreset": "windows-default"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release"
     }
   ],
   "testPresets": [
@@ -154,6 +188,19 @@
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 300
+      }
+    },
+    {
+      "name": "windows-default",
+      "configurePreset": "windows-default",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 4,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 60
       }
     }
   ]

@@ -1,12 +1,8 @@
 #include "abyss/queue/file_offset_store.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <array>
 #include <atomic>
-#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -16,12 +12,15 @@
 #include <vector>
 
 #include "abyss/log/log.h"
+#include "abyss/platform/fs.h"
 #include "binary_io.h"
 #include "crc32c.h"
 
 namespace abyss::queue {
 
 namespace {
+
+namespace pfs = abyss::platform::fs;
 
 const log::Logger& Log() {
   static const log::Logger l = log::Get("abyss.queue.offsets");
@@ -38,70 +37,25 @@ constexpr uint8_t kOffsetFormatMinor = 0;
 constexpr size_t kOffsetRecordSize = 28;
 constexpr int kShardFileWidth = 20;
 
-core::Error IoError(const char* what) {
-  return {core::ErrorCode::kInternal, std::string(what) + ": " + std::strerror(errno)};
-}
-
-core::Result<void> WriteFull(int fd, const void* buf, size_t count) {
-  const auto* p = static_cast<const uint8_t*>(buf);
-  size_t remaining = count;
-  while (remaining > 0) {  // NOLINT(bugprone-infinite-loop)
-    auto n = ::write(fd, p, remaining);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return std::unexpected(IoError("write"));
-    }
-    p += n;
-    remaining -= static_cast<size_t>(n);
-  }
-  return {};
-}
-
 core::Result<std::vector<std::byte>> ReadAll(const std::string& path) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    if (errno == ENOENT) {
+  auto file =
+      pfs::Open(std::filesystem::path(path), pfs::OpenOptions{.mode = pfs::OpenMode::kRead});
+  if (!file.has_value()) {
+    if (file.error().code() == core::ErrorCode::kNotFound) {
       return std::vector<std::byte>{};
     }
-    return std::unexpected(IoError("open"));
+    return std::unexpected(file.error());
   }
-  struct stat st{};
-  if (::fstat(fd, &st) < 0) {
-    ::close(fd);
-    return std::unexpected(IoError("fstat"));
+  auto size = pfs::FileSize(*file);
+  if (!size.has_value()) return std::unexpected(size.error());
+  std::vector<std::byte> buf(static_cast<size_t>(*size));
+  if (buf.empty()) return buf;
+  auto nread = pfs::Pread(*file, buf.data(), buf.size(), 0);
+  if (!nread.has_value()) return std::unexpected(nread.error());
+  if (*nread < buf.size()) {
+    return std::unexpected(core::Error{core::ErrorCode::kCorruption, "short read"});
   }
-  std::vector<std::byte> buf(static_cast<size_t>(st.st_size));
-  auto* p = buf.data();
-  size_t remaining = buf.size();
-  while (remaining > 0) {
-    auto n = ::read(fd, p, remaining);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      ::close(fd);
-      return std::unexpected(IoError("read"));
-    }
-    if (n == 0) {
-      ::close(fd);
-      return std::unexpected(core::Error{core::ErrorCode::kCorruption, "short read"});
-    }
-    p += n;
-    remaining -= static_cast<size_t>(n);
-  }
-  ::close(fd);
   return buf;
-}
-
-core::Result<void> FsyncDir(const std::string& dir) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-  const int fd = ::open(dir.c_str(), O_RDONLY);
-  if (fd < 0) return std::unexpected(IoError("open dir"));
-  if (::fsync(fd) < 0) {
-    ::close(fd);
-    return std::unexpected(IoError("fsync dir"));
-  }
-  ::close(fd);
-  return {};
 }
 
 std::string FormatShardName(core::ShardId shard) {
@@ -174,7 +128,7 @@ std::string FileOffsetStore::ShardFilePath(core::ConsumerId consumer, core::Shar
 
 std::string FileOffsetStore::ShardTempPath(core::ConsumerId consumer, core::ShardId shard) const {
   static std::atomic<uint64_t> counter{0};
-  const auto suffix = std::to_string(::getpid()) + "." +
+  const auto suffix = std::to_string(pfs::ProcessId()) + "." +
                       std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
   return ShardFilePath(consumer, shard) + ".tmp." + suffix;
 }
@@ -291,31 +245,33 @@ core::Result<void> FileOffsetStore::WriteShardFile(core::ConsumerId consumer, co
   binary::WriteU32LE(buf, crc);
 
   const auto tmp = ShardTempPath(consumer, shard);
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) return std::unexpected(IoError("open tmp"));
+  auto file = pfs::Open(
+      std::filesystem::path(tmp),
+      pfs::OpenOptions{
+          .mode = pfs::OpenMode::kWrite, .create = true, .exclusive = false, .truncate = true});
+  if (!file.has_value()) return std::unexpected(file.error());
 
-  auto wr = WriteFull(fd, buf.data(), buf.size());
-  if (!wr.has_value()) {
-    ::close(fd);
-    ::unlink(tmp.c_str());
-    return std::unexpected(wr.error());
+  if (auto r = pfs::WriteAll(*file, buf.data(), buf.size()); !r.has_value()) {
+    file->Close();
+    (void)pfs::Unlink(std::filesystem::path(tmp));  // NOLINT(bugprone-unused-return-value)
+    return std::unexpected(r.error());
   }
 
-  if (::fsync(fd) < 0) {
-    ::close(fd);
-    ::unlink(tmp.c_str());
-    return std::unexpected(IoError("fsync tmp"));
+  if (auto r = pfs::Fsync(*file); !r.has_value()) {
+    file->Close();
+    (void)pfs::Unlink(std::filesystem::path(tmp));  // NOLINT(bugprone-unused-return-value)
+    return std::unexpected(r.error());
   }
-  ::close(fd);
+  file->Close();
 
   const auto target = ShardFilePath(consumer, shard);
-  if (::rename(tmp.c_str(), target.c_str()) < 0) {
-    ::unlink(tmp.c_str());
-    return std::unexpected(IoError("rename"));
+  if (auto r = pfs::Rename(std::filesystem::path(tmp), std::filesystem::path(target));
+      !r.has_value()) {
+    (void)pfs::Unlink(std::filesystem::path(tmp));  // NOLINT(bugprone-unused-return-value)
+    return std::unexpected(r.error());
   }
 
-  return FsyncDir(consumer_dir);
+  return pfs::FsyncDir(std::filesystem::path(consumer_dir));
 }
 
 }  // namespace abyss::queue

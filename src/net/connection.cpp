@@ -1,18 +1,17 @@
 #include "abyss/net/connection.h"
 
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
+#include <cstdint>
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/platform/net.h"
 
 namespace abyss::net {
 
 namespace {
+
+namespace pnet = abyss::platform::net;
 
 const log::Logger& Log() {
   static const log::Logger l = log::Get("abyss.net.conn");
@@ -131,7 +130,7 @@ void Connection::Close(metrics::CloseReason reason) {
       ABYSS_LOG_DEBUG(Log(), "poller remove on close failed", {"client_id", client_id_},
                       {"err", std::string_view{r.error().message()}});
     }
-    ::shutdown(fd_.Get(), SHUT_RDWR);
+    pnet::ShutdownBoth(fd_.Get());
   }
   fd_.Reset();
 
@@ -155,7 +154,7 @@ void Connection::OnReadable() {
     const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
     read_buf_.resize(old_size + want);
 
-    const ssize_t n = ::recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
+    const auto n = pnet::Recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
     if (n > 0) {
       read_buf_.resize(old_size + static_cast<size_t>(n));
       metrics_.bytes_in.Increment(static_cast<double>(n));
@@ -169,10 +168,11 @@ void Connection::OnReadable() {
       Close(metrics::CloseReason::kClient);
       return;
     }
-    if (errno == EINTR) continue;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+    const int err = pnet::LastError();
+    if (pnet::IsInterrupted(err)) continue;
+    if (pnet::IsWouldBlock(err)) break;
     ABYSS_LOG_DEBUG(Log(), "recv error", {"client_id", client_id_},
-                    {"err", std::string_view{std::strerror(errno)}});
+                    {"err", std::string_view{pnet::ErrorString(err)}});
     Close(metrics::CloseReason::kClient);
     return;
   }
@@ -219,27 +219,23 @@ void Connection::DispatchPipelineOutput() {
 void Connection::TryDrainWrite() {
   while (write_pos_ < write_buf_.size()) {
     const size_t remaining = write_buf_.size() - write_pos_;
-    const ssize_t n = ::send(fd_.Get(), write_buf_.data() + write_pos_, remaining,
-#ifdef MSG_NOSIGNAL
-                             MSG_NOSIGNAL
-#else
-                             0
-#endif
-    );
+    const auto n = pnet::Send(fd_.Get(), write_buf_.data() + write_pos_, remaining,
+                              pnet::SendFlagsNoSigPipe());
     if (n > 0) {
       write_pos_ += static_cast<size_t>(n);
       metrics_.bytes_out.Increment(static_cast<double>(n));
       continue;
     }
     if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-      if (errno == EPIPE || errno == ECONNRESET) {
+      const int err = pnet::LastError();
+      if (pnet::IsInterrupted(err)) continue;
+      if (pnet::IsWouldBlock(err)) return;
+      if (pnet::IsBrokenPipe(err) || pnet::IsConnReset(err)) {
         Close(metrics::CloseReason::kClient);
         return;
       }
       ABYSS_LOG_DEBUG(Log(), "send error", {"client_id", client_id_},
-                      {"err", std::string_view{std::strerror(errno)}});
+                      {"err", std::string_view{pnet::ErrorString(err)}});
       Close(metrics::CloseReason::kClient);
       return;
     }

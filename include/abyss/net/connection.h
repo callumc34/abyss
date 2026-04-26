@@ -64,7 +64,7 @@ class Connection {
   Connection(Connection&&) = delete;
   Connection& operator=(Connection&&) = delete;
 
-  int RawFd() const noexcept { return fd_.Get(); }
+  Socket RawFd() const noexcept { return fd_.Get(); }
   uint64_t ClientId() const noexcept { return client_id_; }
   uint32_t RemoteIpv4() const noexcept { return remote_ipv4_; }
   uint16_t RemotePort() const noexcept { return remote_port_; }

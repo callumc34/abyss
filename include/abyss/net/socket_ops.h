@@ -5,36 +5,38 @@
 #include <utility>
 
 #include "abyss/core/result.h"
+#include "abyss/platform/types.h"
 
 namespace abyss::net {
 
-inline constexpr int kInvalidFd = -1;
+using platform::kInvalidSocket;
+using platform::Socket;
 
 class Fd {
  public:
   Fd() = default;
-  explicit Fd(int fd) noexcept : fd_(fd) {}
+  explicit Fd(Socket fd) noexcept : fd_(fd) {}
   ~Fd() noexcept { Reset(); }
 
   Fd(const Fd&) = delete;
   Fd& operator=(const Fd&) = delete;
 
-  Fd(Fd&& other) noexcept : fd_(std::exchange(other.fd_, kInvalidFd)) {}
+  Fd(Fd&& other) noexcept : fd_(std::exchange(other.fd_, kInvalidSocket)) {}
   Fd& operator=(Fd&& other) noexcept {
     if (this != &other) {
       Reset();
-      fd_ = std::exchange(other.fd_, kInvalidFd);
+      fd_ = std::exchange(other.fd_, kInvalidSocket);
     }
     return *this;
   }
 
-  int Get() const noexcept { return fd_; }
-  int Release() noexcept { return std::exchange(fd_, kInvalidFd); }
+  Socket Get() const noexcept { return fd_; }
+  Socket Release() noexcept { return std::exchange(fd_, kInvalidSocket); }
   void Reset() noexcept;
-  bool Valid() const noexcept { return fd_ != kInvalidFd; }
+  bool Valid() const noexcept { return fd_ != kInvalidSocket; }
 
  private:
-  int fd_ = kInvalidFd;
+  Socket fd_ = kInvalidSocket;
 };
 
 struct ListenOptions {
@@ -58,13 +60,10 @@ struct AcceptResult {
 };
 
 // kUnavailable on EAGAIN/EWOULDBLOCK.
-core::Result<AcceptResult> AcceptNonBlocking(int listen_fd);
+core::Result<AcceptResult> AcceptNonBlocking(Socket listen_fd);
 
-void SetTcpNoDelay(int fd) noexcept;
-void SetNoSigPipe(int fd) noexcept;
-void IgnoreSigPipeProcessWide() noexcept;
+void SetTcpNoDelay(Socket s) noexcept;
 
 std::string FormatIpv4(uint32_t addr_net);
-void CloseFd(int fd) noexcept;
 
 }  // namespace abyss::net

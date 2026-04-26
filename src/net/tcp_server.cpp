@@ -7,6 +7,7 @@
 #include "abyss/log/log.h"
 #include "abyss/net/poller.h"
 #include "abyss/net/socket_ops.h"
+#include "abyss/platform/net.h"
 #include "reactor.h"
 
 namespace abyss::net {
@@ -42,7 +43,7 @@ core::Result<void> TcpServer::Start() {
         core::Error{core::ErrorCode::kAlreadyExists, "TcpServer::Start called twice"});
   }
 
-  IgnoreSigPipeProcessWide();
+  platform::net::IgnoreSigPipe();
 
   const auto io_threads = ResolveIoThreads(config_.io_threads);
   config_.io_threads = io_threads;
@@ -128,7 +129,7 @@ void TcpServer::AcceptAll() {
     }
 
     SetTcpNoDelay(accepted->fd.Get());
-    SetNoSigPipe(accepted->fd.Get());
+    platform::net::SetNoSigPipePerSocket(accepted->fd.Get());
 
     const auto prior = active_count_.fetch_add(1, std::memory_order_acq_rel);
     if (prior >= config_.max_connections) {

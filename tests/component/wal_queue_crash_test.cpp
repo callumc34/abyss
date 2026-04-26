@@ -1,7 +1,13 @@
 // Verifies WAL durability across a kill -9: fsynced entries survive, the
 // mid-batch un-fsynced ones don't, no partial batches.
+//
+// The test relies on POSIX fork() to simulate a crash inside the child while
+// the parent observes the on-disk state. Windows has no fork() equivalent, so
+// the test is skipped there; the same invariant is exercised by Linux CI.
 
 #include <gtest/gtest.h>
+
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -15,9 +21,18 @@
 #include "abyss/core/types.h"
 #include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
+#endif
 
 namespace abyss::queue {
 namespace {
+
+#ifdef _WIN32
+
+TEST(WalCrashTest, AckedWritesSurviveKillNineAndReopen) {
+  GTEST_SKIP() << "fork()-based crash simulation is POSIX-only";
+}
+
+#else
 
 using namespace std::chrono_literals;
 
@@ -114,6 +129,8 @@ TEST_F(WalCrashTest, AckedWritesSurviveKillNineAndReopen) {
   const size_t tail = read->size() - kDurableCount;
   EXPECT_TRUE(tail == 0 || tail == 5);
 }
+
+#endif  // !_WIN32
 
 }  // namespace
 }  // namespace abyss::queue
