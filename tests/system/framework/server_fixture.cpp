@@ -17,7 +17,8 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <thread>
+
+#include "abyss/platform/net.h"
 
 #ifndef ABYSS_SERVER_BINARY
 #define ABYSS_SERVER_BINARY ""
@@ -26,6 +27,21 @@
 namespace abyss::system_test {
 
 namespace {
+
+// Process-wide one-time WSA init via the platform abstraction. Refcounted by
+// platform::net so this is safe whether RedisClient or TestServer constructs
+// first; the refcount is not balanced by a Shutdown — we leak it deliberately
+// so socket primitives stay live for any framework class that runs in
+// destructor order during process teardown.
+void EnsureNetInit() {
+#ifdef _WIN32
+  static const bool kInitOnce = [] {
+    auto r = platform::net::Init();
+    return r.has_value();
+  }();
+  (void)kInitOnce;
+#endif
+}
 
 constexpr std::string_view kPortKey = "\"port\":";
 
@@ -45,18 +61,6 @@ uint16_t ParseReadyLine(std::string_view line) {
 }
 
 #ifdef _WIN32
-
-struct WsaGuard {
-  WsaGuard() {
-    WSADATA data;
-    WSAStartup(MAKEWORD(2, 2), &data);
-  }
-  ~WsaGuard() { WSACleanup(); }
-  WsaGuard(const WsaGuard&) = delete;
-  WsaGuard& operator=(const WsaGuard&) = delete;
-};
-
-const WsaGuard kWsaGuard;
 
 std::string BuildCommandLine(const char* binary, const std::string& data_dir,
                              const std::string& shard_count, const std::string& ready_fd) {
@@ -110,6 +114,7 @@ TestServer::~TestServer() {
 }
 
 bool TestServer::Start() {
+  EnsureNetInit();
   const char* binary = ABYSS_SERVER_BINARY;
   if (binary[0] == '\0') {
     skip_reason_ = "ABYSS_SERVER_BINARY macro not set at compile time";
@@ -233,7 +238,7 @@ bool TestServer::WaitForReady() {
     }
 
     DWORD nread = 0;
-    const DWORD to_read = static_cast<DWORD>(std::min<DWORD>(bytes_avail, chunk.size()));
+    const DWORD to_read = static_cast<DWORD>(std::min<size_t>(bytes_avail, chunk.size()));
     if (!ReadFile(ready_read_, chunk.data(), to_read, &nread, nullptr)) {
       skip_reason_ = "ReadFile failed: " + std::to_string(GetLastError());
       return false;

@@ -66,6 +66,13 @@ jobs:
     uses: ./.github/workflows/_build.yml
     secrets: inherit
 
+  build-windows:
+    name: Build (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
+    uses: ./.github/workflows/_build-windows.yml
+    secrets: inherit
+
   sanitizer:
     name: Sanitizer
     needs: [changes, build]
@@ -89,7 +96,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-24.04
-    needs: [changes, format, build, sanitizer, docker]
+    needs: [changes, format, build, build-windows, sanitizer, docker]
     if: always()
     timeout-minutes: 2
     steps:

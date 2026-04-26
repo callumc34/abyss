@@ -191,13 +191,13 @@ TEST_F(ShardedHotStoreTest, ConcurrentWriteAndRead) {
       auto key = "w:" + std::to_string(i);
       auto value = std::to_string(i);
       core::ops::StringSet op{.key = key, .value = value};
-      store_.Apply(core::ops::WriteOp{op}, kEviction);  // NOLINT(bugprone-unused-return-value)
+      (void)store_.Apply(core::ops::WriteOp{op}, kEviction);
     }
   });
 
   std::thread reader([this]() {
     for (int i = 0; i < 200; ++i) {
-      GetString("w:" + std::to_string(i));  // NOLINT(bugprone-unused-return-value)
+      (void)GetString("w:" + std::to_string(i));
     }
   });
 
@@ -212,7 +212,7 @@ TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
 
   std::thread reader([this]() {
     for (int i = 0; i < 50; ++i) {
-      GetString("d:" + std::to_string(i));  // NOLINT(bugprone-unused-return-value)
+      (void)GetString("d:" + std::to_string(i));
     }
   });
 

@@ -60,7 +60,7 @@ class KqueuePoller final : public Poller {
   }
 
   ~KqueuePoller() override {
-    if (kq_ >= 0) CloseFd(kq_);
+    if (kq_ >= 0) ::close(kq_);
   }
 
   KqueuePoller(const KqueuePoller&) = delete;
@@ -68,7 +68,7 @@ class KqueuePoller final : public Poller {
   KqueuePoller(KqueuePoller&&) = delete;
   KqueuePoller& operator=(KqueuePoller&&) = delete;
 
-  core::Result<void> Add(int fd, EventKind interest, void* user_data) override {
+  core::Result<void> Add(Socket fd, EventKind interest, void* user_data) override {
     if (registered_.contains(fd)) {
       return std::unexpected(
           core::Error{core::ErrorCode::kAlreadyExists, "Poller::Add: fd already registered"});
@@ -78,7 +78,7 @@ class KqueuePoller final : public Poller {
     return {};
   }
 
-  core::Result<void> Modify(int fd, EventKind interest, void* user_data) override {
+  core::Result<void> Modify(Socket fd, EventKind interest, void* user_data) override {
     auto it = registered_.find(fd);
     if (it == registered_.end()) {
       return std::unexpected(
@@ -89,7 +89,7 @@ class KqueuePoller final : public Poller {
     return {};
   }
 
-  core::Result<void> Remove(int fd) override {
+  core::Result<void> Remove(Socket fd) override {
     auto it = registered_.find(fd);
     if (it == registered_.end()) {
       return std::unexpected(
@@ -145,7 +145,7 @@ class KqueuePoller final : public Poller {
 
   explicit KqueuePoller(int kq) : kq_(kq) {}
 
-  core::Result<void> ApplyChange(int fd, EventKind old_interest, EventKind next_interest,
+  core::Result<void> ApplyChange(Socket fd, EventKind old_interest, EventKind next_interest,
                                  void* user_data) const {
     std::array<struct kevent, 2> changes{};
     int n = 0;
@@ -180,7 +180,7 @@ class KqueuePoller final : public Poller {
   }
 
   int kq_ = -1;
-  std::unordered_map<int, EventKind> registered_;
+  std::unordered_map<Socket, EventKind> registered_;
   std::vector<struct kevent> raw_events_;
   std::vector<Event> user_events_;
 };

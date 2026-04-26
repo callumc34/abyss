@@ -1,7 +1,12 @@
 #include "abyss/net/tcp_server.h"
 
 #include <gtest/gtest.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <sys/socket.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -13,11 +18,21 @@
 #include "abyss/core/command_dispatcher.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/platform/net.h"
 #include "abyss/resp/command_registry.h"
 #include "sync_redis_client.h"
 
 namespace abyss::net {
 namespace {
+
+class TcpServerComponentTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+#ifdef _WIN32
+    ASSERT_TRUE(platform::net::Init().has_value());
+#endif
+  }
+};
 
 class StubDispatcher : public core::CommandDispatcher {
  public:
@@ -47,9 +62,9 @@ TcpServerConfig DefaultTestConfig() {
   c.reaper_tick = std::chrono::milliseconds{100};
   c.connection.idle_timeout = std::chrono::seconds{60};
   return c;
-}
+}  // namespace
 
-TEST(TcpServerComponentTest, BindFailureSurfacesAsError) {
+TEST_F(TcpServerComponentTest, BindFailureSurfacesAsError) {
   TcpServerConfig good = DefaultTestConfig();
   good.port = 0;
   StubDispatcher dispatcher;
@@ -65,7 +80,7 @@ TEST(TcpServerComponentTest, BindFailureSurfacesAsError) {
   s1.Stop();
 }
 
-TEST(TcpServerComponentTest, PingRoundTrip) {
+TEST_F(TcpServerComponentTest, PingRoundTrip) {
   StubDispatcher dispatcher;
   TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
@@ -79,7 +94,7 @@ TEST(TcpServerComponentTest, PingRoundTrip) {
   server.Stop();
 }
 
-TEST(TcpServerComponentTest, GetAndSetExerciseDispatcher) {
+TEST_F(TcpServerComponentTest, GetAndSetExerciseDispatcher) {
   StubDispatcher dispatcher;
   TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
@@ -95,7 +110,7 @@ TEST(TcpServerComponentTest, GetAndSetExerciseDispatcher) {
   server.Stop();
 }
 
-TEST(TcpServerComponentTest, PipeliningPreservesOrder) {
+TEST_F(TcpServerComponentTest, PipeliningPreservesOrder) {
   StubDispatcher dispatcher;
   TcpServer server(DefaultTestConfig(), resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
@@ -126,7 +141,7 @@ TEST(TcpServerComponentTest, PipeliningPreservesOrder) {
 }
 
 // #94: Stop must not block per-connection.
-TEST(TcpServerComponentTest, StopJoinIsBoundedWithActiveConnections) {
+TEST_F(TcpServerComponentTest, StopJoinIsBoundedWithActiveConnections) {
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.shutdown_grace = std::chrono::seconds{1};
   cfg.io_threads = 4;
@@ -147,7 +162,7 @@ TEST(TcpServerComponentTest, StopJoinIsBoundedWithActiveConnections) {
   EXPECT_LT(elapsed, std::chrono::seconds{3});
 }
 
-TEST(TcpServerComponentTest, MaxConnectionsRejectsNewClients) {
+TEST_F(TcpServerComponentTest, MaxConnectionsRejectsNewClients) {
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.max_connections = 2;
   StubDispatcher dispatcher;
@@ -172,24 +187,28 @@ TEST(TcpServerComponentTest, MaxConnectionsRejectsNewClients) {
   server.Stop();
 }
 
-TEST(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
+TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows TCP loopback ignores SO_SNDBUF; backpressure can't fire.";
+#endif
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.connection.write_backpressure_bytes = 4096;
   cfg.connection.write_resume_bytes = 1024;
   cfg.connection.write_hard_limit_bytes = 8192;
   cfg.io_threads = 2;
   StubDispatcher dispatcher;
-  // Payload large enough to overflow loopback kernel buffers on every platform.
-  dispatcher.read_payload.assign(4 * 1024 * 1024, 'z');
+  dispatcher.read_payload.assign(32 * 1024 * 1024, 'z');
   TcpServer server(cfg, resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
+  // Small SO_RCVBUF + never reading: receive window stays tight, the server's
+  // write_buf_ accumulates past the hard limit, and the close path fires.
   component_test::SyncRedisClient slow;
-  ASSERT_TRUE(slow.Connect(server.BoundPort()));
-  // Tight RCVBUF so server-side send() EAGAINs early on macOS too.
-  const int rcvbuf = 4096;
-  ::setsockopt(slow.Fd(), SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+  ASSERT_TRUE(slow.Connect(server.BoundPort(), component_test::SyncRedisClient::ConnectOptions{
+                                                   .timeout = std::chrono::milliseconds{2000},
+                                                   .recv_buffer_bytes = 4096,
+                                               }));
   ASSERT_TRUE(slow.SendRaw("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"));
 
   component_test::SyncRedisClient healthy;
@@ -197,21 +216,20 @@ TEST(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
 
-  std::string drain;
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-  while (std::chrono::steady_clock::now() < deadline) {
-    auto chunk = slow.ReadSome(8192, std::chrono::milliseconds{100});
-    if (chunk.empty()) break;
-    drain += chunk;
+  // Server should hard-limit-close the slow connection. Poll ActiveConnections
+  // until only the healthy client remains.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (std::chrono::steady_clock::now() < deadline && server.ActiveConnections() > 1) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
   }
-  EXPECT_LT(drain.size(), 1U * 1024U * 1024U);
+  EXPECT_EQ(server.ActiveConnections(), 1U);
 
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
 
   server.Stop();
 }
 
-TEST(TcpServerComponentTest, AcceptBurstHandledWithoutDrops) {
+TEST_F(TcpServerComponentTest, AcceptBurstHandledWithoutDrops) {
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.max_connections = 64;
   cfg.io_threads = 2;
@@ -232,7 +250,7 @@ TEST(TcpServerComponentTest, AcceptBurstHandledWithoutDrops) {
   server.Stop();
 }
 
-TEST(TcpServerComponentTest, IdleConnectionsClosedByReaper) {
+TEST_F(TcpServerComponentTest, IdleConnectionsClosedByReaper) {
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.connection.idle_timeout = std::chrono::seconds{1};
   cfg.reaper_tick = std::chrono::milliseconds{100};

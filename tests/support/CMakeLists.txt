@@ -7,5 +7,10 @@ target_include_directories(abyss_test_support INTERFACE
 
 target_link_libraries(abyss_test_support INTERFACE
   abyss::core
+  abyss::platform
   GTest::gmock
 )
+
+if(WIN32)
+  target_link_libraries(abyss_test_support INTERFACE ws2_32)
+endif()

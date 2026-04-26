@@ -9,10 +9,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   list(APPEND ABYSS_NET_SOURCES poller_epoll.cpp)
 elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "BSD")
   list(APPEND ABYSS_NET_SOURCES poller_kqueue.cpp)
+elseif(WIN32)
+  list(APPEND ABYSS_NET_SOURCES poller_windows.cpp)
 else()
   message(FATAL_ERROR
-    "abyss::net has no Poller backend for ${CMAKE_SYSTEM_NAME}. "
-    "Windows IOCP is tracked in a follow-up issue.")
+    "abyss::net has no Poller backend for ${CMAKE_SYSTEM_NAME}.")
 endif()
 
 add_library(abyss_net ${ABYSS_NET_SOURCES})
@@ -23,5 +24,5 @@ target_include_directories(abyss_net PRIVATE
 )
 
 target_link_libraries(abyss_net
-  PUBLIC abyss::core abyss::resp abyss::metrics abyss::log
+  PUBLIC abyss::core abyss::resp abyss::metrics abyss::log abyss::platform
 )

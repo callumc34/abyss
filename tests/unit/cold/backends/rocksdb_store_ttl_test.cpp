@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -45,8 +50,13 @@ class TtlFixture : public ::testing::Test {
   void SetUp() override {
     static std::atomic<int> counter{0};
     auto base = std::filesystem::temp_directory_path();
+#ifdef _WIN32
+    path_ = base / ("abyss_cold_ttl_test_" + std::to_string(GetCurrentProcessId()) + "_" +
+                    std::to_string(counter.fetch_add(1)));
+#else
     path_ = base / ("abyss_cold_ttl_test_" + std::to_string(getpid()) + "_" +
                     std::to_string(counter.fetch_add(1)));
+#endif
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
   }
@@ -105,7 +115,7 @@ TEST_F(TtlFixture, ZeroTtlNeverExpires) {
   core::ops::WriteOp op = core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = 0};
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
 
-  clock_.SetTo(std::numeric_limits<uint64_t>::max() / 2);
+  clock_.SetTo((std::numeric_limits<uint64_t>::max)() / 2);
   auto r = store->Exec(core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(r->AsString(), "v");

@@ -6,8 +6,12 @@
 #include <span>
 
 #include "abyss/core/result.h"
+#include "abyss/platform/types.h"
 
 namespace abyss::net {
+
+using platform::kInvalidSocket;
+using platform::Socket;
 
 enum class EventKind : uint8_t {
   kNone = 0,
@@ -47,9 +51,9 @@ class Poller {
   Poller(Poller&&) = delete;
   Poller& operator=(Poller&&) = delete;
 
-  virtual core::Result<void> Add(int fd, EventKind interest, void* user_data) = 0;
-  virtual core::Result<void> Modify(int fd, EventKind interest, void* user_data) = 0;
-  virtual core::Result<void> Remove(int fd) = 0;
+  virtual core::Result<void> Add(Socket fd, EventKind interest, void* user_data) = 0;
+  virtual core::Result<void> Modify(Socket fd, EventKind interest, void* user_data) = 0;
+  virtual core::Result<void> Remove(Socket fd) = 0;
 
   // Returned span is valid until the next Wait() call.
   virtual core::Result<std::span<const Event>> Wait(std::chrono::milliseconds timeout) = 0;

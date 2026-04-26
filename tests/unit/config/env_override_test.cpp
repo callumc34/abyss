@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
+#ifdef _WIN32
+#else
 #include <cstdlib>
+#endif
+
 #include <string>
 
 #include "abyss/config/config.h"
@@ -17,13 +21,25 @@ class ScopedEnv {
       had_previous_ = true;
       previous_ = prev;
     }
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
     ::setenv(name, value, 1);
+#endif
   }
   ~ScopedEnv() {
     if (had_previous_) {
+#ifdef _WIN32
+      _putenv_s(name_.c_str(), previous_.c_str());
+#else
       ::setenv(name_.c_str(), previous_.c_str(), 1);
+#endif
     } else {
+#ifdef _WIN32
+      _putenv_s(name_.c_str(), "");
+#else
       ::unsetenv(name_.c_str());
+#endif
     }
   }
 

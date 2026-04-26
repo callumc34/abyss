@@ -1,23 +1,24 @@
 #include "segment.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "abyss/log/log.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/wal_entry.h"
 #include "binary_io.h"
 
 namespace abyss::queue {
 
 namespace {
+
+namespace pfs = abyss::platform::fs;
 
 const log::Logger& Log() {
   static const log::Logger l = log::Get("abyss.queue.segment");
@@ -26,156 +27,95 @@ const log::Logger& Log() {
 
 constexpr size_t kReadChunkSize = size_t{256} * 1024;
 
-core::Error IoError(const char* what) {
-  return {core::ErrorCode::kInternal, std::string(what) + ": " + std::strerror(errno)};
-}
-
-core::Result<void> FullPwrite(int fd, const void* buf, size_t count, off_t offset) {
-  const auto* p = static_cast<const uint8_t*>(buf);
-  size_t remaining = count;
-  while (remaining > 0) {  // NOLINT(bugprone-infinite-loop)
-    auto n = ::pwrite(fd, p, remaining, offset);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return std::unexpected(IoError("pwrite"));
-    }
-    p += n;
-    offset += n;
-    remaining -= static_cast<size_t>(n);
-  }
-  return {};
-}
-
-core::Result<size_t> FullPread(int fd, void* buf, size_t count, off_t offset) {
-  auto* p = static_cast<uint8_t*>(buf);
-  size_t total = 0;
-  while (total < count) {
-    auto n = ::pread(fd, p + total, count - total, offset + static_cast<off_t>(total));
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return std::unexpected(IoError("pread"));
-    }
-    if (n == 0) break;
-    total += static_cast<size_t>(n);
-  }
-  return total;
-}
-
 }  // namespace
 
-Segment::Segment(std::string path, SegmentHeader header, size_t max_size, int fd,
+Segment::Segment(std::string path, SegmentHeader header, size_t max_size, pfs::File file,
                  size_t write_offset, core::SequenceId next_seq, size_t entry_count)
     : path_(std::move(path)),
       header_(header),
       max_size_(max_size),
-      fd_(fd),
+      file_(std::move(file)),
       write_offset_(write_offset),
       next_seq_(next_seq),
       entry_count_(entry_count) {}
-
-Segment::~Segment() {
-  if (fd_ >= 0) {
-    ::close(fd_);
-  }
-}
 
 Segment::Segment(Segment&& other) noexcept
     : path_(std::move(other.path_)),
       header_(other.header_),
       max_size_(other.max_size_),
-      fd_(other.fd_),
+      file_(std::move(other.file_)),
       write_offset_(other.write_offset_.load(std::memory_order_relaxed)),
       next_seq_(other.next_seq_.load(std::memory_order_relaxed)),
       entry_count_(other.entry_count_),
-      sealed_(other.sealed_) {
-  other.fd_ = -1;
-}
+      sealed_(other.sealed_) {}
 
 Segment& Segment::operator=(Segment&& other) noexcept {
   if (this != &other) {
-    if (fd_ >= 0) {
-      ::close(fd_);
-    }
     path_ = std::move(other.path_);
     header_ = other.header_;
     max_size_ = other.max_size_;
-    fd_ = other.fd_;
+    file_ = std::move(other.file_);
     write_offset_.store(other.write_offset_.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
     next_seq_.store(other.next_seq_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     entry_count_ = other.entry_count_;
     sealed_ = other.sealed_;
-    other.fd_ = -1;
   }
   return *this;
 }
 
 core::Result<Segment> Segment::Create(const std::string& path, SegmentHeader header,
                                       size_t max_size) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-  int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
-  if (fd < 0) {
-    return std::unexpected(IoError("open(create)"));
-  }
+  auto file = pfs::Open(
+      std::filesystem::path(path),
+      pfs::OpenOptions{
+          .mode = pfs::OpenMode::kReadWrite, .create = true, .exclusive = true, .truncate = false});
+  if (!file.has_value()) return std::unexpected(file.error());
 
   std::vector<std::byte> buf;
   buf.reserve(kSegmentHeaderSize);
   EncodeSegmentHeader(header, buf);
 
-  auto wr = FullPwrite(fd, buf.data(), buf.size(), 0);
+  auto wr = pfs::Pwrite(*file, buf.data(), buf.size(), 0);
   if (!wr.has_value()) {
-    ::close(fd);
-    ::unlink(path.c_str());
+    file->Close();
+    (void)pfs::Unlink(std::filesystem::path(path));  // NOLINT(bugprone-unused-return-value)
     return std::unexpected(wr.error());
   }
 
-  return Segment(path, header, max_size, fd, kSegmentHeaderSize, header.base_seq, 0);
+  return Segment(path, header, max_size, std::move(*file), kSegmentHeaderSize, header.base_seq, 0);
 }
 
 core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-  int fd = ::open(path.c_str(), O_RDWR);
-  if (fd < 0) {
-    return std::unexpected(IoError("open"));
-  }
+  auto file =
+      pfs::Open(std::filesystem::path(path), pfs::OpenOptions{.mode = pfs::OpenMode::kReadWrite});
+  if (!file.has_value()) return std::unexpected(file.error());
 
   std::vector<std::byte> hdr_buf(kSegmentHeaderSize);
-  auto hdr_read = FullPread(fd, hdr_buf.data(), kSegmentHeaderSize, 0);
-  if (!hdr_read.has_value()) {
-    ::close(fd);
-    return std::unexpected(hdr_read.error());
-  }
+  auto hdr_read = pfs::Pread(*file, hdr_buf.data(), kSegmentHeaderSize, 0);
+  if (!hdr_read.has_value()) return std::unexpected(hdr_read.error());
   if (*hdr_read < kSegmentHeaderSize) {
-    ::close(fd);
     return std::unexpected(
         core::Error{core::ErrorCode::kCorruption, "segment too small for header"});
   }
 
   auto header = DecodeSegmentHeader(hdr_buf);
-  if (!header.has_value()) {
-    ::close(fd);
-    return std::unexpected(header.error());
-  }
+  if (!header.has_value()) return std::unexpected(header.error());
 
-  struct stat st{};
-  if (::fstat(fd, &st) < 0) {
-    ::close(fd);
-    return std::unexpected(IoError("fstat"));
-  }
-  const auto file_size = static_cast<size_t>(st.st_size);
+  auto file_size = pfs::FileSize(*file);
+  if (!file_size.has_value()) return std::unexpected(file_size.error());
 
-  const size_t data_size = file_size > kSegmentHeaderSize ? file_size - kSegmentHeaderSize : 0;
+  const auto file_size_bytes = static_cast<size_t>(*file_size);
+  const size_t data_size =
+      file_size_bytes > kSegmentHeaderSize ? file_size_bytes - kSegmentHeaderSize : 0;
   size_t write_offset = kSegmentHeaderSize;
   core::SequenceId next_seq = header->base_seq;
   size_t entry_count = 0;
 
   if (data_size > 0) {
     std::vector<std::byte> data(data_size);
-    auto data_read = FullPread(fd, data.data(), data_size, static_cast<off_t>(kSegmentHeaderSize));
-    if (!data_read.has_value()) {
-      ::close(fd);
-      return std::unexpected(data_read.error());
-    }
+    auto data_read = pfs::Pread(*file, data.data(), data_size, kSegmentHeaderSize);
+    if (!data_read.has_value()) return std::unexpected(data_read.error());
 
     // Scan the body. Advance the "durable" watermark only at batch-closing.
     std::span<const std::byte> view(data.data(), *data_read);
@@ -202,20 +142,19 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
     write_offset = kSegmentHeaderSize + durable_offset;
   }
 
-  if (write_offset < file_size) {
+  if (write_offset < file_size_bytes) {
     ABYSS_LOG_WARN(Log(), "torn tail truncated at recovery", {"path", std::string_view{path}},
                    {"shard", static_cast<int64_t>(header->shard_id)},
                    {"base_seq", static_cast<uint64_t>(header->base_seq)},
-                   {"file_size", static_cast<uint64_t>(file_size)},
+                   {"file_size", static_cast<uint64_t>(file_size_bytes)},
                    {"durable_offset", static_cast<uint64_t>(write_offset)},
-                   {"bytes_discarded", static_cast<uint64_t>(file_size - write_offset)});
-    if (::ftruncate(fd, static_cast<off_t>(write_offset)) < 0) {
-      ::close(fd);
-      return std::unexpected(IoError("ftruncate"));
+                   {"bytes_discarded", static_cast<uint64_t>(file_size_bytes - write_offset)});
+    if (auto r = pfs::Ftruncate(*file, write_offset); !r.has_value()) {
+      return std::unexpected(r.error());
     }
   }
 
-  return Segment(path, *header, max_size, fd, write_offset, next_seq, entry_count);
+  return Segment(path, *header, max_size, std::move(*file), write_offset, next_seq, entry_count);
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
@@ -249,9 +188,8 @@ core::Result<size_t> Segment::AppendEncoded(std::span<const std::byte> bytes,
     return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "segment full"});
   }
 
-  auto wr = FullPwrite(fd_, bytes.data(), bytes.size(), static_cast<off_t>(current_offset));
-  if (!wr.has_value()) {
-    return std::unexpected(wr.error());
+  if (auto r = pfs::Pwrite(file_, bytes.data(), bytes.size(), current_offset); !r.has_value()) {
+    return std::unexpected(r.error());
   }
 
   write_offset_.store(current_offset + bytes.size(), std::memory_order_release);
@@ -261,27 +199,20 @@ core::Result<size_t> Segment::AppendEncoded(std::span<const std::byte> bytes,
 }
 
 core::Result<void> Segment::Fsync() const {
-  if (fd_ < 0) {
+  if (!file_.valid()) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync on closed segment"});
   }
-  if (::fsync(fd_) < 0) {
-    return std::unexpected(IoError("fsync"));
-  }
-  return {};
+  return pfs::Fsync(file_);
 }
 
 core::Result<void> Segment::Seal() {
   if (sealed_) return {};
-  if (fd_ < 0) {
+  if (!file_.valid()) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "seal on closed segment"});
   }
   const size_t offset = write_offset_.load(std::memory_order_relaxed);
-  if (::ftruncate(fd_, static_cast<off_t>(offset)) < 0) {
-    return std::unexpected(IoError("ftruncate"));
-  }
-  if (::fsync(fd_) < 0) {
-    return std::unexpected(IoError("fsync"));
-  }
+  if (auto r = pfs::Ftruncate(file_, offset); !r.has_value()) return std::unexpected(r.error());
+  if (auto r = pfs::Fsync(file_); !r.has_value()) return std::unexpected(r.error());
   sealed_ = true;
   return {};
 }
@@ -307,7 +238,7 @@ core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_
     const size_t to_read = std::min(remaining, kReadChunkSize);
 
     std::vector<std::byte> buf(to_read);
-    auto nread = FullPread(fd_, buf.data(), to_read, static_cast<off_t>(cursor));
+    auto nread = pfs::Pread(file_, buf.data(), to_read, cursor);
     if (!nread.has_value()) return std::unexpected(nread.error());
     if (*nread == 0) break;
     buf.resize(*nread);
@@ -337,7 +268,7 @@ core::Result<Segment::ReadResult> Segment::ReadEntries(size_t file_offset, size_
       if (entry_size > remaining) break;
 
       std::vector<std::byte> entry_buf(entry_size);
-      auto entry_read = FullPread(fd_, entry_buf.data(), entry_size, static_cast<off_t>(cursor));
+      auto entry_read = pfs::Pread(file_, entry_buf.data(), entry_size, cursor);
       if (!entry_read.has_value() || *entry_read < entry_size) break;
 
       auto decoded = DecodeWalEntry(std::span<const std::byte>(entry_buf), header_.format_minor);

@@ -13,5 +13,5 @@ add_library(abyss::core ALIAS abyss_core)
 
 target_link_libraries(abyss_core
   PUBLIC abyss::compiler_options
-  PRIVATE xxHash::xxhash abyss::log
+  PRIVATE xxHash::xxhash abyss::log abyss::platform
 )

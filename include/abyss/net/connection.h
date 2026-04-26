@@ -64,7 +64,7 @@ class Connection {
   Connection(Connection&&) = delete;
   Connection& operator=(Connection&&) = delete;
 
-  int RawFd() const noexcept { return fd_.Get(); }
+  Socket RawFd() const noexcept { return fd_.Get(); }
   uint64_t ClientId() const noexcept { return client_id_; }
   uint32_t RemoteIpv4() const noexcept { return remote_ipv4_; }
   uint16_t RemotePort() const noexcept { return remote_port_; }
@@ -96,6 +96,12 @@ class Connection {
   void DispatchPipelineOutput();
   void RecordReadBufferHighWater();
   void TouchActivity();
+
+  // Lazy poller interest: kReadable iff not paused; kWritable iff write
+  // buffer has pending bytes. Avoids spurious POLLOUT storms on level-
+  // triggered backends (WSAPoll) for idle connections.
+  EventKind DesiredInterest() const noexcept;
+  bool SyncPollerInterest();
 
   Fd fd_;
   uint32_t remote_ipv4_;

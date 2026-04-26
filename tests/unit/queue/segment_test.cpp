@@ -1,25 +1,55 @@
 #include "segment.h"
 
-#include <fcntl.h>
 #include <gtest/gtest.h>
-#include <unistd.h>
 
 #include <chrono>
 #include <cstddef>
-#include <cstdlib>
+#include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
+#include "temp_dir.h"
 
 namespace abyss::queue {
 namespace {
 
+namespace pfs = abyss::platform::fs;
+
 constexpr size_t kDefaultMaxSize = size_t{4} * 1024 * 1024;
+
+uint64_t FileSizeOf(const std::string& path) {
+  auto f = pfs::Open(path, {.mode = pfs::OpenMode::kRead});
+  EXPECT_TRUE(f.has_value()) << f.error().message();
+  if (!f.has_value()) return 0;
+  auto sz = pfs::FileSize(*f);
+  EXPECT_TRUE(sz.has_value()) << sz.error().message();
+  return sz.has_value() ? *sz : 0;
+}
+
+void TruncateTo(const std::string& path, uint64_t bytes) {
+  auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+  ASSERT_TRUE(f.has_value()) << f.error().message();
+  ASSERT_TRUE(pfs::Ftruncate(*f, bytes).has_value());
+}
+
+void FlipByte(const std::string& path, uint64_t offset) {
+  auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+  ASSERT_TRUE(f.has_value()) << f.error().message();
+  uint8_t byte = 0;
+  auto r = pfs::Pread(*f, &byte, 1, offset);
+  ASSERT_TRUE(r.has_value());
+  ASSERT_EQ(*r, 1U);
+  byte ^= 0x01U;
+  auto w = pfs::Pwrite(*f, &byte, 1, offset);
+  ASSERT_TRUE(w.has_value());
+}
 
 // Most tests write single-entry appends where batch_last_seq == entry.seq.
 // This wrapper keeps test expressions tidy; tests that exercise batches
@@ -30,21 +60,10 @@ core::Result<size_t> AppendSingle(Segment& seg, const core::QueueEntry& entry) {
 
 class SegmentTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    auto tmpl = std::filesystem::temp_directory_path() / "abyss_seg_XXXXXX";
-    std::string s = tmpl.string();
-    ASSERT_NE(::mkdtemp(s.data()), nullptr);
-    tmp_dir_ = s;
-  }
-
-  void TearDown() override {
-    if (!tmp_dir_.empty()) {
-      std::filesystem::remove_all(tmp_dir_);
-    }
-  }
+  void SetUp() override { dir_ = std::make_unique<testing::TempDir>("segment"); }
 
   std::string SegPath(const std::string& name = "test.wal") const {
-    return (std::filesystem::path(tmp_dir_) / name).string();
+    return (dir_->Path() / name).string();
   }
 
   static SegmentHeader MakeHeader(core::SequenceId base_seq = 0, core::ShardId shard = 0) {
@@ -103,12 +122,13 @@ class SegmentTest : public ::testing::Test {
     EXPECT_EQ(w->cmd.args, expected);
   }
 
-  std::string tmp_dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  std::unique_ptr<testing::TempDir> dir_;
 };
 
 TEST_F(SegmentTest, CreateAndReadBack) {
   auto seg = Segment::Create(SegPath(), MakeHeader(100), kDefaultMaxSize);
-  ASSERT_TRUE(seg.has_value());
+  ASSERT_TRUE(seg.has_value()) << seg.error().message();
 
   EXPECT_EQ(seg->base_seq(), 100U);
   EXPECT_EQ(seg->next_seq(), 100U);
@@ -196,7 +216,7 @@ TEST_F(SegmentTest, TornTail_TruncatedBody) {
   }
 
   // Truncate mid-way through the second entry's body.
-  ::truncate(path.c_str(), static_cast<off_t>(good_offset) + 10);
+  TruncateTo(path, good_offset + 10);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -205,9 +225,7 @@ TEST_F(SegmentTest, TornTail_TruncatedBody) {
   EXPECT_EQ(seg->write_offset(), good_offset);
 
   // Verify file was physically truncated to the clean boundary.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), good_offset);
+  EXPECT_EQ(FileSizeOf(path), good_offset);
 
   auto read = seg->ReadEntries(kSegmentHeaderSize, 10);
   ASSERT_TRUE(read.has_value());
@@ -227,9 +245,7 @@ TEST_F(SegmentTest, TornTail_TruncatedCrc) {
   }
 
   // Read file to find where the second entry's CRC starts, then truncate there.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  ::truncate(path.c_str(), st.st_size - 2);
+  TruncateTo(path, FileSizeOf(path) - 2);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -250,14 +266,7 @@ TEST_F(SegmentTest, TornTail_CrcMismatch) {
   }
 
   // Corrupt a byte in the second entry's body.
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-  int fd = ::open(path.c_str(), O_RDWR);
-  ASSERT_GE(fd, 0);
-  uint8_t byte = 0;
-  ASSERT_EQ(::pread(fd, &byte, 1, static_cast<off_t>(good_offset + 5)), 1);
-  byte ^= 0x01;
-  ASSERT_EQ(::pwrite(fd, &byte, 1, static_cast<off_t>(good_offset + 5)), 1);
-  ::close(fd);
+  FlipByte(path, good_offset + 5);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -281,9 +290,7 @@ TEST_F(SegmentTest, AppendAfterRecovery) {
   }
 
   // Truncate mid-second-entry.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  ::truncate(path.c_str(), st.st_size - 5);
+  TruncateTo(path, FileSizeOf(path) - 5);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -548,7 +555,7 @@ TEST_F(SegmentTest, CreateFailsIfFileExists) {
 
   auto seg2 = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
   ASSERT_FALSE(seg2.has_value());
-  EXPECT_EQ(seg2.error().code(), core::ErrorCode::kInternal);
+  EXPECT_EQ(seg2.error().code(), core::ErrorCode::kAlreadyExists);
 }
 
 TEST_F(SegmentTest, ReadEntriesFromWithBaseSeq) {
@@ -598,9 +605,7 @@ TEST_F(SegmentTest, SealTruncatesToWriteOffset) {
     EXPECT_TRUE(seg->sealed());
   }
 
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), sealed_offset);
+  EXPECT_EQ(FileSizeOf(path), sealed_offset);
 }
 
 TEST_F(SegmentTest, AppendRejectedAfterSeal) {
@@ -656,9 +661,7 @@ TEST_F(SegmentTest, RecoveryTruncatesIncompleteBatch) {
   EXPECT_EQ(seg->write_offset(), before_batch_offset);
 
   // File was physically truncated.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), before_batch_offset);
+  EXPECT_EQ(FileSizeOf(path), before_batch_offset);
 }
 
 TEST_F(SegmentTest, RecoveryKeepsCompleteBatchesAfterIncompleteTruncation) {

@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -22,8 +27,13 @@ class CollectionsFixture : public ::testing::Test {
   void SetUp() override {
     static std::atomic<int> counter{0};
     auto base = std::filesystem::temp_directory_path();
+#ifdef _WIN32
+    path_ = base / ("abyss_cold_collections_test_" + std::to_string(GetCurrentProcessId()) + "_" +
+                    std::to_string(counter.fetch_add(1)));
+#else
     path_ = base / ("abyss_cold_collections_test_" + std::to_string(getpid()) + "_" +
                     std::to_string(counter.fetch_add(1)));
+#endif
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
   }

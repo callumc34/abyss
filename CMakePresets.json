@@ -13,12 +13,10 @@
     },
     {
       "name": "release",
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_BUILD_TESTS": "OFF",
-        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
+        "ABYSS_BUILD_TESTS": "OFF"
       }
     },
     {
@@ -70,45 +68,39 @@
         "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
         "CMAKE_EXE_LINKER_FLAGS": "-static-libstdc++ -static-libgcc"
       }
+    },
+    {
+      "name": "windows",
+      "inherits": "default",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ABYSS_WERROR": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-release",
+        "VCPKG_HOST_TRIPLET": "x64-windows-static-release",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets"
+      }
     }
   ],
   "buildPresets": [
-    {
-      "name": "default",
-      "configurePreset": "default"
-    },
-    {
-      "name": "release",
-      "configurePreset": "release"
-    },
-    {
-      "name": "asan",
-      "configurePreset": "asan"
-    },
-    {
-      "name": "tsan",
-      "configurePreset": "tsan"
-    },
-    {
-      "name": "bench",
-      "configurePreset": "bench"
-    },
-    {
-      "name": "cloud-only",
-      "configurePreset": "cloud-only"
-    },
-    {
-      "name": "container",
-      "configurePreset": "container"
-    }
+    { "name": "default", "configurePreset": "default" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "bench", "configurePreset": "bench" },
+    { "name": "cloud-only", "configurePreset": "cloud-only" },
+    { "name": "container", "configurePreset": "container" },
+    { "name": "windows", "configurePreset": "windows" }
   ],
   "testPresets": [
     {
       "name": "default",
       "configurePreset": "default",
-      "output": {
-        "outputOnFailure": true
-      },
+      "output": { "outputOnFailure": true },
       "execution": {
         "jobs": 8,
         "scheduleRandom": true,
@@ -120,9 +112,7 @@
     {
       "name": "cloud-only",
       "configurePreset": "cloud-only",
-      "output": {
-        "outputOnFailure": true
-      },
+      "output": { "outputOnFailure": true },
       "execution": {
         "jobs": 8,
         "scheduleRandom": true,
@@ -133,9 +123,7 @@
     {
       "name": "asan",
       "configurePreset": "asan",
-      "output": {
-        "outputOnFailure": true
-      },
+      "output": { "outputOnFailure": true },
       "execution": {
         "jobs": 2,
         "scheduleRandom": true,
@@ -146,14 +134,23 @@
     {
       "name": "tsan",
       "configurePreset": "tsan",
-      "output": {
-        "outputOnFailure": true
-      },
+      "output": { "outputOnFailure": true },
       "execution": {
         "jobs": 2,
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 300
+      }
+    },
+    {
+      "name": "windows",
+      "configurePreset": "windows",
+      "output": { "outputOnFailure": true },
+      "execution": {
+        "jobs": 4,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 180
       }
     }
   ]

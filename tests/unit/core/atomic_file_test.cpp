@@ -57,9 +57,10 @@ TEST(AtomicFileTest, NoTempLeakOnSuccess) {
 TEST(AtomicFileTest, BinarySpanRoundTrip) {
   testing::TempDir dir("atomic_file_binary");
   const auto path = dir.Sub("blob");
-  const std::array<std::byte, 4> bytes{std::byte{0x00}, std::byte{0xFF}, std::byte{0x10},
-                                       std::byte{0xAA}};
-  ASSERT_TRUE(WriteFileAtomic(path, std::span<const std::byte>(bytes)).has_value());
+  const uint8_t bytes[4] = {0x00, 0xFF, 0x10, 0xAA};
+  ASSERT_TRUE(WriteFileAtomic(
+                  path, std::span<const std::byte>(reinterpret_cast<const std::byte*>(bytes), 4))
+                  .has_value());
   const auto got = ReadFile(path);
   ASSERT_EQ(got.size(), 4U);
   EXPECT_EQ(static_cast<unsigned char>(got[0]), 0x00U);

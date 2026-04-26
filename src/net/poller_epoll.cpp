@@ -53,7 +53,7 @@ class EpollPoller final : public Poller {
 
     const int evfd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (evfd < 0) {
-      CloseFd(epfd);
+      ::close(epfd);
       return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "eventfd"));
     }
 
@@ -69,8 +69,8 @@ class EpollPoller final : public Poller {
   }
 
   ~EpollPoller() override {
-    if (event_fd_ >= 0) CloseFd(event_fd_);
-    if (epoll_fd_ >= 0) CloseFd(epoll_fd_);
+    if (event_fd_ >= 0) ::close(event_fd_);
+    if (epoll_fd_ >= 0) ::close(epoll_fd_);
   }
 
   EpollPoller(const EpollPoller&) = delete;
@@ -78,7 +78,7 @@ class EpollPoller final : public Poller {
   EpollPoller(EpollPoller&&) = delete;
   EpollPoller& operator=(EpollPoller&&) = delete;
 
-  core::Result<void> Add(int fd, EventKind interest, void* user_data) override {
+  core::Result<void> Add(Socket fd, EventKind interest, void* user_data) override {
     epoll_event ev{};
     ev.events = ToEpollMask(interest);
     ev.data.ptr = user_data;
@@ -90,7 +90,7 @@ class EpollPoller final : public Poller {
     return {};
   }
 
-  core::Result<void> Modify(int fd, EventKind interest, void* user_data) override {
+  core::Result<void> Modify(Socket fd, EventKind interest, void* user_data) override {
     epoll_event ev{};
     ev.events = ToEpollMask(interest);
     ev.data.ptr = user_data;
@@ -101,7 +101,7 @@ class EpollPoller final : public Poller {
     return {};
   }
 
-  core::Result<void> Remove(int fd) override {
+  core::Result<void> Remove(Socket fd) override {
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) < 0) {
       const auto code = (errno == ENOENT) ? core::ErrorCode::kNotFound : core::ErrorCode::kInternal;
       return std::unexpected(MakeErrno(code, "epoll_ctl DEL"));

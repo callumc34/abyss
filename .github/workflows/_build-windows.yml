@@ -1,0 +1,60 @@
+name: Build & Test (Windows)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,readwrite"
+
+jobs:
+  build-test-windows:
+    name: Build & Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v6
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build-windows
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_owner: ${{ github.repository_owner }}
+
+      - name: Set up sccache
+        id: sccache_install
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Probe sccache
+        id: sccache_probe
+        if: steps.sccache_install.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          sccache --start-server
+          exit $LASTEXITCODE
+
+      - name: Configure
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: cmake --preset windows -G Ninja -DABYSS_USE_CCACHE=${{ steps.sccache_probe.outcome == 'success' && 'ON' || 'OFF' }}
+
+      - name: Build
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          cmake --build build/windows --parallel
+          if ("${{ steps.sccache_probe.outcome }}" -eq "success") { sccache --show-stats }
+
+      - name: Test
+        shell: pwsh
+        run: ctest --preset windows --output-on-failure

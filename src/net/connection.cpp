@@ -1,18 +1,17 @@
 #include "abyss/net/connection.h"
 
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
+#include <cstdint>
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/platform/net.h"
 
 namespace abyss::net {
 
 namespace {
+
+namespace pnet = abyss::platform::net;
 
 const log::Logger& Log() {
   static const log::Logger l = log::Get("abyss.net.conn");
@@ -110,8 +109,28 @@ bool Connection::IsIdle(core::SteadyTime now) const noexcept {
 }
 
 core::Result<void> Connection::Arm() {
-  armed_interest_ = EventKind::kReadable | EventKind::kWritable;
+  armed_interest_ = DesiredInterest();
   return poller_.Add(fd_.Get(), armed_interest_, this);
+}
+
+EventKind Connection::DesiredInterest() const noexcept {
+  EventKind k = EventKind::kNone;
+  if (!reading_paused_) k |= EventKind::kReadable;
+  if (HasPendingWrites()) k |= EventKind::kWritable;
+  return k;
+}
+
+bool Connection::SyncPollerInterest() {
+  const EventKind want = DesiredInterest();
+  if (want == armed_interest_) return true;
+  if (auto r = poller_.Modify(fd_.Get(), want, this); !r) {
+    ABYSS_LOG_WARN(Log(), "poller modify failed", {"client_id", client_id_},
+                   {"err", std::string_view{r.error().message()}});
+    Close(metrics::CloseReason::kClient);
+    return false;
+  }
+  armed_interest_ = want;
+  return true;
 }
 
 void Connection::Close(metrics::CloseReason reason) {
@@ -131,7 +150,7 @@ void Connection::Close(metrics::CloseReason reason) {
       ABYSS_LOG_DEBUG(Log(), "poller remove on close failed", {"client_id", client_id_},
                       {"err", std::string_view{r.error().message()}});
     }
-    ::shutdown(fd_.Get(), SHUT_RDWR);
+    pnet::ShutdownBoth(fd_.Get());
   }
   fd_.Reset();
 
@@ -155,7 +174,7 @@ void Connection::OnReadable() {
     const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
     read_buf_.resize(old_size + want);
 
-    const ssize_t n = ::recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
+    const auto n = pnet::Recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
     if (n > 0) {
       read_buf_.resize(old_size + static_cast<size_t>(n));
       metrics_.bytes_in.Increment(static_cast<double>(n));
@@ -169,10 +188,11 @@ void Connection::OnReadable() {
       Close(metrics::CloseReason::kClient);
       return;
     }
-    if (errno == EINTR) continue;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+    const int err = pnet::LastError();
+    if (pnet::IsInterrupted(err)) continue;
+    if (pnet::IsWouldBlock(err)) break;
     ABYSS_LOG_DEBUG(Log(), "recv error", {"client_id", client_id_},
-                    {"err", std::string_view{std::strerror(errno)}});
+                    {"err", std::string_view{pnet::ErrorString(err)}});
     Close(metrics::CloseReason::kClient);
     return;
   }
@@ -185,10 +205,14 @@ void Connection::OnReadable() {
 
   if (EnforceWriteHardLimit()) return;
   MaybePauseReading();
+  if (closed_) return;
 
   if (close_after_drain_ && !HasPendingWrites()) {
     Close(metrics::CloseReason::kClient);
+    return;
   }
+
+  SyncPollerInterest();
 }
 
 void Connection::OnWritable() {
@@ -198,10 +222,14 @@ void Connection::OnWritable() {
   if (closed_) return;
 
   MaybeResumeReading();
+  if (closed_) return;
 
   if (close_after_drain_ && !HasPendingWrites()) {
     Close(metrics::CloseReason::kClient);
+    return;
   }
+
+  SyncPollerInterest();
 }
 
 void Connection::DispatchPipelineOutput() {
@@ -219,27 +247,23 @@ void Connection::DispatchPipelineOutput() {
 void Connection::TryDrainWrite() {
   while (write_pos_ < write_buf_.size()) {
     const size_t remaining = write_buf_.size() - write_pos_;
-    const ssize_t n = ::send(fd_.Get(), write_buf_.data() + write_pos_, remaining,
-#ifdef MSG_NOSIGNAL
-                             MSG_NOSIGNAL
-#else
-                             0
-#endif
-    );
+    const auto n = pnet::Send(fd_.Get(), write_buf_.data() + write_pos_, remaining,
+                              pnet::SendFlagsNoSigPipe());
     if (n > 0) {
       write_pos_ += static_cast<size_t>(n);
       metrics_.bytes_out.Increment(static_cast<double>(n));
       continue;
     }
     if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-      if (errno == EPIPE || errno == ECONNRESET) {
+      const int err = pnet::LastError();
+      if (pnet::IsInterrupted(err)) continue;
+      if (pnet::IsWouldBlock(err)) return;
+      if (pnet::IsBrokenPipe(err) || pnet::IsConnReset(err)) {
         Close(metrics::CloseReason::kClient);
         return;
       }
       ABYSS_LOG_DEBUG(Log(), "send error", {"client_id", client_id_},
-                      {"err", std::string_view{std::strerror(errno)}});
+                      {"err", std::string_view{pnet::ErrorString(err)}});
       Close(metrics::CloseReason::kClient);
       return;
     }
@@ -270,14 +294,8 @@ void Connection::MaybePauseReading() {
   if (reading_paused_) return;
   if (WriteBufferBytes() < config_.write_backpressure_bytes) return;
 
-  armed_interest_ = EventKind::kWritable;
-  if (auto r = poller_.Modify(fd_.Get(), armed_interest_, this); !r) {
-    ABYSS_LOG_WARN(Log(), "poller modify (pause) failed", {"client_id", client_id_},
-                   {"err", std::string_view{r.error().message()}});
-    Close(metrics::CloseReason::kClient);
-    return;
-  }
   reading_paused_ = true;
+  if (!SyncPollerInterest()) return;
   metrics_.backpressure_active.Increment();
   metrics_.backpressure_entered.Increment();
   ABYSS_LOG_DEBUG(Log(), "backpressure paused", {"client_id", client_id_},
@@ -288,14 +306,8 @@ void Connection::MaybeResumeReading() {
   if (!reading_paused_) return;
   if (WriteBufferBytes() >= config_.write_resume_bytes) return;
 
-  armed_interest_ = EventKind::kReadable | EventKind::kWritable;
-  if (auto r = poller_.Modify(fd_.Get(), armed_interest_, this); !r) {
-    ABYSS_LOG_WARN(Log(), "poller modify (resume) failed", {"client_id", client_id_},
-                   {"err", std::string_view{r.error().message()}});
-    Close(metrics::CloseReason::kClient);
-    return;
-  }
   reading_paused_ = false;
+  if (!SyncPollerInterest()) return;
   metrics_.backpressure_active.Decrement();
   metrics_.backpressure_exited.Increment();
   ABYSS_LOG_DEBUG(Log(), "backpressure resumed", {"client_id", client_id_},

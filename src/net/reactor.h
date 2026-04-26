@@ -37,7 +37,7 @@ class Reactor {
   Reactor(Reactor&&) = delete;
   Reactor& operator=(Reactor&&) = delete;
 
-  core::Result<void> AdoptListener(int listen_fd);
+  core::Result<void> AdoptListener(Socket listen_fd);
 
   void Start();
   void RequestStop();
@@ -64,7 +64,7 @@ class Reactor {
   TcpServer& server_;
   std::unique_ptr<Poller> poller_;
   bool is_acceptor_;
-  int listen_fd_ = -1;
+  Socket listen_fd_ = kInvalidSocket;
   // Pointer identity distinguishes accept-side events from connections.
   char listener_marker_ = 0;
   bool listener_armed_ = false;

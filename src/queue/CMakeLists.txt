@@ -20,5 +20,5 @@ target_include_directories(abyss_queue
 
 target_link_libraries(abyss_queue
   PUBLIC abyss::core
-  PRIVATE Crc32c::crc32c abyss::resp abyss::log
+  PRIVATE Crc32c::crc32c abyss::resp abyss::log abyss::platform
 )

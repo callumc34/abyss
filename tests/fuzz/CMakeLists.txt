@@ -1,3 +1,9 @@
+if(WIN32)
+  message(FATAL_ERROR
+    "ABYSS_BUILD_FUZZ requires libFuzzer (-fsanitize=fuzzer) which is not wired for MSVC. "
+    "Disable ABYSS_BUILD_FUZZ on Windows.")
+endif()
+
 add_executable(fuzz_resp_parser resp_parser_fuzz.cpp)
 target_link_libraries(fuzz_resp_parser PRIVATE
   abyss::resp

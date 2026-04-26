@@ -404,7 +404,7 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   EXPECT_GT(after_insert.used_bytes, 0U);
 
   core::ops::Del del_op{.keys = {"k"}};
-  store_.Apply(core::ops::WriteOp{del_op}, kEviction);  // NOLINT(bugprone-unused-return-value)
+  auto del_result = store_.Apply(core::ops::WriteOp{del_op}, kEviction);
   auto after_delete = store_.Stats();
   EXPECT_EQ(after_delete.key_count, 0U);
   EXPECT_EQ(after_delete.used_bytes, 0U);

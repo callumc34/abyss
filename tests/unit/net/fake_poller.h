@@ -7,17 +7,17 @@
 
 #include "abyss/core/result.h"
 #include "abyss/net/poller.h"
+#include "abyss/platform/types.h"
 
 namespace abyss::net::testing {
 
-// Recording Poller for Connection FSM tests; single-threaded.
 class FakePoller : public Poller {
  public:
   enum class Op : uint8_t { kAdd, kModify, kRemove, kWake };
 
   struct Call {
     Op op = Op::kAdd;
-    int fd = -1;
+    Socket fd = kInvalidSocket;
     EventKind interest = EventKind::kNone;
     void* user_data = nullptr;
   };
@@ -25,15 +25,15 @@ class FakePoller : public Poller {
   std::vector<Call> calls;
   std::vector<Event> next_events;
 
-  core::Result<void> Add(int fd, EventKind interest, void* user_data) override {
+  core::Result<void> Add(Socket fd, EventKind interest, void* user_data) override {
     calls.push_back({Op::kAdd, fd, interest, user_data});
     return {};
   }
-  core::Result<void> Modify(int fd, EventKind interest, void* user_data) override {
+  core::Result<void> Modify(Socket fd, EventKind interest, void* user_data) override {
     calls.push_back({Op::kModify, fd, interest, user_data});
     return {};
   }
-  core::Result<void> Remove(int fd) override {
+  core::Result<void> Remove(Socket fd) override {
     calls.push_back({Op::kRemove, fd, EventKind::kNone, nullptr});
     return {};
   }
@@ -41,7 +41,7 @@ class FakePoller : public Poller {
     return std::span<const Event>{next_events};
   }
   core::Result<void> Wake() override {
-    calls.push_back({Op::kWake, -1, EventKind::kNone, nullptr});
+    calls.push_back({Op::kWake, kInvalidSocket, EventKind::kNone, nullptr});
     return {};
   }
 

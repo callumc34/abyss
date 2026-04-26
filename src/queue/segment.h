@@ -9,6 +9,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/segment_header.h"
 
 namespace abyss::queue {
@@ -20,7 +21,7 @@ class Segment {
                                       size_t max_size);
   static core::Result<Segment> Open(const std::string& path, size_t max_size);
 
-  ~Segment();
+  ~Segment() = default;
 
   Segment(Segment&& other) noexcept;
   Segment& operator=(Segment&& other) noexcept;
@@ -60,16 +61,15 @@ class Segment {
     const size_t offset = write_offset_.load(std::memory_order_acquire);
     return max_size_ > offset ? max_size_ - offset : 0;
   }
-  int fd() const { return fd_; }
 
  private:
-  Segment(std::string path, SegmentHeader header, size_t max_size, int fd, size_t write_offset,
-          core::SequenceId next_seq, size_t entry_count);
+  Segment(std::string path, SegmentHeader header, size_t max_size, platform::fs::File file,
+          size_t write_offset, core::SequenceId next_seq, size_t entry_count);
 
   std::string path_;
   SegmentHeader header_;
   size_t max_size_;
-  int fd_ = -1;
+  platform::fs::File file_;
   // Mutated in AppendEncoded under the owning ShardState's append_mu_; read by
   // consumers without that lock via ReadEntries/ReadEntriesFrom. Acquire/release
   // synchronises the published watermark with the preceding pwrite.
