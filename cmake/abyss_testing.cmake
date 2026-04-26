@@ -36,3 +36,15 @@ macro(abyss_add_binary_test target labels)
     TIMEOUT ${ABYSS_TEST_TIMEOUT_SLOW}
   )
 endmacro()
+
+# Per-test timeout override for tests discovered via gtest_discover_tests.
+function(abyss_mark_slow_tests tag dir)
+  set(_overrides_file "${CMAKE_BINARY_DIR}/abyss_slow_${tag}_overrides.cmake")
+  set(_content "")
+  foreach(_test IN LISTS ARGN)
+    string(APPEND _content
+      "set_tests_properties(${_test} PROPERTIES TIMEOUT ${ABYSS_TEST_TIMEOUT_SLOW})\n")
+  endforeach()
+  file(WRITE "${_overrides_file}" "${_content}")
+  set_property(DIRECTORY "${dir}" APPEND PROPERTY TEST_INCLUDE_FILES "${_overrides_file}")
+endfunction()
