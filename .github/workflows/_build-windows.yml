@@ -26,28 +26,26 @@ jobs:
           github_owner: ${{ github.repository_owner }}
 
       - name: Set up sccache
+        id: sccache_install
         uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
 
       - name: Probe sccache
         id: sccache_probe
+        if: steps.sccache_install.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
         env:
           SCCACHE_GHA_ENABLED: "true"
         run: |
           sccache --start-server
-          if ($LASTEXITCODE -eq 0) {
-            "ABYSS_USE_CCACHE=ON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          } else {
-            Write-Warning "sccache failed to start; building without compile cache"
-            "ABYSS_USE_CCACHE=OFF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
-          exit 0
+          exit $LASTEXITCODE
 
       - name: Configure
         shell: pwsh
         env:
           SCCACHE_GHA_ENABLED: "true"
-        run: cmake --preset windows -G Ninja "-DABYSS_USE_CCACHE=$env:ABYSS_USE_CCACHE"
+        run: cmake --preset windows -G Ninja -DABYSS_USE_CCACHE=${{ steps.sccache_probe.outcome == 'success' && 'ON' || 'OFF' }}
 
       - name: Build
         shell: pwsh
@@ -55,7 +53,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
         run: |
           cmake --build build/windows --parallel
-          if ($env:ABYSS_USE_CCACHE -eq "ON") { sccache --show-stats }
+          if ("${{ steps.sccache_probe.outcome }}" -eq "success") { sccache --show-stats }
 
       - name: Test
         shell: pwsh
