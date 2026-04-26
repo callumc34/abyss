@@ -18,6 +18,17 @@
 namespace abyss::testing {
 
 // Two non-blocking, mutually-connected sockets.
+//
+// On POSIX this is an AF_UNIX socketpair. On Windows it's a TCP loopback pair.
+// Both backends honour `small_buffers=true` to surface kernel flow control on
+// payloads as small as a few KiB, which is what backpressure tests rely on.
+//
+// On Windows, SO_SNDBUF / SO_RCVBUF are reliably honoured ONLY when set BEFORE
+// connect(). Listener inheritance to accepted sockets is unreliable: the
+// kernel autotunes the accepted socket's send buffer to multiple MiB. So
+// Read() returns the *connecting* socket (Connection's side, where Send() runs)
+// and Write() returns the accepted socket (test peer). This way Connection's
+// kernel send buffer is a known small size when small_buffers=true.
 class SocketPair {
  public:
   SocketPair() = default;
@@ -46,19 +57,36 @@ class SocketPair {
     return std::exchange(read_end_, platform::kInvalidSocket);
   }
 
-  // small_buffers makes the kernel surface flow control on small payloads so
-  // backpressure tests behave the same on POSIX socketpair and Windows TCP.
   static core::Result<SocketPair> Make(bool small_buffers = false);
 
  private:
   SocketPair(platform::Socket read, platform::Socket write) noexcept
       : read_end_(read), write_end_(write) {}
 
+#ifdef _WIN32
+  static void SetBuffers(platform::Socket s, int bytes) noexcept {
+    (void)::setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes),
+                       sizeof(bytes));
+    (void)::setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes),
+                       sizeof(bytes));
+  }
+#else
+  static void SetBuffers(platform::Socket s, int bytes) noexcept {
+    (void)::setsockopt(s, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+    (void)::setsockopt(s, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
+  }
+#endif
+
   platform::Socket read_end_ = platform::kInvalidSocket;
   platform::Socket write_end_ = platform::kInvalidSocket;
 };
 
 inline core::Result<SocketPair> SocketPair::Make(bool small_buffers) {
+  // 8 KiB matches Windows' minimum effective SO_RCVBUF (smaller values are
+  // silently rounded up). Setting it explicitly disables Windows TCP
+  // autotuning so the buffer stays at this fixed size.
+  constexpr int kSmallBuf = 8192;
+
 #ifdef _WIN32
   using platform::net::CloseSocket;
   using platform::net::LastErrorString;
@@ -68,6 +96,12 @@ inline core::Result<SocketPair> SocketPair::Make(bool small_buffers) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal,
                                        std::string("socket(listener): ") + LastErrorString()});
   }
+
+  // Listener buffers are set pre-bind; SO_RCVBUF *is* inherited by accepted
+  // sockets reliably, but SO_SNDBUF inheritance is not. So the *reader* below
+  // is the connecting socket (where pre-connect setsockopt is honoured), and
+  // the writer is the accepted socket.
+  if (small_buffers) SetBuffers(listener, kSmallBuf);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -90,22 +124,29 @@ inline core::Result<SocketPair> SocketPair::Make(bool small_buffers) {
         core::Error{core::ErrorCode::kInternal, std::string("listen: ") + LastErrorString()});
   }
 
-  const platform::Socket writer = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (writer == platform::kInvalidSocket) {
+  const platform::Socket reader = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (reader == platform::kInvalidSocket) {
     CloseSocket(listener);
     return std::unexpected(core::Error{core::ErrorCode::kInternal,
-                                       std::string("socket(writer): ") + LastErrorString()});
+                                       std::string("socket(reader): ") + LastErrorString()});
   }
-  if (::connect(writer, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+
+  // Reader is the connecting socket: setsockopt BEFORE connect() is the only
+  // way to pin SO_SNDBUF on Windows. This is what makes Connection.send()
+  // hit EWOULDBLOCK after kSmallBuf bytes instead of having the kernel quietly
+  // absorb multi-MiB payloads via autotuning.
+  if (small_buffers) SetBuffers(reader, kSmallBuf);
+
+  if (::connect(reader, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
     CloseSocket(listener);
-    CloseSocket(writer);
+    CloseSocket(reader);
     return std::unexpected(
         core::Error{core::ErrorCode::kInternal, std::string("connect: ") + LastErrorString()});
   }
-  const platform::Socket reader = ::accept(listener, nullptr, nullptr);
+  const platform::Socket writer = ::accept(listener, nullptr, nullptr);
   CloseSocket(listener);
-  if (reader == platform::kInvalidSocket) {
-    CloseSocket(writer);
+  if (writer == platform::kInvalidSocket) {
+    CloseSocket(reader);
     return std::unexpected(
         core::Error{core::ErrorCode::kInternal, std::string("accept: ") + LastErrorString()});
   }
@@ -117,6 +158,12 @@ inline core::Result<SocketPair> SocketPair::Make(bool small_buffers) {
   }
   const platform::Socket reader = sv[0];
   const platform::Socket writer = sv[1];
+
+  // AF_UNIX honours setsockopt post-creation; order doesn't matter.
+  if (small_buffers) {
+    SetBuffers(reader, kSmallBuf);
+    SetBuffers(writer, kSmallBuf);
+  }
 #endif
 
   if (auto r = platform::net::SetNonBlocking(reader); !r) {
@@ -128,20 +175,6 @@ inline core::Result<SocketPair> SocketPair::Make(bool small_buffers) {
     platform::net::CloseSocket(reader);
     platform::net::CloseSocket(writer);
     return std::unexpected(r.error());
-  }
-
-  if (small_buffers) {
-    // Set SO_SNDBUF and SO_RCVBUF on both ends so flow control triggers
-    // regardless of which side the connection-under-test owns. POSIX socketpair
-    // honours SO_SNDBUF on AF_UNIX; Windows TCP loopback honours both. Setting
-    // them on both sides keeps the helper portable.
-    const int buf = 4096;
-    for (auto s : {reader, writer}) {
-      (void)::setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf),
-                         sizeof(buf));
-      (void)::setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf),
-                         sizeof(buf));
-    }
   }
 
   return SocketPair{reader, writer};

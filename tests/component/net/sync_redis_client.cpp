@@ -49,9 +49,21 @@ bool WaitReadable(Socket s, std::chrono::milliseconds timeout) {
 SyncRedisClient::~SyncRedisClient() { Close(); }
 
 bool SyncRedisClient::Connect(uint16_t port, std::chrono::milliseconds timeout) {
+  return Connect(port, ConnectOptions{.timeout = timeout});
+}
+
+bool SyncRedisClient::Connect(uint16_t port, const ConnectOptions& opts) {
   Close();
   Socket sock = ::socket(AF_INET, SOCK_STREAM, 0);
   if (sock == kInvalidSocket) return false;
+
+  // Apply socket options BEFORE connect: Windows TCP ignores SO_RCVBUF /
+  // SO_SNDBUF set on a connected socket, so callers (notably backpressure
+  // tests) need this to take effect at all.
+  if (opts.recv_buffer_bytes > 0) {
+    const int sz = opts.recv_buffer_bytes;
+    (void)::setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&sz), sizeof(sz));
+  }
 
   if (auto r = pnet::SetNonBlocking(sock); !r) {
     pnet::CloseSocket(sock);
@@ -76,7 +88,7 @@ bool SyncRedisClient::Connect(uint16_t port, std::chrono::milliseconds timeout) 
     }
   }
 
-  if (!WaitWritable(sock, timeout)) {
+  if (!WaitWritable(sock, opts.timeout)) {
     pnet::CloseSocket(sock);
     return false;
   }

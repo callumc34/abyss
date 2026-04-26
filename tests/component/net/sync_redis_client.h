@@ -21,7 +21,15 @@ class SyncRedisClient {
   SyncRedisClient(SyncRedisClient&&) = delete;
   SyncRedisClient& operator=(SyncRedisClient&&) = delete;
 
+  struct ConnectOptions {
+    std::chrono::milliseconds timeout{2000};
+    // 0 leaves the kernel default. Honoured pre-connect on Windows where
+    // post-connect setsockopt is ignored by the TCP stack.
+    int recv_buffer_bytes = 0;
+  };
+
   bool Connect(uint16_t port, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
+  bool Connect(uint16_t port, const ConnectOptions& opts);
   void Close();
   bool IsConnected() const noexcept { return fd_ != ::abyss::platform::kInvalidSocket; }
 

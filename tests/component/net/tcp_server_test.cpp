@@ -194,18 +194,22 @@ TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
   cfg.connection.write_hard_limit_bytes = 8192;
   cfg.io_threads = 2;
   StubDispatcher dispatcher;
-  dispatcher.read_payload.assign(4 * 1024 * 1024, 'z');
+  // 32 MiB exceeds even Windows' maximum autotuned TCP send buffer (~16 MiB),
+  // guaranteeing write_buf_ stays well above write_hard_limit_bytes (8 KiB).
+  dispatcher.read_payload.assign(32 * 1024 * 1024, 'z');
   TcpServer server(cfg, resp::GlobalRegistry(),
                    resp::PipelineDependencies{.dispatcher = &dispatcher});
   ASSERT_TRUE(server.Start().has_value());
 
+  // Slow client: small SO_RCVBUF set pre-connect, and crucially we never call
+  // recv() on it. On Windows TCP loopback, an actively-reading client drains
+  // the kernel buffer at full speed regardless of SO_RCVBUF — backpressure
+  // only surfaces when the receiver app is genuinely idle.
   component_test::SyncRedisClient slow;
-  ASSERT_TRUE(slow.Connect(server.BoundPort()));
-  // Small SO_RCVBUF on the slow client forces TCP flow control to kick in on
-  // both POSIX and Windows loopback once the server emits more than a few KB.
-  const int rcvbuf = 4096;
-  (void)::setsockopt(slow.Fd(), SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf),
-                     sizeof(rcvbuf));
+  ASSERT_TRUE(slow.Connect(server.BoundPort(), component_test::SyncRedisClient::ConnectOptions{
+                                                   .timeout = std::chrono::milliseconds{2000},
+                                                   .recv_buffer_bytes = 4096,
+                                               }));
   ASSERT_TRUE(slow.SendRaw("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"));
 
   component_test::SyncRedisClient healthy;
@@ -213,14 +217,13 @@ TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
 
-  std::string drain;
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-  while (std::chrono::steady_clock::now() < deadline) {
-    auto chunk = slow.ReadSome(8192, std::chrono::milliseconds{100});
-    if (chunk.empty()) break;
-    drain += chunk;
+  // Server should hard-limit-close the slow connection. Poll ActiveConnections
+  // until only the healthy client remains.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (std::chrono::steady_clock::now() < deadline && server.ActiveConnections() > 1) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
   }
-  EXPECT_LT(drain.size(), 1U * 1024U * 1024U);
+  EXPECT_EQ(server.ActiveConnections(), 1U);
 
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
 
