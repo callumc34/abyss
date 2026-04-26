@@ -2,11 +2,9 @@
 
 #include <ws2tcpip.h>
 
-#include <atomic>
 #include <mutex>
 #include <string>
 #include <system_error>
-#include <utility>
 
 #include "abyss/platform/net.h"
 
@@ -14,13 +12,15 @@ namespace abyss::platform::net {
 
 namespace {
 
+// Both lock and counter are touched only inside the same critical section,
+// so a plain int suffices.
 std::mutex& InitMutex() {
   static std::mutex m;
   return m;
 }
 
-std::atomic<int>& InitCount() {
-  static std::atomic<int> c{0};
+int& InitCount() {
+  static int c = 0;
   return c;
 }
 
@@ -28,8 +28,8 @@ std::atomic<int>& InitCount() {
 
 core::Result<void> Init() {
   const std::scoped_lock lock(InitMutex());
-  if (InitCount().load(std::memory_order_relaxed) > 0) {
-    InitCount().fetch_add(1, std::memory_order_relaxed);
+  if (InitCount() > 0) {
+    ++InitCount();
     return {};
   }
   WSADATA data{};
@@ -39,17 +39,18 @@ core::Result<void> Init() {
         core::Error{core::ErrorCode::kInternal,
                     std::string("WSAStartup: ") + std::system_category().message(rc)});
   }
-  InitCount().store(1, std::memory_order_relaxed);
+  InitCount() = 1;
   return {};
 }
 
 void Shutdown() noexcept {
   const std::scoped_lock lock(InitMutex());
-  const int prev = InitCount().fetch_sub(1, std::memory_order_relaxed);
-  if (prev == 1) {
+  if (InitCount() <= 0) {
+    InitCount() = 0;
+    return;
+  }
+  if (--InitCount() == 0) {
     ::WSACleanup();
-  } else if (prev <= 0) {
-    InitCount().store(0, std::memory_order_relaxed);
   }
 }
 

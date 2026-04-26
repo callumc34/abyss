@@ -109,8 +109,28 @@ bool Connection::IsIdle(core::SteadyTime now) const noexcept {
 }
 
 core::Result<void> Connection::Arm() {
-  armed_interest_ = EventKind::kReadable | EventKind::kWritable;
+  armed_interest_ = DesiredInterest();
   return poller_.Add(fd_.Get(), armed_interest_, this);
+}
+
+EventKind Connection::DesiredInterest() const noexcept {
+  EventKind k = EventKind::kNone;
+  if (!reading_paused_) k |= EventKind::kReadable;
+  if (HasPendingWrites()) k |= EventKind::kWritable;
+  return k;
+}
+
+bool Connection::SyncPollerInterest() {
+  const EventKind want = DesiredInterest();
+  if (want == armed_interest_) return true;
+  if (auto r = poller_.Modify(fd_.Get(), want, this); !r) {
+    ABYSS_LOG_WARN(Log(), "poller modify failed", {"client_id", client_id_},
+                   {"err", std::string_view{r.error().message()}});
+    Close(metrics::CloseReason::kClient);
+    return false;
+  }
+  armed_interest_ = want;
+  return true;
 }
 
 void Connection::Close(metrics::CloseReason reason) {
@@ -185,10 +205,14 @@ void Connection::OnReadable() {
 
   if (EnforceWriteHardLimit()) return;
   MaybePauseReading();
+  if (closed_) return;
 
   if (close_after_drain_ && !HasPendingWrites()) {
     Close(metrics::CloseReason::kClient);
+    return;
   }
+
+  SyncPollerInterest();
 }
 
 void Connection::OnWritable() {
@@ -198,10 +222,14 @@ void Connection::OnWritable() {
   if (closed_) return;
 
   MaybeResumeReading();
+  if (closed_) return;
 
   if (close_after_drain_ && !HasPendingWrites()) {
     Close(metrics::CloseReason::kClient);
+    return;
   }
+
+  SyncPollerInterest();
 }
 
 void Connection::DispatchPipelineOutput() {
@@ -266,14 +294,8 @@ void Connection::MaybePauseReading() {
   if (reading_paused_) return;
   if (WriteBufferBytes() < config_.write_backpressure_bytes) return;
 
-  armed_interest_ = EventKind::kWritable;
-  if (auto r = poller_.Modify(fd_.Get(), armed_interest_, this); !r) {
-    ABYSS_LOG_WARN(Log(), "poller modify (pause) failed", {"client_id", client_id_},
-                   {"err", std::string_view{r.error().message()}});
-    Close(metrics::CloseReason::kClient);
-    return;
-  }
   reading_paused_ = true;
+  if (!SyncPollerInterest()) return;
   metrics_.backpressure_active.Increment();
   metrics_.backpressure_entered.Increment();
   ABYSS_LOG_DEBUG(Log(), "backpressure paused", {"client_id", client_id_},
@@ -284,14 +306,8 @@ void Connection::MaybeResumeReading() {
   if (!reading_paused_) return;
   if (WriteBufferBytes() >= config_.write_resume_bytes) return;
 
-  armed_interest_ = EventKind::kReadable | EventKind::kWritable;
-  if (auto r = poller_.Modify(fd_.Get(), armed_interest_, this); !r) {
-    ABYSS_LOG_WARN(Log(), "poller modify (resume) failed", {"client_id", client_id_},
-                   {"err", std::string_view{r.error().message()}});
-    Close(metrics::CloseReason::kClient);
-    return;
-  }
   reading_paused_ = false;
+  if (!SyncPollerInterest()) return;
   metrics_.backpressure_active.Decrement();
   metrics_.backpressure_exited.Increment();
   ABYSS_LOG_DEBUG(Log(), "backpressure resumed", {"client_id", client_id_},

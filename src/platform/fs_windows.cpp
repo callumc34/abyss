@@ -198,10 +198,12 @@ core::Result<std::uint64_t> FileSize(const File& f) {
 core::Result<void> Unlink(const std::filesystem::path& path) {
   if (::DeleteFileW(path.c_str()) == 0) {
     const DWORD err = ::GetLastError();
-    const auto code =
-        (err == ERROR_FILE_NOT_FOUND) ? core::ErrorCode::kNotFound : core::ErrorCode::kInternal;
+    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+      return std::unexpected(core::Error{core::ErrorCode::kNotFound,
+                                         std::string("unlink: no such file: ") + path.string()});
+    }
     ::SetLastError(err);
-    return std::unexpected(MakeWin32Error(code, "DeleteFile"));
+    return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "DeleteFile"));
   }
   return {};
 }

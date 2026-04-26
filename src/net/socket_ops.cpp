@@ -63,11 +63,23 @@ core::Result<ListenResult> CreateListenSocket(const ListenOptions& opts) {
 
   if (opts.reuse_addr) {
     const int on = 1;
+#ifdef _WIN32
+    // POSIX-equivalent semantics: bind fails when the address is already in
+    // use. Windows SO_REUSEADDR otherwise allows multiple concurrent binds to
+    // the same port — surprising and dangerous for a server listener.
+    if (::setsockopt(listen_fd.Get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                     reinterpret_cast<const char*>(&on), sizeof(on)) < 0) {
+      return std::unexpected(
+          MakeSocketError(core::ErrorCode::kInternal, "setsockopt SO_EXCLUSIVEADDRUSE"));
+    }
+#else
+    // Allow rebinding ports stuck in TIME_WAIT after a clean restart.
     if (::setsockopt(listen_fd.Get(), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on),
                      sizeof(on)) < 0) {
       return std::unexpected(
           MakeSocketError(core::ErrorCode::kInternal, "setsockopt SO_REUSEADDR"));
     }
+#endif
   }
 
   sockaddr_in addr{};

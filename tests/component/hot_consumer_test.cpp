@@ -26,8 +26,7 @@ using namespace std::chrono_literals;
 class HotConsumerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    testing::TempDir dir("hot_consumer");
-    tmp_dir_ = dir.String();
+    dir_ = std::make_unique<testing::TempDir>("hot_consumer");
 
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
         .max_memory_bytes = 16UL * 1024UL * 1024UL,
@@ -35,7 +34,7 @@ class HotConsumerTest : public ::testing::Test {
     });
 
     auto queue_result = queue::WalQueue::Open(queue::WalConfig{
-        .wal_path = tmp_dir_,
+        .wal_path = dir_->String(),
         .segment_size_bytes = 4096,
         .shard_count = 1,
         .commit = {.policy = queue::FsyncPolicy::kGroupCommit,
@@ -52,10 +51,7 @@ class HotConsumerTest : public ::testing::Test {
     if (consumer_) consumer_->Stop();
     queue_.reset();
     hot_.reset();
-    if (!tmp_dir_.empty()) {
-      std::error_code ec;
-      std::filesystem::remove_all(tmp_dir_, ec);
-    }
+    dir_.reset();
   }
 
   // Start a consumer on the shared queue/store pointing at shard 0.
@@ -88,7 +84,7 @@ class HotConsumerTest : public ::testing::Test {
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
-  std::string tmp_dir_;
+  std::unique_ptr<testing::TempDir> dir_;
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<hot::ShardedHotStore> hot_;
   core::ConsumerRpc rpc_;

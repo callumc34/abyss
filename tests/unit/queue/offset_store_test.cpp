@@ -1,14 +1,5 @@
 #include "abyss/queue/offset_store.h"
 
-#ifdef _WIN32
-#include <process.h>
-
-#include "abyss/platform/fs.h"
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -20,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/platform/fs.h"
 #include "abyss/queue/file_offset_store.h"
 #include "abyss/queue/memory_offset_store.h"
 #include "temp_dir.h"
@@ -29,30 +21,24 @@ namespace {
 
 class OffsetStoreTest : public ::testing::TestWithParam<std::string> {
  protected:
-  void SetUp() override {
-    testing::TempDir dir("offset");
-    tmp_dir_ = dir.String();
-  }
+  void SetUp() override { dir_ = std::make_unique<testing::TempDir>("offset"); }
 
   void TearDown() override {
     store_.reset();
-    if (!tmp_dir_.empty()) {
-      std::error_code ec;
-      std::filesystem::remove_all(tmp_dir_, ec);
-    }
+    dir_.reset();
   }
 
   std::unique_ptr<OffsetStore> MakeStore() {
     if (GetParam() == "memory") {
       return std::make_unique<MemoryOffsetStore>();
     }
-    auto result = FileOffsetStore::Open({.directory = tmp_dir_});
+    auto result = FileOffsetStore::Open({.directory = dir_->String()});
     EXPECT_TRUE(result.has_value());
     return std::move(*result);
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
-  std::string tmp_dir_;
+  std::unique_ptr<testing::TempDir> dir_;
   std::unique_ptr<OffsetStore> store_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
@@ -103,29 +89,24 @@ INSTANTIATE_TEST_SUITE_P(Impls, OffsetStoreTest, ::testing::Values("memory", "fi
 
 class FileOffsetStoreTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    testing::TempDir dir("file_offsets");
-    tmp_dir_ = dir.String();
-  }
+  void SetUp() override { dir_ = std::make_unique<testing::TempDir>("file_offsets"); }
 
-  void TearDown() override {
-    if (!tmp_dir_.empty()) {
-      std::error_code ec;
-      std::filesystem::remove_all(tmp_dir_, ec);
-    }
-  }
+  void TearDown() override { dir_.reset(); }
+
+  std::string TmpDir() const { return dir_->String(); }
 
   std::string ShardFilePath(core::ConsumerId consumer, core::ShardId shard) const {
     std::ostringstream oss;
     oss << std::setw(20) << std::setfill('0') << shard << ".offset";
-    return (std::filesystem::path(tmp_dir_) / std::to_string(consumer) / oss.str()).string();
+    return (dir_->Path() / std::to_string(consumer) / oss.str()).string();
   }
 
-  std::string tmp_dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  std::unique_ptr<testing::TempDir> dir_;
 };
 
 TEST_F(FileOffsetStoreTest, SetPersistsSynchronouslyToPerShardFile) {
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
   ASSERT_TRUE((*store)->Set(0, 0, 7).has_value());
 
@@ -133,7 +114,7 @@ TEST_F(FileOffsetStoreTest, SetPersistsSynchronouslyToPerShardFile) {
 }
 
 TEST_F(FileOffsetStoreTest, SetsDifferentShardsCreateSeparateFiles) {
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
   ASSERT_TRUE((*store)->Set(0, 0, 1).has_value());
   ASSERT_TRUE((*store)->Set(0, 1, 2).has_value());
@@ -146,13 +127,13 @@ TEST_F(FileOffsetStoreTest, SetsDifferentShardsCreateSeparateFiles) {
 
 TEST_F(FileOffsetStoreTest, PersistsAcrossReopen) {
   {
-    auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+    auto store = FileOffsetStore::Open({.directory = TmpDir()});
     ASSERT_TRUE(store.has_value());
     ASSERT_TRUE((*store)->Set(0, 5, 123).has_value());
     ASSERT_TRUE((*store)->Set(1, 2, 456).has_value());
   }
 
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
   EXPECT_EQ(*(*store)->Get(0, 5), 123U);
   EXPECT_EQ(*(*store)->Get(1, 2), 456U);
@@ -160,21 +141,21 @@ TEST_F(FileOffsetStoreTest, PersistsAcrossReopen) {
 
 TEST_F(FileOffsetStoreTest, CorruptedRecordDetected) {
   {
-    auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+    auto store = FileOffsetStore::Open({.directory = TmpDir()});
     ASSERT_TRUE(store.has_value());
     ASSERT_TRUE((*store)->Set(0, 0, 100).has_value());
   }
 
   std::filesystem::resize_file(ShardFilePath(0, 0), 8);
 
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_FALSE(store.has_value());
   EXPECT_EQ(store.error().code(), core::ErrorCode::kCorruption);
 }
 
 TEST_F(FileOffsetStoreTest, CrcMismatchDetected) {
   {
-    auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+    auto store = FileOffsetStore::Open({.directory = TmpDir()});
     ASSERT_TRUE(store.has_value());
     ASSERT_TRUE((*store)->Set(0, 0, 100).has_value());
   }
@@ -193,7 +174,7 @@ TEST_F(FileOffsetStoreTest, CrcMismatchDetected) {
     ASSERT_TRUE(w.has_value());
   }
 
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_FALSE(store.has_value());
   EXPECT_EQ(store.error().code(), core::ErrorCode::kCorruption);
 }
@@ -205,7 +186,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossShardsSameConsumerAllPersist) {
   constexpr int kShards = 16;
   constexpr int kSetsPerShard = 100;
 
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
 
   std::vector<std::thread> threads;
@@ -227,7 +208,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossShardsSameConsumerAllPersist) {
 
   // And the per-shard values must survive reopen.
   store->reset();
-  auto reopened = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto reopened = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(reopened.has_value());
   for (int s = 0; s < kShards; ++s) {
     auto got = (*reopened)->Get(0, s);
@@ -240,7 +221,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossConsumersSameShardAllPersist) {
   constexpr int kConsumers = 8;
   constexpr int kSetsPerConsumer = 100;
 
-  auto store = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
 
   std::vector<std::thread> threads;
@@ -255,7 +236,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossConsumersSameShardAllPersist) {
   for (auto& t : threads) t.join();
 
   store->reset();
-  auto reopened = FileOffsetStore::Open({.directory = tmp_dir_});
+  auto reopened = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(reopened.has_value());
   for (int c = 0; c < kConsumers; ++c) {
     auto got = (*reopened)->Get(c, 0);

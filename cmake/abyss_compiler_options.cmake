@@ -19,7 +19,15 @@ set(ABYSS_GCC_CLANG_WARNINGS
 set(ABYSS_MSVC_WARNINGS
   /W4
   /permissive-
+  /EHsc
   /Zc:preprocessor
+  # __cplusplus reflects the negotiated /std level. Without this MSVC reports
+  # 199711L regardless of /std:c++23, which silently disables feature gates in
+  # third-party headers.
+  /Zc:__cplusplus
+  # Suppress warnings for legacy POSIX-named CRT functions used in tests.
+  /D_CRT_SECURE_NO_WARNINGS
+  /D_CRT_NONSTDC_NO_DEPRECATION
 )
 
 target_compile_options(abyss_compiler_options INTERFACE

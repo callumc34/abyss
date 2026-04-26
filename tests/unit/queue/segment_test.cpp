@@ -1,75 +1,55 @@
 #include "segment.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <io.h>
-#include <windows.h>
-#include <winsock2.h>
-
-#include "abyss/platform/fs.h"
-
-#ifdef _O_RDWR
-#undef _O_RDWR
-#endif
-#define _O_RDWR 0x0002
-
-#ifndef O_RDWR
-#define O_RDWR _O_RDWR
-#endif
-
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <cstddef>
-#include <cstdlib>
+#include <cstdint>
 #include <filesystem>
-#include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
 #include "temp_dir.h"
 
-#ifdef _WIN32
-#ifndef O_RDWR
-#define O_RDWR _O_RDWR
-#endif
-
-inline int truncate(const char* path, long length) {
-  int fd = _open(path, 0x0002);  // _O_RDWR
-  if (fd < 0) return -1;
-  return _chsize_s(fd, length);
-}
-inline int stat(const char* path, struct _stat* st) { return _stat(path, st); }
-inline int open(const char* path, int flags) { return _open(path, flags); }
-inline int pread(int fd, void* buf, unsigned int count, long offset) {
-  long pos = _lseek(fd, 0, SEEK_CUR);
-  _lseek(fd, offset, SEEK_SET);
-  int bytes_read = _read(fd, buf, count);
-  _lseek(fd, pos, SEEK_SET);
-  return bytes_read;
-}
-inline int pwrite(int fd, const void* buf, unsigned int count, long offset) {
-  long pos = _lseek(fd, 0, SEEK_CUR);
-  _lseek(fd, offset, SEEK_SET);
-  int written = _write(fd, buf, count);
-  _lseek(fd, pos, SEEK_SET);
-  return written;
-}
-#endif
-
 namespace abyss::queue {
 namespace {
 
+namespace pfs = abyss::platform::fs;
+
 constexpr size_t kDefaultMaxSize = size_t{4} * 1024 * 1024;
+
+uint64_t FileSizeOf(const std::string& path) {
+  auto f = pfs::Open(path, {.mode = pfs::OpenMode::kRead});
+  EXPECT_TRUE(f.has_value()) << f.error().message();
+  if (!f.has_value()) return 0;
+  auto sz = pfs::FileSize(*f);
+  EXPECT_TRUE(sz.has_value()) << sz.error().message();
+  return sz.has_value() ? *sz : 0;
+}
+
+void TruncateTo(const std::string& path, uint64_t bytes) {
+  auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+  ASSERT_TRUE(f.has_value()) << f.error().message();
+  ASSERT_TRUE(pfs::Ftruncate(*f, bytes).has_value());
+}
+
+void FlipByte(const std::string& path, uint64_t offset) {
+  auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+  ASSERT_TRUE(f.has_value()) << f.error().message();
+  uint8_t byte = 0;
+  auto r = pfs::Pread(*f, &byte, 1, offset);
+  ASSERT_TRUE(r.has_value());
+  ASSERT_EQ(*r, 1U);
+  byte ^= 0x01U;
+  auto w = pfs::Pwrite(*f, &byte, 1, offset);
+  ASSERT_TRUE(w.has_value());
+}
 
 // Most tests write single-entry appends where batch_last_seq == entry.seq.
 // This wrapper keeps test expressions tidy; tests that exercise batches
@@ -80,26 +60,10 @@ core::Result<size_t> AppendSingle(Segment& seg, const core::QueueEntry& entry) {
 
 class SegmentTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    dir_ = std::make_unique<testing::TempDir>("segment");
-    tmp_dir_ = dir_->String();
-    if (!std::filesystem::exists(tmp_dir_)) {
-      throw std::runtime_error("TempDir did not create directory: " + tmp_dir_);
-    }
-  }
+  void SetUp() override { dir_ = std::make_unique<testing::TempDir>("segment"); }
 
-  // Helper to ensure path is accessible on Windows after TempDir creation
   std::string SegPath(const std::string& name = "test.wal") const {
-    auto path = std::filesystem::path(tmp_dir_) / name;
-
-#ifdef _WIN32
-    // Force Windows to see the directory
-    auto parent = std::filesystem::path(tmp_dir_);
-    DWORD attr = GetFileAttributesW(parent.c_str());
-    (void)attr;
-#endif
-
-    return path.string();
+    return (dir_->Path() / name).string();
   }
 
   static SegmentHeader MakeHeader(core::SequenceId base_seq = 0, core::ShardId shard = 0) {
@@ -158,9 +122,8 @@ class SegmentTest : public ::testing::Test {
     EXPECT_EQ(w->cmd.args, expected);
   }
 
-  std::string tmp_dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
-  std::unique_ptr<testing::TempDir>
-      dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  std::unique_ptr<testing::TempDir> dir_;
 };
 
 TEST_F(SegmentTest, CreateAndReadBack) {
@@ -253,7 +216,7 @@ TEST_F(SegmentTest, TornTail_TruncatedBody) {
   }
 
   // Truncate mid-way through the second entry's body.
-  ::truncate(path.c_str(), static_cast<off_t>(good_offset) + 10);
+  TruncateTo(path, good_offset + 10);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -262,9 +225,7 @@ TEST_F(SegmentTest, TornTail_TruncatedBody) {
   EXPECT_EQ(seg->write_offset(), good_offset);
 
   // Verify file was physically truncated to the clean boundary.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), good_offset);
+  EXPECT_EQ(FileSizeOf(path), good_offset);
 
   auto read = seg->ReadEntries(kSegmentHeaderSize, 10);
   ASSERT_TRUE(read.has_value());
@@ -284,9 +245,7 @@ TEST_F(SegmentTest, TornTail_TruncatedCrc) {
   }
 
   // Read file to find where the second entry's CRC starts, then truncate there.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  ::truncate(path.c_str(), st.st_size - 2);
+  TruncateTo(path, FileSizeOf(path) - 2);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -307,18 +266,7 @@ TEST_F(SegmentTest, TornTail_CrcMismatch) {
   }
 
   // Corrupt a byte in the second entry's body.
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-#ifdef _WIN32
-  int fd = _open(path.c_str(), O_RDWR);
-#else
-  int fd = ::open(path.c_str(), O_RDWR);
-#endif
-  ASSERT_GE(fd, 0);
-  uint8_t byte = 0;
-  ASSERT_EQ(::pread(fd, &byte, 1, static_cast<off_t>(good_offset + 5)), 1);
-  byte ^= 0x01;
-  ASSERT_EQ(::pwrite(fd, &byte, 1, static_cast<off_t>(good_offset + 5)), 1);
-  ::close(fd);
+  FlipByte(path, good_offset + 5);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -342,9 +290,7 @@ TEST_F(SegmentTest, AppendAfterRecovery) {
   }
 
   // Truncate mid-second-entry.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  ::truncate(path.c_str(), st.st_size - 5);
+  TruncateTo(path, FileSizeOf(path) - 5);
 
   auto seg = Segment::Open(path, kDefaultMaxSize);
   ASSERT_TRUE(seg.has_value());
@@ -659,9 +605,7 @@ TEST_F(SegmentTest, SealTruncatesToWriteOffset) {
     EXPECT_TRUE(seg->sealed());
   }
 
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), sealed_offset);
+  EXPECT_EQ(FileSizeOf(path), sealed_offset);
 }
 
 TEST_F(SegmentTest, AppendRejectedAfterSeal) {
@@ -717,9 +661,7 @@ TEST_F(SegmentTest, RecoveryTruncatesIncompleteBatch) {
   EXPECT_EQ(seg->write_offset(), before_batch_offset);
 
   // File was physically truncated.
-  struct stat st{};
-  ASSERT_EQ(::stat(path.c_str(), &st), 0);
-  EXPECT_EQ(static_cast<size_t>(st.st_size), before_batch_offset);
+  EXPECT_EQ(FileSizeOf(path), before_batch_offset);
 }
 
 TEST_F(SegmentTest, RecoveryKeepsCompleteBatchesAfterIncompleteTruncation) {

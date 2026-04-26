@@ -38,22 +38,16 @@ core::QueueEntry MakeWrite(std::vector<std::string> args) {
 
 class WalQueueTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    testing::TempDir dir("wal_queue");
-    tmp_dir_ = dir.String();
-  }
+  void SetUp() override { dir_ = std::make_unique<testing::TempDir>("wal_queue"); }
 
   void TearDown() override {
     queue_.reset();
-    if (!tmp_dir_.empty()) {
-      std::error_code ec;
-      std::filesystem::remove_all(tmp_dir_, ec);
-    }
+    dir_.reset();
   }
 
   WalConfig DefaultConfig() const {
     return WalConfig{
-        .wal_path = tmp_dir_,
+        .wal_path = dir_->String(),
         .segment_size_bytes = 4096,
         .shard_count = 2,
         .commit = {.policy = FsyncPolicy::kGroupCommit,
@@ -71,7 +65,7 @@ class WalQueueTest : public ::testing::Test {
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
-  std::string tmp_dir_;
+  std::unique_ptr<testing::TempDir> dir_;
   std::unique_ptr<WalQueue> queue_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
@@ -350,7 +344,7 @@ TEST_F(WalQueueTest, MissingMiddleSegmentRejectedAsCorruption) {
   }
 
   // Find and delete a middle (non-first, non-last) segment file.
-  const auto shard_dir = std::filesystem::path(tmp_dir_) / "shard-0000";
+  const auto shard_dir = dir_->Path() / "shard-0000";
   std::vector<std::filesystem::path> seg_paths;
   for (const auto& entry : std::filesystem::directory_iterator(shard_dir)) {
     if (entry.path().extension() == ".log") seg_paths.push_back(entry.path());
@@ -678,7 +672,7 @@ TEST_F(WalQueueTest, AppendBatchCrashMidBatchLosesWholeBatch) {
   // Truncate the segment mid-batch before reopening. This models the crash:
   // some of the batch's bytes hit disk, the closing entry did not.
   queue_.reset();
-  const auto shard_dir = std::filesystem::path(tmp_dir_) / "shard-0000";
+  const auto shard_dir = dir_->Path() / "shard-0000";
   std::string segment_path;
   for (const auto& entry : std::filesystem::directory_iterator(shard_dir)) {
     if (entry.path().extension() == ".log") {

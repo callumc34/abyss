@@ -16,7 +16,7 @@ namespace {
 class TcpServerSmokeTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Initialize Windows sockets on Windows
+    // No-op on POSIX; refcounted WSAStartup on Windows.
     ASSERT_TRUE(abyss::platform::net::Init().has_value());
 
     TcpServerConfig cfg;

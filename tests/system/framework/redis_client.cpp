@@ -13,6 +13,25 @@
 #include <ostream>
 #include <string>
 
+#include "abyss/platform/net.h"
+
+namespace {
+
+#ifdef _WIN32
+namespace pnet = abyss::platform::net;
+#endif
+
+void EnsureNetInit() {
+#ifdef _WIN32
+  static const bool kInitOnce = [] {
+    auto r = pnet::Init();
+    return r.has_value();
+  }();
+  (void)kInitOnce;
+#endif
+}
+}  // namespace
+
 namespace abyss::system_test {
 
 // --- Reply ------------------------------------------------------------------
@@ -99,7 +118,7 @@ RedisClient::~RedisClient() { Close(); }
 
 RedisClient::RedisClient(RedisClient&& other) noexcept
     : fd_(other.fd_), buf_(std::move(other.buf_)), rpos_(other.rpos_), wpos_(other.wpos_) {
-  other.fd_ = kInvalidSocket;
+  other.fd_ = abyss::platform::kInvalidSocket;
 }
 
 RedisClient& RedisClient::operator=(RedisClient&& other) noexcept {
@@ -109,17 +128,18 @@ RedisClient& RedisClient::operator=(RedisClient&& other) noexcept {
     buf_ = std::move(other.buf_);
     rpos_ = other.rpos_;
     wpos_ = other.wpos_;
-    other.fd_ = kInvalidSocket;
+    other.fd_ = abyss::platform::kInvalidSocket;
   }
   return *this;
 }
 
 bool RedisClient::Connect(const std::string& host, uint16_t port,
                           std::chrono::milliseconds timeout) {
+  EnsureNetInit();
   Close();
 
   fd_ = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd_ == kInvalidSocket) return false;
+  if (fd_ == abyss::platform::kInvalidSocket) return false;
 
 #ifndef _WIN32
 #ifdef __APPLE__
@@ -148,7 +168,7 @@ bool RedisClient::Connect(const std::string& host, uint16_t port,
       return false;
     }
 #else
-    if (GetSocketError() != WSAEWOULDBLOCK) {
+    if (pnet::LastError() != WSAEWOULDBLOCK) {
       Close();
       return false;
     }
@@ -197,9 +217,9 @@ bool RedisClient::Connect(const std::string& host, uint16_t port,
 }
 
 void RedisClient::Close() {
-  if (fd_ != kInvalidSocket) {
-    CLOSE_SOCKET(fd_);
-    fd_ = kInvalidSocket;
+  if (fd_ != abyss::platform::kInvalidSocket) {
+    abyss::platform::net::CloseSocket(fd_);
+    fd_ = abyss::platform::kInvalidSocket;
   }
   rpos_ = 0;
   wpos_ = 0;
@@ -229,7 +249,7 @@ bool RedisClient::SendEncoded(const std::string& data) {
 #ifndef _WIN32
       if (errno == EINTR) continue;
 #else
-      if (GetSocketError() == WSAEINTR) continue;
+      if (pnet::LastError() == WSAEINTR) continue;
 #endif
       return false;
     }
@@ -258,7 +278,7 @@ bool RedisClient::FillBuffer() {
 #ifndef _WIN32
     if (n < 0 && errno == EINTR) return FillBuffer();
 #else
-    if (n < 0 && GetSocketError() == WSAEINTR) return FillBuffer();
+    if (n < 0 && pnet::LastError() == WSAEINTR) return FillBuffer();
 #endif
     return false;
   }

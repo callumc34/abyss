@@ -164,6 +164,7 @@ add_executable(abyss_net_tests
   net/poller_test.cpp
   net/connection_backpressure_test.cpp
   net/connection_idle_test.cpp
+  net/connection_lazy_arm_test.cpp
   net/connection_oversize_test.cpp
 )
 
@@ -173,6 +174,7 @@ target_include_directories(abyss_net_tests PRIVATE
 
 target_link_libraries(abyss_net_tests PRIVATE
   abyss::net
+  abyss::test_support
   GTest::gtest_main
 )
 

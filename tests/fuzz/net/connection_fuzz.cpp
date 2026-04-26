@@ -1,10 +1,11 @@
-#ifdef _WIN32
-#include <winsock2.h>
-#else
+// libFuzzer harness — POSIX-only because socketpair(AF_UNIX) and the
+// libFuzzer entrypoint both depend on Clang's `-fsanitize=fuzzer` runtime,
+// which is not currently wired for MSVC. The Windows preset doesn't enable
+// ABYSS_BUILD_FUZZ.
+
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include "abyss/net/connection.h"
 #include "abyss/net/poller.h"
 #include "abyss/net/socket_ops.h"
+#include "abyss/platform/types.h"
 #include "abyss/resp/command_registry.h"
 #include "abyss/resp/request_pipeline.h"
 
@@ -26,15 +28,16 @@ namespace {
 
 class NoopPoller : public abyss::net::Poller {
  public:
-  abyss::core::Result<void> Add(int /*fd*/, abyss::net::EventKind /*interest*/,
+  abyss::core::Result<void> Add(abyss::platform::Socket /*fd*/, abyss::net::EventKind /*interest*/,
                                 void* /*user_data*/) override {
     return {};
   }
-  abyss::core::Result<void> Modify(int /*fd*/, abyss::net::EventKind /*interest*/,
+  abyss::core::Result<void> Modify(abyss::platform::Socket /*fd*/,
+                                   abyss::net::EventKind /*interest*/,
                                    void* /*user_data*/) override {
     return {};
   }
-  abyss::core::Result<void> Remove(int /*fd*/) override { return {}; }
+  abyss::core::Result<void> Remove(abyss::platform::Socket /*fd*/) override { return {}; }
   abyss::core::Result<std::span<const abyss::net::Event>> Wait(
       std::chrono::milliseconds /*timeout*/) override {
     return std::span<const abyss::net::Event>{};

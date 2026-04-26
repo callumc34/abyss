@@ -65,11 +65,6 @@ TcpServerConfig DefaultTestConfig() {
 }  // namespace
 
 TEST_F(TcpServerComponentTest, BindFailureSurfacesAsError) {
-#ifdef _WIN32
-  GTEST_SKIP() << "Windows default enables SO_REUSEADDR, allowing bind to TIME_WAIT ports - "
-                  "semantic difference from POSIX where this fails";
-#endif
-
   TcpServerConfig good = DefaultTestConfig();
   good.port = 0;
   StubDispatcher dispatcher;
@@ -193,12 +188,6 @@ TEST_F(TcpServerComponentTest, MaxConnectionsRejectsNewClients) {
 }
 
 TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
-#ifdef _WIN32
-  GTEST_SKIP()
-      << "Kernel socket buffer backpressure differs: POSIX triggers quickly with small buffers, "
-      << "Windows TCP loopback has different flow semantics - fundamental OS difference";
-#endif
-
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.connection.write_backpressure_bytes = 4096;
   cfg.connection.write_resume_bytes = 1024;
@@ -212,8 +201,11 @@ TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
 
   component_test::SyncRedisClient slow;
   ASSERT_TRUE(slow.Connect(server.BoundPort()));
+  // Small SO_RCVBUF on the slow client forces TCP flow control to kick in on
+  // both POSIX and Windows loopback once the server emits more than a few KB.
   const int rcvbuf = 4096;
-  ::setsockopt(slow.Fd(), SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
+  (void)::setsockopt(slow.Fd(), SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf),
+                     sizeof(rcvbuf));
   ASSERT_TRUE(slow.SendRaw("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"));
 
   component_test::SyncRedisClient healthy;

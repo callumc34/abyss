@@ -97,6 +97,12 @@ class Connection {
   void RecordReadBufferHighWater();
   void TouchActivity();
 
+  // Lazy poller interest: kReadable iff not paused; kWritable iff write
+  // buffer has pending bytes. Avoids spurious POLLOUT storms on level-
+  // triggered backends (WSAPoll) for idle connections.
+  EventKind DesiredInterest() const noexcept;
+  bool SyncPollerInterest();
+
   Fd fd_;
   uint32_t remote_ipv4_;
   uint16_t remote_port_;
