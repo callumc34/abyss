@@ -28,11 +28,25 @@ jobs:
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.7
 
+      - name: Probe sccache
+        id: sccache_probe
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          sccache --start-server
+          if ($LASTEXITCODE -eq 0) {
+            "ABYSS_USE_CCACHE=ON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Warning "sccache failed to start; building without compile cache"
+            "ABYSS_USE_CCACHE=OFF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
       - name: Configure
         shell: pwsh
         env:
           SCCACHE_GHA_ENABLED: "true"
-        run: cmake --preset windows -G Ninja
+        run: cmake --preset windows -G Ninja "-DABYSS_USE_CCACHE=$env:ABYSS_USE_CCACHE"
 
       - name: Build
         shell: pwsh
@@ -40,7 +54,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
         run: |
           cmake --build build/windows --parallel
-          sccache --show-stats
+          if ($env:ABYSS_USE_CCACHE -eq "ON") { sccache --show-stats }
 
       - name: Test
         shell: pwsh

@@ -36,7 +36,7 @@ class SyncRedisClient {
   std::string Command(std::initializer_list<std::string> args) const;
   bool SendRaw(const std::string& bytes) const;
   std::string ReadSome(size_t n,
-                       std::chrono::milliseconds timeout = std::chrono::milliseconds{500}) const;
+                       std::chrono::milliseconds timeout = std::chrono::milliseconds{2000}) const;
 
   ::abyss::platform::Socket Fd() const noexcept { return fd_; }
 
