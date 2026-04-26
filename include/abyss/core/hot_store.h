@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 
 #include "abyss/core/ops.h"
+#include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
@@ -16,16 +18,20 @@ struct MemoryStats {
   uint64_t eviction_count = 0;
 };
 
-class HotStore {
+class HotStore : public Reader {
  public:
   HotStore() = default;
-  virtual ~HotStore() = default;
+  ~HotStore() override = default;
   HotStore(const HotStore&) = delete;
   HotStore& operator=(const HotStore&) = delete;
   HotStore(HotStore&&) = delete;
   HotStore& operator=(HotStore&&) = delete;
 
-  virtual Result<RespValue> Exec(const ops::ReadOp& op) = 0;
+  // Deadline is accepted for interface uniformity; the in-memory hot tier
+  // serves reads in microseconds and ignores the parameter.
+  Result<RespValue> Exec(const ops::ReadOp& op,
+                         std::optional<Duration> deadline = std::nullopt) override = 0;
+
   virtual Result<void> Apply(const ops::WriteOp& op, EvictionTTL eviction) = 0;
   virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops, EvictionTTL eviction) = 0;
 

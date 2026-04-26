@@ -1,5 +1,6 @@
 #pragma once
 
+#include "abyss/core/predicate.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 
@@ -16,6 +17,8 @@ class CommandDispatcher {
 
   virtual Result<RespValue> DispatchRead(std::string_view name, const RespCommand& cmd) = 0;
   virtual Result<RespValue> DispatchWrite(std::string_view name, RespCommand cmd) = 0;
+  virtual Result<RespValue> DispatchConditional(std::string_view name, RespCommand cmd,
+                                                PredicateFlags flags) = 0;
 };
 
 }  // namespace abyss::core

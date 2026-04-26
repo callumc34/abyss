@@ -183,7 +183,8 @@ constexpr CommandSpec Read(std::string_view name, int arity, int first_key, int 
 }
 
 constexpr CommandSpec Write(std::string_view name, int arity, Dispatch dispatch, int first_key,
-                            int last_key, int key_step, CommandDocs docs) {
+                            int last_key, int key_step, CommandDocs docs,
+                            PredicateExtractor predicate = nullptr) {
   return {.name = name,
           .arity = arity,
           .cls = C::kWrite,
@@ -192,7 +193,8 @@ constexpr CommandSpec Write(std::string_view name, int arity, Dispatch dispatch,
           .last_key = last_key,
           .key_step = key_step,
           .loading_safe = false,
-          .docs = docs};
+          .docs = docs,
+          .predicate = predicate};
 }
 
 constexpr auto kCommandTable = std::to_array<CommandSpec>({
@@ -235,9 +237,11 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Read("GET", 2, 1, 1, 1, {"Returns the string value of a key.", "1.0.0", "string", "O(1)"}),
     Write("SET", -3, D::kWritePath, 1, 1, 1,
           {"Sets the string value of a key. Supports TTL and conditional options.", "1.0.0",
-           "string", "O(1)"}),
+           "string", "O(1)"},
+          ExtractSetFlags),
     Write("SETNX", 3, D::kConditionalWrite, 1, 1, 1,
-          {"Sets a string value only if the key does not exist.", "1.0.0", "string", "O(1)"}),
+          {"Sets a string value only if the key does not exist.", "1.0.0", "string", "O(1)"},
+          ExtractSetNxFlags),
     Write("SETEX", 4, D::kWritePath, 1, 1, 1,
           {"Sets the value and expiration in seconds.", "2.0.0", "string", "O(1)"}),
     Write("PSETEX", 4, D::kWritePath, 1, 1, 1,
@@ -267,7 +271,8 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
           {"Sets the values of multiple keys.", "1.0.1", "string", "O(N) over keys set"}),
     Write("MSETNX", -3, D::kConditionalWrite, 1, -1, 2,
           {"Atomically sets multiple keys only if none exist.", "1.0.1", "string",
-           "O(N) over keys set"}),
+           "O(N) over keys set"},
+          ExtractMsetNxFlags),
 
     // Sets
     Write("SADD", -3, D::kWritePath, 1, 1, 1,
@@ -290,7 +295,8 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     // Sorted sets
     Write("ZADD", -4, D::kWritePath, 1, 1, 1,
           {"Adds members to a sorted set or updates their scores.", "1.2.0", "sorted-set",
-           "O(log N) per member"}),
+           "O(log N) per member"},
+          ExtractZAddFlags),
     Write("ZREM", -3, D::kWritePath, 1, 1, 1,
           {"Removes members from a sorted set.", "1.2.0", "sorted-set", "O(log N) per member"}),
     Read("ZSCORE", 3, 1, 1, 1,
@@ -328,14 +334,18 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Read("EXISTS", -2, 1, -1, 1,
          {"Tests whether keys exist.", "1.0.0", "generic", "O(N) over keys requested"}),
     Write("EXPIRE", -3, D::kWritePath, 1, 1, 1,
-          {"Sets a key's time-to-live in seconds.", "1.0.0", "generic", "O(1)"}),
+          {"Sets a key's time-to-live in seconds.", "1.0.0", "generic", "O(1)"},
+          ExtractExpireFlags),
     Write("PEXPIRE", -3, D::kWritePath, 1, 1, 1,
-          {"Sets a key's time-to-live in milliseconds.", "2.6.0", "generic", "O(1)"}),
+          {"Sets a key's time-to-live in milliseconds.", "2.6.0", "generic", "O(1)"},
+          ExtractExpireFlags),
     Write("EXPIREAT", -3, D::kWritePath, 1, 1, 1,
-          {"Sets the expiration of a key to a Unix timestamp.", "1.2.0", "generic", "O(1)"}),
+          {"Sets the expiration of a key to a Unix timestamp.", "1.2.0", "generic", "O(1)"},
+          ExtractExpireFlags),
     Write("PEXPIREAT", -3, D::kWritePath, 1, 1, 1,
           {"Sets the expiration of a key to a Unix millisecond timestamp.", "2.6.0", "generic",
-           "O(1)"}),
+           "O(1)"},
+          ExtractExpireFlags),
     Write("PERSIST", 2, D::kWritePath, 1, 1, 1,
           {"Removes the expiration from a key.", "2.2.0", "generic", "O(1)"}),
     Read("TTL", 2, 1, 1, 1,
@@ -350,9 +360,14 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Read("TYPE", 2, 1, 1, 1, {"Returns the type of a key.", "1.0.0", "generic", "O(1)"}),
     Write("RENAME", 3, D::kWritePath, 1, 2, 1, {"Renames a key.", "1.0.0", "generic", "O(1)"}),
     Write("RENAMENX", 3, D::kConditionalWrite, 1, 2, 1,
-          {"Renames a key only if the destination does not exist.", "1.0.0", "generic", "O(1)"}),
+          {"Renames a key only if the destination does not exist.", "1.0.0", "generic", "O(1)"},
+          ExtractRenameNxFlags),
     Write("COPY", -3, D::kConditionalWrite, 1, 2, 1,
-          {"Copies the value of a key to another key.", "6.2.0", "generic", "O(N)"}),
+          {"Copies the value of a key to another key.", "6.2.0", "generic", "O(N)"},
+          ExtractCopyFlags),
+    Write("HSETNX", 4, D::kConditionalWrite, 1, 1, 1,
+          {"Sets a hash field only if the field does not already exist.", "2.0.0", "hash", "O(1)"},
+          ExtractHsetNxFlags),
     Read("OBJECT", -3, 2, 2, 1,
          {"A container for object-introspection commands.", "2.2.3", "generic",
           "Depends on subcommand."},

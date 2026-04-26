@@ -105,10 +105,10 @@ class SegmentTest : public ::testing::Test {
     e.payload = core::entry::Resolved{
         .ref = ref,
         .decision = decision,
-        .materialised_op =
+        .materialised_ops =
             decision == core::Decision::kApply
-                ? std::optional<core::RespCommand>{core::RespCommand{{"SET", "k", "v"}}}
-                : std::nullopt,
+                ? std::vector<core::RespCommand>{core::RespCommand{{"SET", "k", "v"}}}
+                : std::vector<core::RespCommand>{},
         .return_value = decision == core::Decision::kApply ? core::RespValue::SimpleString("OK")
                                                            : core::RespValue::Null(),
     };
@@ -486,7 +486,7 @@ TEST_F(SegmentTest, AllEntryTypes) {
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(r->ref, 1U);
   EXPECT_EQ(r->decision, core::Decision::kApply);
-  ASSERT_TRUE(r->materialised_op.has_value());
+  ASSERT_EQ(r->materialised_ops.size(), 1U);
   EXPECT_TRUE(r->return_value.IsSimpleString());
 }
 

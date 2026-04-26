@@ -15,6 +15,7 @@
 #include <string_view>
 
 #include "abyss/core/command_dispatcher.h"
+#include "abyss/core/predicate.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/net/connection.h"
@@ -53,6 +54,11 @@ class NoopDispatcher : public abyss::core::CommandDispatcher {
   }
   abyss::core::Result<abyss::core::RespValue> DispatchWrite(
       std::string_view /*name*/, abyss::core::RespCommand /*cmd*/) override {
+    return abyss::core::RespValue::SimpleString("OK");
+  }
+  abyss::core::Result<abyss::core::RespValue> DispatchConditional(
+      std::string_view /*name*/, abyss::core::RespCommand /*cmd*/,
+      abyss::core::PredicateFlags /*flags*/) override {
     return abyss::core::RespValue::SimpleString("OK");
   }
 };

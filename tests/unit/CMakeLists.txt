@@ -89,6 +89,8 @@ add_executable(abyss_consumer_tests
   consumer/flush_strategy_test.cpp
   consumer/compaction_buffer_test.cpp
   consumer/cold_consumer_test.cpp
+  consumer/existence_cache_test.cpp
+  consumer/resolver_test.cpp
 )
 
 target_link_libraries(abyss_consumer_tests PRIVATE

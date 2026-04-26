@@ -101,11 +101,9 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
           binary::WriteU64LE(out, p.ref);
           binary::WriteU8(out, static_cast<uint8_t>(p.decision));
-          if (p.materialised_op.has_value()) {
-            binary::WriteU8(out, 1);
-            WriteRespCommand(out, *p.materialised_op);
-          } else {
-            binary::WriteU8(out, 0);
+          binary::WriteU32LE(out, static_cast<uint32_t>(p.materialised_ops.size()));
+          for (const auto& op : p.materialised_ops) {
+            WriteRespCommand(out, op);
           }
           WriteRespValue(out, p.return_value);
         }
@@ -198,15 +196,16 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
       if (!ReadU8(cursor, decision)) {
         return std::unexpected(Corrupted("missing decision"));
       }
-      uint8_t has_op = 0;
-      if (!ReadU8(cursor, has_op)) {
-        return std::unexpected(Corrupted("missing has_op"));
+      uint32_t op_count = 0;
+      if (!ReadU32LE(cursor, op_count)) {
+        return std::unexpected(Corrupted("missing materialised_ops count"));
       }
-      std::optional<core::RespCommand> mat_op;
-      if (has_op != 0) {
+      std::vector<core::RespCommand> mat_ops;
+      mat_ops.reserve(op_count);
+      for (uint32_t i = 0; i < op_count; ++i) {
         auto cmd = ReadRespCommand(cursor);
         if (!cmd.has_value()) return std::unexpected(cmd.error());
-        mat_op = std::move(*cmd);
+        mat_ops.push_back(std::move(*cmd));
       }
       uint32_t resp_len = 0;
       if (!ReadU32LE(cursor, resp_len)) {
@@ -227,7 +226,7 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
       qe.payload = core::entry::Resolved{
           .ref = ref,
           .decision = static_cast<core::Decision>(decision),
-          .materialised_op = std::move(mat_op),
+          .materialised_ops = std::move(mat_ops),
           .return_value = std::move(return_value),
       };
       break;

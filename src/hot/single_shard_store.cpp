@@ -306,6 +306,10 @@ core::Result<void> SingleShardStore::Apply(const core::ops::WriteOp& op,
           return ApplyHashDel(o);
         } else if constexpr (std::is_same_v<T, core::ops::MultiStringSet>) {
           return ApplyMultiStringSet(o, eviction);
+        } else if constexpr (std::is_same_v<T, core::ops::Expire>) {
+          return ApplyExpire(o);
+        } else if constexpr (std::is_same_v<T, core::ops::Persist>) {
+          return ApplyPersist(o);
         } else {
           return std::unexpected(
               core::Error(core::ErrorCode::kInternal, "unsupported write operation"));
@@ -517,6 +521,32 @@ core::Result<void> SingleShardStore::ApplyMultiStringSet(const core::ops::MultiS
     auto result = ApplyStringSet(core::ops::StringSet{.key = e.key, .value = e.value}, eviction);
     if (!result.has_value()) return result;
   }
+  return {};
+}
+
+core::Result<void> SingleShardStore::ApplyExpire(const core::ops::Expire& op) {
+  auto it = entries_.find(std::string(op.key));
+  if (it == entries_.end()) return {};
+  if (IsExpiredByTtl(it->second, config_.wall_clock)) {
+    RemoveEntry(std::string(op.key));
+    return {};
+  }
+  TrackRemove(it->second, op.key);
+  it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
+  TrackInsert(it->second, op.key);
+  return {};
+}
+
+core::Result<void> SingleShardStore::ApplyPersist(const core::ops::Persist& op) {
+  auto it = entries_.find(std::string(op.key));
+  if (it == entries_.end()) return {};
+  if (IsExpiredByTtl(it->second, config_.wall_clock)) {
+    RemoveEntry(std::string(op.key));
+    return {};
+  }
+  TrackRemove(it->second, op.key);
+  it->second.abs_ttl_ms = 0;
+  TrackInsert(it->second, op.key);
   return {};
 }
 

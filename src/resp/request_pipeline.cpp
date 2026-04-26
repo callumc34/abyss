@@ -140,25 +140,34 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       }
 
     case Dispatch::kWritePath:
+    case Dispatch::kConditionalWrite: {
       if (deps_.dispatcher == nullptr) {
         return finish(InternalServerError("dispatcher missing for write path", parent.name));
       }
-      {
-        auto result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
-        if (!result.has_value()) {
-          ABYSS_LOG_WARN(Logger(), "engine write error", {"client_id", state_.client_id},
-                         {"cmd", std::string_view{parent.name}},
-                         {"err", std::string_view{result.error().message()}});
-          return finish(RespValue::Error(ErrorPrefix::kErr, result.error().message()));
+      // Registry class is a hint; the extractor decides per args (e.g. SET vs SET NX).
+      core::PredicateFlags flags = core::PredicateFlags::kNone;
+      if (parent.predicate != nullptr) {
+        auto extracted = parent.predicate(cmd);
+        if (!extracted.has_value()) {
+          return finish(
+              RespValue::Error(ErrorPrefix::kErr, std::string{extracted.error().message()}));
         }
-        return finish(std::move(*result));
+        flags = *extracted;
       }
-
-    case Dispatch::kConditionalWrite: {
-      std::string msg = "conditional writes are not supported in this build (";
-      msg.append(parent.name);
-      msg.append("); tracked in abyss#97");
-      return finish(RespValue::Error(ErrorPrefix::kErr, std::move(msg)));
+      core::Result<RespValue> result;
+      if (flags == core::PredicateFlags::kNone &&
+          resolved.parent->dispatch == Dispatch::kWritePath) {
+        result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
+      } else {
+        result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
+      }
+      if (!result.has_value()) {
+        ABYSS_LOG_WARN(Logger(), "engine write error", {"client_id", state_.client_id},
+                       {"cmd", std::string_view{parent.name}},
+                       {"err", std::string_view{result.error().message()}});
+        return finish(RespValue::Error(ErrorPrefix::kErr, result.error().message()));
+      }
+      return finish(std::move(*result));
     }
 
     case Dispatch::kConsumerRpc:

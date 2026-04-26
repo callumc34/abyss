@@ -43,7 +43,8 @@ class RocksdbStore : public core::ColdStore {
   RocksdbStore(RocksdbStore&&) = delete;
   RocksdbStore& operator=(RocksdbStore&&) = delete;
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) override;
+  core::Result<core::RespValue> Exec(
+      const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;

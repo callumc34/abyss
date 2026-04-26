@@ -22,10 +22,15 @@ Pod starts
   │
   ├─ 2. Replay queue to resolver
   │     Resolver rebuilds its recent-writes existence cache from
-  │     Write, Conditional, and Resolved entries.
-  │     No new Resolved entries are emitted — the log already
-  │     contains matching Resolved entries for every Conditional
-  │     from the original run.
+  │     Write, Conditional, and Resolved entries. For every
+  │     Conditional whose matching Resolved is already in the log,
+  │     no new emission happens — the log carries the decision.
+  │     For every Conditional with no matching Resolved (the crash
+  │     happened between Conditional fsync and Resolved fsync), the
+  │     resolver re-decides and emits a fresh Resolved. The decision
+  │     is deterministic given the log state up to the Conditional's
+  │     seq, so the post-recovery outcome is identical to the
+  │     pre-crash decision had the original Resolved fsynced.
   │
   ├─ 3. Replay queue to cold consumer
   │     Cold consumer absorbs entries into compaction buffer,

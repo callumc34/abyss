@@ -55,6 +55,32 @@ bool ColdConsumerPool::IsRunning() const {
   return false;
 }
 
+core::Result<core::RespValue> ColdConsumerPool::Exec(const core::ops::ReadOp& op,
+                                                     std::optional<core::Duration> /*deadline*/) {
+  if (const auto* exists = std::get_if<core::ops::Exists>(&op)) {
+    int64_t total = 0;
+    for (auto key : exists->keys) {
+      auto sub = consumers_[ShardForKey(key)]->Buffer().Exec(
+          core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
+      if (!sub.has_value()) {
+        if (sub.error().code() == core::ErrorCode::kNotFound) continue;
+        return std::unexpected(sub.error());
+      }
+      total += sub->AsInteger();
+    }
+    return core::RespValue::Integer(total);
+  }
+  if (std::holds_alternative<core::ops::MultiStringGet>(op)) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kNotFound, "buffer defers MGET to per-tier composition"));
+  }
+  const auto key = core::ops::PrimaryKey(op);
+  if (key.empty()) {
+    return std::unexpected(core::Error(core::ErrorCode::kInternal, "empty primary key"));
+  }
+  return consumers_[ShardForKey(key)]->Buffer().Exec(op);
+}
+
 core::Result<core::RespValue> ColdConsumerPool::Read(std::string_view key) const {
   const auto shard = ShardForKey(key);
   return consumers_[shard]->Buffer().Read(std::string(key));

@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "abyss/consumer/compaction_buffer.h"
@@ -13,6 +15,8 @@
 #include "abyss/core/cold_store.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
+#include "abyss/core/queue_entry.h"
+#include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/consumer_metrics.h"
 
@@ -31,6 +35,7 @@ class ColdConsumer {
     std::chrono::milliseconds queue_read_timeout{50};
     std::chrono::milliseconds retry_initial_backoff{50};
     std::chrono::milliseconds retry_max_backoff{30000};
+    std::chrono::milliseconds block_and_scan_timeout{1000};
     std::optional<uint64_t> rng_seed = std::nullopt;
   };
 
@@ -97,10 +102,17 @@ class ColdConsumer {
  private:
   void RunLoop();
 
-  bool AbsorbQueueEntry(const core::QueueEntry& entry);
+  void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
+  void HandleConditional(const core::QueueEntry& entry, const core::entry::Conditional& cond);
+  void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
 
-  // On persistent failure (shutdown during retry) entries are Reinserted into
-  // the buffer so the next run replays them from the queue.
+  // Multi-key forms (DEL, MSET) expand into per-key absorbs.
+  bool AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq);
+
+  std::optional<core::SequenceId> OldestPendingConditional() const ABYSS_EXCLUDES(pending_mu_);
+  void CheckBlockAndScanTimeout();
+
+  // Reinserts entries on shutdown-during-retry so the next run replays them.
   bool ApplyBatchWithRetry(std::vector<BufferEntry> entries);
 
   std::vector<core::ops::WriteOp> BuildBatchOps(const std::vector<BufferEntry>& entries,
@@ -127,6 +139,16 @@ class ColdConsumer {
 
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   std::atomic<core::SequenceId> last_ack_seq_{0};
+  bool first_ack_recorded_ = false;
+
+  struct PendingConditional {
+    core::SequenceId seq = 0;
+    std::chrono::steady_clock::time_point received_at;
+  };
+  mutable std::mutex pending_mu_;
+  std::unordered_map<core::SequenceId, PendingConditional> pending_conditionals_
+      ABYSS_GUARDED_BY(pending_mu_);
+  bool block_and_scan_warning_emitted_ = false;
 
   metrics::ConsumerCounters counters_;
   std::atomic<uint64_t> retry_attempts_{0};

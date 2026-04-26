@@ -47,6 +47,8 @@ class ColdConsumerPool : public CompactionBufferRouter {
   ColdConsumerPool(ColdConsumerPool&&) = delete;
   ColdConsumerPool& operator=(ColdConsumerPool&&) = delete;
 
+  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
+                                     std::optional<core::Duration> deadline) override;
   core::Result<core::RespValue> Read(std::string_view key) const override;
 
   void Start();

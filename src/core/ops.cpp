@@ -223,11 +223,55 @@ Result<WriteOp> ParseHdel(const RespCommand& cmd) {
   return WriteOp{HashDel{.key = cmd.args[1], .fields = CollectArgs(cmd, 2)}};
 }
 
+// All four EXPIRE forms collapse to abs_ttl_ms; NX/XX/GT/LT are stripped
+// by the predicate extractor before this runs.
+Result<WriteOp> ParseExpireSeconds(const RespCommand& cmd) {
+  auto secs = ParseUint64(cmd.args[2]);
+  if (!secs.has_value()) return std::unexpected(secs.error());
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = NowWallMs() + (*secs * 1000)}};
+}
+
+Result<WriteOp> ParseExpireMs(const RespCommand& cmd) {
+  auto ms = ParseUint64(cmd.args[2]);
+  if (!ms.has_value()) return std::unexpected(ms.error());
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = NowWallMs() + *ms}};
+}
+
+Result<WriteOp> ParseExpireAt(const RespCommand& cmd) {
+  auto ts = ParseUint64(cmd.args[2]);
+  if (!ts.has_value()) return std::unexpected(ts.error());
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ts * 1000}};
+}
+
+Result<WriteOp> ParsePexpireAt(const RespCommand& cmd) {
+  auto ts = ParseUint64(cmd.args[2]);
+  if (!ts.has_value()) return std::unexpected(ts.error());
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ts}};
+}
+
+Result<WriteOp> ParsePersist(const RespCommand& cmd) {
+  return WriteOp{Persist{.key = cmd.args[1]}};
+}
+
 const std::unordered_map<std::string_view, WriteParserFn>& WriteParsers() {
   static const std::unordered_map<std::string_view, WriteParserFn> table{
-      {"SET", ParseSet},   {"SETEX", ParseSetex}, {"PSETEX", ParsePsetex}, {"MSET", ParseMset},
-      {"DEL", ParseDel},   {"UNLINK", ParseDel},  {"SADD", ParseSadd},     {"SREM", ParseSrem},
-      {"ZADD", ParseZadd}, {"ZREM", ParseZrem},   {"HSET", ParseHset},     {"HDEL", ParseHdel},
+      {"SET", ParseSet},
+      {"SETEX", ParseSetex},
+      {"PSETEX", ParsePsetex},
+      {"MSET", ParseMset},
+      {"DEL", ParseDel},
+      {"UNLINK", ParseDel},
+      {"SADD", ParseSadd},
+      {"SREM", ParseSrem},
+      {"ZADD", ParseZadd},
+      {"ZREM", ParseZrem},
+      {"HSET", ParseHset},
+      {"HDEL", ParseHdel},
+      {"EXPIRE", ParseExpireSeconds},
+      {"PEXPIRE", ParseExpireMs},
+      {"EXPIREAT", ParseExpireAt},
+      {"PEXPIREAT", ParsePexpireAt},
+      {"PERSIST", ParsePersist},
   };
   return table;
 }

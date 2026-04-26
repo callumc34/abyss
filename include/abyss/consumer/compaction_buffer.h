@@ -30,6 +30,10 @@ class CompactionBuffer {
   void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction,
               core::SequenceId seq = 0) ABYSS_EXCLUDES(mutex_);
 
+  // kNotFound signals "fall through to next tier"; tombstones surface as
+  // RespValue::Null so the caller treats a buffered DEL as authoritative.
+  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const ABYSS_EXCLUDES(mutex_);
+
   core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
 
   std::vector<BufferEntry> FlushReady(core::SteadyTime now,

@@ -14,8 +14,8 @@ const log::Logger& Log() {
 }  // namespace
 
 HotConsumerPool::HotConsumerPool(core::Queue& queue, core::HotStore& hot_store,
-                                 core::ConsumerRpc& rpc, Config config,
-                                 const core::EvictionPolicy& eviction_policy) {
+                                 core::ConsumerRpc& rpc, core::ApplyNotifier& apply_notifier,
+                                 Config config, const core::EvictionPolicy& eviction_policy) {
   if (config.shard_count == 0) {
     throw std::invalid_argument("HotConsumerPool requires shard_count >= 1");
   }
@@ -23,8 +23,8 @@ HotConsumerPool::HotConsumerPool(core::Queue& queue, core::HotStore& hot_store,
   for (uint32_t shard = 0; shard < config.shard_count; ++shard) {
     HotConsumer::Config per_shard = config.consumer;
     per_shard.shard = shard;
-    consumers_.push_back(
-        std::make_unique<HotConsumer>(queue, hot_store, rpc, per_shard, eviction_policy));
+    consumers_.push_back(std::make_unique<HotConsumer>(queue, hot_store, rpc, apply_notifier,
+                                                       per_shard, eviction_policy));
   }
 }
 

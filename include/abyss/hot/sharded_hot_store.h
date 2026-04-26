@@ -30,7 +30,8 @@ class ShardedHotStore : public core::HotStore {
   ShardedHotStore(ShardedHotStore&&) = delete;
   ShardedHotStore& operator=(ShardedHotStore&&) = delete;
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) override;
+  core::Result<core::RespValue> Exec(
+      const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
   core::Result<void> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::EvictionTTL eviction) override;

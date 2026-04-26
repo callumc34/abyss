@@ -37,7 +37,8 @@ ShardedHotStore::Shard& ShardedHotStore::ShardFor(std::string_view key) {
   return *shards_[core::ComputeShard(key, config_.shard_count)];
 }
 
-core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op)
+core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op,
+                                                    std::optional<core::Duration> /*deadline*/)
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   return std::visit(
       [this, &op](const auto& o) -> core::Result<core::RespValue> {

@@ -63,6 +63,7 @@ void ColdConsumer::RunLoop() {
     Drain();
     if (stop_requested_.load(std::memory_order_acquire)) break;
     Flush();
+    CheckBlockAndScanTimeout();
   }
   ABYSS_LOG_DEBUG(Log(), "cold consumer stopped", {"shard", static_cast<int64_t>(shard_)},
                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())},
@@ -86,27 +87,60 @@ size_t ColdConsumer::Drain() {
 
   size_t count = 0;
   for (const auto& entry : *result) {
-    if (AbsorbQueueEntry(entry)) ++count;
-    latest_drained_seq_.store(entry.seq, std::memory_order_release);
+    const auto seq = entry.seq;
+    std::visit(
+        [this, &entry, &count](const auto& payload) {
+          using T = std::decay_t<decltype(payload)>;
+          if constexpr (std::is_same_v<T, core::entry::Write>) {
+            HandleWrite(entry, payload);
+            ++count;
+          } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
+            HandleConditional(entry, payload);
+          } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
+            HandleResolved(entry, payload);
+            ++count;
+          }
+        },
+        entry.payload);
+    latest_drained_seq_.store(seq, std::memory_order_release);
   }
   return count;
 }
 
-bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
-  auto extracted = core::entry::ExtractApplicableCommand(entry);
-  if (!extracted.has_value()) {
-    if (extracted.error().code() == core::ErrorCode::kNotFound) return false;
-    // Conditional or other parse-level failure.
+void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
+  if (write.cmd.args.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    return;
   }
-  const core::RespCommand* cmd = *extracted;
-  if (cmd->args.empty()) {
-    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
+  AbsorbResolvedOp(write.cmd, entry.seq);
+}
 
-  auto op = core::ops::ParseWriteOp(cmd->Name(), *cmd);
+void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
+                                     const core::entry::Conditional& /*cond*/) {
+  const auto seq = entry.seq;
+  const std::scoped_lock lock(pending_mu_);
+  pending_conditionals_.emplace(
+      seq, PendingConditional{.seq = seq, .received_at = std::chrono::steady_clock::now()});
+}
+
+void ColdConsumer::HandleResolved(const core::QueueEntry& /*entry*/,
+                                  const core::entry::Resolved& resolved) {
+  {
+    const std::scoped_lock lock(pending_mu_);
+    pending_conditionals_.erase(resolved.ref);
+  }
+  if (resolved.decision != core::Decision::kApply) return;
+  for (const auto& cmd : resolved.materialised_ops) {
+    if (cmd.args.empty()) {
+      counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    AbsorbResolvedOp(cmd, resolved.ref);
+  }
+}
+
+bool ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq) {
+  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -118,7 +152,7 @@ bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
       const std::string key_str(key);
       auto eviction = eviction_policy_.Resolve(key_str);
       core::ops::Del single{.keys = {key}};
-      buffer_.Absorb(key_str, core::ops::WriteOp{single}, eviction, entry.seq);
+      buffer_.Absorb(key_str, core::ops::WriteOp{single}, eviction, seq);
     }
     return !del->keys.empty();
   }
@@ -128,7 +162,7 @@ bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
       const std::string key_str(kv.key);
       auto eviction = eviction_policy_.Resolve(key_str);
       core::ops::StringSet single{.key = kv.key, .value = kv.value, .abs_ttl_ms = 0};
-      buffer_.Absorb(key_str, core::ops::WriteOp{single}, eviction, entry.seq);
+      buffer_.Absorb(key_str, core::ops::WriteOp{single}, eviction, seq);
     }
     return !mset->entries.empty();
   }
@@ -141,8 +175,46 @@ bool ColdConsumer::AbsorbQueueEntry(const core::QueueEntry& entry) {
 
   const std::string key_str(key);
   auto eviction = eviction_policy_.Resolve(key_str);
-  buffer_.Absorb(key_str, *op, eviction, entry.seq);
+  buffer_.Absorb(key_str, *op, eviction, seq);
   return true;
+}
+
+std::optional<core::SequenceId> ColdConsumer::OldestPendingConditional() const {
+  const std::scoped_lock lock(pending_mu_);
+  if (pending_conditionals_.empty()) return std::nullopt;
+  core::SequenceId oldest = std::numeric_limits<core::SequenceId>::max();
+  for (const auto& [seq, _] : pending_conditionals_) {
+    oldest = std::min(oldest, seq);
+  }
+  return oldest;
+}
+
+void ColdConsumer::CheckBlockAndScanTimeout() {
+  std::chrono::steady_clock::time_point oldest{};
+  bool have_pending = false;
+  {
+    const std::scoped_lock lock(pending_mu_);
+    for (const auto& [_, pending] : pending_conditionals_) {
+      if (!have_pending || pending.received_at < oldest) {
+        oldest = pending.received_at;
+        have_pending = true;
+      }
+    }
+  }
+  if (!have_pending) {
+    block_and_scan_warning_emitted_ = false;
+    return;
+  }
+  const auto age = std::chrono::steady_clock::now() - oldest;
+  if (age >= config_.block_and_scan_timeout && !block_and_scan_warning_emitted_) {
+    ABYSS_LOG_WARN(
+        Log(), "cold consumer block-and-scan timeout; resolver may be stuck",
+        {"shard", static_cast<int64_t>(shard_)},
+        {"oldest_age_ms",
+         static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(age).count())});
+    block_and_scan_warning_emitted_ = true;
+    counters_.block_and_scan_timeouts.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 bool ColdConsumer::Flush() {
@@ -328,17 +400,22 @@ void ColdConsumer::UpdateMode(size_t current_bytes) {
 }
 
 void ColdConsumer::TryAdvanceAck() {
-  const auto oldest = buffer_.OldestPendingSeq();
+  const auto oldest_unflushed = buffer_.OldestPendingSeq();
+  const auto oldest_pending_cond = OldestPendingConditional();
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
 
   core::SequenceId target = drained;
-  if (oldest.has_value() && *oldest > 0) {
-    target = std::min(target, *oldest - 1);
+  if (oldest_unflushed.has_value() && *oldest_unflushed > 0) {
+    target = std::min(target, *oldest_unflushed - 1);
+  }
+  if (oldest_pending_cond.has_value() && *oldest_pending_cond > 0) {
+    target = std::min(target, *oldest_pending_cond - 1);
   }
 
   const auto last_ack = last_ack_seq_.load(std::memory_order_acquire);
-  if (target <= last_ack) return;
-  if (target == 0) return;
+  // The first queue entry has seq=0; without first_ack_recorded_ the initial
+  // last_ack=0 is indistinguishable from "we already acked 0".
+  if (first_ack_recorded_ && target <= last_ack) return;
 
   auto ack = queue_.Ack(core::kColdConsumer, shard_, target);
   if (!ack.has_value()) {
@@ -347,6 +424,7 @@ void ColdConsumer::TryAdvanceAck() {
   }
 
   last_ack_seq_.store(target, std::memory_order_release);
+  first_ack_recorded_ = true;
 }
 
 ColdConsumer::Metrics ColdConsumer::Snapshot() const {

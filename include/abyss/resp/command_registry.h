@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "abyss/core/resp_types.h"
+#include "abyss/resp/predicate_extractor.h"
 
 namespace abyss::resp {
 
@@ -59,6 +60,9 @@ struct CommandSpec {
   CommandDocs docs{};
 
   std::span<const SubcommandSpec> subcommands{};
+
+  // nullptr if the command is never conditional. See ADP-011.
+  PredicateExtractor predicate = nullptr;
 };
 
 // `subcommand` is null when the parent applies directly.

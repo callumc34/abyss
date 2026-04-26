@@ -11,6 +11,7 @@ struct ConsumerCounters {
   std::atomic<uint64_t> apply_failures{0};
   std::atomic<uint64_t> queue_read_failures{0};
   std::atomic<uint64_t> ack_failures{0};
+  std::atomic<uint64_t> block_and_scan_timeouts{0};
 };
 
 struct ConsumerSnapshot {
@@ -19,6 +20,7 @@ struct ConsumerSnapshot {
   uint64_t apply_failures = 0;
   uint64_t queue_read_failures = 0;
   uint64_t ack_failures = 0;
+  uint64_t block_and_scan_timeouts = 0;
 };
 
 inline ConsumerSnapshot SnapshotOf(const ConsumerCounters& c) noexcept {
@@ -28,6 +30,7 @@ inline ConsumerSnapshot SnapshotOf(const ConsumerCounters& c) noexcept {
       .apply_failures = c.apply_failures.load(std::memory_order_relaxed),
       .queue_read_failures = c.queue_read_failures.load(std::memory_order_relaxed),
       .ack_failures = c.ack_failures.load(std::memory_order_relaxed),
+      .block_and_scan_timeouts = c.block_and_scan_timeouts.load(std::memory_order_relaxed),
   };
 }
 

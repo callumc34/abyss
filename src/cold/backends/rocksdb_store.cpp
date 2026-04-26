@@ -183,25 +183,41 @@ struct RocksdbStore::Impl {
 
   // --- Dispatch ------------------------------------------------------------
 
-  core::Result<RespValue> Exec(const core::ops::ReadOp& op) const;
+  core::Result<RespValue> Exec(const core::ops::ReadOp& op,
+                               std::optional<core::Duration> deadline) const;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) const;
   core::Result<RespValue> ExecDel(const core::ops::Del& op) const;
 
   // --- Read handlers -------------------------------------------------------
 
-  // Read handlers are const: they may trigger inline lazy-delete writes via
-  // `db` directly, which mutate the underlying RocksDB state but not `*this`.
-  core::Result<RespValue> Handle(const core::ops::StringGet& op) const;
-  core::Result<RespValue> Handle(const core::ops::SetIsMember& op) const;
-  core::Result<RespValue> Handle(const core::ops::SetMembers& op) const;
-  core::Result<RespValue> Handle(const core::ops::SetCard& op) const;
-  core::Result<RespValue> Handle(const core::ops::ZsetScore& op) const;
-  core::Result<RespValue> Handle(const core::ops::ZsetCard& op) const;
-  core::Result<RespValue> Handle(const core::ops::ZsetRange& op) const;
-  core::Result<RespValue> Handle(const core::ops::HashGet& op) const;
-  core::Result<RespValue> Handle(const core::ops::HashGetAll& op) const;
-  core::Result<RespValue> Handle(const core::ops::Exists& op) const;
-  core::Result<RespValue> Handle(const core::ops::MultiStringGet& op) const;
+  // const handlers may emit inline lazy-deletes through `db`. `deadline`
+  // propagates into rocksdb::ReadOptions::deadline.
+  core::Result<RespValue> Handle(const core::ops::StringGet& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::SetIsMember& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::SetMembers& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::SetCard& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::ZsetScore& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::ZsetCard& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::ZsetRange& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashGet& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashGetAll& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::Exists& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::MultiStringGet& op,
+                                 std::optional<core::Duration> deadline) const;
+
+  // Builds a rocksdb::ReadOptions with `.deadline` set when `deadline` is
+  // present. `deadline` is interpreted as a relative duration from now.
+  rocksdb::ReadOptions MakeReadOptions(std::optional<core::Duration> deadline) const;
 
   // --- Write handlers (all take the shared WBWI) --------------------------
 
@@ -217,6 +233,8 @@ struct RocksdbStore::Impl {
   core::Result<void> Apply(const core::ops::HashDel& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::MultiStringSet& op,
                            rocksdb::WriteBatchWithIndex& wb) const;
+  core::Result<void> Apply(const core::ops::Expire& op, rocksdb::WriteBatchWithIndex& wb) const;
+  core::Result<void> Apply(const core::ops::Persist& op, rocksdb::WriteBatchWithIndex& wb) const;
 
   // --- Shared helpers ------------------------------------------------------
 
@@ -324,7 +342,10 @@ RocksdbStore::~RocksdbStore() = default;
 
 // --- Public ColdStore forwards ---------------------------------------------
 
-core::Result<RespValue> RocksdbStore::Exec(const core::ops::ReadOp& op) { return impl_->Exec(op); }
+core::Result<RespValue> RocksdbStore::Exec(const core::ops::ReadOp& op,
+                                           std::optional<core::Duration> deadline) {
+  return impl_->Exec(op, deadline);
+}
 
 core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
   return impl_->ApplyBatch(ops);
@@ -401,8 +422,27 @@ core::Result<std::optional<core::RespCommand>> RocksdbStore::GetPromotionCommand
 
 // --- Dispatch ---------------------------------------------------------------
 
-core::Result<RespValue> RocksdbStore::Impl::Exec(const core::ops::ReadOp& op) const {
-  return std::visit([this](const auto& o) { return this->Handle(o); }, op);
+core::Result<RespValue> RocksdbStore::Impl::Exec(const core::ops::ReadOp& op,
+                                                 std::optional<core::Duration> deadline) const {
+  if (deadline.has_value() && *deadline <= core::Duration::zero()) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kTimeout, "cold read deadline already elapsed"));
+  }
+  return std::visit([this, &deadline](const auto& o) { return this->Handle(o, deadline); }, op);
+}
+
+rocksdb::ReadOptions RocksdbStore::Impl::MakeReadOptions(
+    std::optional<core::Duration> deadline) const {
+  rocksdb::ReadOptions opts;
+  if (deadline.has_value()) {
+    // RocksDB compares `deadline` against SystemClock::NowMicros(); set it to
+    // the absolute wall-clock microsecond at which this read should abort.
+    const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch());
+    const auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(*deadline);
+    opts.deadline = now_us + delta_us;
+  }
+  return opts;
 }
 
 core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::WriteOp> ops) const {
@@ -420,10 +460,11 @@ core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::Wri
 
 // --- Read handlers ----------------------------------------------------------
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::StringGet& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::StringGet& op,
+                                                   std::optional<core::Duration> deadline) const {
   const auto encoded_key = fmt::EncodeStringKey(op.key);
   std::string raw;
-  auto status = db->Get(rocksdb::ReadOptions(), default_cf.get(), encoded_key, &raw);
+  auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded_key, &raw);
   if (status.IsNotFound()) return RespValue::Null();
   if (!status.ok()) return std::unexpected(FromStatus(status, "GET"));
 
@@ -438,20 +479,22 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::StringGet& o
   return RespValue::BulkString(std::string(decoded->payload));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetIsMember& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetIsMember& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Integer(0);
 
   const auto encoded = fmt::EncodeSetMemberKey(op.key, op.member);
   std::string raw;
-  auto status = db->Get(rocksdb::ReadOptions(), default_cf.get(), encoded, &raw);
+  auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Integer(0);
   if (!status.ok()) return std::unexpected(FromStatus(status, "SISMEMBER"));
   return RespValue::Integer(1);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetMembers& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::SetMembers& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -469,21 +512,23 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetMembers& 
   return RespValue::Array(std::move(members));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetCard& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::SetCard& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Integer(0);
   return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetScore& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetScore& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Null();
 
   const auto encoded = fmt::EncodeZsetMemberKey(op.key, op.member);
   std::string raw;
-  auto status = db->Get(rocksdb::ReadOptions(), default_cf.get(), encoded, &raw);
+  auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Null();
   if (!status.ok()) return std::unexpected(FromStatus(status, "ZSCORE"));
 
@@ -492,14 +537,16 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetScore& o
   return RespValue::BulkString(core::FormatRespDouble(*score));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetCard& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::ZsetCard& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Integer(0);
   return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetRange& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::ZsetRange& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -614,20 +661,22 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetRange& o
   return RespValue::Array(std::move(out));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGet& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGet& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Null();
 
   const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field);
   std::string raw;
-  auto status = db->Get(rocksdb::ReadOptions(), default_cf.get(), encoded, &raw);
+  auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Null();
   if (!status.ok()) return std::unexpected(FromStatus(status, "HGET"));
   return RespValue::BulkString(std::move(raw));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGetAll& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::HashGetAll& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -646,7 +695,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGetAll& 
   return RespValue::Array(std::move(pairs));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::Exists& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::Exists& op, std::optional<core::Duration> /*deadline*/) const {
   int64_t count = 0;
   for (auto key : op.keys) {
     auto r = AnyLiveRecord(key);
@@ -656,11 +706,12 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::Exists& op) 
   return RespValue::Integer(count);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::MultiStringGet& op) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::MultiStringGet& op,
+                                                   std::optional<core::Duration> deadline) const {
   std::vector<RespValue> out;
   out.reserve(op.keys.size());
   for (auto key : op.keys) {
-    auto r = Handle(core::ops::StringGet{.key = key});
+    auto r = Handle(core::ops::StringGet{.key = key}, deadline);
     if (!r.has_value()) return std::unexpected(r.error());
     out.push_back(std::move(*r));
   }
@@ -873,6 +924,65 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::MultiStringSet& op
     if (!r.has_value()) return r;
   }
   return {};
+}
+
+namespace {
+
+// Predicate (NX/XX/GT/LT) was resolved upstream; this just rewrites flags+TTL.
+core::Result<void> ApplyTtlChange(rocksdb::WriteBatchWithIndex& wb, rocksdb::DB& db,
+                                  rocksdb::ColumnFamilyHandle& cf, std::string_view key,
+                                  uint8_t new_flags, uint64_t new_abs_ttl_ms) {
+  const auto string_key = fmt::EncodeStringKey(key);
+  std::string raw;
+  auto s = wb.GetFromBatchAndDB(&db, rocksdb::ReadOptions(), &cf, string_key, &raw);
+  if (s.ok()) {
+    auto decoded = fmt::DecodeStringValue(raw);
+    if (!decoded.has_value()) return std::unexpected(decoded.error());
+    const auto encoded = fmt::EncodeStringValue({
+        .flags = new_flags,
+        .abs_ttl_ms = new_abs_ttl_ms,
+        .payload = decoded->payload,
+    });
+    auto put = wb.Put(&cf, string_key, encoded);
+    if (!put.ok()) return std::unexpected(FromStatus(put, "EXPIRE/PERSIST string"));
+    return {};
+  }
+  if (!s.IsNotFound()) {
+    return std::unexpected(FromStatus(s, "EXPIRE/PERSIST string existence"));
+  }
+
+  for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
+    const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+    std::string meta_raw;
+    auto ms = wb.GetFromBatchAndDB(&db, rocksdb::ReadOptions(), &cf, meta_key, &meta_raw);
+    if (ms.IsNotFound()) continue;
+    if (!ms.ok()) return std::unexpected(FromStatus(ms, "EXPIRE/PERSIST meta existence"));
+    auto decoded = fmt::DecodeMetaValue(meta_raw);
+    if (!decoded.has_value()) return std::unexpected(decoded.error());
+    const auto encoded = fmt::EncodeMetaValue({
+        .flags = new_flags,
+        .abs_ttl_ms = new_abs_ttl_ms,
+        .cardinality = decoded->cardinality,
+    });
+    auto put = wb.Put(&cf, meta_key, encoded);
+    if (!put.ok()) return std::unexpected(FromStatus(put, "EXPIRE/PERSIST meta"));
+    return {};
+  }
+
+  // Key may have been concurrently evicted; no-op is safe.
+  return {};
+}
+
+}  // namespace
+
+core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Expire& op,
+                                             rocksdb::WriteBatchWithIndex& wb) const {
+  return ApplyTtlChange(wb, *db, *default_cf, op.key, fmt::kFlagHasTtl, op.abs_ttl_ms);
+}
+
+core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Persist& op,
+                                             rocksdb::WriteBatchWithIndex& wb) const {
+  return ApplyTtlChange(wb, *db, *default_cf, op.key, /*new_flags=*/0, /*new_abs_ttl_ms=*/0);
 }
 
 // --- DEL --------------------------------------------------------------------

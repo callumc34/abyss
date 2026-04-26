@@ -4,6 +4,7 @@
 
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace abyss::core::entry {
@@ -25,47 +26,57 @@ QueueEntry MakeConditionalEntry() {
   };
 }
 
-QueueEntry MakeResolvedEntry(Decision decision, std::optional<RespCommand> materialised) {
+QueueEntry MakeResolvedEntry(Decision decision, std::vector<RespCommand> materialised_ops) {
   return QueueEntry{
       .seq = 1,
       .appended_at = WallClock::now(),
-      .payload = entry::Resolved{.decision = decision, .materialised_op = std::move(materialised)},
+      .payload =
+          entry::Resolved{.decision = decision, .materialised_ops = std::move(materialised_ops)},
   };
 }
 
-TEST(ExtractApplicableCommand, WriteReturnsCmd) {
+TEST(QueueEntryVariant, WriteCarriesCommand) {
   auto e = MakeWriteEntry({"SET", "k", "v"});
-  auto r = ExtractApplicableCommand(e);
-  ASSERT_TRUE(r.has_value());
-  EXPECT_EQ((*r)->args.front(), "SET");
+  ASSERT_TRUE(std::holds_alternative<Write>(e.payload));
+  const auto& w = std::get<Write>(e.payload);
+  EXPECT_EQ(w.cmd.args.front(), "SET");
 }
 
-TEST(ExtractApplicableCommand, ConditionalReturnsInvalidArgument) {
+TEST(QueueEntryVariant, ConditionalCarriesCommandAndFlags) {
   auto e = MakeConditionalEntry();
-  auto r = ExtractApplicableCommand(e);
-  ASSERT_FALSE(r.has_value());
-  EXPECT_EQ(r.error().code(), ErrorCode::kInvalidArgument);
+  ASSERT_TRUE(std::holds_alternative<Conditional>(e.payload));
+  const auto& c = std::get<Conditional>(e.payload);
+  EXPECT_EQ(c.cmd.args.front(), "SET");
+  EXPECT_EQ(c.flags, PredicateFlags::kNone);
 }
 
-TEST(ExtractApplicableCommand, ResolvedApplyWithMaterialisedReturnsCmd) {
-  auto e = MakeResolvedEntry(Decision::kApply, RespCommand{.args = {"SET", "k", "v"}});
-  auto r = ExtractApplicableCommand(e);
-  ASSERT_TRUE(r.has_value());
-  EXPECT_EQ((*r)->args.front(), "SET");
+TEST(QueueEntryVariant, ResolvedApplyCarriesMaterialisedOps) {
+  auto e = MakeResolvedEntry(Decision::kApply, {RespCommand{.args = {"SET", "k", "v"}}});
+  ASSERT_TRUE(std::holds_alternative<Resolved>(e.payload));
+  const auto& r = std::get<Resolved>(e.payload);
+  EXPECT_EQ(r.decision, Decision::kApply);
+  ASSERT_EQ(r.materialised_ops.size(), 1U);
+  EXPECT_EQ(r.materialised_ops[0].args.front(), "SET");
 }
 
-TEST(ExtractApplicableCommand, ResolvedApplyWithoutMaterialisedReturnsNotFound) {
-  auto e = MakeResolvedEntry(Decision::kApply, std::nullopt);
-  auto r = ExtractApplicableCommand(e);
-  ASSERT_FALSE(r.has_value());
-  EXPECT_EQ(r.error().code(), ErrorCode::kNotFound);
+TEST(QueueEntryVariant, ResolvedSkipHasEmptyMaterialisedOps) {
+  auto e = MakeResolvedEntry(Decision::kSkip, {});
+  ASSERT_TRUE(std::holds_alternative<Resolved>(e.payload));
+  const auto& r = std::get<Resolved>(e.payload);
+  EXPECT_EQ(r.decision, Decision::kSkip);
+  EXPECT_TRUE(r.materialised_ops.empty());
 }
 
-TEST(ExtractApplicableCommand, ResolvedSkipReturnsNotFound) {
-  auto e = MakeResolvedEntry(Decision::kSkip, std::nullopt);
-  auto r = ExtractApplicableCommand(e);
-  ASSERT_FALSE(r.has_value());
-  EXPECT_EQ(r.error().code(), ErrorCode::kNotFound);
+TEST(QueueEntryVariant, ResolvedSupportsMultipleMaterialisedOps) {
+  auto e = MakeResolvedEntry(
+      Decision::kApply,
+      {RespCommand{.args = {"DEL", "src"}}, RespCommand{.args = {"SET", "dst", "v"}},
+       RespCommand{.args = {"PEXPIREAT", "dst", "1700000000000"}}});
+  const auto& r = std::get<Resolved>(e.payload);
+  EXPECT_EQ(r.materialised_ops.size(), 3U);
+  EXPECT_EQ(r.materialised_ops[0].args[0], "DEL");
+  EXPECT_EQ(r.materialised_ops[1].args[0], "SET");
+  EXPECT_EQ(r.materialised_ops[2].args[0], "PEXPIREAT");
 }
 
 }  // namespace

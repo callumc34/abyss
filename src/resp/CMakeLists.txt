@@ -2,6 +2,7 @@ add_library(abyss_resp
   parser.cpp
   serializer.cpp
   command_registry.cpp
+  predicate_extractor.cpp
   request_pipeline.cpp
   metrics.cpp
   node_identity.cpp

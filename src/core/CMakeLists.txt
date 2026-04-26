@@ -2,9 +2,9 @@ add_library(abyss_core
   resp_types.cpp
   resp_format.cpp
   consumer_rpc.cpp
+  apply_notifier.cpp
   ops.cpp
   eviction_policy.cpp
-  queue_entry.cpp
   shard_router.cpp
   slot.cpp
   atomic_file.cpp
