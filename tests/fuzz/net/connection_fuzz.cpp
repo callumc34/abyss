@@ -1,6 +1,10 @@
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>

@@ -76,7 +76,9 @@ core::Result<File> Open(const std::filesystem::path& path, OpenOptions opts) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
   const int fd = ::open(path.c_str(), flags, 0644);
   if (fd < 0) {
-    const auto code = (errno == ENOENT) ? core::ErrorCode::kNotFound : core::ErrorCode::kInternal;
+    const auto code = (errno == ENOENT)   ? core::ErrorCode::kNotFound
+                      : (errno == EEXIST) ? core::ErrorCode::kAlreadyExists
+                                          : core::ErrorCode::kInternal;
     return std::unexpected(MakeErrno(code, "open"));
   }
   return File{fd};

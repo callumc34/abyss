@@ -5,6 +5,7 @@
 #include <string>
 
 #include "abyss/net/tcp_server.h"
+#include "abyss/platform/net.h"
 #include "abyss/resp/command_registry.h"
 #include "integration_harness.h"
 #include "sync_redis_client.h"
@@ -15,6 +16,9 @@ namespace {
 class TcpServerSmokeTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Initialize Windows sockets on Windows
+    ASSERT_TRUE(abyss::platform::net::Init().has_value());
+
     TcpServerConfig cfg;
     cfg.bind = "127.0.0.1";
     cfg.port = 0;

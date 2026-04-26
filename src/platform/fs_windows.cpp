@@ -75,8 +75,9 @@ core::Result<File> Open(const std::filesystem::path& path, OpenOptions opts) {
     const DWORD err = ::GetLastError();
     const auto code = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
                           ? core::ErrorCode::kNotFound
-                      : (err == ERROR_FILE_EXISTS) ? core::ErrorCode::kAlreadyExists
-                                                   : core::ErrorCode::kInternal;
+                      : (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)
+                          ? core::ErrorCode::kAlreadyExists
+                          : core::ErrorCode::kInternal;
     ::SetLastError(err);
     return std::unexpected(MakeWin32Error(code, "CreateFile"));
   }

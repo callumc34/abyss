@@ -233,7 +233,7 @@ bool TestServer::WaitForReady() {
     }
 
     DWORD nread = 0;
-    const DWORD to_read = static_cast<DWORD>(std::min<DWORD>(bytes_avail, chunk.size()));
+    const DWORD to_read = static_cast<DWORD>(std::min<size_t>(bytes_avail, chunk.size()));
     if (!ReadFile(ready_read_, chunk.data(), to_read, &nread, nullptr)) {
       skip_reason_ = "ReadFile failed: " + std::to_string(GetLastError());
       return false;

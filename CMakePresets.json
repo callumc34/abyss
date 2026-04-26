@@ -13,12 +13,10 @@
     },
     {
       "name": "release",
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_BUILD_TESTS": "OFF",
-        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
+        "ABYSS_BUILD_TESTS": "OFF"
       }
     },
     {
@@ -70,31 +68,22 @@
         "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
         "CMAKE_EXE_LINKER_FLAGS": "-static-libstdc++ -static-libgcc"
       }
-    },
+},
     {
-      "name": "windows-default",
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "name": "windows",
+      "inherits": "default",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       },
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "ABYSS_BUILD_TESTS": "ON",
-        "VCPKG_MANIFEST_FEATURES": "builtin-cold",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS": "/EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATION",
+        "CMAKE_C_FLAGS": "/EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATION",
         "VCPKG_TARGET_TRIPLET": "x64-windows-static-release",
         "VCPKG_HOST_TRIPLET": "x64-windows-static-release",
-        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets"
-      }
-    },
-    {
-      "name": "windows-release",
-      "inherits": "windows-default",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_BUILD_TESTS": "OFF"
+"VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets"
       }
     }
   ],
@@ -110,33 +99,29 @@
     {
       "name": "asan",
       "configurePreset": "asan"
-    },
-    {
-      "name": "tsan",
-      "configurePreset": "tsan"
-    },
-    {
-      "name": "bench",
-      "configurePreset": "bench"
-    },
-    {
-      "name": "cloud-only",
-      "configurePreset": "cloud-only"
-    },
-    {
-      "name": "container",
-      "configurePreset": "container"
-    },
-    {
-      "name": "windows-default",
-      "configurePreset": "windows-default"
-    },
-    {
-      "name": "windows-release",
-      "configurePreset": "windows-release"
-    }
-  ],
-  "testPresets": [
+},
+      {
+        "name": "tsan",
+        "configurePreset": "tsan"
+      },
+      {
+        "name": "bench",
+        "configurePreset": "bench"
+      },
+      {
+        "name": "cloud-only",
+        "configurePreset": "cloud-only"
+      },
+      {
+        "name": "container",
+        "configurePreset": "container"
+      },
+      {
+        "name": "windows",
+        "configurePreset": "windows"
+      }
+    ],
+    "testPresets": [
     {
       "name": "default",
       "configurePreset": "default",
@@ -191,8 +176,8 @@
       }
     },
     {
-      "name": "windows-default",
-      "configurePreset": "windows-default",
+      "name": "windows",
+      "configurePreset": "windows",
       "output": {
         "outputOnFailure": true
       },

@@ -17,6 +17,7 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/platform/fs.h"
 #include "mock_queue.h"
 #include "test_clock.h"
 
@@ -28,7 +29,8 @@ class IntegrationHarness {
   static constexpr size_t kHotMemory = 4UL * 1024UL * 1024UL;
 
   IntegrationHarness() {
-    tmp_dir_ = std::filesystem::temp_directory_path() / ("abyss_test_" + std::to_string(getpid()));
+    tmp_dir_ = std::filesystem::temp_directory_path() /
+               ("abyss_test_" + std::to_string(abyss::platform::fs::ProcessId()));
     std::filesystem::create_directories(tmp_dir_);
 
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{

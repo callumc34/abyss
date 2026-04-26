@@ -255,14 +255,14 @@ core::Result<void> ValidatePortCollisions(const Config& c) {
       {c.metrics.port, "metrics.port"},
       {c.admin.port, "admin.port"},
   }};
-  for (const auto* lhs = ports.begin(); lhs != ports.end(); ++lhs) {
-    if (lhs->first == 0) continue;  // ephemeral; resolved at bind time
-    for (const auto* rhs = std::next(lhs); rhs != ports.end(); ++rhs) {
-      if (lhs->first == rhs->first) {
+  for (auto lhs_it = ports.begin(); lhs_it != ports.end(); ++lhs_it) {
+    if (lhs_it->first == 0) continue;  // ephemeral; resolved at bind time
+    for (auto rhs_it = std::next(lhs_it); rhs_it != ports.end(); ++rhs_it) {
+      if (lhs_it->first == rhs_it->first) {
         std::string msg = "collides with ";
-        msg += rhs->second;
+        msg += rhs_it->second;
         msg += " (both bound to the same port)";
-        return std::unexpected(InvalidArg(std::string(lhs->second), msg));
+        return std::unexpected(InvalidArg(std::string(lhs_it->second), msg));
       }
     }
   }

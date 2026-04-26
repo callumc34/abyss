@@ -1,13 +1,34 @@
 #include "segment.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <io.h>
+#include <windows.h>
+#include <winsock2.h>
+
+#include "abyss/platform/fs.h"
+
+#ifdef _O_RDWR
+#undef _O_RDWR
+#endif
+#define _O_RDWR 0x0002
+
+#ifndef O_RDWR
+#define O_RDWR _O_RDWR
+#endif
+
+#else
 #include <fcntl.h>
-#include <gtest/gtest.h>
 #include <unistd.h>
+#endif
+
+#include <gtest/gtest.h>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -15,6 +36,35 @@
 #include "abyss/core/types.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
+#include "temp_dir.h"
+
+#ifdef _WIN32
+#ifndef O_RDWR
+#define O_RDWR _O_RDWR
+#endif
+
+inline int truncate(const char* path, long length) {
+  int fd = _open(path, 0x0002);  // _O_RDWR
+  if (fd < 0) return -1;
+  return _chsize_s(fd, length);
+}
+inline int stat(const char* path, struct _stat* st) { return _stat(path, st); }
+inline int open(const char* path, int flags) { return _open(path, flags); }
+inline int pread(int fd, void* buf, unsigned int count, long offset) {
+  long pos = _lseek(fd, 0, SEEK_CUR);
+  _lseek(fd, offset, SEEK_SET);
+  int bytes_read = _read(fd, buf, count);
+  _lseek(fd, pos, SEEK_SET);
+  return bytes_read;
+}
+inline int pwrite(int fd, const void* buf, unsigned int count, long offset) {
+  long pos = _lseek(fd, 0, SEEK_CUR);
+  _lseek(fd, offset, SEEK_SET);
+  int written = _write(fd, buf, count);
+  _lseek(fd, pos, SEEK_SET);
+  return written;
+}
+#endif
 
 namespace abyss::queue {
 namespace {
@@ -31,20 +81,25 @@ core::Result<size_t> AppendSingle(Segment& seg, const core::QueueEntry& entry) {
 class SegmentTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto tmpl = std::filesystem::temp_directory_path() / "abyss_seg_XXXXXX";
-    std::string s = tmpl.string();
-    ASSERT_NE(::mkdtemp(s.data()), nullptr);
-    tmp_dir_ = s;
-  }
-
-  void TearDown() override {
-    if (!tmp_dir_.empty()) {
-      std::filesystem::remove_all(tmp_dir_);
+    dir_ = std::make_unique<testing::TempDir>("segment");
+    tmp_dir_ = dir_->String();
+    if (!std::filesystem::exists(tmp_dir_)) {
+      throw std::runtime_error("TempDir did not create directory: " + tmp_dir_);
     }
   }
 
+  // Helper to ensure path is accessible on Windows after TempDir creation
   std::string SegPath(const std::string& name = "test.wal") const {
-    return (std::filesystem::path(tmp_dir_) / name).string();
+    auto path = std::filesystem::path(tmp_dir_) / name;
+
+#ifdef _WIN32
+    // Force Windows to see the directory
+    auto parent = std::filesystem::path(tmp_dir_);
+    DWORD attr = GetFileAttributesW(parent.c_str());
+    (void)attr;
+#endif
+
+    return path.string();
   }
 
   static SegmentHeader MakeHeader(core::SequenceId base_seq = 0, core::ShardId shard = 0) {
@@ -104,11 +159,13 @@ class SegmentTest : public ::testing::Test {
   }
 
   std::string tmp_dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
+  std::unique_ptr<testing::TempDir>
+      dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
 TEST_F(SegmentTest, CreateAndReadBack) {
   auto seg = Segment::Create(SegPath(), MakeHeader(100), kDefaultMaxSize);
-  ASSERT_TRUE(seg.has_value());
+  ASSERT_TRUE(seg.has_value()) << seg.error().message();
 
   EXPECT_EQ(seg->base_seq(), 100U);
   EXPECT_EQ(seg->next_seq(), 100U);
@@ -251,7 +308,11 @@ TEST_F(SegmentTest, TornTail_CrcMismatch) {
 
   // Corrupt a byte in the second entry's body.
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
+#ifdef _WIN32
+  int fd = _open(path.c_str(), O_RDWR);
+#else
   int fd = ::open(path.c_str(), O_RDWR);
+#endif
   ASSERT_GE(fd, 0);
   uint8_t byte = 0;
   ASSERT_EQ(::pread(fd, &byte, 1, static_cast<off_t>(good_offset + 5)), 1);
@@ -548,7 +609,7 @@ TEST_F(SegmentTest, CreateFailsIfFileExists) {
 
   auto seg2 = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
   ASSERT_FALSE(seg2.has_value());
-  EXPECT_EQ(seg2.error().code(), core::ErrorCode::kInternal);
+  EXPECT_EQ(seg2.error().code(), core::ErrorCode::kAlreadyExists);
 }
 
 TEST_F(SegmentTest, ReadEntriesFromWithBaseSeq) {

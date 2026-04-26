@@ -19,6 +19,7 @@ set(ABYSS_GCC_CLANG_WARNINGS
 set(ABYSS_MSVC_WARNINGS
   /W4
   /permissive-
+  /Zc:preprocessor
 )
 
 target_compile_options(abyss_compiler_options INTERFACE

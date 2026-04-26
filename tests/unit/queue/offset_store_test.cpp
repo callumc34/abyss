@@ -1,8 +1,15 @@
 #include "abyss/queue/offset_store.h"
 
+#ifdef _WIN32
+#include <process.h>
+
+#include "abyss/platform/fs.h"
+#else
 #include <fcntl.h>
-#include <gtest/gtest.h>
 #include <unistd.h>
+#endif
+
+#include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -15,6 +22,7 @@
 
 #include "abyss/queue/file_offset_store.h"
 #include "abyss/queue/memory_offset_store.h"
+#include "temp_dir.h"
 
 namespace abyss::queue {
 namespace {
@@ -22,10 +30,8 @@ namespace {
 class OffsetStoreTest : public ::testing::TestWithParam<std::string> {
  protected:
   void SetUp() override {
-    auto tmpl = std::filesystem::temp_directory_path() / "abyss_offset_XXXXXX";
-    std::string s = tmpl.string();
-    ASSERT_NE(::mkdtemp(s.data()), nullptr);
-    tmp_dir_ = s;
+    testing::TempDir dir("offset");
+    tmp_dir_ = dir.String();
   }
 
   void TearDown() override {
@@ -98,10 +104,8 @@ INSTANTIATE_TEST_SUITE_P(Impls, OffsetStoreTest, ::testing::Values("memory", "fi
 class FileOffsetStoreTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto tmpl = std::filesystem::temp_directory_path() / "abyss_file_offsets_XXXXXX";
-    std::string s = tmpl.string();
-    ASSERT_NE(::mkdtemp(s.data()), nullptr);
-    tmp_dir_ = s;
+    testing::TempDir dir("file_offsets");
+    tmp_dir_ = dir.String();
   }
 
   void TearDown() override {
@@ -177,14 +181,17 @@ TEST_F(FileOffsetStoreTest, CrcMismatchDetected) {
 
   // Flip a byte in the seq field (offset 16).
   const auto path = ShardFilePath(0, 0);
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,cppcoreguidelines-init-variables)
-  const int fd = ::open(path.c_str(), O_RDWR);
-  ASSERT_GE(fd, 0);
-  uint8_t byte = 0;
-  ASSERT_EQ(::pread(fd, &byte, 1, 16), 1);
-  byte ^= 0x01;
-  ASSERT_EQ(::pwrite(fd, &byte, 1, 16), 1);
-  ::close(fd);
+  {
+    auto f = abyss::platform::fs::Open(path, {.mode = abyss::platform::fs::OpenMode::kReadWrite});
+    ASSERT_TRUE(f.has_value());
+    uint8_t byte = 0;
+    auto r = abyss::platform::fs::Pread(*f, &byte, 1, 16);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(*r, 1);
+    byte ^= 0x01;
+    auto w = abyss::platform::fs::Pwrite(*f, &byte, 1, 16);
+    ASSERT_TRUE(w.has_value());
+  }
 
   auto store = FileOffsetStore::Open({.directory = tmp_dir_});
   ASSERT_FALSE(store.has_value());

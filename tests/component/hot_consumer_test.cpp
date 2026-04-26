@@ -16,6 +16,7 @@
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
+#include "temp_dir.h"
 
 namespace abyss::consumer {
 namespace {
@@ -25,10 +26,8 @@ using namespace std::chrono_literals;
 class HotConsumerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto tmpl = std::filesystem::temp_directory_path() / "abyss_hot_consumer_XXXXXX";
-    std::string s = tmpl.string();
-    ASSERT_NE(::mkdtemp(s.data()), nullptr);
-    tmp_dir_ = s;
+    testing::TempDir dir("hot_consumer");
+    tmp_dir_ = dir.String();
 
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
         .max_memory_bytes = 16UL * 1024UL * 1024UL,
