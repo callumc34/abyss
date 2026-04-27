@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <utility>
 
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
@@ -107,7 +108,8 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
     return std::unexpected(pending.error());
   }
   const core::SequenceId seq = pending->seq();
-  auto rpc_future = rpc_.Register(seq);
+  const core::RpcId rpc_id = core::MakeRpcId(shard, seq);
+  auto rpc_future = rpc_.Register(rpc_id);
   queue::DurabilityFuture durable_future = std::move(pending->durable());
   pending->Publish();
 
@@ -115,7 +117,7 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
 
   // fsync first: a durable-layer failure takes precedence over consumer error.
   if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
-    rpc_.Cancel(seq);
+    rpc_.Cancel(rpc_id);
     ABYSS_LOG_WARN(Log(), "write durable wait timeout", {"shard", static_cast<int64_t>(shard)},
                    {"seq", static_cast<uint64_t>(seq)},
                    {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
@@ -125,7 +127,7 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
   }
   auto durable = durable_future.get();
   if (!durable.has_value()) {
-    rpc_.Cancel(seq);
+    rpc_.Cancel(rpc_id);
     ABYSS_LOG_ERROR(Log(), "write durable failed", {"shard", static_cast<int64_t>(shard)},
                     {"seq", static_cast<uint64_t>(seq)},
                     {"err", std::string_view{durable.error().message()}});
@@ -138,7 +140,7 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
   const auto rpc_deadline = std::max(durable_deadline, now + min_rpc_budget);
 
   if (rpc_future.wait_until(rpc_deadline) == std::future_status::timeout) {
-    rpc_.Cancel(seq);
+    rpc_.Cancel(rpc_id);
     ABYSS_LOG_WARN(Log(), "write durable but consumer apply timeout",
                    {"shard", static_cast<int64_t>(shard)}, {"seq", static_cast<uint64_t>(seq)});
     return core::RespValue::Error(
@@ -163,20 +165,21 @@ core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_vie
     return std::unexpected(pending.error());
   }
   const core::SequenceId seq = pending->seq();
-  auto rpc_future = rpc_.Register(seq);
+  const core::RpcId rpc_id = core::MakeRpcId(shard, seq);
+  auto rpc_future = rpc_.Register(rpc_id);
   queue::DurabilityFuture durable_future = std::move(pending->durable());
   pending->Publish();
 
   const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
   if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
-    rpc_.Cancel(seq);
+    rpc_.Cancel(rpc_id);
     return core::RespValue::Error(
         core::ErrorPrefix::kErr,
         "conditional durable wait exceeded server timeout; will resolve on resolver catch-up");
   }
   auto durable = durable_future.get();
   if (!durable.has_value()) {
-    rpc_.Cancel(seq);
+    rpc_.Cancel(rpc_id);
     return std::unexpected(durable.error());
   }
 
@@ -186,7 +189,7 @@ core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_vie
   const auto rpc_deadline = std::max(durable_deadline, now + min_rpc_budget);
 
   if (rpc_future.wait_until(rpc_deadline) == std::future_status::timeout) {
-    rpc_.Cancel(seq);
+    rpc_.Cancel(rpc_id);
     return core::RespValue::Error(
         core::ErrorPrefix::kErr,
         "conditional durable in queue but resolver did not decide within timeout");

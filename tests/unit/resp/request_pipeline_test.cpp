@@ -118,11 +118,11 @@ TEST(RequestPipelineTest, QuitSetsCloseRequested) {
 TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$4\r\nHGET\r\n$3\r\nkey\r\n"), output);
+  pipeline.Process(Bytes("*2\r\n$5\r\nLPUSH\r\n$3\r\nkey\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
-  EXPECT_NE(response.AsString().find("unknown command 'HGET'"), std::string::npos);
+  EXPECT_NE(response.AsString().find("unknown command 'LPUSH'"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, FlushallFallsThroughToUnknownCommand) {

@@ -840,13 +840,14 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
               .payload = resolved,
           };
           auto append = queue_.Append(config_.shard, std::move(out));
+          const core::RpcId client_rpc_id = core::MakeRpcId(config_.shard, entry.seq);
           if (!append.has_value()) {
             append_failures_.fetch_add(1, std::memory_order_relaxed);
             ABYSS_LOG_ERROR(Log(), "resolver append failed",
                             {"shard", static_cast<int64_t>(config_.shard)},
                             {"seq", static_cast<uint64_t>(entry.seq)},
                             {"err", std::string_view{append.error().message()}});
-            (void)rpc_.Fulfill(entry.seq,
+            (void)rpc_.Fulfill(client_rpc_id,
                                core::RespValue::Error(core::ErrorPrefix::kErr,
                                                       "resolver could not append decision"));
             return;
@@ -863,7 +864,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
           // Block until hot applies — required for read-your-write.
           (void)WaitForHotApply(append->seq);
 
-          (void)rpc_.Fulfill(entry.seq, std::move(resolved.return_value));
+          (void)rpc_.Fulfill(client_rpc_id, std::move(resolved.return_value));
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
           UpdateCacheFromResolved(entry.seq, payload);
         }
@@ -904,7 +905,8 @@ void Resolver::Run() {
 }
 
 bool Resolver::WaitForHotApply(core::SequenceId seq) {
-  auto fut = apply_notifier_.AwaitApplied(seq);
+  const core::RpcId id = core::MakeRpcId(config_.shard, seq);
+  auto fut = apply_notifier_.AwaitApplied(id);
   if (fut.wait_for(config_.hot_apply_wait) == std::future_status::ready) {
     try {
       fut.get();
@@ -914,7 +916,7 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
     }
   }
   apply_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-  apply_notifier_.Cancel(seq);
+  apply_notifier_.Cancel(id);
   ABYSS_LOG_WARN(Log(), "resolver hot-apply wait timeout",
                  {"shard", static_cast<int64_t>(config_.shard)},
                  {"seq", static_cast<uint64_t>(seq)});
@@ -1015,13 +1017,20 @@ core::Result<void> Resolver::ReplayForRecovery() {
   ABYSS_LOG_INFO(Log(), "resolver replay starting", {"shard", static_cast<int64_t>(config_.shard)});
 
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
+  core::SequenceId highest_seen = 0;
   while (true) {
     auto batch = queue_.Read(core::kResolverConsumer, config_.shard, config_.read_batch_size,
                              core::Duration{50});
     if (!batch.has_value()) break;
     if (batch->empty()) break;
 
+    bool any_new = false;
     for (const auto& entry : *batch) {
+      // Read returns from the persisted ack offset; once the consumer has
+      // dangling Conditionals we cannot ack past, subsequent Reads will
+      // re-emit entries we've already absorbed. Skip them.
+      if (entry.seq <= highest_seen) continue;
+      any_new = true;
       std::visit(
           [&](const auto& payload) {
             using T = std::decay_t<decltype(payload)>;
@@ -1035,7 +1044,33 @@ core::Result<void> Resolver::ReplayForRecovery() {
             }
           },
           entry.payload);
+      highest_seen = entry.seq;
       latest_drained_seq_.store(entry.seq, std::memory_order_release);
+    }
+    if (!any_new) break;
+
+    // Low-water-mark ack so the next Read advances past entries we've absorbed,
+    // but never past a dangling Conditional. Holding the offset behind any
+    // unresolved Conditional preserves replay correctness across a crash mid-
+    // recovery: a dangling Conditional whose Resolved we have not yet emitted
+    // stays in the queue's unread range and gets re-processed on the next
+    // ReplayForRecovery.
+    core::SequenceId ack_to = highest_seen;
+    if (!dangling.empty()) {
+      core::SequenceId oldest_dangling = std::numeric_limits<core::SequenceId>::max();
+      for (const auto& [seq, _] : dangling) {
+        oldest_dangling = std::min(oldest_dangling, seq);
+      }
+      if (oldest_dangling > 0 && oldest_dangling - 1 < ack_to) {
+        ack_to = oldest_dangling - 1;
+      } else if (oldest_dangling == 0) {
+        ack_to = 0;
+      }
+    }
+    if (ack_to > last_ack_seq_.load(std::memory_order_acquire)) {
+      core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, ack_to),
+                          append_failures_);
+      last_ack_seq_.store(ack_to, std::memory_order_release);
     }
   }
 

@@ -20,6 +20,10 @@
 #include "abyss/resp/command_registry.h"
 #include "abyss/version.h"
 
+#ifdef ABYSS_HAVE_ROCKSDB
+#include "abyss/cold/backends/rocksdb_store.h"
+#endif
+
 namespace abyss::server {
 
 namespace {
@@ -38,11 +42,30 @@ Server::Server(config::Config config) : config_(std::move(config)) {}
 Server::~Server() { Shutdown(); }
 
 bool Server::Initialize() {
+  if (config_.profile != "embedded") {
+    ABYSS_LOG_CRITICAL(ServerLog(), "unsupported profile",
+                       {"profile", std::string_view{config_.profile}},
+                       {"supported", std::string_view{"embedded"}});
+    return false;
+  }
+
+#ifndef ABYSS_HAVE_ROCKSDB
+  ABYSS_LOG_CRITICAL(
+      ServerLog(),
+      "embedded profile requires the RocksDB cold store; rebuild with -DABYSS_WITH_ROCKSDB=ON");
+  return false;
+#else
   std::error_code ec;
   std::filesystem::create_directories(config_.queue.wal_path, ec);
   if (ec) {
     ABYSS_LOG_CRITICAL(ServerLog(), "create WAL directory failed",
                        {"path", std::string_view{config_.queue.wal_path}}, {"err", ec.message()});
+    return false;
+  }
+  std::filesystem::create_directories(config_.cold.data_path, ec);
+  if (ec) {
+    ABYSS_LOG_CRITICAL(ServerLog(), "create cold store directory failed",
+                       {"path", std::string_view{config_.cold.data_path}}, {"err", ec.message()});
     return false;
   }
 
@@ -70,30 +93,25 @@ bool Server::Initialize() {
               .max_bytes = config_.queue.group_commit_max_bytes,
           },
       .min_retention = config_.queue.min_retention,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer, core::kResolverConsumer},
+      // Cold and resolver gate retention; hot is volatile (replays from queue
+      // on restart) per ADP-002 §"Eviction refresh vs queue retention".
+      .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
+      .volatile_consumers = {core::kHotConsumer},
   });
-  if (queue_result.has_value() && (*queue_result)->IsRecovering()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "WAL opened but still recovering; refusing to start");
-    return false;
-  }
   if (!queue_result.has_value()) {
     ABYSS_LOG_CRITICAL(ServerLog(), "WAL open failed",
                        {"path", std::string_view{config_.queue.wal_path}},
                        {"err", std::string_view{queue_result.error().message()}});
     return false;
   }
+  if ((*queue_result)->IsRecovering()) {
+    ABYSS_LOG_CRITICAL(ServerLog(), "WAL opened but still recovering; refusing to start");
+    return false;
+  }
   queue_ = std::move(*queue_result);
 
   consumer_rpc_ = std::make_unique<core::ConsumerRpc>(config_.consumer_rpc);
   apply_notifier_ = std::make_unique<core::ApplyNotifier>();
-
-#ifdef ABYSS_HAVE_ROCKSDB
-  std::filesystem::create_directories(config_.cold.data_path, ec);
-  if (ec) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "create cold store directory failed",
-                       {"path", std::string_view{config_.cold.data_path}}, {"err", ec.message()});
-    return false;
-  }
 
   auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
       .data_path = config_.cold.data_path,
@@ -103,7 +121,7 @@ bool Server::Initialize() {
     ABYSS_LOG_CRITICAL(ServerLog(), "cold store open failed",
                        {"path", std::string_view{config_.cold.data_path}},
                        {"err", std::string_view{cold_result.error().message()}});
-    return false;  // NOLINT(readability-simplify-boolean-expr)
+    return false;
   }
   cold_store_ = std::move(*cold_result);
 
@@ -175,12 +193,17 @@ bool Server::Initialize() {
     return false;
   }
 
+  // Captured before clients connect: LOADING flips once hot catches up to here.
+  std::vector<core::SequenceId> ready_watermarks(hot_store_->shard_count(), 0);
+  for (uint32_t s = 0; s < hot_store_->shard_count(); ++s) {
+    if (auto t = queue_->TailSeq(s); t.has_value()) ready_watermarks[s] = *t;
+  }
+
   hot_eviction_worker_->Start();
 
   resolver_pool_->Start();
   hot_pool_->Start();
   cold_pool_->Start();
-#endif
 
   auto identity = resp::NodeIdentity::Open(config_.queue.wal_path);
   if (!identity.has_value()) {
@@ -190,24 +213,24 @@ bool Server::Initialize() {
   }
   node_identity_ = std::make_unique<resp::NodeIdentity>(std::move(*identity));
 
-  core::ColdStore* cold_ptr = nullptr;
-#ifdef ABYSS_HAVE_ROCKSDB
-  cold_ptr = cold_store_.get();
-#endif
-
-  stats_ = std::make_unique<ServerStatsImpl>(*queue_, *hot_store_, cold_ptr, std::string{kVersion},
-                                             config_.net.bind,
-                                             /*advertise_address=*/std::string{},
-                                             /*mode=*/"standalone", config_.net.port);
+  stats_ = std::make_unique<ServerStatsImpl>(
+      *queue_, *hot_store_, cold_store_.get(), std::string{kVersion}, config_.net.bind,
+      /*advertise_address=*/std::string{}, /*mode=*/"standalone", config_.net.port);
   config_provider_ = std::make_unique<ConfigProviderImpl>(config_);
-  loading_ = std::make_unique<LoadingStateImpl>(
-      [q = queue_.get()] { return q != nullptr && q->IsRecovering(); });
+  loading_ =
+      std::make_unique<LoadingStateImpl>([queue_ptr = queue_.get(), pool_ptr = hot_pool_.get(),
+                                          watermarks = std::move(ready_watermarks)] {
+        if (queue_ptr != nullptr && queue_ptr->IsRecovering()) return true;
+        if (pool_ptr == nullptr) return false;
+        for (uint32_t s = 0; s < watermarks.size(); ++s) {
+          if (pool_ptr->ConsumerFor(s).HighestSettledSeq() < watermarks[s]) return true;
+        }
+        return false;
+      });
   resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
 
-  // Dispatcher stays unwired until the hot consumer surfaces typed write
-  // returns; wiring it today would reply +OK to SADD/ZADD/DEL/etc.
   resp::PipelineDependencies pipeline_deps{
-      .dispatcher = nullptr,
+      .dispatcher = engine_.get(),
       .loading = loading_.get(),
       .stats = stats_.get(),
       .config = config_provider_.get(),
@@ -234,10 +257,14 @@ bool Server::Initialize() {
   };
   tcp_server_ = std::make_unique<net::TcpServer>(tcp_config, resp::GlobalRegistry(), pipeline_deps);
 
+  stats_->set_connection_count_provider(
+      [server_ptr = tcp_server_.get()] { return server_ptr->ActiveConnections(); });
+
   ready_.store(true, std::memory_order_release);
   ABYSS_LOG_INFO(ServerLog(), "server ready",
                  {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
   return true;
+#endif
 }
 
 void Server::Run(const std::atomic<bool>& stop) {

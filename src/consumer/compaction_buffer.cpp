@@ -22,13 +22,14 @@ size_t EntryBytes(const BufferEntry& entry) {
 }  // namespace
 
 CompactionBuffer::CompactionBuffer(FlushStrategy strategy, core::SteadyClockFn clock,
-                                   std::optional<uint64_t> rng_seed)
+                                   std::optional<uint64_t> rng_seed, core::WallClockFn wall_clock)
     : strategy_(strategy),
       clock_(std::move(clock)),
+      wall_clock_(std::move(wall_clock)),
       rng_(rng_seed.value_or(std::random_device{}())) {}
 
-CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock)
-    : CompactionBuffer(FlushStrategy{}, std::move(clock)) {}
+CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock, core::WallClockFn wall_clock)
+    : CompactionBuffer(FlushStrategy{}, std::move(clock), std::nullopt, std::move(wall_clock)) {}
 
 void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op,
                               core::EvictionTTL eviction,
@@ -70,6 +71,17 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
 
+  // Lazy abs-TTL expiry mirrors the hot-store read path: an entry whose
+  // absolute TTL has elapsed must surface as a miss/null even before the
+  // cold consumer flushes a tombstone.
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(wall_clock_().time_since_epoch())
+          .count());
+  auto is_expired = [&](const CompactedState& state) {
+    const uint64_t ttl = state.AbsTtlMs();
+    return ttl > 0 && ttl <= now_ms;
+  };
+
   return std::visit(
       [&](const auto& read) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(read)>;
@@ -80,6 +92,7 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
             auto it = entries_.find(std::string(key));
             if (it == entries_.end()) continue;
             if (it->second.state.IsTombstone()) continue;
+            if (is_expired(it->second.state)) continue;
             ++count;
           }
           return core::RespValue::Integer(count);
@@ -97,7 +110,7 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
                   core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
             }
             const auto& state = it->second.state;
-            if (state.IsTombstone()) {
+            if (state.IsTombstone() || is_expired(state)) {
               out.push_back(core::RespValue::Null());
             } else if (state.Type() == CompactedState::DataType::kString) {
               out.push_back(core::RespValue::BulkString(state.StringValue()));
@@ -122,7 +135,7 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
         }
         const auto& state = it->second.state;
 
-        if (state.IsTombstone()) return core::RespValue::Null();
+        if (state.IsTombstone() || is_expired(state)) return core::RespValue::Null();
 
         if constexpr (std::is_same_v<T, core::ops::StringGet>) {
           if (state.Type() != CompactedState::DataType::kString) {

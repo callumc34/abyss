@@ -21,13 +21,16 @@ namespace abyss::server {
 // outlive every pipeline that reads them.
 class ServerStatsImpl : public resp::ServerStatsProvider {
  public:
+  using ConnectionCountFn = std::function<size_t()>;
+
   ServerStatsImpl(core::Queue& queue, core::HotStore& hot, core::ColdStore* cold,
                   std::string version, std::string bind_address, std::string advertise_address,
                   std::string mode, uint16_t tcp_port);
 
-  void IncrementConnectedClients() noexcept;
-  void DecrementConnectedClients() noexcept;
   void SetTcpPort(uint16_t port) noexcept;
+
+  // Read-through to the live reactor connection count; no push-side counter to drift.
+  void set_connection_count_provider(ConnectionCountFn fn);
 
   resp::ServerStats Snapshot() const override;
 
@@ -40,7 +43,7 @@ class ServerStatsImpl : public resp::ServerStatsProvider {
   std::string advertise_address_;
   std::string mode_;
   std::atomic<uint16_t> tcp_port_;
-  std::atomic<uint64_t> connected_clients_{0};
+  ConnectionCountFn connection_count_;
   std::chrono::steady_clock::time_point started_at_;
   uint64_t process_id_;
 };

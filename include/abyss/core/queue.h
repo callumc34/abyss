@@ -42,6 +42,10 @@ class Queue {
 
   virtual Result<void> Ack(ConsumerId consumer, ShardId shard, SequenceId seq) = 0;
   virtual Result<SequenceId> OldestRetained(ShardId shard) = 0;
+  virtual Result<SequenceId> TailSeq(ShardId shard) = 0;
+  // Last ack offset for `consumer` on `shard`; 0 if never acked. Persisted for
+  // retention consumers; in-memory-only for volatile consumers.
+  virtual Result<SequenceId> AckOffset(ConsumerId consumer, ShardId shard) = 0;
   virtual Result<QueueStats> Stats() = 0;
 };
 

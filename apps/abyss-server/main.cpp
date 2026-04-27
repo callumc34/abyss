@@ -34,7 +34,7 @@ std::string ResolveConfigPath(const std::string& cli_path) {
 
 // NOLINTNEXTLINE(modernize-avoid-c-arrays,bugprone-exception-escape)
 int main(int argc, char* argv[]) {
-  // TODO(Callum): Set default in abyss::config
+  // Local-dev sandbox: used only when neither --config nor --data-dir is given.
   constexpr auto kDefaultDataDir = "/tmp/abyss";
 
   CLI::App app{"abyss — Redis-compatible hot-cold tiered KV store"};

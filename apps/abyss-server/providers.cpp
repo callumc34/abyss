@@ -55,16 +55,12 @@ ServerStatsImpl::ServerStatsImpl(core::Queue& queue, core::HotStore& hot, core::
       started_at_(std::chrono::steady_clock::now()),
       process_id_(CurrentProcessId()) {}
 
-void ServerStatsImpl::IncrementConnectedClients() noexcept {
-  connected_clients_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void ServerStatsImpl::DecrementConnectedClients() noexcept {
-  connected_clients_.fetch_sub(1, std::memory_order_relaxed);
-}
-
 void ServerStatsImpl::SetTcpPort(uint16_t port) noexcept {
   tcp_port_.store(port, std::memory_order_relaxed);
+}
+
+void ServerStatsImpl::set_connection_count_provider(ConnectionCountFn fn) {
+  connection_count_ = std::move(fn);
 }
 
 resp::ServerStats ServerStatsImpl::Snapshot() const {
@@ -78,9 +74,14 @@ resp::ServerStats ServerStatsImpl::Snapshot() const {
       out.cold_key_count = stats->key_count;
     }
   }
-  (void)queue_;  // Reserved for queue depth/age fields.
+  if (auto stats = queue_.Stats(); stats.has_value()) {
+    out.queue_total_entries = stats->total_entries;
+    out.queue_total_bytes = stats->total_bytes;
+    out.queue_head_seq = stats->head_seq;
+    out.queue_tail_seq = stats->tail_seq;
+  }
 
-  out.connected_clients = connected_clients_.load(std::memory_order_relaxed);
+  out.connected_clients = connection_count_ ? connection_count_() : 0;
   out.process_id = process_id_;
   const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
                           std::chrono::steady_clock::now() - started_at_)

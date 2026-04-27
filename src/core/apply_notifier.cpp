@@ -16,24 +16,24 @@ ApplyNotifier::ApplyNotifier(ApplyNotifierConfig config) {
   }
 }
 
-ApplyNotifier::Shard& ApplyNotifier::ShardFor(SequenceId seq) const {
-  return *shards_[seq % shards_.size()];
+ApplyNotifier::Shard& ApplyNotifier::ShardFor(RpcId id) const {
+  return *shards_[id % shards_.size()];
 }
 
-std::future<void> ApplyNotifier::AwaitApplied(SequenceId seq) {
-  auto& shard = ShardFor(seq);
+std::future<void> ApplyNotifier::AwaitApplied(RpcId id) {
+  auto& shard = ShardFor(id);
   const std::scoped_lock lock(shard.mu);
 
   // Late-arrival: return ready if already fired within the recent window.
   for (auto fired : shard.recent_fired) {
-    if (fired == seq) {
+    if (fired == id) {
       std::promise<void> p;
       p.set_value();
       return p.get_future();
     }
   }
 
-  auto [it, inserted] = shard.pending.try_emplace(seq);
+  auto [it, inserted] = shard.pending.try_emplace(id);
   if (!inserted) {
     // Duplicate Await: original waiter keeps its future; duplicate gets a broken one.
     std::promise<void> broken;
@@ -42,28 +42,28 @@ std::future<void> ApplyNotifier::AwaitApplied(SequenceId seq) {
   return it->second.get_future();
 }
 
-void ApplyNotifier::NotifyApplied(SequenceId seq) {
-  auto& shard = ShardFor(seq);
+void ApplyNotifier::NotifyApplied(RpcId id) {
+  auto& shard = ShardFor(id);
   std::promise<void> to_fulfill;
   bool fulfill = false;
   {
     const std::scoped_lock lock(shard.mu);
-    auto it = shard.pending.find(seq);
+    auto it = shard.pending.find(id);
     if (it != shard.pending.end()) {
       to_fulfill = std::move(it->second);
       shard.pending.erase(it);
       fulfill = true;
     }
-    shard.recent_fired[shard.recent_cursor] = seq;
+    shard.recent_fired[shard.recent_cursor] = id;
     shard.recent_cursor = (shard.recent_cursor + 1) % shard.recent_fired.size();
   }
   if (fulfill) to_fulfill.set_value();
 }
 
-bool ApplyNotifier::Cancel(SequenceId seq) {
-  auto& shard = ShardFor(seq);
+bool ApplyNotifier::Cancel(RpcId id) {
+  auto& shard = ShardFor(id);
   const std::scoped_lock lock(shard.mu);
-  return shard.pending.erase(seq) > 0;
+  return shard.pending.erase(id) > 0;
 }
 
 size_t ApplyNotifier::PendingCount() const {

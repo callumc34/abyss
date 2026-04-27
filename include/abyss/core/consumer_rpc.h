@@ -11,10 +11,16 @@
 
 #include "abyss/core/resp_types.h"
 #include "abyss/core/thread_annotations.h"
+#include "abyss/core/types.h"
 
 namespace abyss::core {
 
 using RpcId = uint64_t;
+
+// Per-shard seqs collide at the registry; pack shard in top 16 bits, seq in lower 48.
+inline RpcId MakeRpcId(ShardId shard, SequenceId seq) {
+  return (static_cast<RpcId>(shard) << 48) | (static_cast<RpcId>(seq) & ((RpcId{1} << 48) - 1));
+}
 
 struct ConsumerRpcConfig {
   // Striped across this many mutex-protected partitions; `id % count` selects.

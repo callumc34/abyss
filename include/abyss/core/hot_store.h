@@ -32,7 +32,8 @@ class HotStore : public Reader {
   Result<RespValue> Exec(const ops::ReadOp& op,
                          std::optional<Duration> deadline = std::nullopt) override = 0;
 
-  virtual Result<void> Apply(const ops::WriteOp& op, EvictionTTL eviction) = 0;
+  // Returns the typed reply the client observes (+OK for SET, count for SADD/etc.).
+  virtual Result<RespValue> Apply(const ops::WriteOp& op, EvictionTTL eviction) = 0;
   virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops, EvictionTTL eviction) = 0;
 
   virtual Result<MemoryStats> Stats() = 0;

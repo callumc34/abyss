@@ -28,6 +28,17 @@ const log::Logger& Logger() {
   return l;
 }
 
+ErrorPrefix MapErrorCode(core::ErrorCode code) {
+  switch (code) {
+    case core::ErrorCode::kWrongType:
+      return ErrorPrefix::kWrongType;
+    case core::ErrorCode::kResourceExhausted:
+      return ErrorPrefix::kOom;
+    default:
+      return ErrorPrefix::kErr;
+  }
+}
+
 }  // namespace
 
 RequestPipeline::RequestPipeline(const CommandRegistry& registry, ConnectionState state,
@@ -134,7 +145,8 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
           ABYSS_LOG_WARN(Logger(), "engine read error", {"client_id", state_.client_id},
                          {"cmd", std::string_view{parent.name}},
                          {"err", std::string_view{result.error().message()}});
-          return finish(RespValue::Error(ErrorPrefix::kErr, result.error().message()));
+          return finish(
+              RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
         }
         return finish(std::move(*result));
       }
@@ -165,7 +177,8 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         ABYSS_LOG_WARN(Logger(), "engine write error", {"client_id", state_.client_id},
                        {"cmd", std::string_view{parent.name}},
                        {"err", std::string_view{result.error().message()}});
-        return finish(RespValue::Error(ErrorPrefix::kErr, result.error().message()));
+        return finish(
+            RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
       }
       return finish(std::move(*result));
     }

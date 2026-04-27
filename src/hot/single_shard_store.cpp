@@ -283,10 +283,10 @@ core::Result<core::RespValue> SingleShardStore::ExecExists(const core::ops::Exis
 
 // --- Write operations ---
 
-core::Result<void> SingleShardStore::Apply(const core::ops::WriteOp& op,
-                                           core::EvictionTTL eviction) {
+core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& op,
+                                                      core::EvictionTTL eviction) {
   return std::visit(
-      [this, eviction](const auto& o) -> core::Result<void> {
+      [this, eviction](const auto& o) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, core::ops::StringSet>) {
           return ApplyStringSet(o, eviction);
@@ -322,13 +322,13 @@ core::Result<void> SingleShardStore::ApplyBatch(std::span<const core::ops::Write
                                                 core::EvictionTTL eviction) {
   for (const auto& op : ops) {
     auto result = Apply(op, eviction);
-    if (!result.has_value()) return result;
+    if (!result.has_value()) return std::unexpected(result.error());
   }
   return {};
 }
 
-core::Result<void> SingleShardStore::ApplyStringSet(const core::ops::StringSet& op,
-                                                    core::EvictionTTL eviction) {
+core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::StringSet& op,
+                                                               core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end()) {
     if (it->second.type != Entry::Type::kString) {
@@ -339,7 +339,7 @@ core::Result<void> SingleShardStore::ApplyStringSet(const core::ops::StringSet& 
       it->second.last_access = config_.steady_clock();
       it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
       TrackInsert(it->second, op.key);
-      return {};
+      return core::RespValue::SimpleString("OK");
     }
     TrackRemove(it->second, op.key);
     std::get<std::string>(it->second.value) = std::string(op.value);
@@ -347,67 +347,80 @@ core::Result<void> SingleShardStore::ApplyStringSet(const core::ops::StringSet& 
     it->second.last_access = config_.steady_clock();
     it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
     TrackInsert(it->second, op.key);
-    return {};
+    return core::RespValue::SimpleString("OK");
   }
 
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kString, eviction);
   entry.value = std::string(op.value);
   entry.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
   TrackInsert(entry, op.key);
-  return {};
+  return core::RespValue::SimpleString("OK");
 }
 
-core::Result<void> SingleShardStore::ApplyDel(const core::ops::Del& op) {
+core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& op) {
+  int64_t removed = 0;
   for (auto key : op.keys) {
+    auto it = entries_.find(std::string(key));
+    if (it == entries_.end()) continue;
+    if (IsExpiredByTtl(it->second, config_.wall_clock)) {
+      RemoveEntry(std::string(key));
+      continue;
+    }
     RemoveEntry(std::string(key));
+    ++removed;
   }
-  return {};
+  return core::RespValue::Integer(removed);
 }
 
-core::Result<void> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
-                                                 core::EvictionTTL eviction) {
+core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
+                                                            core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
-  if (it != entries_.end() && it->second.type != Entry::Type::kSet) {
-    if (!IsExpiredByTtl(it->second, config_.wall_clock) && it->second.type != Entry::Type::kSet) {
-      return std::unexpected(core::Error(
-          core::ErrorCode::kWrongType, "Operation against a key holding the wrong kind of value"));
-    }
+  if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
+      it->second.type != Entry::Type::kSet) {
+    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
+                                       "Operation against a key holding the wrong kind of value"));
+  }
+  if (it != entries_.end() && IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
   }
 
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kSet, eviction);
   TrackRemove(entry, op.key);
   auto& members = std::get<SetValue>(entry.value).members;
+  int64_t added = 0;
   for (auto member : op.members) {
-    members.insert(std::string(member));
+    if (members.insert(std::string(member)).second) ++added;
   }
   entry.eviction_deadline = config_.steady_clock() + eviction;
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
-  return {};
+  return core::RespValue::Integer(added);
 }
 
-core::Result<void> SingleShardStore::ApplySetRem(const core::ops::SetRem& op) {
+core::Result<core::RespValue> SingleShardStore::ApplySetRem(const core::ops::SetRem& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
+  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) {
+    return core::RespValue::Integer(0);
+  }
   if (it->second.type != Entry::Type::kSet) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
   TrackRemove(it->second, op.key);
   auto& members = std::get<SetValue>(it->second.value).members;
+  int64_t removed = 0;
   for (auto member : op.members) {
-    members.erase(std::string(member));
+    removed += static_cast<int64_t>(members.erase(std::string(member)));
   }
   TrackInsert(it->second, op.key);
   if (members.empty()) {
     RemoveEntry(std::string(op.key));
   }
-  return {};
+  return core::RespValue::Integer(removed);
 }
 
-core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
-                                                  core::EvictionTTL eviction) {
+core::Result<core::RespValue> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
+                                                             core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
       it->second.type != Entry::Type::kZset) {
@@ -422,6 +435,7 @@ core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
   TrackRemove(entry, op.key);
   auto& zset = std::get<ZsetValue>(entry.value);
 
+  int64_t added = 0;
   for (const auto& e : op.entries) {
     std::string member(e.member);
     auto existing = zset.member_scores.find(member);
@@ -431,6 +445,8 @@ core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
       if (zset.score_members[old_score].empty()) {
         zset.score_members.erase(old_score);
       }
+    } else {
+      ++added;
     }
     zset.member_scores[member] = e.score;
     zset.score_members[e.score].insert(std::move(member));
@@ -439,12 +455,14 @@ core::Result<void> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
   entry.eviction_deadline = config_.steady_clock() + eviction;
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
-  return {};
+  return core::RespValue::Integer(added);
 }
 
-core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) {
+core::Result<core::RespValue> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
+  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) {
+    return core::RespValue::Integer(0);
+  }
   if (it->second.type != Entry::Type::kZset) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
@@ -452,6 +470,7 @@ core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) 
   TrackRemove(it->second, op.key);
   auto& zset = std::get<ZsetValue>(it->second.value);
 
+  int64_t removed = 0;
   for (auto member : op.members) {
     std::string m(member);
     auto score_it = zset.member_scores.find(m);
@@ -462,6 +481,7 @@ core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) 
         zset.score_members.erase(score);
       }
       zset.member_scores.erase(score_it);
+      ++removed;
     }
   }
 
@@ -469,11 +489,11 @@ core::Result<void> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op) 
   if (zset.member_scores.empty()) {
     RemoveEntry(std::string(op.key));
   }
-  return {};
+  return core::RespValue::Integer(removed);
 }
 
-core::Result<void> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
-                                                  core::EvictionTTL eviction) {
+core::Result<core::RespValue> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
+                                                             core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
   if (it != entries_.end() && !IsExpiredByTtl(it->second, config_.wall_clock) &&
       it->second.type != Entry::Type::kHash) {
@@ -487,67 +507,79 @@ core::Result<void> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kHash, eviction);
   TrackRemove(entry, op.key);
   auto& fields = std::get<HashValue>(entry.value).fields;
+  int64_t new_fields = 0;
   for (const auto& fv : op.fields) {
-    fields[std::string(fv.field)] = std::string(fv.value);
+    auto [field_it, inserted] = fields.try_emplace(std::string(fv.field), std::string(fv.value));
+    if (inserted) {
+      ++new_fields;
+    } else {
+      field_it->second = std::string(fv.value);
+    }
   }
   entry.eviction_deadline = config_.steady_clock() + eviction;
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
-  return {};
+  return core::RespValue::Integer(new_fields);
 }
 
-core::Result<void> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op) {
+core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) return {};
+  if (it == entries_.end() || IsExpiredByTtl(it->second, config_.wall_clock)) {
+    return core::RespValue::Integer(0);
+  }
   if (it->second.type != Entry::Type::kHash) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
   TrackRemove(it->second, op.key);
   auto& fields = std::get<HashValue>(it->second.value).fields;
+  int64_t removed = 0;
   for (auto field : op.fields) {
-    fields.erase(std::string(field));
+    removed += static_cast<int64_t>(fields.erase(std::string(field)));
   }
   TrackInsert(it->second, op.key);
   if (fields.empty()) {
     RemoveEntry(std::string(op.key));
   }
-  return {};
+  return core::RespValue::Integer(removed);
 }
 
-core::Result<void> SingleShardStore::ApplyMultiStringSet(const core::ops::MultiStringSet& op,
-                                                         core::EvictionTTL eviction) {
+core::Result<core::RespValue> SingleShardStore::ApplyMultiStringSet(
+    const core::ops::MultiStringSet& op, core::EvictionTTL eviction) {
   for (const auto& e : op.entries) {
     auto result = ApplyStringSet(core::ops::StringSet{.key = e.key, .value = e.value}, eviction);
-    if (!result.has_value()) return result;
+    if (!result.has_value()) return std::unexpected(result.error());
   }
-  return {};
+  return core::RespValue::SimpleString("OK");
 }
 
-core::Result<void> SingleShardStore::ApplyExpire(const core::ops::Expire& op) {
+core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Expire& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end()) return {};
+  if (it == entries_.end()) return core::RespValue::Integer(0);
   if (IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
-    return {};
+    return core::RespValue::Integer(0);
   }
   TrackRemove(it->second, op.key);
   it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
   TrackInsert(it->second, op.key);
-  return {};
+  return core::RespValue::Integer(1);
 }
 
-core::Result<void> SingleShardStore::ApplyPersist(const core::ops::Persist& op) {
+core::Result<core::RespValue> SingleShardStore::ApplyPersist(const core::ops::Persist& op) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end()) return {};
+  if (it == entries_.end()) return core::RespValue::Integer(0);
   if (IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
-    return {};
+    return core::RespValue::Integer(0);
+  }
+  if (it->second.abs_ttl_ms == 0) {
+    return core::RespValue::Integer(0);
   }
   TrackRemove(it->second, op.key);
   it->second.abs_ttl_ms = 0;
   TrackInsert(it->second, op.key);
-  return {};
+  return core::RespValue::Integer(1);
 }
 
 // --- Maintenance ---

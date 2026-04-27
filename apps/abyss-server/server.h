@@ -9,6 +9,7 @@
 #include "abyss/consumer/hot_consumer_pool.h"
 #include "abyss/consumer/resolver_pool.h"
 #include "abyss/core/apply_notifier.h"
+#include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
@@ -18,10 +19,6 @@
 #include "abyss/resp/metrics.h"
 #include "abyss/resp/node_identity.h"
 #include "providers.h"
-
-#ifdef ABYSS_HAVE_ROCKSDB
-#include "abyss/cold/backends/rocksdb_store.h"
-#endif
 
 namespace abyss::server {
 
@@ -52,9 +49,7 @@ class Server {
   // Destruction is reverse — dependents destroyed before their dependencies.
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<hot::ShardedHotStore> hot_store_;
-#ifdef ABYSS_HAVE_ROCKSDB
-  std::unique_ptr<cold::backends::RocksdbStore> cold_store_;
-#endif
+  std::unique_ptr<core::ColdStore> cold_store_;
   std::unique_ptr<hot::EvictionWorker> hot_eviction_worker_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
