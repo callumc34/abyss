@@ -109,7 +109,7 @@ ShardState::ShardState(ShardStateConfig config) : config_(std::move(config)) {}
 ShardState::~ShardState() { Shutdown(); }
 
 core::Result<void> ShardState::Initialize() {
-  std::lock_guard lock(append_mu_);
+  const std::scoped_lock lock(append_mu_);
 
   auto existing = EnumerateSegmentBaseSeqs(config_.directory);
   if (!existing.has_value()) return std::unexpected(existing.error());
@@ -367,6 +367,7 @@ core::Result<std::vector<core::QueueEntry>> ShardState::Read(core::SequenceId fr
                                                              size_t max_count,
                                                              core::Duration timeout) {
   std::vector<std::shared_ptr<Segment>> snapshot;
+  core::SequenceId publish_cliff = 0;
   {
     std::unique_lock lock(append_mu_);
     read_cv_.wait_for(lock, timeout,
@@ -379,6 +380,8 @@ core::Result<std::vector<core::QueueEntry>> ShardState::Read(core::SequenceId fr
       return std::vector<core::QueueEntry>{};
     }
 
+    publish_cliff = next_seq_;
+
     snapshot.reserve(sealed_.size() + 1);
     for (const auto& seg : sealed_) {
       if (seg->next_seq() > from_seq) {
@@ -387,6 +390,8 @@ core::Result<std::vector<core::QueueEntry>> ShardState::Read(core::SequenceId fr
     }
     snapshot.push_back(active_);
   }
+
+  max_count = std::min(max_count, static_cast<size_t>(publish_cliff - from_seq));
 
   std::vector<core::QueueEntry> result;
   result.reserve(std::min<size_t>(max_count, 256));
@@ -404,12 +409,12 @@ core::Result<std::vector<core::QueueEntry>> ShardState::Read(core::SequenceId fr
 }
 
 core::SequenceId ShardState::head_seq() const {
-  std::lock_guard lock(append_mu_);
+  const std::scoped_lock lock(append_mu_);
   return next_seq_;
 }
 
 core::SequenceId ShardState::tail_seq() const {
-  std::lock_guard lock(append_mu_);
+  const std::scoped_lock lock(append_mu_);
   if (!sealed_.empty()) {
     return sealed_.front()->base_seq();
   }
@@ -417,7 +422,7 @@ core::SequenceId ShardState::tail_seq() const {
 }
 
 size_t ShardState::total_entries() const {
-  std::lock_guard lock(append_mu_);
+  const std::scoped_lock lock(append_mu_);
   size_t total = 0;
   for (const auto& seg : sealed_) total += seg->entry_count();
   if (active_) total += active_->entry_count();
@@ -425,7 +430,7 @@ size_t ShardState::total_entries() const {
 }
 
 size_t ShardState::total_bytes() const {
-  std::lock_guard lock(append_mu_);
+  const std::scoped_lock lock(append_mu_);
   size_t total = 0;
   for (const auto& seg : sealed_) total += seg->write_offset();
   if (active_) total += active_->write_offset();
@@ -433,7 +438,7 @@ size_t ShardState::total_bytes() const {
 }
 
 std::vector<SegmentRegistry::SealedSegmentInfo> ShardState::ListSealedSegments() const {
-  std::lock_guard lock(append_mu_);
+  const std::scoped_lock lock(append_mu_);
   std::vector<SegmentRegistry::SealedSegmentInfo> result;
   result.reserve(sealed_.size());
   for (const auto& seg : sealed_) {
@@ -452,7 +457,7 @@ core::Result<void> ShardState::RemoveSegment(core::SequenceId base_seq) {
   std::shared_ptr<Segment> to_remove;
   std::string path;
   {
-    std::lock_guard lock(append_mu_);
+    const std::scoped_lock lock(append_mu_);
     auto it = std::ranges::find_if(
         sealed_, [&](const std::shared_ptr<Segment>& s) { return s->base_seq() == base_seq; });
     if (it == sealed_.end()) {
@@ -474,7 +479,7 @@ core::Result<void> ShardState::RemoveSegment(core::SequenceId base_seq) {
 
 void ShardState::Shutdown() {
   {
-    std::lock_guard lock(append_mu_);
+    const std::scoped_lock lock(append_mu_);
     if (shutting_down_) return;
     shutting_down_ = true;
   }
