@@ -58,7 +58,7 @@ class SingleShardStore {
 
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const;
 
-  core::Result<void> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction);
+  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction);
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::EvictionTTL eviction);
 
@@ -81,18 +81,22 @@ class SingleShardStore {
   core::Result<core::RespValue> ExecHashGetAll(const core::ops::HashGetAll& op) const;
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op) const;
 
-  core::Result<void> ApplyStringSet(const core::ops::StringSet& op, core::EvictionTTL eviction);
-  core::Result<void> ApplyDel(const core::ops::Del& op);
-  core::Result<void> ApplySetAdd(const core::ops::SetAdd& op, core::EvictionTTL eviction);
-  core::Result<void> ApplySetRem(const core::ops::SetRem& op);
-  core::Result<void> ApplyZsetAdd(const core::ops::ZsetAdd& op, core::EvictionTTL eviction);
-  core::Result<void> ApplyZsetRem(const core::ops::ZsetRem& op);
-  core::Result<void> ApplyHashSet(const core::ops::HashSet& op, core::EvictionTTL eviction);
-  core::Result<void> ApplyHashDel(const core::ops::HashDel& op);
-  core::Result<void> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
-                                         core::EvictionTTL eviction);
-  core::Result<void> ApplyExpire(const core::ops::Expire& op);
-  core::Result<void> ApplyPersist(const core::ops::Persist& op);
+  core::Result<core::RespValue> ApplyStringSet(const core::ops::StringSet& op,
+                                               core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyDel(const core::ops::Del& op);
+  core::Result<core::RespValue> ApplySetAdd(const core::ops::SetAdd& op,
+                                            core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplySetRem(const core::ops::SetRem& op);
+  core::Result<core::RespValue> ApplyZsetAdd(const core::ops::ZsetAdd& op,
+                                             core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyZsetRem(const core::ops::ZsetRem& op);
+  core::Result<core::RespValue> ApplyHashSet(const core::ops::HashSet& op,
+                                             core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyHashDel(const core::ops::HashDel& op);
+  core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
+                                                    core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyExpire(const core::ops::Expire& op);
+  core::Result<core::RespValue> ApplyPersist(const core::ops::Persist& op);
 
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;

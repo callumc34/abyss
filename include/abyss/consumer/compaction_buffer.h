@@ -23,9 +23,11 @@ namespace abyss::consumer {
 class CompactionBuffer {
  public:
   CompactionBuffer(FlushStrategy strategy, core::SteadyClockFn clock,
-                   std::optional<uint64_t> rng_seed = std::nullopt);
+                   std::optional<uint64_t> rng_seed = std::nullopt,
+                   core::WallClockFn wall_clock = core::DefaultWallClock);
 
-  explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock);
+  explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock,
+                            core::WallClockFn wall_clock = core::DefaultWallClock);
 
   void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction,
               core::SequenceId seq = 0) ABYSS_EXCLUDES(mutex_);
@@ -64,6 +66,7 @@ class CompactionBuffer {
 
   const FlushStrategy strategy_;
   core::SteadyClockFn clock_;
+  core::WallClockFn wall_clock_;
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, BufferEntry> entries_ ABYSS_GUARDED_BY(mutex_);
   std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<>> flush_heap_

@@ -158,14 +158,18 @@ core::Result<std::vector<core::QueueEntry>> WalQueue::Read(core::ConsumerId cons
                                                            core::ShardId shard, size_t max_count,
                                                            core::Duration timeout) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  const auto persisted = offsets_->Get(consumer, shard);
-  const core::SequenceId from_seq = persisted.has_value() ? *persisted + 1 : 0;
+  const auto offset = GetOffset(consumer, shard);
+  const core::SequenceId from_seq = offset.has_value() ? *offset + 1 : 0;
   return shards_[shard]->Read(from_seq, max_count, timeout);
 }
 
 core::Result<void> WalQueue::Ack(core::ConsumerId consumer, core::ShardId shard,
                                  core::SequenceId seq) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  if (IsVolatile(consumer)) {
+    SetVolatileOffset(consumer, shard, seq);
+    return {};
+  }
   auto set = offsets_->Set(consumer, shard, seq);
   if (!set.has_value()) return set;
   RunReaper();
@@ -184,6 +188,48 @@ core::Result<core::SequenceId> WalQueue::OldestRetained(core::ShardId shard) {
     min_ack = std::min(min_ack, *ack);
   }
   return min_ack;
+}
+
+core::Result<core::SequenceId> WalQueue::TailSeq(core::ShardId shard) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  // head_seq is the next seq to assign; the highest assigned (matching what
+  // a consumer's HighestSettledSeq will reach once caught up) is one less.
+  const auto head = shards_[shard]->head_seq();
+  return head > 0 ? head - 1 : 0;
+}
+
+core::Result<core::SequenceId> WalQueue::AckOffset(core::ConsumerId consumer, core::ShardId shard) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return GetOffset(consumer, shard).value_or(0);
+}
+
+bool WalQueue::IsVolatile(core::ConsumerId consumer) const {
+  return std::ranges::find(config_.volatile_consumers, consumer) !=
+         config_.volatile_consumers.end();
+}
+
+namespace {
+constexpr uint64_t kShardKeyShift = 32;
+uint64_t MakeOffsetKey(core::ConsumerId consumer, core::ShardId shard) {
+  return (static_cast<uint64_t>(consumer) << kShardKeyShift) | static_cast<uint64_t>(shard);
+}
+}  // namespace
+
+std::optional<core::SequenceId> WalQueue::GetOffset(core::ConsumerId consumer,
+                                                    core::ShardId shard) const {
+  if (IsVolatile(consumer)) {
+    const std::scoped_lock lock(volatile_mu_);
+    auto it = volatile_offsets_.find(MakeOffsetKey(consumer, shard));
+    if (it == volatile_offsets_.end()) return std::nullopt;
+    return it->second;
+  }
+  return offsets_->Get(consumer, shard);
+}
+
+void WalQueue::SetVolatileOffset(core::ConsumerId consumer, core::ShardId shard,
+                                 core::SequenceId seq) {
+  const std::scoped_lock lock(volatile_mu_);
+  volatile_offsets_[MakeOffsetKey(consumer, shard)] = seq;
 }
 
 core::Result<core::QueueStats> WalQueue::Stats() {

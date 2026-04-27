@@ -52,7 +52,9 @@ class TestServer {
 // Class-scoped shared server via SetUpTestSuite / TearDownTestSuite. One
 // server per TEST_F class; different classes parallelize. Use
 // IsolatedServerTest instead when a test restarts the server or asserts
-// against non-keyspace state.
+// against non-keyspace state. Tests that mutate the keyspace must use
+// IsolatedDataServerTest (or its alias DataCommandTest) — sharing a server
+// across data tests has no FLUSHDB to fall back on for cleanup.
 class SystemTest : public ::testing::Test {
  public:
   static void SetUpTestSuite();
@@ -68,11 +70,6 @@ class SystemTest : public ::testing::Test {
  private:
   static std::unique_ptr<TestServer> shared_server_;
   RedisClient client_;
-};
-
-class DataCommandTest : public SystemTest {
- protected:
-  void SetUp() override;
 };
 
 // Per-test isolated server. Required for tests that restart/kill the server
@@ -97,5 +94,11 @@ class IsolatedDataServerTest : public IsolatedServerTest {
  protected:
   void SetUp() override;
 };
+
+// TODO: Once FLUSHDB lands, fold this back into a shared-server fixture (one
+// server per TEST_F class, FLUSHDB in SetUp) so data-tier tests don't pay
+// per-test server startup cost. Until then we use per-test isolation —
+// correct but expensive, ~1.5s/test × N tests.
+using DataCommandTest = IsolatedDataServerTest;
 
 }  // namespace abyss::system_test

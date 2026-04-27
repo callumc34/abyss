@@ -28,8 +28,8 @@ TEST(CommandRegistryTest, LookupIsCaseInsensitive) {
 
 TEST(CommandRegistryTest, UnknownCommandReturnsNull) {
   CommandRegistry reg;
-  EXPECT_EQ(reg.Find("HGET"), nullptr);
   EXPECT_EQ(reg.Find("LPUSH"), nullptr);
+  EXPECT_EQ(reg.Find("RPUSH"), nullptr);
   EXPECT_EQ(reg.Find("KEYS"), nullptr);
   EXPECT_EQ(reg.Find("WAIT"), nullptr);
   EXPECT_EQ(reg.Find("MULTI"), nullptr);
@@ -146,7 +146,7 @@ TEST(CommandRegistryTest, DocsPopulatedForEveryCommandAndSubcommand) {
 
 TEST(CommandRegistryTest, ResolveUnknownCommand) {
   CommandRegistry reg;
-  core::RespCommand cmd{{"HGET", "myhash", "field"}};
+  core::RespCommand cmd{{"LPUSH", "mylist", "value"}};
   const auto r = reg.Resolve(cmd);
   EXPECT_EQ(r.status, Status::kUnknownCommand);
 }

@@ -26,6 +26,9 @@ class MockQueue : public core::Queue {
   MOCK_METHOD(core::Result<void>, Ack,
               (core::ConsumerId consumer, core::ShardId shard, core::SequenceId seq), (override));
   MOCK_METHOD(core::Result<core::SequenceId>, OldestRetained, (core::ShardId shard), (override));
+  MOCK_METHOD(core::Result<core::SequenceId>, TailSeq, (core::ShardId shard), (override));
+  MOCK_METHOD(core::Result<core::SequenceId>, AckOffset,
+              (core::ConsumerId consumer, core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::QueueStats>, Stats, (), (override));
 };
 

@@ -4,6 +4,7 @@
 #include <utility>
 #include <variant>
 
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/fire_and_forget.h"
 #include "abyss/core/ops.h"
 #include "abyss/log/log.h"
@@ -133,13 +134,14 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
         result = MapApplyError(applied.error());
       } else {
         counters_.applied.fetch_add(1, std::memory_order_relaxed);
-        result = core::RespValue::SimpleString("OK");
+        result = std::move(*applied);
       }
     }
   }
 
-  (void)rpc_.Fulfill(entry.seq, std::move(result));
-  apply_notifier_.NotifyApplied(entry.seq);
+  const core::RpcId rpc_id = core::MakeRpcId(config_.shard, entry.seq);
+  (void)rpc_.Fulfill(rpc_id, std::move(result));
+  apply_notifier_.NotifyApplied(rpc_id);
   MarkSettledAndMaybeAck(entry.seq);
 }
 
@@ -154,7 +156,7 @@ void HotConsumer::HandleConditional(core::QueueEntry entry,
         seq, PendingConditional{.entry = std::move(entry),
                                 .received_at = std::chrono::steady_clock::now()});
   }
-  apply_notifier_.NotifyApplied(seq);
+  apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, seq));
 }
 
 void HotConsumer::HandleResolved(const core::QueueEntry& entry,
@@ -181,9 +183,11 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
     }
   }
 
-  // The resolver awaits NotifyApplied(ref) before fulfilling the client RPC.
-  apply_notifier_.NotifyApplied(resolved.ref);
-  apply_notifier_.NotifyApplied(entry.seq);
+  // The resolver awaits NotifyApplied on the conditional's RpcId before
+  // fulfilling the client RPC. The Resolved entry's own RpcId has no
+  // resolver-side waiter today, but we notify for symmetry with future RPCs.
+  apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, resolved.ref));
+  apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, entry.seq));
 
   if (had_pending) MarkSettledAndMaybeAck(resolved.ref);
   MarkSettledAndMaybeAck(entry.seq);
@@ -202,8 +206,9 @@ core::Result<void> HotConsumer::ApplyOps(const std::vector<core::RespCommand>& o
       return std::unexpected(op.error());
     }
     const auto eviction = eviction_policy_.Resolve(core::ops::PrimaryKey(*op));
+    // Reply value is constructed by the Resolver; discard here.
     auto applied = store_.Apply(*op, eviction);
-    if (!applied.has_value()) return applied;
+    if (!applied.has_value()) return std::unexpected(applied.error());
   }
   return {};
 }

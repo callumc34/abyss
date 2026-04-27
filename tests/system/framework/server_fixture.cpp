@@ -384,20 +384,6 @@ void SystemTest::TearDown() { client_.Close(); }
 
 uint16_t SystemTest::ServerPort() { return shared_server_->Port(); }
 
-void DataCommandTest::SetUp() {
-  SystemTest::SetUp();
-  if (IsSkipped()) return;
-  const auto probe = Client().Command({"SET", "__probe__", "1"});
-  // Positive probe: only proceed when SET round-trips to +OK. Any other shape
-  // (error, internal-server-error from a partially wired pipeline, wrong type)
-  // means the data path is not yet ready and the test would fail for reasons
-  // unrelated to its assertion target.
-  if (!probe.IsStatus() || probe.String() != "OK") {
-    GTEST_SKIP() << "data path not yet ready: SET probe returned " << probe.String();
-  }
-  Client().Command({"DEL", "__probe__"});
-}
-
 void IsolatedServerTest::SetUp() {
   if (!server_.Start()) {
     GTEST_SKIP() << server_.SkipReason();

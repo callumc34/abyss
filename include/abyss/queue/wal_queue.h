@@ -4,11 +4,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "abyss/core/queue.h"
 #include "abyss/core/result.h"
+#include "abyss/core/thread_annotations.h"
 #include "abyss/queue/group_commit.h"
 #include "abyss/queue/offset_store.h"
 #include "abyss/queue/segment_reaper.h"
@@ -24,7 +28,10 @@ struct WalConfig {
   size_t shard_count = 1;
   GroupCommitConfig commit;
   std::chrono::seconds min_retention{86400};
+  // Persisted ack offsets; gate retention.
   std::vector<core::ConsumerId> retention_consumers;
+  // Read offsets kept in memory only (replayed on Open); do not gate retention.
+  std::vector<core::ConsumerId> volatile_consumers;
 };
 
 // NOLINTNEXTLINE(misc-multiple-inheritance)
@@ -51,6 +58,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<void> Ack(core::ConsumerId consumer, core::ShardId shard,
                          core::SequenceId seq) override;
   core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override;
+  core::Result<core::SequenceId> TailSeq(core::ShardId shard) override;
+  core::Result<core::SequenceId> AckOffset(core::ConsumerId consumer, core::ShardId shard) override;
   core::Result<core::QueueStats> Stats() override;
 
   std::vector<SegmentRegistry::SealedSegmentInfo> ListSealedSegments() const override;
@@ -68,12 +77,19 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<void> ValidateShard(core::ShardId shard) const;
   void RunReaper();
 
+  bool IsVolatile(core::ConsumerId consumer) const;
+  std::optional<core::SequenceId> GetOffset(core::ConsumerId consumer, core::ShardId shard) const;
+  void SetVolatileOffset(core::ConsumerId consumer, core::ShardId shard, core::SequenceId seq);
+
   WalConfig config_;
   std::atomic<bool> recovering_{true};
   std::atomic<uint64_t> reaper_failures_{0};
   std::vector<std::unique_ptr<ShardState>> shards_;
   std::unique_ptr<OffsetStore> offsets_;
   std::unique_ptr<SegmentReaper> reaper_;
+
+  mutable std::mutex volatile_mu_;
+  std::unordered_map<uint64_t, core::SequenceId> volatile_offsets_ ABYSS_GUARDED_BY(volatile_mu_);
 };
 
 }  // namespace abyss::queue

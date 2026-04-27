@@ -325,6 +325,15 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Read("ZLEXCOUNT", 4, 1, 1, 1,
          {"Counts members of a sorted set in a lex range.", "2.8.9", "sorted-set", "O(log N)"}),
 
+    // Hashes
+    Write("HSET", -4, D::kWritePath, 1, 1, 1,
+          {"Sets fields in a hash.", "2.0.0", "hash", "O(N) over fields set"}),
+    Write("HDEL", -3, D::kWritePath, 1, 1, 1,
+          {"Deletes fields from a hash.", "2.0.0", "hash", "O(N) over fields deleted"}),
+    Read("HGET", 3, 1, 1, 1, {"Returns the value of a hash field.", "2.0.0", "hash", "O(1)"}),
+    Read("HGETALL", 2, 1, 1, 1,
+         {"Returns all fields and values of a hash.", "2.0.0", "hash", "O(N) over fields"}),
+
     // Generic / key management
     Write("DEL", -2, D::kWritePath, 1, -1, 1,
           {"Deletes one or more keys.", "1.0.0", "generic", "O(N) over keys deleted"}),

@@ -2,11 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "abyss/core/apply_notifier.h"
@@ -161,6 +162,36 @@ TEST_F(HotConsumerTest, MetricsAdvanceOnApply) {
   EXPECT_EQ(snap.parse_failures, 0U);
   EXPECT_EQ(snap.queue_read_failures, 0U);
   EXPECT_EQ(snap.ack_failures, 0U);
+}
+
+TEST_F(HotConsumerTest, ConcurrentWritersAlwaysSeeRegisteredEntries) {
+  StartConsumer();
+
+  constexpr int kWriters = 8;
+  constexpr int kWritesPerWriter = 50;
+  std::atomic<int> broken_futures{0};
+
+  std::vector<std::thread> writers;
+  writers.reserve(kWriters);
+  for (int w = 0; w < kWriters; ++w) {
+    writers.emplace_back([&, w]() {
+      for (int i = 0; i < kWritesPerWriter; ++i) {
+        auto future = AppendWithRpc(
+            {"SET", "w" + std::to_string(w) + "_" + std::to_string(i), std::to_string(i)});
+        // Bound the wait: an orphaned promise from a Fulfill-before-Register
+        // race would block forever otherwise.
+        if (future.wait_for(5s) != std::future_status::ready) {
+          broken_futures.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          EXPECT_TRUE(future.get().IsSimpleString());
+        }
+      }
+    });
+  }
+  for (auto& t : writers) t.join();
+
+  EXPECT_EQ(broken_futures.load(), 0);
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
 }
 
 TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {

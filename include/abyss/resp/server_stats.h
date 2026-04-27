@@ -9,6 +9,10 @@ struct ServerStats {
   uint64_t hot_key_count = 0;
   uint64_t cold_key_count = 0;
   uint64_t hot_memory_bytes = 0;
+  uint64_t queue_total_entries = 0;
+  uint64_t queue_total_bytes = 0;
+  uint64_t queue_head_seq = 0;
+  uint64_t queue_tail_seq = 0;
   uint64_t connected_clients = 0;
   uint64_t process_id = 0;
   uint32_t uptime_seconds = 0;

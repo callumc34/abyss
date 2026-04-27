@@ -227,6 +227,17 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 | `ZCOUNT key min max` | 4 | Read | TieredRead | Integer |
 | `ZLEXCOUNT key min max` | 4 | Read | TieredRead | Integer |
 
+**Hashes (direct key only):**
+
+| Command | Arity | Class | Dispatch | Response |
+|---------|-------|-------|----------|----------|
+| `HSET key field value [field value ...]` | -4 | Write | Write | Integer (count of new fields) |
+| `HDEL key field [field ...]` | -3 | Write | Write | Integer (count deleted) |
+| `HGET key field` | 3 | Read | TieredRead | Bulk or nil |
+| `HGETALL key` | 2 | Read | TieredRead | Array |
+
+The remaining hash commands (`HEXISTS`, `HKEYS`, `HLEN`, `HMGET`, `HSETNX`, `HVALS`, `HINCRBY`, `HRANDFIELD`, `HSCAN`) are deferred until the corresponding store ops are exposed.
+
 **Generic / key management (direct key only):**
 
 | Command | Arity | Class | Dispatch | Response |
@@ -260,7 +271,7 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 - Streams — `XADD`, `XREAD`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL`, `XGROUP`, `XACK`, ...
 - Debug — `DEBUG`, `MONITOR`, `LATENCY`, `SLOWLOG`
 - Dump / restore — `DUMP`, `RESTORE`, `MIGRATE`
-- Deferred types — hashes (`HGET` et al.), lists (`LPUSH` et al.), bitmaps, hyperloglog, geo. Rejected with `ERR unknown command` in Phase 1; added in Phase 2 when the hot store supports them.
+- Deferred types — lists (`LPUSH` et al.), bitmaps, hyperloglog, geo. Rejected with `ERR unknown command` in Phase 1; added in Phase 2 when the hot store supports them. Hashes are partially supported (see "Hashes" above); the remaining hash commands listed there are deferred.
 
 ### SET Command Full Specification
 

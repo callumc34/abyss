@@ -12,6 +12,7 @@
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/shard_router.h"
 #include "mock_cold_store.h"
 #include "mock_hot_store.h"
 #include "mock_queue.h"
@@ -161,13 +162,14 @@ TEST_F(TieringEngineTest, WriteSuccessReturnsConsumerResult) {
   auto engine = MakeEngine();
 
   constexpr core::SequenceId kSeq = 42;
+  const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
   EXPECT_CALL(queue_, BeginAppend(_, _))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
       .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
 
-  std::thread fulfiller([this]() {
+  std::thread fulfiller([this, kRpcId]() {
     while (rpc_.PendingCount() == 0) std::this_thread::yield();
-    EXPECT_TRUE(rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK")));
+    EXPECT_TRUE(rpc_.Fulfill(kRpcId, core::RespValue::SimpleString("OK")));
   });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
@@ -183,14 +185,15 @@ TEST_F(TieringEngineTest, WriteConsumerErrorPropagates) {
   auto engine = MakeEngine();
 
   constexpr core::SequenceId kSeq = 43;
+  const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
   EXPECT_CALL(queue_, BeginAppend(_, _))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
       .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
 
-  std::thread fulfiller([this]() {
+  std::thread fulfiller([this, kRpcId]() {
     while (rpc_.PendingCount() == 0) std::this_thread::yield();
-    EXPECT_TRUE(rpc_.Fulfill(kSeq, core::RespValue::Error(core::ErrorPrefix::kWrongType,
-                                                          "operation against wrong type")));
+    EXPECT_TRUE(rpc_.Fulfill(kRpcId, core::RespValue::Error(core::ErrorPrefix::kWrongType,
+                                                            "operation against wrong type")));
   });
 
   auto result = engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}));
@@ -260,6 +263,7 @@ TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
   TieringEngine engine(queue_, hot_, cold_, router_, rpc_, cfg);
 
   constexpr core::SequenceId kSeq = 201;
+  const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
   std::promise<core::Result<void>> durable_p;
   auto durable_fut = durable_p.get_future();
   EXPECT_CALL(queue_, BeginAppend(_, _))
@@ -273,11 +277,11 @@ TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
     std::this_thread::sleep_for(75ms);
     durable_p.set_value(core::Result<void>{});
   });
-  std::thread rpc_releaser([this]() {
+  std::thread rpc_releaser([this, kRpcId]() {
     std::this_thread::sleep_for(115ms);
     // Fulfill either succeeds (promise is still pending) or fails because the
     // RPC was cancelled on a timeout path — either way, no retry loop.
-    (void)rpc_.Fulfill(kSeq, core::RespValue::SimpleString("OK"));
+    (void)rpc_.Fulfill(kRpcId, core::RespValue::SimpleString("OK"));
   });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));

@@ -32,7 +32,8 @@ class ShardedHotStore : public core::HotStore {
 
   core::Result<core::RespValue> Exec(
       const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
-  core::Result<void> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction) override;
+  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op,
+                                      core::EvictionTTL eviction) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::EvictionTTL eviction) override;
   core::Result<core::MemoryStats> Stats() override;
@@ -50,7 +51,7 @@ class ShardedHotStore : public core::HotStore {
     mutable std::mutex access_mutex;
     std::vector<std::string> access_buffer;
 
-    explicit Shard(SingleShardConfig config) : store(config) {}
+    explicit Shard(SingleShardConfig config) : store(std::move(config)) {}
   };
 
   Shard& ShardFor(std::string_view key);
@@ -58,9 +59,9 @@ class ShardedHotStore : public core::HotStore {
   core::Result<core::RespValue> ExecMultiStringGet(const core::ops::MultiStringGet& op);
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
 
-  core::Result<void> ApplyDel(const core::ops::Del& op);
-  core::Result<void> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
-                                         core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyDel(const core::ops::Del& op);
+  core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
+                                                    core::EvictionTTL eviction);
 
   ShardedHotStoreConfig config_;
   std::vector<std::unique_ptr<Shard>> shards_;
