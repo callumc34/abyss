@@ -7,16 +7,13 @@
 #include "abyss/log/log.h"
 #include "abyss/platform/net.h"
 
+ABYSS_LOG_COMPONENT("abyss.net.conn")
+
 namespace abyss::net {
 
 namespace {
 
 namespace pnet = abyss::platform::net;
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.net.conn");
-  return l;
-}
 
 constexpr size_t kRecvChunkBytes = 8192;
 constexpr size_t kWriteCompactThresholdBytes = 65536;
@@ -124,7 +121,7 @@ bool Connection::SyncPollerInterest() {
   const EventKind want = DesiredInterest();
   if (want == armed_interest_) return true;
   if (auto r = poller_.Modify(fd_.Get(), want, this); !r) {
-    ABYSS_LOG_WARN(Log(), "poller modify failed", {"client_id", client_id_},
+    ABYSS_LOG_WARN("poller modify failed", {"client_id", client_id_},
                    {"err", std::string_view{r.error().message()}});
     Close(metrics::CloseReason::kClient);
     return false;
@@ -147,14 +144,14 @@ void Connection::Close(metrics::CloseReason reason) {
   // De-register before close: a reused fd number must not deliver to us.
   if (fd_.Valid()) {
     if (auto r = poller_.Remove(fd_.Get()); !r) {
-      ABYSS_LOG_DEBUG(Log(), "poller remove on close failed", {"client_id", client_id_},
+      ABYSS_LOG_DEBUG("poller remove on close failed", {"client_id", client_id_},
                       {"err", std::string_view{r.error().message()}});
     }
     pnet::ShutdownBoth(fd_.Get());
   }
   fd_.Reset();
 
-  ABYSS_LOG_DEBUG(Log(), "client closed", {"client_id", client_id_},
+  ABYSS_LOG_DEBUG("client closed", {"client_id", client_id_},
                   {"reason", metrics::ToStringView(reason)},
                   {"bytes_pending", static_cast<uint64_t>(WriteBufferBytes())});
 }
@@ -166,7 +163,7 @@ void Connection::OnReadable() {
     const size_t old_size = read_buf_.size();
     if (old_size + kRecvChunkBytes > config_.max_read_buffer_bytes &&
         old_size >= config_.max_read_buffer_bytes) {
-      ABYSS_LOG_WARN(Log(), "read buffer would exceed max", {"client_id", client_id_},
+      ABYSS_LOG_WARN("read buffer would exceed max", {"client_id", client_id_},
                      {"limit", static_cast<uint64_t>(config_.max_read_buffer_bytes)});
       Close(metrics::CloseReason::kOversize);
       return;
@@ -191,7 +188,7 @@ void Connection::OnReadable() {
     const int err = pnet::LastError();
     if (pnet::IsInterrupted(err)) continue;
     if (pnet::IsWouldBlock(err)) break;
-    ABYSS_LOG_DEBUG(Log(), "recv error", {"client_id", client_id_},
+    ABYSS_LOG_DEBUG("recv error", {"client_id", client_id_},
                     {"err", std::string_view{pnet::ErrorString(err)}});
     Close(metrics::CloseReason::kClient);
     return;
@@ -262,7 +259,7 @@ void Connection::TryDrainWrite() {
         Close(metrics::CloseReason::kClient);
         return;
       }
-      ABYSS_LOG_DEBUG(Log(), "send error", {"client_id", client_id_},
+      ABYSS_LOG_DEBUG("send error", {"client_id", client_id_},
                       {"err", std::string_view{pnet::ErrorString(err)}});
       Close(metrics::CloseReason::kClient);
       return;
@@ -281,7 +278,7 @@ void Connection::TryDrainWrite() {
 
 bool Connection::EnforceWriteHardLimit() {
   if (WriteBufferBytes() > config_.write_hard_limit_bytes) {
-    ABYSS_LOG_WARN(Log(), "write buffer exceeded hard limit", {"client_id", client_id_},
+    ABYSS_LOG_WARN("write buffer exceeded hard limit", {"client_id", client_id_},
                    {"bytes", static_cast<uint64_t>(WriteBufferBytes())},
                    {"limit", static_cast<uint64_t>(config_.write_hard_limit_bytes)});
     Close(metrics::CloseReason::kBackpressure);
@@ -298,7 +295,7 @@ void Connection::MaybePauseReading() {
   if (!SyncPollerInterest()) return;
   metrics_.backpressure_active.Increment();
   metrics_.backpressure_entered.Increment();
-  ABYSS_LOG_DEBUG(Log(), "backpressure paused", {"client_id", client_id_},
+  ABYSS_LOG_DEBUG("backpressure paused", {"client_id", client_id_},
                   {"write_bytes", static_cast<uint64_t>(WriteBufferBytes())});
 }
 
@@ -310,7 +307,7 @@ void Connection::MaybeResumeReading() {
   if (!SyncPollerInterest()) return;
   metrics_.backpressure_active.Decrement();
   metrics_.backpressure_exited.Increment();
-  ABYSS_LOG_DEBUG(Log(), "backpressure resumed", {"client_id", client_id_},
+  ABYSS_LOG_DEBUG("backpressure resumed", {"client_id", client_id_},
                   {"write_bytes", static_cast<uint64_t>(WriteBufferBytes())});
 }
 

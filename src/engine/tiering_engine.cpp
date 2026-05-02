@@ -10,14 +10,9 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
 
-namespace abyss::engine {
+ABYSS_LOG_COMPONENT("abyss.engine")
 
-namespace {
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.engine");
-  return l;
-}
-}  // namespace
+namespace abyss::engine {
 
 TieringEngine::TieringEngine(core::Queue& queue, core::HotStore& hot_store,
                              core::ColdStore& cold_store,
@@ -73,7 +68,7 @@ void TieringEngine::PromoteThroughQueue(std::string_view key) {
   auto appended = queue_.Append(shard, std::move(entry));
   if (!appended.has_value()) {
     promotion_append_failures_.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_WARN(Log(), "promotion append failed", {"shard", static_cast<int64_t>(shard)},
+    ABYSS_LOG_WARN("promotion append failed", {"shard", static_cast<int64_t>(shard)},
                    {"key_hash", log::KeyHash(key)},
                    {"err", std::string_view{appended.error().message()}});
   }
@@ -118,7 +113,7 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
   // fsync first: a durable-layer failure takes precedence over consumer error.
   if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
     rpc_.Cancel(rpc_id);
-    ABYSS_LOG_WARN(Log(), "write durable wait timeout", {"shard", static_cast<int64_t>(shard)},
+    ABYSS_LOG_WARN("write durable wait timeout", {"shard", static_cast<int64_t>(shard)},
                    {"seq", static_cast<uint64_t>(seq)},
                    {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
     return core::RespValue::Error(
@@ -128,7 +123,7 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
   auto durable = durable_future.get();
   if (!durable.has_value()) {
     rpc_.Cancel(rpc_id);
-    ABYSS_LOG_ERROR(Log(), "write durable failed", {"shard", static_cast<int64_t>(shard)},
+    ABYSS_LOG_ERROR("write durable failed", {"shard", static_cast<int64_t>(shard)},
                     {"seq", static_cast<uint64_t>(seq)},
                     {"err", std::string_view{durable.error().message()}});
     return std::unexpected(durable.error());
@@ -141,7 +136,7 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
 
   if (rpc_future.wait_until(rpc_deadline) == std::future_status::timeout) {
     rpc_.Cancel(rpc_id);
-    ABYSS_LOG_WARN(Log(), "write durable but consumer apply timeout",
+    ABYSS_LOG_WARN("write durable but consumer apply timeout",
                    {"shard", static_cast<int64_t>(shard)}, {"seq", static_cast<uint64_t>(seq)});
     return core::RespValue::Error(
         core::ErrorPrefix::kErr,

@@ -14,16 +14,13 @@
 #include "abyss/queue/wal_entry.h"
 #include "binary_io.h"
 
+ABYSS_LOG_COMPONENT("abyss.queue.segment")
+
 namespace abyss::queue {
 
 namespace {
 
 namespace pfs = abyss::platform::fs;
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.queue.segment");
-  return l;
-}
 
 constexpr size_t kReadChunkSize = size_t{256} * 1024;
 
@@ -143,7 +140,7 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
   }
 
   if (write_offset < file_size_bytes) {
-    ABYSS_LOG_WARN(Log(), "torn tail truncated at recovery", {"path", std::string_view{path}},
+    ABYSS_LOG_WARN("torn tail truncated at recovery", {"path", std::string_view{path}},
                    {"shard", static_cast<int64_t>(header->shard_id)},
                    {"base_seq", static_cast<uint64_t>(header->base_seq)},
                    {"file_size", static_cast<uint64_t>(file_size_bytes)},

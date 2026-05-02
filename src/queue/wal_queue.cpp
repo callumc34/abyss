@@ -10,14 +10,11 @@
 #include "abyss/queue/file_offset_store.h"
 #include "shard_state.h"
 
+ABYSS_LOG_COMPONENT("abyss.queue.wal")
+
 namespace abyss::queue {
 
 namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.queue.wal");
-  return l;
-}
 
 constexpr int kShardNameWidth = 4;
 
@@ -53,7 +50,7 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
   for (const auto& shard : queue->shards_) {
     max_head = std::max(max_head, shard->head_seq());
   }
-  ABYSS_LOG_INFO(Log(), "WAL opened", {"path", std::string_view{queue->config_.wal_path}},
+  ABYSS_LOG_INFO("WAL opened", {"path", std::string_view{queue->config_.wal_path}},
                  {"shard_count", static_cast<int64_t>(queue->config_.shard_count)},
                  {"segment_size_bytes", static_cast<uint64_t>(queue->config_.segment_size_bytes)},
                  {"min_retention_s", static_cast<int64_t>(queue->config_.min_retention.count())},
@@ -91,7 +88,7 @@ core::Result<void> WalQueue::Initialize() {
     for (auto consumer : config_.retention_consumers) {
       if (auto persisted = offsets_->Get(consumer, shard); persisted.has_value()) {
         if (*persisted > (*state)->head_seq()) {
-          ABYSS_LOG_CRITICAL(Log(), "persisted offset exceeds WAL head",
+          ABYSS_LOG_CRITICAL("persisted offset exceeds WAL head",
                              {"consumer", static_cast<uint64_t>(consumer)},
                              {"shard", static_cast<int64_t>(shard)},
                              {"persisted", static_cast<uint64_t>(*persisted)},
@@ -119,8 +116,7 @@ void WalQueue::RunReaper() {
   auto result = reaper_->RunOnce();
   if (!result.has_value()) {
     reaper_failures_.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_WARN(Log(), "segment reaper failed",
-                   {"err", std::string_view{result.error().message()}});
+    ABYSS_LOG_WARN("segment reaper failed", {"err", std::string_view{result.error().message()}});
   }
 }
 

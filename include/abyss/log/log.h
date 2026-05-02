@@ -76,11 +76,19 @@ class Logger {
 // Component-scoped logger; results are cached process-wide.
 Logger Get(std::string_view component);
 
-// Emission macros: expand to a level check that gates field-argument
-// evaluation. `msg` should be static; dynamic values go in fields.
-// Usage: ABYSS_LOG_INFO(logger, "flush complete", {"reason", "quiet"});
+// Declare a translation-unit-scoped logger. Place once per .cpp, before any
+// ABYSS_LOG_* call. The implicit macros below reference kAbyssLog_.
 //
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
+#define ABYSS_LOG_COMPONENT(name)                                  \
+  namespace {                                                      \
+  const ::abyss::log::Logger kAbyssLog_ = ::abyss::log::Get(name); \
+  }
+
+// Base macro: explicit logger, gates field-argument evaluation on the level
+// check. Used by the implicit macros below and by tests that need a specific
+// logger instance.
+// Usage: ABYSS_LOG_EMIT_(logger, Level::kInfo, "msg", {"k", v});
 #define ABYSS_LOG_EMIT_(LOGGER, LEVEL, MSG, ...)                                                  \
   do {                                                                                            \
     const ::abyss::log::Logger& abyss_log_logger_ = (LOGGER);                                     \
@@ -92,18 +100,20 @@ Logger Get(std::string_view component);
     }                                                                                             \
   } while (false)
 
-#define ABYSS_LOG_TRACE(LOGGER, MSG, ...) \
-  ABYSS_LOG_EMIT_(LOGGER, ::abyss::log::Level::kTrace, MSG __VA_OPT__(, ) __VA_ARGS__)
-#define ABYSS_LOG_DEBUG(LOGGER, MSG, ...) \
-  ABYSS_LOG_EMIT_(LOGGER, ::abyss::log::Level::kDebug, MSG __VA_OPT__(, ) __VA_ARGS__)
-#define ABYSS_LOG_INFO(LOGGER, MSG, ...) \
-  ABYSS_LOG_EMIT_(LOGGER, ::abyss::log::Level::kInfo, MSG __VA_OPT__(, ) __VA_ARGS__)
-#define ABYSS_LOG_WARN(LOGGER, MSG, ...) \
-  ABYSS_LOG_EMIT_(LOGGER, ::abyss::log::Level::kWarn, MSG __VA_OPT__(, ) __VA_ARGS__)
-#define ABYSS_LOG_ERROR(LOGGER, MSG, ...) \
-  ABYSS_LOG_EMIT_(LOGGER, ::abyss::log::Level::kError, MSG __VA_OPT__(, ) __VA_ARGS__)
-#define ABYSS_LOG_CRITICAL(LOGGER, MSG, ...) \
-  ABYSS_LOG_EMIT_(LOGGER, ::abyss::log::Level::kCritical, MSG __VA_OPT__(, ) __VA_ARGS__)
+// Implicit emission macros. Require ABYSS_LOG_COMPONENT in the same TU.
+// Usage: ABYSS_LOG_INFO("flush complete", {"reason", "quiet"});
+#define ABYSS_LOG_TRACE(MSG, ...) \
+  ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kTrace, MSG __VA_OPT__(, ) __VA_ARGS__)
+#define ABYSS_LOG_DEBUG(MSG, ...) \
+  ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kDebug, MSG __VA_OPT__(, ) __VA_ARGS__)
+#define ABYSS_LOG_INFO(MSG, ...) \
+  ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kInfo, MSG __VA_OPT__(, ) __VA_ARGS__)
+#define ABYSS_LOG_WARN(MSG, ...) \
+  ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kWarn, MSG __VA_OPT__(, ) __VA_ARGS__)
+#define ABYSS_LOG_ERROR(MSG, ...) \
+  ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kError, MSG __VA_OPT__(, ) __VA_ARGS__)
+#define ABYSS_LOG_CRITICAL(MSG, ...) \
+  ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kCritical, MSG __VA_OPT__(, ) __VA_ARGS__)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 
 }  // namespace abyss::log

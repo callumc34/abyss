@@ -10,6 +10,8 @@
 #include "abyss/version.h"
 #include "server.h"
 
+ABYSS_LOG_COMPONENT("abyss.server.bootstrap")
+
 namespace {
 
 std::atomic<bool> g_shutdown_requested{false};
@@ -63,15 +65,12 @@ int main(int argc, char* argv[]) {
 
   CLI11_PARSE(app, argc, argv);
 
-  const auto bootstrap_logger = abyss::log::Get("abyss.server.bootstrap");
-
   abyss::config::Config config;
   const std::string resolved = ResolveConfigPath(config_path);
   if (!resolved.empty()) {
     auto loaded = abyss::config::Config::LoadFromFile(resolved);
     if (!loaded.has_value()) {
-      ABYSS_LOG_CRITICAL(bootstrap_logger, "config load failed",
-                         {"path", std::string_view{resolved}},
+      ABYSS_LOG_CRITICAL("config load failed", {"path", std::string_view{resolved}},
                          {"err", std::string_view{loaded.error().message()}});
       return EXIT_FAILURE;
     }
@@ -82,8 +81,7 @@ int main(int argc, char* argv[]) {
     config.cold.data_path = data_dir + "/cold";
     config.ApplyEnvironmentOverrides();
     if (auto r = config.Validate(); !r.has_value()) {
-      ABYSS_LOG_CRITICAL(bootstrap_logger, "config invalid",
-                         {"err", std::string_view{r.error().message()}});
+      ABYSS_LOG_CRITICAL("config invalid", {"err", std::string_view{r.error().message()}});
       return EXIT_FAILURE;
     }
   }
@@ -92,14 +90,14 @@ int main(int argc, char* argv[]) {
   if (shard_count_override.has_value()) config.hot.shard_count = *shard_count_override;
 
   if (auto r = config.Validate(); !r.has_value()) {
-    ABYSS_LOG_CRITICAL(bootstrap_logger, "config invalid after overrides",
+    ABYSS_LOG_CRITICAL("config invalid after overrides",
                        {"err", std::string_view{r.error().message()}});
     return EXIT_FAILURE;
   }
 
   abyss::log::Init(config.log);
 
-  ABYSS_LOG_INFO(bootstrap_logger, "abyss starting", {"version", std::string_view{abyss::kVersion}},
+  ABYSS_LOG_INFO("abyss starting", {"version", std::string_view{abyss::kVersion}},
                  {"profile", std::string_view{config.profile}},
                  {"bind", std::string_view{config.net.bind}},
                  {"port", static_cast<int64_t>(config.net.port)},
@@ -121,13 +119,12 @@ int main(int argc, char* argv[]) {
   abyss::server::Server server(config);
   server.set_ready_fd(ready_fd);
   if (!server.Initialize()) {
-    ABYSS_LOG_CRITICAL(bootstrap_logger, "server initialize failed");
+    ABYSS_LOG_CRITICAL("server initialize failed");
     return EXIT_FAILURE;
   }
 
   server.Run(g_shutdown_requested);
 
-  ABYSS_LOG_INFO(bootstrap_logger, "abyss stopped",
-                 {"signal", static_cast<int64_t>(g_shutdown_signal.load())});
+  ABYSS_LOG_INFO("abyss stopped", {"signal", static_cast<int64_t>(g_shutdown_signal.load())});
   return EXIT_SUCCESS;
 }

@@ -9,14 +9,11 @@
 #include "abyss/core/ops.h"
 #include "abyss/log/log.h"
 
+ABYSS_LOG_COMPONENT("abyss.hot.consumer")
+
 namespace abyss::consumer {
 
 namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.hot.consumer");
-  return l;
-}
 
 core::RespValue MapApplyError(const core::Error& err) {
   switch (err.code()) {
@@ -68,14 +65,14 @@ size_t HotConsumer::PendingConditionalCount() const {
 }
 
 void HotConsumer::Run() {
-  ABYSS_LOG_DEBUG(Log(), "hot consumer started", {"shard", static_cast<int64_t>(config_.shard)});
+  ABYSS_LOG_DEBUG("hot consumer started", {"shard", static_cast<int64_t>(config_.shard)});
 
   while (!stop_requested_.load(std::memory_order_acquire)) {
     auto read = queue_.Read(core::kHotConsumer, config_.shard, config_.read_batch_size,
                             config_.read_timeout);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
-        ABYSS_LOG_WARN(Log(), "hot consumer stopping: queue unavailable",
+        ABYSS_LOG_WARN("hot consumer stopping: queue unavailable",
                        {"shard", static_cast<int64_t>(config_.shard)});
         return;
       }
@@ -101,7 +98,7 @@ void HotConsumer::Run() {
     CheckBlockAndScanTimeout();
   }
 
-  ABYSS_LOG_DEBUG(Log(), "hot consumer stopped", {"shard", static_cast<int64_t>(config_.shard)});
+  ABYSS_LOG_DEBUG("hot consumer stopped", {"shard", static_cast<int64_t>(config_.shard)});
 }
 
 void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
@@ -109,7 +106,7 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
   core::RespValue result;
   if (cmd.args.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_ERROR(Log(), "queue entry has empty command payload",
+    ABYSS_LOG_ERROR("queue entry has empty command payload",
                     {"shard", static_cast<int64_t>(config_.shard)});
     result =
         core::RespValue::Error(core::ErrorPrefix::kErr, "empty command payload in queue entry");
@@ -117,9 +114,9 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
     auto op = core::ops::ParseWriteOp(cmd.args[0], cmd);
     if (!op.has_value()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-      ABYSS_LOG_ERROR(
-          Log(), "queue entry parse failed", {"shard", static_cast<int64_t>(config_.shard)},
-          {"cmd", std::string_view{cmd.args[0]}}, {"err", std::string_view{op.error().message()}});
+      ABYSS_LOG_ERROR("queue entry parse failed", {"shard", static_cast<int64_t>(config_.shard)},
+                      {"cmd", std::string_view{cmd.args[0]}},
+                      {"err", std::string_view{op.error().message()}});
       result = core::RespValue::Error(core::ErrorPrefix::kErr, op.error().message());
     } else {
       const auto eviction = eviction_policy_.Resolve(core::ops::PrimaryKey(*op));
@@ -127,7 +124,7 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
       if (!applied.has_value()) {
         counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
         if (applied.error().code() != core::ErrorCode::kWrongType) {
-          ABYSS_LOG_ERROR(Log(), "hot apply failed", {"shard", static_cast<int64_t>(config_.shard)},
+          ABYSS_LOG_ERROR("hot apply failed", {"shard", static_cast<int64_t>(config_.shard)},
                           {"cmd", std::string_view{cmd.args[0]}},
                           {"err", std::string_view{applied.error().message()}});
         }
@@ -172,8 +169,7 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
     if (!applied.has_value()) {
       counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
       if (applied.error().code() != core::ErrorCode::kWrongType) {
-        ABYSS_LOG_ERROR(Log(), "hot resolved apply failed",
-                        {"shard", static_cast<int64_t>(config_.shard)},
+        ABYSS_LOG_ERROR("hot resolved apply failed", {"shard", static_cast<int64_t>(config_.shard)},
                         {"ref", static_cast<uint64_t>(resolved.ref)},
                         {"err", std::string_view{applied.error().message()}});
       }
@@ -257,7 +253,7 @@ void HotConsumer::CheckBlockAndScanTimeout() {
   const auto age = std::chrono::steady_clock::now() - oldest;
   if (age >= config_.block_and_scan_timeout && !block_and_scan_warning_emitted_) {
     ABYSS_LOG_WARN(
-        Log(), "hot consumer block-and-scan timeout; resolver may be stuck",
+        "hot consumer block-and-scan timeout; resolver may be stuck",
         {"shard", static_cast<int64_t>(config_.shard)},
         {"oldest_age_ms",
          static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(age).count())});

@@ -4,14 +4,9 @@
 
 #include "abyss/log/log.h"
 
-namespace abyss::consumer {
+ABYSS_LOG_COMPONENT("abyss.resolver")
 
-namespace {
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.resolver");
-  return l;
-}
-}  // namespace
+namespace abyss::consumer {
 
 ResolverPool::ResolverPool(core::Queue& queue, core::ColdStore& cold,
                            CompactionBufferRouter& buffer_router, core::ConsumerRpc& rpc,
@@ -40,7 +35,7 @@ core::Result<void> ResolverPool::ReplayForRecovery() {
 
 void ResolverPool::Start() {
   for (auto& consumer : consumers_) consumer->Start();
-  ABYSS_LOG_INFO(Log(), "resolvers started", {"count", static_cast<int64_t>(consumers_.size())});
+  ABYSS_LOG_INFO("resolvers started", {"count", static_cast<int64_t>(consumers_.size())});
 }
 
 void ResolverPool::Stop() {

@@ -16,16 +16,13 @@
 #include "binary_io.h"
 #include "crc32c.h"
 
+ABYSS_LOG_COMPONENT("abyss.queue.offsets")
+
 namespace abyss::queue {
 
 namespace {
 
 namespace pfs = abyss::platform::fs;
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.queue.offsets");
-  return l;
-}
 
 constexpr std::array<std::byte, 8> kOffsetMagic{
     std::byte{'A'}, std::byte{'B'}, std::byte{'Y'}, std::byte{'S'},
@@ -84,7 +81,7 @@ core::Result<std::unique_ptr<FileOffsetStore>> FileOffsetStore::Open(FileOffsetS
     const std::scoped_lock lock(store->mu_);
     for (const auto& [_, shards] : store->offsets_) persisted += shards.size();
   }
-  ABYSS_LOG_INFO(Log(), "offset store opened", {"dir", std::string_view{store->config_.directory}},
+  ABYSS_LOG_INFO("offset store opened", {"dir", std::string_view{store->config_.directory}},
                  {"persisted_entries", static_cast<uint64_t>(persisted)});
 
   return store;
@@ -111,7 +108,7 @@ core::Result<void> FileOffsetStore::Set(core::ConsumerId consumer, core::ShardId
   }
   auto result = WriteShardFile(consumer, shard, seq);
   if (!result.has_value()) {
-    ABYSS_LOG_ERROR(Log(), "offset persist failed", {"consumer", static_cast<uint64_t>(consumer)},
+    ABYSS_LOG_ERROR("offset persist failed", {"consumer", static_cast<uint64_t>(consumer)},
                     {"shard", static_cast<int64_t>(shard)}, {"seq", static_cast<uint64_t>(seq)},
                     {"err", std::string_view{result.error().message()}});
   }
@@ -184,13 +181,13 @@ core::Result<FileOffsetStore::Record> FileOffsetStore::LoadShardFile(const std::
 
   const auto* raw = reinterpret_cast<const uint8_t*>(bytes->data());
   if (std::memcmp(raw, kOffsetMagic.data(), kOffsetMagic.size()) != 0) {
-    ABYSS_LOG_CRITICAL(Log(), "offsets magic mismatch", {"path", std::string_view{path}});
+    ABYSS_LOG_CRITICAL("offsets magic mismatch", {"path", std::string_view{path}});
     return std::unexpected(core::Error{core::ErrorCode::kCorruption, "offsets magic mismatch"});
   }
 
   const uint8_t major = raw[kOffsetMagic.size()];
   if (major != kOffsetFormatMajor) {
-    ABYSS_LOG_CRITICAL(Log(), "unsupported offsets format", {"path", std::string_view{path}},
+    ABYSS_LOG_CRITICAL("unsupported offsets format", {"path", std::string_view{path}},
                        {"found_major", static_cast<int64_t>(major)},
                        {"expected_major", static_cast<int64_t>(kOffsetFormatMajor)});
     return std::unexpected(
@@ -213,7 +210,7 @@ core::Result<FileOffsetStore::Record> FileOffsetStore::LoadShardFile(const std::
   const uint32_t computed =
       Crc32c(std::span<const std::byte>(bytes->data(), kOffsetRecordSize - sizeof(uint32_t)));
   if (computed != stored_crc) {
-    ABYSS_LOG_CRITICAL(Log(), "offsets crc mismatch", {"path", std::string_view{path}},
+    ABYSS_LOG_CRITICAL("offsets crc mismatch", {"path", std::string_view{path}},
                        {"stored_crc", static_cast<uint64_t>(stored_crc)},
                        {"computed_crc", static_cast<uint64_t>(computed)});
     return std::unexpected(core::Error{core::ErrorCode::kCorruption, "offsets crc mismatch"});
