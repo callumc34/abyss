@@ -11,7 +11,8 @@ if(ABYSS_BUILD_TESTS)
   abyss_mark_slow_tests(unit "${CMAKE_CURRENT_SOURCE_DIR}/unit"
     FileOffsetStoreTest.ConcurrentSetsAcrossShardsSameConsumerAllPersist)
   abyss_mark_slow_tests(component "${CMAKE_CURRENT_SOURCE_DIR}/component"
-    WalQueueTest.TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace)
+    WalQueueTest.TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace
+    HotConsumerTest.ConcurrentWritersAlwaysSeeRegisteredEntries)
 endif()
 
 if(ABYSS_BUILD_BENCHMARKS)
