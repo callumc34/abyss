@@ -35,6 +35,8 @@ class TestServer {
 
   bool IsRunning() const { return proc_ != kInvalidProcHandle; }
   uint16_t Port() const { return port_; }
+  uint16_t AdminPort() const { return admin_port_; }
+  uint16_t MetricsPort() const { return metrics_port_; }
   const std::string& SkipReason() const { return skip_reason_; }
 
  private:
@@ -46,6 +48,8 @@ class TestServer {
   proc_handle_t proc_ = kInvalidProcHandle;
   pipe_handle_t ready_read_ = kInvalidPipeHandle;
   uint16_t port_ = 0;
+  uint16_t admin_port_ = 0;
+  uint16_t metrics_port_ = 0;
   std::string skip_reason_;
 };
 

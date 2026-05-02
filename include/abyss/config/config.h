@@ -120,6 +120,7 @@ struct LogConfig {
 };
 
 struct AdminConfig {
+  bool enabled = true;
   std::string bind = "0.0.0.0";
   uint16_t port = 8080;
 };

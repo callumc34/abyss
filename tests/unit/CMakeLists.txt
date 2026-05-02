@@ -180,6 +180,25 @@ target_link_libraries(abyss_net_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_admin_tests
+  admin/http_server_test.cpp
+  admin/health_handler_test.cpp
+  admin/ready_handler_test.cpp
+  admin/metrics_handler_test.cpp
+  admin/status_handler_test.cpp
+  admin/json_writer_test.cpp
+)
+
+target_include_directories(abyss_admin_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/admin
+)
+
+target_link_libraries(abyss_admin_tests PRIVATE
+  abyss::admin
+  abyss::test_support
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -191,3 +210,4 @@ abyss_discover_tests(abyss_support_tests  "unit\;unit-support")
 abyss_discover_tests(abyss_log_tests      "unit\;unit-log")
 abyss_discover_tests(abyss_metrics_tests  "unit\;unit-metrics")
 abyss_discover_tests(abyss_net_tests      "unit\;unit-net")
+abyss_discover_tests(abyss_admin_tests    "unit\;unit-admin")

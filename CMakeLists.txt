@@ -81,6 +81,14 @@ set_package_properties(yaml-cpp PROPERTIES
   PURPOSE "Configuration file parsing"
 )
 
+find_package(httplib CONFIG REQUIRED)
+set_package_properties(httplib PROPERTIES
+  TYPE REQUIRED
+  DESCRIPTION "Header-only C++ HTTP/HTTPS server and client library"
+  URL "https://github.com/yhirose/cpp-httplib"
+  PURPOSE "Admin and metrics HTTP endpoints"
+)
+
 if(ABYSS_WITH_LOGGING)
   find_package(spdlog CONFIG REQUIRED)
   set_package_properties(spdlog PROPERTIES
@@ -121,6 +129,25 @@ add_feature_info(WithMetrics     ABYSS_WITH_METRICS     "Enable prometheus-cpp-b
 add_feature_info(BuildFuzz       ABYSS_BUILD_FUZZ       "Build libFuzzer fuzz targets")
 add_feature_info(UseCcache       ABYSS_USE_CCACHE       "Use ccache as compiler launcher if available")
 
+find_package(Git QUIET)
+if(Git_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE ABYSS_BUILD_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _git_status
+  )
+  if(NOT _git_status EQUAL 0)
+    set(ABYSS_BUILD_COMMIT "unknown")
+  endif()
+else()
+  set(ABYSS_BUILD_COMMIT "unknown")
+endif()
+
+string(TIMESTAMP ABYSS_BUILD_DATE "%Y-%m-%dT%H:%M:%SZ" UTC)
+
 configure_file(
   cmake/version.h.in
   ${CMAKE_BINARY_DIR}/generated/abyss/version.h
@@ -139,6 +166,7 @@ add_subdirectory(src/consumer)
 add_subdirectory(src/engine)
 add_subdirectory(src/net)
 add_subdirectory(src/config)
+add_subdirectory(src/admin)
 
 add_subdirectory(apps/abyss-server)
 

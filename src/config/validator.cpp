@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <ranges>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -21,11 +20,6 @@ core::Error InvalidArg(std::string path, std::string_view message) {
 
 bool OneOf(std::string_view value, std::initializer_list<std::string_view> allowed) {
   return std::ranges::find(allowed, value) != allowed.end();
-}
-
-core::Result<void> RequirePort(std::string path, uint16_t port) {
-  if (port == 0) return std::unexpected(InvalidArg(std::move(path), "port must be non-zero"));
-  return {};
 }
 
 core::Result<void> RequireNonEmpty(std::string path, std::string_view value) {
@@ -217,7 +211,8 @@ core::Result<void> ValidateNet(const NetConfig& n) {
 
 core::Result<void> ValidateMetrics(const MetricsConfig& m) {
   if (auto r = RequireNonEmpty("metrics.bind", m.bind); !r) return r;
-  if (auto r = RequirePort("metrics.port", m.port); !r) return r;
+  // port == 0 requests an OS-assigned ephemeral port; the listener reports
+  // the bound port via the readiness pipe.
   return {};
 }
 
@@ -244,7 +239,7 @@ core::Result<void> ValidateLog(const LogConfig& l) {
 
 core::Result<void> ValidateAdmin(const AdminConfig& a) {
   if (auto r = RequireNonEmpty("admin.bind", a.bind); !r) return r;
-  if (auto r = RequirePort("admin.port", a.port); !r) return r;
+  // port == 0 requests an OS-assigned ephemeral port.
   return {};
 }
 
@@ -255,9 +250,9 @@ core::Result<void> ValidatePortCollisions(const Config& c) {
       {c.metrics.port, "metrics.port"},
       {c.admin.port, "admin.port"},
   }};
-  for (auto lhs_it = ports.begin(); lhs_it != ports.end(); ++lhs_it) {
+  for (const auto* lhs_it = ports.begin(); lhs_it != ports.end(); ++lhs_it) {
     if (lhs_it->first == 0) continue;  // ephemeral; resolved at bind time
-    for (auto rhs_it = std::next(lhs_it); rhs_it != ports.end(); ++rhs_it) {
+    for (const auto* rhs_it = std::next(lhs_it); rhs_it != ports.end(); ++rhs_it) {
       if (lhs_it->first == rhs_it->first) {
         std::string msg = "collides with ";
         msg += rhs_it->second;

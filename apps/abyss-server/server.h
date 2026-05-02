@@ -4,6 +4,11 @@
 #include <cstdint>
 #include <memory>
 
+#include "abyss/admin/health_handler.h"
+#include "abyss/admin/http_server.h"
+#include "abyss/admin/metrics_handler.h"
+#include "abyss/admin/ready_handler.h"
+#include "abyss/admin/status_handler.h"
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/consumer/hot_consumer_pool.h"
@@ -36,6 +41,14 @@ class Server {
   void Run(const std::atomic<bool>& stop);
   void Shutdown();
   bool IsReady() const { return ready_.load(std::memory_order_acquire); }
+  bool IsShuttingDown() const { return shutting_down_.load(std::memory_order_acquire); }
+
+  uint16_t AdminBoundPort() const noexcept {
+    return admin_http_ != nullptr ? admin_http_->BoundPort() : 0;
+  }
+  uint16_t MetricsBoundPort() const noexcept {
+    return metrics_http_ != nullptr ? metrics_http_->BoundPort() : 0;
+  }
 
   // POSIX: file descriptor. Windows: HANDLE reinterpreted as intptr_t.
   void set_ready_fd(intptr_t fd) { ready_fd_ = fd; }
@@ -66,6 +79,16 @@ class Server {
   std::unique_ptr<resp::RespMetrics> resp_metrics_;
 
   std::unique_ptr<net::TcpServer> tcp_server_;
+
+  // Admin / metrics HTTP servers. Both are torn down at the head of Shutdown
+  // so /ready flips to 503 before consumers stop, giving K8s its drain window.
+  std::unique_ptr<StatusProviderImpl> status_provider_;
+  std::unique_ptr<admin::HealthHandler> health_handler_;
+  std::unique_ptr<admin::ReadyHandler> ready_handler_;
+  std::unique_ptr<admin::StatusHandler> status_handler_;
+  std::unique_ptr<admin::MetricsHandler> metrics_handler_;
+  std::unique_ptr<admin::HttpServer> admin_http_;
+  std::unique_ptr<admin::HttpServer> metrics_http_;
 
   intptr_t ready_fd_ = -1;
   std::atomic<bool> ready_{false};

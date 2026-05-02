@@ -60,12 +60,101 @@
 
 ## Health Endpoints
 
+Two HTTP listeners run alongside the RESP server. Both default to `0.0.0.0` and can be disabled via `admin.enabled` / `metrics.enabled` in config. Pass `0` for either port to request an OS-assigned ephemeral port (the bound port is reported on the `--ready-fd` JSON line and in `/status`).
+
 | Endpoint | Port | Purpose |
 |----------|------|---------|
-| `GET /healthz` | 8080 | Liveness: process alive, RESP port bound |
-| `GET /ready` | 8080 | Readiness: recovery complete, serving traffic |
+| `GET /healthz` | 8080 | Liveness probe |
+| `GET /ready` | 8080 | Readiness probe |
+| `GET /status` | 8080 | Operational state snapshot (JSON) |
 | `GET /metrics` | 9090 | Prometheus scrape target |
-| `GET /status` | 8080 | JSON: component stats, consumer positions, lag |
+
+All endpoints accept `GET` and `HEAD` only. `POST`/`PUT`/`DELETE` return `405 Method Not Allowed` with an `Allow: GET, HEAD` header. Unknown paths on either port return `404`. Connections are per-request (no keep-alive); each handler completes within a hard read/write deadline so a slow client cannot pin a worker thread.
+
+### `/healthz` — Liveness
+
+Always returns `200 OK` with body `ok\n` once the listener is up. The fact that the process generated a response is itself the liveness signal — Kubernetes SIG-Node convention. Failing this probe means the kubelet should restart the container, so it is deliberately permissive: TCP-bound state, recovery progress, and consumer health belong in `/ready`, not here.
+
+### `/ready` — Readiness
+
+Returns `200 OK` only when **all** of the following hold:
+
+- The RESP TCP listener is bound and accepting traffic.
+- Recovery is complete (queue is no longer in `IsRecovering` state and every hot consumer has caught up to its ready watermark).
+- The server is not in `shutting_down` state.
+
+Otherwise returns `503 Service Unavailable`. The body is plain text key:value pairs naming each condition's truth value, so an operator can see at a glance which check failed:
+
+```
+tcp_bound: true
+recovery_complete: false
+not_shutting_down: true
+```
+
+Returning `503` during shutdown grace removes the pod from Kubernetes Service endpoints before the data plane stops, allowing in-flight clients to drain via the configured `net.shutdown_grace_seconds`.
+
+### `/metrics` — Prometheus scrape
+
+Returns the Prometheus exposition format payload (`text/plain; version=0.0.4; charset=utf-8`) from the process-wide registry. Empty body when the registry is empty or `metrics.enabled = false` — Prometheus tolerates an empty body. The endpoint always returns `200`.
+
+### `/status` — Operational state snapshot
+
+Returns a JSON document with the live operational state of the process. Content-Type is `application/json; charset=utf-8`. The schema is **foundational** — extended only by addition, never by rename or type change.
+
+```json
+{
+  "schema_version": 1,
+  "abyss":   { "version": "0.1.0", "build": { "commit": "abc1234", "date": "2026-05-03T12:34:56Z" } },
+  "server":  { "node_id": "...", "started_at_unix_ms": 1714742400000,
+               "uptime_seconds": 3600, "process_id": 12345,
+               "ready": true, "loading": false, "shutting_down": false,
+               "mode": "standalone", "role": "master" },
+  "config":  { "profile": "embedded", "shard_count": 64,
+               "fsync_policy": "group_commit", "default_eviction_seconds": 86400 },
+  "endpoints": {
+    "resp":    { "bind": "0.0.0.0", "port": 6379 },
+    "admin":   { "bind": "0.0.0.0", "port": 8080, "enabled": true },
+    "metrics": { "bind": "0.0.0.0", "port": 9090, "enabled": true }
+  },
+  "queue": { "backend": "builtin_wal", "head_seq": 0, "tail_seq": 0,
+             "total_entries": 0, "total_bytes": 0 },
+  "hot":   { "backend": "builtin_hashmap", "key_count": 0, "memory_bytes": 0 },
+  "cold":  { "backend": "builtin_rocksdb", "key_count": 0,
+             "buffer": { "entries": 0, "bytes": 0 } },
+  "consumers": {
+    "hot":      { "highest_settled_seq_min": 0, "highest_settled_seq_max": 0 },
+    "cold":     { "last_ack_seq_min": 0, "last_ack_seq_max": 0 },
+    "resolver": { "last_ack_seq_min": 0, "last_ack_seq_max": 0,
+                  "cache_entries": 0, "cache_bytes": 0 }
+  },
+  "lag":     { "hot_max_entries": 0, "cold_max_entries": 0,
+               "resolver_max_entries": 0 },
+  "connections": { "active": 0 },
+  "cluster": null
+}
+```
+
+#### Schema-stability invariants
+
+These invariants govern any change to the `/status` payload across releases. Bumping `schema_version` is the only signal that one of them has been broken.
+
+- **Append-only.** New fields may be added to any object. Existing fields are never renamed, retyped, or removed.
+- **Reserved nulls.** Keys reserved for capabilities not yet present (e.g. `cluster` in Phase 1) appear as `null`. They are not omitted.
+- **Neutral values for unset numerics.** Counters and gauges default to `0` when not yet observable; never missing.
+- **Per-tier name stability.** `queue.backend`, `hot.backend`, `cold.backend` are free-form strings whose values may change with the deployment profile. Their *keys* are stable.
+- **Counters belong in `/metrics`, not `/status`.** Anything that monotonically increases — flushes, decisions, accepted connections — is exposed as a Prometheus counter, not a JSON field. Trend and rate observation belong on the metrics path; `/status` is a state snapshot.
+
+#### Field semantics
+
+- `schema_version` — bumps only when an invariant above is broken. Today: `1`.
+- `abyss.build.commit` / `abyss.build.date` — captured at configure time. `unknown` outside a git checkout.
+- `server.mode` — `"standalone"` or `"cluster"`. Phase 1 always emits `"standalone"`.
+- `server.role` — `"master"` or `"replica"`. Phase 1 always emits `"master"`.
+- `consumers.*.{seq}_min` / `_max` — per-shard min and max of the corresponding sequence positions. Equal values mean uniform progress across shards; divergence indicates shard skew.
+- `lag.*_max_entries` — worst-case lag across shards (`tail_seq − consumer_seq`), in queue entries.
+- `cluster` — reserved for Phase 2; populated with `slots_owned`, `peers`, `epoch` when cluster mode lands.
+
+
 
 ## Logging
 
