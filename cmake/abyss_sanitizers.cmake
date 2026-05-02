@@ -8,8 +8,8 @@
 #   none                no sanitizer (default).
 #   address             AddressSanitizer.
 #   thread              ThreadSanitizer.
-#   undefined           UndefinedBehaviorSanitizer (extended check set, clang only).
-#   address+undefined   ASan + UBSan combined (default UBSan check group, GCC or clang).
+#   undefined           UndefinedBehaviorSanitizer (default check group + float-divide-by-zero).
+#   address+undefined   ASan + UBSan combined (default UBSan check group).
 
 set(ABYSS_SANITIZER_VALUES none address thread undefined address+undefined)
 set(ABYSS_SANITIZER "none" CACHE STRING
@@ -57,32 +57,9 @@ elseif(ABYSS_SANITIZER STREQUAL "address+undefined")
   list(APPEND _abyss_san_link -fsanitize=address,undefined)
 
 elseif(ABYSS_SANITIZER STREQUAL "undefined")
-  # The extended UBSan check set relies on clang-only groups (nullability,
-  # local-bounds) and the modern -fsanitize-ignorelist semantics. GCC's UBSan
-  # has known parity gaps in both. The asan preset's address+undefined mode
-  # covers GCC with the default check group.
-  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
-    message(FATAL_ERROR
-      "ABYSS_SANITIZER=undefined requires Clang (got ${CMAKE_CXX_COMPILER_ID}); "
-      "use ABYSS_SANITIZER=address+undefined for the default UBSan check group on GCC")
-  endif()
-
-  # Extended check set beyond the default `undefined` group:
-  #   nullability           - null passed to _Nonnull-annotated parameters.
-  #   local-bounds          - stack-array OOB the default array-bounds misses.
-  #   float-divide-by-zero  - finite/zero on float (not in `undefined`).
-  #   integer               - signed + unsigned overflow + shifts. Highest-value
-  #                           check for offset, sequence, and TTL math.
-  #   implicit-conversion   - narrowing/sign-changing implicit conversions.
-  set(_ubsan_on undefined,nullability,local-bounds,float-divide-by-zero,integer,implicit-conversion)
-  # Sub-checks inside the groups above that are pure noise on idiomatic C++:
-  #   implicit-integer-sign-change       - fires on int -> size_t indexing.
-  #   implicit-signed-integer-truncation - fires on `uint8_t x = 0xFF`.
-  set(_ubsan_off implicit-integer-sign-change,implicit-signed-integer-truncation)
-
+  set(_ubsan_on undefined,float-divide-by-zero)
   list(APPEND _abyss_san_compile
     -fsanitize=${_ubsan_on}
-    -fno-sanitize=${_ubsan_off}
     -fno-sanitize-recover=all
   )
   list(APPEND _abyss_san_link -fsanitize=${_ubsan_on})

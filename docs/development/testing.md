@@ -18,9 +18,9 @@ ctest --preset default -L unit-hot      # one library's unit tests
 ctest --preset default -R '.*Recovery.*' # name regex
 ```
 
-Sanitizers run in CI via dedicated presets (`asan`, `tsan`, `ubsan`) as a build-matrix fan-out. The `asan` and `tsan` jobs use `jobs: 2` to avoid OOM under shadow-memory inflation; `ubsan` runs `jobs: 4`. ASan/TSan are not reliable on Apple Silicon locally; UBSan is, and reproducing findings locally with `cmake --preset ubsan` is supported (requires Clang).
+Sanitizers run in CI via dedicated presets (`asan`, `tsan`, `ubsan`) as a build-matrix fan-out. The `asan` and `tsan` jobs use `jobs: 2` to avoid OOM under shadow-memory inflation; `ubsan` runs `jobs: 4`. ASan/TSan are not reliable on Apple Silicon locally; UBSan is, and reproducing findings locally with `cmake --preset ubsan` is supported.
 
-CI sets `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:abort_on_error=1` and points at `cmake/ubsan_suppressions.txt`. The `asan` preset combines AddressSanitizer with the default UBSan check group, so `UBSAN_OPTIONS` is set on that job too — a UBSan hit during an asan run aborts the test, just as an ASan hit does. The `ubsan` preset enables the extended UBSan check set; see `docs/development/building.md` for the full check inventory.
+CI sets `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:abort_on_error=1` and points at `cmake/ubsan_suppressions.txt`. The `asan` preset combines AddressSanitizer with the default UBSan check group, so `UBSAN_OPTIONS` is set on that job too — a UBSan hit during an asan run aborts the test, just as an ASan hit does. See `docs/development/building.md` for the full check inventory.
 
 Micro-benchmarks are not run via ctest. Build with the `bench` preset and run the binary directly.
 

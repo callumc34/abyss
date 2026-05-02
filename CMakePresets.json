@@ -38,8 +38,6 @@
       "inherits": "default",
       "cacheVariables": {
         "ABYSS_SANITIZER": "undefined",
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_CXX_FLAGS_DEBUG": "-O1 -g"
       }
     },

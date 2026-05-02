@@ -70,9 +70,9 @@ ctest --preset default
 |--------|------|-------|-------------|
 | `default` | Debug | On | Development build |
 | `release` | Release | Off | Optimised build |
-| `asan` | Debug | On | Address sanitizer + undefined behaviour sanitizer (default UBSan check group) |
+| `asan` | Debug | On | Address sanitizer + undefined behaviour sanitizer |
 | `tsan` | Debug | On | Thread sanitizer |
-| `ubsan` | Debug, `-O1` | On | Standalone undefined behaviour sanitizer with extended check set. Clang-only |
+| `ubsan` | Debug, `-O1` | On | Standalone undefined behaviour sanitizer |
 | `bench` | Release | Off | Benchmarks enabled (pulls in `benchmark` via vcpkg) |
 | `container` | Release | Off | Static-linked binary for container images (Linux only) |
 
@@ -85,30 +85,30 @@ cmake --build build/asan
 cmake --preset tsan
 cmake --build build/tsan
 
-# Standalone UndefinedBehaviorSanitizer (extended check set, requires Clang)
-CC=clang CXX=clang++ cmake --preset ubsan
+# Standalone UndefinedBehaviorSanitizer
+cmake --preset ubsan
 cmake --build build/ubsan
 ```
 
 ## Sanitizers
 
-Sanitizer wiring is centralised in `cmake/abyss_sanitizers.cmake` and selected via `ABYSS_SANITIZER`:
+Sanitizer wiring is centralised in `cmake/abyss_sanitizers.cmake` and selected via `ABYSS_SANITIZER`. All sanitizer presets use the same compiler as the `default` preset (GCC on Linux CI, the system clang on macOS).
 
-| `ABYSS_SANITIZER` | Compiler | Checks |
-|-------------------|----------|--------|
-| `none` (default) | any | — |
-| `address` | GCC or Clang | AddressSanitizer only |
-| `thread` | GCC or Clang | ThreadSanitizer |
-| `address+undefined` | GCC or Clang | AddressSanitizer + default UBSan check group, used by the `asan` preset |
-| `undefined` | Clang only | Extended UBSan check set, used by the `ubsan` preset |
+| `ABYSS_SANITIZER` | Checks |
+|-------------------|--------|
+| `none` (default) | — |
+| `address` | AddressSanitizer only |
+| `thread` | ThreadSanitizer |
+| `address+undefined` | AddressSanitizer + default UBSan check group, used by the `asan` preset |
+| `undefined` | Default UBSan check group + `float-divide-by-zero`, used by the `ubsan` preset |
 
-The `undefined` mode enables a wider check set than the default `-fsanitize=undefined` group: `nullability`, `local-bounds`, `float-divide-by-zero`, `integer` (including unsigned overflow), and `implicit-conversion`. Two noisy implicit-conversion sub-checks (`implicit-integer-sign-change`, `implicit-signed-integer-truncation`) are turned off because they fire on idiomatic `int → size_t` indexing and `uint8_t = literal` patterns.
+The default `-fsanitize=undefined` check group covers signed-integer-overflow, bounds, null, alignment, shift, vptr, return, unreachable, vla-bound, enum, builtin, pointer-overflow, object-size, and integer-divide-by-zero. The `ubsan` preset adds `float-divide-by-zero` (not in the default group on either compiler).
 
-The `ubsan` preset pins to Clang because the extended checks (`nullability`, `local-bounds`) and the modern `-fsanitize-ignorelist` semantics are clang-first; GCC's UBSan has parity gaps. It builds at `-O1` rather than unoptimised Debug — UBSan's value comes from finding UB the optimiser is about to exploit, and `-O1` engages range analysis and DCE without the inlining transforms that ruin stack traces. Assertions are kept enabled (`Debug` build type, no `NDEBUG`).
+The `ubsan` preset builds at `-O1` rather than unoptimised Debug — UBSan's value comes from finding UB the optimiser is about to exploit, and `-O1` engages range analysis and DCE without the inlining transforms that ruin stack traces. Assertions stay enabled (`Debug` build type, no `NDEBUG`).
 
 `-fno-sanitize-recover=all` is set on the `ubsan` preset and `-fno-sanitize-recover=undefined` on the `asan` preset, so a UBSan finding aborts the test process — required for CI to fail on UB.
 
-Third-party headers pulled into our translation units (RocksDB, hiredis, libc++/libstdc++, gtest) are scoped out via `cmake/ubsan_ignorelist.txt`. Runtime suppressions for `vptr`/`function` checks (which can't be ignorelisted at compile time) live in `cmake/ubsan_suppressions.txt`.
+Third-party headers pulled into our translation units (RocksDB, hiredis, libstdc++, gtest) are scoped out via `cmake/ubsan_ignorelist.txt` (supported by GCC ≥ 12 and Clang). Runtime suppressions for `vptr`/`function` checks (which can't be ignorelisted at compile time) live in `cmake/ubsan_suppressions.txt`.
 
 ## Build Options
 
