@@ -108,7 +108,7 @@ The `ubsan` preset builds at `-O1` rather than unoptimised Debug — UBSan's val
 
 `-fno-sanitize-recover=all` is set on the `ubsan` preset and `-fno-sanitize-recover=undefined` on the `asan` preset, so a UBSan finding aborts the test process — required for CI to fail on UB.
 
-Third-party headers pulled into our translation units (RocksDB, hiredis, libstdc++, gtest) are scoped out via `cmake/ubsan_ignorelist.txt` (supported by GCC ≥ 12 and Clang). Runtime suppressions for `vptr`/`function` checks (which can't be ignorelisted at compile time) live in `cmake/ubsan_suppressions.txt`.
+Third-party headers pulled into our translation units (RocksDB, hiredis, libstdc++, gtest) are scoped out via `cmake/ubsan_ignorelist.txt` when building with Clang. GCC has no equivalent flag, so the ignorelist isn't applied on GCC; this is acceptable in practice because GCC's default `undefined` check group is narrower than Clang's and the third-party patterns that needed scoping (e.g. unsigned shift wrap in libc++'s hash) aren't checked by GCC. Runtime suppressions for `vptr`/`function` checks live in `cmake/ubsan_suppressions.txt`.
 
 ## Build Options
 

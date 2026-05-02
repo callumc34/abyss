@@ -64,9 +64,12 @@ elseif(ABYSS_SANITIZER STREQUAL "undefined")
   )
   list(APPEND _abyss_san_link -fsanitize=${_ubsan_on})
 
-  set(_ubsan_ignorelist "${PROJECT_SOURCE_DIR}/cmake/ubsan_ignorelist.txt")
-  if(EXISTS "${_ubsan_ignorelist}")
-    list(APPEND _abyss_san_compile "-fsanitize-ignorelist=${_ubsan_ignorelist}")
+  # -fsanitize-ignorelist is clang-only; GCC has no equivalent.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
+    set(_ubsan_ignorelist "${PROJECT_SOURCE_DIR}/cmake/ubsan_ignorelist.txt")
+    if(EXISTS "${_ubsan_ignorelist}")
+      list(APPEND _abyss_san_compile "-fsanitize-ignorelist=${_ubsan_ignorelist}")
+    endif()
   endif()
 endif()
 
