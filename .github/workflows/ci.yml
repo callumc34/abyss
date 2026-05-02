@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [asan, tsan]
+        preset: [asan, tsan, ubsan]
     uses: ./.github/workflows/_sanitizer.yml
     with:
       preset: ${{ matrix.preset }}

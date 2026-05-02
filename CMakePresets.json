@@ -23,14 +23,24 @@
       "name": "asan",
       "inherits": "default",
       "cacheVariables": {
-        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer"
+        "ABYSS_SANITIZER": "address+undefined"
       }
     },
     {
       "name": "tsan",
       "inherits": "default",
       "cacheVariables": {
-        "CMAKE_CXX_FLAGS": "-fsanitize=thread"
+        "ABYSS_SANITIZER": "thread"
+      }
+    },
+    {
+      "name": "ubsan",
+      "inherits": "default",
+      "cacheVariables": {
+        "ABYSS_SANITIZER": "undefined",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_FLAGS_DEBUG": "-O1 -g"
       }
     },
     {
@@ -91,6 +101,7 @@
     { "name": "release", "configurePreset": "release" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
     { "name": "bench", "configurePreset": "bench" },
     { "name": "cloud-only", "configurePreset": "cloud-only" },
     { "name": "container", "configurePreset": "container" },
@@ -140,6 +151,17 @@
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 300
+      }
+    },
+    {
+      "name": "ubsan",
+      "configurePreset": "ubsan",
+      "output": { "outputOnFailure": true },
+      "execution": {
+        "jobs": 4,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 180
       }
     },
     {

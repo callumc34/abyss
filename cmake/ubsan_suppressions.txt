@@ -1,0 +1,10 @@
+# Runtime UBSan suppressions for the abyss test binaries.
+#
+# Use sparingly. Compile-time scoping via cmake/ubsan_ignorelist.txt is
+# preferred; runtime suppressions exist for checks that fire on dynamic type
+# information (vptr, function) which the ignorelist cannot scope.
+#
+# Format: <check>:<symbol-or-type-pattern>
+# Reference: https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#runtime-suppressions
+
+# (intentionally empty — add entries as concrete cases arise)
