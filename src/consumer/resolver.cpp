@@ -17,14 +17,11 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
 
+ABYSS_LOG_COMPONENT("abyss.resolver")
+
 namespace abyss::consumer {
 
 namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.resolver");
-  return l;
-}
 
 std::string AsciiUpper(std::string_view s) {
   std::string out(s);
@@ -843,7 +840,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
           const core::RpcId client_rpc_id = core::MakeRpcId(config_.shard, entry.seq);
           if (!append.has_value()) {
             append_failures_.fetch_add(1, std::memory_order_relaxed);
-            ABYSS_LOG_ERROR(Log(), "resolver append failed",
+            ABYSS_LOG_ERROR("resolver append failed",
                             {"shard", static_cast<int64_t>(config_.shard)},
                             {"seq", static_cast<uint64_t>(entry.seq)},
                             {"err", std::string_view{append.error().message()}});
@@ -873,14 +870,14 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
 }
 
 void Resolver::Run() {
-  ABYSS_LOG_DEBUG(Log(), "resolver started", {"shard", static_cast<int64_t>(config_.shard)});
+  ABYSS_LOG_DEBUG("resolver started", {"shard", static_cast<int64_t>(config_.shard)});
 
   while (!stop_requested_.load(std::memory_order_acquire)) {
     auto read = queue_.Read(core::kResolverConsumer, config_.shard, config_.read_batch_size,
                             config_.read_timeout);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
-        ABYSS_LOG_WARN(Log(), "resolver stopping: queue unavailable",
+        ABYSS_LOG_WARN("resolver stopping: queue unavailable",
                        {"shard", static_cast<int64_t>(config_.shard)});
         return;
       }
@@ -901,7 +898,7 @@ void Resolver::Run() {
     cache_.SweepExpired();
   }
 
-  ABYSS_LOG_DEBUG(Log(), "resolver stopped", {"shard", static_cast<int64_t>(config_.shard)});
+  ABYSS_LOG_DEBUG("resolver stopped", {"shard", static_cast<int64_t>(config_.shard)});
 }
 
 bool Resolver::WaitForHotApply(core::SequenceId seq) {
@@ -917,8 +914,7 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
   }
   apply_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
   apply_notifier_.Cancel(id);
-  ABYSS_LOG_WARN(Log(), "resolver hot-apply wait timeout",
-                 {"shard", static_cast<int64_t>(config_.shard)},
+  ABYSS_LOG_WARN("resolver hot-apply wait timeout", {"shard", static_cast<int64_t>(config_.shard)},
                  {"seq", static_cast<uint64_t>(seq)});
   return false;
 }
@@ -1014,7 +1010,7 @@ void Resolver::UpdateCacheFromResolved(core::SequenceId seq,
 // ---------------------------------------------------------------------------
 
 core::Result<void> Resolver::ReplayForRecovery() {
-  ABYSS_LOG_INFO(Log(), "resolver replay starting", {"shard", static_cast<int64_t>(config_.shard)});
+  ABYSS_LOG_INFO("resolver replay starting", {"shard", static_cast<int64_t>(config_.shard)});
 
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
   core::SequenceId highest_seen = 0;
@@ -1090,7 +1086,7 @@ core::Result<void> Resolver::ReplayForRecovery() {
     auto append = queue_.Append(config_.shard, std::move(out));
     if (!append.has_value()) {
       ABYSS_LOG_ERROR(
-          Log(), "resolver replay append failed", {"shard", static_cast<int64_t>(config_.shard)},
+          "resolver replay append failed", {"shard", static_cast<int64_t>(config_.shard)},
           {"seq", static_cast<uint64_t>(seq)}, {"err", std::string_view{append.error().message()}});
       return std::unexpected(append.error());
     }
@@ -1105,7 +1101,7 @@ core::Result<void> Resolver::ReplayForRecovery() {
     last_ack_seq_.store(drained, std::memory_order_release);
   }
 
-  ABYSS_LOG_INFO(Log(), "resolver replay complete", {"shard", static_cast<int64_t>(config_.shard)},
+  ABYSS_LOG_INFO("resolver replay complete", {"shard", static_cast<int64_t>(config_.shard)},
                  {"dangling_emitted", static_cast<uint64_t>(sorted.size())},
                  {"cache_entries", static_cast<uint64_t>(cache_.Size())});
   return {};

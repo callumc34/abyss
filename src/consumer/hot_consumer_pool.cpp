@@ -4,14 +4,9 @@
 
 #include "abyss/log/log.h"
 
-namespace abyss::consumer {
+ABYSS_LOG_COMPONENT("abyss.hot.consumer")
 
-namespace {
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.hot.consumer");
-  return l;
-}
-}  // namespace
+namespace abyss::consumer {
 
 HotConsumerPool::HotConsumerPool(core::Queue& queue, core::HotStore& hot_store,
                                  core::ConsumerRpc& rpc, core::ApplyNotifier& apply_notifier,
@@ -34,8 +29,7 @@ void HotConsumerPool::Start() {
   for (auto& consumer : consumers_) {
     consumer->Start();
   }
-  ABYSS_LOG_INFO(Log(), "hot consumers started",
-                 {"count", static_cast<int64_t>(consumers_.size())});
+  ABYSS_LOG_INFO("hot consumers started", {"count", static_cast<int64_t>(consumers_.size())});
 }
 
 void HotConsumerPool::Stop() {

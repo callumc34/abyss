@@ -5,14 +5,11 @@
 
 #include "abyss/log/log.h"
 
+ABYSS_LOG_COMPONENT("abyss.queue.group_commit")
+
 namespace abyss::queue {
 
 namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.queue.group_commit");
-  return l;
-}
 
 constexpr std::chrono::milliseconds kSlowFsyncThreshold{50};
 
@@ -132,12 +129,12 @@ void GroupCommitter::Run() {
     const auto elapsed = std::chrono::steady_clock::now() - start;
 
     if (!result.has_value()) {
-      ABYSS_LOG_ERROR(Log(), "fsync failed", {"batch", static_cast<uint64_t>(batch.size())},
+      ABYSS_LOG_ERROR("fsync failed", {"batch", static_cast<uint64_t>(batch.size())},
                       {"bytes", static_cast<uint64_t>(batch_bytes)},
                       {"err", std::string_view{result.error().message()}});
     } else if (elapsed > kSlowFsyncThreshold) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-      ABYSS_LOG_WARN(Log(), "slow fsync", {"batch", static_cast<uint64_t>(batch.size())},
+      ABYSS_LOG_WARN("slow fsync", {"batch", static_cast<uint64_t>(batch.size())},
                      {"bytes", static_cast<uint64_t>(batch_bytes)},
                      {"duration_ms", static_cast<int64_t>(ms)});
     }

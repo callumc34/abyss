@@ -8,14 +8,9 @@
 #include "abyss/core/thread_annotations.h"
 #include "abyss/log/log.h"
 
-namespace abyss::hot {
+ABYSS_LOG_COMPONENT("abyss.hot.store")
 
-namespace {
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.hot.store");
-  return l;
-}
-}  // namespace
+namespace abyss::hot {
 
 ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(config) {
   SingleShardConfig shard_config{
@@ -27,7 +22,7 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(config)
   for (uint32_t i = 0; i < config_.shard_count; ++i) {
     shards_.push_back(std::make_unique<Shard>(shard_config));
   }
-  ABYSS_LOG_INFO(Log(), "hot store opened", {"shards", static_cast<int64_t>(config_.shard_count)},
+  ABYSS_LOG_INFO("hot store opened", {"shards", static_cast<int64_t>(config_.shard_count)},
                  {"max_memory_bytes", static_cast<uint64_t>(config_.max_memory_bytes)});
 }
 

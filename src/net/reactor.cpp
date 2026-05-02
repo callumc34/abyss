@@ -7,16 +7,9 @@
 #include "abyss/log/log.h"
 #include "abyss/net/tcp_server.h"
 
+ABYSS_LOG_COMPONENT("abyss.net.reactor")
+
 namespace abyss::net {
-
-namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.net.reactor");
-  return l;
-}
-
-}  // namespace
 
 Reactor::Reactor(uint32_t id, TcpServer& server, std::unique_ptr<Poller> poller, bool is_acceptor)
     : id_(id), server_(server), poller_(std::move(poller)), is_acceptor_(is_acceptor) {}
@@ -45,7 +38,7 @@ void Reactor::Start() { thread_ = std::thread(&Reactor::Run, this); }
 
 void Reactor::RequestStop() {
   if (auto r = poller_->Wake(); !r) {
-    ABYSS_LOG_WARN(Log(), "wake during stop failed", {"reactor", static_cast<int64_t>(id_)},
+    ABYSS_LOG_WARN("wake during stop failed", {"reactor", static_cast<int64_t>(id_)},
                    {"err", std::string_view{r.error().message()}});
   }
 }
@@ -60,14 +53,14 @@ void Reactor::Handoff(HandoffEntry entry) {
     handoff_queue_.push_back(std::move(entry));
   }
   if (auto r = poller_->Wake(); !r) {
-    ABYSS_LOG_WARN(Log(), "wake during handoff failed", {"reactor", static_cast<int64_t>(id_)},
+    ABYSS_LOG_WARN("wake during handoff failed", {"reactor", static_cast<int64_t>(id_)},
                    {"err", std::string_view{r.error().message()}});
   }
 }
 
 void Reactor::Run() {
   running_.store(true, std::memory_order_release);
-  ABYSS_LOG_DEBUG(Log(), "reactor started", {"reactor", static_cast<int64_t>(id_)},
+  ABYSS_LOG_DEBUG("reactor started", {"reactor", static_cast<int64_t>(id_)},
                   {"acceptor", is_acceptor_});
 
   bool grace_set = false;
@@ -80,7 +73,7 @@ void Reactor::Run() {
 
     if (stopping && is_acceptor_ && listener_armed_) {
       if (auto r = poller_->Remove(listen_fd_); !r) {
-        ABYSS_LOG_WARN(Log(), "listener disarm failed", {"reactor", static_cast<int64_t>(id_)},
+        ABYSS_LOG_WARN("listener disarm failed", {"reactor", static_cast<int64_t>(id_)},
                        {"err", std::string_view{r.error().message()}});
       }
       listener_armed_ = false;
@@ -101,7 +94,7 @@ void Reactor::Run() {
 
     auto wait_result = poller_->Wait(timeout);
     if (!wait_result) {
-      ABYSS_LOG_ERROR(Log(), "poll wait failed", {"reactor", static_cast<int64_t>(id_)},
+      ABYSS_LOG_ERROR("poll wait failed", {"reactor", static_cast<int64_t>(id_)},
                       {"err", std::string_view{wait_result.error().message()}});
       break;
     }
@@ -127,7 +120,7 @@ void Reactor::Run() {
   SweepClosed();
 
   running_.store(false, std::memory_order_release);
-  ABYSS_LOG_DEBUG(Log(), "reactor stopped", {"reactor", static_cast<int64_t>(id_)});
+  ABYSS_LOG_DEBUG("reactor stopped", {"reactor", static_cast<int64_t>(id_)});
 }
 
 void Reactor::DrainHandoff() {
@@ -144,7 +137,7 @@ void Reactor::DrainHandoff() {
                                      server_.config_.connection, server_.metrics_, server_.clock_);
 
     if (auto r = conn->Arm(); !r) {
-      ABYSS_LOG_WARN(Log(), "arm failed; dropping connection", {"client_id", entry.client_id},
+      ABYSS_LOG_WARN("arm failed; dropping connection", {"client_id", entry.client_id},
                      {"err", std::string_view{r.error().message()}});
       server_.active_count_.fetch_sub(1, std::memory_order_relaxed);
       continue;

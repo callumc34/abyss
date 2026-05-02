@@ -24,17 +24,12 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #endif
 
+ABYSS_LOG_COMPONENT("abyss.server")
+
 namespace abyss::server {
 
 namespace {
-
-const log::Logger& ServerLog() {
-  static const log::Logger l = log::Get("abyss.server");
-  return l;
-}
-
 constexpr std::chrono::milliseconds kStopPollInterval{100};
-
 }  // namespace
 
 Server::Server(config::Config config) : config_(std::move(config)) {}
@@ -43,8 +38,7 @@ Server::~Server() { Shutdown(); }
 
 bool Server::Initialize() {
   if (config_.profile != "embedded") {
-    ABYSS_LOG_CRITICAL(ServerLog(), "unsupported profile",
-                       {"profile", std::string_view{config_.profile}},
+    ABYSS_LOG_CRITICAL("unsupported profile", {"profile", std::string_view{config_.profile}},
                        {"supported", std::string_view{"embedded"}});
     return false;
   }
@@ -58,13 +52,13 @@ bool Server::Initialize() {
   std::error_code ec;
   std::filesystem::create_directories(config_.queue.wal_path, ec);
   if (ec) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "create WAL directory failed",
+    ABYSS_LOG_CRITICAL("create WAL directory failed",
                        {"path", std::string_view{config_.queue.wal_path}}, {"err", ec.message()});
     return false;
   }
   std::filesystem::create_directories(config_.cold.data_path, ec);
   if (ec) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "create cold store directory failed",
+    ABYSS_LOG_CRITICAL("create cold store directory failed",
                        {"path", std::string_view{config_.cold.data_path}}, {"err", ec.message()});
     return false;
   }
@@ -76,7 +70,7 @@ bool Server::Initialize() {
 
   auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
   if (!fsync_policy.has_value()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "invalid fsync_policy",
+    ABYSS_LOG_CRITICAL("invalid fsync_policy",
                        {"value", std::string_view{config_.queue.fsync_policy}},
                        {"err", std::string_view{fsync_policy.error().message()}});
     return false;
@@ -99,13 +93,12 @@ bool Server::Initialize() {
       .volatile_consumers = {core::kHotConsumer},
   });
   if (!queue_result.has_value()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "WAL open failed",
-                       {"path", std::string_view{config_.queue.wal_path}},
+    ABYSS_LOG_CRITICAL("WAL open failed", {"path", std::string_view{config_.queue.wal_path}},
                        {"err", std::string_view{queue_result.error().message()}});
     return false;
   }
   if ((*queue_result)->IsRecovering()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "WAL opened but still recovering; refusing to start");
+    ABYSS_LOG_CRITICAL("WAL opened but still recovering; refusing to start");
     return false;
   }
   queue_ = std::move(*queue_result);
@@ -118,8 +111,7 @@ bool Server::Initialize() {
       .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
   });
   if (!cold_result.has_value()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "cold store open failed",
-                       {"path", std::string_view{config_.cold.data_path}},
+    ABYSS_LOG_CRITICAL("cold store open failed", {"path", std::string_view{config_.cold.data_path}},
                        {"err", std::string_view{cold_result.error().message()}});
     return false;
   }
@@ -188,8 +180,7 @@ bool Server::Initialize() {
 
   // Resolver replay must finish before any consumer starts. ADP-011 §Recovery.
   if (auto r = resolver_pool_->ReplayForRecovery(); !r.has_value()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "resolver replay failed",
-                       {"err", std::string_view{r.error().message()}});
+    ABYSS_LOG_CRITICAL("resolver replay failed", {"err", std::string_view{r.error().message()}});
     return false;
   }
 
@@ -207,7 +198,7 @@ bool Server::Initialize() {
 
   auto identity = resp::NodeIdentity::Open(config_.queue.wal_path);
   if (!identity.has_value()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "node identity load failed",
+    ABYSS_LOG_CRITICAL("node identity load failed",
                        {"err", std::string_view{identity.error().message()}});
     return false;
   }
@@ -261,8 +252,7 @@ bool Server::Initialize() {
       [server_ptr = tcp_server_.get()] { return server_ptr->ActiveConnections(); });
 
   ready_.store(true, std::memory_order_release);
-  ABYSS_LOG_INFO(ServerLog(), "server ready",
-                 {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
+  ABYSS_LOG_INFO("server ready", {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
   return true;
 #endif
 }
@@ -270,8 +260,7 @@ bool Server::Initialize() {
 void Server::Run(const std::atomic<bool>& stop) {
   if (!tcp_server_) return;
   if (auto r = tcp_server_->Start(); !r.has_value()) {
-    ABYSS_LOG_CRITICAL(ServerLog(), "tcp server start failed",
-                       {"err", std::string_view{r.error().message()}});
+    ABYSS_LOG_CRITICAL("tcp server start failed", {"err", std::string_view{r.error().message()}});
     return;
   }
 
@@ -279,7 +268,7 @@ void Server::Run(const std::atomic<bool>& stop) {
   if (stats_) stats_->SetTcpPort(config_.net.port);
 
   NotifyReady();
-  ABYSS_LOG_INFO(ServerLog(), "listening", {"version", std::string_view{kVersion}},
+  ABYSS_LOG_INFO("listening", {"version", std::string_view{kVersion}},
                  {"bind", std::string_view{config_.net.bind}},
                  {"port", static_cast<int64_t>(config_.net.port)});
 
@@ -325,7 +314,7 @@ void Server::NotifyReady() {
 void Server::Shutdown() {
   if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
-  ABYSS_LOG_INFO(ServerLog(), "shutdown starting");
+  ABYSS_LOG_INFO("shutdown starting");
 
   if (tcp_server_) {
     tcp_server_->Stop();
@@ -337,7 +326,7 @@ void Server::Shutdown() {
   if (hot_eviction_worker_) hot_eviction_worker_->Stop();
 
   ready_.store(false, std::memory_order_release);
-  ABYSS_LOG_INFO(ServerLog(), "shutdown complete");
+  ABYSS_LOG_INFO("shutdown complete");
 }
 
 }  // namespace abyss::server

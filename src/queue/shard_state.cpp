@@ -11,14 +11,11 @@
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
 
+ABYSS_LOG_COMPONENT("abyss.queue.shard")
+
 namespace abyss::queue {
 
 namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.queue.shard");
-  return l;
-}
 
 constexpr int kSegmentNameWidth = 20;
 
@@ -94,12 +91,12 @@ core::Result<std::unique_ptr<ShardState>> ShardState::Open(ShardStateConfig conf
   // A pristine shard has exactly one segment with seq 0. Pre-existing state
   // means this process is picking up from prior writes; call that out.
   if (segment_count > 1 || state->head_seq() > 0) {
-    ABYSS_LOG_INFO(Log(), "shard recovered", {"shard", static_cast<int64_t>(state->config_.shard)},
+    ABYSS_LOG_INFO("shard recovered", {"shard", static_cast<int64_t>(state->config_.shard)},
                    {"segments", static_cast<int64_t>(segment_count)},
                    {"head_seq", static_cast<uint64_t>(state->head_seq())},
                    {"tail_seq", static_cast<uint64_t>(state->tail_seq())});
   } else {
-    ABYSS_LOG_DEBUG(Log(), "shard opened", {"shard", static_cast<int64_t>(state->config_.shard)});
+    ABYSS_LOG_DEBUG("shard opened", {"shard", static_cast<int64_t>(state->config_.shard)});
   }
   return state;
 }
@@ -164,7 +161,7 @@ core::Result<void> ShardState::OpenExistingSegments() {
     if (!opened.has_value()) return std::unexpected(opened.error());
 
     if (opened->header().shard_id != config_.shard) {
-      ABYSS_LOG_CRITICAL(Log(), "segment shard_id mismatch", {"path", path.string()},
+      ABYSS_LOG_CRITICAL("segment shard_id mismatch", {"path", path.string()},
                          {"expected_shard", static_cast<int64_t>(config_.shard)},
                          {"found_shard", static_cast<int64_t>(opened->header().shard_id)});
       return std::unexpected(core::Error{core::ErrorCode::kCorruption,
@@ -172,7 +169,7 @@ core::Result<void> ShardState::OpenExistingSegments() {
     }
 
     if (expected_base_seq.has_value() && opened->header().base_seq != *expected_base_seq) {
-      ABYSS_LOG_CRITICAL(Log(), "segment base_seq gap", {"path", path.string()},
+      ABYSS_LOG_CRITICAL("segment base_seq gap", {"path", path.string()},
                          {"shard", static_cast<int64_t>(config_.shard)},
                          {"expected_base_seq", static_cast<uint64_t>(*expected_base_seq)},
                          {"found_base_seq", static_cast<uint64_t>(opened->header().base_seq)});
@@ -244,7 +241,7 @@ core::Result<void> ShardState::Rotate() {
   committer_ = std::make_unique<GroupCommitter>(config_.commit,
                                                 [captured = active_] { return captured->Fsync(); });
 
-  ABYSS_LOG_DEBUG(Log(), "segment rotated", {"shard", static_cast<int64_t>(config_.shard)},
+  ABYSS_LOG_DEBUG("segment rotated", {"shard", static_cast<int64_t>(config_.shard)},
                   {"sealed_base_seq", static_cast<uint64_t>(sealed_base)},
                   {"sealed_bytes", static_cast<uint64_t>(sealed_bytes)},
                   {"sealed_entries", static_cast<uint64_t>(sealed_entries)},

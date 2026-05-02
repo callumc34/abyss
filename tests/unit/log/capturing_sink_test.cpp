@@ -4,6 +4,8 @@
 #include "abyss/log/log.h"
 #include "abyss/log/testing.h"
 
+ABYSS_LOG_COMPONENT("fixture")
+
 namespace abyss::log {
 namespace {
 
@@ -22,8 +24,7 @@ class CapturingSinkTest : public ::testing::Test {
 
 TEST_F(CapturingSinkTest, ReceivesEmittedRecords) {
   testing::CapturingSink capture;
-  const Logger l = Get("fixture");
-  ABYSS_LOG_INFO(l, "hello world", {"count", int64_t{3}});
+  ABYSS_LOG_INFO("hello world", {"count", int64_t{3}});
 
   const auto records = capture.Records();
   ASSERT_EQ(records.size(), 1U);
@@ -43,10 +44,9 @@ TEST_F(CapturingSinkTest, LevelFilteringAppliesBeforeCapture) {
   Init(cfg);
 
   testing::CapturingSink capture;
-  const Logger l = Get("fixture");
-  ABYSS_LOG_DEBUG(l, "debug");
-  ABYSS_LOG_INFO(l, "info");
-  ABYSS_LOG_ERROR(l, "error");
+  ABYSS_LOG_DEBUG("debug");
+  ABYSS_LOG_INFO("info");
+  ABYSS_LOG_ERROR("error");
 
   const auto records = capture.Records();
   ASSERT_EQ(records.size(), 1U);
@@ -62,22 +62,20 @@ TEST_F(CapturingSinkTest, MacroSkipsArgEvaluationBelowLevel) {
   Init(cfg);
 
   testing::CapturingSink capture;
-  const Logger l = Get("fixture");
   bool evaluated = false;
   const auto expensive = [&]() {
     evaluated = true;
     return std::string_view{"ignored"};
   };
-  ABYSS_LOG_DEBUG(l, "gated out", {"k", expensive()});
+  ABYSS_LOG_DEBUG("gated out", {"k", expensive()});
   EXPECT_FALSE(evaluated);
   EXPECT_EQ(capture.Size(), 0U);
 }
 
 TEST_F(CapturingSinkTest, ClearResetsCaptured) {
   testing::CapturingSink capture;
-  const Logger l = Get("fixture");
-  ABYSS_LOG_INFO(l, "a");
-  ABYSS_LOG_INFO(l, "b");
+  ABYSS_LOG_INFO("a");
+  ABYSS_LOG_INFO("b");
   EXPECT_EQ(capture.Size(), 2U);
   capture.Clear();
   EXPECT_EQ(capture.Size(), 0U);

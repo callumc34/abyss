@@ -10,14 +10,11 @@
 #include "abyss/platform/net.h"
 #include "reactor.h"
 
+ABYSS_LOG_COMPONENT("abyss.net")
+
 namespace abyss::net {
 
 namespace {
-
-const log::Logger& Log() {
-  static const log::Logger l = log::Get("abyss.net");
-  return l;
-}
 
 uint32_t ResolveIoThreads(uint32_t configured) {
   if (configured > 0) return configured;
@@ -55,7 +52,7 @@ core::Result<void> TcpServer::Start() {
       .reuse_addr = true,
   });
   if (!listen_result) {
-    ABYSS_LOG_ERROR(Log(), "listener bind failed", {"bind", std::string_view{config_.bind}},
+    ABYSS_LOG_ERROR("listener bind failed", {"bind", std::string_view{config_.bind}},
                     {"port", static_cast<int64_t>(config_.port)},
                     {"err", std::string_view{listen_result.error().message()}});
     return std::unexpected(listen_result.error());
@@ -87,7 +84,7 @@ core::Result<void> TcpServer::Start() {
   }
 
   running_.store(true, std::memory_order_release);
-  ABYSS_LOG_INFO(Log(), "tcp server listening", {"bind", std::string_view{config_.bind}},
+  ABYSS_LOG_INFO("tcp server listening", {"bind", std::string_view{config_.bind}},
                  {"port", static_cast<int64_t>(bound_port_)},
                  {"io_threads", static_cast<int64_t>(io_threads)},
                  {"max_connections", static_cast<int64_t>(config_.max_connections)});
@@ -96,7 +93,7 @@ core::Result<void> TcpServer::Start() {
 
 void TcpServer::RequestStop() {
   if (stop_requested_.exchange(true, std::memory_order_acq_rel)) return;
-  ABYSS_LOG_INFO(Log(), "tcp server stopping",
+  ABYSS_LOG_INFO("tcp server stopping",
                  {"active", static_cast<int64_t>(active_count_.load(std::memory_order_relaxed))},
                  {"grace_seconds", static_cast<int64_t>(config_.shutdown_grace.count())});
   for (auto& reactor : reactors_) {
@@ -111,7 +108,7 @@ void TcpServer::Join() {
   listen_fd_.Reset();
   reactors_.clear();
   running_.store(false, std::memory_order_release);
-  ABYSS_LOG_INFO(Log(), "tcp server stopped");
+  ABYSS_LOG_INFO("tcp server stopped");
 }
 
 void TcpServer::Stop() {
@@ -124,7 +121,7 @@ void TcpServer::AcceptAll() {
     auto accepted = AcceptNonBlocking(listen_fd_.Get());
     if (!accepted) {
       if (accepted.error().code() == core::ErrorCode::kUnavailable) return;
-      ABYSS_LOG_WARN(Log(), "accept failed", {"err", std::string_view{accepted.error().message()}});
+      ABYSS_LOG_WARN("accept failed", {"err", std::string_view{accepted.error().message()}});
       return;
     }
 
@@ -135,7 +132,7 @@ void TcpServer::AcceptAll() {
     if (prior >= config_.max_connections) {
       active_count_.fetch_sub(1, std::memory_order_release);
       metrics_.Rejected(metrics::RejectReason::kMaxConnections).Increment();
-      ABYSS_LOG_DEBUG(Log(), "accept rejected: max_connections",
+      ABYSS_LOG_DEBUG("accept rejected: max_connections",
                       {"limit", static_cast<int64_t>(config_.max_connections)});
       continue;
     }

@@ -15,6 +15,8 @@
 #include "abyss/resp/serializer.h"
 #include "abyss/version.h"
 
+ABYSS_LOG_COMPONENT("abyss.resp")
+
 namespace abyss::resp {
 namespace {
 
@@ -22,11 +24,6 @@ using core::ErrorPrefix;
 using core::RespCommand;
 using core::RespValue;
 using metrics::RequestStatus;
-
-const log::Logger& Logger() {
-  static const log::Logger l = log::Get("abyss.resp");
-  return l;
-}
 
 ErrorPrefix MapErrorCode(core::ErrorCode code) {
   switch (code) {
@@ -55,7 +52,7 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
       if (parsed.error().code() == core::ErrorCode::kIncomplete) {
         break;
       }
-      ABYSS_LOG_DEBUG(Logger(), "parse error", {"client_id", state_.client_id},
+      ABYSS_LOG_DEBUG("parse error", {"client_id", state_.client_id},
                       {"err", std::string_view{parsed.error().message()}});
       if (deps_.metrics != nullptr) deps_.metrics->RecordParseError();
       auto response = RespValue::Error(ErrorPrefix::kErr,
@@ -142,7 +139,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       {
         auto result = deps_.dispatcher->DispatchRead(parent.name, cmd);
         if (!result.has_value()) {
-          ABYSS_LOG_WARN(Logger(), "engine read error", {"client_id", state_.client_id},
+          ABYSS_LOG_WARN("engine read error", {"client_id", state_.client_id},
                          {"cmd", std::string_view{parent.name}},
                          {"err", std::string_view{result.error().message()}});
           return finish(
@@ -174,7 +171,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
       }
       if (!result.has_value()) {
-        ABYSS_LOG_WARN(Logger(), "engine write error", {"client_id", state_.client_id},
+        ABYSS_LOG_WARN("engine write error", {"client_id", state_.client_id},
                        {"cmd", std::string_view{parent.name}},
                        {"err", std::string_view{result.error().message()}});
         return finish(
@@ -322,7 +319,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::HandleHello(const CommandSpec&
 
   state_.protocol_version = negotiated;
   if (deps_.metrics != nullptr) deps_.metrics->RecordProtocol(negotiated);
-  ABYSS_LOG_DEBUG(Logger(), "hello handshake", {"client_id", state_.client_id},
+  ABYSS_LOG_DEBUG("hello handshake", {"client_id", state_.client_id},
                   {"proto", static_cast<int64_t>(negotiated)});
 
   return record_response(RespValue::Array({
@@ -380,7 +377,7 @@ RespValue RequestPipeline::HandleReset() {
 
 RespValue RequestPipeline::InternalServerError(std::string_view context,
                                                std::string_view cmd_name) {
-  ABYSS_LOG_ERROR(Logger(), "request pipeline internal error", {"client_id", state_.client_id},
+  ABYSS_LOG_ERROR("request pipeline internal error", {"client_id", state_.client_id},
                   {"cmd", std::string_view{cmd_name}}, {"context", context});
   return RespValue::Error(ErrorPrefix::kErr, "internal server error");
 }

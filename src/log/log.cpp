@@ -481,13 +481,18 @@ namespace internal {
 void ResetForTesting() {
   Registry& r = State();
   const std::lock_guard<std::mutex> lk(r.mu);
-  r.loggers.clear();
   r.component_levels.clear();
-  r.sink.reset();
   r.sink_destination = "stderr";
   r.sink_format = "text";
+  r.sink = MakeSink(r.sink_destination, r.sink_format);
   r.default_level.store(Level::kInfo, std::memory_order_relaxed);
   r.initialized.store(false, std::memory_order_release);
+
+  for (auto& [name, impl] : r.loggers) {
+    impl->spd->sinks() = {r.sink};
+    impl->spd->set_level(ToSpdlog(Level::kInfo));
+    impl->level.store(Level::kInfo, std::memory_order_relaxed);
+  }
 }
 
 void InstallTestSink(std::shared_ptr<spdlog::sinks::sink> sink) {

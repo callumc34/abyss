@@ -9,6 +9,8 @@
 #include "abyss/log/log.h"
 #include "abyss/log/testing.h"
 
+ABYSS_LOG_COMPONENT("threaded.emitter")
+
 namespace abyss::log {
 namespace {
 
@@ -37,11 +39,10 @@ TEST_F(ThreadedLogTest, ConcurrentEmissionCapturesAllRecords) {
   threads.reserve(kThreads);
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([i, &started, &go]() {
-      const Logger l = Get("threaded.emitter");
       ++started;
       while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
       for (int op = 0; op < kOpsPerThread; ++op) {
-        ABYSS_LOG_INFO(l, "tick", {"thread", static_cast<int64_t>(i)},
+        ABYSS_LOG_INFO("tick", {"thread", static_cast<int64_t>(i)},
                        {"op", static_cast<int64_t>(op)});
       }
     });
