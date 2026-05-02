@@ -37,6 +37,8 @@ target_compile_options(abyss_compiler_options INTERFACE
 
 target_compile_options(abyss_compiler_options INTERFACE
   $<$<CXX_COMPILER_ID:Clang>:-Wthread-safety>
+  # libstdc++'s std::mutex is not annotated with [[clang::capability]
+  $<$<CXX_COMPILER_ID:Clang>:-Wno-thread-safety-attributes>
 )
 
 if(ABYSS_STRICT_WARNINGS)

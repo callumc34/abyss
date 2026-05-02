@@ -33,11 +33,18 @@ jobs:
       - name: Install Clang for UBSan
         if: inputs.preset == 'ubsan'
         run: |
-          sudo apt-get install -y -qq clang-19 llvm-19
+          sudo apt-get install -y -qq clang-19 llvm-19 libstdc++-14-dev
           sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-19   100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100
+
+          # Force clang at gcc-14's libstdc++.
+          STDCXX="-isystem/usr/include/c++/14 -isystem/usr/include/x86_64-linux-gnu/c++/14 -isystem/usr/include/c++/14/backward"
+          GCC_DIR="--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14"
           echo "CC=clang"   >> "${GITHUB_ENV}"
           echo "CXX=clang++" >> "${GITHUB_ENV}"
+          echo "CFLAGS=${GCC_DIR}"   >> "${GITHUB_ENV}"
+          echo "CXXFLAGS=${STDCXX} ${GCC_DIR}" >> "${GITHUB_ENV}"
+          echo "LDFLAGS=${GCC_DIR}" >> "${GITHUB_ENV}"
           echo "UBSAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer-19" >> "${GITHUB_ENV}"
 
       - name: Set up ccache

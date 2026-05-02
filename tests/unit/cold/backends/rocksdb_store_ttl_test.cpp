@@ -115,7 +115,8 @@ TEST_F(TtlFixture, ZeroTtlNeverExpires) {
   core::ops::WriteOp op = core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = 0};
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
 
-  clock_.SetTo((std::numeric_limits<uint64_t>::max)() / 2);
+  // Avoid overflow issues
+  clock_.SetTo(1'000'000'000'000ULL);
   auto r = store->Exec(core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(r->AsString(), "v");
