@@ -36,6 +36,28 @@
 - `abyss_evicted_total` — keys evicted from hot (moved to cold-only)
 - `abyss_promotions_total` — cold hits promoted back to hot
 
+### Cold-store active TTL expiry
+
+The cold-store backend owns an internal sweeper thread that proactively
+finds and deletes expired keys (see [ADP-003](../design/proposals/003-cold-store.md)
+§TTL Expiry). The scanner self-throttles based on observed expired ratio,
+disk pressure, and a CPU budget cap.
+
+- `abyss_cold_ttl_samples_total{subject="string|collection"}` — random samples drawn per cycle
+- `abyss_cold_ttl_with_ttl_total{subject="string|collection"}` — sampled records that carried a TTL flag
+- `abyss_cold_ttl_expired_total{subject="string|collection"}` — sampled records past their TTL at sample time
+- `abyss_cold_ttl_deleted_total{subject="string|collection"}` — records the scanner successfully deleted
+- `abyss_cold_ttl_conflicts_total{subject="string|collection"}` — CAS commits aborted by a concurrent writer
+
+Gauges:
+
+- `abyss_cold_ttl_interval_ms` — current sleep interval between scanner ticks
+- `abyss_cold_ttl_sample_size` — current per-tick sample size
+- `abyss_cold_ttl_rate_multiplier` — adaptive rate factor
+- `abyss_cold_ttl_cpu_fraction` — EWMA of scanner-thread CPU as a fraction of wall time
+- `abyss_cold_ttl_disk_pressure_fraction` — fraction of the cold-store filesystem in use
+- `abyss_cold_ttl_disk_pressure_active` — `1` when the scanner is in disk-pressure mode, `0` otherwise
+
 ### Gauges
 
 - `abyss_hot_memory_bytes` — hot store memory usage
@@ -264,3 +286,5 @@ class FlushEngine {
 - `abyss_cold_buffer_oldest_entry_age_seconds > (default_eviction * 0.8)` — cold consumer is approaching the danger zone.
 - `abyss_cold_flush_reason_total{reason="pressure"}` increasing — buffer memory pressure is forcing early flushes, reducing compaction efficiency.
 - `abyss_cold_flush_reason_total{reason="deadline"}` dominating over `{reason="quiet"}` — keys are being written continuously without quiet windows. This may be normal for the workload, or it may indicate the quiet threshold needs tuning.
+- `abyss_cold_ttl_disk_pressure_active == 1` — the cold-store filesystem has crossed `disk_pressure_threshold` and the TTL scanner has switched to maximum aggression. Sustained pressure means provisioning is underspec'd or the cold consumer is producing more than active expiry can reclaim.
+- `rate(abyss_cold_ttl_deleted_total[5m]) == 0 AND abyss_cold_keys > 0` — scanner is alive but reclaiming nothing. Either the workload genuinely has no expiring keys (benign) or the scanner is failing silently (investigate logs at component `abyss.cold.ttl_scanner`).

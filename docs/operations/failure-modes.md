@@ -10,6 +10,7 @@
 | Queue WAL PVC full | Queue `Append()` fails. Writes return Redis errors to clients. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). |
 | Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
+| Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
 
 ## Backpressure Cascade
 

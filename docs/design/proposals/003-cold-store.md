@@ -33,7 +33,7 @@ The cold store implements a dual expiry model matching the industry-standard app
 
 **Lazy expiry:** On every cold store read, check the key's absolute TTL. If expired, delete it and return nil. This is zero-cost when keys are not being read.
 
-**Active expiry:** A background thread periodically samples random keys from the cold store and deletes expired ones. The sampling rate ramps up adaptively based on the hit ratio (fraction of sampled keys that were expired):
+**Active expiry:** A background sweeper periodically samples random keys from the cold store and deletes the expired ones. The sampling rate adapts to the observed expired ratio:
 
 ```
 loop:
@@ -51,6 +51,30 @@ loop:
 ```
 
 This ensures the cold store doesn't accumulate expired keys indefinitely while keeping CPU usage minimal under normal conditions. Under disk pressure, the scanner becomes more aggressive to reclaim space.
+
+#### Ownership and execution model
+
+Active expiry is **a property of the cold-store backend**, not of the server. Each backend implements (or omits) it according to its topology:
+
+- The embedded RocksDB backend owns a `TtlScanner` instance internally and runs it on a single low-priority thread spawned at server start.
+- External backends (KVRocks, DragonflyDB, Redis-compatible stores) ship with their own native expiry mechanism and do **not** spawn an Abyss-side scanner.
+- A future shared-nothing per-core deployment owns one `TtlScanner` per cold partition, driven as a cooperative task from the per-core reactor instead of a thread.
+
+The server is unaware of which mechanism is in use. It calls `Start()` on the cold store after recovery completes and `Stop()` during shutdown; whether that activates zero, one, or many internal workers is the backend's decision.
+
+#### Sampling
+
+Random sampling is restricted to the type prefixes that carry a TTL — string records and collection meta records (see [ADP-010](010-cold-key-encoding.md) §TTL Encoding Summary). Member, hash field, and score-index entries inherit their parent collection's TTL; sampling them directly would waste cycles. The implementation uses a random byte-prefix iterator seek rather than a uniform-distribution scheme; the bias is acceptable because the rate is driven by an estimated ratio rather than a uniform per-key guarantee.
+
+#### Concurrency: CAS-safe deletion
+
+A delete that depends on read state — "this key was expired when I sampled it, so I will delete it" — must be linearisable with concurrent unconditional writes from the cold consumer. Without a concurrency control, a race between the sampler's read and a writer's re-set of the same key with a fresh TTL would clobber the new value. Each backend satisfies the invariant according to its model:
+
+- The embedded RocksDB backend opens its DB as an `OptimisticTransactionDB` and runs every expiry-driven delete inside a transaction with `GetForUpdate` on the affected meta or string key. A concurrent write to the same key causes the commit to abort; the scanner counts this as a `conflicts` outcome and moves on. Lazy expiry uses the same primitive, so the contract holds for read-driven deletes as well as for the active sweeper.
+- External backends serialise all writes through their server-side protocol; the contract holds without any client-side coordination.
+- A shared-nothing partition is single-threaded over its data; the contract holds trivially.
+
+The contract does not hold by accident: every component that could delete an expired record must funnel through the backend's CAS-safe primitive. Bypassing it is an upstream bug that violates the active-expiry invariant ("never delete a key that hasn't expired").
 
 ### Configuration
 

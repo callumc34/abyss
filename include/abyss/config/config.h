@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "abyss/cold/ttl_scanner.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/result.h"
 #include "abyss/log/log.h"
@@ -33,6 +34,7 @@ struct ColdConfig {
   std::string backend = "builtin_rocksdb";
   std::string data_path = "/data/cold";
   size_t write_buffer_size_bytes = 67108864;
+  cold::TtlScanner::Config ttl_scanner{};
 };
 
 struct QueueConfig {

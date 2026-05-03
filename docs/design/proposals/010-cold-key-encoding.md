@@ -279,3 +279,5 @@ zset_score_idx CF:  0x06 0x03 "z:1" <sortable(2.5)> "b"        →  ∅
 **Cardinality cached in meta vs. computed on demand.** Cached. Computing cardinality on demand is O(N) per call and would dominate `HLEN`/`SCARD`/`ZCARD` latency for large collections. The compaction-buffer flush already knows the delta, so maintaining the cache is cheap.
 
 **Format version record.** Cheap insurance. The cost of writing it now is one extra KV. The cost of needing it later without it is a forced rewrite of the entire cold store.
+
+**Optimistic transactions for expiry deletes.** The embedded backend opens its database as an `OptimisticTransactionDB` rather than a plain `DB`. Existing read and write paths remain unchanged through the base interface; only expiry-driven deletes opt in to the transaction primitive. This is the implementation that satisfies the CAS-safety contract for expiry deletes specified in [ADP-003](003-cold-store.md) §TTL Expiry. The encoding above is unaffected — the on-disk layout is identical regardless of how a delete is committed.

@@ -9,7 +9,7 @@
 namespace abyss::metrics {
 
 // Closed whitelist of permitted label keys.
-enum class LabelKey : uint8_t { kTier, kShard, kCmd, kReason, kStatus, kOp, kProto };
+enum class LabelKey : uint8_t { kTier, kShard, kCmd, kReason, kStatus, kOp, kProto, kSubject };
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
   switch (k) {
@@ -27,6 +27,8 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "op";
     case LabelKey::kProto:
       return "proto";
+    case LabelKey::kSubject:
+      return "subject";
   }
   return {};
 }
@@ -135,6 +137,19 @@ constexpr std::string_view ToStringView(RejectReason r) noexcept {
   return {};
 }
 
+// TTL-scanner subject: which type of record was sampled.
+enum class TtlSubject : uint8_t { kString, kCollection };
+
+constexpr std::string_view ToStringView(TtlSubject s) noexcept {
+  switch (s) {
+    case TtlSubject::kString:
+      return "string";
+    case TtlSubject::kCollection:
+      return "collection";
+  }
+  return {};
+}
+
 // Command-name label value. Values are expected to be views into the command
 // registry; never client-supplied strings.
 struct CmdLabel {
@@ -188,6 +203,10 @@ template <>
 struct LabelKeyOf<ProtoLabel> {
   static constexpr LabelKey value = LabelKey::kProto;
 };
+template <>
+struct LabelKeyOf<TtlSubject> {
+  static constexpr LabelKey value = LabelKey::kSubject;
+};
 
 // Produces the string value written into a Prometheus series for a typed
 // label value. Registration-time only; never called on the hot path.
@@ -200,6 +219,7 @@ inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
 inline std::string ToLabelString(ProtoLabel p) { return std::to_string(p.version); }
+inline std::string ToLabelString(TtlSubject s) { return std::string(ToStringView(s)); }
 
 template <class... Ts>
 struct CounterDesc {
@@ -444,6 +464,63 @@ inline constexpr CounterDesc<> kNetBackpressureEnteredTotal{
 inline constexpr CounterDesc<> kNetBackpressureExitedTotal{
     .name = "abyss_net_backpressure_exited_total",
     .help = "Times a connection exited the back-pressure paused state.",
+};
+
+// --- Cold TTL active expiry ------------------------------------------------
+
+inline constexpr CounterDesc<TtlSubject> kColdTtlSamplesTotal{
+    .name = "abyss_cold_ttl_samples_total",
+    .help = "Random samples drawn by the cold TTL scanner, by subject type.",
+};
+
+inline constexpr CounterDesc<TtlSubject> kColdTtlWithTtlTotal{
+    .name = "abyss_cold_ttl_with_ttl_total",
+    .help = "Sampled records that carried a TTL flag, by subject type.",
+};
+
+inline constexpr CounterDesc<TtlSubject> kColdTtlExpiredTotal{
+    .name = "abyss_cold_ttl_expired_total",
+    .help = "Sampled records that were past their TTL, by subject type.",
+};
+
+inline constexpr CounterDesc<TtlSubject> kColdTtlDeletedTotal{
+    .name = "abyss_cold_ttl_deleted_total",
+    .help = "Records deleted by the cold TTL scanner, by subject type.",
+};
+
+inline constexpr CounterDesc<TtlSubject> kColdTtlConflictsTotal{
+    .name = "abyss_cold_ttl_conflicts_total",
+    .help = "Cold TTL expiry attempts aborted by a concurrent writer (CAS).",
+};
+
+inline constexpr GaugeDesc<> kColdTtlIntervalMs{
+    .name = "abyss_cold_ttl_interval_ms",
+    .help = "Current sleep interval between cold TTL scanner ticks.",
+};
+
+inline constexpr GaugeDesc<> kColdTtlSampleSize{
+    .name = "abyss_cold_ttl_sample_size",
+    .help = "Current sample size for each cold TTL scanner tick.",
+};
+
+inline constexpr GaugeDesc<> kColdTtlRateMultiplier{
+    .name = "abyss_cold_ttl_rate_multiplier",
+    .help = "Adaptive rate multiplier driving the cold TTL scanner cadence.",
+};
+
+inline constexpr GaugeDesc<> kColdTtlCpuFraction{
+    .name = "abyss_cold_ttl_cpu_fraction",
+    .help = "EWMA of the cold TTL scanner thread CPU as a fraction of wall time.",
+};
+
+inline constexpr GaugeDesc<> kColdTtlDiskPressureFraction{
+    .name = "abyss_cold_ttl_disk_pressure_fraction",
+    .help = "Fraction of the cold-store filesystem in use, observed by the TTL scanner.",
+};
+
+inline constexpr GaugeDesc<> kColdTtlDiskPressureActive{
+    .name = "abyss_cold_ttl_disk_pressure_active",
+    .help = "Whether the cold TTL scanner is in disk-pressure mode (1) or not (0).",
 };
 
 }  // namespace names
