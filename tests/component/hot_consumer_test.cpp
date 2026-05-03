@@ -68,6 +68,22 @@ class HotConsumerTest : public ::testing::Test {
     consumer_->Start();
   }
 
+  // Build (without starting) a consumer with a fixed wall-clock function and
+  // configurable eviction. Used by ReplayUntil-driven skip-stale tests.
+  void BuildConsumerWithClock(core::WallClockFn clock,
+                              core::EvictionTTL eviction = core::EvictionTTL{86400},
+                              core::ShardId shard = 0) {
+    consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_, apply_notifier_,
+                                              HotConsumer::Config{
+                                                  .shard = shard,
+                                                  .read_batch_size = 32,
+                                                  .replay_batch_size = 32,
+                                                  .read_timeout = core::Duration{10},
+                                                  .wall_clock = std::move(clock),
+                                              },
+                                              core::EvictionPolicy{eviction});
+  }
+
   core::QueueEntry MakeWrite(std::vector<std::string> args) {
     core::QueueEntry e;
     e.appended_at = core::WallClock::now();
@@ -192,6 +208,77 @@ TEST_F(HotConsumerTest, ConcurrentWritersAlwaysSeeRegisteredEntries) {
 
   EXPECT_EQ(broken_futures.load(), 0);
   EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesPastEvictionWindow) {
+  // Append two entries via direct queue Append (no client-side RPC). One
+  // entry's appended_at sits 25h in the past (> default 24h eviction); the
+  // second is fresh. Replay must skip the stale one but apply the fresh one.
+  const auto stale_at = core::WallClock::now() - std::chrono::hours{25};
+  const auto fresh_at = core::WallClock::now();
+
+  auto stale_entry = MakeWrite({"SET", "stale", "v"});
+  stale_entry.appended_at = stale_at;
+  ASSERT_TRUE(queue_->Append(0, stale_entry).has_value());
+
+  auto fresh_entry = MakeWrite({"SET", "fresh", "v"});
+  fresh_entry.appended_at = fresh_at;
+  ASSERT_TRUE(queue_->Append(0, fresh_entry).has_value());
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+
+  EXPECT_FALSE(hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "stale"}}).has_value());
+  auto fresh = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "fresh"}});
+  ASSERT_TRUE(fresh.has_value());
+  EXPECT_EQ(fresh->AsString(), "v");
+
+  EXPECT_EQ(consumer_->Snapshot().replay_skipped_eviction, 1U);
+  EXPECT_EQ(consumer_->Snapshot().applied, 1U);
+}
+
+TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesWithExpiredAbsoluteTtl) {
+  // PXAT carries an absolute Unix-ms deadline that the parser preserves
+  // verbatim (unlike EX/PX which currently anchor to parse time). A deadline
+  // already in the past at replay time should fire the abs-TTL skip even
+  // when the eviction window from appended_at has not elapsed.
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          core::WallClock::now().time_since_epoch())
+                          .count();
+  const auto past_ms = now_ms - 5000;
+  auto entry = MakeWrite({"SET", "k", "v", "PXAT", std::to_string(past_ms)});
+  ASSERT_TRUE(queue_->Append(0, entry).has_value());
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+
+  EXPECT_FALSE(hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k"}}).has_value());
+  EXPECT_EQ(consumer_->Snapshot().replay_skipped_abs_ttl, 1U);
+  EXPECT_EQ(consumer_->Snapshot().applied, 0U);
+}
+
+TEST_F(HotConsumerTest, SteadyStateAppliesEvenWhenAppendedAtIsAncient) {
+  // The skip-stale checks gate on replay_mode_, not on entry age alone.
+  // Steady-state Run() must apply an entry regardless of its appended_at —
+  // that's a writer's right-now intent (typically only seconds old in
+  // practice but not in tests that backdate).
+  StartConsumer();
+
+  auto entry = MakeWrite({"SET", "k", "v"});
+  entry.appended_at = core::WallClock::now() - std::chrono::hours{48};
+  auto pending = queue_->BeginAppend(0, entry);
+  ASSERT_TRUE(pending.has_value());
+  auto fut = rpc_.Register(pending->seq());
+  pending->Publish();
+  ASSERT_TRUE(pending->durable().get().has_value());
+
+  EXPECT_EQ(fut.get().AsString(), "OK");
+  auto read = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k"}});
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->AsString(), "v");
+  EXPECT_EQ(consumer_->Snapshot().replay_skipped_eviction, 0U);
 }
 
 TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {

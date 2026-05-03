@@ -139,6 +139,7 @@ bool Server::Initialize() {
                   .buffer_low_water_bytes = config_.cold_consumer.buffer_low_water_bytes,
                   .max_flush_batch_size = config_.cold_consumer.max_flush_batch_size,
                   .queue_read_max_count = config_.cold_consumer.queue_read_max_count,
+                  .replay_batch_size = config_.recovery.cold_replay_batch_size,
                   .queue_read_timeout = config_.cold_consumer.queue_read_timeout,
                   .retry_initial_backoff = config_.cold_consumer.retry_initial_backoff,
                   .retry_max_backoff = config_.cold_consumer.retry_max_backoff,
@@ -161,6 +162,7 @@ bool Server::Initialize() {
           .consumer =
               consumer::HotConsumer::Config{
                   .read_batch_size = config_.hot_consumer.read_batch_size,
+                  .replay_batch_size = config_.recovery.hot_replay_batch_size,
                   .read_timeout = config_.hot_consumer.read_timeout,
               },
       },
@@ -177,26 +179,22 @@ bool Server::Initialize() {
       *queue_, *cold_store_, *cold_pool_, *consumer_rpc_, *apply_notifier_,
       consumer::ResolverPool::Config{
           .shard_count = hot_store_->shard_count(),
-          .consumer = consumer::Resolver::Config{},
+          .consumer =
+              consumer::Resolver::Config{
+                  .replay_batch_size = config_.recovery.resolver_replay_batch_size,
+              },
       });
 
-  // Resolver replay must finish before any consumer starts. ADP-011 §Recovery.
-  if (auto r = resolver_pool_->ReplayForRecovery(); !r.has_value()) {
-    ABYSS_LOG_CRITICAL("resolver replay failed", {"err", std::string_view{r.error().message()}});
-    return false;
-  }
-
-  // Captured before clients connect: LOADING flips once hot catches up to here.
-  std::vector<core::SequenceId> ready_watermarks(hot_store_->shard_count(), 0);
-  for (uint32_t s = 0; s < hot_store_->shard_count(); ++s) {
-    if (auto t = queue_->TailSeq(s); t.has_value()) ready_watermarks[s] = *t;
-  }
-
-  hot_eviction_worker_->Start();
-
-  resolver_pool_->Start();
-  hot_pool_->Start();
-  cold_pool_->Start();
+  recovery_scheduler_ =
+      std::make_unique<engine::BoundedThreadShardScheduler>(config_.recovery.replay_parallelism);
+  recovery_coordinator_ = std::make_unique<engine::RecoveryCoordinator>(
+      *queue_, *resolver_pool_, *cold_pool_, *hot_pool_, *recovery_scheduler_,
+      engine::RecoveryConfig{
+          .replay_parallelism = config_.recovery.replay_parallelism,
+          .hot_replay_batch_size = config_.recovery.hot_replay_batch_size,
+          .cold_replay_batch_size = config_.recovery.cold_replay_batch_size,
+          .resolver_replay_batch_size = config_.recovery.resolver_replay_batch_size,
+      });
 
   auto identity = resp::NodeIdentity::Open(config_.queue.wal_path);
   if (!identity.has_value()) {
@@ -210,15 +208,14 @@ bool Server::Initialize() {
       *queue_, *hot_store_, cold_store_.get(), std::string{kVersion}, config_.net.bind,
       /*advertise_address=*/std::string{}, /*mode=*/"standalone", config_.net.port);
   config_provider_ = std::make_unique<ConfigProviderImpl>(config_);
-  loading_ =
-      std::make_unique<LoadingStateImpl>([queue_ptr = queue_.get(), pool_ptr = hot_pool_.get(),
-                                          watermarks = std::move(ready_watermarks)] {
+  // The coordinator is the single source of truth for "still recovering."
+  // queue.IsRecovering() handles WAL self-recovery (synchronous today,
+  // potentially async for external backends); coordinator covers consumer
+  // catch-up in every phase. Either being true keeps LOADING active.
+  loading_ = std::make_unique<LoadingStateImpl>(
+      [queue_ptr = queue_.get(), coordinator_ptr = recovery_coordinator_.get()] {
         if (queue_ptr != nullptr && queue_ptr->IsRecovering()) return true;
-        if (pool_ptr == nullptr) return false;
-        for (uint32_t s = 0; s < watermarks.size(); ++s) {
-          if (pool_ptr->ConsumerFor(s).HighestSettledSeq() < watermarks[s]) return true;
-        }
-        return false;
+        return coordinator_ptr != nullptr && coordinator_ptr->IsRecovering();
       });
   resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
 
@@ -261,6 +258,7 @@ bool Server::Initialize() {
       .hot_pool = hot_pool_.get(),
       .cold_pool = cold_pool_.get(),
       .resolver_pool = resolver_pool_.get(),
+      .recovery_coordinator = recovery_coordinator_.get(),
       .node_identity = node_identity_.get(),
       .ready = [this] { return IsReady(); },
       .loading = [provider =
@@ -312,26 +310,21 @@ bool Server::Initialize() {
     metrics_http_->AddHandler("/metrics", metrics_handler_.get());
   }
 
-  ready_.store(true, std::memory_order_release);
-  ABYSS_LOG_INFO("server ready", {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
+  ABYSS_LOG_INFO("server initialized",
+                 {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
   return true;
 #endif
 }
 
 void Server::Run(const std::atomic<bool>& stop) {
   if (!tcp_server_) return;
-  if (auto r = tcp_server_->Start(); !r.has_value()) {
-    ABYSS_LOG_CRITICAL("tcp server start failed", {"err", std::string_view{r.error().message()}});
-    return;
-  }
 
-  config_.net.port = tcp_server_->BoundPort();
-  if (stats_) stats_->SetTcpPort(config_.net.port);
-
+  // Bind admin and metrics first so /healthz and /ready answer immediately.
+  // /ready will report 503 (recovery_complete=false) until the coordinator
+  // marks Phase::kComplete after consumer catch-up.
   if (admin_http_) {
     if (auto r = admin_http_->Start(); !r.has_value()) {
       ABYSS_LOG_CRITICAL("admin http start failed", {"err", std::string_view{r.error().message()}});
-      tcp_server_->Stop();
       return;
     }
   }
@@ -340,30 +333,61 @@ void Server::Run(const std::atomic<bool>& stop) {
       ABYSS_LOG_CRITICAL("metrics http start failed",
                          {"err", std::string_view{r.error().message()}});
       if (admin_http_) admin_http_->Stop();
-      tcp_server_->Stop();
       return;
     }
   }
 
-  NotifyReady();
+  // Bind the data-plane listener. The LOADING gate (loading_->IsLoading()
+  // backed by the coordinator) makes data commands return -LOADING until
+  // recovery completes; admin RESP commands stay available throughout.
+  if (auto r = tcp_server_->Start(); !r.has_value()) {
+    ABYSS_LOG_CRITICAL("tcp server start failed", {"err", std::string_view{r.error().message()}});
+    if (admin_http_) admin_http_->Stop();
+    if (metrics_http_) metrics_http_->Stop();
+    return;
+  }
+  config_.net.port = tcp_server_->BoundPort();
+  if (stats_) stats_->SetTcpPort(config_.net.port);
+
   ABYSS_LOG_INFO("listening", {"version", std::string_view{kVersion}},
                  {"bind", std::string_view{config_.net.bind}},
                  {"port", static_cast<int64_t>(config_.net.port)},
                  {"admin_port", static_cast<int64_t>(AdminBoundPort())},
                  {"metrics_port", static_cast<int64_t>(MetricsBoundPort())});
 
-  // Defer cold-store background work (TTL scanner) until hot replay catches
-  // up to the captured tail watermark. Starting earlier would just contend on
-  // disk I/O with replay for no benefit.
-  while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning() && loading_ &&
-         loading_->IsLoading()) {
-    std::this_thread::sleep_for(kStopPollInterval);
+  // Run the recovery state machine. Blocks until all phases complete or the
+  // shutdown signal arrives. On cancellation the coordinator returns
+  // kUnavailable and we fall through to a clean shutdown without flipping
+  // ready_=true — /ready stays 503 until process exit.
+  if (recovery_coordinator_) {
+    if (auto r = recovery_coordinator_->Run(stop); !r.has_value()) {
+      ABYSS_LOG_CRITICAL("recovery failed; shutting down",
+                         {"err", std::string_view{r.error().message()}});
+      Shutdown();
+      return;
+    }
   }
+
+  // Recovery is complete; start the per-shard consumer threads for steady-
+  // state tailing, plus the eviction maintenance worker.
+  if (hot_eviction_worker_) hot_eviction_worker_->Start();
+  if (resolver_pool_) resolver_pool_->Start();
+  if (cold_pool_) cold_pool_->Start();
+  if (hot_pool_) hot_pool_->Start();
+
+  // Cold-store background work (TTL scanner). Deliberately deferred until
+  // after recovery so it doesn't contend with replay on disk I/O.
   if (!stop.load(std::memory_order_acquire) && cold_store_) {
     if (auto r = cold_store_->Start(); !r.has_value()) {
       ABYSS_LOG_WARN("cold store start failed", {"err", std::string_view{r.error().message()}});
     }
   }
+
+  ready_.store(true, std::memory_order_release);
+  // Emit the readiness pipe line only after all subsystems are up — operators
+  // and supervisors that wait on it then know the data plane is serving.
+  NotifyReady();
+  ABYSS_LOG_INFO("server ready");
 
   while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning()) {
     std::this_thread::sleep_for(kStopPollInterval);

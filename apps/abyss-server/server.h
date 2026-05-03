@@ -16,6 +16,8 @@
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/engine/bounded_thread_shard_scheduler.h"
+#include "abyss/engine/recovery_coordinator.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -70,6 +72,8 @@ class Server {
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
   std::unique_ptr<consumer::ResolverPool> resolver_pool_;
+  std::unique_ptr<engine::BoundedThreadShardScheduler> recovery_scheduler_;
+  std::unique_ptr<engine::RecoveryCoordinator> recovery_coordinator_;
 
   // Frontend providers — outlive the TCP server.
   std::unique_ptr<resp::NodeIdentity> node_identity_;

@@ -25,6 +25,9 @@ class Resolver {
   struct Config {
     core::ShardId shard = 0;
     size_t read_batch_size = 256;
+    // Used by ReplayForRecovery(); larger than read_batch_size to amortise
+    // queue reads while scanning a long catch-up backlog.
+    size_t replay_batch_size = 5000;
     core::Duration read_timeout{100};
     std::chrono::milliseconds cold_lookup_timeout{100};
     uint32_t stripe_count = 64;
@@ -42,7 +45,9 @@ class Resolver {
   Resolver& operator=(Resolver&&) = delete;
 
   // Idempotent. Must run before Start() and before cold/hot consumers start.
-  core::Result<void> ReplayForRecovery();
+  // If `cancel` flips true mid-replay, the call returns kUnavailable; partial
+  // progress is still acked so a subsequent invocation resumes cleanly.
+  core::Result<void> ReplayForRecovery(const std::atomic<bool>& cancel);
 
   void Start();
   void RequestStop();

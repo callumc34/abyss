@@ -67,9 +67,10 @@ void ColdConsumer::RunLoop() {
                   {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
 }
 
-size_t ColdConsumer::Drain() {
-  auto result = queue_.Read(core::kColdConsumer, shard_, config_.queue_read_max_count,
-                            config_.queue_read_timeout);
+size_t ColdConsumer::Drain() { return DrainWithBatch(config_.queue_read_max_count); }
+
+size_t ColdConsumer::DrainWithBatch(size_t max_count) {
+  auto result = queue_.Read(core::kColdConsumer, shard_, max_count, config_.queue_read_timeout);
   if (!result.has_value()) {
     if (result.error().code() == core::ErrorCode::kUnavailable) {
       // Queue has shut down; signal loop exit rather than spinning on the same error.
@@ -102,6 +103,98 @@ size_t ColdConsumer::Drain() {
     latest_drained_seq_.store(seq, std::memory_order_release);
   }
   return count;
+}
+
+core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
+                                             const std::atomic<bool>& cancel) {
+  ABYSS_LOG_INFO("cold replay starting", {"shard", static_cast<int64_t>(shard_)},
+                 {"target_seq", static_cast<uint64_t>(target)});
+
+  // Drain to target. Drive progress on the read result rather than the
+  // post-condition: latest_drained_seq starts at 0 and target may also be 0
+  // (single entry at seq 0), so we cannot use `latest_drained < target` as
+  // the loop guard without skipping that entry.
+  while (!cancel.load(std::memory_order_acquire)) {
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      return std::unexpected(
+          core::Error{core::ErrorCode::kUnavailable, "cold replay aborted by stop"});
+    }
+    auto read = queue_.Read(core::kColdConsumer, shard_, config_.replay_batch_size,
+                            config_.queue_read_timeout);
+    if (!read.has_value()) {
+      if (read.error().code() == core::ErrorCode::kUnavailable) {
+        return std::unexpected(read.error());
+      }
+      counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+
+    if (read->empty()) {
+      if (latest_drained_seq_.load(std::memory_order_acquire) >= target) break;
+      continue;
+    }
+
+    for (const auto& entry : *read) {
+      const auto seq = entry.seq;
+      std::visit(
+          [this, &entry](const auto& payload) {
+            using T = std::decay_t<decltype(payload)>;
+            if constexpr (std::is_same_v<T, core::entry::Write>) {
+              HandleWrite(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
+              HandleConditional(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
+              HandleResolved(entry, payload);
+            }
+          },
+          entry.payload);
+      latest_drained_seq_.store(seq, std::memory_order_release);
+    }
+
+    if (buffer_.BytesEstimate() >= config_.buffer_high_water_bytes) {
+      Flush();
+    }
+    if (latest_drained_seq_.load(std::memory_order_acquire) >= target) break;
+  }
+
+  if (cancel.load(std::memory_order_acquire) &&
+      latest_drained_seq_.load(std::memory_order_acquire) < target) {
+    ABYSS_LOG_WARN("cold replay cancelled before reaching target",
+                   {"shard", static_cast<int64_t>(shard_)},
+                   {"target_seq", static_cast<uint64_t>(target)});
+    return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "cold replay cancelled"});
+  }
+
+  // Drain the buffer to disk. Replay-absorbed entries have a fresh first_seen
+  // (set when DrainWithBatch absorbed them seconds ago), so the steady-state
+  // FlushReady() would defer them by quiet_threshold and the loop would
+  // deadlock. FlushUnscheduled() pops oldest unconditionally, which is the
+  // right semantic for "make this buffer empty before declaring recovery
+  // done." Bounded by max_flush_batch_size per call; loop until empty.
+  while (!cancel.load(std::memory_order_acquire) && buffer_.Size() > 0) {
+    if (!FlushUnscheduled()) {
+      // No progress: either the buffer reported entries but FlushOldest
+      // returned none (shouldn't happen for non-empty buffer with target=0),
+      // or ApplyBatchWithRetry hit a poisoned batch and reinserted them. The
+      // latter is unrecoverable here — operator intervention required.
+      ABYSS_LOG_ERROR("cold replay flush stalled", {"shard", static_cast<int64_t>(shard_)},
+                      {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
+      return std::unexpected(core::Error{core::ErrorCode::kInternal, "cold replay flush stalled"});
+    }
+  }
+  TryAdvanceAck();
+
+  if (cancel.load(std::memory_order_acquire) && buffer_.Size() > 0) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kUnavailable, "cold replay cancelled during flush"});
+  }
+
+  ABYSS_LOG_INFO(
+      "cold replay complete", {"shard", static_cast<int64_t>(shard_)},
+      {"latest_drained",
+       static_cast<uint64_t>(latest_drained_seq_.load(std::memory_order_acquire))},
+      {"last_ack", static_cast<uint64_t>(last_ack_seq_.load(std::memory_order_acquire))});
+  return {};
 }
 
 void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
@@ -228,6 +321,23 @@ bool ColdConsumer::Flush() {
     return false;
   }
 
+  return ApplyFlushBatch(std::move(to_flush), aggressive, flush_start);
+}
+
+bool ColdConsumer::FlushUnscheduled() {
+  const auto flush_start = std::chrono::steady_clock::now();
+  auto to_flush = buffer_.FlushOldest(/*target_bytes=*/0, config_.max_flush_batch_size);
+  if (to_flush.empty()) {
+    TryAdvanceAck();
+    return false;
+  }
+  // Replay flushes count as aggressive in the per-flush trigger metric — they
+  // bypass the quiet/deadline strategy.
+  return ApplyFlushBatch(std::move(to_flush), /*aggressive=*/true, flush_start);
+}
+
+bool ColdConsumer::ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggressive,
+                                   std::chrono::steady_clock::time_point flush_start) {
   const auto wall_now = wall_clock_();
   std::vector<BufferEntry> surviving;
   surviving.reserve(to_flush.size());

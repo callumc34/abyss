@@ -15,6 +15,7 @@
 #include "abyss/core/cold_store.h"
 #include "abyss/core/hot_store.h"
 #include "abyss/core/queue.h"
+#include "abyss/engine/recovery_coordinator.h"
 #include "abyss/resp/config_provider.h"
 #include "abyss/resp/loading_state.h"
 #include "abyss/resp/node_identity.h"
@@ -91,6 +92,7 @@ class StatusProviderImpl : public admin::StatusProvider {
     consumer::HotConsumerPool* hot_pool = nullptr;
     consumer::ColdConsumerPool* cold_pool = nullptr;
     consumer::ResolverPool* resolver_pool = nullptr;
+    const engine::RecoveryCoordinator* recovery_coordinator = nullptr;
     const resp::NodeIdentity* node_identity = nullptr;
     BoolFn ready;
     BoolFn loading;

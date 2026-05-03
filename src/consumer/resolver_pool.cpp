@@ -25,14 +25,6 @@ ResolverPool::ResolverPool(core::Queue& queue, core::ColdStore& cold,
 
 ResolverPool::~ResolverPool() { Stop(); }
 
-core::Result<void> ResolverPool::ReplayForRecovery() {
-  for (auto& consumer : consumers_) {
-    auto r = consumer->ReplayForRecovery();
-    if (!r.has_value()) return r;
-  }
-  return {};
-}
-
 void ResolverPool::Start() {
   for (auto& consumer : consumers_) consumer->Start();
   ABYSS_LOG_INFO("resolvers started", {"count", static_cast<int64_t>(consumers_.size())});

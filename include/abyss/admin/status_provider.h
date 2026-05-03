@@ -103,6 +103,27 @@ struct StatusConnectionsInfo {
   uint64_t active = 0;
 };
 
+// Mirrors engine::RecoverySnapshot::Phase but kept in the admin-facing schema
+// to keep /status decoupled from the engine library and stable under
+// engine-side renames. Order matches engine::RecoverySnapshot::Phase.
+enum class StatusRecoveryPhase : uint8_t {
+  kQueueOpen = 0,
+  kResolverReplay = 1,
+  kColdHotReplay = 2,
+  kComplete = 3,
+};
+
+struct StatusRecoveryInfo {
+  StatusRecoveryPhase phase = StatusRecoveryPhase::kComplete;
+  uint64_t resolver_entries_replayed = 0;
+  uint64_t resolver_entries_target = 0;
+  uint64_t cold_entries_replayed = 0;
+  uint64_t cold_entries_target = 0;
+  uint64_t hot_entries_replayed = 0;
+  uint64_t hot_entries_target = 0;
+  uint64_t elapsed_ms = 0;
+};
+
 // Foundational schema. Stability rules in docs/operations/observability.md:
 // fields are append-only, never renamed, never typed-changed without a
 // schema_version bump. Unset/inapplicable fields render as JSON null or as
@@ -119,6 +140,7 @@ struct StatusSnapshot {
   StatusConsumersInfo consumers;
   StatusLagInfo lag;
   StatusConnectionsInfo connections;
+  StatusRecoveryInfo recovery;
 };
 
 // Implementations must be thread-safe. The handler may invoke Snapshot() from

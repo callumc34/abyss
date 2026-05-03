@@ -1,6 +1,8 @@
 #include "abyss/consumer/hot_consumer.h"
 
 #include <chrono>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 
@@ -26,6 +28,28 @@ core::RespValue MapApplyError(const core::Error& err) {
   }
 }
 
+uint64_t WallMs(core::WallTime t) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count());
+}
+
+// Returns the absolute-TTL of `op` in ms-since-epoch. 0 means "no TTL".
+// Persist explicitly clears TTL so it never carries one to skip on.
+uint64_t AbsTtlMs(const core::ops::WriteOp& op) {
+  return std::visit(
+      [](const auto& typed) -> uint64_t {
+        using T = std::decay_t<decltype(typed)>;
+        if constexpr (std::is_same_v<T, core::ops::StringSet>) {
+          return typed.abs_ttl_ms;
+        } else if constexpr (std::is_same_v<T, core::ops::Expire>) {
+          return typed.abs_ttl_ms;
+        } else {
+          return 0;
+        }
+      },
+      op);
+}
+
 }  // namespace
 
 HotConsumer::HotConsumer(core::Queue& queue, core::HotStore& store, core::ConsumerRpc& rpc,
@@ -35,7 +59,7 @@ HotConsumer::HotConsumer(core::Queue& queue, core::HotStore& store, core::Consum
       store_(store),
       rpc_(rpc),
       apply_notifier_(apply_notifier),
-      config_(config),
+      config_(std::move(config)),
       eviction_policy_(std::move(eviction_policy)) {}
 
 HotConsumer::~HotConsumer() { Stop(); }
@@ -81,24 +105,88 @@ void HotConsumer::Run() {
       continue;
     }
 
-    for (auto& entry : *read) {
-      std::visit(
-          [this, &entry](auto& payload) {
-            using T = std::decay_t<decltype(payload)>;
-            if constexpr (std::is_same_v<T, core::entry::Write>) {
-              HandleWrite(entry, payload);
-            } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-              HandleConditional(std::move(entry), payload);
-            } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-              HandleResolved(entry, payload);
-            }
-          },
-          entry.payload);
-    }
+    ProcessBatch(*read);
     CheckBlockAndScanTimeout();
   }
 
   ABYSS_LOG_DEBUG("hot consumer stopped", {"shard", static_cast<int64_t>(config_.shard)});
+}
+
+void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {
+  for (auto& entry : batch) {
+    std::visit(
+        [this, &entry](auto& payload) {
+          using T = std::decay_t<decltype(payload)>;
+          if constexpr (std::is_same_v<T, core::entry::Write>) {
+            HandleWrite(entry, payload);
+          } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
+            HandleConditional(std::move(entry), payload);
+          } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
+            HandleResolved(entry, payload);
+          }
+        },
+        entry.payload);
+  }
+}
+
+core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
+                                            const std::atomic<bool>& cancel) {
+  ABYSS_LOG_INFO("hot replay starting", {"shard", static_cast<int64_t>(config_.shard)},
+                 {"target_seq", static_cast<uint64_t>(target)});
+
+  replay_mode_.store(true, std::memory_order_release);
+  struct ReplayGuard {
+    std::atomic<bool>& flag;
+    explicit ReplayGuard(std::atomic<bool>& f) : flag(f) {}
+    ReplayGuard(const ReplayGuard&) = delete;
+    ReplayGuard& operator=(const ReplayGuard&) = delete;
+    ReplayGuard(ReplayGuard&&) = delete;
+    ReplayGuard& operator=(ReplayGuard&&) = delete;
+    ~ReplayGuard() { flag.store(false, std::memory_order_release); }
+  };
+  ReplayGuard guard(replay_mode_);
+
+  // The progress signal is "highest_settled_seq has reached target", but
+  // both start at 0. To distinguish "target=0 means one entry at seq=0 to
+  // process" from "target=0 means queue empty", read once before checking.
+  // An empty read with progress reached → caught up; empty read with progress
+  // behind → genuinely waiting on the queue, retry.
+  while (!cancel.load(std::memory_order_acquire)) {
+    auto read = queue_.Read(core::kHotConsumer, config_.shard, config_.replay_batch_size,
+                            config_.read_timeout);
+    if (!read.has_value()) {
+      if (read.error().code() == core::ErrorCode::kUnavailable) {
+        return std::unexpected(read.error());
+      }
+      counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+
+    if (read->empty()) {
+      if (highest_settled_seq_.load(std::memory_order_acquire) >= target) break;
+      CheckBlockAndScanTimeout();
+      continue;
+    }
+
+    ProcessBatch(*read);
+    CheckBlockAndScanTimeout();
+    if (highest_settled_seq_.load(std::memory_order_acquire) >= target) break;
+  }
+
+  if (cancel.load(std::memory_order_acquire) &&
+      highest_settled_seq_.load(std::memory_order_acquire) < target) {
+    ABYSS_LOG_WARN("hot replay cancelled before reaching target",
+                   {"shard", static_cast<int64_t>(config_.shard)},
+                   {"target_seq", static_cast<uint64_t>(target)},
+                   {"highest_settled",
+                    static_cast<uint64_t>(highest_settled_seq_.load(std::memory_order_acquire))});
+    return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "hot replay cancelled"});
+  }
+
+  ABYSS_LOG_INFO("hot replay complete", {"shard", static_cast<int64_t>(config_.shard)},
+                 {"highest_settled",
+                  static_cast<uint64_t>(highest_settled_seq_.load(std::memory_order_acquire))});
+  return {};
 }
 
 void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
@@ -119,19 +207,29 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
                       {"err", std::string_view{op.error().message()}});
       result = core::RespValue::Error(core::ErrorPrefix::kErr, op.error().message());
     } else {
-      const auto eviction = eviction_policy_.Resolve(core::ops::PrimaryKey(*op));
-      auto applied = store_.Apply(*op, eviction);
-      if (!applied.has_value()) {
-        counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-        if (applied.error().code() != core::ErrorCode::kWrongType) {
-          ABYSS_LOG_ERROR("hot apply failed", {"shard", static_cast<int64_t>(config_.shard)},
-                          {"cmd", std::string_view{cmd.args[0]}},
-                          {"err", std::string_view{applied.error().message()}});
-        }
-        result = MapApplyError(applied.error());
+      const auto key = core::ops::PrimaryKey(*op);
+      const auto eviction = eviction_policy_.Resolve(key);
+      const bool replaying = replay_mode_.load(std::memory_order_acquire);
+      const auto wall_now = config_.wall_clock();
+
+      if (replaying && ShouldSkipForEvictionElapsed(entry.appended_at, key, wall_now)) {
+        counters_.replay_skipped_eviction.fetch_add(1, std::memory_order_relaxed);
+      } else if (replaying && ShouldSkipForAbsTtlElapsed(AbsTtlMs(*op), wall_now)) {
+        counters_.replay_skipped_abs_ttl.fetch_add(1, std::memory_order_relaxed);
       } else {
-        counters_.applied.fetch_add(1, std::memory_order_relaxed);
-        result = std::move(*applied);
+        auto applied = store_.Apply(*op, eviction);
+        if (!applied.has_value()) {
+          counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+          if (applied.error().code() != core::ErrorCode::kWrongType) {
+            ABYSS_LOG_ERROR("hot apply failed", {"shard", static_cast<int64_t>(config_.shard)},
+                            {"cmd", std::string_view{cmd.args[0]}},
+                            {"err", std::string_view{applied.error().message()}});
+          }
+          result = MapApplyError(applied.error());
+        } else {
+          counters_.applied.fetch_add(1, std::memory_order_relaxed);
+          result = std::move(*applied);
+        }
       }
     }
   }
@@ -158,14 +256,30 @@ void HotConsumer::HandleConditional(core::QueueEntry entry,
 
 void HotConsumer::HandleResolved(const core::QueueEntry& entry,
                                  const core::entry::Resolved& resolved) {
+  // Per ADP-011 invariant 7, a Resolved takes effect at the Conditional's seq
+  // position. The skip-stale check uses the Conditional's wall-clock
+  // appended_at (the original write time), not the Resolved's. The pending
+  // map is the only place that timestamp lives; capture before erase.
+  std::optional<core::WallTime> conditional_appended_at;
   bool had_pending = false;
   {
     const std::scoped_lock lock(pending_mu_);
-    had_pending = pending_conditionals_.erase(resolved.ref) > 0;
+    if (auto it = pending_conditionals_.find(resolved.ref); it != pending_conditionals_.end()) {
+      conditional_appended_at = it->second.entry.appended_at;
+      pending_conditionals_.erase(it);
+      had_pending = true;
+    }
   }
+  // If we never saw the Conditional (cold replay re-entered after a partial
+  // recovery, or the Conditional landed before our ack point), fall back to
+  // the Resolved's own appended_at. Less precise but a safe approximation:
+  // the Resolved was emitted shortly after the Conditional in steady state,
+  // and during recovery re-emission they share the original appended_at
+  // (see Resolver::ReplayForRecovery — `out.appended_at = entry.appended_at`).
+  const core::WallTime reference_at = conditional_appended_at.value_or(entry.appended_at);
 
   if (resolved.decision == core::Decision::kApply) {
-    auto applied = ApplyOps(resolved.materialised_ops);
+    auto applied = ApplyResolvedOps(resolved.materialised_ops, reference_at);
     if (!applied.has_value()) {
       counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
       if (applied.error().code() != core::ErrorCode::kWrongType) {
@@ -173,9 +287,6 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
                         {"ref", static_cast<uint64_t>(resolved.ref)},
                         {"err", std::string_view{applied.error().message()}});
       }
-    } else {
-      counters_.applied.fetch_add(static_cast<uint64_t>(resolved.materialised_ops.size()),
-                                  std::memory_order_relaxed);
     }
   }
 
@@ -189,7 +300,11 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
   MarkSettledAndMaybeAck(entry.seq);
 }
 
-core::Result<void> HotConsumer::ApplyOps(const std::vector<core::RespCommand>& ops) {
+core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCommand>& ops,
+                                                 core::WallTime reference_at) {
+  const bool replaying = replay_mode_.load(std::memory_order_acquire);
+  const auto wall_now = config_.wall_clock();
+
   for (const auto& cmd : ops) {
     if (cmd.args.empty()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
@@ -201,12 +316,43 @@ core::Result<void> HotConsumer::ApplyOps(const std::vector<core::RespCommand>& o
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
       return std::unexpected(op.error());
     }
-    const auto eviction = eviction_policy_.Resolve(core::ops::PrimaryKey(*op));
+    const auto key = core::ops::PrimaryKey(*op);
+
+    if (replaying && ShouldSkipForEvictionElapsed(reference_at, key, wall_now)) {
+      counters_.replay_skipped_eviction.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    if (replaying && ShouldSkipForAbsTtlElapsed(AbsTtlMs(*op), wall_now)) {
+      counters_.replay_skipped_abs_ttl.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+
+    const auto eviction = eviction_policy_.Resolve(key);
     // Reply value is constructed by the Resolver; discard here.
     auto applied = store_.Apply(*op, eviction);
     if (!applied.has_value()) return std::unexpected(applied.error());
+    counters_.applied.fetch_add(1, std::memory_order_relaxed);
   }
   return {};
+}
+
+bool HotConsumer::ShouldSkipForEvictionElapsed(core::WallTime appended_at, std::string_view key,
+                                               core::WallTime wall_now) const {
+  const auto eviction = eviction_policy_.Resolve(key);
+  // Cast both sides to milliseconds for an unambiguous compare; entries from
+  // a clock that ran backwards across restart still skip cleanly.
+  const auto appended_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(appended_at.time_since_epoch()).count();
+  const auto deadline_ms =
+      appended_ms + std::chrono::duration_cast<std::chrono::milliseconds>(eviction).count();
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(wall_now.time_since_epoch()).count();
+  return now_ms > deadline_ms;
+}
+
+bool HotConsumer::ShouldSkipForAbsTtlElapsed(uint64_t abs_ttl_ms, core::WallTime wall_now) {
+  if (abs_ttl_ms == 0) return false;
+  return WallMs(wall_now) >= abs_ttl_ms;
 }
 
 void HotConsumer::MarkSettledAndMaybeAck(core::SequenceId seq) {

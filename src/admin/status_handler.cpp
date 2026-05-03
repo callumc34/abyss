@@ -206,6 +206,41 @@ std::string Render(const StatusSnapshot& s) {
     w.EndObject();
   }
 
+  w.Key("recovery");
+  {
+    w.BeginObject();
+    w.Key("phase");
+    switch (s.recovery.phase) {
+      case StatusRecoveryPhase::kQueueOpen:
+        w.String("queue_open");
+        break;
+      case StatusRecoveryPhase::kResolverReplay:
+        w.String("resolver_replay");
+        break;
+      case StatusRecoveryPhase::kColdHotReplay:
+        w.String("cold_hot_replay");
+        break;
+      case StatusRecoveryPhase::kComplete:
+        w.String("complete");
+        break;
+    }
+    w.Key("resolver_entries_replayed");
+    w.UInt(s.recovery.resolver_entries_replayed);
+    w.Key("resolver_entries_target");
+    w.UInt(s.recovery.resolver_entries_target);
+    w.Key("cold_entries_replayed");
+    w.UInt(s.recovery.cold_entries_replayed);
+    w.Key("cold_entries_target");
+    w.UInt(s.recovery.cold_entries_target);
+    w.Key("hot_entries_replayed");
+    w.UInt(s.recovery.hot_entries_replayed);
+    w.Key("hot_entries_target");
+    w.UInt(s.recovery.hot_entries_target);
+    w.Key("elapsed_ms");
+    w.UInt(s.recovery.elapsed_ms);
+    w.EndObject();
+  }
+
   // Reserved for Phase 2; explicit null preserves the slot now so the schema
   // doesn't change shape when cluster mode lands.
   w.Key("cluster");
