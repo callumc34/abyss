@@ -17,6 +17,7 @@
 #endif
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
 #include "abyss/resp/command_registry.h"
 #include "abyss/version.h"
 
@@ -251,6 +252,65 @@ bool Server::Initialize() {
   stats_->set_connection_count_provider(
       [server_ptr = tcp_server_.get()] { return server_ptr->ActiveConnections(); });
 
+  status_provider_ = std::make_unique<StatusProviderImpl>(StatusProviderImpl::Deps{
+      .config = &config_,
+      .queue = queue_.get(),
+      .hot_store = hot_store_.get(),
+      .cold_store = cold_store_.get(),
+      .hot_pool = hot_pool_.get(),
+      .cold_pool = cold_pool_.get(),
+      .resolver_pool = resolver_pool_.get(),
+      .node_identity = node_identity_.get(),
+      .ready = [this] { return IsReady(); },
+      .loading = [provider =
+                      loading_.get()] { return provider != nullptr && provider->IsLoading(); },
+      .shutting_down = [this] { return IsShuttingDown(); },
+      .connection_count =
+          [server_ptr = tcp_server_.get()] {
+            return server_ptr != nullptr ? server_ptr->ActiveConnections() : size_t{0};
+          },
+      .resp_port =
+          [server_ptr = tcp_server_.get()] {
+            return server_ptr != nullptr ? server_ptr->BoundPort() : uint16_t{0};
+          },
+      .admin_port = [this] { return AdminBoundPort(); },
+      .metrics_port = [this] { return MetricsBoundPort(); },
+  });
+
+  health_handler_ = std::make_unique<admin::HealthHandler>();
+  ready_handler_ = std::make_unique<admin::ReadyHandler>(admin::ReadyChecks{
+      .tcp_bound =
+          [server_ptr = tcp_server_.get()] {
+            return server_ptr != nullptr && server_ptr->IsRunning();
+          },
+      .recovery_complete =
+          [provider = loading_.get()] { return provider != nullptr && !provider->IsLoading(); },
+      .not_shutting_down = [this] { return !IsShuttingDown(); },
+  });
+  status_handler_ = std::make_unique<admin::StatusHandler>(status_provider_.get());
+  metrics_handler_ = std::make_unique<admin::MetricsHandler>(
+      [] { return metrics::Registry::Instance().Scrape(); });
+
+  if (config_.admin.enabled) {
+    admin_http_ = std::make_unique<admin::HttpServer>(admin::HttpServerConfig{
+        .bind = config_.admin.bind,
+        .port = config_.admin.port,
+        .label = "admin",
+    });
+    admin_http_->AddHandler("/healthz", health_handler_.get());
+    admin_http_->AddHandler("/ready", ready_handler_.get());
+    admin_http_->AddHandler("/status", status_handler_.get());
+  }
+
+  if (config_.metrics.enabled) {
+    metrics_http_ = std::make_unique<admin::HttpServer>(admin::HttpServerConfig{
+        .bind = config_.metrics.bind,
+        .port = config_.metrics.port,
+        .label = "metrics",
+    });
+    metrics_http_->AddHandler("/metrics", metrics_handler_.get());
+  }
+
   ready_.store(true, std::memory_order_release);
   ABYSS_LOG_INFO("server ready", {"shard_count", static_cast<int64_t>(hot_store_->shard_count())});
   return true;
@@ -267,10 +327,29 @@ void Server::Run(const std::atomic<bool>& stop) {
   config_.net.port = tcp_server_->BoundPort();
   if (stats_) stats_->SetTcpPort(config_.net.port);
 
+  if (admin_http_) {
+    if (auto r = admin_http_->Start(); !r.has_value()) {
+      ABYSS_LOG_CRITICAL("admin http start failed", {"err", std::string_view{r.error().message()}});
+      tcp_server_->Stop();
+      return;
+    }
+  }
+  if (metrics_http_) {
+    if (auto r = metrics_http_->Start(); !r.has_value()) {
+      ABYSS_LOG_CRITICAL("metrics http start failed",
+                         {"err", std::string_view{r.error().message()}});
+      if (admin_http_) admin_http_->Stop();
+      tcp_server_->Stop();
+      return;
+    }
+  }
+
   NotifyReady();
   ABYSS_LOG_INFO("listening", {"version", std::string_view{kVersion}},
                  {"bind", std::string_view{config_.net.bind}},
-                 {"port", static_cast<int64_t>(config_.net.port)});
+                 {"port", static_cast<int64_t>(config_.net.port)},
+                 {"admin_port", static_cast<int64_t>(AdminBoundPort())},
+                 {"metrics_port", static_cast<int64_t>(MetricsBoundPort())});
 
   while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning()) {
     std::this_thread::sleep_for(kStopPollInterval);
@@ -286,6 +365,18 @@ void Server::NotifyReady() {
   line += config_.net.bind;
   line += R"(","port":)";
   line += std::to_string(config_.net.port);
+  if (admin_http_) {
+    line += R"(,"admin_bind":")";
+    line += config_.admin.bind;
+    line += R"(","admin_port":)";
+    line += std::to_string(AdminBoundPort());
+  }
+  if (metrics_http_) {
+    line += R"(,"metrics_bind":")";
+    line += config_.metrics.bind;
+    line += R"(","metrics_port":)";
+    line += std::to_string(MetricsBoundPort());
+  }
   line += "}\n";
 
 #ifdef _WIN32
@@ -316,6 +407,14 @@ void Server::Shutdown() {
 
   ABYSS_LOG_INFO("shutdown starting");
 
+  // Flip /ready to 503 first so K8s pulls the pod from Service endpoints
+  // before we tear down the data plane. Admin liveness keeps responding via
+  // the http servers below until they're stopped.
+  ready_.store(false, std::memory_order_release);
+
+  if (admin_http_) admin_http_->Stop();
+  if (metrics_http_) metrics_http_->Stop();
+
   if (tcp_server_) {
     tcp_server_->Stop();
   }
@@ -325,7 +424,6 @@ void Server::Shutdown() {
   if (resolver_pool_) resolver_pool_->Stop();
   if (hot_eviction_worker_) hot_eviction_worker_->Stop();
 
-  ready_.store(false, std::memory_order_release);
   ABYSS_LOG_INFO("shutdown complete");
 }
 

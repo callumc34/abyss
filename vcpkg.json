@@ -5,6 +5,7 @@
   "builtin-baseline": "d13fa75214c258099923cf25a5e6311e58c07f3b",
   "dependencies": [
     "cli11",
+    "cpp-httplib",
     "crc32c",
     "prometheus-cpp",
     "spdlog",

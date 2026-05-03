@@ -125,11 +125,15 @@ core::Result<void> ParseNet(const YamlCursor& cur, NetConfig& out) {
       .Finish();
 }
 
-core::Result<void> ParseBindPort(const YamlCursor& cur, std::string& bind, uint16_t& port) {
-  return SectionDecoder(cur).Optional("bind", bind).Optional("port", port).Finish();
+core::Result<void> ParseMetrics(const YamlCursor& cur, MetricsConfig& out) {
+  return SectionDecoder(cur)
+      .Optional("enabled", out.enabled)
+      .Optional("bind", out.bind)
+      .Optional("port", out.port)
+      .Finish();
 }
 
-core::Result<void> ParseMetrics(const YamlCursor& cur, MetricsConfig& out) {
+core::Result<void> ParseAdmin(const YamlCursor& cur, AdminConfig& out) {
   return SectionDecoder(cur)
       .Optional("enabled", out.enabled)
       .Optional("bind", out.bind)
@@ -261,8 +265,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
       {"recovery", [](const YamlCursor& c, Config& cfg) { return ParseRecovery(c, cfg.recovery); }},
       {"net", [](const YamlCursor& c, Config& cfg) { return ParseNet(c, cfg.net); }},
       {"metrics", [](const YamlCursor& c, Config& cfg) { return ParseMetrics(c, cfg.metrics); }},
-      {"admin", [](const YamlCursor& c,
-                   Config& cfg) { return ParseBindPort(c, cfg.admin.bind, cfg.admin.port); }},
+      {"admin", [](const YamlCursor& c, Config& cfg) { return ParseAdmin(c, cfg.admin); }},
       {"log", [](const YamlCursor& c, Config& cfg) { return ParseLog(c, cfg.log); }},
   }};
 

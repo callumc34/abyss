@@ -66,6 +66,7 @@ metrics:
   port: 9090
 
 admin:
+  enabled: true
   bind: 0.0.0.0
   port: 8080
 

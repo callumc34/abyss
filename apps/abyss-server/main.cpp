@@ -45,6 +45,8 @@ int main(int argc, char* argv[]) {
   std::string config_path;
   std::string data_dir = kDefaultDataDir;
   std::optional<uint16_t> port_override;
+  std::optional<uint16_t> admin_port_override;
+  std::optional<uint16_t> metrics_port_override;
   std::optional<uint32_t> shard_count_override;
   intptr_t ready_fd = -1;
 
@@ -52,6 +54,13 @@ int main(int argc, char* argv[]) {
   app.add_option("-p,--port", port_override,
                  "RESP listen port (overrides config). Pass 0 to let the OS pick an ephemeral "
                  "port; the bound port is emitted via --ready-fd when set.");
+  app.add_option("--admin-port", admin_port_override,
+                 "Admin HTTP listen port (overrides config). Pass 0 for an OS-assigned "
+                 "ephemeral port; the bound port is emitted via --ready-fd when set.");
+  app.add_option("--metrics-port", metrics_port_override,
+                 "Prometheus metrics HTTP listen port (overrides config). Pass 0 for an "
+                 "OS-assigned ephemeral port; the bound port is emitted via --ready-fd "
+                 "when set.");
   app.add_option("-d,--data-dir", data_dir,
                  "Data directory for WAL and cold store (used when no config file is given)")
       ->default_val(data_dir);
@@ -60,8 +69,9 @@ int main(int argc, char* argv[]) {
                  "opened with the same count.");
   app.add_option("--ready-fd", ready_fd,
                  "Readiness pipe. POSIX fd, or Windows HANDLE cast to intptr_t. Once the "
-                 "listener is bound, one JSON line ({\"bind\":\"...\",\"port\":N}) is written "
-                 "and the handle is closed.");
+                 "listener is bound, one JSON line ({\"bind\":\"...\",\"port\":N,"
+                 "\"admin_bind\":\"...\",\"admin_port\":N,\"metrics_bind\":\"...\","
+                 "\"metrics_port\":N}) is written and the handle is closed.");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -87,6 +97,8 @@ int main(int argc, char* argv[]) {
   }
 
   if (port_override.has_value()) config.net.port = *port_override;
+  if (admin_port_override.has_value()) config.admin.port = *admin_port_override;
+  if (metrics_port_override.has_value()) config.metrics.port = *metrics_port_override;
   if (shard_count_override.has_value()) config.hot.shard_count = *shard_count_override;
 
   if (auto r = config.Validate(); !r.has_value()) {

@@ -75,6 +75,7 @@ metrics:
   port: 9090
 
 admin:
+  enabled: false
   bind: 0.0.0.0
   port: 8080
 )YAML";
@@ -139,6 +140,7 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
 
   EXPECT_EQ(cfg->metrics.bind, "0.0.0.0");
   EXPECT_EQ(cfg->metrics.port, 9090);
+  EXPECT_FALSE(cfg->admin.enabled);
   EXPECT_EQ(cfg->admin.bind, "0.0.0.0");
   EXPECT_EQ(cfg->admin.port, 8080);
 }

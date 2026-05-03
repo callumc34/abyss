@@ -21,10 +21,17 @@ TEST(ConfigValidate, AcceptsZeroNetPortAsEphemeral) {
   EXPECT_EQ(cfg->net.port, 0);
 }
 
-TEST(ConfigValidate, RejectsZeroMetricsPort) {
+TEST(ConfigValidate, AcceptsZeroMetricsPortAsEphemeral) {
+  // metrics.port == 0 mirrors net.port == 0: kernel-assigned ephemeral.
   auto cfg = Config::ParseFromYaml("metrics:\n  port: 0\n");
-  ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("metrics.port"), std::string::npos);
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->metrics.port, 0);
+}
+
+TEST(ConfigValidate, AcceptsZeroAdminPortAsEphemeral) {
+  auto cfg = Config::ParseFromYaml("admin:\n  port: 0\n");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->admin.port, 0);
 }
 
 TEST(ConfigValidate, RejectsPortAboveSixteenBit) {

@@ -22,6 +22,7 @@ add_executable(abyss_system_tests
   tiering_test.cpp
   durability_test.cpp
   operational_test.cpp
+  health_test.cpp
 )
 
 target_link_libraries(abyss_system_tests PRIVATE

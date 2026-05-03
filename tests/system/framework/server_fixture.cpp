@@ -44,11 +44,14 @@ void EnsureNetInit() {
 }
 
 constexpr std::string_view kPortKey = "\"port\":";
+constexpr std::string_view kAdminPortKey = "\"admin_port\":";
+constexpr std::string_view kMetricsPortKey = "\"metrics_port\":";
 
-uint16_t ParseReadyLine(std::string_view line) {
-  const auto key = line.find(kPortKey);
-  if (key == std::string_view::npos) return 0;
-  line.remove_prefix(key + kPortKey.size());
+// Returns 0 if `key` is not present or its value can't be parsed.
+uint16_t ExtractPort(std::string_view line, std::string_view key) {
+  const auto pos = line.find(key);
+  if (pos == std::string_view::npos) return 0;
+  line.remove_prefix(pos + key.size());
   uint32_t port = 0;
   bool any = false;
   for (char c : line) {
@@ -60,6 +63,20 @@ uint16_t ParseReadyLine(std::string_view line) {
   return any ? static_cast<uint16_t>(port) : 0;
 }
 
+struct ReadyPorts {
+  uint16_t resp = 0;
+  uint16_t admin = 0;
+  uint16_t metrics = 0;
+};
+
+ReadyPorts ParseReadyLine(std::string_view line) {
+  return ReadyPorts{
+      .resp = ExtractPort(line, kPortKey),
+      .admin = ExtractPort(line, kAdminPortKey),
+      .metrics = ExtractPort(line, kMetricsPortKey),
+  };
+}
+
 #ifdef _WIN32
 
 std::string BuildCommandLine(const char* binary, const std::string& data_dir,
@@ -68,7 +85,7 @@ std::string BuildCommandLine(const char* binary, const std::string& data_dir,
   cmd.reserve(256);
   cmd += '"';
   cmd += binary;
-  cmd += "\" --port 0 --data-dir \"";
+  cmd += "\" --port 0 --admin-port 0 --metrics-port 0 --data-dir \"";
   cmd += data_dir;
   cmd += "\" --shard-count ";
   cmd += shard_count;
@@ -185,8 +202,9 @@ bool TestServer::Start() {
   if (pid == 0) {
     ::close(pipe_fds[0]);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-    ::execl(binary, "abyss-server", "--port", "0", "--data-dir", data_str.c_str(), "--shard-count",
-            shard_str.c_str(), "--ready-fd", ready_str.c_str(), nullptr);
+    ::execl(binary, "abyss-server", "--port", "0", "--admin-port", "0", "--metrics-port", "0",
+            "--data-dir", data_str.c_str(), "--shard-count", shard_str.c_str(), "--ready-fd",
+            ready_str.c_str(), nullptr);
     ::_exit(127);
   }
 
@@ -297,13 +315,15 @@ bool TestServer::WaitForReady() {
     if (nl == std::string::npos) continue;
 
     const std::string_view line(buffer.data(), nl);
-    const uint16_t port = ParseReadyLine(line);
-    if (port == 0) {
+    const ReadyPorts ports = ParseReadyLine(line);
+    if (ports.resp == 0) {
       skip_reason_ = "malformed ready line: ";
       skip_reason_.append(line);
       return false;
     }
-    port_ = port;
+    port_ = ports.resp;
+    admin_port_ = ports.admin;
+    metrics_port_ = ports.metrics;
     return true;
   }
 
@@ -351,6 +371,8 @@ void TestServer::WaitChild() {
 #endif
   ClosePipe(&ready_read_);
   port_ = 0;
+  admin_port_ = 0;
+  metrics_port_ = 0;
 }
 
 std::unique_ptr<TestServer> SystemTest::shared_server_;
