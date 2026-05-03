@@ -389,7 +389,6 @@ void Server::Run(const std::atomic<bool>& stop) {
   NotifyReady();
   ABYSS_LOG_INFO("server ready");
 
-
   while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning()) {
     std::this_thread::sleep_for(kStopPollInterval);
   }
