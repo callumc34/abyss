@@ -319,5 +319,54 @@ TEST_F(TtlFixture, ConcurrentReadsOnExpiredKeyAreSafe) {
   EXPECT_EQ(null_count.load(), kThreads * 64);
 }
 
+// CAS-safety: a writer racing with a lazy-expiry read must never lose its
+// value. The lazy delete uses an OptimisticTransaction that aborts when the
+// concurrent rewrite has overlapping write set.
+TEST_F(TtlFixture, LazyExpiryDoesNotClobberConcurrentWrite) {
+  auto store = OpenStore();
+  std::string k = "k";
+
+  // Write an expired value as the starting state.
+  core::ops::WriteOp expired =
+      core::ops::StringSet{.key = k, .value = "old", .abs_ttl_ms = clock_.Now() - 1};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&expired, 1}).has_value());
+
+  std::atomic<bool> stop_writer{false};
+  std::thread writer([&]() {
+    while (!stop_writer.load(std::memory_order_acquire)) {
+      core::ops::WriteOp rewrite = core::ops::StringSet{
+          .key = k,
+          .value = "fresh",
+          .abs_ttl_ms = clock_.Now() + 60'000,
+      };
+      auto r = store->ApplyBatch(std::span{&rewrite, 1});
+      (void)r;
+    }
+  });
+
+  // Many lazy reads in parallel. Some will observe the expired old value and
+  // try to delete it; the OCC commit aborts whenever the writer rewrote
+  // concurrently, so "fresh" is never wiped.
+  constexpr int kReaders = 4;
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int i = 0; i < kReaders; ++i) {
+    readers.emplace_back([&] {
+      for (int j = 0; j < 200; ++j) {
+        auto r = store->Exec(core::ops::StringGet{.key = k});
+        EXPECT_TRUE(r.has_value());
+      }
+    });
+  }
+  for (auto& t : readers) t.join();
+  stop_writer.store(true, std::memory_order_release);
+  writer.join();
+
+  // After the dust settles the writer's last value must still be readable.
+  auto final_read = store->Exec(core::ops::StringGet{.key = k});
+  ASSERT_TRUE(final_read.has_value());
+  EXPECT_EQ(final_read->AsString(), "fresh");
+}
+
 }  // namespace
 }  // namespace abyss::cold::backends

@@ -39,6 +39,13 @@ class ColdStore : public Reader {
   // cold, or nullopt if the key does not exist or its type isn't promotable
   // in this implementation. Preserves absolute TTL.
   virtual Result<std::optional<RespCommand>> GetPromotionCommand(std::string_view key) = 0;
+
+  // Server calls Start() once after recovery completes to enable any
+  // backend-internal background work (TTL sweeping, prefetch, etc.). Stop()
+  // is called during shutdown before the store is destroyed. Both are
+  // idempotent. Backends with no background work leave the defaults.
+  virtual Result<void> Start() { return {}; }
+  virtual Result<void> Stop() { return {}; }
 };
 
 }  // namespace abyss::core

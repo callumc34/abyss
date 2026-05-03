@@ -16,6 +16,23 @@ cold:
   data_path: /data/cold
   write_buffer_size_bytes: 67108864
 
+  ttl_scanner:
+    enabled: true
+    base_sample_size: 20
+    min_sample_size: 5
+    max_sample_size: 200
+    base_interval_ms: 1000
+    min_interval_ms: 100
+    max_interval_ms: 60000
+    high_threshold: 0.25                       # ratio above this → ramp up
+    low_threshold: 0.05                        # ratio below this → ramp down
+    rate_increase_factor: 1.5
+    rate_decrease_factor: 0.7
+    disk_pressure_threshold: 0.9               # fs fraction at data_path
+    disk_pressure_release_threshold: 0.855     # hysteresis on exit
+    max_cpu_fraction: 0.10                     # scanner CPU cap (EWMA)
+    cpu_ewma_window_seconds: 30
+
 queue:
   backend: builtin_wal
   wal_path: /data/wal

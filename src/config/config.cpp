@@ -42,11 +42,32 @@ core::Result<void> ParseHot(const YamlCursor& cur, HotConfig& out) {
       .Finish();
 }
 
+core::Result<void> ParseColdTtlScanner(const YamlCursor& cur, cold::TtlScanner::Config& out) {
+  return SectionDecoder(cur)
+      .Optional("enabled", out.enabled)
+      .Optional("base_sample_size", out.base_sample_size)
+      .Optional("min_sample_size", out.min_sample_size)
+      .Optional("max_sample_size", out.max_sample_size)
+      .Optional("base_interval_ms", out.base_interval)
+      .Optional("min_interval_ms", out.min_interval)
+      .Optional("max_interval_ms", out.max_interval)
+      .Optional("high_threshold", out.high_threshold)
+      .Optional("low_threshold", out.low_threshold)
+      .Optional("rate_increase_factor", out.rate_increase_factor)
+      .Optional("rate_decrease_factor", out.rate_decrease_factor)
+      .Optional("disk_pressure_threshold", out.disk_pressure_threshold)
+      .Optional("disk_pressure_release_threshold", out.disk_pressure_release_threshold)
+      .Optional("max_cpu_fraction", out.max_cpu_fraction)
+      .Optional("cpu_ewma_window_seconds", out.cpu_ewma_window)
+      .Finish();
+}
+
 core::Result<void> ParseCold(const YamlCursor& cur, ColdConfig& out) {
   return SectionDecoder(cur)
       .Optional("backend", out.backend)
       .Optional("data_path", out.data_path)
       .Optional("write_buffer_size_bytes", out.write_buffer_size_bytes)
+      .OptionalSection("ttl_scanner", out.ttl_scanner, ParseColdTtlScanner)
       .Finish();
 }
 

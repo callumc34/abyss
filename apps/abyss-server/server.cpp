@@ -110,6 +110,7 @@ bool Server::Initialize() {
   auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
       .data_path = config_.cold.data_path,
       .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
+      .ttl_scanner = config_.cold.ttl_scanner,
   });
   if (!cold_result.has_value()) {
     ABYSS_LOG_CRITICAL("cold store open failed", {"path", std::string_view{config_.cold.data_path}},
@@ -351,6 +352,19 @@ void Server::Run(const std::atomic<bool>& stop) {
                  {"admin_port", static_cast<int64_t>(AdminBoundPort())},
                  {"metrics_port", static_cast<int64_t>(MetricsBoundPort())});
 
+  // Defer cold-store background work (TTL scanner) until hot replay catches
+  // up to the captured tail watermark. Starting earlier would just contend on
+  // disk I/O with replay for no benefit.
+  while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning() && loading_ &&
+         loading_->IsLoading()) {
+    std::this_thread::sleep_for(kStopPollInterval);
+  }
+  if (!stop.load(std::memory_order_acquire) && cold_store_) {
+    if (auto r = cold_store_->Start(); !r.has_value()) {
+      ABYSS_LOG_WARN("cold store start failed", {"err", std::string_view{r.error().message()}});
+    }
+  }
+
   while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning()) {
     std::this_thread::sleep_for(kStopPollInterval);
   }
@@ -423,6 +437,11 @@ void Server::Shutdown() {
   if (hot_pool_) hot_pool_->Stop();
   if (resolver_pool_) resolver_pool_->Stop();
   if (hot_eviction_worker_) hot_eviction_worker_->Stop();
+  if (cold_store_) {
+    if (auto r = cold_store_->Stop(); !r.has_value()) {
+      ABYSS_LOG_WARN("cold store stop failed", {"err", std::string_view{r.error().message()}});
+    }
+  }
 
   ABYSS_LOG_INFO("shutdown complete");
 }

@@ -67,11 +67,69 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
   return {};
 }
 
+core::Result<void> ValidateColdTtlScanner(const cold::TtlScanner::Config& s) {
+  if (s.high_threshold < 0.0 || s.high_threshold > 1.0) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.high_threshold", "must be in [0.0, 1.0]"));
+  }
+  if (s.low_threshold < 0.0 || s.low_threshold > 1.0) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.low_threshold", "must be in [0.0, 1.0]"));
+  }
+  if (s.high_threshold <= s.low_threshold) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.high_threshold",
+                                      "must be strictly greater than low_threshold"));
+  }
+  if (s.disk_pressure_threshold < 0.0 || s.disk_pressure_threshold > 1.0) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.disk_pressure_threshold", "must be in [0.0, 1.0]"));
+  }
+  if (s.disk_pressure_release_threshold < 0.0 || s.disk_pressure_release_threshold > 1.0) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.disk_pressure_release_threshold", "must be in [0.0, 1.0]"));
+  }
+  if (s.disk_pressure_release_threshold > s.disk_pressure_threshold) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.disk_pressure_release_threshold",
+                                      "must be <= disk_pressure_threshold"));
+  }
+  if (s.base_sample_size == 0 || s.min_sample_size == 0) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.base_sample_size", "must be > 0"));
+  }
+  if (s.min_sample_size > s.base_sample_size || s.base_sample_size > s.max_sample_size) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.base_sample_size",
+                   "must satisfy min_sample_size <= base_sample_size <= max_sample_size"));
+  }
+  if (s.min_interval.count() <= 0 || s.base_interval.count() <= 0 || s.max_interval.count() <= 0) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.base_interval_ms", "must be > 0"));
+  }
+  if (s.min_interval > s.base_interval || s.base_interval > s.max_interval) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.base_interval_ms",
+                   "must satisfy min_interval_ms <= base_interval_ms <= max_interval_ms"));
+  }
+  if (s.rate_increase_factor <= 1.0) {
+    return std::unexpected(InvalidArg("cold.ttl_scanner.rate_increase_factor", "must be > 1.0"));
+  }
+  if (s.rate_decrease_factor <= 0.0 || s.rate_decrease_factor >= 1.0) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.rate_decrease_factor", "must be in (0.0, 1.0)"));
+  }
+  if (s.max_cpu_fraction <= 0.0 || s.max_cpu_fraction > 1.0) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.max_cpu_fraction", "must be in (0.0, 1.0]"));
+  }
+  if (s.cpu_ewma_window.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold.ttl_scanner.cpu_ewma_window_seconds", "must be > 0 seconds"));
+  }
+  return {};
+}
+
 core::Result<void> ValidateCold(const ColdConfig& cold) {
   if (auto r = RequireNonEmpty("cold.backend", cold.backend); !r) return r;
   if (auto r = RequireNonEmpty("cold.data_path", cold.data_path); !r) return r;
   if (auto r = RequirePositive("cold.write_buffer_size_bytes", cold.write_buffer_size_bytes); !r)
     return r;
+  if (auto r = ValidateColdTtlScanner(cold.ttl_scanner); !r) return r;
   return {};
 }
 

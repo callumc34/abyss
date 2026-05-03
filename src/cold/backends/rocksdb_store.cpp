@@ -7,10 +7,13 @@
 #include <rocksdb/slice.h>
 #include <rocksdb/status.h>
 #include <rocksdb/table.h>
+#include <rocksdb/utilities/optimistic_transaction_db.h>
+#include <rocksdb/utilities/transaction.h>
 #include <rocksdb/utilities/write_batch_with_index.h>
 #include <rocksdb/write_batch.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -20,6 +23,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -27,6 +31,7 @@
 #include <vector>
 
 #include "abyss/cold/format/key_codec.h"
+#include "abyss/cold/ttl_scanner.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_format.h"
 #include "abyss/core/resp_types.h"
@@ -46,6 +51,13 @@ using core::ErrorCode;
 using core::RespValue;
 
 constexpr std::string_view kZsetScoreIndexCfName = "zset_score_idx";
+
+enum class ExpireOutcome : uint8_t {
+  kDeleted,
+  kNotExpired,
+  kNotFound,
+  kConflict,
+};
 
 ErrorCode MapStatusCode(const rocksdb::Status& status) {
   if (status.IsNotFound()) return ErrorCode::kNotFound;
@@ -170,13 +182,18 @@ struct CfHandleDeleter {
 };
 using CfHandle = std::unique_ptr<rocksdb::ColumnFamilyHandle, CfHandleDeleter>;
 
-struct RocksdbStore::Impl {
+struct RocksdbStore::Impl : public TtlScannerBackend {
   RocksdbConfig config;
-  std::unique_ptr<rocksdb::DB> db;
+  std::unique_ptr<rocksdb::OptimisticTransactionDB> db;
   CfHandle default_cf;
   CfHandle zset_score_idx_cf;
+  std::unique_ptr<TtlScanner> ttl_scanner;
+  std::mt19937_64 rng{0};  // NOLINT(bugprone-random-generator-seed): re-seeded at Create.
 
   uint64_t NowMs() const { return WallMs(config.wall_clock); }
+
+  // TtlScannerBackend.
+  core::Result<SweepReport> SampleAndExpire(SweepRequest req) override;
 
   // --- Dispatch ------------------------------------------------------------
 
@@ -257,11 +274,22 @@ struct RocksdbStore::Impl {
   core::Result<void> IterateAndDeleteCollection(rocksdb::WriteBatchWithIndex& wb,
                                                 uint8_t inner_type, std::string_view key) const;
 
-  // Inline-expire a string: a single point-delete written directly to the DB.
-  core::Result<void> InlineExpireString(std::string_view key) const;
+  // CAS-safe expiry. Begins an optimistic transaction with a snapshot, re-reads
+  // the record under the snapshot, and commits a delete only if it is still
+  // expired. If a concurrent writer modified the record between the caller's
+  // first read and our commit, the commit aborts (kConflict) and we leave the
+  // record alone — the writer just produced fresh data we must not clobber.
+  // The meta-record GetForUpdate covers collections by transitivity: every
+  // member-affecting write also touches the meta (ApplyMetaDelta /
+  // ReadMetaOrPurgeIfExpired), so a concurrent member write conflicts.
+  core::Result<ExpireOutcome> ExpireStringIfStillExpired(std::string_view key) const;
+  core::Result<ExpireOutcome> ExpireCollectionIfStillExpired(uint8_t inner_type,
+                                                             std::string_view key) const;
 
-  // Inline-expire a collection: opens a fresh WBWI and then commits.
-  core::Result<void> InlineExpireCollection(uint8_t inner_type, std::string_view key) const;
+  // One-sample helpers used by SampleAndExpire. Each draws a single random
+  // sample from its type's range and applies CAS expiry if expired.
+  core::Result<void> SampleAndExpireString(SweepReport& report);
+  core::Result<void> SampleAndExpireMeta(SweepReport& report);
 
   core::Result<bool> AnyLiveRecord(std::string_view key) const;
 
@@ -294,10 +322,14 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
 
   auto impl = std::make_unique<Impl>();
   std::vector<rocksdb::ColumnFamilyHandle*> cf_handles;
-  auto status = rocksdb::DB::Open(db_opts, config.data_path, cf_descs, &cf_handles, &impl->db);
+  rocksdb::OptimisticTransactionDB* raw_db = nullptr;
+  auto status = rocksdb::OptimisticTransactionDB::Open(db_opts, config.data_path, cf_descs,
+                                                       &cf_handles, &raw_db);
   if (!status.ok()) {
-    return std::unexpected(FromStatus(status, "RocksdbStore::Create: DB::Open"));
+    return std::unexpected(
+        FromStatus(status, "RocksdbStore::Create: OptimisticTransactionDB::Open"));
   }
+  impl->db.reset(raw_db);
 
   impl->config = std::move(config);
   impl->default_cf = CfHandle(cf_handles[0], CfHandleDeleter{impl->db.get()});
@@ -330,6 +362,33 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
 
   ABYSS_LOG_INFO("cold store opened", {"path", std::string_view{impl->config.data_path}},
                  {"format_version", static_cast<int64_t>(fmt::kFormatVersion)});
+
+  // Seed the sampling RNG. Production seeds from std::random_device; tests
+  // can supply a deterministic seed by injecting their own backend.
+  std::random_device rd;
+  impl->rng.seed((static_cast<uint64_t>(rd()) << 32) | static_cast<uint64_t>(rd()));
+
+  // Construct the TTL scanner. The scanner is created in a stopped state;
+  // RocksdbStore::Start() is what flips it on, called by the server after
+  // recovery completes.
+  TtlScanner::Hooks hooks;
+  if (impl->config.ttl_scanner_hooks.has_value()) {
+    hooks = *impl->config.ttl_scanner_hooks;
+  } else {
+    const std::string data_path_copy = impl->config.data_path;
+    // NOLINTNEXTLINE(bugprone-exception-escape): std::function tolerates exceptions; alloc failures
+    // from Result/string are operator-actionable, not silently swallowed here.
+    hooks.disk_usage = [data_path_copy] { return DefaultDiskUsage(data_path_copy); };
+    hooks.cpu_clock = DefaultThreadCpuClock;
+    hooks.steady_clock = core::DefaultSteadyClock;
+  }
+  const auto mode = impl->config.ttl_scanner_mode.value_or(TtlScanner::ExecutionMode::kOwnedThread);
+  auto scanner = TtlScanner::Create(*impl, impl->config.ttl_scanner, mode, std::move(hooks));
+  if (!scanner.has_value()) {
+    return std::unexpected(scanner.error());
+  }
+  impl->ttl_scanner = std::move(*scanner);
+
   return std::unique_ptr<RocksdbStore>(new RocksdbStore(std::move(impl)));
 }
 
@@ -417,6 +476,28 @@ core::Result<std::optional<core::RespCommand>> RocksdbStore::GetPromotionCommand
   return std::optional<core::RespCommand>{std::move(cmd)};
 }
 
+core::Result<void> RocksdbStore::Start() {
+  if (impl_->ttl_scanner != nullptr) impl_->ttl_scanner->Start();
+  return {};
+}
+
+core::Result<void> RocksdbStore::Stop() {
+  if (impl_->ttl_scanner != nullptr) impl_->ttl_scanner->Stop();
+  return {};
+}
+
+core::Result<SweepReport> RocksdbStore::RunScannerTickForTesting() {
+  if (impl_->ttl_scanner == nullptr) {
+    return std::unexpected(Error(ErrorCode::kUnavailable, "ttl scanner is not constructed"));
+  }
+  return impl_->ttl_scanner->Tick();
+}
+
+TtlScanner::Snapshot RocksdbStore::ScannerSnapshot() const {
+  if (impl_->ttl_scanner == nullptr) return TtlScanner::Snapshot{};
+  return impl_->ttl_scanner->CurrentSnapshot();
+}
+
 // --- Dispatch ---------------------------------------------------------------
 
 core::Result<RespValue> RocksdbStore::Impl::Exec(const core::ops::ReadOp& op,
@@ -469,7 +550,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::StringGet& o
   if (!decoded.has_value()) return std::unexpected(decoded.error());
 
   if (fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) {
-    auto r = InlineExpireString(op.key);
+    auto r = ExpireStringIfStillExpired(op.key);
     if (!r.has_value()) return std::unexpected(r.error());
     return RespValue::Null();
   }
@@ -1044,7 +1125,7 @@ core::Result<std::optional<fmt::MetaValue>> RocksdbStore::Impl::ReadMetaIfLive(
   auto decoded = fmt::DecodeMetaValue(raw);
   if (!decoded.has_value()) return std::unexpected(decoded.error());
   if (fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) {
-    auto r = InlineExpireCollection(inner_type, key);
+    auto r = ExpireCollectionIfStillExpired(inner_type, key);
     if (!r.has_value()) return std::unexpected(r.error());
     return std::optional<fmt::MetaValue>{};
   }
@@ -1150,20 +1231,300 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
   return {};
 }
 
-core::Result<void> RocksdbStore::Impl::InlineExpireString(std::string_view key) const {
-  const auto encoded = fmt::EncodeStringKey(key);
-  auto s = db->Delete(rocksdb::WriteOptions(), default_cf.get(), encoded);
-  if (!s.ok()) return std::unexpected(FromStatus(s, "lazy expire string"));
+core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireStringIfStillExpired(
+    std::string_view key) const {
+  rocksdb::WriteOptions write_opts;
+  rocksdb::OptimisticTransactionOptions txn_opts;
+  txn_opts.set_snapshot = true;
+  std::unique_ptr<rocksdb::Transaction> txn(db->BeginTransaction(write_opts, txn_opts));
+
+  rocksdb::ReadOptions read_opts;
+  read_opts.snapshot = txn->GetSnapshot();
+
+  const auto encoded_key = fmt::EncodeStringKey(key);
+  std::string raw;
+  auto s = txn->GetForUpdate(read_opts, default_cf.get(), encoded_key, &raw);
+  if (s.IsNotFound()) {
+    txn->Rollback();
+    return ExpireOutcome::kNotFound;
+  }
+  if (!s.ok()) {
+    return std::unexpected(FromStatus(s, "expire string GetForUpdate"));
+  }
+
+  auto decoded = fmt::DecodeStringValue(raw);
+  if (!decoded.has_value()) {
+    txn->Rollback();
+    return std::unexpected(decoded.error());
+  }
+  if (!fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) {
+    txn->Rollback();
+    return ExpireOutcome::kNotExpired;
+  }
+
+  if (auto del = txn->Delete(default_cf.get(), encoded_key); !del.ok()) {
+    txn->Rollback();
+    return std::unexpected(FromStatus(del, "expire string delete"));
+  }
+
+  auto commit = txn->Commit();
+  if (commit.IsBusy() || commit.IsTryAgain()) {
+    return ExpireOutcome::kConflict;
+  }
+  if (!commit.ok()) {
+    return std::unexpected(FromStatus(commit, "expire string commit"));
+  }
+  return ExpireOutcome::kDeleted;
+}
+
+core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireCollectionIfStillExpired(
+    uint8_t inner_type, std::string_view key) const {
+  std::string member_prefix;
+  switch (inner_type) {
+    case fmt::kTypeHashField:
+      member_prefix = fmt::HashFieldPrefix(key);
+      break;
+    case fmt::kTypeSetMember:
+      member_prefix = fmt::SetMemberPrefix(key);
+      break;
+    case fmt::kTypeZsetMember:
+      member_prefix = fmt::ZsetMemberPrefix(key);
+      break;
+    default:
+      return std::unexpected(
+          Error(ErrorCode::kInternal, "ExpireCollectionIfStillExpired: unknown inner type"));
+  }
+
+  rocksdb::WriteOptions write_opts;
+  rocksdb::OptimisticTransactionOptions txn_opts;
+  txn_opts.set_snapshot = true;
+  std::unique_ptr<rocksdb::Transaction> txn(db->BeginTransaction(write_opts, txn_opts));
+
+  rocksdb::ReadOptions read_opts;
+  read_opts.snapshot = txn->GetSnapshot();
+
+  const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+  std::string raw_meta;
+  auto s = txn->GetForUpdate(read_opts, default_cf.get(), meta_key, &raw_meta);
+  if (s.IsNotFound()) {
+    txn->Rollback();
+    return ExpireOutcome::kNotFound;
+  }
+  if (!s.ok()) {
+    return std::unexpected(FromStatus(s, "expire collection GetForUpdate meta"));
+  }
+
+  auto decoded = fmt::DecodeMetaValue(raw_meta);
+  if (!decoded.has_value()) {
+    txn->Rollback();
+    return std::unexpected(decoded.error());
+  }
+  if (!fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) {
+    txn->Rollback();
+    return ExpireOutcome::kNotExpired;
+  }
+
+  // Member iteration uses the txn's snapshot, so we delete only the member
+  // set as it existed at snapshot time. Concurrent writes to the meta record
+  // (every member-affecting write touches the meta) cause Commit to abort.
+  std::string upper = LexicographicSuccessor(member_prefix);
+  rocksdb::Slice upper_slice(upper);
+  rocksdb::ReadOptions iter_opts = read_opts;
+  if (!upper.empty()) iter_opts.iterate_upper_bound = &upper_slice;
+  std::unique_ptr<rocksdb::Iterator> it(txn->GetIterator(iter_opts, default_cf.get()));
+  for (it->Seek(ToSlice(member_prefix)); it->Valid(); it->Next()) {
+    auto k = ToSv(it->key());
+    if (!k.starts_with(member_prefix)) break;
+    if (auto del = txn->Delete(default_cf.get(), ToSlice(k)); !del.ok()) {
+      txn->Rollback();
+      return std::unexpected(FromStatus(del, "expire collection member delete"));
+    }
+  }
+  if (!it->status().ok()) {
+    txn->Rollback();
+    return std::unexpected(FromStatus(it->status(), "expire collection member scan"));
+  }
+
+  if (inner_type == fmt::kTypeZsetMember) {
+    const auto score_prefix = fmt::ZsetScoreIndexPrefix(key);
+    std::string score_upper = LexicographicSuccessor(score_prefix);
+    rocksdb::Slice score_upper_slice(score_upper);
+    rocksdb::ReadOptions score_iter_opts = read_opts;
+    if (!score_upper.empty()) score_iter_opts.iterate_upper_bound = &score_upper_slice;
+    std::unique_ptr<rocksdb::Iterator> score_it(
+        txn->GetIterator(score_iter_opts, zset_score_idx_cf.get()));
+    for (score_it->Seek(ToSlice(score_prefix)); score_it->Valid(); score_it->Next()) {
+      auto k = ToSv(score_it->key());
+      if (!k.starts_with(score_prefix)) break;
+      if (auto del = txn->Delete(zset_score_idx_cf.get(), ToSlice(k)); !del.ok()) {
+        txn->Rollback();
+        return std::unexpected(FromStatus(del, "expire collection score index delete"));
+      }
+    }
+    if (!score_it->status().ok()) {
+      txn->Rollback();
+      return std::unexpected(FromStatus(score_it->status(), "expire collection score index scan"));
+    }
+  }
+
+  if (auto del = txn->Delete(default_cf.get(), meta_key); !del.ok()) {
+    txn->Rollback();
+    return std::unexpected(FromStatus(del, "expire collection meta delete"));
+  }
+
+  auto commit = txn->Commit();
+  if (commit.IsBusy() || commit.IsTryAgain()) {
+    return ExpireOutcome::kConflict;
+  }
+  if (!commit.ok()) {
+    return std::unexpected(FromStatus(commit, "expire collection commit"));
+  }
+  return ExpireOutcome::kDeleted;
+}
+
+// --- Active TTL sampling ----------------------------------------------------
+
+core::Result<SweepReport> RocksdbStore::Impl::SampleAndExpire(SweepRequest req) {
+  SweepReport report{};
+  if (req.sample_size == 0) return report;
+  for (size_t i = 0; i < req.sample_size; ++i) {
+    const bool sample_string = (i % 2 == 0);
+    auto r = sample_string ? SampleAndExpireString(report) : SampleAndExpireMeta(report);
+    if (!r.has_value()) return std::unexpected(r.error());
+  }
+  return report;
+}
+
+core::Result<void> RocksdbStore::Impl::SampleAndExpireString(SweepReport& report) {
+  std::array<char, 9> seek_target{};
+  seek_target[0] = static_cast<char>(fmt::kTypeString);
+  const uint64_t random_suffix = rng();
+  std::memcpy(seek_target.data() + 1, &random_suffix, sizeof(random_suffix));
+
+  const std::array<char, 1> upper{static_cast<char>(fmt::kTypeString + 1)};
+  const rocksdb::Slice upper_slice(upper.data(), upper.size());
+  rocksdb::ReadOptions opts;
+  opts.iterate_upper_bound = &upper_slice;
+
+  std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(opts, default_cf.get()));
+  it->Seek(rocksdb::Slice(seek_target.data(), seek_target.size()));
+  if (!it->Valid()) {
+    const std::array<char, 1> start{static_cast<char>(fmt::kTypeString)};
+    it->Seek(rocksdb::Slice(start.data(), start.size()));
+    if (!it->Valid()) {
+      if (!it->status().ok()) {
+        return std::unexpected(FromStatus(it->status(), "sample string iterator"));
+      }
+      return {};
+    }
+  }
+
+  ++report.sampled_strings;
+
+  const auto encoded_key = ToSv(it->key());
+  if (encoded_key.empty() || static_cast<uint8_t>(encoded_key[0]) != fmt::kTypeString) {
+    return {};
+  }
+  const auto user_key = std::string(encoded_key.substr(1));
+  const auto value = ToSv(it->value());
+
+  auto decoded = fmt::DecodeStringValue(value);
+  if (!decoded.has_value()) {
+    ABYSS_LOG_WARN("ttl scanner: corrupt string value, skipping");
+    return {};
+  }
+
+  if ((decoded->flags & fmt::kFlagHasTtl) == 0) return {};
+  ++report.with_ttl_strings;
+
+  if (!fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) return {};
+  ++report.expired_strings;
+
+  it.reset();
+
+  auto outcome = ExpireStringIfStillExpired(user_key);
+  if (!outcome.has_value()) return std::unexpected(outcome.error());
+
+  switch (*outcome) {
+    case ExpireOutcome::kDeleted:
+      ++report.deleted_strings;
+      break;
+    case ExpireOutcome::kConflict:
+    case ExpireOutcome::kNotExpired:
+    case ExpireOutcome::kNotFound:
+      ++report.conflicts_strings;
+      break;
+  }
+
   return {};
 }
 
-core::Result<void> RocksdbStore::Impl::InlineExpireCollection(uint8_t inner_type,
-                                                              std::string_view key) const {
-  rocksdb::WriteBatchWithIndex wb(rocksdb::BytewiseComparator(), 0, /*overwrite_key=*/true);
-  auto r = IterateAndDeleteCollection(wb, inner_type, key);
-  if (!r.has_value()) return r;
-  auto s = db->Write(rocksdb::WriteOptions(), wb.GetWriteBatch());
-  if (!s.ok()) return std::unexpected(FromStatus(s, "lazy expire collection"));
+core::Result<void> RocksdbStore::Impl::SampleAndExpireMeta(SweepReport& report) {
+  std::array<char, 9> seek_target{};
+  seek_target[0] = static_cast<char>(fmt::kTypeMeta);
+  const uint64_t random_suffix = rng();
+  std::memcpy(seek_target.data() + 1, &random_suffix, sizeof(random_suffix));
+
+  const std::array<char, 1> upper{static_cast<char>(fmt::kTypeMeta + 1)};
+  const rocksdb::Slice upper_slice(upper.data(), upper.size());
+  rocksdb::ReadOptions opts;
+  opts.iterate_upper_bound = &upper_slice;
+
+  std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(opts, default_cf.get()));
+  it->Seek(rocksdb::Slice(seek_target.data(), seek_target.size()));
+  if (!it->Valid()) {
+    const std::array<char, 1> start{static_cast<char>(fmt::kTypeMeta)};
+    it->Seek(rocksdb::Slice(start.data(), start.size()));
+    if (!it->Valid()) {
+      if (!it->status().ok()) {
+        return std::unexpected(FromStatus(it->status(), "sample meta iterator"));
+      }
+      return {};
+    }
+  }
+
+  ++report.sampled_collections;
+
+  const auto encoded_key = ToSv(it->key());
+  if (encoded_key.size() < 2 || static_cast<uint8_t>(encoded_key[0]) != fmt::kTypeMeta) {
+    return {};
+  }
+  const auto inner_type = static_cast<uint8_t>(encoded_key[1]);
+  if (inner_type != fmt::kTypeHashField && inner_type != fmt::kTypeSetMember &&
+      inner_type != fmt::kTypeZsetMember) {
+    return {};
+  }
+  const auto user_key = std::string(encoded_key.substr(2));
+  const auto value = ToSv(it->value());
+
+  auto decoded = fmt::DecodeMetaValue(value);
+  if (!decoded.has_value()) {
+    ABYSS_LOG_WARN("ttl scanner: corrupt meta value, skipping");
+    return {};
+  }
+
+  if ((decoded->flags & fmt::kFlagHasTtl) == 0) return {};
+  ++report.with_ttl_collections;
+
+  if (!fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) return {};
+  ++report.expired_collections;
+
+  it.reset();
+
+  auto outcome = ExpireCollectionIfStillExpired(inner_type, user_key);
+  if (!outcome.has_value()) return std::unexpected(outcome.error());
+
+  switch (*outcome) {
+    case ExpireOutcome::kDeleted:
+      ++report.deleted_collections;
+      break;
+    case ExpireOutcome::kConflict:
+    case ExpireOutcome::kNotExpired:
+    case ExpireOutcome::kNotFound:
+      ++report.conflicts_collections;
+      break;
+  }
+
   return {};
 }
 
@@ -1175,7 +1536,7 @@ core::Result<bool> RocksdbStore::Impl::AnyLiveRecord(std::string_view key) const
     auto decoded = fmt::DecodeStringValue(raw);
     if (!decoded.has_value()) return std::unexpected(decoded.error());
     if (!fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) return true;
-    auto r = InlineExpireString(key);
+    auto r = ExpireStringIfStillExpired(key);
     if (!r.has_value()) return std::unexpected(r.error());
   } else if (!s.IsNotFound()) {
     return std::unexpected(FromStatus(s, "EXISTS string"));

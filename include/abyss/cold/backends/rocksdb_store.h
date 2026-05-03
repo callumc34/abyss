@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 
+#include "abyss/cold/ttl_scanner.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/types.h"
 
@@ -29,6 +30,9 @@ struct RocksdbConfig {
   uint32_t bloom_filter_bits_per_key = 10;
   CompactionStyle compaction_style = CompactionStyle::kLevel;
   core::WallClockFn wall_clock = core::DefaultWallClock;
+  TtlScanner::Config ttl_scanner;
+  std::optional<TtlScanner::Hooks> ttl_scanner_hooks;
+  std::optional<TtlScanner::ExecutionMode> ttl_scanner_mode;
 };
 
 // RocksDB-backed cold store.
@@ -52,6 +56,12 @@ class RocksdbStore : public core::ColdStore {
 
   // DEL returns the count of keys that existed before deletion.
   core::Result<core::RespValue> ExecDel(const core::ops::Del& op);
+
+  core::Result<void> Start() override;
+  core::Result<void> Stop() override;
+
+  core::Result<SweepReport> RunScannerTickForTesting();
+  TtlScanner::Snapshot ScannerSnapshot() const;
 
  private:
   struct Impl;

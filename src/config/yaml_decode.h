@@ -174,6 +174,21 @@ class SectionDecoder {
     return *this;
   }
 
+  // Parse a nested YAML mapping into a typed destination via a caller-provided
+  // section parser. Absent key → out left at its default. Present null → out
+  // left at its default.
+  template <typename T, typename SectionParser>
+  SectionDecoder& OptionalSection(std::string_view key, T& out, SectionParser parse) {
+    Register(key);
+    if (!state_.has_value()) return *this;
+    auto child = cur_.Child(key);
+    if (!child.node().IsDefined() || child.node().IsNull()) return *this;
+    if (auto r = parse(child, out); !r.has_value()) {
+      state_ = std::unexpected(r.error());
+    }
+    return *this;
+  }
+
   // Parse a YAML sequence of T using a caller-provided per-item parser.
   // Absent key → out is left untouched. Missing sequence → error.
   template <typename T, typename ItemParser>
