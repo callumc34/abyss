@@ -141,6 +141,7 @@ TEST_F(SweepFixture, ExpiredStringsAreSweptWithoutBeingRead) {
   std::vector<std::string> values(200, "x");
   std::vector<core::ops::WriteOp> ops;
   ops.reserve(200);
+  keys_.reserve(keys_.size() + 200);
   for (size_t i = 0; i < 200; ++i) {
     auto& key_storage = keys_.emplace_back("k:" + std::to_string(i));
     ops.emplace_back(core::ops::StringSet{
