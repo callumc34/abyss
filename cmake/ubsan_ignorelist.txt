@@ -1,0 +1,35 @@
+# UBSan ignorelist for the extended `undefined` sanitizer mode.
+#
+# Entries scope checks out of third-party headers that are pulled into our
+# translation units (and so end up instrumented) but whose code is outside our
+# control. Patterns match the source filename of the function being checked.
+#
+# The [*] section applies entries to every UBSan sub-check. Function patterns
+# (`fun:*`) on abyss code must never appear here without an inline justification
+# comment.
+#
+# Reference:
+#   https://clang.llvm.org/docs/SanitizerSpecialCaseList.html
+
+[*]
+
+# Vendored libraries pulled in via vcpkg or as inline templates from headers.
+src:*rocksdb*
+src:*hiredis*
+src:*xxhash*
+src:*xxHash*
+src:*crc32c*
+src:*spdlog*
+src:*fmt*
+src:*yaml-cpp*
+src:*prometheus*
+
+# Standard library headers (libc++ on macOS, libstdc++ on Linux). String and
+# numeric hashing use intentional unsigned shift wrap; std::unordered_map
+# instantiations from gtest reach this at static-init time.
+src:*c++/v1*
+src:*include/c++*
+src:*bits/*
+src:*googletest*
+src:*gtest*
+src:*gmock*

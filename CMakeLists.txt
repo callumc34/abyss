@@ -19,6 +19,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FeatureSummary)
 include(cmake/abyss_compiler_options.cmake)
+include(cmake/abyss_sanitizers.cmake)
 
 option(ABYSS_BUILD_TESTS "Build tests" ON)
 option(ABYSS_BUILD_BENCHMARKS "Build benchmarks" OFF)

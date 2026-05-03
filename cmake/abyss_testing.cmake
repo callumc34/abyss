@@ -4,7 +4,7 @@ set(ABYSS_TEST_TIMEOUT_DEFAULT 30)
 set(ABYSS_TEST_TIMEOUT_SLOW 300)
 
 function(_abyss_discover_tests_impl target labels timeout)
-  if(CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  if(ABYSS_SANITIZER_ACTIVE)
     gtest_discover_tests(${target}
       DISCOVERY_MODE PRE_TEST
       DISCOVERY_TIMEOUT 120
