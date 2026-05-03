@@ -139,11 +139,13 @@ core::Result<void> HttpServer::Start() {
   }
   impl_->bound_port.store(static_cast<uint16_t>(bound), std::memory_order_release);
 
-  impl_->running.store(true, std::memory_order_release);
   impl_->loop = std::thread([this] {
     impl_->server.listen_after_bind();
     impl_->running.store(false, std::memory_order_release);
   });
+
+  impl_->server.wait_until_ready();
+  impl_->running.store(true, std::memory_order_release);
 
   ABYSS_LOG_INFO("admin http listening", {"label", std::string_view{config_.label}},
                  {"bind", std::string_view{config_.bind}},
