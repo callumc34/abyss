@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -100,6 +101,8 @@ class ResolverTest : public ::testing::Test {
   Resolver::Config config_;
   std::vector<core::QueueEntry> appended_;
   core::SequenceId next_appended_seq_ = 1000;
+  // Tests never cancel — pass to ReplayForRecovery to satisfy the API.
+  std::atomic<bool> cancel_{false};
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
@@ -111,7 +114,7 @@ TEST_F(ResolverTest, SetnxOnAbsentKeyDecidesApply) {
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
-  ASSERT_TRUE(resolver.ReplayForRecovery().has_value());
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
   ASSERT_EQ(appended_.size(), 1U);
   const auto* resolved = std::get_if<core::entry::Resolved>(&appended_[0].payload);
@@ -132,7 +135,7 @@ TEST_F(ResolverTest, SetnxOnPresentKeyDecidesSkip) {
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(1)));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
-  ASSERT_TRUE(resolver.ReplayForRecovery().has_value());
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
   ASSERT_EQ(appended_.size(), 1U);
   const auto* resolved = std::get_if<core::entry::Resolved>(&appended_[0].payload);
@@ -149,7 +152,7 @@ TEST_F(ResolverTest, SetXxOnAbsentKeyDecidesSkipReturnsNull) {
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
-  ASSERT_TRUE(resolver.ReplayForRecovery().has_value());
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
   ASSERT_EQ(appended_.size(), 1U);
   const auto* resolved = std::get_if<core::entry::Resolved>(&appended_[0].payload);
@@ -167,7 +170,7 @@ TEST_F(ResolverTest, MsetnxAtomicSkipsAllIfAnyExist) {
   // MSETNX requires all-absent, so any present key triggers Skip.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(1)));
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
-  ASSERT_TRUE(resolver.ReplayForRecovery().has_value());
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
   ASSERT_EQ(appended_.size(), 1U);
   const auto* resolved = std::get_if<core::entry::Resolved>(&appended_[0].payload);
@@ -185,7 +188,7 @@ TEST_F(ResolverTest, ColdTimeoutDecidesSkipWithError) {
           Return(std::unexpected(core::Error{core::ErrorCode::kTimeout, "cold deadline elapsed"})));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
-  ASSERT_TRUE(resolver.ReplayForRecovery().has_value());
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
   ASSERT_EQ(appended_.size(), 1U);
   const auto* resolved = std::get_if<core::entry::Resolved>(&appended_[0].payload);
@@ -216,7 +219,7 @@ TEST_F(ResolverTest, RecoveryRebuildsCacheFromExistingResolved) {
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
-  ASSERT_TRUE(resolver.ReplayForRecovery().has_value());
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
   EXPECT_TRUE(appended_.empty());  // no new Resolveds emitted
   EXPECT_EQ(resolver.GetSnapshot().replayed_resolveds_emitted, 0U);

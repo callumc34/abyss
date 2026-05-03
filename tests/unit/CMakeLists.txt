@@ -202,6 +202,16 @@ target_link_libraries(abyss_admin_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_engine_tests
+  engine/shard_scheduler_test.cpp
+)
+
+target_link_libraries(abyss_engine_tests PRIVATE
+  abyss::engine
+  abyss::test_support
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -214,3 +224,4 @@ abyss_discover_tests(abyss_log_tests      "unit\;unit-log")
 abyss_discover_tests(abyss_metrics_tests  "unit\;unit-metrics")
 abyss_discover_tests(abyss_net_tests      "unit\;unit-net")
 abyss_discover_tests(abyss_admin_tests    "unit\;unit-admin")
+abyss_discover_tests(abyss_engine_tests   "unit\;unit-engine")

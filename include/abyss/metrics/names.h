@@ -523,6 +523,57 @@ inline constexpr GaugeDesc<> kColdTtlDiskPressureActive{
     .help = "Whether the cold TTL scanner is in disk-pressure mode (1) or not (0).",
 };
 
+// ---------------------------------------------------------------------------
+// Recovery
+// ---------------------------------------------------------------------------
+
+// Encoded as the underlying value of engine::RecoverySnapshot::Phase:
+// 0=queue_open, 1=resolver_replay, 2=cold_hot_replay, 3=complete.
+inline constexpr GaugeDesc<> kRecoveryPhase{
+    .name = "abyss_recovery_phase",
+    .help =
+        "Current recovery phase (0=queue_open, 1=resolver_replay, "
+        "2=cold_hot_replay, 3=complete).",
+};
+
+// Per-consumer counters live under separate metric names rather than a Tier
+// label because the resolver is not a tier and the closed Tier enum should
+// not be widened just for recovery observability.
+inline constexpr GaugeDesc<> kRecoveryResolverEntriesReplayed{
+    .name = "abyss_recovery_resolver_entries_replayed",
+    .help = "Live entries scanned by the resolver during recovery, all shards.",
+};
+
+inline constexpr GaugeDesc<> kRecoveryResolverEntriesTarget{
+    .name = "abyss_recovery_resolver_entries_target",
+    .help = "Total entries the resolver must scan during recovery, all shards.",
+};
+
+inline constexpr GaugeDesc<> kRecoveryColdEntriesReplayed{
+    .name = "abyss_recovery_cold_entries_replayed",
+    .help = "Live entries drained by the cold consumer during recovery, all shards.",
+};
+
+inline constexpr GaugeDesc<> kRecoveryColdEntriesTarget{
+    .name = "abyss_recovery_cold_entries_target",
+    .help = "Total entries the cold consumer must drain during recovery, all shards.",
+};
+
+inline constexpr GaugeDesc<> kRecoveryHotEntriesReplayed{
+    .name = "abyss_recovery_hot_entries_replayed",
+    .help = "Live entries settled by the hot consumer during recovery, all shards.",
+};
+
+inline constexpr GaugeDesc<> kRecoveryHotEntriesTarget{
+    .name = "abyss_recovery_hot_entries_target",
+    .help = "Total entries the hot consumer must settle during recovery, all shards.",
+};
+
+inline constexpr GaugeDesc<> kRecoveryDurationSeconds{
+    .name = "abyss_recovery_duration_seconds",
+    .help = "Wall-clock elapsed time for the current recovery run.",
+};
+
 }  // namespace names
 
 }  // namespace abyss::metrics

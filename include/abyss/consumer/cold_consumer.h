@@ -32,6 +32,9 @@ class ColdConsumer {
     size_t buffer_low_water_bytes = 0;
     size_t max_flush_batch_size = 10000;
     size_t queue_read_max_count = 1024;
+    // Used by ReplayUntil(); larger than queue_read_max_count to amortise
+    // queue reads while draining a long catch-up backlog.
+    size_t replay_batch_size = 50000;
     std::chrono::milliseconds queue_read_timeout{50};
     std::chrono::milliseconds retry_initial_backoff{50};
     std::chrono::milliseconds retry_max_backoff{30000};
@@ -84,6 +87,13 @@ class ColdConsumer {
   // pair to avoid O(N * queue_read_timeout) serial teardown.
   void Stop();
 
+  // Synchronous replay drive. Drains entries from the queue into the buffer
+  // until `target` is reached, then flushes the buffer to the cold store so
+  // post-recovery reads do not hit a cold-store-on-disk that lags the WAL.
+  // Returns when caught up, cancelled, or on unrecoverable error. Must NOT
+  // be called while Start() is running on the same instance.
+  core::Result<void> ReplayUntil(core::SequenceId target, const std::atomic<bool>& cancel);
+
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
   CompactionBuffer& Buffer() { return buffer_; }
@@ -94,7 +104,15 @@ class ColdConsumer {
   // Single-writer on this consumer: must not be called from multiple threads
   // concurrently. Safe to interleave with buffer reads from I/O threads.
   size_t Drain();
+  // Replay-mode drain — uses replay_batch_size for amortised reads. ReplayUntil
+  // routes through this; steady-state Run() uses Drain().
+  size_t DrainWithBatch(size_t max_count);
   bool Flush();
+  // Replay variant: pops oldest buffer entries regardless of quiet/deadline
+  // timing and flushes them. Steady-state Flush() honours the strategy timers
+  // and returns false if no entries are due, which deadlocks a replay loop
+  // that has fresh entries with future scheduled_times.
+  bool FlushUnscheduled();
 
   Metrics Snapshot() const;
   Mode CurrentMode() const { return mode_.load(std::memory_order_acquire); }
@@ -114,6 +132,11 @@ class ColdConsumer {
 
   // Reinserts entries on shutdown-during-retry so the next run replays them.
   bool ApplyBatchWithRetry(std::vector<BufferEntry> entries);
+
+  // Shared implementation between Flush() and FlushUnscheduled() — once a
+  // batch has been popped from the buffer, the apply path is identical.
+  bool ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggressive,
+                       std::chrono::steady_clock::time_point flush_start);
 
   std::vector<core::ops::WriteOp> BuildBatchOps(const std::vector<BufferEntry>& entries,
                                                 std::vector<core::ops::Del>& del_storage) const;

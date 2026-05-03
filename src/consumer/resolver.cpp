@@ -1009,13 +1009,19 @@ void Resolver::UpdateCacheFromResolved(core::SequenceId seq,
 // Recovery replay
 // ---------------------------------------------------------------------------
 
-core::Result<void> Resolver::ReplayForRecovery() {
+core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) {
   ABYSS_LOG_INFO("resolver replay starting", {"shard", static_cast<int64_t>(config_.shard)});
 
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
   core::SequenceId highest_seen = 0;
   while (true) {
-    auto batch = queue_.Read(core::kResolverConsumer, config_.shard, config_.read_batch_size,
+    if (cancel.load(std::memory_order_acquire)) {
+      ABYSS_LOG_WARN("resolver replay cancelled during scan",
+                     {"shard", static_cast<int64_t>(config_.shard)});
+      return std::unexpected(
+          core::Error{core::ErrorCode::kUnavailable, "resolver replay cancelled"});
+    }
+    auto batch = queue_.Read(core::kResolverConsumer, config_.shard, config_.replay_batch_size,
                              core::Duration{50});
     if (!batch.has_value()) break;
     if (batch->empty()) break;
@@ -1075,6 +1081,12 @@ core::Result<void> Resolver::ReplayForRecovery() {
   for (const auto& [seq, _] : dangling) sorted.push_back(seq);
   std::ranges::sort(sorted);
   for (auto seq : sorted) {
+    if (cancel.load(std::memory_order_acquire)) {
+      ABYSS_LOG_WARN("resolver replay cancelled during dangling emit",
+                     {"shard", static_cast<int64_t>(config_.shard)});
+      return std::unexpected(
+          core::Error{core::ErrorCode::kUnavailable, "resolver replay cancelled"});
+    }
     const auto& entry = dangling.at(seq);
     const auto& cond = std::get<core::entry::Conditional>(entry.payload);
     auto resolved = Decide(entry, cond);

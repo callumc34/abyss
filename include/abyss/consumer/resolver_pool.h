@@ -30,8 +30,6 @@ class ResolverPool {
   ResolverPool(ResolverPool&&) = delete;
   ResolverPool& operator=(ResolverPool&&) = delete;
 
-  core::Result<void> ReplayForRecovery();
-
   void Start();
   void Stop();
   bool IsRunning() const;

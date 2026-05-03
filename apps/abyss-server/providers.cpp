@@ -262,6 +262,18 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
 
   s.connections.active = deps_.connection_count ? deps_.connection_count() : 0;
 
+  if (deps_.recovery_coordinator != nullptr) {
+    const auto rsnap = deps_.recovery_coordinator->Snapshot();
+    s.recovery.phase = static_cast<admin::StatusRecoveryPhase>(static_cast<uint8_t>(rsnap.phase));
+    s.recovery.resolver_entries_replayed = rsnap.resolver_entries_replayed;
+    s.recovery.resolver_entries_target = rsnap.resolver_entries_target;
+    s.recovery.cold_entries_replayed = rsnap.cold_entries_replayed;
+    s.recovery.cold_entries_target = rsnap.cold_entries_target;
+    s.recovery.hot_entries_replayed = rsnap.hot_entries_replayed;
+    s.recovery.hot_entries_target = rsnap.hot_entries_target;
+    s.recovery.elapsed_ms = static_cast<uint64_t>(rsnap.elapsed.count());
+  }
+
   return s;
 }
 

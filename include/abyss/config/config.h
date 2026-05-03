@@ -66,9 +66,22 @@ struct ColdConsumerConfig {
 };
 
 struct RecoveryConfig {
+  // Concurrent shard-replay tasks scheduled at startup. Capped operationally
+  // to keep thread count below shard count on small pods. Per-shard threads
+  // resume normal independent operation after recovery completes.
   uint32_t replay_parallelism = 4;
+
+  // Bigger batches than steady-state amortise queue Read syscalls during a
+  // long catch-up backlog. Steady-state batch sizes (hot_consumer.read_batch_size,
+  // cold_consumer.queue_read_max_count) are tuned for low-latency tailing,
+  // not bulk drain.
   size_t hot_replay_batch_size = 10000;
   size_t cold_replay_batch_size = 50000;
+
+  // Internal default — not exposed in YAML. The resolver scan is CPU-bound
+  // cache updates on the common path; tuning won't materially move recovery
+  // latency.
+  size_t resolver_replay_batch_size = 5000;
 };
 
 struct NetConfig {
