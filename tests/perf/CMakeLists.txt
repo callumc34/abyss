@@ -1,0 +1,10 @@
+if(ABYSS_BUILD_PERF)
+  add_subdirectory(framework)
+  if(ABYSS_BUILD_TESTS)
+    add_subdirectory(framework/tests)
+  endif()
+endif()
+
+if(ABYSS_BUILD_BENCHMARKS)
+  add_subdirectory(micro)
+endif()

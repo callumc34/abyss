@@ -24,6 +24,17 @@
       "dependencies": [
         "benchmark"
       ]
+    },
+    "perf": {
+      "description": "Build the performance harness (probes, load generator, framework)",
+      "dependencies": [
+        {
+          "name": "hdr-histogram",
+          "features": [
+            "log"
+          ]
+        }
+      ]
     }
   }
 }

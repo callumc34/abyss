@@ -23,6 +23,7 @@ include(cmake/abyss_sanitizers.cmake)
 
 option(ABYSS_BUILD_TESTS "Build tests" ON)
 option(ABYSS_BUILD_BENCHMARKS "Build benchmarks" OFF)
+option(ABYSS_BUILD_PERF "Build performance harness (probes, load generator, framework)" OFF)
 option(ABYSS_WERROR "Treat warnings as errors" OFF)
 option(ABYSS_STRICT_WARNINGS "Enable additional warning flags" OFF)
 option(ABYSS_WITH_ROCKSDB "Build the built-in RocksDB cold store backend" ON)
@@ -121,6 +122,7 @@ endif()
 
 add_feature_info(BuildTests      ABYSS_BUILD_TESTS      "Build unit and integration tests")
 add_feature_info(BuildBenchmarks ABYSS_BUILD_BENCHMARKS "Build micro-benchmarks")
+add_feature_info(BuildPerf       ABYSS_BUILD_PERF       "Build performance harness")
 add_feature_info(StrictWarnings  ABYSS_STRICT_WARNINGS  "Enable additional compiler warning flags")
 add_feature_info(Werror          ABYSS_WERROR           "Treat compiler warnings as errors")
 add_feature_info(WithRocksDB     ABYSS_WITH_ROCKSDB     "Build the built-in RocksDB cold store backend")
@@ -180,6 +182,16 @@ if(ABYSS_BUILD_BENCHMARKS)
   )
 endif()
 
+if(ABYSS_BUILD_PERF)
+  find_package(hdr_histogram CONFIG REQUIRED)
+  set_package_properties(hdr_histogram PROPERTIES
+    TYPE OPTIONAL
+    DESCRIPTION "C port of HdrHistogram (High Dynamic Range)"
+    URL "https://github.com/HdrHistogram/HdrHistogram_c"
+    PURPOSE "Lossless latency recording for the performance harness"
+  )
+endif()
+
 if(ABYSS_BUILD_TESTS)
   enable_testing()
   include(FetchContent)
@@ -192,7 +204,7 @@ if(ABYSS_BUILD_TESTS)
   include(cmake/abyss_testing.cmake)
 endif()
 
-if(ABYSS_BUILD_TESTS OR ABYSS_BUILD_BENCHMARKS)
+if(ABYSS_BUILD_TESTS OR ABYSS_BUILD_BENCHMARKS OR ABYSS_BUILD_PERF)
   add_subdirectory(tests)
 endif()
 

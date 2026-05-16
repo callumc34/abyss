@@ -15,8 +15,8 @@ if(ABYSS_BUILD_TESTS)
     HotConsumerTest.ConcurrentWritersAlwaysSeeRegisteredEntries)
 endif()
 
-if(ABYSS_BUILD_BENCHMARKS)
-  add_subdirectory(bench)
+if(ABYSS_BUILD_BENCHMARKS OR ABYSS_BUILD_PERF)
+  add_subdirectory(perf)
 endif()
 
 if(ABYSS_BUILD_FUZZ)
