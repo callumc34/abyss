@@ -16,6 +16,8 @@
 #include <string>
 #include <string_view>
 
+#include "abyss/version.h"
+
 namespace abyss::perf {
 
 namespace {
@@ -346,6 +348,7 @@ HostClassification DetectClassification() {
 
 BuildInfo CurrentBuildInfo() {
   BuildInfo b;
+  b.commit = kBuildCommit;
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables): false positive on if-init.
   if (const char* preset = std::getenv("ABYSS_PRESET"); preset != nullptr) {
     b.preset = preset;
