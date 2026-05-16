@@ -103,6 +103,8 @@ Each shard receives a `Flush` queue entry. The hot consumer wipes its in-memory 
 
 The client sees `+OK` only when every consumer on every shard has applied the wipe. Partial fan-out failures (a shard's durable wait or any consumer's apply timeout) surface as a Redis error; the Flush entries that did land remain durable in the queue and apply on consumer catch-up. A retry of FLUSHDB is idempotent at the wipe level.
 
+**Durability invariant — Flush ack precedes RPC fulfilment.** Each consumer persists its per-shard Flush ack *before* fulfilling the Flush RPC that the engine waits on. Without this, FLUSHDB could return `+OK` while a peer shard's persisted ack is still pre-Flush; a crash in that window would leave recovery to re-process the missed Flush, and because `ColdStore::Wipe` is global (single RocksDB instance), a replay-time Wipe in any shard destroys data that a parallel shard's replay has already flushed to cold disk after its own Flush. The invariant holds uniformly across hot/cold/resolver consumers — even where the store is in-memory and self-correcting on recovery — so a future persistent hot snapshot does not inherit the race.
+
 Multi-pod (Phase 2+) extends this naturally: each pod receives the broadcast at the RESP layer and runs the same fan-out across its owned shards. There is no cross-pod synchronisation step.
 
 ### Write Promise Lifecycle
