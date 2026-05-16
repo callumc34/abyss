@@ -148,6 +148,12 @@ endif()
 
 string(TIMESTAMP ABYSS_BUILD_DATE "%Y-%m-%dT%H:%M:%SZ" UTC)
 
+if(CMAKE_BUILD_TYPE)
+  string(TOLOWER "${CMAKE_BUILD_TYPE}" ABYSS_BUILD_TYPE)
+else()
+  set(ABYSS_BUILD_TYPE "unknown")
+endif()
+
 configure_file(
   cmake/version.h.in
   ${CMAKE_BINARY_DIR}/generated/abyss/version.h
@@ -157,6 +163,7 @@ configure_file(
 add_subdirectory(src/platform)
 add_subdirectory(src/core)
 add_subdirectory(src/log)
+add_subdirectory(src/branding)
 add_subdirectory(src/metrics)
 add_subdirectory(src/resp)
 add_subdirectory(src/queue)
