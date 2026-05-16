@@ -296,11 +296,14 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
 
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
 
+  // Persist the Flush ack BEFORE fulfilling the RPC. See the equivalent comment
+  // in ColdConsumer::HandleFlush.
+  MarkSettledAndMaybeAck(entry.seq);
+
   const core::RpcId rpc_id = core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq);
   (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
   apply_notifier_.NotifyApplied(rpc_id);
   counters_.applied.fetch_add(1, std::memory_order_relaxed);
-  MarkSettledAndMaybeAck(entry.seq);
 }
 
 void HotConsumer::HandleResolved(const core::QueueEntry& entry,

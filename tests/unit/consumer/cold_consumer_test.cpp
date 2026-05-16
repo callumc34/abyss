@@ -317,6 +317,46 @@ TEST_F(ColdConsumerTest, HighWaterTriggersAggressiveMode) {
   EXPECT_EQ(c->Buffer().Size(), 0);
 }
 
+// Pins the ordering "queue.Ack precedes rpc.Fulfill" for Flush. ColdStore::Wipe
+// is global, so a Flush observed-but-not-acked at kill time leaves recovery to
+// re-Wipe and destroy post-Flush data applied by another shard's parallel
+// replay. The engine reports FLUSHDB OK only after the Flush RPC is fulfilled;
+// fulfilling before the ack persists is exactly the durability hole.
+TEST_F(ColdConsumerTest, FlushAckPersistedBeforeRpcFulfilled) {
+  auto c = MakeConsumer();
+
+  constexpr core::SequenceId kFlushSeq = 7;
+  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, kShard, kFlushSeq);
+  auto fut = rpc_.Register(rpc_id);
+
+  bool ack_observed = false;
+  EXPECT_CALL(queue_, Ack(core::kColdConsumer, kShard, kFlushSeq))
+      .WillOnce([&](core::ConsumerId, core::ShardId, core::SequenceId) {
+        EXPECT_NE(fut.wait_for(0ms), std::future_status::ready)
+            << "Flush RPC fulfilled before its ack was persisted";
+        ack_observed = true;
+        return core::Result<void>{};
+      });
+
+  EXPECT_CALL(cold_, Wipe()).WillOnce(Return(core::Result<void>{}));
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(core::QueueEntry{
+      .seq = kFlushSeq,
+      .appended_at = core::WallClock::now(),
+      .payload = core::entry::Flush{},
+  });
+  EXPECT_CALL(queue_, Read(core::kColdConsumer, kShard, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  c->Drain();
+
+  EXPECT_TRUE(ack_observed) << "Flush did not persist an ack";
+  ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready) << "Flush RPC not fulfilled after Drain";
+  EXPECT_TRUE(fut.get().IsSimpleString());
+}
+
 // --- Low-water ack ------------------------------------------------------------
 
 TEST_F(ColdConsumerTest, AckAdvancesToDrainedSeqWhenBufferEmpty) {

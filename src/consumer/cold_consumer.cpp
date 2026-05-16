@@ -295,9 +295,22 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
   flushes_applied_.fetch_add(1, std::memory_order_relaxed);
 
-  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
-  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
+  // Persist the Flush ack BEFORE fulfilling the RPC. Without this, FLUSHDB can
+  // return OK to the client while a peer shard's cold ack is still pre-Flush.
+  latest_drained_seq_.store(entry.seq, std::memory_order_release);
+  drained_anything_ = true;
   TryAdvanceAck();
+
+  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
+  if (last_ack_seq_.load(std::memory_order_acquire) < entry.seq) {
+    ABYSS_LOG_ERROR("cold flush ack persist failed", {"shard", static_cast<int64_t>(shard_)},
+                    {"seq", static_cast<uint64_t>(entry.seq)});
+    rpc_.Fulfill(rpc_id, core::RespValue::Error(core::ErrorPrefix::kErr,
+                                                "cold flush ack persist failed; retry"));
+    return;
+  }
+
+  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
 }
 
 bool ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq,
