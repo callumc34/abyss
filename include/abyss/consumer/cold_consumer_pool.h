@@ -50,6 +50,7 @@ class ColdConsumerPool : public CompactionBufferRouter {
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
                                      std::optional<core::Duration> deadline) override;
   core::Result<core::RespValue> Read(std::string_view key) const override;
+  HashOverlay HashOverlayFor(std::string_view key) const override;
 
   void Start();
   void Stop();

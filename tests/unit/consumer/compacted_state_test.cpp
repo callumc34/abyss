@@ -7,6 +7,7 @@ namespace {
 
 using core::ops::Del;
 using core::ops::HashDel;
+using core::ops::HashMSet;
 using core::ops::HashSet;
 using core::ops::MultiStringSet;
 using core::ops::SetAdd;
@@ -227,6 +228,55 @@ TEST_F(CompactedStateTest, HashSetThenDelRemovesField) {
   auto& fields = std::get<HashSet>(ops[0]).fields;
   ASSERT_EQ(fields.size(), 1);
   EXPECT_EQ(fields[0].field, "f2");
+}
+
+TEST_F(CompactedStateTest, HashMSetAbsorbsLikeHashSet) {
+  state_.Absorb(WriteOp{HashMSet{
+      .key = "k", .fields = {{.field = "f1", .value = "v1"}, {.field = "f2", .value = "v2"}}}});
+  EXPECT_EQ(state_.Type(), CompactedState::DataType::kHash);
+  EXPECT_FALSE(state_.IsTombstone());
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  // Cold flush always emits HashSet — the +OK vs count distinction lives on
+  // the hot reply path only.
+  ASSERT_TRUE(std::holds_alternative<HashSet>(ops[0]));
+  EXPECT_EQ(std::get<HashSet>(ops[0]).fields.size(), 2);
+}
+
+TEST_F(CompactedStateTest, HashMSetAndHashSetInterleave) {
+  state_.Absorb(WriteOp{HashMSet{.key = "k", .fields = {{.field = "a", .value = "1"}}}});
+  state_.Absorb(WriteOp{HashSet{.key = "k", .fields = {{.field = "b", .value = "2"}}}});
+  state_.Absorb(WriteOp{HashMSet{.key = "k", .fields = {{.field = "a", .value = "1b"}}}});
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  const auto& fields = std::get<HashSet>(ops[0]).fields;
+  ASSERT_EQ(fields.size(), 2);
+  // Both fields present, 'a' reflects the later HMSet value.
+  bool saw_a = false;
+  bool saw_b = false;
+  for (const auto& fv : fields) {
+    if (fv.field == "a") {
+      EXPECT_EQ(fv.value, "1b");
+      saw_a = true;
+    } else if (fv.field == "b") {
+      EXPECT_EQ(fv.value, "2");
+      saw_b = true;
+    }
+  }
+  EXPECT_TRUE(saw_a);
+  EXPECT_TRUE(saw_b);
+}
+
+TEST_F(CompactedStateTest, HashOverlayAccessorsReflectAbsorbs) {
+  state_.Absorb(WriteOp{HashSet{
+      .key = "k", .fields = {{.field = "keep", .value = "v"}, {.field = "gone", .value = "v"}}}});
+  state_.Absorb(WriteOp{HashDel{.key = "k", .fields = {"gone"}}});
+
+  EXPECT_TRUE(state_.HashFields().contains("keep"));
+  EXPECT_FALSE(state_.HashFields().contains("gone"));
+  EXPECT_TRUE(state_.HashRemovedFields().contains("gone"));
 }
 
 TEST_F(CompactedStateTest, HashDelThenSetSameField) {

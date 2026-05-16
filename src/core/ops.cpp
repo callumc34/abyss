@@ -99,16 +99,31 @@ Result<ReadOp> ParseHgetall(const RespCommand& cmd) {
   return ReadOp{HashGetAll{.key = cmd.args[1]}};
 }
 
+Result<ReadOp> ParseHmget(const RespCommand& cmd) {
+  return ReadOp{HashMultiGet{.key = cmd.args[1], .fields = CollectArgs(cmd, 2)}};
+}
+
+Result<ReadOp> ParseHexists(const RespCommand& cmd) {
+  return ReadOp{HashFieldExists{.key = cmd.args[1], .field = cmd.args[2]}};
+}
+
+Result<ReadOp> ParseHkeys(const RespCommand& cmd) { return ReadOp{HashKeys{.key = cmd.args[1]}}; }
+
+Result<ReadOp> ParseHvals(const RespCommand& cmd) { return ReadOp{HashVals{.key = cmd.args[1]}}; }
+
+Result<ReadOp> ParseHlen(const RespCommand& cmd) { return ReadOp{HashLen{.key = cmd.args[1]}}; }
+
 Result<ReadOp> ParseExists(const RespCommand& cmd) {
   return ReadOp{Exists{.keys = CollectArgs(cmd, 1)}};
 }
 
 const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
   static const std::unordered_map<std::string_view, ReadParserFn> table{
-      {"GET", ParseGet},           {"MGET", ParseMget},   {"SISMEMBER", ParseSismember},
-      {"SMEMBERS", ParseSmembers}, {"SCARD", ParseScard}, {"ZSCORE", ParseZscore},
-      {"ZCARD", ParseZcard},       {"HGET", ParseHget},   {"HGETALL", ParseHgetall},
-      {"EXISTS", ParseExists},
+      {"GET", ParseGet},           {"MGET", ParseMget},       {"SISMEMBER", ParseSismember},
+      {"SMEMBERS", ParseSmembers}, {"SCARD", ParseScard},     {"ZSCORE", ParseZscore},
+      {"ZCARD", ParseZcard},       {"HGET", ParseHget},       {"HGETALL", ParseHgetall},
+      {"HMGET", ParseHmget},       {"HEXISTS", ParseHexists}, {"HKEYS", ParseHkeys},
+      {"HVALS", ParseHvals},       {"HLEN", ParseHlen},       {"EXISTS", ParseExists},
   };
   return table;
 }
@@ -219,6 +234,18 @@ Result<WriteOp> ParseHset(const RespCommand& cmd) {
   return WriteOp{HashSet{.key = cmd.args[1], .fields = std::move(fields)}};
 }
 
+Result<WriteOp> ParseHmset(const RespCommand& cmd) {
+  if (cmd.args.size() % 2 != 0) {
+    return std::unexpected(SyntaxError("HMSET requires field-value pairs"));
+  }
+  std::vector<HashSet::FieldValue> fields;
+  fields.reserve((cmd.args.size() - 2) / 2);
+  for (size_t i = 2; i < cmd.args.size(); i += 2) {
+    fields.push_back({.field = cmd.args[i], .value = cmd.args[i + 1]});
+  }
+  return WriteOp{HashMSet{.key = cmd.args[1], .fields = std::move(fields)}};
+}
+
 Result<WriteOp> ParseHdel(const RespCommand& cmd) {
   return WriteOp{HashDel{.key = cmd.args[1], .fields = CollectArgs(cmd, 2)}};
 }
@@ -266,6 +293,7 @@ const std::unordered_map<std::string_view, WriteParserFn>& WriteParsers() {
       {"ZADD", ParseZadd},
       {"ZREM", ParseZrem},
       {"HSET", ParseHset},
+      {"HMSET", ParseHmset},
       {"HDEL", ParseHdel},
       {"EXPIRE", ParseExpireSeconds},
       {"PEXPIRE", ParseExpireMs},

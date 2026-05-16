@@ -148,15 +148,17 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
           auto value = state.HashFieldValue(read.field);
           if (!value.has_value()) return core::RespValue::Null();
           return core::RespValue::BulkString(*value);
-        } else if constexpr (std::is_same_v<T, core::ops::HashGetAll>) {
-          if (state.Type() != CompactedState::DataType::kHash) {
-            return std::unexpected(
-                core::Error(core::ErrorCode::kWrongType,
-                            "Operation against a key holding the wrong kind of value"));
-          }
-          // Buffer's collection view is partial; full reads merge in cold.
+        } else if constexpr (std::is_same_v<T, core::ops::HashGetAll> ||
+                             std::is_same_v<T, core::ops::HashKeys> ||
+                             std::is_same_v<T, core::ops::HashVals> ||
+                             std::is_same_v<T, core::ops::HashLen> ||
+                             std::is_same_v<T, core::ops::HashMultiGet> ||
+                             std::is_same_v<T, core::ops::HashFieldExists>) {
+          // Multi-field hash reads are answered by the engine merging this
+          // overlay with cold's full state. The buffer alone never has the
+          // complete picture for these ops.
           return std::unexpected(core::Error(core::ErrorCode::kNotFound,
-                                             "buffer defers full-collection reads to cold"));
+                                             "buffer defers multi-field hash reads to engine"));
         } else if constexpr (std::is_same_v<T, core::ops::SetIsMember>) {
           if (state.Type() != CompactedState::DataType::kSet) {
             return std::unexpected(
@@ -204,6 +206,39 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
 
 core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const {
   return Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
+}
+
+HashOverlay CompactionBuffer::HashOverlayFor(std::string_view key) const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  auto it = entries_.find(std::string(key));
+  if (it == entries_.end()) return HashOverlay{.kind = HashOverlay::Kind::kNotPresent};
+
+  const auto& state = it->second.state;
+
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(wall_clock_().time_since_epoch())
+          .count());
+  const uint64_t ttl = state.AbsTtlMs();
+  const bool ttl_expired = ttl > 0 && ttl <= now_ms;
+
+  if (state.IsTombstone() || ttl_expired) {
+    return HashOverlay{.kind = HashOverlay::Kind::kTombstone};
+  }
+  if (state.Type() != CompactedState::DataType::kHash) {
+    // kNone falls through as "no useful overlay" rather than wrong-type:
+    // None means the buffer's state has been cleared without a tombstone,
+    // which is not a typed conflict for the caller.
+    if (state.Type() == CompactedState::DataType::kNone) {
+      return HashOverlay{.kind = HashOverlay::Kind::kNotPresent};
+    }
+    return HashOverlay{.kind = HashOverlay::Kind::kWrongType};
+  }
+  return HashOverlay{
+      .kind = HashOverlay::Kind::kHash,
+      .fields = state.HashFields(),
+      .removed_fields = state.HashRemovedFields(),
+  };
 }
 
 std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size_t max_count)

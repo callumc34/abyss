@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -268,6 +269,112 @@ TEST_F(SingleShardStoreTest, HashDelRemovesField) {
   auto result = store_.Exec(core::ops::ReadOp{get_op});
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsNull());
+}
+
+TEST_F(SingleShardStoreTest, HsetReturnsNewFieldCount) {
+  core::ops::HashSet first{.key = "h",
+                           .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}};
+  auto r1 = store_.Apply(core::ops::WriteOp{first}, kEviction);
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(r1->AsInteger(), 2);
+
+  core::ops::HashSet second{
+      .key = "h", .fields = {{.field = "a", .value = "1b"}, {.field = "c", .value = "3"}}};
+  auto r2 = store_.Apply(core::ops::WriteOp{second}, kEviction);
+  ASSERT_TRUE(r2.has_value());
+  EXPECT_EQ(r2->AsInteger(), 1);
+}
+
+TEST_F(SingleShardStoreTest, HmsetReturnsOk) {
+  core::ops::HashMSet op{.key = "h",
+                         .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}};
+  auto r = store_.Apply(core::ops::WriteOp{op}, kEviction);
+  ASSERT_TRUE(r.has_value());
+  ASSERT_TRUE(r->IsSimpleString());
+  EXPECT_EQ(r->AsString(), "OK");
+
+  // HMSET persists field-by-field like HSET; subsequent HGET sees the values.
+  core::ops::HashGet get_op{.key = "h", .field = "a"};
+  auto got = store_.Exec(core::ops::ReadOp{get_op});
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->AsString(), "1");
+}
+
+TEST_F(SingleShardStoreTest, HmgetReturnsArrayWithNullsForMissing) {
+  core::ops::HashSet set_op{.key = "h",
+                            .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set_op}, kEviction).has_value());
+
+  core::ops::HashMultiGet op{.key = "h", .fields = {"a", "missing", "b"}};
+  auto r = store_.Exec(core::ops::ReadOp{op});
+  ASSERT_TRUE(r.has_value());
+  ASSERT_TRUE(r->IsArray());
+  const auto& arr = r->AsArray();
+  ASSERT_EQ(arr.size(), 3U);
+  EXPECT_EQ(arr[0].AsString(), "1");
+  EXPECT_TRUE(arr[1].IsNull());
+  EXPECT_EQ(arr[2].AsString(), "2");
+}
+
+TEST_F(SingleShardStoreTest, HexistsReturns1Or0) {
+  core::ops::HashSet set_op{.key = "h", .fields = {{.field = "a", .value = "1"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set_op}, kEviction).has_value());
+
+  core::ops::HashFieldExists yes{.key = "h", .field = "a"};
+  EXPECT_EQ(store_.Exec(core::ops::ReadOp{yes})->AsInteger(), 1);
+  core::ops::HashFieldExists no{.key = "h", .field = "no_such"};
+  EXPECT_EQ(store_.Exec(core::ops::ReadOp{no})->AsInteger(), 0);
+}
+
+TEST_F(SingleShardStoreTest, HkeysHvalsHlenReturnCollection) {
+  core::ops::HashSet set_op{.key = "h",
+                            .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set_op}, kEviction).has_value());
+
+  auto keys = store_.Exec(core::ops::ReadOp{core::ops::HashKeys{.key = "h"}});
+  ASSERT_TRUE(keys.has_value());
+  ASSERT_TRUE(keys->IsArray());
+  EXPECT_EQ(keys->AsArray().size(), 2U);
+
+  auto vals = store_.Exec(core::ops::ReadOp{core::ops::HashVals{.key = "h"}});
+  ASSERT_TRUE(vals.has_value());
+  ASSERT_TRUE(vals->IsArray());
+  EXPECT_EQ(vals->AsArray().size(), 2U);
+
+  auto len = store_.Exec(core::ops::ReadOp{core::ops::HashLen{.key = "h"}});
+  ASSERT_TRUE(len.has_value());
+  EXPECT_EQ(len->AsInteger(), 2);
+}
+
+TEST_F(SingleShardStoreTest, HashReadsOnMissingKeyReportNotFound) {
+  // FindTypedEntry-on-absent returns kNotFound so the engine can fall through
+  // to buffer + cold. This contract is load-bearing for the merge path.
+  for (const auto& op : std::array<core::ops::ReadOp, 5>{
+           core::ops::HashKeys{.key = "missing"},
+           core::ops::HashVals{.key = "missing"},
+           core::ops::HashLen{.key = "missing"},
+           core::ops::HashFieldExists{.key = "missing", .field = "f"},
+           core::ops::HashMultiGet{.key = "missing", .fields = {"f"}},
+       }) {
+    auto r = store_.Exec(op);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().code(), core::ErrorCode::kNotFound);
+  }
+}
+
+TEST_F(SingleShardStoreTest, HashReadsOnWrongTypeReturnWrongType) {
+  SetString("k", "scalar");
+  for (const auto& op : std::array<core::ops::ReadOp, 5>{
+           core::ops::HashKeys{.key = "k"},
+           core::ops::HashVals{.key = "k"},
+           core::ops::HashLen{.key = "k"},
+           core::ops::HashFieldExists{.key = "k", .field = "f"},
+           core::ops::HashMultiGet{.key = "k", .fields = {"f"}},
+       }) {
+    auto r = store_.Exec(op);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().code(), core::ErrorCode::kWrongType);
+  }
 }
 
 // --- DEL ---

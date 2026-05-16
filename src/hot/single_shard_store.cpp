@@ -74,6 +74,16 @@ core::Result<core::RespValue> SingleShardStore::Exec(const core::ops::ReadOp& op
           return ExecHashGet(o);
         } else if constexpr (std::is_same_v<T, core::ops::HashGetAll>) {
           return ExecHashGetAll(o);
+        } else if constexpr (std::is_same_v<T, core::ops::HashMultiGet>) {
+          return ExecHashMultiGet(o);
+        } else if constexpr (std::is_same_v<T, core::ops::HashFieldExists>) {
+          return ExecHashFieldExists(o);
+        } else if constexpr (std::is_same_v<T, core::ops::HashKeys>) {
+          return ExecHashKeys(o);
+        } else if constexpr (std::is_same_v<T, core::ops::HashVals>) {
+          return ExecHashVals(o);
+        } else if constexpr (std::is_same_v<T, core::ops::HashLen>) {
+          return ExecHashLen(o);
         } else if constexpr (std::is_same_v<T, core::ops::Exists>) {
           return ExecExists(o);
         } else {
@@ -196,7 +206,7 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
 
     int64_t start = op.offset;
     int64_t count = op.count < 0 ? static_cast<int64_t>(collected.size()) : op.count;
-    if (start < static_cast<int64_t>(collected.size())) {
+    if (std::cmp_less(start, collected.size())) {
       auto end = std::min(start + count, static_cast<int64_t>(collected.size()));
       for (int64_t i = start; i < end; ++i) {
         elements.push_back(core::RespValue::BulkString(collected[static_cast<size_t>(i)].first));
@@ -273,6 +283,78 @@ core::Result<core::RespValue> SingleShardStore::ExecHashGetAll(
   return core::RespValue::Array(std::move(elements));
 }
 
+core::Result<core::RespValue> SingleShardStore::ExecHashMultiGet(
+    const core::ops::HashMultiGet& op) const {
+  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
+  if (!result.has_value()) return std::unexpected(result.error());
+  if (*result == nullptr) {
+    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
+  }
+  const auto& fields = std::get<HashValue>((*result)->value).fields;
+  std::vector<core::RespValue> elements;
+  elements.reserve(op.fields.size());
+  for (auto field : op.fields) {
+    auto it = fields.find(std::string(field));
+    if (it == fields.end()) {
+      elements.push_back(core::RespValue::Null());
+    } else {
+      elements.push_back(core::RespValue::BulkString(it->second));
+    }
+  }
+  return core::RespValue::Array(std::move(elements));
+}
+
+core::Result<core::RespValue> SingleShardStore::ExecHashFieldExists(
+    const core::ops::HashFieldExists& op) const {
+  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
+  if (!result.has_value()) return std::unexpected(result.error());
+  if (*result == nullptr) {
+    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
+  }
+  const auto& fields = std::get<HashValue>((*result)->value).fields;
+  return core::RespValue::Integer(fields.contains(std::string(op.field)) ? 1 : 0);
+}
+
+core::Result<core::RespValue> SingleShardStore::ExecHashKeys(const core::ops::HashKeys& op) const {
+  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
+  if (!result.has_value()) return std::unexpected(result.error());
+  if (*result == nullptr) {
+    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
+  }
+  const auto& fields = std::get<HashValue>((*result)->value).fields;
+  std::vector<core::RespValue> elements;
+  elements.reserve(fields.size());
+  for (const auto& [k, _] : fields) {
+    elements.push_back(core::RespValue::BulkString(k));
+  }
+  return core::RespValue::Array(std::move(elements));
+}
+
+core::Result<core::RespValue> SingleShardStore::ExecHashVals(const core::ops::HashVals& op) const {
+  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
+  if (!result.has_value()) return std::unexpected(result.error());
+  if (*result == nullptr) {
+    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
+  }
+  const auto& fields = std::get<HashValue>((*result)->value).fields;
+  std::vector<core::RespValue> elements;
+  elements.reserve(fields.size());
+  for (const auto& [_, v] : fields) {
+    elements.push_back(core::RespValue::BulkString(v));
+  }
+  return core::RespValue::Array(std::move(elements));
+}
+
+core::Result<core::RespValue> SingleShardStore::ExecHashLen(const core::ops::HashLen& op) const {
+  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
+  if (!result.has_value()) return std::unexpected(result.error());
+  if (*result == nullptr) {
+    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
+  }
+  const auto& fields = std::get<HashValue>((*result)->value).fields;
+  return core::RespValue::Integer(static_cast<int64_t>(fields.size()));
+}
+
 core::Result<core::RespValue> SingleShardStore::ExecExists(const core::ops::Exists& op) const {
   int64_t count = 0;
   for (auto key : op.keys) {
@@ -302,6 +384,8 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
           return ApplyZsetRem(o);
         } else if constexpr (std::is_same_v<T, core::ops::HashSet>) {
           return ApplyHashSet(o, eviction);
+        } else if constexpr (std::is_same_v<T, core::ops::HashMSet>) {
+          return ApplyHashMSet(o, eviction);
         } else if constexpr (std::is_same_v<T, core::ops::HashDel>) {
           return ApplyHashDel(o);
         } else if constexpr (std::is_same_v<T, core::ops::MultiStringSet>) {
@@ -525,6 +609,17 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashSet(const core::ops::Ha
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
   return core::RespValue::Integer(new_fields);
+}
+
+core::Result<core::RespValue> SingleShardStore::ApplyHashMSet(const core::ops::HashMSet& op,
+                                                              core::EvictionTTL eviction) {
+  // HMSET shares HSET's apply path; the only difference is the reply (+OK
+  // vs new-field count). Constructing a transient HashSet preserves type
+  // safety for any future hot-store apply changes.
+  const core::ops::HashSet hset{.key = op.key, .fields = op.fields};
+  auto r = ApplyHashSet(hset, eviction);
+  if (!r.has_value()) return r;
+  return core::RespValue::SimpleString("OK");
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op) {

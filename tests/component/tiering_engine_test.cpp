@@ -7,6 +7,10 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
@@ -33,6 +37,9 @@ class SingleBufferRouter : public consumer::CompactionBufferRouter {
   }
   core::Result<core::RespValue> Read(std::string_view key) const override {
     return buffer_.Read(std::string(key));
+  }
+  consumer::HashOverlay HashOverlayFor(std::string_view key) const override {
+    return buffer_.HashOverlayFor(key);
   }
 
  private:
@@ -154,6 +161,217 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsNull());
+}
+
+// --- Hash multi-field read merge ---
+
+namespace {
+
+core::RespValue MakeHashGetAllResponse(
+    const std::vector<std::pair<std::string, std::string>>& pairs) {
+  std::vector<core::RespValue> elems;
+  elems.reserve(pairs.size() * 2);
+  for (const auto& [k, v] : pairs) {
+    elems.push_back(core::RespValue::BulkString(k));
+    elems.push_back(core::RespValue::BulkString(v));
+  }
+  return core::RespValue::Array(std::move(elems));
+}
+
+std::unordered_map<std::string, std::string> ArrayPairsToMap(const core::RespValue& v) {
+  std::unordered_map<std::string, std::string> m;
+  const auto& a = v.AsArray();
+  for (size_t i = 0; i + 1 < a.size(); i += 2) {
+    m.emplace(a[i].AsString(), a[i + 1].AsString());
+  }
+  return m;
+}
+
+}  // namespace
+
+TEST_F(TieringEngineTest, HashGetAllMergesColdAndBufferOverlay) {
+  auto engine = MakeEngine();
+  // Buffer overlay: adds 'b' (new field) and 'a' (overrides cold's value);
+  // removes 'c' (HDEL after HSET) — should disappear from the merged result.
+  buffer_.Absorb(
+      "h",
+      core::ops::WriteOp{core::ops::HashSet{
+          .key = "h", .fields = {{.field = "a", .value = "buf"}, {.field = "b", .value = "new"}}}},
+      core::EvictionTTL{86400});
+  buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // Cold has prior fields including 'c' (which the buffer has removed).
+  EXPECT_CALL(cold_, Exec(_, _))
+      .WillOnce(Return(MakeHashGetAllResponse({{"a", "cold"}, {"c", "stale"}, {"d", "kept"}})));
+
+  auto result = engine.DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsArray());
+  const auto merged = ArrayPairsToMap(*result);
+  EXPECT_EQ(merged.size(), 3U);
+  EXPECT_EQ(merged.at("a"), "buf");    // buffer wins over cold
+  EXPECT_EQ(merged.at("b"), "new");    // buffer-only
+  EXPECT_EQ(merged.at("d"), "kept");   // cold-only, untouched
+  EXPECT_FALSE(merged.contains("c"));  // removed in buffer
+}
+
+TEST_F(TieringEngineTest, HashGetAllTombstoneShortCircuitsCold) {
+  auto engine = MakeEngine();
+  buffer_.Absorb(
+      "h",
+      core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "a", .value = "v"}}}},
+      core::EvictionTTL{86400});
+  buffer_.Absorb("h", core::ops::WriteOp{core::ops::Del{.keys = {"h"}}}, core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // Tombstone must not consult cold.
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsArray());
+  EXPECT_TRUE(result->AsArray().empty());
+}
+
+TEST_F(TieringEngineTest, HashGetAllWrongTypeOverlayReturnsError) {
+  auto engine = MakeEngine();
+  // Buffer was re-typed to a string after a prior hash.
+  buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "now_a_string"}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchRead("HGETALL", MakeCmd({"HGETALL", "k"}));
+  // WRONGTYPE is encoded as a kError RespValue (not a Result error).
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsError());
+}
+
+TEST_F(TieringEngineTest, HashGetAllNotPresentDelegatesToCold) {
+  auto engine = MakeEngine();
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(MakeHashGetAllResponse({{"x", "1"}, {"y", "2"}})));
+
+  auto result = engine.DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  ASSERT_TRUE(result.has_value());
+  const auto map = ArrayPairsToMap(*result);
+  EXPECT_EQ(map.size(), 2U);
+  EXPECT_EQ(map.at("x"), "1");
+  EXPECT_EQ(map.at("y"), "2");
+}
+
+TEST_F(TieringEngineTest, HashLenMergedCardinality) {
+  auto engine = MakeEngine();
+  buffer_.Absorb(
+      "h",
+      core::ops::WriteOp{core::ops::HashSet{
+          .key = "h", .fields = {{.field = "a", .value = "buf"}, {.field = "b", .value = "new"}}}},
+      core::EvictionTTL{86400});
+  buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _))
+      .WillOnce(Return(MakeHashGetAllResponse({{"a", "cold"}, {"c", "stale"}, {"d", "kept"}})));
+
+  // 3 distinct fields after merge: a (buf), b (buf), d (cold).
+  auto result = engine.DispatchRead("HLEN", MakeCmd({"HLEN", "h"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 3);
+}
+
+TEST_F(TieringEngineTest, HashKeysAndValsProjectMergedSet) {
+  auto engine = MakeEngine();
+  buffer_.Absorb("h",
+                 core::ops::WriteOp{core::ops::HashSet{
+                     .key = "h", .fields = {{.field = "buf_only", .value = "x"}}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .Times(2)
+      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _))
+      .Times(2)
+      .WillRepeatedly(Return(MakeHashGetAllResponse({{"cold_only", "y"}})));
+
+  auto keys = engine.DispatchRead("HKEYS", MakeCmd({"HKEYS", "h"}));
+  ASSERT_TRUE(keys.has_value());
+  std::unordered_set<std::string> key_set;
+  for (const auto& e : keys->AsArray()) key_set.insert(e.AsString());
+  EXPECT_EQ(key_set, (std::unordered_set<std::string>{"buf_only", "cold_only"}));
+
+  auto vals = engine.DispatchRead("HVALS", MakeCmd({"HVALS", "h"}));
+  ASSERT_TRUE(vals.has_value());
+  std::unordered_set<std::string> val_set;
+  for (const auto& e : vals->AsArray()) val_set.insert(e.AsString());
+  EXPECT_EQ(val_set, (std::unordered_set<std::string>{"x", "y"}));
+}
+
+TEST_F(TieringEngineTest, HmgetMixedBufferAndColdFields) {
+  auto engine = MakeEngine();
+  buffer_.Absorb("h",
+                 core::ops::WriteOp{core::ops::HashSet{
+                     .key = "h", .fields = {{.field = "buf_known", .value = "from_buf"}}}},
+                 core::EvictionTTL{86400});
+  buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"buf_removed"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // Cold gets one per-field HGet for the unknown-from-buffer field.
+  EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(core::RespValue::BulkString("from_cold")));
+
+  auto result = engine.DispatchRead(
+      "HMGET", MakeCmd({"HMGET", "h", "buf_known", "buf_removed", "cold_only"}));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsArray());
+  const auto& a = result->AsArray();
+  ASSERT_EQ(a.size(), 3U);
+  EXPECT_EQ(a[0].AsString(), "from_buf");
+  EXPECT_TRUE(a[1].IsNull());
+  EXPECT_EQ(a[2].AsString(), "from_cold");
+}
+
+TEST_F(TieringEngineTest, HexistsBufferKnownDoesNotCallCold) {
+  auto engine = MakeEngine();
+  buffer_.Absorb(
+      "h",
+      core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
+      core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchRead("HEXISTS", MakeCmd({"HEXISTS", "h", "f"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 1);
+}
+
+TEST_F(TieringEngineTest, HexistsBufferRemovedFieldReturnsZero) {
+  auto engine = MakeEngine();
+  buffer_.Absorb(
+      "h",
+      core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
+      core::EvictionTTL{86400});
+  buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"f"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchRead("HEXISTS", MakeCmd({"HEXISTS", "h", "f"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 0);
 }
 
 // --- Write path ---

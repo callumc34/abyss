@@ -20,6 +20,27 @@
 
 namespace abyss::consumer {
 
+// Snapshot of a key's hash state in the buffer. Multi-field hash reads cannot
+// be answered from the buffer alone: the buffer represents the delta since
+// the last flush, while cold holds the prior committed state. The engine
+// pulls this overlay and merges it with cold's result for the full answer.
+struct HashOverlay {
+  enum class Kind : uint8_t {
+    // No buffer entry for this key — engine reads cold as-is.
+    kNotPresent,
+    // Buffer holds a DEL; key is dead regardless of cold's content.
+    kTombstone,
+    // Buffer holds a different type (e.g. a SET that re-typed the key);
+    // engine surfaces WRONGTYPE without consulting cold's hash records.
+    kWrongType,
+    // Buffer holds hash state; merge with cold.
+    kHash,
+  };
+  Kind kind = Kind::kNotPresent;
+  std::unordered_map<std::string, std::string> fields;
+  std::unordered_set<std::string> removed_fields;
+};
+
 class CompactionBuffer {
  public:
   CompactionBuffer(FlushStrategy strategy, core::SteadyClockFn clock,
@@ -37,6 +58,8 @@ class CompactionBuffer {
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const ABYSS_EXCLUDES(mutex_);
 
   core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
+
+  HashOverlay HashOverlayFor(std::string_view key) const ABYSS_EXCLUDES(mutex_);
 
   std::vector<BufferEntry> FlushReady(core::SteadyTime now,
                                       size_t max_count = std::numeric_limits<size_t>::max())

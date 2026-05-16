@@ -224,6 +224,16 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
                                  std::optional<core::Duration> deadline) const;
   core::Result<RespValue> Handle(const core::ops::HashGetAll& op,
                                  std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashMultiGet& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashFieldExists& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashKeys& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashVals& op,
+                                 std::optional<core::Duration> deadline) const;
+  core::Result<RespValue> Handle(const core::ops::HashLen& op,
+                                 std::optional<core::Duration> deadline) const;
   core::Result<RespValue> Handle(const core::ops::Exists& op,
                                  std::optional<core::Duration> deadline) const;
   core::Result<RespValue> Handle(const core::ops::MultiStringGet& op,
@@ -244,6 +254,7 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   core::Result<void> Apply(const core::ops::ZsetAdd& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::ZsetRem& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::HashSet& op, rocksdb::WriteBatchWithIndex& wb) const;
+  core::Result<void> Apply(const core::ops::HashMSet& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::HashDel& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::MultiStringSet& op,
                            rocksdb::WriteBatchWithIndex& wb) const;
@@ -376,8 +387,9 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
     hooks = *impl->config.ttl_scanner_hooks;
   } else {
     const std::string data_path_copy = impl->config.data_path;
-    // NOLINTNEXTLINE(bugprone-exception-escape): std::function tolerates exceptions; alloc failures
-    // from Result/string are operator-actionable, not silently swallowed here.
+    // std::function tolerates exceptions; alloc failures from Result/string are
+    // operator-actionable, not silently swallowed here.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
     hooks.disk_usage = [data_path_copy] { return DefaultDiskUsage(data_path_copy); };
     hooks.cpu_clock = DefaultThreadCpuClock;
     hooks.steady_clock = core::DefaultSteadyClock;
@@ -773,6 +785,94 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   return RespValue::Array(std::move(pairs));
 }
 
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashMultiGet& op,
+                                                   std::optional<core::Duration> deadline) const {
+  auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
+  if (!meta.has_value()) return std::unexpected(meta.error());
+
+  std::vector<RespValue> out;
+  out.reserve(op.fields.size());
+  if (!meta->has_value()) {
+    for (size_t i = 0; i < op.fields.size(); ++i) out.push_back(RespValue::Null());
+    return RespValue::Array(std::move(out));
+  }
+
+  const auto read_opts = MakeReadOptions(deadline);
+  for (auto field : op.fields) {
+    const auto encoded = fmt::EncodeHashFieldKey(op.key, field);
+    std::string raw;
+    auto status = db->Get(read_opts, default_cf.get(), encoded, &raw);
+    if (status.IsNotFound()) {
+      out.push_back(RespValue::Null());
+    } else if (!status.ok()) {
+      return std::unexpected(FromStatus(status, "HMGET"));
+    } else {
+      out.push_back(RespValue::BulkString(std::move(raw)));
+    }
+  }
+  return RespValue::Array(std::move(out));
+}
+
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashFieldExists& op,
+                                                   std::optional<core::Duration> deadline) const {
+  auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
+  if (!meta.has_value()) return std::unexpected(meta.error());
+  if (!meta->has_value()) return RespValue::Integer(0);
+
+  const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field);
+  std::string raw;
+  auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
+  if (status.IsNotFound()) return RespValue::Integer(0);
+  if (!status.ok()) return std::unexpected(FromStatus(status, "HEXISTS"));
+  return RespValue::Integer(1);
+}
+
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::HashKeys& op, std::optional<core::Duration> /*deadline*/) const {
+  auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
+  if (!meta.has_value()) return std::unexpected(meta.error());
+  if (!meta->has_value()) return RespValue::Array({});
+
+  std::vector<RespValue> keys;
+  keys.reserve((*meta)->cardinality);
+  const auto prefix = fmt::HashFieldPrefix(op.key);
+  auto r = ScanPrefix(
+      nullptr, default_cf.get(), prefix,
+      [&](std::string_view full_key, std::string_view /*value*/) -> core::Result<bool> {
+        keys.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
+        return true;
+      });
+  if (!r.has_value()) return std::unexpected(r.error());
+  return RespValue::Array(std::move(keys));
+}
+
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::HashVals& op, std::optional<core::Duration> /*deadline*/) const {
+  auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
+  if (!meta.has_value()) return std::unexpected(meta.error());
+  if (!meta->has_value()) return RespValue::Array({});
+
+  std::vector<RespValue> vals;
+  vals.reserve((*meta)->cardinality);
+  const auto prefix = fmt::HashFieldPrefix(op.key);
+  auto r =
+      ScanPrefix(nullptr, default_cf.get(), prefix,
+                 [&](std::string_view /*full_key*/, std::string_view value) -> core::Result<bool> {
+                   vals.push_back(RespValue::BulkString(std::string(value)));
+                   return true;
+                 });
+  if (!r.has_value()) return std::unexpected(r.error());
+  return RespValue::Array(std::move(vals));
+}
+
+core::Result<RespValue> RocksdbStore::Impl::Handle(
+    const core::ops::HashLen& op, std::optional<core::Duration> /*deadline*/) const {
+  auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
+  if (!meta.has_value()) return std::unexpected(meta.error());
+  if (!meta->has_value()) return RespValue::Integer(0);
+  return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
+}
+
 core::Result<RespValue> RocksdbStore::Impl::Handle(
     const core::ops::Exists& op, std::optional<core::Duration> /*deadline*/) const {
   int64_t count = 0;
@@ -971,6 +1071,11 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashSet& op,
   }
   if (added == 0) return {};
   return ApplyMetaDelta(wb, fmt::kTypeHashField, op.key, added);
+}
+
+core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashMSet& op,
+                                             rocksdb::WriteBatchWithIndex& wb) const {
+  return Apply(core::ops::HashSet{.key = op.key, .fields = op.fields}, wb);
 }
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashDel& op,

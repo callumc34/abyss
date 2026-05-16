@@ -52,6 +52,7 @@ class TieringEngine : public core::CommandDispatcher {
 
  private:
   void PromoteThroughQueue(std::string_view key);
+  core::Result<core::RespValue> DispatchHashRead(const core::ops::ReadOp& op);
 
   core::Queue& queue_;
   core::HotStore& hot_store_;

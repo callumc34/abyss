@@ -60,6 +60,7 @@ class CollectionsFixture : public ::testing::Test {
     return out;
   }
 
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::filesystem::path path_;
 };
 
@@ -167,7 +168,7 @@ TEST_F(CollectionsFixture, HashSetThenGetAllReturnsPairs) {
   auto result = store->Exec(core::ops::HashGetAll{.key = key});
   ASSERT_TRUE(result.has_value());
   ASSERT_TRUE(result->IsArray());
-  ASSERT_EQ(result->AsArray().size(), 4u);
+  ASSERT_EQ(result->AsArray().size(), 4U);
 }
 
 TEST_F(CollectionsFixture, HashGetFieldOrNull) {
@@ -199,7 +200,107 @@ TEST_F(CollectionsFixture, HashSetOverwritesFieldWithoutCardinalityBump) {
   auto get = store->Exec(core::ops::HashGet{.key = key, .field = "f"});
   EXPECT_EQ(get->AsString(), "v2");
   auto all = store->Exec(core::ops::HashGetAll{.key = key});
-  EXPECT_EQ(all->AsArray().size(), 2u);  // one pair
+  EXPECT_EQ(all->AsArray().size(), 2U);  // one pair
+}
+
+TEST_F(CollectionsFixture, HashMSetRoundTripsLikeHashSet) {
+  auto store = OpenStore();
+  std::string key = "h";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {
+      {.field = "a", .value = "1"},
+      {.field = "b", .value = "2"},
+  };
+  std::vector<core::ops::WriteOp> ops = {core::ops::HashMSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+
+  auto all = store->Exec(core::ops::HashGetAll{.key = key});
+  ASSERT_TRUE(all.has_value());
+  ASSERT_EQ(all->AsArray().size(), 4U);
+}
+
+TEST_F(CollectionsFixture, HashLenReturnsCachedCardinality) {
+  auto store = OpenStore();
+  std::string key = "h";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {
+      {.field = "a", .value = "1"},
+      {.field = "b", .value = "2"},
+      {.field = "c", .value = "3"},
+  };
+  std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+
+  auto len = store->Exec(core::ops::HashLen{.key = key});
+  ASSERT_TRUE(len.has_value());
+  EXPECT_EQ(len->AsInteger(), 3);
+
+  auto missing = store->Exec(core::ops::HashLen{.key = "nope"});
+  ASSERT_TRUE(missing.has_value());
+  EXPECT_EQ(missing->AsInteger(), 0);
+}
+
+TEST_F(CollectionsFixture, HashKeysAndValsReturnProjections) {
+  auto store = OpenStore();
+  std::string key = "h";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {
+      {.field = "a", .value = "1"},
+      {.field = "b", .value = "2"},
+  };
+  std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+
+  auto keys = store->Exec(core::ops::HashKeys{.key = key});
+  ASSERT_TRUE(keys.has_value());
+  EXPECT_EQ(ArrayToStrings(*keys), (std::vector<std::string>{"a", "b"}));
+
+  auto vals = store->Exec(core::ops::HashVals{.key = key});
+  ASSERT_TRUE(vals.has_value());
+  EXPECT_EQ(ArrayToStrings(*vals), (std::vector<std::string>{"1", "2"}));
+
+  auto empty_keys = store->Exec(core::ops::HashKeys{.key = "nope"});
+  ASSERT_TRUE(empty_keys.has_value());
+  EXPECT_TRUE(empty_keys->AsArray().empty());
+}
+
+TEST_F(CollectionsFixture, HashMultiGetReturnsArrayWithNulls) {
+  auto store = OpenStore();
+  std::string key = "h";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {
+      {.field = "a", .value = "1"},
+      {.field = "b", .value = "2"},
+  };
+  std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+
+  std::vector<std::string_view> req = {"a", "missing", "b"};
+  auto r = store->Exec(core::ops::HashMultiGet{.key = key, .fields = req});
+  ASSERT_TRUE(r.has_value());
+  ASSERT_TRUE(r->IsArray());
+  const auto& arr = r->AsArray();
+  ASSERT_EQ(arr.size(), 3U);
+  EXPECT_EQ(arr[0].AsString(), "1");
+  EXPECT_TRUE(arr[1].IsNull());
+  EXPECT_EQ(arr[2].AsString(), "2");
+
+  // Missing-key short-circuits with all nulls.
+  std::vector<std::string_view> two_fields = {"x", "y"};
+  auto miss = store->Exec(core::ops::HashMultiGet{.key = "nope", .fields = two_fields});
+  ASSERT_TRUE(miss.has_value());
+  ASSERT_EQ(miss->AsArray().size(), 2U);
+  EXPECT_TRUE(miss->AsArray()[0].IsNull());
+  EXPECT_TRUE(miss->AsArray()[1].IsNull());
+}
+
+TEST_F(CollectionsFixture, HashFieldExistsReturns1Or0) {
+  auto store = OpenStore();
+  std::string key = "h";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "a", .value = "1"}};
+  std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+
+  EXPECT_EQ(store->Exec(core::ops::HashFieldExists{.key = key, .field = "a"})->AsInteger(), 1);
+  EXPECT_EQ(store->Exec(core::ops::HashFieldExists{.key = key, .field = "missing"})->AsInteger(),
+            0);
+  EXPECT_EQ(store->Exec(core::ops::HashFieldExists{.key = "no_key", .field = "a"})->AsInteger(), 0);
 }
 
 TEST_F(CollectionsFixture, HashDelRemovesOnlyNamedFields) {
@@ -218,7 +319,7 @@ TEST_F(CollectionsFixture, HashDelRemovesOnlyNamedFields) {
   ASSERT_TRUE(store->ApplyBatch(del_ops).has_value());
 
   auto all = store->Exec(core::ops::HashGetAll{.key = key});
-  ASSERT_EQ(all->AsArray().size(), 2u);
+  ASSERT_EQ(all->AsArray().size(), 2U);
   EXPECT_EQ(all->AsArray()[0].AsString(), "b");
   EXPECT_EQ(all->AsArray()[1].AsString(), "2");
 }
@@ -267,7 +368,7 @@ TEST_F(CollectionsFixture, ZsetAddOverwriteReplacesScoreIndex) {
 
   auto range2 =
       store->Exec(core::ops::ZsetRange{.key = key, .min = "0", .max = "100", .by_score = true});
-  ASSERT_EQ(range2->AsArray().size(), 1u);
+  ASSERT_EQ(range2->AsArray().size(), 1U);
   EXPECT_EQ(range2->AsArray()[0].AsString(), "m");
 }
 
@@ -284,13 +385,13 @@ TEST_F(CollectionsFixture, ZsetRangeByScoreExclusiveBounds) {
 
   auto exclusive_min =
       store->Exec(core::ops::ZsetRange{.key = key, .min = "(1", .max = "3", .by_score = true});
-  ASSERT_EQ(exclusive_min->AsArray().size(), 2u);
+  ASSERT_EQ(exclusive_min->AsArray().size(), 2U);
   EXPECT_EQ(exclusive_min->AsArray()[0].AsString(), "b");
   EXPECT_EQ(exclusive_min->AsArray()[1].AsString(), "c");
 
   auto exclusive_both =
       store->Exec(core::ops::ZsetRange{.key = key, .min = "(1", .max = "(3", .by_score = true});
-  ASSERT_EQ(exclusive_both->AsArray().size(), 1u);
+  ASSERT_EQ(exclusive_both->AsArray().size(), 1U);
   EXPECT_EQ(exclusive_both->AsArray()[0].AsString(), "b");
 }
 
@@ -312,7 +413,7 @@ TEST_F(CollectionsFixture, ZsetRangeByScoreWithScoresAndRev) {
                                                  .rev = true,
                                                  .with_scores = true});
   ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->AsArray().size(), 6u);
+  ASSERT_EQ(result->AsArray().size(), 6U);
   EXPECT_EQ(result->AsArray()[0].AsString(), "c");
   EXPECT_EQ(result->AsArray()[1].AsString(), "3");
   EXPECT_EQ(result->AsArray()[2].AsString(), "b");
@@ -334,7 +435,7 @@ TEST_F(CollectionsFixture, ZsetRangeByScoreOffsetCount) {
   auto result = store->Exec(core::ops::ZsetRange{
       .key = key, .min = "-inf", .max = "+inf", .by_score = true, .offset = 1, .count = 2});
   ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->AsArray().size(), 2u);
+  ASSERT_EQ(result->AsArray().size(), 2U);
   EXPECT_EQ(result->AsArray()[0].AsString(), "b");
   EXPECT_EQ(result->AsArray()[1].AsString(), "c");
 }
@@ -352,14 +453,14 @@ TEST_F(CollectionsFixture, ZsetRangeIndexBased) {
 
   // ZRANGE z 0 -1 — all members in score order.
   auto all = store->Exec(core::ops::ZsetRange{.key = key, .min = "0", .max = "-1"});
-  ASSERT_EQ(all->AsArray().size(), 3u);
+  ASSERT_EQ(all->AsArray().size(), 3U);
   EXPECT_EQ(all->AsArray()[0].AsString(), "a");
   EXPECT_EQ(all->AsArray()[1].AsString(), "b");
   EXPECT_EQ(all->AsArray()[2].AsString(), "c");
 
   // Slice [1..2].
   auto slice = store->Exec(core::ops::ZsetRange{.key = key, .min = "1", .max = "2"});
-  ASSERT_EQ(slice->AsArray().size(), 2u);
+  ASSERT_EQ(slice->AsArray().size(), 2U);
   EXPECT_EQ(slice->AsArray()[0].AsString(), "b");
   EXPECT_EQ(slice->AsArray()[1].AsString(), "c");
 }
@@ -385,7 +486,7 @@ TEST_F(CollectionsFixture, ZsetRemRemovesScoreIndex) {
 
   auto full_range =
       store->Exec(core::ops::ZsetRange{.key = key, .min = "-inf", .max = "+inf", .by_score = true});
-  ASSERT_EQ(full_range->AsArray().size(), 1u);
+  ASSERT_EQ(full_range->AsArray().size(), 1U);
   EXPECT_EQ(full_range->AsArray()[0].AsString(), "b");
 }
 
@@ -491,7 +592,7 @@ TEST_F(CollectionsFixture, MultiStringGetPreservesOrderAndNulls) {
   mget.keys = {"a", "b", "c"};
   auto result = store->Exec(mget);
   ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->AsArray().size(), 3u);
+  ASSERT_EQ(result->AsArray().size(), 3U);
   EXPECT_EQ(result->AsArray()[0].AsString(), "one");
   EXPECT_TRUE(result->AsArray()[1].IsNull());
   EXPECT_EQ(result->AsArray()[2].AsString(), "three");

@@ -102,18 +102,24 @@ struct AbsorbVisitor {
     }
   }
 
-  void operator()(const core::ops::HashSet& h) {
+  // HSET and HMSET differ only at the hot store's reply (count of new fields
+  // vs +OK); the cold-side compaction merges them identically.
+  void AbsorbHashFields(const std::vector<core::ops::HashSet::FieldValue>& fields) {
     if (type != CompactedState::DataType::kHash && type != CompactedState::DataType::kNone) {
       return;
     }
     type = CompactedState::DataType::kHash;
     is_tombstone = false;
-    for (const auto& fv : h.fields) {
+    for (const auto& fv : fields) {
       auto field = std::string(fv.field);
       hash_removed_fields.erase(field);
       hash_fields[std::move(field)] = std::string(fv.value);
     }
   }
+
+  void operator()(const core::ops::HashSet& h) { AbsorbHashFields(h.fields); }
+
+  void operator()(const core::ops::HashMSet& h) { AbsorbHashFields(h.fields); }
 
   void operator()(const core::ops::HashDel& h) {
     if (type != CompactedState::DataType::kHash && type != CompactedState::DataType::kNone) {

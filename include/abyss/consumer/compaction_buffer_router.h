@@ -3,6 +3,7 @@
 #include <optional>
 #include <string_view>
 
+#include "abyss/consumer/compaction_buffer.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
@@ -26,6 +27,8 @@ class CompactionBufferRouter : public core::Reader {
       std::optional<core::Duration> deadline = std::nullopt) override = 0;
 
   virtual core::Result<core::RespValue> Read(std::string_view key) const = 0;
+
+  virtual HashOverlay HashOverlayFor(std::string_view key) const = 0;
 };
 
 }  // namespace abyss::consumer

@@ -80,6 +80,11 @@ core::Result<core::RespValue> ColdConsumerPool::Read(std::string_view key) const
   return consumers_[shard]->Buffer().Read(std::string(key));
 }
 
+HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {
+  const auto shard = ShardForKey(key);
+  return consumers_[shard]->Buffer().HashOverlayFor(key);
+}
+
 core::ShardId ColdConsumerPool::ShardForKey(std::string_view key) const {
   return core::ComputeShard(key, static_cast<uint32_t>(consumers_.size()));
 }

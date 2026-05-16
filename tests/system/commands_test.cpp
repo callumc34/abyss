@@ -1,3 +1,6 @@
+#include <set>
+#include <string>
+
 #include "server_fixture.h"
 
 namespace abyss::system_test {
@@ -186,6 +189,78 @@ TEST_F(HashOpsTest, Hdel) {
   ASSERT_TRUE(r.IsInteger());
   EXPECT_EQ(r.Integer(), 1);
   EXPECT_TRUE(Client().Command({"HGET", "h", "a"}).IsNil());
+}
+
+TEST_F(HashOpsTest, Hmset) {
+  EXPECT_TRUE(Client().Command({"HMSET", "h", "a", "1", "b", "2"}).IsOk());
+
+  EXPECT_EQ(Client().Command({"HGET", "h", "a"}).String(), "1");
+  EXPECT_EQ(Client().Command({"HGET", "h", "b"}).String(), "2");
+}
+
+TEST_F(HashOpsTest, Hmget) {
+  Client().Command({"HSET", "h", "a", "1", "b", "2"});
+  auto r = Client().Command({"HMGET", "h", "a", "missing", "b"});
+  ASSERT_TRUE(r.IsArray());
+  const auto& a = r.Elements();
+  ASSERT_EQ(a.size(), 3U);
+  EXPECT_EQ(a[0].String(), "1");
+  EXPECT_TRUE(a[1].IsNil());
+  EXPECT_EQ(a[2].String(), "2");
+}
+
+TEST_F(HashOpsTest, Hexists) {
+  Client().Command({"HSET", "h", "a", "1"});
+  EXPECT_EQ(Client().Command({"HEXISTS", "h", "a"}).Integer(), 1);
+  EXPECT_EQ(Client().Command({"HEXISTS", "h", "missing"}).Integer(), 0);
+  EXPECT_EQ(Client().Command({"HEXISTS", "no_such_key", "a"}).Integer(), 0);
+}
+
+TEST_F(HashOpsTest, Hkeys) {
+  Client().Command({"HSET", "h", "a", "1", "b", "2"});
+  auto r = Client().Command({"HKEYS", "h"});
+  ASSERT_TRUE(r.IsArray());
+  std::set<std::string> got;
+  for (const auto& e : r.Elements()) got.insert(e.String());
+  EXPECT_EQ(got, (std::set<std::string>{"a", "b"}));
+}
+
+TEST_F(HashOpsTest, Hvals) {
+  Client().Command({"HSET", "h", "a", "1", "b", "2"});
+  auto r = Client().Command({"HVALS", "h"});
+  ASSERT_TRUE(r.IsArray());
+  std::set<std::string> got;
+  for (const auto& e : r.Elements()) got.insert(e.String());
+  EXPECT_EQ(got, (std::set<std::string>{"1", "2"}));
+}
+
+TEST_F(HashOpsTest, Hlen) {
+  Client().Command({"HSET", "h", "a", "1", "b", "2", "c", "3"});
+  EXPECT_EQ(Client().Command({"HLEN", "h"}).Integer(), 3);
+  EXPECT_EQ(Client().Command({"HLEN", "no_such_key"}).Integer(), 0);
+}
+
+TEST_F(HashOpsTest, HdelAllFieldsHgetallReturnsEmptyArray) {
+  // Redis semantic: a hash with no remaining fields is "no such key" — HGETALL
+  // returns an empty array (not nil), the meta record is deleted.
+  Client().Command({"HSET", "h", "a", "1", "b", "2"});
+  EXPECT_EQ(Client().Command({"HDEL", "h", "a", "b"}).Integer(), 2);
+  auto r = Client().Command({"HGETALL", "h"});
+  ASSERT_TRUE(r.IsArray());
+  EXPECT_TRUE(r.Elements().empty());
+}
+
+TEST_F(HashOpsTest, MultiFieldReadsOnMissingKey) {
+  EXPECT_TRUE(Client().Command({"HGETALL", "missing"}).Elements().empty());
+  EXPECT_TRUE(Client().Command({"HKEYS", "missing"}).Elements().empty());
+  EXPECT_TRUE(Client().Command({"HVALS", "missing"}).Elements().empty());
+  EXPECT_EQ(Client().Command({"HLEN", "missing"}).Integer(), 0);
+
+  auto hmget = Client().Command({"HMGET", "missing", "f1", "f2"});
+  ASSERT_TRUE(hmget.IsArray());
+  ASSERT_EQ(hmget.Elements().size(), 2U);
+  EXPECT_TRUE(hmget.Elements()[0].IsNil());
+  EXPECT_TRUE(hmget.Elements()[1].IsNil());
 }
 
 // --- Sorted set operations --------------------------------------------------

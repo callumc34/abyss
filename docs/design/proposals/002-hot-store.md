@@ -17,7 +17,7 @@ Read operations (`Exec`) refresh the eviction timer on hits. Write operations (`
 
 See `include/abyss/core/hot_store.h` and `include/abyss/core/ops.h` for the current interface.
 
-Phase 1 built-in hot store supports: strings, sets, sorted sets. Hashes and lists are Phase 2 candidates. External stores (DragonflyDB, Redis, Valkey) support whatever they natively support — Abyss passes commands through.
+Phase 1 built-in hot store supports: strings, sets, sorted sets, hashes. Lists, bitmaps, hyperloglog, geo, and streams are Phase 2 candidates. External stores (DragonflyDB, Redis, Valkey) support whatever they natively support — Abyss passes commands through.
 
 ### Built-in Concurrent Hash Map
 
