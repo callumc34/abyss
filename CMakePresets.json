@@ -8,7 +8,8 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "ABYSS_BUILD_TESTS": "ON",
-        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
+        "ABYSS_BUILD_PERF": "ON",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold;perf"
       }
     },
     {
@@ -16,7 +17,9 @@
       "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_BUILD_TESTS": "OFF"
+        "ABYSS_BUILD_TESTS": "OFF",
+        "ABYSS_BUILD_PERF": "OFF",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
       }
     },
     {
@@ -46,9 +49,10 @@
       "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_BUILD_TESTS": "OFF",
+        "ABYSS_BUILD_TESTS": "ON",
         "ABYSS_BUILD_BENCHMARKS": "ON",
-        "VCPKG_MANIFEST_FEATURES": "builtin-cold;benchmarks"
+        "ABYSS_BUILD_PERF": "ON",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold;benchmarks;perf"
       }
     },
     {
@@ -116,6 +120,9 @@
         "noTestsAction": "error",
         "timeout": 30,
         "stopOnFailure": false
+      },
+      "filter": {
+        "exclude": { "label": "perf-micro|perf-probe|perf-load" }
       }
     },
     {
@@ -138,6 +145,9 @@
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 300
+      },
+      "filter": {
+        "exclude": { "label": "perf-micro|perf-probe|perf-load" }
       }
     },
     {
@@ -149,6 +159,9 @@
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 300
+      },
+      "filter": {
+        "exclude": { "label": "perf-micro|perf-probe|perf-load" }
       }
     },
     {
@@ -160,6 +173,9 @@
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 180
+      },
+      "filter": {
+        "exclude": { "label": "perf-micro|perf-probe|perf-load" }
       }
     },
     {

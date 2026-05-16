@@ -83,6 +83,16 @@ Non-deterministic, long-running tests that explore edge cases automated tests mi
 
 These run in CI only, not during local development.
 
+## Performance harness (sits beside the pyramid)
+
+The performance harness under `tests/perf/` is not a pyramid layer — it answers a different question. The pyramid validates **correctness**: did the code do what we said it would? The harness validates **operational characteristics**: does the system meet its latency and throughput targets in [requirements.md](../design/requirements.md)?
+
+It comprises three substrates — Google Benchmark microbenchmarks (`tests/perf/micro/`), in-process component probes (`tests/perf/probe/`), and a TCP load generator against the full server binary (`tests/perf/load/`) — wired through a shared framework (`tests/perf/framework/`) that handles HdrHistogram recording, coordinated-omission correction, workload YAML parsing, and versioned JSON reporting.
+
+The harness's design and the discipline it enforces are described in [ADP-013](../design/proposals/013-performance-harness.md); the operating guide lives in [docs/development/performance.md](../development/performance.md).
+
+The `perf-framework` label runs the harness's own unit tests in the default `ctest` invocation; the `perf-micro`, `perf-probe`, and `perf-load` labels are excluded from the default run and must be invoked explicitly.
+
 ## Test Binary Structure
 
 Each layer and component compiles into its own test binary. This gives O(changed-component) rebuild times and allows CTest to run subsets by label.

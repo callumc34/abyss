@@ -1,0 +1,30 @@
+# Reference workload for authoritative runs on perf-grade hardware.
+# Preloads ~1.3 GiB at 256B × 5M keys; will exhaust memory on small machines.
+# For developer-laptop exploration, copy this file and lower key_count and
+# value_size_bytes substantially.
+# See docs/development/performance.md §Conditions of measurement.
+name: cold-read-aged
+description: |
+  Preload a working set far larger than the hot store memory budget, then read
+  with a uniform key distribution so most lookups fall through to the cold
+  store. Validates the cold-read p99 target end-to-end.
+duration_seconds: 60
+warmup_seconds: 30
+workers: 2
+connections_per_worker: 4
+target_rate_ops: 0
+key_count: 5000000
+key_distribution:
+  kind: uniform
+  seed: 13
+value_size_bytes: 256
+mix:
+  GET: 1.0
+preload:
+  enabled: true
+  key_count: 5000000
+  value_size_bytes: 256
+targets:
+  per_op:
+    GET:
+      p99_us: 5000
