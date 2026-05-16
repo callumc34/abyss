@@ -19,6 +19,8 @@ enum class MultiKeyKind : uint8_t {
   kDelete,
 };
 
+enum class FlushTarget : uint8_t { kThisDb, kAllDbs };
+
 class CommandDispatcher {
  public:
   CommandDispatcher() = default;
@@ -33,6 +35,7 @@ class CommandDispatcher {
   virtual Result<RespValue> DispatchConditional(std::string_view name, RespCommand cmd,
                                                 PredicateFlags flags) = 0;
   virtual Result<RespValue> DispatchFanOut(MultiKeyKind kind, RespCommand cmd) = 0;
+  virtual Result<RespValue> DispatchFlush(FlushTarget target) = 0;
 };
 
 }  // namespace abyss::core

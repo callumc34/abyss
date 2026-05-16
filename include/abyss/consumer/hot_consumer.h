@@ -87,6 +87,7 @@ class HotConsumer {
   void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
   void HandleConditional(core::QueueEntry entry, const core::entry::Conditional& cond);
   void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
+  void HandleFlush(const core::QueueEntry& entry);
 
   // Applies materialised ops from a Resolved entry. `reference_at` is the
   // Conditional's appended_at, used for the eviction-window skip-stale check
@@ -132,6 +133,8 @@ class HotConsumer {
       ABYSS_GUARDED_BY(pending_mu_);
 
   std::atomic<core::SequenceId> highest_settled_seq_{0};
+  // Highest seq of an applied `entry::Flush`; no-ops Resolveds whose Conditional was wiped.
+  std::atomic<core::SequenceId> latest_flush_seq_{0};
   bool block_and_scan_warning_emitted_ = false;
 };
 

@@ -13,6 +13,7 @@
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/flush_strategy.h"
 #include "abyss/core/cold_store.h"
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
@@ -67,7 +68,7 @@ class ColdConsumer {
   // `eviction_policy` is borrowed; the server owns the single instance and
   // outlives every consumer.
   ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard, Config config,
-               const core::EvictionPolicy& eviction_policy,
+               const core::EvictionPolicy& eviction_policy, core::ConsumerRpc& rpc,
                core::SteadyClockFn steady_clock = core::DefaultSteadyClock,
                core::WallClockFn wall_clock = core::DefaultWallClock);
   ~ColdConsumer();
@@ -125,9 +126,11 @@ class ColdConsumer {
   void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
   void HandleConditional(const core::QueueEntry& entry, const core::entry::Conditional& cond);
   void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
+  void HandleFlush(const core::QueueEntry& entry);
 
-  // Multi-key forms (DEL, MSET) expand into per-key absorbs.
-  bool AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq);
+  // `wall_now_ms` must be the entry's appended_at so hot and cold materialise
+  // identical absolute TTLs from PX/EX args.
+  bool AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t wall_now_ms);
 
   std::optional<core::SequenceId> OldestPendingConditional() const ABYSS_EXCLUDES(pending_mu_);
   void CheckBlockAndScanTimeout();
@@ -150,6 +153,7 @@ class ColdConsumer {
 
   core::Queue& queue_;
   core::ColdStore& cold_store_;
+  core::ConsumerRpc& rpc_;
   core::ShardId shard_;
   Config config_;
   const core::EvictionPolicy& eviction_policy_;
@@ -164,7 +168,13 @@ class ColdConsumer {
 
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   std::atomic<core::SequenceId> last_ack_seq_{0};
+  // Highest seq of an applied `entry::Flush`; gates Resolveds whose ref was wiped.
+  std::atomic<core::SequenceId> latest_flush_seq_{0};
   bool first_ack_recorded_ = false;
+  // Disambiguates `latest_drained_seq_=0` between "nothing drained" and "drained
+  // seq 0"; prevents Ack(0) before any entry has been appended.
+  bool drained_anything_ = false;
+  std::atomic<uint64_t> flushes_applied_{0};
 
   struct PendingConditional {
     core::SequenceId seq = 0;

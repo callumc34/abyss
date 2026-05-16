@@ -371,5 +371,39 @@ TEST(WalEntryTest, BatchLastSeqLessThanSelfIsCorruption) {
   EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
 }
 
+TEST(WalEntryTest, RoundTripFlushEntry) {
+  const core::QueueEntry entry{
+      .seq = 77,
+      .appended_at = core::WallClock::now(),
+      .payload = core::entry::Flush{},
+  };
+
+  std::vector<std::byte> buf;
+  const size_t encoded = EncodeWalEntry(entry, entry.seq, buf);
+  EXPECT_EQ(buf.size(), encoded);
+
+  auto decoded = DecodeWalEntry(buf);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->entry.seq, 77U);
+  EXPECT_EQ(decoded->batch_last_seq, 77U);
+  EXPECT_TRUE(std::holds_alternative<core::entry::Flush>(decoded->entry.payload));
+}
+
+TEST(WalEntryTest, FlushEntryBatchedWithSibling) {
+  const core::QueueEntry entry{
+      .seq = 100,
+      .appended_at = core::WallClock::now(),
+      .payload = core::entry::Flush{},
+  };
+
+  std::vector<std::byte> buf;
+  EncodeWalEntry(entry, /*batch_last_seq=*/101, buf);
+
+  auto decoded = DecodeWalEntry(buf);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->entry.seq, 100U);
+  EXPECT_EQ(decoded->batch_last_seq, 101U);
+}
+
 }  // namespace
 }  // namespace abyss::queue

@@ -263,6 +263,13 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Admin("DBSIZE", 1, D::kConsumerRpc, false,
           {"Returns the number of keys in the database.", "1.0.0", "server", "O(1)"}),
 
+    // Admin — broadcast wipe. Arity -1 to accept the optional [ASYNC|SYNC]
+    // modifier; both behave synchronously and the modifier is currently ignored.
+    Admin("FLUSHDB", -1, D::kFlush, false,
+          {"Removes all keys from the current database.", "1.0.0", "server", "O(N)"}),
+    Admin("FLUSHALL", -1, D::kFlush, false,
+          {"Removes all keys from every database.", "1.0.0", "server", "O(N)"}),
+
     // Strings
     Read("GET", 2, 1, 1, 1, {"Returns the string value of a key.", "1.0.0", "string", "O(1)"}),
     Write("SET", -3, D::kWritePath, 1, 1, 1,

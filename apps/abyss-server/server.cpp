@@ -147,7 +147,7 @@ bool Server::Initialize() {
                   .retry_max_backoff = config_.cold_consumer.retry_max_backoff,
               },
       },
-      *eviction_policy_);
+      *eviction_policy_, *consumer_rpc_);
 
   engine_ = std::make_unique<engine::TieringEngine>(
       *queue_, *hot_store_, *cold_store_, *cold_pool_, *consumer_rpc_,

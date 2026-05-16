@@ -155,8 +155,11 @@ Resolver::Snapshot Resolver::GetSnapshot() const {
   s.append_failures = append_failures_.load(std::memory_order_relaxed);
   s.parse_failures = parse_failures_.load(std::memory_order_relaxed);
   s.replayed_resolveds_emitted = replayed_resolveds_emitted_.load(std::memory_order_relaxed);
+  s.flushes_observed = flushes_observed_.load(std::memory_order_relaxed);
+  s.flush_skip_resolveds_emitted = flush_skip_resolveds_emitted_.load(std::memory_order_relaxed);
   s.latest_drained_seq = latest_drained_seq_.load(std::memory_order_relaxed);
   s.last_ack_seq = last_ack_seq_.load(std::memory_order_relaxed);
+  s.latest_flush_seq = latest_flush_seq_.load(std::memory_order_relaxed);
   s.cache_entries = cache_.Size();
   s.cache_bytes = cache_.BytesEstimate();
   return s;
@@ -197,7 +200,8 @@ KeyView LookupKey(ExistenceCache& cache, CompactionBufferRouter& buffer, core::C
                   std::optional<core::Duration> deadline, std::string_view key,
                   std::atomic<uint64_t>& cache_hits, std::atomic<uint64_t>& buffer_hits,
                   std::atomic<uint64_t>& cold_hits, std::atomic<uint64_t>& cold_timeouts,
-                  std::atomic<uint64_t>& cold_errors, uint64_t now_ms) {
+                  std::atomic<uint64_t>& cold_errors, uint64_t now_ms,
+                  bool cache_only_after_miss = false) {
   KeyView out;
 
   // Cache.
@@ -212,6 +216,15 @@ KeyView LookupKey(ExistenceCache& cache, CompactionBufferRouter& buffer, core::C
       out.exists = false;
     }
     cache_hits.fetch_add(1, std::memory_order_relaxed);
+    return out;
+  }
+
+  // Post-Flush replay: cold still holds pre-Flush garbage, so a cache miss is
+  // definitively absent rather than a fall-through to stale tiers.
+  if (cache_only_after_miss) {
+    out.source = KeyView::Source::kMiss;
+    out.definitive = true;
+    out.exists = false;
     return out;
   }
 
@@ -263,12 +276,14 @@ std::optional<double> LookupZsetMemberScore(
     std::optional<core::Duration> deadline, std::string_view key, std::string_view member,
     std::atomic<uint64_t>& cache_hits, std::atomic<uint64_t>& buffer_hits,
     std::atomic<uint64_t>& cold_hits, std::atomic<uint64_t>& cold_timeouts,
-    std::atomic<uint64_t>& cold_errors, bool& definitive) {
+    std::atomic<uint64_t>& cold_errors, bool& definitive, bool cache_only_after_miss = false) {
   definitive = true;
   if (auto cached = cache.GetMember(key, member); cached.has_value()) {
     cache_hits.fetch_add(1, std::memory_order_relaxed);
     return cached->score;
   }
+  // Post-Flush replay shortcut — see LookupKey.
+  if (cache_only_after_miss) return std::nullopt;
   auto buf = buffer.Exec(core::ops::ReadOp{core::ops::ZsetScore{.key = key, .member = member}});
   if (buf.has_value()) {
     buffer_hits.fetch_add(1, std::memory_order_relaxed);
@@ -304,7 +319,8 @@ std::optional<std::string> LookupHashFieldValue(
     std::optional<core::Duration> deadline, std::string_view key, std::string_view field,
     std::atomic<uint64_t>& cache_hits, std::atomic<uint64_t>& buffer_hits,
     std::atomic<uint64_t>& cold_hits, std::atomic<uint64_t>& cold_timeouts,
-    std::atomic<uint64_t>& cold_errors, bool& definitive, bool& exists) {
+    std::atomic<uint64_t>& cold_errors, bool& definitive, bool& exists,
+    bool cache_only_after_miss = false) {
   definitive = true;
   exists = false;
   if (auto cached = cache.GetField(key, field); cached.has_value()) {
@@ -313,6 +329,8 @@ std::optional<std::string> LookupHashFieldValue(
     if (cached->value_known) return cached->value;
     return std::nullopt;
   }
+  // Post-Flush replay shortcut — see LookupKey.
+  if (cache_only_after_miss) return std::nullopt;
   auto buf = buffer.Exec(core::ops::ReadOp{core::ops::HashGet{.key = key, .field = field}});
   if (buf.has_value()) {
     buffer_hits.fetch_add(1, std::memory_order_relaxed);
@@ -429,6 +447,11 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
   const auto seq = entry.seq;
   const auto now_ms = WallMs(entry.appended_at);
   const std::optional<core::Duration> deadline{config_.cold_lookup_timeout};
+  // During replay, cold still reflects pre-Flush state (cold replay runs after
+  // resolver replay). Post-Flush danglings must trust the cache alone.
+  const bool cache_only = replay_mode_.load(std::memory_order_acquire) &&
+                          latest_flush_seq_.load(std::memory_order_acquire) > 0 &&
+                          entry.seq > latest_flush_seq_.load(std::memory_order_acquire);
 
   if (cmd.args.empty()) {
     parse_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -457,8 +480,9 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr, parsed.error));
     }
-    KeyView view = LookupKey(cache_, buffer_router_, cold_, deadline, parsed.key, cache_hits_,
-                             buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, now_ms);
+    KeyView view =
+        LookupKey(cache_, buffer_router_, cold_, deadline, parsed.key, cache_hits_, buffer_hits_,
+                  cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
     if (!view.definitive) {
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
                                                   "cold tier unavailable for conditional lookup"));
@@ -508,7 +532,7 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     }
     for (const auto& [k, _] : kvs) {
       KeyView v = LookupKey(cache_, buffer_router_, cold_, deadline, k, cache_hits_, buffer_hits_,
-                            cold_hits_, cold_timeouts_, cold_errors_, now_ms);
+                            cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
       if (!v.definitive) {
         return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
                                                     "cold tier unavailable for MSETNX"));
@@ -579,9 +603,9 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     int64_t changed = 0;
     for (const auto& p : proposed) {
       bool definitive = false;
-      auto existing =
-          LookupZsetMemberScore(cache_, buffer_router_, cold_, deadline, key, p.member, cache_hits_,
-                                buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, definitive);
+      auto existing = LookupZsetMemberScore(cache_, buffer_router_, cold_, deadline, key, p.member,
+                                            cache_hits_, buffer_hits_, cold_hits_, cold_timeouts_,
+                                            cold_errors_, definitive, cache_only);
       if (!definitive) {
         return MakeSkip(seq,
                         core::RespValue::Error(core::ErrorPrefix::kErr,
@@ -655,8 +679,9 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     }
 
     const std::string_view key = cmd.args[1];
-    KeyView view = LookupKey(cache_, buffer_router_, cold_, deadline, key, cache_hits_,
-                             buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, now_ms);
+    KeyView view =
+        LookupKey(cache_, buffer_router_, cold_, deadline, key, cache_hits_, buffer_hits_,
+                  cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
     if (!view.definitive) {
       return MakeSkip(
           seq, core::RespValue::Error(core::ErrorPrefix::kErr, "cold tier unavailable for EXPIRE"));
@@ -690,10 +715,12 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     }
     const std::string_view src = cmd.args[1];
     const std::string_view dst = cmd.args[2];
-    KeyView src_view = LookupKey(cache_, buffer_router_, cold_, deadline, src, cache_hits_,
-                                 buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, now_ms);
-    KeyView dst_view = LookupKey(cache_, buffer_router_, cold_, deadline, dst, cache_hits_,
-                                 buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, now_ms);
+    KeyView src_view =
+        LookupKey(cache_, buffer_router_, cold_, deadline, src, cache_hits_, buffer_hits_,
+                  cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
+    KeyView dst_view =
+        LookupKey(cache_, buffer_router_, cold_, deadline, dst, cache_hits_, buffer_hits_,
+                  cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
     if (!src_view.definitive || !dst_view.definitive) {
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
                                                   "cold tier unavailable for RENAMENX"));
@@ -741,10 +768,12 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     }
     const std::string_view src = cmd.args[1];
     const std::string_view dst = cmd.args[2];
-    KeyView src_view = LookupKey(cache_, buffer_router_, cold_, deadline, src, cache_hits_,
-                                 buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, now_ms);
-    KeyView dst_view = LookupKey(cache_, buffer_router_, cold_, deadline, dst, cache_hits_,
-                                 buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, now_ms);
+    KeyView src_view =
+        LookupKey(cache_, buffer_router_, cold_, deadline, src, cache_hits_, buffer_hits_,
+                  cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
+    KeyView dst_view =
+        LookupKey(cache_, buffer_router_, cold_, deadline, dst, cache_hits_, buffer_hits_,
+                  cold_hits_, cold_timeouts_, cold_errors_, now_ms, cache_only);
     if (!src_view.definitive || !dst_view.definitive) {
       return MakeSkip(
           seq, core::RespValue::Error(core::ErrorPrefix::kErr, "cold tier unavailable for COPY"));
@@ -779,7 +808,7 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     bool exists = false;
     (void)LookupHashFieldValue(cache_, buffer_router_, cold_, deadline, key, field, cache_hits_,
                                buffer_hits_, cold_hits_, cold_timeouts_, cold_errors_, definitive,
-                               exists);
+                               exists, cache_only);
     if (!definitive) {
       return MakeSkip(
           seq, core::RespValue::Error(core::ErrorPrefix::kErr, "cold tier unavailable for HSETNX"));
@@ -798,12 +827,27 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
 // Loop, append, fulfil
 // ---------------------------------------------------------------------------
 
+void Resolver::HandleFlush(const core::QueueEntry& entry) {
+  ABYSS_LOG_DEBUG("resolver HandleFlush", {"shard", static_cast<int64_t>(config_.shard)},
+                  {"seq", static_cast<uint64_t>(entry.seq)});
+  cache_.Clear();
+  latest_flush_seq_.store(entry.seq, std::memory_order_release);
+  flushes_observed_.fetch_add(1, std::memory_order_relaxed);
+
+  const core::RpcId rpc_id =
+      core::MakeFlushRpcId(core::kResolverConsumer, config_.shard, entry.seq);
+  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
+  apply_notifier_.NotifyApplied(rpc_id);
+}
+
 void Resolver::ProcessEntry(const core::QueueEntry& entry) {
   std::visit(
       [this, &entry](const auto& payload) {
         using T = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<T, core::entry::Write>) {
           UpdateCacheFromWrite(entry.seq, payload.cmd);
+        } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+          HandleFlush(entry);
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
           conditionals_resolved_.fetch_add(1, std::memory_order_relaxed);
 
@@ -872,6 +916,10 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
 void Resolver::Run() {
   ABYSS_LOG_DEBUG("resolver started", {"shard", static_cast<int64_t>(config_.shard)});
 
+  // Disambiguates `latest_drained_seq_=0` between "nothing drained" and "drained seq 0".
+  bool drained_anything = false;
+  bool first_ack_recorded = false;
+
   while (!stop_requested_.load(std::memory_order_acquire)) {
     auto read = queue_.Read(core::kResolverConsumer, config_.shard, config_.read_batch_size,
                             config_.read_timeout);
@@ -886,13 +934,17 @@ void Resolver::Run() {
     for (const auto& entry : *read) {
       ProcessEntry(entry);
       latest_drained_seq_.store(entry.seq, std::memory_order_release);
+      drained_anything = true;
     }
-    const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
-    const auto last = last_ack_seq_.load(std::memory_order_acquire);
-    if (drained > last) {
-      auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, drained);
-      if (ack.has_value()) {
-        last_ack_seq_.store(drained, std::memory_order_release);
+    if (drained_anything) {
+      const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
+      const auto last = last_ack_seq_.load(std::memory_order_acquire);
+      if (!first_ack_recorded || drained > last) {
+        auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, drained);
+        if (ack.has_value()) {
+          last_ack_seq_.store(drained, std::memory_order_release);
+          first_ack_recorded = true;
+        }
       }
     }
     cache_.SweepExpired();
@@ -1012,6 +1064,20 @@ void Resolver::UpdateCacheFromResolved(core::SequenceId seq,
 core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) {
   ABYSS_LOG_INFO("resolver replay starting", {"shard", static_cast<int64_t>(config_.shard)});
 
+  // Gates `cache_only_after_miss` in Decide; cold replay runs after this.
+  replay_mode_.store(true, std::memory_order_release);
+  latest_flush_seq_.store(0, std::memory_order_release);
+  struct ReplayGuard {
+    std::atomic<bool>& flag;
+    explicit ReplayGuard(std::atomic<bool>& f) : flag(f) {}
+    ReplayGuard(const ReplayGuard&) = delete;
+    ReplayGuard& operator=(const ReplayGuard&) = delete;
+    ReplayGuard(ReplayGuard&&) = delete;
+    ReplayGuard& operator=(ReplayGuard&&) = delete;
+    ~ReplayGuard() { flag.store(false, std::memory_order_release); }
+  };
+  ReplayGuard guard(replay_mode_);
+
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
   core::SequenceId highest_seen = 0;
   while (true) {
@@ -1043,6 +1109,34 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
             } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
               dangling.erase(payload.ref);
               UpdateCacheFromResolved(entry.seq, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+              HandleFlush(entry);
+              // Emit Skip Resolveds for pre-Flush danglings so hot/cold's
+              // block-and-scan can advance past them.
+              std::vector<core::SequenceId> to_emit;
+              to_emit.reserve(dangling.size());
+              for (const auto& [d_seq, _] : dangling) {
+                if (d_seq < entry.seq) to_emit.push_back(d_seq);
+              }
+              for (auto d_seq : to_emit) {
+                const auto& d_entry = dangling.at(d_seq);
+                core::QueueEntry out{
+                    .seq = 0,
+                    .appended_at = d_entry.appended_at,
+                    .payload = MakeSkip(d_seq, core::RespValue::Null()),
+                };
+                auto append = queue_.Append(config_.shard, std::move(out));
+                if (!append.has_value()) {
+                  append_failures_.fetch_add(1, std::memory_order_relaxed);
+                  ABYSS_LOG_ERROR("resolver pre-flush skip append failed",
+                                  {"shard", static_cast<int64_t>(config_.shard)},
+                                  {"ref", static_cast<uint64_t>(d_seq)},
+                                  {"err", std::string_view{append.error().message()}});
+                  continue;
+                }
+                flush_skip_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
+                dangling.erase(d_seq);
+              }
             }
           },
           entry.payload);

@@ -517,12 +517,12 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   EXPECT_EQ(after_delete.used_bytes, 0U);
 }
 
-// --- Flush ---
+// --- Wipe ---
 
-TEST_F(SingleShardStoreTest, FlushClearsAll) {
+TEST_F(SingleShardStoreTest, WipeClearsAll) {
   SetString("a", "1");
   SetString("b", "2");
-  store_.Flush();
+  store_.Wipe();
 
   EXPECT_EQ(store_.Stats().key_count, 0U);
   auto result = GetString("a");

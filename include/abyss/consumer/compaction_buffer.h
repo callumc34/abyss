@@ -85,6 +85,9 @@ class CompactionBuffer {
 
   std::optional<core::SequenceId> OldestPendingSeq() const ABYSS_EXCLUDES(mutex_);
 
+  // Drops every buffered entry without emitting to cold. Used by FLUSHDB.
+  void Clear() ABYSS_EXCLUDES(mutex_);
+
   size_t Size() const ABYSS_EXCLUDES(mutex_);
   size_t BytesEstimate() const ABYSS_EXCLUDES(mutex_);
 

@@ -71,7 +71,7 @@ TEST_F(DataProtocolTest, ConcurrentClients) {
   threads.reserve(kClients);
   std::atomic<int> errors{0};
 
-  uint16_t port = Server().Port();
+  uint16_t port = ServerPort();
   for (int t = 0; t < kClients; ++t) {
     threads.emplace_back([&errors, t, port]() {
       RedisClient c;

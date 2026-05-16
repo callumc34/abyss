@@ -72,8 +72,11 @@ class Resolver {
     uint64_t append_failures = 0;
     uint64_t parse_failures = 0;
     uint64_t replayed_resolveds_emitted = 0;
+    uint64_t flushes_observed = 0;
+    uint64_t flush_skip_resolveds_emitted = 0;
     core::SequenceId latest_drained_seq = 0;
     core::SequenceId last_ack_seq = 0;
+    core::SequenceId latest_flush_seq = 0;
     size_t cache_entries = 0;
     size_t cache_bytes = 0;
   };
@@ -83,6 +86,7 @@ class Resolver {
  private:
   void Run();
   void ProcessEntry(const core::QueueEntry& entry);
+  void HandleFlush(const core::QueueEntry& entry);
 
   // Pure function of cache + buffer + cold + entry.appended_at — required
   // for replay determinism (ADP-011 §Decision determinism).
@@ -111,6 +115,11 @@ class Resolver {
 
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   std::atomic<core::SequenceId> last_ack_seq_{0};
+  // Highest seq of an observed `entry::Flush`. During replay, gates the
+  // cache-only lookup path for post-Flush danglings (cold replay runs after
+  // resolver replay, so cold is still pre-Flush).
+  std::atomic<core::SequenceId> latest_flush_seq_{0};
+  std::atomic<bool> replay_mode_{false};
 
   std::atomic<uint64_t> conditionals_resolved_{0};
   std::atomic<uint64_t> decisions_apply_{0};
@@ -124,6 +133,8 @@ class Resolver {
   std::atomic<uint64_t> append_failures_{0};
   std::atomic<uint64_t> parse_failures_{0};
   std::atomic<uint64_t> replayed_resolveds_emitted_{0};
+  std::atomic<uint64_t> flushes_observed_{0};
+  std::atomic<uint64_t> flush_skip_resolveds_emitted_{0};
 };
 
 }  // namespace abyss::consumer

@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/resp/command_registry.h"
 #include "abyss/resp/config_provider.h"
 #include "abyss/resp/loading_state.h"
@@ -43,6 +44,35 @@ class FakeConfig : public ConfigProvider {
 
  private:
   std::vector<Entry> entries_;
+};
+
+class StubDispatcher : public core::CommandDispatcher {
+ public:
+  int flush_calls = 0;
+  core::FlushTarget last_target = core::FlushTarget::kThisDb;
+
+  core::Result<core::RespValue> DispatchRead(std::string_view /*name*/,
+                                             const core::RespCommand& /*cmd*/) override {
+    return core::RespValue::Null();
+  }
+  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/,
+                                              core::RespCommand /*cmd*/) override {
+    return core::RespValue::SimpleString("OK");
+  }
+  core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
+                                                    core::RespCommand /*cmd*/,
+                                                    core::PredicateFlags /*flags*/) override {
+    return core::RespValue::SimpleString("OK");
+  }
+  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
+                                               core::RespCommand /*cmd*/) override {
+    return core::RespValue::SimpleString("OK");
+  }
+  core::Result<core::RespValue> DispatchFlush(core::FlushTarget target) override {
+    ++flush_calls;
+    last_target = target;
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 std::span<const uint8_t> Bytes(const std::string& s) {
@@ -125,22 +155,63 @@ TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
   EXPECT_NE(response.AsString().find("unknown command 'LPUSH'"), std::string::npos);
 }
 
-TEST(RequestPipelineTest, FlushallFallsThroughToUnknownCommand) {
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+TEST(RequestPipelineTest, FlushdbRoutesThroughDispatcher) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$8\r\nFLUSHALL\r\n"), output);
-  auto response = ParseResponse(output);
-  ASSERT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("unknown command 'FLUSHALL'"), std::string::npos);
+  pipeline.Process(Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
+  EXPECT_EQ(ToStr(output), "+OK\r\n");
+  EXPECT_EQ(dispatcher.flush_calls, 1);
+  EXPECT_EQ(dispatcher.last_target, core::FlushTarget::kThisDb);
 }
 
-TEST(RequestPipelineTest, FlushdbFallsThroughToUnknownCommand) {
+TEST(RequestPipelineTest, FlushallRoutesThroughDispatcher) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*1\r\n$8\r\nFLUSHALL\r\n"), output);
+  EXPECT_EQ(ToStr(output), "+OK\r\n");
+  EXPECT_EQ(dispatcher.flush_calls, 1);
+  EXPECT_EQ(dispatcher.last_target, core::FlushTarget::kAllDbs);
+}
+
+TEST(RequestPipelineTest, FlushdbAsyncAndSyncModifiersAccepted) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output_async;
+  pipeline.Process(Bytes("*2\r\n$7\r\nFLUSHDB\r\n$5\r\nASYNC\r\n"), output_async);
+  EXPECT_EQ(ToStr(output_async), "+OK\r\n");
+
+  std::vector<uint8_t> output_sync;
+  pipeline.Process(Bytes("*2\r\n$7\r\nFLUSHDB\r\n$4\r\nSYNC\r\n"), output_sync);
+  EXPECT_EQ(ToStr(output_sync), "+OK\r\n");
+
+  EXPECT_EQ(dispatcher.flush_calls, 2);
+}
+
+TEST(RequestPipelineTest, FlushdbRejectsUnknownModifier) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$7\r\nFLUSHDB\r\n$3\r\nFOO\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
+  EXPECT_EQ(dispatcher.flush_calls, 0);
+}
+
+TEST(RequestPipelineTest, FlushdbWithoutDispatcherReturnsInternalError) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
-  EXPECT_NE(response.AsString().find("unknown command 'FLUSHDB'"), std::string::npos);
+  EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
+  EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, ArityMismatchReturnsErr) {

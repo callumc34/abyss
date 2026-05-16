@@ -38,7 +38,7 @@ class HotStore : public Reader {
   virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops) = 0;
 
   virtual Result<MemoryStats> Stats() = 0;
-  virtual Result<void> Flush() = 0;
+  virtual Result<void> Wipe() = 0;
 };
 
 }  // namespace abyss::core

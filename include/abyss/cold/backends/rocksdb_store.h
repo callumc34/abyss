@@ -50,6 +50,7 @@ class RocksdbStore : public core::ColdStore {
   core::Result<core::RespValue> Exec(
       const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
+  core::Result<void> Wipe() override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
   core::Result<std::optional<core::RespCommand>> GetPromotionCommand(std::string_view key) override;

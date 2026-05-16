@@ -164,7 +164,11 @@ using WriteOp = std::variant<StringSet, Del, SetAdd, SetRem, ZsetAdd, ZsetRem, H
                              HashDel, Expire, Persist>;
 
 Result<ReadOp> ParseReadOp(std::string_view name, const RespCommand& cmd);
-Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd);
+// `wall_now_ms` is the reference for materialising relative TTLs (PX/EX/EXPIRE)
+// to absolute. Pass the entry's `appended_at` so hot and cold agree across replay.
+uint64_t WallNowMs();
+Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd,
+                             uint64_t wall_now_ms = WallNowMs());
 
 std::string_view PrimaryKey(const ReadOp& op);
 std::string_view PrimaryKey(const WriteOp& op);

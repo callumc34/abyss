@@ -31,12 +31,15 @@ struct Resolved {
   RespValue return_value;
 };
 
+// FLUSHDB / FLUSHALL tombstone.
+struct Flush {};
+
 }  // namespace entry
 
 struct QueueEntry {
   SequenceId seq = 0;
   WallTime appended_at;
-  std::variant<entry::Write, entry::Conditional, entry::Resolved> payload;
+  std::variant<entry::Write, entry::Conditional, entry::Resolved, entry::Flush> payload;
 };
 
 }  // namespace abyss::core

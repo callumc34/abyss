@@ -189,6 +189,8 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   CfHandle zset_score_idx_cf;
   std::unique_ptr<TtlScanner> ttl_scanner;
   std::mt19937_64 rng{0};  // NOLINT(bugprone-random-generator-seed): re-seeded at Create.
+  // Per-shard cold consumers fan in here on FLUSHDB; serialises the shared backend wipe.
+  std::mutex wipe_mu;
 
   uint64_t NowMs() const { return WallMs(config.wall_clock); }
 
@@ -413,6 +415,30 @@ core::Result<RespValue> RocksdbStore::Exec(const core::ops::ReadOp& op,
 
 core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
   return impl_->ApplyBatch(ops);
+}
+
+core::Result<void> RocksdbStore::Wipe() {
+  const std::scoped_lock wipe_lock(impl_->wipe_mu);
+
+  // Data prefixes 0x01..0x06 (ADP-010); system-records prefix 0xFF preserved
+  // so the next Open() still finds the format-version record.
+  const std::string data_begin(1, '\x01');
+  const std::string data_end(1, '\x06');
+  const std::string score_begin(1, '\x06');
+  const std::string score_end(1, '\x07');
+
+  // OptimisticTransactionDB doesn't expose DeleteRange; go through the base DB.
+  rocksdb::WriteOptions wo;
+  rocksdb::DB* base = impl_->db->GetBaseDB();
+  auto status = base->DeleteRange(wo, impl_->default_cf.get(), data_begin, data_end);
+  if (!status.ok()) {
+    return std::unexpected(FromStatus(status, "Wipe: DeleteRange default_cf"));
+  }
+  status = base->DeleteRange(wo, impl_->zset_score_idx_cf.get(), score_begin, score_end);
+  if (!status.ok()) {
+    return std::unexpected(FromStatus(status, "Wipe: DeleteRange zset_score_idx_cf"));
+  }
+  return {};
 }
 
 core::Result<RespValue> RocksdbStore::ExecDel(const core::ops::Del& op) {

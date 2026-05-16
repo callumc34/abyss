@@ -83,6 +83,28 @@ Cold store hits **do** promote via the queue. This gives the promoted key:
 
 Promotion is a queue append, not a direct hot store write. This preserves the invariant that the queue is the sole write path.
 
+### Broadcast Write Path (FLUSHDB / FLUSHALL)
+
+FLUSHDB and FLUSHALL clear every key. To preserve the Kappa invariant — the queue is the single source of truth and every materialised view observes events in queue order — the wipe is routed through the queue rather than executed as a side-channel operation against the stores.
+
+```
+Client ──▶ RESP Frontend ──▶ For every owned shard:
+                                  ├─ Queue.BeginAppend(entry::Flush)
+                                  ├─ Register 3 RPCs (hot, cold, resolver)
+                                  └─ Publish
+                              │
+                              ├─ Wait on every shard's durable future
+                              └─ Wait on every consumer's apply future
+                                          │
+                                          └──▶ +OK to client
+```
+
+Each shard receives a `Flush` queue entry. The hot consumer wipes its in-memory store and fulfils its per-shard flush RPC. The cold consumer drops its compaction buffer (pre-Flush writes never reach cold), wipes the cold store, and fulfils its RPC. The Resolver clears its existence cache, emits Skip Resolveds for any pre-Flush Conditional whose Resolved had not yet been issued (so consumers' block-and-scan can drain past the parked Conditionals), and fulfils its RPC.
+
+The client sees `+OK` only when every consumer on every shard has applied the wipe. Partial fan-out failures (a shard's durable wait or any consumer's apply timeout) surface as a Redis error; the Flush entries that did land remain durable in the queue and apply on consumer catch-up. A retry of FLUSHDB is idempotent at the wipe level.
+
+Multi-pod (Phase 2+) extends this naturally: each pod receives the broadcast at the RESP layer and runs the same fan-out across its owned shards. There is no cross-pod synchronisation step.
+
 ### Write Promise Lifecycle
 
 All client-facing async operations — unconditional writes, conditional writes, and admin RPCs — use a single promise registry (`ConsumerRpc`). This replaces the earlier dual-system design where writes and consumer RPCs had separate promise maps.

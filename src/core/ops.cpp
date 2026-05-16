@@ -124,9 +124,9 @@ const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
 
 // --- Write parsers ----------------------------------------------------------
 
-using WriteParserFn = Result<WriteOp> (*)(const RespCommand&);
+using WriteParserFn = Result<WriteOp> (*)(const RespCommand&, uint64_t);
 
-Result<WriteOp> ParseSet(const RespCommand& cmd) {
+Result<WriteOp> ParseSet(const RespCommand& cmd, uint64_t wall_now_ms) {
   uint64_t abs_ttl_ms = 0;
   for (size_t i = 3; i < cmd.args.size(); ++i) {
     const auto opt = AsciiUpper(cmd.args[i]);
@@ -137,9 +137,9 @@ Result<WriteOp> ParseSet(const RespCommand& cmd) {
       auto ttl_arg = ParseUint64(cmd.args[++i]);
       if (!ttl_arg.has_value()) return std::unexpected(ttl_arg.error());
       if (opt == "EX") {
-        abs_ttl_ms = NowWallMs() + (*ttl_arg * 1000);
+        abs_ttl_ms = wall_now_ms + (*ttl_arg * 1000);
       } else if (opt == "PX") {
-        abs_ttl_ms = NowWallMs() + *ttl_arg;
+        abs_ttl_ms = wall_now_ms + *ttl_arg;
       } else if (opt == "EXAT") {
         abs_ttl_ms = *ttl_arg * 1000;
       } else {
@@ -150,33 +150,33 @@ Result<WriteOp> ParseSet(const RespCommand& cmd) {
   return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[2], .abs_ttl_ms = abs_ttl_ms}};
 }
 
-Result<WriteOp> ParseSetex(const RespCommand& cmd) {
+Result<WriteOp> ParseSetex(const RespCommand& cmd, uint64_t wall_now_ms) {
   auto ttl = ParseUint64(cmd.args[2]);
   if (!ttl.has_value()) return std::unexpected(ttl.error());
   return WriteOp{StringSet{
-      .key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = NowWallMs() + (*ttl * 1000)}};
+      .key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = wall_now_ms + (*ttl * 1000)}};
 }
 
-Result<WriteOp> ParsePsetex(const RespCommand& cmd) {
+Result<WriteOp> ParsePsetex(const RespCommand& cmd, uint64_t wall_now_ms) {
   auto ttl = ParseUint64(cmd.args[2]);
   if (!ttl.has_value()) return std::unexpected(ttl.error());
   return WriteOp{
-      StringSet{.key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = NowWallMs() + *ttl}};
+      StringSet{.key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = wall_now_ms + *ttl}};
 }
 
-Result<WriteOp> ParseDel(const RespCommand& cmd) {
+Result<WriteOp> ParseDel(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{Del{.keys = CollectArgs(cmd, 1)}};
 }
 
-Result<WriteOp> ParseSadd(const RespCommand& cmd) {
+Result<WriteOp> ParseSadd(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{SetAdd{.key = cmd.args[1], .members = CollectArgs(cmd, 2)}};
 }
 
-Result<WriteOp> ParseSrem(const RespCommand& cmd) {
+Result<WriteOp> ParseSrem(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{SetRem{.key = cmd.args[1], .members = CollectArgs(cmd, 2)}};
 }
 
-Result<WriteOp> ParseZadd(const RespCommand& cmd) {
+Result<WriteOp> ParseZadd(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   size_t i = 2;
   while (i < cmd.args.size()) {
     const auto opt = AsciiUpper(cmd.args[i]);
@@ -199,11 +199,11 @@ Result<WriteOp> ParseZadd(const RespCommand& cmd) {
   return WriteOp{ZsetAdd{.key = cmd.args[1], .entries = std::move(entries)}};
 }
 
-Result<WriteOp> ParseZrem(const RespCommand& cmd) {
+Result<WriteOp> ParseZrem(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{ZsetRem{.key = cmd.args[1], .members = CollectArgs(cmd, 2)}};
 }
 
-Result<WriteOp> ParseHset(const RespCommand& cmd) {
+Result<WriteOp> ParseHset(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   if (cmd.args.size() % 2 != 0) {
     return std::unexpected(SyntaxError("HSET requires field-value pairs"));
   }
@@ -215,7 +215,7 @@ Result<WriteOp> ParseHset(const RespCommand& cmd) {
   return WriteOp{HashSet{.key = cmd.args[1], .fields = std::move(fields)}};
 }
 
-Result<WriteOp> ParseHmset(const RespCommand& cmd) {
+Result<WriteOp> ParseHmset(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   if (cmd.args.size() % 2 != 0) {
     return std::unexpected(SyntaxError("HMSET requires field-value pairs"));
   }
@@ -227,37 +227,37 @@ Result<WriteOp> ParseHmset(const RespCommand& cmd) {
   return WriteOp{HashMSet{.key = cmd.args[1], .fields = std::move(fields)}};
 }
 
-Result<WriteOp> ParseHdel(const RespCommand& cmd) {
+Result<WriteOp> ParseHdel(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{HashDel{.key = cmd.args[1], .fields = CollectArgs(cmd, 2)}};
 }
 
 // All four EXPIRE forms collapse to abs_ttl_ms; NX/XX/GT/LT are stripped
 // by the predicate extractor before this runs.
-Result<WriteOp> ParseExpireSeconds(const RespCommand& cmd) {
+Result<WriteOp> ParseExpireSeconds(const RespCommand& cmd, uint64_t wall_now_ms) {
   auto secs = ParseUint64(cmd.args[2]);
   if (!secs.has_value()) return std::unexpected(secs.error());
-  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = NowWallMs() + (*secs * 1000)}};
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = wall_now_ms + (*secs * 1000)}};
 }
 
-Result<WriteOp> ParseExpireMs(const RespCommand& cmd) {
+Result<WriteOp> ParseExpireMs(const RespCommand& cmd, uint64_t wall_now_ms) {
   auto ms = ParseUint64(cmd.args[2]);
   if (!ms.has_value()) return std::unexpected(ms.error());
-  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = NowWallMs() + *ms}};
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = wall_now_ms + *ms}};
 }
 
-Result<WriteOp> ParseExpireAt(const RespCommand& cmd) {
+Result<WriteOp> ParseExpireAt(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   auto ts = ParseUint64(cmd.args[2]);
   if (!ts.has_value()) return std::unexpected(ts.error());
   return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ts * 1000}};
 }
 
-Result<WriteOp> ParsePexpireAt(const RespCommand& cmd) {
+Result<WriteOp> ParsePexpireAt(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   auto ts = ParseUint64(cmd.args[2]);
   if (!ts.has_value()) return std::unexpected(ts.error());
   return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ts}};
 }
 
-Result<WriteOp> ParsePersist(const RespCommand& cmd) {
+Result<WriteOp> ParsePersist(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{Persist{.key = cmd.args[1]}};
 }
 
@@ -298,14 +298,16 @@ Result<ReadOp> ParseReadOp(std::string_view name, const RespCommand& cmd) {
   return it->second(cmd);
 }
 
-Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd) {
+uint64_t WallNowMs() { return NowWallMs(); }
+
+Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd, uint64_t wall_now_ms) {
   const auto& table = WriteParsers();
   const auto it = table.find(name);
   if (it == table.end()) {
     return std::unexpected(
         Error(ErrorCode::kInvalidArgument, "unknown write command '" + std::string(name) + "'"));
   }
-  return it->second(cmd);
+  return it->second(cmd, wall_now_ms);
 }
 
 std::string_view PrimaryKey(const ReadOp& op) {

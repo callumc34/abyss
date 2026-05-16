@@ -14,15 +14,16 @@ The queue interface must be shard-aware from the start to support horizontal sca
 
 ### Entry Types
 
-Each log entry carries a type tag that determines how consumers process it. Phase 1 defines three variants; the set is closed and extended only by ADP:
+Each log entry carries a type tag that determines how consumers process it. Phase 1 defines four variants; the set is closed and extended only by ADP:
 
 | Type | Semantics | Written by | Read by |
 |------|-----------|------------|---------|
 | `Write` | Unconditional op (SET, DEL, SADD, ...) | Frontend | Hot, Cold |
 | `Conditional` | Op + predicate (SET NX, ZADD GT, ...) | Frontend | Resolver |
 | `Resolved` | ref to a Conditional + decision + materialised op + return value | Resolver | Hot, Cold |
+| `Flush` | FLUSHDB / FLUSHALL tombstone — wipes every key on the shard | Frontend | Hot, Cold, Resolver |
 
-The `Conditional` / `Resolved` pair and the block-and-scan protocol are specified in [ADP-011](011-conditional-writes-and-consumer-rpc.md). The queue itself is agnostic to the semantics — it stores entries in order, preserves the type tag, and hands them to consumers unchanged.
+The `Conditional` / `Resolved` pair and the block-and-scan protocol are specified in [ADP-011](011-conditional-writes-and-consumer-rpc.md). The `Flush` variant is specified in [ADP-006](006-read-write-paths.md) §Broadcast write path; it is the queue-routed expression of FLUSHDB so all materialised views observe the wipe at the same logical position. The queue itself is agnostic to the semantics — it stores entries in order, preserves the type tag, and hands them to consumers unchanged.
 
 ### Interface
 

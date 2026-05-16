@@ -215,6 +215,35 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         msg.append("); tracked in abyss#97");
         return finish(RespValue::Error(ErrorPrefix::kErr, std::move(msg)));
       }
+
+    case Dispatch::kFlush: {
+      if (deps_.dispatcher == nullptr) {
+        return finish(InternalServerError("dispatcher missing for flush", parent.name));
+      }
+      // Optional [ASYNC|SYNC] modifier — accepted but ignored.
+      if (cmd.args.size() > 2) {
+        return finish(RespValue::Error(
+            ErrorPrefix::kErr,
+            "wrong number of arguments for '" + std::string{parent.name} + "' command"));
+      }
+      if (cmd.args.size() == 2) {
+        if (!core::AsciiEqualsIgnoreCase(cmd.args[1], "ASYNC") &&
+            !core::AsciiEqualsIgnoreCase(cmd.args[1], "SYNC")) {
+          return finish(RespValue::Error(ErrorPrefix::kErr, "syntax error"));
+        }
+      }
+      const auto target =
+          (parent.name == "FLUSHALL") ? core::FlushTarget::kAllDbs : core::FlushTarget::kThisDb;
+      auto result = deps_.dispatcher->DispatchFlush(target);
+      if (!result.has_value()) {
+        ABYSS_LOG_WARN("flush dispatch error", {"client_id", state_.client_id},
+                       {"cmd", std::string_view{parent.name}},
+                       {"err", std::string_view{result.error().message()}});
+        return finish(
+            RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
+      }
+      return finish(std::move(*result));
+    }
   }
   return finish(InternalServerError("unhandled dispatch class", parent.name));
 }

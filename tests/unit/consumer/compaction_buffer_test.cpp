@@ -672,5 +672,35 @@ TEST_F(CompactionBufferTest, MultiFieldHashReadsDeferToEngine) {
   }
 }
 
+TEST_F(CompactionBufferTest, ClearDropsEntriesAndHeap) {
+  const auto eviction = core::EvictionTTL{3600};
+  buffer_.Absorb("s", WriteOp{StringSet{.key = "s", .value = "v"}}, eviction);
+  buffer_.Absorb("set_k", WriteOp{SetAdd{.key = "set_k", .members = {"a", "b"}}}, eviction);
+  buffer_.Absorb("hash_k",
+                 WriteOp{HashSet{.key = "hash_k", .fields = {{.field = "f", .value = "v"}}}},
+                 eviction);
+  buffer_.Absorb(
+      "zset_k",
+      WriteOp{core::ops::ZsetAdd{.key = "zset_k", .entries = {{.score = 1.0, .member = "m"}}}},
+      eviction);
+  ASSERT_EQ(buffer_.Size(), 4U);
+  ASSERT_GT(buffer_.BytesEstimate(), 0U);
+
+  buffer_.Clear();
+
+  EXPECT_EQ(buffer_.Size(), 0U);
+  EXPECT_EQ(buffer_.BytesEstimate(), 0U);
+  EXPECT_FALSE(buffer_.OldestPendingSeq().has_value());
+  EXPECT_EQ(buffer_.Read("s").error().code(), core::ErrorCode::kNotFound);
+
+  // A subsequent Absorb works on the empty buffer; the heap is sane.
+  buffer_.Absorb("post", WriteOp{StringSet{.key = "post", .value = "v"}}, eviction);
+  EXPECT_EQ(buffer_.Size(), 1U);
+  auto r = buffer_.Read("post");
+  ASSERT_TRUE(r.has_value());
+  EXPECT_TRUE(r->IsBulkString());
+  EXPECT_EQ(r->AsString(), "v");
+}
+
 }  // namespace
 }  // namespace abyss::consumer

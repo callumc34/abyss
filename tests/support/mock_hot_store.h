@@ -14,7 +14,7 @@ class MockHotStore : public core::HotStore {
   MOCK_METHOD(core::Result<void>, ApplyBatch, (std::span<const core::ops::WriteOp> ops),
               (override));
   MOCK_METHOD(core::Result<core::MemoryStats>, Stats, (), (override));
-  MOCK_METHOD(core::Result<void>, Flush, (), (override));
+  MOCK_METHOD(core::Result<void>, Wipe, (), (override));
 };
 
 }  // namespace abyss::testing

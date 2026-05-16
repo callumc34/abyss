@@ -25,6 +25,7 @@ enum class Dispatch : uint8_t {
   kWritePath,
   kConditionalWrite,
   kConsumerRpc,
+  kFlush,
 };
 
 struct CommandDocs {

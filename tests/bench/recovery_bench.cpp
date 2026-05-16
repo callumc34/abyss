@@ -122,7 +122,7 @@ void BM_RecoveryColdHot(benchmark::State& state) {
 
     auto cold_pool = std::make_unique<consumer::ColdConsumerPool>(
         **queue, **cold, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
-        eviction_policy);
+        eviction_policy, rpc);
     auto hot_pool = std::make_unique<consumer::HotConsumerPool>(
         **queue, *hot, rpc, notifier, consumer::HotConsumerPool::Config{.shard_count = kShardCount},
         eviction_policy);

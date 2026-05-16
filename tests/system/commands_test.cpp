@@ -370,5 +370,66 @@ TEST_F(TypeSafetyTest, DelWorksOnAnyType) {
   EXPECT_EQ(r.Integer(), 3);
 }
 
+// --- FLUSHDB / FLUSHALL -----------------------------------------------------
+
+class FlushTest : public DataCommandTest {};
+
+TEST_F(FlushTest, FlushdbWipesMixedTypes) {
+  ASSERT_TRUE(Client().Command({"SET", "s", "v"}).IsOk());
+  ASSERT_TRUE(Client().Command({"SADD", "set_k", "m1", "m2"}).IsInteger());
+  ASSERT_TRUE(Client().Command({"HSET", "hash_k", "f", "v"}).IsInteger());
+  ASSERT_TRUE(Client().Command({"ZADD", "zset_k", "1", "a", "2", "b"}).IsInteger());
+
+  auto flush = Client().Command({"FLUSHDB"});
+  ASSERT_TRUE(flush.IsStatus()) << "FLUSHDB response: " << flush.String();
+  EXPECT_EQ(flush.String(), "OK");
+
+  EXPECT_TRUE(Client().Command({"GET", "s"}).IsNil());
+  EXPECT_EQ(Client().Command({"SCARD", "set_k"}).Integer(), 0);
+  EXPECT_EQ(Client().Command({"HLEN", "hash_k"}).Integer(), 0);
+  EXPECT_EQ(Client().Command({"ZCARD", "zset_k"}).Integer(), 0);
+  EXPECT_EQ(Client().Command({"EXISTS", "s", "set_k", "hash_k", "zset_k"}).Integer(), 0);
+}
+
+TEST_F(FlushTest, FlushallBehavesAsFlushdb) {
+  ASSERT_TRUE(Client().Command({"SET", "k", "v"}).IsOk());
+  auto flush = Client().Command({"FLUSHALL"});
+  ASSERT_TRUE(flush.IsStatus());
+  EXPECT_EQ(flush.String(), "OK");
+  EXPECT_TRUE(Client().Command({"GET", "k"}).IsNil());
+}
+
+TEST_F(FlushTest, FlushdbAcceptsAsyncModifier) {
+  ASSERT_TRUE(Client().Command({"SET", "k", "v"}).IsOk());
+  auto flush = Client().Command({"FLUSHDB", "ASYNC"});
+  ASSERT_TRUE(flush.IsStatus());
+  EXPECT_EQ(flush.String(), "OK");
+  EXPECT_TRUE(Client().Command({"GET", "k"}).IsNil());
+}
+
+TEST_F(FlushTest, FlushdbAcceptsSyncModifier) {
+  ASSERT_TRUE(Client().Command({"SET", "k", "v"}).IsOk());
+  auto flush = Client().Command({"FLUSHDB", "SYNC"});
+  ASSERT_TRUE(flush.IsStatus());
+  EXPECT_EQ(flush.String(), "OK");
+  EXPECT_TRUE(Client().Command({"GET", "k"}).IsNil());
+}
+
+TEST_F(FlushTest, FlushdbRejectsUnknownModifier) {
+  auto r = Client().Command({"FLUSHDB", "FOO"});
+  ASSERT_TRUE(r.IsError());
+}
+
+TEST_F(FlushTest, WritesAfterFlushSurvive) {
+  ASSERT_TRUE(Client().Command({"SET", "before", "x"}).IsOk());
+  ASSERT_TRUE(Client().Command({"FLUSHDB"}).IsStatus());
+  ASSERT_TRUE(Client().Command({"SET", "after", "y"}).IsOk());
+
+  EXPECT_TRUE(Client().Command({"GET", "before"}).IsNil());
+  auto after = Client().Command({"GET", "after"});
+  ASSERT_TRUE(after.IsBulk());
+  EXPECT_EQ(after.String(), "y");
+}
+
 }  // namespace
 }  // namespace abyss::system_test

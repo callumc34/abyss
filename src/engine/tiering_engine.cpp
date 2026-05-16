@@ -307,7 +307,114 @@ void TieringEngine::PromoteThroughQueue(std::string_view key) {
 TieringEngineMetrics TieringEngine::Snapshot() const {
   return TieringEngineMetrics{
       .promotion_append_failures = promotion_append_failures_.load(std::memory_order_relaxed),
+      .flush_total = flush_total_.load(std::memory_order_relaxed),
+      .flush_durable_failures = flush_durable_failures_.load(std::memory_order_relaxed),
+      .flush_consumer_timeouts = flush_consumer_timeouts_.load(std::memory_order_relaxed),
+      .flush_append_failures = flush_append_failures_.load(std::memory_order_relaxed),
   };
+}
+
+core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*target*/) {
+  flush_total_.fetch_add(1, std::memory_order_relaxed);
+
+  struct ShardWait {
+    core::ShardId shard = 0;
+    core::SequenceId seq = 0;
+    queue::DurabilityFuture durable;
+    std::future<core::RespValue> hot;
+    std::future<core::RespValue> cold;
+    std::future<core::RespValue> resolver;
+  };
+
+  auto cancel_all = [&](std::vector<ShardWait>& ws) {
+    for (auto& w : ws) {
+      rpc_.Cancel(core::MakeFlushRpcId(core::kHotConsumer, w.shard, w.seq));
+      rpc_.Cancel(core::MakeFlushRpcId(core::kColdConsumer, w.shard, w.seq));
+      rpc_.Cancel(core::MakeFlushRpcId(core::kResolverConsumer, w.shard, w.seq));
+    }
+  };
+
+  std::vector<ShardWait> waits;
+  waits.reserve(config_.shard_count);
+
+  for (core::ShardId shard = 0; shard < config_.shard_count; ++shard) {
+    core::QueueEntry entry{
+        .seq = 0,
+        .appended_at = core::WallClock::now(),
+        .payload = core::entry::Flush{},
+    };
+    auto pending = queue_.BeginAppend(shard, std::move(entry));
+    if (!pending.has_value()) {
+      flush_append_failures_.fetch_add(1, std::memory_order_relaxed);
+      cancel_all(waits);
+      ABYSS_LOG_ERROR("flush append failed", {"shard", static_cast<int64_t>(shard)},
+                      {"err", std::string_view{pending.error().message()}});
+      return std::unexpected(pending.error());
+    }
+
+    ShardWait w;
+    w.shard = shard;
+    w.seq = pending->seq();
+    w.hot = rpc_.Register(core::MakeFlushRpcId(core::kHotConsumer, shard, w.seq));
+    w.cold = rpc_.Register(core::MakeFlushRpcId(core::kColdConsumer, shard, w.seq));
+    w.resolver = rpc_.Register(core::MakeFlushRpcId(core::kResolverConsumer, shard, w.seq));
+    w.durable = std::move(pending->durable());
+    pending->Publish();
+    waits.push_back(std::move(w));
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + config_.write_timeout;
+
+  // Every shard's durable wait must succeed before any consumer applies; on
+  // timeout, surface one error and cancel — FLUSHDB retry is idempotent.
+  for (auto& w : waits) {
+    if (w.durable.wait_until(deadline) == std::future_status::timeout) {
+      flush_durable_failures_.fetch_add(1, std::memory_order_relaxed);
+      cancel_all(waits);
+      ABYSS_LOG_WARN("flush durable wait timeout", {"shard", static_cast<int64_t>(w.shard)},
+                     {"seq", static_cast<uint64_t>(w.seq)},
+                     {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
+      return core::RespValue::Error(
+          core::ErrorPrefix::kErr,
+          "flush durable wait exceeded server timeout; retry to complete the wipe");
+    }
+    auto durable = w.durable.get();
+    if (!durable.has_value()) {
+      flush_durable_failures_.fetch_add(1, std::memory_order_relaxed);
+      cancel_all(waits);
+      ABYSS_LOG_ERROR("flush durable failed", {"shard", static_cast<int64_t>(w.shard)},
+                      {"seq", static_cast<uint64_t>(w.seq)},
+                      {"err", std::string_view{durable.error().message()}});
+      return std::unexpected(durable.error());
+    }
+  }
+
+  // Floor the apply-phase budget so a slow fsync doesn't leave ~0ms for it.
+  const auto now = std::chrono::steady_clock::now();
+  const auto min_rpc_budget = std::chrono::milliseconds{static_cast<int64_t>(
+      static_cast<double>(config_.write_timeout.count()) * config_.min_rpc_wait_fraction)};
+  const auto rpc_deadline = std::max(deadline, now + min_rpc_budget);
+
+  for (auto& w : waits) {
+    for (auto* fut : {&w.hot, &w.cold, &w.resolver}) {
+      if (fut->wait_until(rpc_deadline) == std::future_status::timeout) {
+        flush_consumer_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        cancel_all(waits);
+        ABYSS_LOG_WARN("flush consumer apply timeout", {"shard", static_cast<int64_t>(w.shard)},
+                       {"seq", static_cast<uint64_t>(w.seq)});
+        return core::RespValue::Error(
+            core::ErrorPrefix::kErr,
+            "flush durable in queue but a consumer did not apply within timeout");
+      }
+      auto val = fut->get();
+      if (val.IsError()) {
+        cancel_all(waits);
+        return val;
+      }
+    }
+  }
+
+  return core::RespValue::SimpleString("OK");
 }
 
 namespace {

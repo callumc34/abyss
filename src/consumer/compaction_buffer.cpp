@@ -308,6 +308,15 @@ std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeq() const
   return oldest;
 }
 
+void CompactionBuffer::Clear() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::unique_lock lock(mutex_);
+  entries_.clear();
+  // std::priority_queue has no clear(); swap with an empty instance.
+  decltype(flush_heap_) empty;
+  flush_heap_.swap(empty);
+  bytes_estimate_ = 0;
+}
+
 size_t CompactionBuffer::Size() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
   return entries_.size();

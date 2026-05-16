@@ -144,5 +144,23 @@ TEST_F(DurabilityTestFixture, StatusEndpointReportsCompleteRecoveryPhase) {
       << "recovery phase should be complete, body: " << resp.body;
 }
 
+TEST_F(DurabilityTestFixture, FlushdbSurvivesKill) {
+  for (int i = 0; i < 50; ++i) {
+    ASSERT_TRUE(Client().Command({"SET", "pre_" + std::to_string(i), "x"}).IsOk());
+  }
+  ASSERT_TRUE(Client().Command({"FLUSHDB"}).IsStatus());
+  ASSERT_TRUE(Client().Command({"SET", "post", "y"}).IsOk());
+
+  KillAndRestartServer();
+
+  for (int i = 0; i < 50; ++i) {
+    auto r = Client().Command({"GET", "pre_" + std::to_string(i)});
+    EXPECT_TRUE(r.IsNil()) << "pre-FLUSHDB key " << i << " should be gone after replay";
+  }
+  auto post = Client().Command({"GET", "post"});
+  ASSERT_TRUE(post.IsBulk());
+  EXPECT_EQ(post.String(), "y") << "post-FLUSHDB write should survive replay";
+}
+
 }  // namespace
 }  // namespace abyss::system_test

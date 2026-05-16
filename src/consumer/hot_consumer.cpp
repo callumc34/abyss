@@ -123,6 +123,8 @@ void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {
             HandleConditional(std::move(entry), payload);
           } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
             HandleResolved(entry, payload);
+          } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+            HandleFlush(entry);
           }
         },
         entry.payload);
@@ -199,7 +201,7 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
     result =
         core::RespValue::Error(core::ErrorPrefix::kErr, "empty command payload in queue entry");
   } else {
-    auto op = core::ops::ParseWriteOp(cmd.args[0], cmd);
+    auto op = core::ops::ParseWriteOp(cmd.args[0], cmd, WallMs(entry.appended_at));
     if (!op.has_value()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
       ABYSS_LOG_ERROR("queue entry parse failed", {"shard", static_cast<int64_t>(config_.shard)},
@@ -253,6 +255,54 @@ void HotConsumer::HandleConditional(core::QueueEntry entry,
   apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, seq));
 }
 
+void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
+  ABYSS_LOG_DEBUG("hot HandleFlush", {"shard", static_cast<int64_t>(config_.shard)},
+                  {"seq", static_cast<uint64_t>(entry.seq)});
+  // Cancel pre-Flush pending Conditionals; the awaiting client sees a broken_promise.
+  std::vector<core::SequenceId> cancelled;
+  {
+    const std::scoped_lock lock(pending_mu_);
+    cancelled.reserve(pending_conditionals_.size());
+    for (auto it = pending_conditionals_.begin(); it != pending_conditionals_.end();) {
+      if (it->first < entry.seq) {
+        cancelled.push_back(it->first);
+        it = pending_conditionals_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto seq : cancelled) {
+    const core::RpcId rpc_id = core::MakeRpcId(config_.shard, seq);
+    rpc_.Cancel(rpc_id);
+    apply_notifier_.NotifyApplied(rpc_id);
+  }
+
+  auto wiped = store_.Wipe();
+  if (!wiped.has_value()) {
+    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+    ABYSS_LOG_ERROR("hot wipe failed", {"shard", static_cast<int64_t>(config_.shard)},
+                    {"seq", static_cast<uint64_t>(entry.seq)},
+                    {"err", std::string_view{wiped.error().message()}});
+    // Fulfil the RPC with the error so the engine surfaces it instead of timing out.
+    const core::RpcId rpc_id = core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq);
+    rpc_.Fulfill(rpc_id,
+                 core::RespValue::Error(core::ErrorPrefix::kErr,
+                                        "hot store wipe failed: " + wiped.error().message()));
+    apply_notifier_.NotifyApplied(rpc_id);
+    MarkSettledAndMaybeAck(entry.seq);
+    return;
+  }
+
+  latest_flush_seq_.store(entry.seq, std::memory_order_release);
+
+  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq);
+  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
+  apply_notifier_.NotifyApplied(rpc_id);
+  counters_.applied.fetch_add(1, std::memory_order_relaxed);
+  MarkSettledAndMaybeAck(entry.seq);
+}
+
 void HotConsumer::HandleResolved(const core::QueueEntry& entry,
                                  const core::entry::Resolved& resolved) {
   // Per ADP-011 invariant 7, a Resolved takes effect at the Conditional's seq
@@ -277,7 +327,11 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
   // (see Resolver::ReplayForRecovery — `out.appended_at = entry.appended_at`).
   const core::WallTime reference_at = conditional_appended_at.value_or(entry.appended_at);
 
-  if (resolved.decision == core::Decision::kApply) {
+  // Drop if the Conditional ref lives on the wiped side of a Flush.
+  const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
+  const bool wiped_by_flush = flush_high > 0 && resolved.ref < flush_high;
+
+  if (!wiped_by_flush && resolved.decision == core::Decision::kApply) {
     auto applied = ApplyResolvedOps(resolved.materialised_ops, reference_at);
     if (!applied.has_value()) {
       counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
@@ -310,7 +364,7 @@ core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCom
       return std::unexpected(
           core::Error(core::ErrorCode::kInvalidArgument, "empty materialised op"));
     }
-    auto op = core::ops::ParseWriteOp(cmd.args[0], cmd);
+    auto op = core::ops::ParseWriteOp(cmd.args[0], cmd, WallMs(reference_at));
     if (!op.has_value()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
       return std::unexpected(op.error());

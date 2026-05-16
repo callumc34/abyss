@@ -448,4 +448,16 @@ void IsolatedDataServerTest::SetUp() {
   Client().Command({"DEL", "__probe__"});
 }
 
+void SharedDataServerTest::SetUp() {
+  SystemTest::SetUp();
+  if (IsSkipped()) return;
+  // Probe the data path before FLUSHDB so a half-built pipeline surfaces here.
+  const auto probe = Client().Command({"SET", "__probe__", "1"});
+  if (!probe.IsStatus() || probe.String() != "OK") {
+    GTEST_SKIP() << "data path not yet ready: SET probe returned " << probe.String();
+  }
+  const auto flush = Client().Command({"FLUSHDB"});
+  ASSERT_TRUE(flush.IsStatus() && flush.String() == "OK") << "FLUSHDB failed: " << flush.String();
+}
+
 }  // namespace abyss::system_test
