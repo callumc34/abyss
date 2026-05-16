@@ -56,6 +56,11 @@ class StubDispatcher : public core::CommandDispatcher {
     write_calls.fetch_add(1);
     return core::RespValue::SimpleString("OK");
   }
+  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
+                                               core::RespCommand /*cmd*/) override {
+    write_calls.fetch_add(1);
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 TcpServerConfig DefaultTestConfig() {

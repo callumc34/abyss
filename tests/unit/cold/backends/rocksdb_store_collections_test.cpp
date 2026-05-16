@@ -578,39 +578,6 @@ TEST_F(CollectionsFixture, ExistsCountsStringsAndCollections) {
   EXPECT_EQ(result->AsInteger(), 2);
 }
 
-TEST_F(CollectionsFixture, MultiStringGetPreservesOrderAndNulls) {
-  auto store = OpenStore();
-  std::string v1 = "one";
-  std::string v3 = "three";
-  std::vector<core::ops::WriteOp> ops = {
-      core::ops::StringSet{.key = "a", .value = v1},
-      core::ops::StringSet{.key = "c", .value = v3},
-  };
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
-
-  core::ops::MultiStringGet mget;
-  mget.keys = {"a", "b", "c"};
-  auto result = store->Exec(mget);
-  ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->AsArray().size(), 3U);
-  EXPECT_EQ(result->AsArray()[0].AsString(), "one");
-  EXPECT_TRUE(result->AsArray()[1].IsNull());
-  EXPECT_EQ(result->AsArray()[2].AsString(), "three");
-}
-
-TEST_F(CollectionsFixture, MultiStringSetRoundTrips) {
-  auto store = OpenStore();
-  std::vector<core::ops::MultiStringSet::Entry> entries = {
-      {.key = "a", .value = "1"},
-      {.key = "b", .value = "2"},
-  };
-  std::vector<core::ops::WriteOp> ops = {core::ops::MultiStringSet{.entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
-
-  EXPECT_EQ(store->Exec(core::ops::StringGet{.key = "a"})->AsString(), "1");
-  EXPECT_EQ(store->Exec(core::ops::StringGet{.key = "b"})->AsString(), "2");
-}
-
 // --- Mixed batch ------------------------------------------------------------
 
 TEST_F(CollectionsFixture, MixedBatchLandsAllOps) {

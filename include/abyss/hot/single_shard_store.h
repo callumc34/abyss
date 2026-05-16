@@ -104,8 +104,6 @@ class SingleShardStore {
   core::Result<core::RespValue> ApplyHashMSet(const core::ops::HashMSet& op,
                                               core::EvictionTTL eviction);
   core::Result<core::RespValue> ApplyHashDel(const core::ops::HashDel& op);
-  core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
-                                                    core::EvictionTTL eviction);
   core::Result<core::RespValue> ApplyExpire(const core::ops::Expire& op);
   core::Result<core::RespValue> ApplyPersist(const core::ops::Persist& op);
 

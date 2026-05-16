@@ -20,6 +20,17 @@
 
 namespace abyss::consumer {
 
+// Type-agnostic verdict on a key's presence in the buffer. EXISTS-style fan-out
+// can't use Read/Exec for this — Read is string-typed (NotFound for a hash in
+// the buffer) and Exec(Exists) collapses tombstone and miss to the same zero.
+// kTombstoned must override cold so a not-yet-flushed DEL suppresses a stale
+// cold residual.
+enum class BufferKeyPresence : uint8_t {
+  kAbsent,
+  kTombstoned,
+  kPresent,
+};
+
 // Snapshot of a key's hash state in the buffer. Multi-field hash reads cannot
 // be answered from the buffer alone: the buffer represents the delta since
 // the last flush, while cold holds the prior committed state. The engine
@@ -58,6 +69,8 @@ class CompactionBuffer {
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const ABYSS_EXCLUDES(mutex_);
 
   core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
+
+  BufferKeyPresence Probe(std::string_view key) const ABYSS_EXCLUDES(mutex_);
 
   HashOverlay HashOverlayFor(std::string_view key) const ABYSS_EXCLUDES(mutex_);
 

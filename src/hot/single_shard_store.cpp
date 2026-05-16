@@ -388,8 +388,6 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
           return ApplyHashMSet(o, eviction);
         } else if constexpr (std::is_same_v<T, core::ops::HashDel>) {
           return ApplyHashDel(o);
-        } else if constexpr (std::is_same_v<T, core::ops::MultiStringSet>) {
-          return ApplyMultiStringSet(o, eviction);
         } else if constexpr (std::is_same_v<T, core::ops::Expire>) {
           return ApplyExpire(o);
         } else if constexpr (std::is_same_v<T, core::ops::Persist>) {
@@ -642,15 +640,6 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::Ha
     RemoveEntry(std::string(op.key));
   }
   return core::RespValue::Integer(removed);
-}
-
-core::Result<core::RespValue> SingleShardStore::ApplyMultiStringSet(
-    const core::ops::MultiStringSet& op, core::EvictionTTL eviction) {
-  for (const auto& e : op.entries) {
-    auto result = ApplyStringSet(core::ops::StringSet{.key = e.key, .value = e.value}, eviction);
-    if (!result.has_value()) return std::unexpected(result.error());
-  }
-  return core::RespValue::SimpleString("OK");
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Expire& op) {

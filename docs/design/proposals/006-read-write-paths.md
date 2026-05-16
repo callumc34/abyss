@@ -95,6 +95,17 @@ The critical section is short: one map insert (register) or one map lookup + era
 
 See `include/abyss/core/consumer_rpc.h` for the current interface.
 
+### Multi-Key Fan-Out
+
+Multi-key commands tagged in the registry (`CommandSpec::multi_key_kind`) bypass `DispatchRead`/`DispatchWrite` and route to `CommandDispatcher::DispatchFanOut`. The engine decomposes them into per-key sub-commands before any queue append or tier access:
+
+- **Reads** (`MGET`, `EXISTS`) — issue per-key single-key reads through the same hot → buffer → cold path; aggregate positional array (MGET) or sum (EXISTS). `EXISTS` uses a tombstone-aware buffer probe so a not-yet-flushed `DEL` overrides a stale cold residual.
+- **Writes** (`MSET`, `DEL`, `UNLINK`) — issue one `Write` queue entry per key. Each `BeginAppend` → `Register` → `Publish` runs sequentially because `BeginAppend` returns with the per-shard append mutex held; the destructor on `PendingAppend` auto-publishes if scope unwinds before an explicit `Publish`. Per-sub durabilities and consumer RPCs are awaited against a shared `write_timeout` deadline. The first sub-error short-circuits the response.
+
+Aggregation rules: `MGET` returns a positional array (nil on miss or hot WRONGTYPE per Redis); `EXISTS` returns the int count without dedup (`EXISTS k k` returns 2); `MSET` returns `+OK` only if every sub succeeded; `DEL`/`UNLINK` returns the integer sum of per-sub replies. No cross-key atomicity — partial state is permitted and clients retry.
+
+Promotion-through-queue on cold hits during fan-out follows the same rule as single-key reads: the promotion entry lands on the *cold-hit key's* owning shard, not on the first key's shard, so Phase-2 horizontal scaling routes correctly.
+
 ### Metrics
 
 Every read records which tier served the response:

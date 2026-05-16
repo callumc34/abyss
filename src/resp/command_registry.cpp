@@ -197,6 +197,36 @@ constexpr CommandSpec Write(std::string_view name, int arity, Dispatch dispatch,
           .predicate = predicate};
 }
 
+// kind != kNone makes the pipeline route through DispatchFanOut; cls/dispatch
+// stay set so COMMAND INFO still reports read-vs-write honestly.
+constexpr CommandSpec ReadFanOut(std::string_view name, int arity, int first_key, int last_key,
+                                 int key_step, core::MultiKeyKind kind, CommandDocs docs) {
+  return {.name = name,
+          .arity = arity,
+          .cls = C::kRead,
+          .dispatch = D::kTieredRead,
+          .first_key = first_key,
+          .last_key = last_key,
+          .key_step = key_step,
+          .loading_safe = false,
+          .multi_key_kind = kind,
+          .docs = docs};
+}
+
+constexpr CommandSpec WriteFanOut(std::string_view name, int arity, int first_key, int last_key,
+                                  int key_step, core::MultiKeyKind kind, CommandDocs docs) {
+  return {.name = name,
+          .arity = arity,
+          .cls = C::kWrite,
+          .dispatch = D::kWritePath,
+          .first_key = first_key,
+          .last_key = last_key,
+          .key_step = key_step,
+          .loading_safe = false,
+          .multi_key_kind = kind,
+          .docs = docs};
+}
+
 constexpr auto kCommandTable = std::to_array<CommandSpec>({
     // Admin — stateless
     Admin("PING", -1, D::kStateless, true,
@@ -265,10 +295,11 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
           {"Decrements the integer value of a key by a given amount.", "1.0.0", "string", "O(1)"}),
     Write("INCRBYFLOAT", 3, D::kWritePath, 1, 1, 1,
           {"Increments the float value of a key by a given amount.", "2.6.0", "string", "O(1)"}),
-    Read("MGET", -2, 1, -1, 1,
-         {"Returns the values of multiple keys.", "1.0.0", "string", "O(N) over keys requested"}),
-    Write("MSET", -3, D::kWritePath, 1, -1, 2,
-          {"Sets the values of multiple keys.", "1.0.1", "string", "O(N) over keys set"}),
+    ReadFanOut(
+        "MGET", -2, 1, -1, 1, core::MultiKeyKind::kMget,
+        {"Returns the values of multiple keys.", "1.0.0", "string", "O(N) over keys requested"}),
+    WriteFanOut("MSET", -3, 1, -1, 2, core::MultiKeyKind::kMset,
+                {"Sets the values of multiple keys.", "1.0.1", "string", "O(N) over keys set"}),
     Write("MSETNX", -3, D::kConditionalWrite, 1, -1, 2,
           {"Atomically sets multiple keys only if none exist.", "1.0.1", "string",
            "O(N) over keys set"},
@@ -347,13 +378,13 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     Read("HLEN", 2, 1, 1, 1, {"Returns the number of fields in a hash.", "2.0.0", "hash", "O(1)"}),
 
     // Generic / key management
-    Write("DEL", -2, D::kWritePath, 1, -1, 1,
-          {"Deletes one or more keys.", "1.0.0", "generic", "O(N) over keys deleted"}),
-    Write("UNLINK", -2, D::kWritePath, 1, -1, 1,
-          {"Deletes one or more keys; treated as a synonym of DEL.", "4.0.0", "generic",
-           "O(N) over keys deleted"}),
-    Read("EXISTS", -2, 1, -1, 1,
-         {"Tests whether keys exist.", "1.0.0", "generic", "O(N) over keys requested"}),
+    WriteFanOut("DEL", -2, 1, -1, 1, core::MultiKeyKind::kDelete,
+                {"Deletes one or more keys.", "1.0.0", "generic", "O(N) over keys deleted"}),
+    WriteFanOut("UNLINK", -2, 1, -1, 1, core::MultiKeyKind::kDelete,
+                {"Deletes one or more keys; treated as a synonym of DEL.", "4.0.0", "generic",
+                 "O(N) over keys deleted"}),
+    ReadFanOut("EXISTS", -2, 1, -1, 1, core::MultiKeyKind::kExists,
+               {"Tests whether keys exist.", "1.0.0", "generic", "O(N) over keys requested"}),
     Write("EXPIRE", -3, D::kWritePath, 1, 1, 1,
           {"Sets a key's time-to-live in seconds.", "1.0.0", "generic", "O(1)"},
           ExtractExpireFlags),

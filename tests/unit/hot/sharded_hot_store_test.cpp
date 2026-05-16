@@ -66,69 +66,29 @@ TEST_F(ShardedHotStoreTest, GetMissingKey) {
   EXPECT_EQ(result.error().code(), core::ErrorCode::kNotFound);
 }
 
-// --- Multi-key operations ---
+// Multi-key MGET/MSET/DEL/EXISTS fan-out lives in the engine now — the store
+// only ever sees per-key (or single-element vector) ops. Cross-shard
+// aggregation coverage is in tests/component/tiering_engine_test.cpp.
 
-TEST_F(ShardedHotStoreTest, MgetAllPresent) {
-  SetString("k1", "v1");
-  SetString("k2", "v2");
-  SetString("k3", "v3");
-
-  core::ops::MultiStringGet op{.keys = {"k1", "k2", "k3"}};
-  auto result = store_.Exec(core::ops::ReadOp{op});
-  ASSERT_TRUE(result.has_value());
-  ASSERT_TRUE(result->IsArray());
-  ASSERT_EQ(result->AsArray().size(), 3U);
-  EXPECT_EQ(result->AsArray()[0].AsString(), "v1");
-  EXPECT_EQ(result->AsArray()[1].AsString(), "v2");
-  EXPECT_EQ(result->AsArray()[2].AsString(), "v3");
-}
-
-TEST_F(ShardedHotStoreTest, MgetSomeMissing) {
-  SetString("k1", "v1");
-
-  core::ops::MultiStringGet op{.keys = {"k1", "missing"}};
-  auto result = store_.Exec(core::ops::ReadOp{op});
-  ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->AsArray().size(), 2U);
-  EXPECT_EQ(result->AsArray()[0].AsString(), "v1");
-  EXPECT_TRUE(result->AsArray()[1].IsNull());
-}
-
-TEST_F(ShardedHotStoreTest, ExistsCountsAcrossShards) {
+TEST_F(ShardedHotStoreTest, ExistsSingleKey) {
   SetString("a", "1");
-  SetString("b", "2");
 
-  core::ops::Exists op{.keys = {"a", "b", "c"}};
+  core::ops::Exists op{.keys = {"a"}};
   auto result = store_.Exec(core::ops::ReadOp{op});
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->AsInteger(), 2);
+  EXPECT_EQ(result->AsInteger(), 1);
+
+  core::ops::Exists missing{.keys = {"missing"}};
+  auto miss = store_.Exec(core::ops::ReadOp{missing});
+  ASSERT_TRUE(miss.has_value());
+  EXPECT_EQ(miss->AsInteger(), 0);
 }
 
-TEST_F(ShardedHotStoreTest, DelAcrossShards) {
+TEST_F(ShardedHotStoreTest, DelSingleKey) {
   SetString("x", "1");
-  SetString("y", "2");
-
-  core::ops::Del del_op{.keys = {"x", "y"}};
+  core::ops::Del del_op{.keys = {"x"}};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{del_op}).has_value());
-
   EXPECT_FALSE(GetString("x").has_value());
-  EXPECT_FALSE(GetString("y").has_value());
-}
-
-TEST_F(ShardedHotStoreTest, MsetAcrossShards) {
-  core::ops::MultiStringSet op{.entries = {
-                                   {.key = "a", .value = "1"},
-                                   {.key = "b", .value = "2"},
-                                   {.key = "c", .value = "3"},
-                               }};
-  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}).has_value());
-
-  auto a = GetString("a");
-  ASSERT_TRUE(a.has_value());
-  EXPECT_EQ(a->AsString(), "1");
-  auto c = GetString("c");
-  ASSERT_TRUE(c.has_value());
-  EXPECT_EQ(c->AsString(), "3");
 }
 
 // --- Stats aggregation ---
@@ -235,9 +195,10 @@ TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
 
 // --- Per-prefix eviction (issue #84) ---
 
-// Regression for the multi-key fan-out bug: MSET with mixed prefixes must
-// resolve eviction per entry, not apply one value to every key.
-TEST(ShardedHotStorePrefixEvictionTest, MsetMixedPrefixesResolvePerEntry) {
+// Per-prefix eviction must resolve per key (was a bug when MSET applied one
+// eviction across the whole entry list). Now driven by per-key StringSet
+// since the engine decomposes MSET upstream.
+TEST(ShardedHotStorePrefixEvictionTest, MixedPrefixesResolvePerEntry) {
   abyss::testing::TestClock clock;
   core::EvictionPolicy policy{
       core::EvictionTTL{86400},
@@ -254,12 +215,11 @@ TEST(ShardedHotStorePrefixEvictionTest, MsetMixedPrefixesResolvePerEntry) {
       .wall_clock = clock.WallFn(),
   }};
 
-  core::ops::MultiStringSet op{.entries = {
-                                   {.key = "session:a", .value = "1"},
-                                   {.key = "ephemeral:b", .value = "2"},
-                                   {.key = "other:c", .value = "3"},
-                               }};
-  ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}).has_value());
+  for (const auto& [k, v] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
+           {"session:a", "1"}, {"ephemeral:b", "2"}, {"other:c", "3"}}) {
+    core::ops::StringSet op{.key = k, .value = v};
+    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}).has_value());
+  }
 
   // session:a expires at 1s — visible after advancing past 1s.
   clock.Advance(1100ms);

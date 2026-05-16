@@ -64,10 +64,6 @@ core::Result<core::RespValue> ColdConsumerPool::Exec(const core::ops::ReadOp& op
     }
     return core::RespValue::Integer(total);
   }
-  if (std::holds_alternative<core::ops::MultiStringGet>(op)) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kNotFound, "buffer defers MGET to per-tier composition"));
-  }
   const auto key = core::ops::PrimaryKey(op);
   if (key.empty()) {
     return std::unexpected(core::Error(core::ErrorCode::kInternal, "empty primary key"));
@@ -78,6 +74,11 @@ core::Result<core::RespValue> ColdConsumerPool::Exec(const core::ops::ReadOp& op
 core::Result<core::RespValue> ColdConsumerPool::Read(std::string_view key) const {
   const auto shard = ShardForKey(key);
   return consumers_[shard]->Buffer().Read(std::string(key));
+}
+
+BufferKeyPresence ColdConsumerPool::Probe(std::string_view key) const {
+  const auto shard = ShardForKey(key);
+  return consumers_[shard]->Buffer().Probe(key);
 }
 
 HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {

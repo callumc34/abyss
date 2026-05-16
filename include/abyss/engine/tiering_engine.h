@@ -47,12 +47,27 @@ class TieringEngine : public core::CommandDispatcher {
                                               core::RespCommand cmd) override;
   core::Result<core::RespValue> DispatchConditional(std::string_view name, core::RespCommand cmd,
                                                     core::PredicateFlags flags) override;
+  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind kind,
+                                               core::RespCommand cmd) override;
 
   TieringEngineMetrics Snapshot() const;
 
  private:
   void PromoteThroughQueue(std::string_view key);
   core::Result<core::RespValue> DispatchHashRead(const core::ops::ReadOp& op);
+  core::Result<core::RespValue> DispatchSingleKeyRead(const core::ops::ReadOp& op);
+  core::Result<core::RespValue> DispatchSingleKeyWrite(core::RespCommand cmd);
+
+  core::Result<core::RespValue> FanOutMget(const core::RespCommand& cmd);
+  core::Result<core::RespValue> FanOutExists(const core::RespCommand& cmd);
+  core::Result<core::RespValue> FanOutMset(const core::RespCommand& cmd);
+  core::Result<core::RespValue> FanOutDel(std::string_view name, const core::RespCommand& cmd);
+
+  // RespValue::Array on success (per-sub results), RespValue::Error on
+  // whole-fan-out timeout. Structural failures surface as Result errors.
+  core::Result<core::RespValue> FanOutWrite(const std::vector<core::RespCommand>& subs);
+
+  core::Result<bool> ProbeKeyExists(std::string_view key);
 
   core::Queue& queue_;
   core::HotStore& hot_store_;

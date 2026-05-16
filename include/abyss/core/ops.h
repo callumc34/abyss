@@ -85,13 +85,9 @@ struct Exists {
   std::vector<std::string_view> keys;
 };
 
-struct MultiStringGet {
-  std::vector<std::string_view> keys;
-};
-
 using ReadOp = std::variant<StringGet, SetIsMember, SetMembers, SetCard, ZsetScore, ZsetCard,
                             ZsetRange, HashGet, HashGetAll, HashMultiGet, HashFieldExists, HashKeys,
-                            HashVals, HashLen, Exists, MultiStringGet>;
+                            HashVals, HashLen, Exists>;
 
 // --- Writes ---
 
@@ -151,14 +147,6 @@ struct HashDel {
   std::vector<std::string_view> fields;
 };
 
-struct MultiStringSet {
-  struct Entry {
-    std::string_view key;
-    std::string_view value;
-  };
-  std::vector<Entry> entries;
-};
-
 // abs_ttl_ms is computed at parse time from EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT
 // so replay sees a single unambiguous timestamp.
 struct Expire {
@@ -173,7 +161,7 @@ struct Persist {
 };
 
 using WriteOp = std::variant<StringSet, Del, SetAdd, SetRem, ZsetAdd, ZsetRem, HashSet, HashMSet,
-                             HashDel, MultiStringSet, Expire, Persist>;
+                             HashDel, Expire, Persist>;
 
 Result<ReadOp> ParseReadOp(std::string_view name, const RespCommand& cmd);
 Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd);

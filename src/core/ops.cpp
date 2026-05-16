@@ -71,10 +71,6 @@ using ReadParserFn = Result<ReadOp> (*)(const RespCommand&);
 
 Result<ReadOp> ParseGet(const RespCommand& cmd) { return ReadOp{StringGet{.key = cmd.args[1]}}; }
 
-Result<ReadOp> ParseMget(const RespCommand& cmd) {
-  return ReadOp{MultiStringGet{.keys = CollectArgs(cmd, 1)}};
-}
-
 Result<ReadOp> ParseSismember(const RespCommand& cmd) {
   return ReadOp{SetIsMember{.key = cmd.args[1], .member = cmd.args[2]}};
 }
@@ -113,17 +109,15 @@ Result<ReadOp> ParseHvals(const RespCommand& cmd) { return ReadOp{HashVals{.key 
 
 Result<ReadOp> ParseHlen(const RespCommand& cmd) { return ReadOp{HashLen{.key = cmd.args[1]}}; }
 
-Result<ReadOp> ParseExists(const RespCommand& cmd) {
-  return ReadOp{Exists{.keys = CollectArgs(cmd, 1)}};
-}
-
 const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
+  // MGET / EXISTS are intentionally absent: the engine decomposes them in
+  // DispatchFanOut and never round-trips through ParseReadOp.
   static const std::unordered_map<std::string_view, ReadParserFn> table{
-      {"GET", ParseGet},           {"MGET", ParseMget},       {"SISMEMBER", ParseSismember},
-      {"SMEMBERS", ParseSmembers}, {"SCARD", ParseScard},     {"ZSCORE", ParseZscore},
-      {"ZCARD", ParseZcard},       {"HGET", ParseHget},       {"HGETALL", ParseHgetall},
-      {"HMGET", ParseHmget},       {"HEXISTS", ParseHexists}, {"HKEYS", ParseHkeys},
-      {"HVALS", ParseHvals},       {"HLEN", ParseHlen},       {"EXISTS", ParseExists},
+      {"GET", ParseGet},         {"SISMEMBER", ParseSismember}, {"SMEMBERS", ParseSmembers},
+      {"SCARD", ParseScard},     {"ZSCORE", ParseZscore},       {"ZCARD", ParseZcard},
+      {"HGET", ParseHget},       {"HGETALL", ParseHgetall},     {"HMGET", ParseHmget},
+      {"HEXISTS", ParseHexists}, {"HKEYS", ParseHkeys},         {"HVALS", ParseHvals},
+      {"HLEN", ParseHlen},
   };
   return table;
 }
@@ -168,19 +162,6 @@ Result<WriteOp> ParsePsetex(const RespCommand& cmd) {
   if (!ttl.has_value()) return std::unexpected(ttl.error());
   return WriteOp{
       StringSet{.key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = NowWallMs() + *ttl}};
-}
-
-Result<WriteOp> ParseMset(const RespCommand& cmd) {
-  if (cmd.args.size() % 2 == 0) {
-    return std::unexpected(
-        SyntaxError("MSET requires an odd number of arguments (key-value pairs)"));
-  }
-  std::vector<MultiStringSet::Entry> entries;
-  entries.reserve((cmd.args.size() - 1) / 2);
-  for (size_t i = 1; i < cmd.args.size(); i += 2) {
-    entries.push_back({.key = cmd.args[i], .value = cmd.args[i + 1]});
-  }
-  return WriteOp{MultiStringSet{.entries = std::move(entries)}};
 }
 
 Result<WriteOp> ParseDel(const RespCommand& cmd) {
@@ -281,11 +262,12 @@ Result<WriteOp> ParsePersist(const RespCommand& cmd) {
 }
 
 const std::unordered_map<std::string_view, WriteParserFn>& WriteParsers() {
+  // MSET is intentionally absent: the engine decomposes it into per-key SETs
+  // before queueing, so the WAL never carries an MSET payload.
   static const std::unordered_map<std::string_view, WriteParserFn> table{
       {"SET", ParseSet},
       {"SETEX", ParseSetex},
       {"PSETEX", ParsePsetex},
-      {"MSET", ParseMset},
       {"DEL", ParseDel},
       {"UNLINK", ParseDel},
       {"SADD", ParseSadd},
@@ -330,7 +312,7 @@ std::string_view PrimaryKey(const ReadOp& op) {
   return std::visit(
       [](const auto& o) -> std::string_view {
         using T = std::decay_t<decltype(o)>;
-        if constexpr (std::is_same_v<T, MultiStringGet> || std::is_same_v<T, Exists>) {
+        if constexpr (std::is_same_v<T, Exists>) {
           return o.keys.empty() ? std::string_view{} : o.keys[0];
         } else {
           return o.key;
@@ -345,8 +327,6 @@ std::string_view PrimaryKey(const WriteOp& op) {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, Del>) {
           return o.keys.empty() ? std::string_view{} : o.keys[0];
-        } else if constexpr (std::is_same_v<T, MultiStringSet>) {
-          return o.entries.empty() ? std::string_view{} : o.entries[0].key;
         } else {
           return o.key;
         }

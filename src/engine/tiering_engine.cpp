@@ -92,8 +92,11 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
   if (!op.has_value()) {
     return std::unexpected(op.error());
   }
+  return DispatchSingleKeyRead(*op);
+}
 
-  auto hot_result = hot_store_.Exec(*op);
+core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::ops::ReadOp& op) {
+  auto hot_result = hot_store_.Exec(op);
   if (hot_result.has_value()) {
     return hot_result;
   }
@@ -103,11 +106,11 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
 
   // Hash reads require buffer-overlay merge: the buffer holds a delta over
   // cold, so neither tier alone has the full state when hot misses.
-  if (IsHashRead(*op)) {
-    return DispatchHashRead(*op);
+  if (IsHashRead(op)) {
+    return DispatchHashRead(op);
   }
 
-  auto key = core::ops::PrimaryKey(*op);
+  auto key = core::ops::PrimaryKey(op);
   if (!key.empty()) {
     auto buffer_result = buffer_router_.Read(key);
     if (buffer_result.has_value()) {
@@ -115,7 +118,7 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
     }
   }
 
-  auto cold_result = cold_store_.Exec(*op);
+  auto cold_result = cold_store_.Exec(op);
   if (cold_result.has_value() && !cold_result->IsNull() && !key.empty()) {
     PromoteThroughQueue(key);
   }
@@ -211,6 +214,77 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
   return core::RespValue::Array(std::move(out));
 }
 
+core::Result<core::RespValue> TieringEngine::FanOutMget(const core::RespCommand& cmd) {
+  if (cmd.args.size() < 2) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kInvalidArgument, "MGET requires at least one key"));
+  }
+  std::vector<core::RespValue> out;
+  out.reserve(cmd.args.size() - 1);
+  for (size_t i = 1; i < cmd.args.size(); ++i) {
+    auto result =
+        DispatchSingleKeyRead(core::ops::ReadOp{core::ops::StringGet{.key = cmd.args[i]}});
+    if (!result.has_value()) {
+      // Redis MGET collapses missing keys and non-string-typed keys to nil.
+      if (result.error().code() == core::ErrorCode::kNotFound ||
+          result.error().code() == core::ErrorCode::kWrongType) {
+        out.push_back(core::RespValue::Null());
+        continue;
+      }
+      return std::unexpected(result.error());
+    }
+    if (result->IsError() && result->ErrorPrefixOf() == core::ErrorPrefix::kWrongType) {
+      out.push_back(core::RespValue::Null());
+      continue;
+    }
+    out.push_back(std::move(*result));
+  }
+  return core::RespValue::Array(std::move(out));
+}
+
+core::Result<core::RespValue> TieringEngine::FanOutExists(const core::RespCommand& cmd) {
+  if (cmd.args.size() < 2) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kInvalidArgument, "EXISTS requires at least one key"));
+  }
+  // EXISTS k k counts twice (Redis behaviour): no dedup.
+  int64_t count = 0;
+  for (size_t i = 1; i < cmd.args.size(); ++i) {
+    auto present = ProbeKeyExists(cmd.args[i]);
+    if (!present.has_value()) {
+      return std::unexpected(present.error());
+    }
+    if (*present) ++count;
+  }
+  return core::RespValue::Integer(count);
+}
+
+core::Result<bool> TieringEngine::ProbeKeyExists(std::string_view key) {
+  auto hot = hot_store_.Exec(core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
+  if (hot.has_value()) {
+    if (hot->IsInteger() && hot->AsInteger() > 0) return true;
+  } else if (hot.error().code() != core::ErrorCode::kNotFound) {
+    return std::unexpected(hot.error());
+  }
+
+  // Buffer probe overrides cold: a not-yet-flushed DEL means the key is absent.
+  switch (buffer_router_.Probe(key)) {
+    case consumer::BufferKeyPresence::kPresent:
+      return true;
+    case consumer::BufferKeyPresence::kTombstoned:
+      return false;
+    case consumer::BufferKeyPresence::kAbsent:
+      break;
+  }
+
+  auto cold = cold_store_.Exec(core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
+  if (!cold.has_value()) {
+    if (cold.error().code() == core::ErrorCode::kNotFound) return false;
+    return std::unexpected(cold.error());
+  }
+  return cold->IsInteger() && cold->AsInteger() > 0;
+}
+
 void TieringEngine::PromoteThroughQueue(std::string_view key) {
   auto promotion = cold_store_.GetPromotionCommand(key);
   if (!promotion.has_value() || !promotion->has_value()) return;
@@ -247,6 +321,29 @@ core::ShardId ShardForCmd(const core::RespCommand& cmd, uint32_t shard_count) {
 
 core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
                                                            core::RespCommand cmd) {
+  return DispatchSingleKeyWrite(std::move(cmd));
+}
+
+core::Result<core::RespValue> TieringEngine::DispatchFanOut(core::MultiKeyKind kind,
+                                                            core::RespCommand cmd) {
+  // See ADP-005 §Multi-Key Commands; ADP-006 §Multi-Key Fan-Out.
+  switch (kind) {
+    case core::MultiKeyKind::kMget:
+      return FanOutMget(cmd);
+    case core::MultiKeyKind::kExists:
+      return FanOutExists(cmd);
+    case core::MultiKeyKind::kMset:
+      return FanOutMset(cmd);
+    case core::MultiKeyKind::kDelete:
+      return FanOutDel(cmd.Name(), cmd);
+    case core::MultiKeyKind::kNone:
+      break;
+  }
+  return std::unexpected(
+      core::Error(core::ErrorCode::kInternal, "DispatchFanOut called with MultiKeyKind::kNone"));
+}
+
+core::Result<core::RespValue> TieringEngine::DispatchSingleKeyWrite(core::RespCommand cmd) {
   const core::ShardId shard = ShardForCmd(cmd, config_.shard_count);
 
   core::QueueEntry entry{
@@ -299,6 +396,144 @@ core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*na
         "write durable in queue but consumer did not apply within timeout");
   }
   return rpc_future.get();
+}
+
+core::Result<core::RespValue> TieringEngine::FanOutMset(const core::RespCommand& cmd) {
+  if (cmd.args.size() < 3 || (cmd.args.size() % 2) == 0) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kInvalidArgument, "MSET requires key-value pairs"));
+  }
+  std::vector<core::RespCommand> subs;
+  subs.reserve((cmd.args.size() - 1) / 2);
+  for (size_t i = 1; i + 1 < cmd.args.size(); i += 2) {
+    subs.push_back(core::RespCommand{.args = {"SET", cmd.args[i], cmd.args[i + 1]}});
+  }
+  auto fan = FanOutWrite(subs);
+  if (!fan.has_value()) return std::unexpected(fan.error());
+  if (fan->IsError()) return std::move(*fan);
+  for (const auto& v : fan->AsArray()) {
+    if (v.IsError()) {
+      return core::RespValue::Error(v.ErrorPrefixOf(), std::string(v.ErrorMessage()));
+    }
+  }
+  return core::RespValue::SimpleString("OK");
+}
+
+core::Result<core::RespValue> TieringEngine::FanOutDel(std::string_view name,
+                                                       const core::RespCommand& cmd) {
+  if (cmd.args.size() < 2) {
+    std::string msg{name};
+    msg += " requires at least one key";
+    return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument, msg));
+  }
+  std::vector<core::RespCommand> subs;
+  subs.reserve(cmd.args.size() - 1);
+  for (size_t i = 1; i < cmd.args.size(); ++i) {
+    subs.push_back(core::RespCommand{.args = {std::string{name}, cmd.args[i]}});
+  }
+  auto fan = FanOutWrite(subs);
+  if (!fan.has_value()) return std::unexpected(fan.error());
+  if (fan->IsError()) return std::move(*fan);
+  int64_t total = 0;
+  for (const auto& v : fan->AsArray()) {
+    if (v.IsError()) return v;
+    if (!v.IsInteger()) {
+      return core::RespValue::Error(core::ErrorPrefix::kErr,
+                                    "internal: DEL sub-result is not an integer");
+    }
+    total += v.AsInteger();
+  }
+  return core::RespValue::Integer(total);
+}
+
+core::Result<core::RespValue> TieringEngine::FanOutWrite(
+    const std::vector<core::RespCommand>& subs) {
+  struct InFlight {
+    core::ShardId shard;
+    core::SequenceId seq;
+    core::RpcId rpc_id;
+    std::future<core::RespValue> rpc_future;
+    queue::DurabilityFuture durable_future;
+  };
+
+  std::vector<InFlight> in_flight;
+  in_flight.reserve(subs.size());
+
+  // Per-sub Begin → Register → Publish. BeginAppend returns with the per-shard
+  // append mutex held; two subs hashing to the same shard would deadlock if we
+  // batched Begins before publishing.
+  for (const auto& sub : subs) {
+    const core::ShardId shard = ShardForCmd(sub, config_.shard_count);
+    core::QueueEntry entry{
+        .appended_at = core::WallClock::now(),
+        .payload = core::entry::Write{.cmd = sub},
+    };
+    auto pending = queue_.BeginAppend(shard, std::move(entry));
+    if (!pending.has_value()) {
+      for (auto& f : in_flight) rpc_.Cancel(f.rpc_id);
+      return std::unexpected(pending.error());
+    }
+    const core::SequenceId seq = pending->seq();
+    const core::RpcId rpc_id = core::MakeRpcId(shard, seq);
+    in_flight.push_back(InFlight{
+        .shard = shard,
+        .seq = seq,
+        .rpc_id = rpc_id,
+        .rpc_future = rpc_.Register(rpc_id),
+        .durable_future = std::move(pending->durable()),
+    });
+    pending->Publish();
+  }
+
+  // Shared deadline: fan-out doesn't widen the single-key write_timeout.
+  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
+  auto cancel_remaining = [&](size_t from) {
+    for (size_t j = from; j < in_flight.size(); ++j) rpc_.Cancel(in_flight[j].rpc_id);
+  };
+
+  for (size_t i = 0; i < in_flight.size(); ++i) {
+    auto& f = in_flight[i];
+    if (f.durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
+      cancel_remaining(i);
+      ABYSS_LOG_WARN("fan-out write durable wait timeout", {"shard", static_cast<int64_t>(f.shard)},
+                     {"seq", static_cast<uint64_t>(f.seq)},
+                     {"sub_index", static_cast<uint64_t>(i)});
+      return core::RespValue::Error(
+          core::ErrorPrefix::kErr,
+          "fan-out write durable wait exceeded server timeout; writes will apply on consumer "
+          "catch-up");
+    }
+    auto durable = f.durable_future.get();
+    if (!durable.has_value()) {
+      cancel_remaining(i);
+      ABYSS_LOG_ERROR("fan-out write durable failed", {"shard", static_cast<int64_t>(f.shard)},
+                      {"seq", static_cast<uint64_t>(f.seq)},
+                      {"err", std::string_view{durable.error().message()}});
+      return std::unexpected(durable.error());
+    }
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto min_rpc_budget = std::chrono::milliseconds{static_cast<int64_t>(
+      static_cast<double>(config_.write_timeout.count()) * config_.min_rpc_wait_fraction)};
+  const auto rpc_deadline = std::max(durable_deadline, now + min_rpc_budget);
+
+  std::vector<core::RespValue> per_sub;
+  per_sub.reserve(in_flight.size());
+  for (size_t i = 0; i < in_flight.size(); ++i) {
+    auto& f = in_flight[i];
+    if (f.rpc_future.wait_until(rpc_deadline) == std::future_status::timeout) {
+      cancel_remaining(i);
+      ABYSS_LOG_WARN(
+          "fan-out write consumer apply timeout", {"shard", static_cast<int64_t>(f.shard)},
+          {"seq", static_cast<uint64_t>(f.seq)}, {"sub_index", static_cast<uint64_t>(i)});
+      return core::RespValue::Error(
+          core::ErrorPrefix::kErr,
+          "fan-out write durable in queue but consumer did not apply within timeout");
+    }
+    per_sub.push_back(f.rpc_future.get());
+  }
+  return core::RespValue::Array(std::move(per_sub));
 }
 
 core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_view /*name*/,

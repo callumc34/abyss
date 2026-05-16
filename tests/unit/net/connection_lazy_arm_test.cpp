@@ -37,6 +37,10 @@ class EchoDispatcher : public core::CommandDispatcher {
                                                     core::PredicateFlags /*flags*/) override {
     return core::RespValue::SimpleString("OK");
   }
+  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
+                                               core::RespCommand /*cmd*/) override {
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 class ConnectionLazyArmTest : public ::testing::Test {

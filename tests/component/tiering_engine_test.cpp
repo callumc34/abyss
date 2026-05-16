@@ -38,6 +38,9 @@ class SingleBufferRouter : public consumer::CompactionBufferRouter {
   core::Result<core::RespValue> Read(std::string_view key) const override {
     return buffer_.Read(std::string(key));
   }
+  consumer::BufferKeyPresence Probe(std::string_view key) const override {
+    return buffer_.Probe(key);
+  }
   consumer::HashOverlay HashOverlayFor(std::string_view key) const override {
     return buffer_.HashOverlayFor(key);
   }
@@ -460,6 +463,225 @@ TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsError());
   EXPECT_TRUE(result->AsString().starts_with("ERR "));
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+// --- Fan-out (MGET, EXISTS, MSET, DEL) ---
+//
+// Coverage focuses on what unit tests can't reach: per-shard WAL placement on
+// MSET/DEL, per-tier aggregation for MGET/EXISTS, and partial-failure surfacing
+// when one sub-command's BeginAppend rejects.
+
+TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
+  auto engine = MakeEngine();
+  buffer_.Absorb("b", core::ops::WriteOp{core::ops::StringSet{.key = "b", .value = "from_buf"}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(core::RespValue::BulkString("from_hot")))                        // a
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))))   // b
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))))   // c
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));  // d
+  // Only c falls through to cold (a hit hot, b hit buffer, d misses cold).
+  EXPECT_CALL(cold_, Exec(_, _))
+      .WillOnce(Return(core::RespValue::BulkString("from_cold")))                       // c
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));  // d
+
+  // c's cold hit must promote through queue on c's shard, not on the MGET first-key shard.
+  const core::ShardId c_shard = core::ComputeShard("c", kShardCount);
+  EXPECT_CALL(cold_, GetPromotionCommand(std::string_view{"c"}))
+      .WillOnce(Return(std::optional<core::RespCommand>{MakeCmd({"SET", "c", "from_cold"})}));
+  EXPECT_CALL(queue_, Append(c_shard, _))
+      .WillOnce([](core::ShardId, const core::QueueEntry&) -> core::Result<queue::AppendResult> {
+        return queue::AppendResult{.seq = 1};
+      });
+
+  auto result =
+      engine.DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "a", "b", "c", "d"}));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsArray());
+  const auto& arr = result->AsArray();
+  ASSERT_EQ(arr.size(), 4U);
+  EXPECT_EQ(arr[0].AsString(), "from_hot");
+  EXPECT_EQ(arr[1].AsString(), "from_buf");
+  EXPECT_EQ(arr[2].AsString(), "from_cold");
+  EXPECT_TRUE(arr[3].IsNull());
+}
+
+TEST_F(TieringEngineTest, MgetWrongTypeInHotCollapsesToNil) {
+  auto engine = MakeEngine();
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kWrongType, "wrong type"))));
+
+  auto result = engine.DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "k"}));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsArray());
+  ASSERT_EQ(result->AsArray().size(), 1U);
+  EXPECT_TRUE(result->AsArray()[0].IsNull());
+}
+
+TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
+  auto engine = MakeEngine();
+  // Buffer holds a SET then a DEL — tombstone state for "k".
+  buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
+                 core::EvictionTTL{86400});
+  buffer_.Absorb("k", core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, core::EvictionTTL{86400});
+
+  // Hot has no record; cold is never consulted because the buffer probe is
+  // authoritative on the tombstone.
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 0);
+}
+
+TEST_F(TieringEngineTest, ExistsCountsDuplicatesRedisStyle) {
+  auto engine = MakeEngine();
+  EXPECT_CALL(hot_, Exec(_, _)).Times(2).WillRepeatedly(Return(core::RespValue::Integer(1)));
+
+  auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k", "k"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 2);
+}
+
+TEST_F(TieringEngineTest, MsetAppendsOneEntryPerKeyToOwningShard) {
+  auto engine = MakeEngine();
+
+  std::vector<core::ShardId> appended_shards;
+  std::vector<std::string> appended_keys;
+  std::vector<core::RpcId> rpc_ids;
+  std::mutex mu;
+  auto seq = std::make_shared<std::atomic<core::SequenceId>>(500);
+
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      .Times(3)
+      .WillRepeatedly([&, seq](core::ShardId shard, core::QueueEntry entry) {
+        const auto next = seq->fetch_add(1);
+        std::string key;
+        const auto* write = std::get_if<core::entry::Write>(&entry.payload);
+        EXPECT_NE(write, nullptr);
+        if (write != nullptr) {
+          EXPECT_EQ(write->cmd.args[0], "SET");
+          key = write->cmd.args[1];
+        }
+        {
+          std::scoped_lock lock(mu);
+          appended_shards.push_back(shard);
+          appended_keys.push_back(key);
+          rpc_ids.push_back(core::MakeRpcId(shard, next));
+        }
+        return MakePending(next, true);
+      });
+
+  // The mock records rpc_ids inside BeginAppend's lambda, before the engine
+  // proceeds to rpc_.Register(). In production, Register strictly precedes
+  // Publish — the consumer can't see the entry yet, so Fulfill can't race.
+  // This fulfiller models that ordering by retrying when Fulfill reports the
+  // id isn't yet registered.
+  std::thread fulfiller([&]() {
+    size_t fulfilled = 0;
+    while (fulfilled < 3) {
+      std::vector<core::RpcId> pending;
+      {
+        std::scoped_lock lock(mu);
+        pending = rpc_ids;
+      }
+      bool made_progress = false;
+      for (size_t i = fulfilled; i < pending.size(); ++i) {
+        if (rpc_.Fulfill(pending[i], core::RespValue::SimpleString("OK"))) {
+          ++fulfilled;
+          made_progress = true;
+        } else {
+          break;
+        }
+      }
+      if (!made_progress) std::this_thread::yield();
+    }
+  });
+
+  auto result = engine.DispatchFanOut(core::MultiKeyKind::kMset,
+                                      MakeCmd({"MSET", "a", "1", "b", "2", "c", "3"}));
+  fulfiller.join();
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsSimpleString());
+  EXPECT_EQ(result->AsString(), "OK");
+
+  // Each key's WAL entry lands on its own shard.
+  ASSERT_EQ(appended_keys.size(), 3U);
+  for (size_t i = 0; i < appended_keys.size(); ++i) {
+    EXPECT_EQ(appended_shards[i], core::ComputeShard(appended_keys[i], kShardCount))
+        << "key '" << appended_keys[i] << "' appended to shard " << appended_shards[i];
+  }
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+TEST_F(TieringEngineTest, DelFanOutSumsPerKeyIntegerReplies) {
+  auto engine = MakeEngine();
+  std::vector<core::RpcId> rpc_ids;
+  std::mutex mu;
+  auto seq = std::make_shared<std::atomic<core::SequenceId>>(700);
+
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      .Times(3)
+      .WillRepeatedly([&, seq](core::ShardId shard, const core::QueueEntry&) {
+        const auto next = seq->fetch_add(1);
+        {
+          std::scoped_lock lock(mu);
+          rpc_ids.push_back(core::MakeRpcId(shard, next));
+        }
+        return MakePending(next, true);
+      });
+
+  // Two keys existed, one didn't; the per-key hot consumer fulfils with 1/0.
+  std::thread fulfiller([&]() {
+    const std::vector<int64_t> replies{1, 0, 1};
+    size_t fulfilled = 0;
+    while (fulfilled < replies.size()) {
+      std::vector<core::RpcId> pending;
+      {
+        std::scoped_lock lock(mu);
+        pending = rpc_ids;
+      }
+      bool made_progress = false;
+      for (size_t i = fulfilled; i < pending.size(); ++i) {
+        if (rpc_.Fulfill(pending[i], core::RespValue::Integer(replies[i]))) {
+          ++fulfilled;
+          made_progress = true;
+        } else {
+          break;
+        }
+      }
+      if (!made_progress) std::this_thread::yield();
+    }
+  });
+
+  auto result = engine.DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c"}));
+  fulfiller.join();
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsInteger());
+  EXPECT_EQ(result->AsInteger(), 2);
+  EXPECT_EQ(rpc_.PendingCount(), 0U);
+}
+
+TEST_F(TieringEngineTest, FanOutPartialBeginAppendFailureSurfacesError) {
+  auto engine = MakeEngine();
+  // First sub succeeds (auto-publishes on scope exit), second fails. Per
+  // ADP-005 the partially-published sub may still apply — we cancel its RPC
+  // registration and return the error to the client.
+  EXPECT_CALL(queue_, BeginAppend(_, _))
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(900, true); })
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kResourceExhausted, "full"))));
+
+  auto result =
+      engine.DispatchFanOut(core::MultiKeyKind::kMset, MakeCmd({"MSET", "a", "1", "b", "2"}));
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
   EXPECT_EQ(rpc_.PendingCount(), 0U);
 }
 

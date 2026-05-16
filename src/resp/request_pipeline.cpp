@@ -128,6 +128,23 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
     return {std::move(response), status, parent.name};
   };
 
+  // Fan-out commands route through DispatchFanOut instead of read/write. The
+  // kind is only set on parent specs, never on subcommands.
+  if (resolved.subcommand == nullptr && parent.multi_key_kind != core::MultiKeyKind::kNone) {
+    if (deps_.dispatcher == nullptr) {
+      return finish(InternalServerError("dispatcher missing for fan-out", parent.name));
+    }
+    auto result = deps_.dispatcher->DispatchFanOut(parent.multi_key_kind, RespCommand(cmd));
+    if (!result.has_value()) {
+      ABYSS_LOG_WARN("engine fan-out error", {"client_id", state_.client_id},
+                     {"cmd", std::string_view{parent.name}},
+                     {"err", std::string_view{result.error().message()}});
+      return finish(
+          RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
+    }
+    return finish(std::move(*result));
+  }
+
   switch (resolved.DispatchClass()) {
     case Dispatch::kStateless:
       return HandleAdminStateless(resolved, cmd);
