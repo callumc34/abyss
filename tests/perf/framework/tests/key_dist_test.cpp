@@ -19,7 +19,7 @@ TEST(UniformDistributionTest, AllKeysReachable) {
   for (int i = 0; i < kIters; ++i) hits[dist.Next()]++;
   EXPECT_EQ(hits.size(), kCount) << "every key should appear at least once";
   for (const auto& [key, count] : hits) {
-    EXPECT_GT(count, 0u);
+    EXPECT_GT(count, 0U);
     EXPECT_LT(key, kCount);
   }
 }
@@ -80,9 +80,9 @@ TEST(MakeKeyDistributionTest, ConstructsEachKind) {
     cfg.seed = 1;
     auto dist = MakeKeyDistribution(cfg, 100);
     ASSERT_NE(dist, nullptr);
-    EXPECT_EQ(dist->KeyCount(), 100u);
+    EXPECT_EQ(dist->KeyCount(), 100U);
     const auto k = dist->Next();
-    EXPECT_LT(k, 100u);
+    EXPECT_LT(k, 100U);
   }
 }
 

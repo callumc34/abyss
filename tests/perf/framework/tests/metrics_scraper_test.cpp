@@ -29,7 +29,7 @@ TEST(MetricsScraperTest, IgnoresCommentsAndBlankLines) {
 abyss_x 99
 )";
   const auto m = MetricsScraper::ParseMetrics(body);
-  EXPECT_EQ(m.size(), 1u);
+  EXPECT_EQ(m.size(), 1U);
   EXPECT_DOUBLE_EQ(m.at("abyss_x"), 99.0);
 }
 
@@ -51,7 +51,7 @@ TEST(MetricsScraperTest, IgnoresMalformedLines) {
 valid_metric 17
 )";
   const auto m = MetricsScraper::ParseMetrics(body);
-  EXPECT_EQ(m.size(), 1u);
+  EXPECT_EQ(m.size(), 1U);
   EXPECT_DOUBLE_EQ(m.at("valid_metric"), 17.0);
 }
 

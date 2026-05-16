@@ -36,6 +36,7 @@ The cold consumer is the most interesting component. Rather than writing every u
 
 - [Architecture](design/architecture.md) — system design, component model, deployment profiles, TTL model
 - [Requirements](design/requirements.md) — performance targets, durability guarantees, design principles, milestones
+- [ADP-013: Performance Harness](design/proposals/013-performance-harness.md) — how Abyss measures itself against its targets
 
 ### Operations
 
@@ -47,3 +48,4 @@ The cold consumer is the most interesting component. Rather than writing every u
 
 - [Building](development/building.md) — build from source, presets, dependencies
 - [Testing](development/testing.md) — test strategy, running tests
+- [Performance](development/performance.md) — performance harness operating guide (probes, load gen, output schema, local-run caveats)

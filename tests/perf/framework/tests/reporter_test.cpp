@@ -42,7 +42,7 @@ TEST(ReporterTest, StatsFromHistogramComputesThroughput) {
   for (int64_t i = 1; i <= 1000; ++i) h.Record(i * 1000);
   const auto stats =
       StatsFromHistogram(h, 1000, std::chrono::nanoseconds{std::chrono::seconds{10}});
-  EXPECT_EQ(stats.count, 1000u);
+  EXPECT_EQ(stats.count, 1000U);
   EXPECT_DOUBLE_EQ(stats.throughput_ops, 100.0);
   EXPECT_GT(stats.p99_ns, stats.p50_ns);
   EXPECT_GT(stats.max_ns, 0);

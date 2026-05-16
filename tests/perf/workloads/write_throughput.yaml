@@ -1,0 +1,26 @@
+# Reference workload for authoritative runs on perf-grade hardware.
+# Closed-loop (target_rate_ops: 0) — will saturate every available core.
+# For developer-laptop exploration, copy this file, lower workers /
+# connections_per_worker / key_count, and set a finite target_rate_ops.
+# See docs/development/performance.md §Conditions of measurement.
+name: write-throughput
+description: 100% SET, uniform, closed-loop. Drives the >100K ops/s embedded write throughput target.
+duration_seconds: 60
+warmup_seconds: 10
+workers: 4
+connections_per_worker: 8
+target_rate_ops: 0
+key_count: 1000000
+key_distribution:
+  kind: uniform
+  seed: 1
+value_size_bytes: 64
+mix:
+  SET: 1.0
+preload:
+  enabled: false
+targets:
+  throughput_ops: 100000
+  per_op:
+    SET:
+      p99_us: 50

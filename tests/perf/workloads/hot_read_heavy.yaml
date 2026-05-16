@@ -1,0 +1,31 @@
+# Reference workload for authoritative runs on perf-grade hardware.
+# Closed-loop (target_rate_ops: 0) — will saturate every available core.
+# For developer-laptop exploration, copy this file, lower workers /
+# connections_per_worker / key_count, and set a finite target_rate_ops.
+# See docs/development/performance.md §Conditions of measurement.
+name: hot-read-heavy
+description: 95/5 GET/SET against a hot working set; zipfian skew (YCSB-A-ish, read-biased).
+duration_seconds: 60
+warmup_seconds: 10
+workers: 4
+connections_per_worker: 4
+target_rate_ops: 0
+key_count: 100000
+key_distribution:
+  kind: zipfian
+  theta: 0.99
+  seed: 42
+value_size_bytes: 64
+mix:
+  GET: 0.95
+  SET: 0.05
+preload:
+  enabled: true
+  key_count: 100000
+  value_size_bytes: 64
+targets:
+  per_op:
+    GET:
+      p99_us: 100
+    SET:
+      p99_us: 50

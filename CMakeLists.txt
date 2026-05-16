@@ -190,6 +190,13 @@ if(ABYSS_BUILD_PERF)
     URL "https://github.com/HdrHistogram/HdrHistogram_c"
     PURPOSE "Lossless latency recording for the performance harness"
   )
+  find_package(hiredis CONFIG REQUIRED)
+  set_package_properties(hiredis PROPERTIES
+    TYPE OPTIONAL
+    DESCRIPTION "Minimalistic C client for Redis"
+    URL "https://github.com/redis/hiredis"
+    PURPOSE "RESP client for the TCP load generator"
+  )
 endif()
 
 if(ABYSS_BUILD_TESTS)

@@ -28,6 +28,7 @@
     "perf": {
       "description": "Build the performance harness (probes, load generator, framework)",
       "dependencies": [
+        "hiredis",
         {
           "name": "hdr-histogram",
           "features": [

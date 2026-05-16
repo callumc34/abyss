@@ -5,6 +5,7 @@ add_executable(abyss_perf_framework_tests
   workload_test.cpp
   reporter_test.cpp
   metrics_scraper_test.cpp
+  run_loop_test.cpp
 )
 
 target_link_libraries(abyss_perf_framework_tests PRIVATE

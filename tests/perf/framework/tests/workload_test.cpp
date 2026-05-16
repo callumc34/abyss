@@ -45,8 +45,8 @@ TEST(WorkloadTest, ParsesValidYaml) {
   EXPECT_EQ(result->duration.count(), 60);
   EXPECT_EQ(result->warmup.count(), 10);
   EXPECT_EQ(result->workers, 4);
-  EXPECT_EQ(result->target_rate_ops, 100'000u);
-  EXPECT_EQ(result->key_count, 1'000'000u);
+  EXPECT_EQ(result->target_rate_ops, 100'000U);
+  EXPECT_EQ(result->key_count, 1'000'000U);
   EXPECT_EQ(result->key_distribution.kind, KeyDistConfig::Kind::kZipfian);
   EXPECT_DOUBLE_EQ(result->key_distribution.theta, 0.99);
   EXPECT_EQ(result->mix.weights.at("GET"), 0.95);

@@ -5,6 +5,7 @@ add_library(abyss_perf_framework
   workload.cpp
   reporter.cpp
   metrics_scraper.cpp
+  run_loop.cpp
 )
 add_library(abyss::perf_framework ALIAS abyss_perf_framework)
 
