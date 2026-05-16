@@ -232,11 +232,19 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 | Command | Arity | Class | Dispatch | Response |
 |---------|-------|-------|----------|----------|
 | `HSET key field value [field value ...]` | -4 | Write | Write | Integer (count of new fields) |
+| `HMSET key field value [field value ...]` | -4 | Write | Write | `+OK` (deprecated upstream; carried for client compatibility) |
 | `HDEL key field [field ...]` | -3 | Write | Write | Integer (count deleted) |
 | `HGET key field` | 3 | Read | TieredRead | Bulk or nil |
+| `HMGET key field [field ...]` | -3 | Read | TieredRead | Array (nil per missing field) |
+| `HEXISTS key field` | 3 | Read | TieredRead | Integer 0/1 |
 | `HGETALL key` | 2 | Read | TieredRead | Array |
+| `HKEYS key` | 2 | Read | TieredRead | Array of field names |
+| `HVALS key` | 2 | Read | TieredRead | Array of values |
+| `HLEN key` | 2 | Read | TieredRead | Integer (field count) |
 
-The remaining hash commands (`HEXISTS`, `HKEYS`, `HLEN`, `HMGET`, `HSETNX`, `HVALS`, `HINCRBY`, `HRANDFIELD`, `HSCAN`) are deferred until the corresponding store ops are exposed.
+`HSETNX` is registered separately under conditional writes. The remaining hash commands (`HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD`, `HSCAN`, `HSTRLEN`, `HEXPIRE` family) are deferred until the corresponding store ops are exposed.
+
+When the hot store does not hold the key — typical after eviction — multi-field hash reads (`HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HMGET`, `HEXISTS`) are answered by merging the compaction buffer's overlay with cold's persisted state in the tiering engine. The buffer alone never holds the complete picture for these reads: its hash-field map captures only net writes since the last flush. The merge enforces buffer-removed fields and buffer-overridden values without dropping cold-resident fields.
 
 **Generic / key management (direct key only):**
 

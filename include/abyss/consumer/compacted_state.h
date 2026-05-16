@@ -35,6 +35,9 @@ class CompactedState {
   // Del-tombstones surface via IsTombstone(), not these.
   bool HashHasField(std::string_view field) const;
   std::optional<std::string> HashFieldValue(std::string_view field) const;
+  // Snapshot accessors for multi-field hash reads
+  const std::unordered_map<std::string, std::string>& HashFields() const { return hash_fields_; }
+  const std::unordered_set<std::string>& HashRemovedFields() const { return hash_removed_fields_; }
   bool SetHasMember(std::string_view member) const;
   size_t SetCardinality() const { return set_members_.size(); }
   std::optional<double> ZsetMemberScore(std::string_view member) const;

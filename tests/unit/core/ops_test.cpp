@@ -134,6 +134,86 @@ TEST(ParseWriteOpTest, HsetRejectsOddFieldValues) {
   ASSERT_FALSE(op.has_value());
 }
 
+TEST(ParseWriteOpTest, ParsesHmset) {
+  RespCommand cmd{{"HMSET", "h", "f1", "v1", "f2", "v2"}};
+  auto op = ParseWriteOp("HMSET", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* hmset = std::get_if<HashMSet>(&*op);
+  ASSERT_NE(hmset, nullptr);
+  EXPECT_EQ(hmset->key, "h");
+  EXPECT_EQ(hmset->fields.size(), 2U);
+  EXPECT_EQ(hmset->fields[0].field, "f1");
+  EXPECT_EQ(hmset->fields[0].value, "v1");
+}
+
+TEST(ParseWriteOpTest, HmsetRejectsOddFieldValues) {
+  RespCommand cmd{{"HMSET", "h", "f1", "v1", "f2"}};
+  auto op = ParseWriteOp("HMSET", cmd);
+  ASSERT_FALSE(op.has_value());
+}
+
+TEST(ParseReadOpTest, ParsesHmget) {
+  RespCommand cmd{{"HMGET", "h", "f1", "f2", "f3"}};
+  auto op = ParseReadOp("HMGET", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* hmget = std::get_if<HashMultiGet>(&*op);
+  ASSERT_NE(hmget, nullptr);
+  EXPECT_EQ(hmget->key, "h");
+  EXPECT_EQ(hmget->fields.size(), 3U);
+}
+
+TEST(ParseReadOpTest, ParsesHexists) {
+  RespCommand cmd{{"HEXISTS", "h", "f"}};
+  auto op = ParseReadOp("HEXISTS", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* hex = std::get_if<HashFieldExists>(&*op);
+  ASSERT_NE(hex, nullptr);
+  EXPECT_EQ(hex->key, "h");
+  EXPECT_EQ(hex->field, "f");
+}
+
+TEST(ParseReadOpTest, ParsesHkeysHvalsHlen) {
+  {
+    RespCommand cmd{{"HKEYS", "h"}};
+    auto op = ParseReadOp("HKEYS", cmd);
+    ASSERT_TRUE(op.has_value());
+    auto* k = std::get_if<HashKeys>(&*op);
+    ASSERT_NE(k, nullptr);
+    EXPECT_EQ(k->key, "h");
+  }
+  {
+    RespCommand cmd{{"HVALS", "h"}};
+    auto op = ParseReadOp("HVALS", cmd);
+    ASSERT_TRUE(op.has_value());
+    auto* v = std::get_if<HashVals>(&*op);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->key, "h");
+  }
+  {
+    RespCommand cmd{{"HLEN", "h"}};
+    auto op = ParseReadOp("HLEN", cmd);
+    ASSERT_TRUE(op.has_value());
+    auto* l = std::get_if<HashLen>(&*op);
+    ASSERT_NE(l, nullptr);
+    EXPECT_EQ(l->key, "h");
+  }
+}
+
+TEST(PrimaryKeyTest, ExtractsFromNewHashReads) {
+  EXPECT_EQ(PrimaryKey(ReadOp{HashKeys{.key = "h"}}), "h");
+  EXPECT_EQ(PrimaryKey(ReadOp{HashVals{.key = "h"}}), "h");
+  EXPECT_EQ(PrimaryKey(ReadOp{HashLen{.key = "h"}}), "h");
+  EXPECT_EQ(PrimaryKey(ReadOp{HashFieldExists{.key = "h", .field = "f"}}), "h");
+  HashMultiGet hmget;
+  hmget.key = "h";
+  hmget.fields = {std::string_view("a"), std::string_view("b")};
+  EXPECT_EQ(PrimaryKey(ReadOp{hmget}), "h");
+}
+
+TEST(PrimaryKeyTest, ExtractsFromHashMSet) {
+  EXPECT_EQ(PrimaryKey(WriteOp{HashMSet{.key = "h"}}), "h");
+}
+
 TEST(PrimaryKeyTest, ExtractsFromReadOps) {
   EXPECT_EQ(PrimaryKey(ReadOp{StringGet{.key = "k"}}), "k");
   EXPECT_EQ(PrimaryKey(ReadOp{SetMembers{.key = "s"}}), "s");

@@ -328,11 +328,23 @@ constexpr auto kCommandTable = std::to_array<CommandSpec>({
     // Hashes
     Write("HSET", -4, D::kWritePath, 1, 1, 1,
           {"Sets fields in a hash.", "2.0.0", "hash", "O(N) over fields set"}),
+    Write("HMSET", -4, D::kWritePath, 1, 1, 1,
+          {"Sets fields in a hash; deprecated alias for multi-field HSET.", "2.0.0", "hash",
+           "O(N) over fields set"}),
     Write("HDEL", -3, D::kWritePath, 1, 1, 1,
           {"Deletes fields from a hash.", "2.0.0", "hash", "O(N) over fields deleted"}),
     Read("HGET", 3, 1, 1, 1, {"Returns the value of a hash field.", "2.0.0", "hash", "O(1)"}),
+    Read("HMGET", -3, 1, 1, 1,
+         {"Returns the values of multiple hash fields.", "2.0.0", "hash",
+          "O(N) over fields requested"}),
+    Read("HEXISTS", 3, 1, 1, 1, {"Tests whether a hash field exists.", "2.0.0", "hash", "O(1)"}),
     Read("HGETALL", 2, 1, 1, 1,
          {"Returns all fields and values of a hash.", "2.0.0", "hash", "O(N) over fields"}),
+    Read("HKEYS", 2, 1, 1, 1,
+         {"Returns all field names of a hash.", "2.0.0", "hash", "O(N) over fields"}),
+    Read("HVALS", 2, 1, 1, 1,
+         {"Returns all values of a hash.", "2.0.0", "hash", "O(N) over fields"}),
+    Read("HLEN", 2, 1, 1, 1, {"Returns the number of fields in a hash.", "2.0.0", "hash", "O(1)"}),
 
     // Generic / key management
     Write("DEL", -2, D::kWritePath, 1, -1, 1,

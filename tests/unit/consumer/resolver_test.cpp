@@ -34,6 +34,9 @@ class EmptyBufferRouter : public CompactionBufferRouter {
   core::Result<core::RespValue> Read(std::string_view /*key*/) const override {
     return std::unexpected(core::Error(core::ErrorCode::kNotFound, "empty buffer (test)"));
   }
+  consumer::HashOverlay HashOverlayFor(std::string_view /*key*/) const override {
+    return consumer::HashOverlay{};
+  }
 };
 
 class ResolverTest : public ::testing::Test {

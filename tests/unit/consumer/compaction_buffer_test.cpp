@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include "test_clock.h"
 
 namespace abyss::consumer {
@@ -9,6 +11,8 @@ namespace {
 
 using namespace std::chrono_literals;
 using core::ops::Del;
+using core::ops::HashDel;
+using core::ops::HashSet;
 using core::ops::SetAdd;
 using core::ops::StringSet;
 using core::ops::WriteOp;
@@ -597,6 +601,75 @@ TEST_F(CompactionBufferTest, ReinsertOverwritesNewerAbsorbForSameKey) {
   auto read = buffer_.Read("k");
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "old");
+}
+
+// ---------------------------------------------------------------------------
+// HashOverlay: snapshot accessor consumed by the engine merge path
+// ---------------------------------------------------------------------------
+
+TEST_F(CompactionBufferTest, HashOverlayReturnsNotPresentForAbsentKey) {
+  EXPECT_EQ(buffer_.HashOverlayFor("missing").kind, HashOverlay::Kind::kNotPresent);
+}
+
+TEST_F(CompactionBufferTest, HashOverlayReturnsHashStateAfterHashSet) {
+  buffer_.Absorb(
+      "h",
+      WriteOp{HashSet{.key = "h",
+                      .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}}},
+      kDefaultEviction);
+  const auto overlay = buffer_.HashOverlayFor("h");
+  ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
+  EXPECT_EQ(overlay.fields.size(), 2);
+  EXPECT_EQ(overlay.fields.at("a"), "1");
+  EXPECT_EQ(overlay.fields.at("b"), "2");
+  EXPECT_TRUE(overlay.removed_fields.empty());
+}
+
+TEST_F(CompactionBufferTest, HashOverlayTracksRemovedFields) {
+  buffer_.Absorb("h",
+                 WriteOp{HashSet{
+                     .key = "h",
+                     .fields = {{.field = "keep", .value = "v"}, {.field = "gone", .value = "v"}}}},
+                 kDefaultEviction);
+  buffer_.Absorb("h", WriteOp{HashDel{.key = "h", .fields = {"gone"}}}, kDefaultEviction);
+
+  const auto overlay = buffer_.HashOverlayFor("h");
+  ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
+  EXPECT_EQ(overlay.fields.size(), 1);
+  EXPECT_TRUE(overlay.fields.contains("keep"));
+  EXPECT_FALSE(overlay.fields.contains("gone"));
+  ASSERT_EQ(overlay.removed_fields.size(), 1);
+  EXPECT_TRUE(overlay.removed_fields.contains("gone"));
+}
+
+TEST_F(CompactionBufferTest, HashOverlayTombstoneAfterDel) {
+  buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "a", .value = "1"}}}},
+                 kDefaultEviction);
+  AbsorbDel("h");
+  EXPECT_EQ(buffer_.HashOverlayFor("h").kind, HashOverlay::Kind::kTombstone);
+}
+
+TEST_F(CompactionBufferTest, HashOverlayWrongTypeWhenKeyIsString) {
+  AbsorbString("h", "scalar");
+  EXPECT_EQ(buffer_.HashOverlayFor("h").kind, HashOverlay::Kind::kWrongType);
+}
+
+TEST_F(CompactionBufferTest, MultiFieldHashReadsDeferToEngine) {
+  buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "a", .value = "1"}}}},
+                 kDefaultEviction);
+  const std::array<core::ops::ReadOp, 6> ops{
+      core::ops::ReadOp{core::ops::HashGetAll{.key = "h"}},
+      core::ops::ReadOp{core::ops::HashKeys{.key = "h"}},
+      core::ops::ReadOp{core::ops::HashVals{.key = "h"}},
+      core::ops::ReadOp{core::ops::HashLen{.key = "h"}},
+      core::ops::ReadOp{core::ops::HashMultiGet{.key = "h", .fields = {"a"}}},
+      core::ops::ReadOp{core::ops::HashFieldExists{.key = "h", .field = "a"}},
+  };
+  for (const auto& op : ops) {
+    auto r = buffer_.Exec(op);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().code(), core::ErrorCode::kNotFound);
+  }
 }
 
 }  // namespace

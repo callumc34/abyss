@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <string_view>
 
 namespace abyss::resp {
@@ -88,6 +89,50 @@ TEST(CommandRegistryTest, ParentLoadingSafeOnlyAppliesAbsentSubcommand) {
   EXPECT_FALSE(reg.Find("GET")->loading_safe);
   EXPECT_FALSE(reg.Find("SET")->loading_safe);
   EXPECT_FALSE(reg.Find("DEL")->loading_safe);
+}
+
+TEST(CommandRegistryTest, HashCommandSurfaceRegistered) {
+  CommandRegistry reg;
+  struct Expected {
+    std::string_view name;
+    int arity;
+    CommandClass cls;
+    Dispatch dispatch;
+  };
+  constexpr std::array<Expected, 6> kExpected{{
+      {"HMGET", -3, CommandClass::kRead, Dispatch::kTieredRead},
+      {"HMSET", -4, CommandClass::kWrite, Dispatch::kWritePath},
+      {"HEXISTS", 3, CommandClass::kRead, Dispatch::kTieredRead},
+      {"HKEYS", 2, CommandClass::kRead, Dispatch::kTieredRead},
+      {"HVALS", 2, CommandClass::kRead, Dispatch::kTieredRead},
+      {"HLEN", 2, CommandClass::kRead, Dispatch::kTieredRead},
+  }};
+  for (const auto& e : kExpected) {
+    const auto* spec = reg.Find(e.name);
+    ASSERT_NE(spec, nullptr) << e.name;
+    EXPECT_EQ(spec->arity, e.arity) << e.name;
+    EXPECT_EQ(spec->cls, e.cls) << e.name;
+    EXPECT_EQ(spec->dispatch, e.dispatch) << e.name;
+    EXPECT_EQ(spec->first_key, 1) << e.name;
+    EXPECT_EQ(spec->last_key, 1) << e.name;
+    EXPECT_EQ(spec->key_step, 1) << e.name;
+  }
+}
+
+TEST(CommandRegistryTest, HmsetArityMismatch) {
+  CommandRegistry reg;
+  core::RespCommand too_few{{"HMSET", "h"}};
+  EXPECT_EQ(reg.Resolve(too_few).status, Status::kArityMismatch);
+  core::RespCommand ok{{"HMSET", "h", "f", "v"}};
+  EXPECT_EQ(reg.Resolve(ok).status, Status::kOk);
+}
+
+TEST(CommandRegistryTest, HmgetArityMismatch) {
+  CommandRegistry reg;
+  core::RespCommand too_few{{"HMGET", "h"}};
+  EXPECT_EQ(reg.Resolve(too_few).status, Status::kArityMismatch);
+  core::RespCommand ok{{"HMGET", "h", "f"}};
+  EXPECT_EQ(reg.Resolve(ok).status, Status::kOk);
 }
 
 TEST(CommandRegistryTest, ClusterSubcommandsCarryLoadingAllowlist) {

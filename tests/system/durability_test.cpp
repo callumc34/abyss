@@ -114,6 +114,21 @@ TEST_F(DurabilityTestFixture, ReadyEndpointReports200OnceRecoveryComplete) {
   EXPECT_NE(resp.body.find("recovery_complete: true"), std::string::npos);
 }
 
+TEST_F(DurabilityTestFixture, HmsetSurvivesCrashAndRestart) {
+  // HMSET is deprecated upstream but widely used; its persistence path must
+  // match multi-field HSET. After a kill the recovered hash should match what
+  // the client observed pre-crash.
+  EXPECT_TRUE(Client().Command({"HMSET", "h", "a", "1", "b", "2", "c", "3"}).IsOk());
+  KillAndRestartServer();
+
+  auto a = Client().Command({"HGET", "h", "a"});
+  ASSERT_TRUE(a.IsBulk());
+  EXPECT_EQ(a.String(), "1");
+  EXPECT_EQ(Client().Command({"HGET", "h", "b"}).String(), "2");
+  EXPECT_EQ(Client().Command({"HGET", "h", "c"}).String(), "3");
+  EXPECT_EQ(Client().Command({"HLEN", "h"}).Integer(), 3);
+}
+
 TEST_F(DurabilityTestFixture, StatusEndpointReportsCompleteRecoveryPhase) {
   // After recovery completes, /status reflects phase=complete with no
   // stuck progress markers. Confirms the StatusProvider wiring through

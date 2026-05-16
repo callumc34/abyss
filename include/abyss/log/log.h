@@ -65,7 +65,7 @@ class Logger {
   std::string_view Name() const noexcept;
 
  private:
-  friend Logger Get(std::string_view);
+  friend Logger Get(std::string_view component);
 
   struct Impl;
   const Impl* impl_ = nullptr;
@@ -79,7 +79,7 @@ Logger Get(std::string_view component);
 // Declare a translation-unit-scoped logger. Place once per .cpp, before any
 // ABYSS_LOG_* call. The implicit macros below reference kAbyssLog_.
 //
-// NOLINTBEGIN(cppcoreguidelines-macro-usage)
+// NOLINTBEGIN(cppcoreguidelines-macro-usage,bugprone-throwing-static-initialization)
 #define ABYSS_LOG_COMPONENT(name)                                  \
   namespace {                                                      \
   const ::abyss::log::Logger kAbyssLog_ = ::abyss::log::Get(name); \
@@ -114,6 +114,6 @@ Logger Get(std::string_view component);
   ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kError, MSG __VA_OPT__(, ) __VA_ARGS__)
 #define ABYSS_LOG_CRITICAL(MSG, ...) \
   ABYSS_LOG_EMIT_(kAbyssLog_, ::abyss::log::Level::kCritical, MSG __VA_OPT__(, ) __VA_ARGS__)
-// NOLINTEND(cppcoreguidelines-macro-usage)
+// NOLINTEND(cppcoreguidelines-macro-usage,bugprone-throwing-static-initialization)
 
 }  // namespace abyss::log

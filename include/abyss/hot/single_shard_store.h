@@ -83,6 +83,11 @@ class SingleShardStore {
   core::Result<core::RespValue> ExecZsetRange(const core::ops::ZsetRange& op) const;
   core::Result<core::RespValue> ExecHashGet(const core::ops::HashGet& op) const;
   core::Result<core::RespValue> ExecHashGetAll(const core::ops::HashGetAll& op) const;
+  core::Result<core::RespValue> ExecHashMultiGet(const core::ops::HashMultiGet& op) const;
+  core::Result<core::RespValue> ExecHashFieldExists(const core::ops::HashFieldExists& op) const;
+  core::Result<core::RespValue> ExecHashKeys(const core::ops::HashKeys& op) const;
+  core::Result<core::RespValue> ExecHashVals(const core::ops::HashVals& op) const;
+  core::Result<core::RespValue> ExecHashLen(const core::ops::HashLen& op) const;
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op) const;
 
   core::Result<core::RespValue> ApplyStringSet(const core::ops::StringSet& op,
@@ -96,6 +101,8 @@ class SingleShardStore {
   core::Result<core::RespValue> ApplyZsetRem(const core::ops::ZsetRem& op);
   core::Result<core::RespValue> ApplyHashSet(const core::ops::HashSet& op,
                                              core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyHashMSet(const core::ops::HashMSet& op,
+                                              core::EvictionTTL eviction);
   core::Result<core::RespValue> ApplyHashDel(const core::ops::HashDel& op);
   core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
                                                     core::EvictionTTL eviction);

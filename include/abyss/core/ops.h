@@ -59,6 +59,28 @@ struct HashGetAll {
   std::string_view key;
 };
 
+struct HashMultiGet {
+  std::string_view key;
+  std::vector<std::string_view> fields;
+};
+
+struct HashFieldExists {
+  std::string_view key;
+  std::string_view field;
+};
+
+struct HashKeys {
+  std::string_view key;
+};
+
+struct HashVals {
+  std::string_view key;
+};
+
+struct HashLen {
+  std::string_view key;
+};
+
 struct Exists {
   std::vector<std::string_view> keys;
 };
@@ -68,7 +90,8 @@ struct MultiStringGet {
 };
 
 using ReadOp = std::variant<StringGet, SetIsMember, SetMembers, SetCard, ZsetScore, ZsetCard,
-                            ZsetRange, HashGet, HashGetAll, Exists, MultiStringGet>;
+                            ZsetRange, HashGet, HashGetAll, HashMultiGet, HashFieldExists, HashKeys,
+                            HashVals, HashLen, Exists, MultiStringGet>;
 
 // --- Writes ---
 
@@ -115,6 +138,14 @@ struct HashSet {
   std::vector<FieldValue> fields;
 };
 
+// Identical payload to HashSet; distinct variant carries the +OK reply
+// semantic so the hot store's Apply produces SimpleString("OK") instead of
+// the per-field new-count integer that HSET requires.
+struct HashMSet {
+  std::string_view key;
+  std::vector<HashSet::FieldValue> fields;
+};
+
 struct HashDel {
   std::string_view key;
   std::vector<std::string_view> fields;
@@ -141,8 +172,8 @@ struct Persist {
   std::string_view key;
 };
 
-using WriteOp = std::variant<StringSet, Del, SetAdd, SetRem, ZsetAdd, ZsetRem, HashSet, HashDel,
-                             MultiStringSet, Expire, Persist>;
+using WriteOp = std::variant<StringSet, Del, SetAdd, SetRem, ZsetAdd, ZsetRem, HashSet, HashMSet,
+                             HashDel, MultiStringSet, Expire, Persist>;
 
 Result<ReadOp> ParseReadOp(std::string_view name, const RespCommand& cmd);
 Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd);
