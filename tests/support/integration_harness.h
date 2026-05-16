@@ -53,10 +53,9 @@ class IntegrationHarness {
 
     InstallQueueMocks();
 
-    core::EvictionPolicy eviction_policy{std::chrono::seconds{86400}};
     cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
-        eviction_policy, *rpc_, clock_.SteadyFn(), clock_.WallFn());
+        eviction_policy_, *rpc_, clock_.SteadyFn(), clock_.WallFn());
 
     engine_ = std::make_unique<engine::TieringEngine>(
         queue_, *hot_, *cold_, *cold_pool_, *rpc_,
@@ -72,7 +71,7 @@ class IntegrationHarness {
                                                                 .read_timeout = core::Duration{10},
                                                             },
                                                     },
-                                                    eviction_policy);
+                                                    eviction_policy_);
     hot_pool_->Start();
   }
 
@@ -166,6 +165,7 @@ class IntegrationHarness {
 
   std::filesystem::path tmp_dir_;
   TestClock clock_;
+  core::EvictionPolicy eviction_policy_{std::chrono::seconds{86400}};
   uint64_t next_seq_ = 1;
 
   ::testing::NiceMock<MockQueue> queue_;
