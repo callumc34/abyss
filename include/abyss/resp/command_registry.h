@@ -7,6 +7,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/resp/predicate_extractor.h"
 
@@ -56,6 +57,11 @@ struct CommandSpec {
 
   // For container commands the subcommand's loading_safe overrides this.
   bool loading_safe = false;
+
+  // Non-kNone signals the frontend to route through DispatchFanOut instead of
+  // DispatchRead/DispatchWrite. The kind picks the aggregator (array vs sum vs
+  // OK). Decomposition itself lives in the engine.
+  core::MultiKeyKind multi_key_kind = core::MultiKeyKind::kNone;
 
   CommandDocs docs{};
 

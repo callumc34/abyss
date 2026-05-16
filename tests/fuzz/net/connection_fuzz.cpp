@@ -61,6 +61,10 @@ class NoopDispatcher : public abyss::core::CommandDispatcher {
       abyss::core::PredicateFlags /*flags*/) override {
     return abyss::core::RespValue::SimpleString("OK");
   }
+  abyss::core::Result<abyss::core::RespValue> DispatchFanOut(
+      abyss::core::MultiKeyKind /*kind*/, abyss::core::RespCommand /*cmd*/) override {
+    return abyss::core::RespValue::SimpleString("OK");
+  }
 };
 
 void SetNonBlocking(int fd) {

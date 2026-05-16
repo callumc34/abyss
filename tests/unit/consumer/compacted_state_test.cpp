@@ -9,7 +9,6 @@ using core::ops::Del;
 using core::ops::HashDel;
 using core::ops::HashMSet;
 using core::ops::HashSet;
-using core::ops::MultiStringSet;
 using core::ops::SetAdd;
 using core::ops::SetRem;
 using core::ops::StringSet;
@@ -314,15 +313,6 @@ TEST_F(CompactedStateTest, ZsetAddOnHashTypeIgnored) {
   state_.Absorb(WriteOp{HashSet{.key = "k", .fields = {{.field = "f", .value = "v"}}}});
   state_.Absorb(WriteOp{ZsetAdd{.key = "k", .entries = {{.score = 1.0, .member = "a"}}}});
   EXPECT_EQ(state_.Type(), CompactedState::DataType::kHash);
-}
-
-// --- MultiStringSet ---
-
-TEST_F(CompactedStateTest, MultiStringSetTreatedAsIndividualSets) {
-  state_.Absorb(WriteOp{
-      MultiStringSet{.entries = {{.key = "k", .value = "v1"}, {.key = "k", .value = "v2"}}}});
-  EXPECT_EQ(state_.Type(), CompactedState::DataType::kString);
-  EXPECT_EQ(state_.StringValue(), "v2");
 }
 
 // --- Reset ---

@@ -18,13 +18,11 @@ TEST(ParseReadOpTest, ParsesGet) {
   EXPECT_EQ(get->key, "mykey");
 }
 
-TEST(ParseReadOpTest, ParsesMget) {
-  RespCommand cmd{{"MGET", "k1", "k2", "k3"}};
-  auto op = ParseReadOp("MGET", cmd);
-  ASSERT_TRUE(op.has_value());
-  auto* mget = std::get_if<MultiStringGet>(&*op);
-  ASSERT_NE(mget, nullptr);
-  EXPECT_EQ(mget->keys.size(), 3U);
+// MGET / EXISTS are decomposed in the engine before parse; ParseReadOp doesn't
+// know about them. See TieringEngine::DispatchFanOut.
+TEST(ParseReadOpTest, MgetNotRegistered) {
+  RespCommand cmd{{"MGET", "k1"}};
+  EXPECT_FALSE(ParseReadOp("MGET", cmd).has_value());
 }
 
 TEST(ParseReadOpTest, ParsesSismember) {
@@ -63,15 +61,9 @@ TEST(ParseWriteOpTest, ParsesDel) {
   EXPECT_EQ(del->keys.size(), 3U);
 }
 
-TEST(ParseWriteOpTest, ParsesMset) {
-  RespCommand cmd{{"MSET", "k1", "v1", "k2", "v2"}};
-  auto op = ParseWriteOp("MSET", cmd);
-  ASSERT_TRUE(op.has_value());
-  auto* mset = std::get_if<MultiStringSet>(&*op);
-  ASSERT_NE(mset, nullptr);
-  EXPECT_EQ(mset->entries.size(), 2U);
-  EXPECT_EQ(mset->entries[0].key, "k1");
-  EXPECT_EQ(mset->entries[1].value, "v2");
+TEST(ParseWriteOpTest, MsetNotRegistered) {
+  RespCommand cmd{{"MSET", "k1", "v1"}};
+  EXPECT_FALSE(ParseWriteOp("MSET", cmd).has_value());
 }
 
 TEST(ParseWriteOpTest, ParsesSadd) {
@@ -218,9 +210,10 @@ TEST(PrimaryKeyTest, ExtractsFromReadOps) {
   EXPECT_EQ(PrimaryKey(ReadOp{StringGet{.key = "k"}}), "k");
   EXPECT_EQ(PrimaryKey(ReadOp{SetMembers{.key = "s"}}), "s");
 
-  MultiStringGet mget;
-  mget.keys = {std::string_view("a"), std::string_view("b")};
-  EXPECT_EQ(PrimaryKey(ReadOp{mget}), "a");
+  Exists exists;
+  const auto keys = std::to_array<std::string_view>({"a", "b"});
+  exists.keys = {keys.begin(), keys.end()};
+  EXPECT_EQ(PrimaryKey(ReadOp{exists}), "a");
 }
 
 TEST(PrimaryKeyTest, ExtractsFromWriteOps) {

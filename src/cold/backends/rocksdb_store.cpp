@@ -236,8 +236,6 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
                                  std::optional<core::Duration> deadline) const;
   core::Result<RespValue> Handle(const core::ops::Exists& op,
                                  std::optional<core::Duration> deadline) const;
-  core::Result<RespValue> Handle(const core::ops::MultiStringGet& op,
-                                 std::optional<core::Duration> deadline) const;
 
   // Builds a rocksdb::ReadOptions with `.deadline` set when `deadline` is
   // present. `deadline` is interpreted as a relative duration from now.
@@ -256,8 +254,6 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   core::Result<void> Apply(const core::ops::HashSet& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::HashMSet& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::HashDel& op, rocksdb::WriteBatchWithIndex& wb) const;
-  core::Result<void> Apply(const core::ops::MultiStringSet& op,
-                           rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::Expire& op, rocksdb::WriteBatchWithIndex& wb) const;
   core::Result<void> Apply(const core::ops::Persist& op, rocksdb::WriteBatchWithIndex& wb) const;
 
@@ -884,18 +880,6 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   return RespValue::Integer(count);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::MultiStringGet& op,
-                                                   std::optional<core::Duration> deadline) const {
-  std::vector<RespValue> out;
-  out.reserve(op.keys.size());
-  for (auto key : op.keys) {
-    auto r = Handle(core::ops::StringGet{.key = key}, deadline);
-    if (!r.has_value()) return std::unexpected(r.error());
-    out.push_back(std::move(*r));
-  }
-  return RespValue::Array(std::move(out));
-}
-
 // --- Write handlers ---------------------------------------------------------
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::StringSet& op,
@@ -1098,15 +1082,6 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashDel& op,
   }
   if (removed == 0) return {};
   return ApplyMetaDelta(wb, fmt::kTypeHashField, op.key, -removed);
-}
-
-core::Result<void> RocksdbStore::Impl::Apply(const core::ops::MultiStringSet& op,
-                                             rocksdb::WriteBatchWithIndex& wb) const {
-  for (const auto& entry : op.entries) {
-    auto r = Apply(core::ops::StringSet{.key = entry.key, .value = entry.value}, wb);
-    if (!r.has_value()) return r;
-  }
-  return {};
 }
 
 namespace {

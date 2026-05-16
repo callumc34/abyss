@@ -236,27 +236,6 @@ bool ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::Sequence
     return false;
   }
 
-  // Multi-key ops expand into per-key absorbs; the buffer is keyed by single keys.
-  if (const auto* del = std::get_if<core::ops::Del>(&*op)) {
-    for (const auto key : del->keys) {
-      const std::string key_str(key);
-      auto eviction = eviction_policy_.Resolve(key_str);
-      core::ops::Del single{.keys = {key}};
-      buffer_.Absorb(key_str, core::ops::WriteOp{single}, eviction, seq);
-    }
-    return !del->keys.empty();
-  }
-
-  if (const auto* mset = std::get_if<core::ops::MultiStringSet>(&*op)) {
-    for (const auto& kv : mset->entries) {
-      const std::string key_str(kv.key);
-      auto eviction = eviction_policy_.Resolve(key_str);
-      core::ops::StringSet single{.key = kv.key, .value = kv.value, .abs_ttl_ms = 0};
-      buffer_.Absorb(key_str, core::ops::WriteOp{single}, eviction, seq);
-    }
-    return !mset->entries.empty();
-  }
-
   auto key = core::ops::PrimaryKey(*op);
   if (key.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
@@ -412,7 +391,7 @@ std::vector<core::ops::WriteOp> ColdConsumer::BuildBatchOps(
             using T = std::decay_t<decltype(typed)>;
             if constexpr (std::is_same_v<T, core::ops::Del>) {
               typed.keys = {entry.key};
-            } else if constexpr (!std::is_same_v<T, core::ops::MultiStringSet>) {
+            } else {
               typed.key = entry.key;
             }
           },

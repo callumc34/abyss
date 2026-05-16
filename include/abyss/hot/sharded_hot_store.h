@@ -61,11 +61,8 @@ class ShardedHotStore : public core::HotStore {
   Shard& ShardFor(std::string_view key);
   core::EvictionTTL ResolveEviction(std::string_view key) const;
 
-  core::Result<core::RespValue> ExecMultiStringGet(const core::ops::MultiStringGet& op);
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
-
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op);
-  core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op);
 
   ShardedHotStoreConfig config_;
   // Fallback when config_.eviction_policy is null; keeps Resolve() infallible.

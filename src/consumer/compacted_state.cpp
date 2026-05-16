@@ -132,13 +132,6 @@ struct AbsorbVisitor {
       hash_removed_fields.insert(std::move(field));
     }
   }
-
-  void operator()(const core::ops::MultiStringSet& ms) {
-    for (const auto& e : ms.entries) {
-      const core::ops::StringSet single{.key = e.key, .value = e.value, .abs_ttl_ms = 0};
-      (*this)(single);
-    }
-  }
 };
 
 }  // namespace

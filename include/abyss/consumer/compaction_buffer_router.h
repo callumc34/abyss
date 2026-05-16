@@ -28,6 +28,8 @@ class CompactionBufferRouter : public core::Reader {
 
   virtual core::Result<core::RespValue> Read(std::string_view key) const = 0;
 
+  virtual BufferKeyPresence Probe(std::string_view key) const = 0;
+
   virtual HashOverlay HashOverlayFor(std::string_view key) const = 0;
 };
 

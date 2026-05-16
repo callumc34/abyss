@@ -98,35 +98,6 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
           return core::RespValue::Integer(count);
         }
 
-        if constexpr (std::is_same_v<T, core::ops::MultiStringGet>) {
-          std::vector<core::RespValue> out;
-          out.reserve(read.keys.size());
-          bool any_definitive = false;
-          for (auto key : read.keys) {
-            auto it = entries_.find(std::string(key));
-            if (it == entries_.end()) {
-              // Any miss → engine composes per-element across tiers.
-              return std::unexpected(
-                  core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
-            }
-            const auto& state = it->second.state;
-            if (state.IsTombstone() || is_expired(state)) {
-              out.push_back(core::RespValue::Null());
-            } else if (state.Type() == CompactedState::DataType::kString) {
-              out.push_back(core::RespValue::BulkString(state.StringValue()));
-            } else {
-              return std::unexpected(
-                  core::Error(core::ErrorCode::kWrongType, "buffered key is not a string"));
-            }
-            any_definitive = true;
-          }
-          if (!any_definitive) {
-            return std::unexpected(
-                core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
-          }
-          return core::RespValue::Array(std::move(out));
-        }
-
         auto key = core::ops::PrimaryKey(core::ops::ReadOp{read});
         auto it = entries_.find(std::string(key));
         if (it == entries_.end()) {
@@ -206,6 +177,23 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
 
 core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const {
   return Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
+}
+
+BufferKeyPresence CompactionBuffer::Probe(std::string_view key) const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  const auto it = entries_.find(std::string(key));
+  if (it == entries_.end()) return BufferKeyPresence::kAbsent;
+
+  const auto& state = it->second.state;
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(wall_clock_().time_since_epoch())
+          .count());
+  const uint64_t ttl = state.AbsTtlMs();
+  const bool ttl_expired = ttl > 0 && ttl <= now_ms;
+  if (state.IsTombstone() || ttl_expired) return BufferKeyPresence::kTombstoned;
+  if (state.Type() == CompactedState::DataType::kNone) return BufferKeyPresence::kAbsent;
+  return BufferKeyPresence::kPresent;
 }
 
 HashOverlay CompactionBuffer::HashOverlayFor(std::string_view key) const

@@ -374,9 +374,18 @@ Invariant: **slot computation is phase-invariant**. `CLUSTER KEYSLOT` always ret
 
 ### Multi-Key Commands
 
-Commands like `MGET` and `MSET` span multiple keys which may target different shards.
+`MGET`, `MSET`, `DEL`, `UNLINK`, and `EXISTS` accept multiple keys that may target different shards. The registry tags each one with a `MultiKeyKind` (kMget / kMset / kDelete / kExists); the request pipeline routes those through `CommandDispatcher::DispatchFanOut`, and the engine decomposes per key before queueing or aggregating. `MSETNX` is the exception — it is conditional and routes through the Resolver instead.
 
-**Single-pod (Phase 1):** All keys are local. `MGET` fans out across hot, buffer, and cold per key and assembles the response. `MSET` decomposes into per-key `Write` queue entries. There is no cross-key atomicity guarantee for `MSET` — a crash mid-decomposition may persist some keys but not others. This matches DragonflyDB's behaviour under internal sharding and is consistent with how Redis Cluster clients handle cross-slot fan-out.
+**Single-pod (Phase 1):** All keys are local. The engine decomposes:
+
+- `MGET k1 k2 ...` → per-key single-key reads across hot → buffer → cold (tombstone-aware), assembled positionally. A `WRONGTYPE` on any key collapses to nil at that slot, matching Redis behaviour.
+- `MSET k1 v1 k2 v2 ...` → N `SET` `Write` queue entries, each appended to its owning shard's WAL.
+- `DEL` / `UNLINK k1 k2 ...` → N single-key `DEL` `Write` queue entries; per-key integer replies are summed.
+- `EXISTS k1 k2 ...` → per-key existence probe across hot → buffer → cold; the buffer probe overrides cold (a not-yet-flushed `DEL` reports the key as absent even if cold still holds a residual). Duplicate keys are counted once each, matching Redis.
+
+There is no cross-key atomicity guarantee for `MSET`, `DEL`, or `UNLINK` — a crash or partial failure mid-decomposition may persist some keys but not others. The client receives an error and may retry. This matches DragonflyDB's behaviour under internal sharding and is consistent with how Redis Cluster clients handle cross-slot fan-out.
+
+For partial failures specifically: if one sub-command's `BeginAppend` fails after prior subs succeeded, the prior pendings still auto-publish on scope exit (their destructor calls `Publish`) — the queue durably absorbs them, the responsible consumers apply them, and the client sees the first error. Subsequent reads observe the partial state.
 
 `MSETNX` is a conditional multi-key write — routed to the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)), which evaluates existence of all keys atomically under shard-striped locks and emits a single `Resolved` entry that either applies all sets or none.
 

@@ -150,37 +150,8 @@ TEST_F(ColdConsumerTest, DrainCountsParseFailuresAndContinues) {
   EXPECT_EQ(c->Snapshot().parse_failures, 1U);
 }
 
-TEST_F(ColdConsumerTest, DrainExpandsMultiKeyDel) {
-  auto c = MakeConsumer();
-
-  std::vector<core::QueueEntry> entries;
-  entries.push_back(MakeWriteEntry(1, {"DEL", "a", "b", "c"}));
-
-  EXPECT_CALL(queue_, Read(_, _, _, _))
-      .WillOnce(Return(entries))
-      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
-
-  c->Drain();
-  c->Flush();
-
-  EXPECT_EQ(c->Buffer().Size(), 3);
-}
-
-TEST_F(ColdConsumerTest, DrainExpandsMset) {
-  auto c = MakeConsumer();
-
-  std::vector<core::QueueEntry> entries;
-  entries.push_back(MakeWriteEntry(1, {"MSET", "a", "1", "b", "2"}));
-
-  EXPECT_CALL(queue_, Read(_, _, _, _))
-      .WillOnce(Return(entries))
-      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
-
-  c->Drain();
-  c->Flush();
-
-  EXPECT_EQ(c->Buffer().Size(), 2);
-}
+// Multi-key DEL/MSET WAL entries no longer occur — the engine decomposes
+// before queueing. Per-key absorption is covered by the SET path tests.
 
 // --- Flush path ---------------------------------------------------------------
 
