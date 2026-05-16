@@ -65,8 +65,10 @@ WalEntryType EntryType(const core::QueueEntry& entry) {
           return WalEntryType::kWrite;
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
           return WalEntryType::kConditional;
-        } else {
+        } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
           return WalEntryType::kResolved;
+        } else {
+          return WalEntryType::kFlush;
         }
       },
       entry.payload);
@@ -106,6 +108,8 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last
             WriteRespCommand(out, op);
           }
           WriteRespValue(out, p.return_value);
+        } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+          // No payload.
         }
       },
       entry.payload);
@@ -231,6 +235,9 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
       };
       break;
     }
+    case WalEntryType::kFlush:
+      qe.payload = core::entry::Flush{};
+      break;
     default:
       return std::unexpected(Corrupted("unknown entry type"));
   }

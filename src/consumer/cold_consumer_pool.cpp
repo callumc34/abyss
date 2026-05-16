@@ -12,15 +12,15 @@ namespace abyss::consumer {
 
 ColdConsumerPool::ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
                                    const core::EvictionPolicy& eviction_policy,
-                                   const core::SteadyClockFn& steady_clock,
+                                   core::ConsumerRpc& rpc, const core::SteadyClockFn& steady_clock,
                                    const core::WallClockFn& wall_clock) {
   if (config.shard_count == 0) {
     throw std::invalid_argument("ColdConsumerPool requires shard_count >= 1");
   }
   consumers_.reserve(config.shard_count);
   for (uint32_t shard = 0; shard < config.shard_count; ++shard) {
-    consumers_.push_back(std::make_unique<ColdConsumer>(queue, cold_store, shard, config.consumer,
-                                                        eviction_policy, steady_clock, wall_clock));
+    consumers_.push_back(std::make_unique<ColdConsumer>(
+        queue, cold_store, shard, config.consumer, eviction_policy, rpc, steady_clock, wall_clock));
   }
 }
 

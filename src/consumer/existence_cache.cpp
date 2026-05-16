@@ -209,6 +209,15 @@ void ExistenceCache::RemoveField(std::string_view key, std::string_view field) {
   EvictEntry(it->second, EvictionReason::kCapacity);
 }
 
+void ExistenceCache::Clear() {
+  const std::scoped_lock lock(mu_);
+  entries_.clear();
+  key_index_.clear();
+  member_index_.clear();
+  field_index_.clear();
+  bytes_ = 0;
+}
+
 size_t ExistenceCache::SweepExpired() {
   const std::scoped_lock lock(mu_);
   const auto now = clock_();

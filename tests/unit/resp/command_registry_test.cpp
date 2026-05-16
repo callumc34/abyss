@@ -40,10 +40,19 @@ TEST(CommandRegistryTest, UnknownCommandReturnsNull) {
   EXPECT_EQ(reg.Find("GIBBERISH"), nullptr);
 }
 
-TEST(CommandRegistryTest, FlushallAndFlushdbAreNotRegistered) {
+TEST(CommandRegistryTest, FlushallAndFlushdbAreRegisteredAsFlushDispatch) {
   CommandRegistry reg;
-  EXPECT_EQ(reg.Find("FLUSHALL"), nullptr);
-  EXPECT_EQ(reg.Find("FLUSHDB"), nullptr);
+  const auto* flushdb = reg.Find("FLUSHDB");
+  ASSERT_NE(flushdb, nullptr);
+  EXPECT_EQ(flushdb->cls, CommandClass::kAdmin);
+  EXPECT_EQ(flushdb->dispatch, Dispatch::kFlush);
+  EXPECT_FALSE(flushdb->loading_safe);
+
+  const auto* flushall = reg.Find("FLUSHALL");
+  ASSERT_NE(flushall, nullptr);
+  EXPECT_EQ(flushall->cls, CommandClass::kAdmin);
+  EXPECT_EQ(flushall->dispatch, Dispatch::kFlush);
+  EXPECT_FALSE(flushall->loading_safe);
 }
 
 TEST(CommandRegistryTest, ConditionalWritesAreMarked) {

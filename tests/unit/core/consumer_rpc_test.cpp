@@ -205,5 +205,32 @@ TEST(ConsumerRpcTest, DefaultTimeoutAccessible) {
   EXPECT_EQ(rpc.default_timeout(), 250ms);
 }
 
+TEST(ConsumerRpcTest, MakeFlushRpcIdDisjointFromMakeRpcId) {
+  for (ShardId shard = 0; shard < 4; ++shard) {
+    for (SequenceId seq : {SequenceId{0}, SequenceId{1}, SequenceId{1'000'000}}) {
+      const auto write_id = MakeRpcId(shard, seq);
+      const auto hot_flush_id = MakeFlushRpcId(kHotConsumer, shard, seq);
+      const auto cold_flush_id = MakeFlushRpcId(kColdConsumer, shard, seq);
+      const auto resolver_flush_id = MakeFlushRpcId(kResolverConsumer, shard, seq);
+      EXPECT_EQ(write_id & kFlushRpcTagBit, 0U);
+      EXPECT_NE(hot_flush_id & kFlushRpcTagBit, 0U);
+      EXPECT_NE(hot_flush_id, write_id);
+      EXPECT_NE(hot_flush_id, cold_flush_id);
+      EXPECT_NE(hot_flush_id, resolver_flush_id);
+      EXPECT_NE(cold_flush_id, resolver_flush_id);
+    }
+  }
+}
+
+TEST(ConsumerRpcTest, MakeFlushRpcIdRoundTripsThroughRegistry) {
+  ConsumerRpc rpc;
+  const auto id = MakeFlushRpcId(kColdConsumer, 7, 42);
+  auto fut = rpc.Register(id);
+  EXPECT_TRUE(rpc.Fulfill(id, RespValue::SimpleString("OK")));
+  auto val = fut.get();
+  EXPECT_TRUE(val.IsSimpleString());
+  EXPECT_EQ(val.AsString(), "OK");
+}
+
 }  // namespace
 }  // namespace abyss::core

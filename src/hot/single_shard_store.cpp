@@ -721,7 +721,7 @@ core::MemoryStats SingleShardStore::Stats() const {
   return {.used_bytes = used_bytes_, .key_count = key_count_, .eviction_count = eviction_count_};
 }
 
-void SingleShardStore::Flush() {
+void SingleShardStore::Wipe() {
   entries_.clear();
   used_bytes_ = 0;
   key_count_ = 0;

@@ -70,6 +70,10 @@ class ExistenceCache {
 
   size_t SweepExpired() ABYSS_EXCLUDES(mu_);
 
+  // Drops every cache entry. Used by the FLUSHDB path. Cumulative eviction
+  // counters are preserved.
+  void Clear() ABYSS_EXCLUDES(mu_);
+
   size_t Size() const ABYSS_EXCLUDES(mu_);
   size_t BytesEstimate() const ABYSS_EXCLUDES(mu_);
   uint64_t EvictionsTtl() const noexcept;

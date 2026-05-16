@@ -192,6 +192,7 @@ consumer_rpc:
 6. Consumer RPC IDs are globally unique: writes and conditionals use the queue `SequenceId`; non-write RPCs use a separate monotonic counter with a distinguishing tag.
 7. `Resolved` entries applied by hot and cold take effect at the `Conditional`'s seq position, not the `Resolved`'s seq position. Queue order is preserved.
 8. The write/conditional-write client path is not acknowledged until the queue fsync completes AND the responsible consumer fulfils the Consumer RPC.
+9. `Resolved` whose `ref` is less than the latest applied `Flush` seq on a consumer is a no-op for state. Both ends of the Conditional/Resolved pair land on the wiped side of the Flush boundary, so the materialised ops are discarded. The Resolver, on observing a `Flush` mid-replay, emits Skip Resolveds for pre-Flush dangling Conditionals so hot and cold's block-and-scan can advance — those Resolveds carry no materialised ops and are dropped under this invariant on arrival.
 
 ## Trade-offs
 

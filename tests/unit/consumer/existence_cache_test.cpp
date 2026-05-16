@@ -133,5 +133,35 @@ TEST(ExistenceCacheTest, LargeStringValueDropsSnapshot) {
   EXPECT_FALSE(got->string_value.has_value());
 }
 
+TEST(ExistenceCacheTest, ClearDropsAllEntriesAcrossKinds) {
+  FakeClock clock;
+  ExistenceCache cache(DefaultConfig(), clock.Fn());
+  cache.UpsertKey("k1", ExistenceCache::KeyMeta{.exists = true,
+                                                .type = ExistenceCache::KeyType::kString,
+                                                .latest_seq = 1,
+                                                .string_value = std::string("v")});
+  cache.UpsertMember("zset", "m", ExistenceCache::MemberMeta{.score = 1.5, .latest_seq = 2});
+  cache.UpsertField(
+      "hash", "f",
+      ExistenceCache::FieldMeta{.value = std::string("v"), .value_known = true, .latest_seq = 3});
+  ASSERT_GT(cache.Size(), 0U);
+  ASSERT_GT(cache.BytesEstimate(), 0U);
+
+  cache.Clear();
+
+  EXPECT_EQ(cache.Size(), 0U);
+  EXPECT_EQ(cache.BytesEstimate(), 0U);
+  EXPECT_FALSE(cache.GetKey("k1").has_value());
+  EXPECT_FALSE(cache.GetMember("zset", "m").has_value());
+  EXPECT_FALSE(cache.GetField("hash", "f").has_value());
+}
+
+TEST(ExistenceCacheTest, ClearOnEmptyIsNoOp) {
+  FakeClock clock;
+  ExistenceCache cache(DefaultConfig(), clock.Fn());
+  cache.Clear();
+  EXPECT_EQ(cache.Size(), 0U);
+}
+
 }  // namespace
 }  // namespace abyss::consumer

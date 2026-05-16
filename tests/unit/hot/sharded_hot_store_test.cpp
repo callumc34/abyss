@@ -104,13 +104,13 @@ TEST_F(ShardedHotStoreTest, StatsAggregated) {
   EXPECT_GT(stats->used_bytes, 0U);
 }
 
-// --- Flush ---
+// --- Wipe ---
 
-TEST_F(ShardedHotStoreTest, FlushClearsAllShards) {
+TEST_F(ShardedHotStoreTest, WipeClearsAllShards) {
   for (int i = 0; i < 100; ++i) {
     SetString("key:" + std::to_string(i), "val");
   }
-  ASSERT_TRUE(store_.Flush().has_value());
+  ASSERT_TRUE(store_.Wipe().has_value());
 
   auto stats = store_.Stats();
   EXPECT_EQ(stats->key_count, 0U);

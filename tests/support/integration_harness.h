@@ -56,7 +56,7 @@ class IntegrationHarness {
     core::EvictionPolicy eviction_policy{std::chrono::seconds{86400}};
     cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
-        eviction_policy, clock_.SteadyFn(), clock_.WallFn());
+        eviction_policy, *rpc_, clock_.SteadyFn(), clock_.WallFn());
 
     engine_ = std::make_unique<engine::TieringEngine>(
         queue_, *hot_, *cold_, *cold_pool_, *rpc_,

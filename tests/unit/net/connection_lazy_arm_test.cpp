@@ -41,6 +41,9 @@ class EchoDispatcher : public core::CommandDispatcher {
                                                core::RespCommand /*cmd*/) override {
     return core::RespValue::SimpleString("OK");
   }
+  core::Result<core::RespValue> DispatchFlush(core::FlushTarget /*target*/) override {
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 class ConnectionLazyArmTest : public ::testing::Test {

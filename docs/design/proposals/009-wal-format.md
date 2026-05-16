@@ -88,11 +88,14 @@ Fixed envelope cost: 37 bytes per entry at format 1.1, plus 4 bytes per argument
 | `0`   | `Write` — unconditional RESP command | None beyond `arg_count`/args |
 | `1`   | `Conditional` — RESP command + predicate. See [ADP-011](011-conditional-writes-and-consumer-rpc.md). | Predicate tag + predicate-specific args, appended after args |
 | `2`   | `Resolved` — decision for a prior `Conditional`. See [ADP-011](011-conditional-writes-and-consumer-rpc.md). | Ref seq (u64), decision (u8), optional materialised RESP command, optional return value (RESP2-serialised) |
-| `3–255` | Reserved for future use | |
+| `3`   | `Flush` — FLUSHDB / FLUSHALL tombstone. See [ADP-006](006-read-write-paths.md) §Broadcast write path. | None — the type byte alone is the entry. `arg_count` is zero. |
+| `4–255` | Reserved for future use | |
 
-All three entry types are part of Format 1.0. Abyss is pre-alpha and greenfield — no deployed WAL exists outside development, so there is no backward-compatibility burden. The initial WAL implementation may land support for the types incrementally (type=0 first, then 1 and 2 alongside the Resolver), but the format-version surface is fixed from the start. Byte-level layouts for `Conditional` and `Resolved` are specified in a follow-up PR that lands with the Resolver implementation; the type-byte assignments are pinned here so ADP-001 and ADP-011 can reference stable values without cross-doc drift.
+All four entry types are part of Format 1. Abyss is pre-alpha and greenfield — no deployed WAL exists outside development, so there is no backward-compatibility burden. The initial WAL implementation may land support for the types incrementally (type=0 first, then 1 and 2 alongside the Resolver, then 3 alongside FLUSHDB), but the format-version surface is fixed from the start. Byte-level layouts for `Conditional` and `Resolved` are specified in a follow-up PR that lands with the Resolver implementation; the type-byte assignments are pinned here so ADP-001 and ADP-011 can reference stable values without cross-doc drift.
 
-Post-alpha, the major/minor compatibility rules in the Schema Evolution section become binding and any new entry type that older readers cannot safely skip (analogous to `Conditional`/`Resolved`'s pairing dependency) requires a major version bump.
+`Flush` is a "cannot safely skip" entry — a reader that ignored it would surface keys the wipe has already removed. Strict post-alpha rules (§Schema evolution) would require a major bump to introduce it. Pre-alpha we keep `format_major = 1` and `format_minor = 1`: there is no deployed reader to fall behind. Post-alpha, any further entry type with the same skip-unsafe profile triggers a major bump.
+
+Post-alpha, the major/minor compatibility rules in the Schema Evolution section become binding and any new entry type that older readers cannot safely skip (analogous to `Conditional`/`Resolved`'s pairing dependency, or `Flush`'s wipe semantics) requires a major version bump.
 
 ### Integrity: CRC32C
 

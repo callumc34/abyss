@@ -99,10 +99,14 @@ class IsolatedDataServerTest : public IsolatedServerTest {
   void SetUp() override;
 };
 
-// TODO: Once FLUSHDB lands, fold this back into a shared-server fixture (one
-// server per TEST_F class, FLUSHDB in SetUp) so data-tier tests don't pay
-// per-test server startup cost. Until then we use per-test isolation —
-// correct but expensive, ~1.5s/test × N tests.
-using DataCommandTest = IsolatedDataServerTest;
+// Class-shared server with FLUSHDB-in-SetUp for keyspace isolation. Tests that
+// restart the server or assert against non-keyspace state must use the
+// `Isolated*` fixtures directly.
+class SharedDataServerTest : public SystemTest {
+ protected:
+  void SetUp() override;
+};
+
+using DataCommandTest = SharedDataServerTest;
 
 }  // namespace abyss::system_test

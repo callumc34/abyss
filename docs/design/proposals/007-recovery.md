@@ -79,6 +79,7 @@ Pod starts
 - For the hot store: replays everything within the eviction window that hasn't absolutely expired. The hot store is fully reconstructed from the queue without reading cold.
 - **The cold store is never read during recovery.** Recovery is purely queue replay.
 - Cold replay benefits from the compaction buffer — recovery write volume to cold is bounded by unique keys, not total queue entries.
+- **`entry::Flush` during replay.** Hot wipes its store and drops any pending Conditionals at seq < Flush.seq. Cold drops its compaction buffer and issues a full-store wipe on the cold backend. Resolver clears its existence cache and emits Skip Resolveds for pre-Flush dangling Conditionals so hot/cold's block-and-scan can advance past them. While the Resolver is in replay mode and has observed a Flush at seq `F`, dangling Conditionals at seq > F are decided cache-only — the cold tier on disk reflects pre-Flush state until cold replay runs (which is sequenced after resolver replay), so a cache miss is treated as definitively absent rather than falling through to stale cold data.
 
 ### Replay Ordering
 

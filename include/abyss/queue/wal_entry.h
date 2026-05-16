@@ -18,6 +18,7 @@ enum class WalEntryType : uint8_t {
   kWrite = 0x00,
   kConditional = 0x01,
   kResolved = 0x02,
+  kFlush = 0x03,
 };
 
 struct DecodedWalEntry {

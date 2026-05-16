@@ -61,6 +61,10 @@ class StubDispatcher : public core::CommandDispatcher {
     write_calls.fetch_add(1);
     return core::RespValue::SimpleString("OK");
   }
+  core::Result<core::RespValue> DispatchFlush(core::FlushTarget /*target*/) override {
+    write_calls.fetch_add(1);
+    return core::RespValue::SimpleString("OK");
+  }
 };
 
 TcpServerConfig DefaultTestConfig() {

@@ -22,9 +22,11 @@ constexpr size_t kDefaultLowWaterDenominator = 4;
 
 ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard,
                            Config config, const core::EvictionPolicy& eviction_policy,
-                           core::SteadyClockFn steady_clock, core::WallClockFn wall_clock)
+                           core::ConsumerRpc& rpc, core::SteadyClockFn steady_clock,
+                           core::WallClockFn wall_clock)
     : queue_(queue),
       cold_store_(cold_store),
+      rpc_(rpc),
       shard_(shard),
       config_(config),
       eviction_policy_(eviction_policy),
@@ -97,10 +99,14 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
           } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
             HandleResolved(entry, payload);
             ++count;
+          } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+            HandleFlush(entry);
+            ++count;
           }
         },
         entry.payload);
     latest_drained_seq_.store(seq, std::memory_order_release);
+    drained_anything_ = true;
   }
   return count;
 }
@@ -109,6 +115,19 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
                                              const std::atomic<bool>& cancel) {
   ABYSS_LOG_INFO("cold replay starting", {"shard", static_cast<int64_t>(shard_)},
                  {"target_seq", static_cast<uint64_t>(target)});
+
+  // Seed from the persisted ack offset; otherwise prior-run acks would leave
+  // latest_drained_seq_ stuck below target and the drain loop would spin.
+  if (auto offset = queue_.AckOffset(core::kColdConsumer, shard_); offset.has_value()) {
+    if (*offset > latest_drained_seq_.load(std::memory_order_acquire)) {
+      latest_drained_seq_.store(*offset, std::memory_order_release);
+    }
+    if (*offset > last_ack_seq_.load(std::memory_order_acquire)) {
+      last_ack_seq_.store(*offset, std::memory_order_release);
+      first_ack_recorded_ = true;
+      drained_anything_ = true;
+    }
+  }
 
   // Drain to target. Drive progress on the read result rather than the
   // post-condition: latest_drained_seq starts at 0 and target may also be 0
@@ -145,10 +164,13 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
               HandleConditional(entry, payload);
             } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
               HandleResolved(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+              HandleFlush(entry);
             }
           },
           entry.payload);
       latest_drained_seq_.store(seq, std::memory_order_release);
+      drained_anything_ = true;
     }
 
     if (buffer_.BytesEstimate() >= config_.buffer_high_water_bytes) {
@@ -202,7 +224,10 @@ void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry:
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  AbsorbResolvedOp(write.cmd, entry.seq);
+  const uint64_t wall_now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
+          .count());
+  AbsorbResolvedOp(write.cmd, entry.seq, wall_now_ms);
 }
 
 void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
@@ -213,24 +238,71 @@ void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
       seq, PendingConditional{.seq = seq, .received_at = std::chrono::steady_clock::now()});
 }
 
-void ColdConsumer::HandleResolved(const core::QueueEntry& /*entry*/,
+void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
                                   const core::entry::Resolved& resolved) {
   {
     const std::scoped_lock lock(pending_mu_);
     pending_conditionals_.erase(resolved.ref);
   }
+  // Drop if the Conditional ref lives on the wiped side of a Flush.
+  const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
+  if (flush_high > 0 && resolved.ref < flush_high) return;
   if (resolved.decision != core::Decision::kApply) return;
+  // Materialised ops use PXAT so wall_now_ms is unused; pass appended_at for symmetry.
+  const uint64_t wall_now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
+          .count());
   for (const auto& cmd : resolved.materialised_ops) {
     if (cmd.args.empty()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-    AbsorbResolvedOp(cmd, resolved.ref);
+    AbsorbResolvedOp(cmd, resolved.ref, wall_now_ms);
   }
 }
 
-bool ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq) {
-  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd);
+void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
+  ABYSS_LOG_DEBUG("cold HandleFlush", {"shard", static_cast<int64_t>(shard_)},
+                  {"seq", static_cast<uint64_t>(entry.seq)});
+  buffer_.Clear();
+
+  // Erase pre-Flush pending Conditionals so block-and-scan doesn't stall on
+  // them. The client-facing RPC is cancelled by the hot consumer.
+  {
+    const std::scoped_lock lock(pending_mu_);
+    for (auto it = pending_conditionals_.begin(); it != pending_conditionals_.end();) {
+      if (it->first < entry.seq) {
+        it = pending_conditionals_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  auto wiped = cold_store_.Wipe();
+  if (!wiped.has_value()) {
+    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+    ABYSS_LOG_ERROR("cold wipe failed", {"shard", static_cast<int64_t>(shard_)},
+                    {"seq", static_cast<uint64_t>(entry.seq)},
+                    {"err", std::string_view{wiped.error().message()}});
+    const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
+    rpc_.Fulfill(rpc_id,
+                 core::RespValue::Error(core::ErrorPrefix::kErr,
+                                        "cold store wipe failed: " + wiped.error().message()));
+    return;
+  }
+
+  latest_flush_seq_.store(entry.seq, std::memory_order_release);
+  flushes_applied_.fetch_add(1, std::memory_order_relaxed);
+
+  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
+  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
+  TryAdvanceAck();
+}
+
+bool ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq,
+                                    uint64_t wall_now_ms) {
+  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, wall_now_ms);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -483,21 +555,26 @@ void ColdConsumer::UpdateMode(size_t current_bytes) {
 }
 
 void ColdConsumer::TryAdvanceAck() {
+  if (!drained_anything_) return;
+
   const auto oldest_unflushed = buffer_.OldestPendingSeq();
   const auto oldest_pending_cond = OldestPendingConditional();
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
 
+  // Unsigned seq space has no "before 0" — at seq 0 the ack must stay put,
+  // else Read skips seq 0 (`from_seq = offset + 1`).
+  if (oldest_unflushed.has_value() && *oldest_unflushed == 0) return;
+  if (oldest_pending_cond.has_value() && *oldest_pending_cond == 0) return;
+
   core::SequenceId target = drained;
-  if (oldest_unflushed.has_value() && *oldest_unflushed > 0) {
+  if (oldest_unflushed.has_value()) {
     target = std::min(target, *oldest_unflushed - 1);
   }
-  if (oldest_pending_cond.has_value() && *oldest_pending_cond > 0) {
+  if (oldest_pending_cond.has_value()) {
     target = std::min(target, *oldest_pending_cond - 1);
   }
 
   const auto last_ack = last_ack_seq_.load(std::memory_order_acquire);
-  // The first queue entry has seq=0; without first_ack_recorded_ the initial
-  // last_ack=0 is indistinguishable from "we already acked 0".
   if (first_ack_recorded_ && target <= last_ack) return;
 
   auto ack = queue_.Ack(core::kColdConsumer, shard_, target);

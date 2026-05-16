@@ -71,7 +71,7 @@ class SingleShardStore {
   size_t EvictLru(size_t target_bytes);
 
   core::MemoryStats Stats() const;
-  void Flush();
+  void Wipe();
 
  private:
   core::Result<core::RespValue> ExecStringGet(const core::ops::StringGet& op) const;

@@ -129,10 +129,10 @@ core::Result<core::MemoryStats> ShardedHotStore::Stats() ABYSS_NO_THREAD_SAFETY_
   return total;
 }
 
-core::Result<void> ShardedHotStore::Flush() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+core::Result<void> ShardedHotStore::Wipe() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   for (auto& shard : shards_) {
     std::unique_lock lock(shard->mutex);
-    shard->store.Flush();
+    shard->store.Wipe();
   }
   return {};
 }

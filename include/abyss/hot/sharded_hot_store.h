@@ -39,7 +39,7 @@ class ShardedHotStore : public core::HotStore {
   core::Result<core::RespValue> Apply(const core::ops::WriteOp& op) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
   core::Result<core::MemoryStats> Stats() override;
-  core::Result<void> Flush() override;
+  core::Result<void> Wipe() override;
 
   // Refreshes the deadline for every buffered access, using the per-key
   // eviction cached on each Entry at Apply time. See ADP-002 §Eviction.

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "abyss/consumer/compaction_buffer.h"
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
@@ -64,8 +65,8 @@ class ColdConsumerTest : public ::testing::Test {
 
   std::unique_ptr<ColdConsumer> MakeConsumer(ColdConsumer::Config cfg = {}) {
     cfg.rng_seed = 42;
-    return std::make_unique<ColdConsumer>(queue_, cold_, kShard, cfg, policy_, clock_.SteadyFn(),
-                                          clock_.WallFn());
+    return std::make_unique<ColdConsumer>(queue_, cold_, kShard, cfg, policy_, rpc_,
+                                          clock_.SteadyFn(), clock_.WallFn());
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -74,6 +75,7 @@ class ColdConsumerTest : public ::testing::Test {
   testing::TestClock clock_;
   // Outlives every consumer the test fixture builds; consumer holds a const ref.
   core::EvictionPolicy policy_{core::EvictionTTL{3600}};
+  core::ConsumerRpc rpc_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
@@ -490,7 +492,7 @@ TEST_F(ColdConsumerTest, DeadlineFlushIncrementsDeadlineCounter) {
   cfg.safety_margin = 10s;
   cfg.jitter_fraction = 0.0;
   const core::EvictionPolicy short_policy{core::EvictionTTL{20}};
-  auto c = std::make_unique<ColdConsumer>(queue_, cold_, kShard, cfg, short_policy,
+  auto c = std::make_unique<ColdConsumer>(queue_, cold_, kShard, cfg, short_policy, rpc_,
                                           clock_.SteadyFn(), clock_.WallFn());
 
   std::vector<core::QueueEntry> entries;

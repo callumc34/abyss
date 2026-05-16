@@ -22,6 +22,16 @@ inline RpcId MakeRpcId(ShardId shard, SequenceId seq) {
   return (static_cast<RpcId>(shard) << 48) | (static_cast<RpcId>(seq) & ((RpcId{1} << 48) - 1));
 }
 
+// Flush RPC id: [tag=1][7 bits consumer][16 bits shard][40 bits seq]. The high
+// bit segregates from `MakeRpcId` (which leaves it clear) so the registry can
+// disambiguate per-consumer Flush fulfilments from per-write ones.
+inline constexpr RpcId kFlushRpcTagBit = RpcId{1} << 63;
+inline RpcId MakeFlushRpcId(ConsumerId consumer, ShardId shard, SequenceId seq) {
+  return kFlushRpcTagBit | (static_cast<RpcId>(consumer & 0x7F) << 56) |
+         (static_cast<RpcId>(shard & 0xFFFF) << 40) |
+         (static_cast<RpcId>(seq) & ((RpcId{1} << 40) - 1));
+}
+
 struct ConsumerRpcConfig {
   // Striped across this many mutex-protected partitions; `id % count` selects.
   uint32_t registry_shard_count = 16;
