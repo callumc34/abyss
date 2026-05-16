@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "test_clock.h"
 
@@ -14,9 +15,11 @@ class EvictionWorkerTest : public ::testing::Test {
  protected:
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::TestClock clock_;
+  core::EvictionPolicy policy_{core::EvictionTTL{1}};
   ShardedHotStore store_{ShardedHotStoreConfig{
       .max_memory_bytes = 8UL * 1024 * 1024,
       .shard_count = 1,
+      .eviction_policy = &policy_,
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
   }};
@@ -24,15 +27,10 @@ class EvictionWorkerTest : public ::testing::Test {
 };
 
 TEST_F(EvictionWorkerTest, TickOnceDrainsBuffersAndEvicts) {
-  const core::EvictionTTL short_eviction{1};
   ASSERT_TRUE(
-      store_
-          .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}}, short_eviction)
-          .has_value());
+      store_.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}}).has_value());
 
-  EvictionWorker worker(store_,
-                        EvictionWorker::Config{.tick = 50ms, .default_eviction = short_eviction},
-                        clock_.SteadyFn());
+  EvictionWorker worker(store_, EvictionWorker::Config{.tick = 50ms}, clock_.SteadyFn());
 
   clock_.Advance(1100ms);
   worker.TickOnce();

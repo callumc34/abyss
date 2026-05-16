@@ -43,7 +43,7 @@ class HotConsumer {
 
   HotConsumer(core::Queue& queue, core::HotStore& store, core::ConsumerRpc& rpc,
               core::ApplyNotifier& apply_notifier, Config config,
-              core::EvictionPolicy eviction_policy);
+              const core::EvictionPolicy& eviction_policy);
   ~HotConsumer();
 
   HotConsumer(const HotConsumer&) = delete;
@@ -110,7 +110,9 @@ class HotConsumer {
   core::ConsumerRpc& rpc_;
   core::ApplyNotifier& apply_notifier_;
   Config config_;
-  core::EvictionPolicy eviction_policy_;
+  // Borrowed; the server owns the single EvictionPolicy instance and outlives
+  // every consumer that references it.
+  const core::EvictionPolicy& eviction_policy_;
 
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> running_{false};

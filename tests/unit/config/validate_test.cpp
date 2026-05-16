@@ -168,6 +168,50 @@ hot:
   EXPECT_NE(cfg.error().message().find("eviction_seconds"), std::string::npos);
 }
 
+// Per-prefix eviction couples to WAL retention: any override longer than
+// `queue.min_retention_seconds` silently degrades recovery, so the validator
+// rejects the misconfiguration at startup. See requirements.md §Consumer
+// Coordination.
+TEST(ConfigValidate, RejectsMinRetentionBelowDefaultEviction) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+hot:
+  default_eviction_seconds: 7200
+queue:
+  min_retention_seconds: 3600
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("queue.min_retention_seconds"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsMinRetentionBelowMaxOverride) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+hot:
+  default_eviction_seconds: 3600
+  eviction_overrides:
+    - prefix: "important:"
+      eviction_seconds: 604800
+queue:
+  min_retention_seconds: 86400
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("queue.min_retention_seconds"), std::string::npos);
+  EXPECT_NE(cfg.error().message().find("604800"), std::string::npos)
+      << "error should name the required value";
+}
+
+TEST(ConfigValidate, AcceptsMinRetentionEqualToMaxEviction) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+hot:
+  default_eviction_seconds: 3600
+  eviction_overrides:
+    - prefix: "long:"
+      eviction_seconds: 86400
+queue:
+  min_retention_seconds: 86400
+)YAML");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+}
+
 TEST(ConfigValidate, RejectsColliding_NetAndMetricsPort) {
   auto cfg = Config::ParseFromYaml(R"YAML(
 net:

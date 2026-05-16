@@ -21,6 +21,8 @@ class HotConsumerPool {
     HotConsumer::Config consumer;
   };
 
+  // `eviction_policy` is borrowed by every per-shard consumer; must outlive
+  // the pool. Owned by the server.
   HotConsumerPool(core::Queue& queue, core::HotStore& hot_store, core::ConsumerRpc& rpc,
                   core::ApplyNotifier& apply_notifier, Config config,
                   const core::EvictionPolicy& eviction_policy);

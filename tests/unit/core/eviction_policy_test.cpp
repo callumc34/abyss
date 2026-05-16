@@ -54,6 +54,57 @@ TEST(EvictionPolicyTest, KeyEqualsPrefixMatches) {
   EXPECT_EQ(policy.Resolve("session"), 300s);
 }
 
+TEST(EvictionPolicyValidate, AcceptsWellFormedInput) {
+  std::vector<EvictionRule> overrides{
+      {.prefix = "session:", .eviction = EvictionTTL{300}},
+      {.prefix = "ephemeral:", .eviction = EvictionTTL{60}},
+  };
+  auto r = EvictionPolicy::Validate(EvictionTTL{3600}, overrides, "hot");
+  EXPECT_TRUE(r.has_value()) << (r.has_value() ? "" : r.error().message());
+}
+
+TEST(EvictionPolicyValidate, RejectsNonPositiveDefault) {
+  auto r = EvictionPolicy::Validate(EvictionTTL{0}, {}, "hot");
+  ASSERT_FALSE(r.has_value());
+  EXPECT_NE(r.error().message().find("hot.default_eviction_seconds"), std::string::npos);
+}
+
+TEST(EvictionPolicyValidate, RejectsEmptyPrefix) {
+  std::vector<EvictionRule> overrides{{.prefix = "", .eviction = EvictionTTL{60}}};
+  auto r = EvictionPolicy::Validate(EvictionTTL{3600}, overrides, "hot");
+  ASSERT_FALSE(r.has_value());
+  EXPECT_NE(r.error().message().find("prefix"), std::string::npos);
+}
+
+TEST(EvictionPolicyValidate, RejectsNonPositiveOverrideEviction) {
+  std::vector<EvictionRule> overrides{{.prefix = "x:", .eviction = EvictionTTL{0}}};
+  auto r = EvictionPolicy::Validate(EvictionTTL{3600}, overrides, "hot");
+  ASSERT_FALSE(r.has_value());
+  EXPECT_NE(r.error().message().find("eviction_seconds"), std::string::npos);
+}
+
+TEST(EvictionPolicyValidate, RejectsDuplicatePrefix) {
+  std::vector<EvictionRule> overrides{
+      {.prefix = "session:", .eviction = EvictionTTL{60}},
+      {.prefix = "session:", .eviction = EvictionTTL{120}},
+  };
+  auto r = EvictionPolicy::Validate(EvictionTTL{3600}, overrides, "hot");
+  ASSERT_FALSE(r.has_value());
+  EXPECT_NE(r.error().message().find("duplicate prefix"), std::string::npos);
+}
+
+TEST(EvictionPolicyValidate, MaxConfiguredTtlReportsMax) {
+  std::vector<EvictionRule> overrides{
+      {.prefix = "short:", .eviction = EvictionTTL{60}},
+      {.prefix = "long:", .eviction = EvictionTTL{604800}},
+  };
+  EXPECT_EQ(EvictionPolicy::MaxConfiguredTtl(EvictionTTL{3600}, overrides), EvictionTTL{604800});
+}
+
+TEST(EvictionPolicyValidate, MaxConfiguredTtlReturnsDefaultWhenNoOverrides) {
+  EXPECT_EQ(EvictionPolicy::MaxConfiguredTtl(EvictionTTL{42}, {}), EvictionTTL{42});
+}
+
 TEST(EvictionPolicyTest, OrderOfInsertionDoesNotMatter) {
   EvictionPolicy a{
       EvictionTTL{3600},

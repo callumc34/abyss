@@ -48,6 +48,8 @@ hot:
       eviction_seconds: 300
 ```
 
+The resolved per-key eviction is computed once at apply time (longest-prefix wins, default if no match) and **cached on the per-key store entry**. Read-driven refresh extends the deadline using that cached value; the per-read path performs no prefix scan. This makes refresh O(1) and keeps the multi-key write path (e.g. `MSET` across mixed prefixes) honest — each entry resolves independently. Configuration is immutable post-startup, so the cached value is canonical for the key's hot residency. The `min_retention_seconds` constraint coupling the WAL retention to `max(default_eviction, max(eviction_overrides))` is enforced at startup by the config validator (see [Requirements §Consumer Coordination](../requirements.md#consumer-coordination)).
+
 **LRU eviction under memory pressure:** If the hot store's memory usage exceeds its configured maximum, keys are evicted in LRU order (by last-read time) regardless of their eviction deadline. Data is safe — it's in the queue and eventually in cold. Reads for prematurely evicted keys fall through to the buffer and cold store.
 
 **Absolute TTL:** If a key has an absolute `ttl` set (via Redis `SET ... EX`, `EXPIRE`, etc.), the hot store tracks this separately. When the absolute TTL expires, the key is deleted — not just evicted. It is removed from both hot and cold. This is different from eviction: TTL expiry means the data is gone.

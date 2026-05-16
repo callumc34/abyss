@@ -6,6 +6,9 @@
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <vector>
+
+#include "abyss/core/eviction_policy.h"
 
 namespace abyss::config::internal {
 
@@ -46,25 +49,17 @@ core::Result<void> RequirePositive(std::string path, std::chrono::seconds value)
 core::Result<void> ValidateHot(const HotConfig& hot) {
   if (auto r = RequireNonEmpty("hot.backend", hot.backend); !r) return r;
   if (auto r = RequirePositive("hot.max_memory_bytes", hot.max_memory_bytes); !r) return r;
-  if (auto r = RequirePositive("hot.default_eviction_seconds", hot.default_eviction); !r) return r;
   if (auto r = RequirePositive("hot.shard_count", hot.shard_count); !r) return r;
   if (hot.eviction_tick.count() <= 0) {
     return std::unexpected(InvalidArg("hot.eviction_tick_ms", "must be > 0 milliseconds"));
   }
 
-  std::unordered_set<std::string> seen;
-  for (size_t i = 0; i < hot.eviction_overrides.size(); ++i) {
-    const auto& o = hot.eviction_overrides[i];
-    std::string base = "hot.eviction_overrides[";
-    base += std::to_string(i);
-    base += ']';
-    if (auto r = RequireNonEmpty(base + ".prefix", o.prefix); !r) return r;
-    if (auto r = RequirePositive(base + ".eviction_seconds", o.eviction); !r) return r;
-    if (!seen.insert(o.prefix).second) {
-      return std::unexpected(InvalidArg(base + ".prefix", "duplicate prefix"));
-    }
+  std::vector<core::EvictionRule> rules;
+  rules.reserve(hot.eviction_overrides.size());
+  for (const auto& o : hot.eviction_overrides) {
+    rules.push_back({.prefix = o.prefix, .eviction = o.eviction});
   }
-  return {};
+  return core::EvictionPolicy::Validate(hot.default_eviction, rules, "hot");
 }
 
 core::Result<void> ValidateColdTtlScanner(const cold::TtlScanner::Config& s) {
@@ -301,6 +296,23 @@ core::Result<void> ValidateAdmin(const AdminConfig& a) {
   return {};
 }
 
+// WAL retention must cover the longest hot-tier residency.
+core::Result<void> ValidateRetentionVsEviction(const Config& c) {
+  std::vector<core::EvictionRule> rules;
+  rules.reserve(c.hot.eviction_overrides.size());
+  for (const auto& o : c.hot.eviction_overrides) {
+    rules.push_back({.prefix = o.prefix, .eviction = o.eviction});
+  }
+  const auto needed = core::EvictionPolicy::MaxConfiguredTtl(c.hot.default_eviction, rules);
+  if (c.queue.min_retention < needed) {
+    std::string msg = "must be >= ";
+    msg += std::to_string(needed.count());
+    msg += " (max of hot.default_eviction_seconds and hot.eviction_overrides[*].eviction_seconds)";
+    return std::unexpected(InvalidArg("queue.min_retention_seconds", msg));
+  }
+  return {};
+}
+
 // NOLINTNEXTLINE(misc-unused-parameters)
 core::Result<void> ValidatePortCollisions(const Config& c) {
   const std::array<std::pair<uint16_t, std::string_view>, 3> ports = {{
@@ -341,6 +353,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateAdmin(config.admin); !r) return r;
   if (auto r = ValidateLog(config.log); !r) return r;
   if (auto r = ValidatePortCollisions(config); !r) return r;
+  if (auto r = ValidateRetentionVsEviction(config); !r) return r;
   return {};
 }
 

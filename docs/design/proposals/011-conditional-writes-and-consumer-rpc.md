@@ -96,7 +96,7 @@ class Resolver {
 
 **Existence lookup.** For each `Conditional`, the Resolver must determine whether affected keys exist (or their current value, for `SET GET`; their current score, for `ZADD GT|LT`). It queries a tiered view:
 
-1. **Local recent-writes cache** — an in-memory `unordered_map<std::string, KeyMeta>` populated as the Resolver processes queue entries. `KeyMeta` holds the latest seq, absolute TTL, and (for scalars) a small-value cache. Bounded by eviction duration (configurable, default equal to hot store's `default_eviction_seconds`). Microsecond lookup.
+1. **Local recent-writes cache** — an in-memory `unordered_map<std::string, KeyMeta>` populated as the Resolver processes queue entries. `KeyMeta` holds the latest seq, absolute TTL, and (for scalars) a small-value cache. The cache is a **hint cache** kept coherent with the log up to the Resolver's position via `UpsertKey` / `TombstoneKey` on every processed entry; on miss the Resolver falls through to the compaction buffer and cold tier. `entry_ttl` is a memory-pressure knob (default 24h), not a residency mirror of the hot tier — cold-resident keys are valid cache subjects too. Microsecond lookup.
 2. **Compaction buffer** — shared read lock against the cold consumer's buffer (same primitive as the read path, [ADP-006](006-read-write-paths.md)). Microsecond lookup.
 3. **Cold store** — `ColdStore::Exec(...)`. Millisecond lookup. Bounded by cold read SLA (<5ms p99).
 

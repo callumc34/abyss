@@ -64,9 +64,18 @@ bool Server::Initialize() {
     return false;
   }
 
+  std::vector<core::EvictionRule> overrides;
+  overrides.reserve(config_.hot.eviction_overrides.size());
+  for (const auto& o : config_.hot.eviction_overrides) {
+    overrides.push_back({.prefix = o.prefix, .eviction = o.eviction});
+  }
+  eviction_policy_ =
+      std::make_unique<core::EvictionPolicy>(config_.hot.default_eviction, std::move(overrides));
+
   hot_store_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = config_.hot.max_memory_bytes,
       .shard_count = config_.hot.shard_count,
+      .eviction_policy = eviction_policy_.get(),
   });
 
   auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
@@ -119,13 +128,6 @@ bool Server::Initialize() {
   }
   cold_store_ = std::move(*cold_result);
 
-  std::vector<core::EvictionRule> overrides;
-  overrides.reserve(config_.hot.eviction_overrides.size());
-  for (const auto& o : config_.hot.eviction_overrides) {
-    overrides.push_back({.prefix = o.prefix, .eviction = o.eviction});
-  }
-  core::EvictionPolicy eviction_policy{config_.hot.default_eviction, std::move(overrides)};
-
   cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
       *queue_, *cold_store_,
       consumer::ColdConsumerPool::Config{
@@ -145,7 +147,7 @@ bool Server::Initialize() {
                   .retry_max_backoff = config_.cold_consumer.retry_max_backoff,
               },
       },
-      eviction_policy);
+      *eviction_policy_);
 
   engine_ = std::make_unique<engine::TieringEngine>(
       *queue_, *hot_store_, *cold_store_, *cold_pool_, *consumer_rpc_,
@@ -166,15 +168,12 @@ bool Server::Initialize() {
                   .read_timeout = config_.hot_consumer.read_timeout,
               },
       },
-      eviction_policy);
+      *eviction_policy_);
 
-  hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
-      *hot_store_,
-      hot::EvictionWorker::Config{
-          .tick = config_.hot.eviction_tick,
-          .default_eviction =
-              core::EvictionTTL{static_cast<uint64_t>(config_.hot.default_eviction.count())},
-      });
+  hot_eviction_worker_ =
+      std::make_unique<hot::EvictionWorker>(*hot_store_, hot::EvictionWorker::Config{
+                                                             .tick = config_.hot.eviction_tick,
+                                                         });
   resolver_pool_ = std::make_unique<consumer::ResolverPool>(
       *queue_, *cold_store_, *cold_pool_, *consumer_rpc_, *apply_notifier_,
       consumer::ResolverPool::Config{

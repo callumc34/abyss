@@ -12,6 +12,7 @@
 
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
@@ -58,13 +59,14 @@ class HotConsumerTest : public ::testing::Test {
 
   // Start a consumer on the shared queue/store pointing at shard 0.
   void StartConsumer(core::EvictionTTL eviction = core::EvictionTTL{86400}) {
+    policy_ = core::EvictionPolicy{eviction};
     consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_, apply_notifier_,
                                               HotConsumer::Config{
                                                   .shard = 0,
                                                   .read_batch_size = 32,
                                                   .read_timeout = core::Duration{10},
                                               },
-                                              core::EvictionPolicy{eviction});
+                                              policy_);
     consumer_->Start();
   }
 
@@ -73,6 +75,7 @@ class HotConsumerTest : public ::testing::Test {
   void BuildConsumerWithClock(core::WallClockFn clock,
                               core::EvictionTTL eviction = core::EvictionTTL{86400},
                               core::ShardId shard = 0) {
+    policy_ = core::EvictionPolicy{eviction};
     consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_, apply_notifier_,
                                               HotConsumer::Config{
                                                   .shard = shard,
@@ -81,7 +84,7 @@ class HotConsumerTest : public ::testing::Test {
                                                   .read_timeout = core::Duration{10},
                                                   .wall_clock = std::move(clock),
                                               },
-                                              core::EvictionPolicy{eviction});
+                                              policy_);
   }
 
   core::QueueEntry MakeWrite(std::vector<std::string> args) {
@@ -107,6 +110,8 @@ class HotConsumerTest : public ::testing::Test {
   std::unique_ptr<hot::ShardedHotStore> hot_;
   core::ConsumerRpc rpc_;
   core::ApplyNotifier apply_notifier_;
+  // Outlives consumer_ — consumer holds a const ref into this slot.
+  core::EvictionPolicy policy_{core::EvictionTTL{86400}};
   std::unique_ptr<HotConsumer> consumer_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };

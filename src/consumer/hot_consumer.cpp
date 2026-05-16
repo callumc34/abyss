@@ -54,13 +54,13 @@ uint64_t AbsTtlMs(const core::ops::WriteOp& op) {
 
 HotConsumer::HotConsumer(core::Queue& queue, core::HotStore& store, core::ConsumerRpc& rpc,
                          core::ApplyNotifier& apply_notifier, Config config,
-                         core::EvictionPolicy eviction_policy)
+                         const core::EvictionPolicy& eviction_policy)
     : queue_(queue),
       store_(store),
       rpc_(rpc),
       apply_notifier_(apply_notifier),
       config_(std::move(config)),
-      eviction_policy_(std::move(eviction_policy)) {}
+      eviction_policy_(eviction_policy) {}
 
 HotConsumer::~HotConsumer() { Stop(); }
 
@@ -208,7 +208,6 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
       result = core::RespValue::Error(core::ErrorPrefix::kErr, op.error().message());
     } else {
       const auto key = core::ops::PrimaryKey(*op);
-      const auto eviction = eviction_policy_.Resolve(key);
       const bool replaying = replay_mode_.load(std::memory_order_acquire);
       const auto wall_now = config_.wall_clock();
 
@@ -217,7 +216,7 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
       } else if (replaying && ShouldSkipForAbsTtlElapsed(AbsTtlMs(*op), wall_now)) {
         counters_.replay_skipped_abs_ttl.fetch_add(1, std::memory_order_relaxed);
       } else {
-        auto applied = store_.Apply(*op, eviction);
+        auto applied = store_.Apply(*op);
         if (!applied.has_value()) {
           counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
           if (applied.error().code() != core::ErrorCode::kWrongType) {
@@ -327,9 +326,8 @@ core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCom
       continue;
     }
 
-    const auto eviction = eviction_policy_.Resolve(key);
     // Reply value is constructed by the Resolver; discard here.
-    auto applied = store_.Apply(*op, eviction);
+    auto applied = store_.Apply(*op);
     if (!applied.has_value()) return std::unexpected(applied.error());
     counters_.applied.fetch_add(1, std::memory_order_relaxed);
   }

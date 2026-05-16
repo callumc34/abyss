@@ -18,7 +18,6 @@ class EvictionWorker {
  public:
   struct Config {
     std::chrono::milliseconds tick{1000};
-    core::EvictionTTL default_eviction{86400};
   };
 
   EvictionWorker(ShardedHotStore& store, Config config,

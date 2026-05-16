@@ -33,8 +33,9 @@ class HotStore : public Reader {
                          std::optional<Duration> deadline = std::nullopt) override = 0;
 
   // Returns the typed reply the client observes (+OK for SET, count for SADD/etc.).
-  virtual Result<RespValue> Apply(const ops::WriteOp& op, EvictionTTL eviction) = 0;
-  virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops, EvictionTTL eviction) = 0;
+  // Per-key eviction (if any) is resolved internally by the implementation.
+  virtual Result<RespValue> Apply(const ops::WriteOp& op) = 0;
+  virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops) = 0;
 
   virtual Result<MemoryStats> Stats() = 0;
   virtual Result<void> Flush() = 0;

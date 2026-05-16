@@ -70,7 +70,7 @@ The queue retains entries until both consumers have acknowledged. Under normal o
 minimum_queue_retention = max(default_eviction, max(eviction_overrides))
 ```
 
-This must fit on the WAL PVC (embedded) or within broker retention config (external).
+This must fit on the WAL PVC (embedded) or within broker retention config (external). The config validator enforces this relationship at startup — `queue.min_retention_seconds < max(eviction)` is rejected, because a shorter retention silently degrades recovery (queue entries for keys still in their hot residency get GC'd, so they never replay into hot).
 
 ## Backpressure
 

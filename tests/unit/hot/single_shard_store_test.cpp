@@ -343,7 +343,7 @@ TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
   clock_.Advance(500ms);
-  store_.RefreshAccess("k", clock_.SteadyNow(), short_eviction);
+  store_.RefreshAccess("k", clock_.SteadyNow());
 
   clock_.Advance(700ms);
   auto evicted = store_.EvictExpired(clock_.SteadyNow());
@@ -352,7 +352,7 @@ TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
 
 TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {
   SetString("old", std::string(512, 'x'));
-  store_.RefreshAccess("old", clock_.SteadyNow() - 100s, kEviction);
+  store_.RefreshAccess("old", clock_.SteadyNow() - 100s);
 
   SetString("new", std::string(512, 'y'));
 
