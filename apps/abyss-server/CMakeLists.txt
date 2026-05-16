@@ -2,6 +2,7 @@ add_executable(abyss-server main.cpp server.cpp providers.cpp)
 
 target_link_libraries(abyss-server PRIVATE
   abyss::admin
+  abyss::branding
   abyss::config
   abyss::engine
   abyss::net

@@ -1,24 +1,38 @@
-# Abyss
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/logo-light.svg">
+    <img alt="Abyss" src="assets/logo/logo-light.svg" width="320">
+  </picture>
+</p>
 
-A Redis-compatible key-value store with transparent hot-cold tiering.
+<p align="center">
+  <em>A Redis-compatible KV store with transparent hot–cold tiering.</em>
+</p>
 
-Abyss exposes a standard Redis protocol interface backed by a Kappa architecture: an append-only queue is the single source of truth, and two independent consumers materialise state into a fast in-memory hot tier and a durable on-disk cold tier. Data moves between tiers automatically. Clients connect with any Redis client library.
+<p align="center">
+  <img alt="C++23" src="https://img.shields.io/badge/C%2B%2B-23-7C3AED">
+  <img alt="Platform: Linux | macOS" src="https://img.shields.io/badge/platform-linux%20%7C%20macOS-7C3AED">
+  <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-A855F7">
+  <img alt="License: TBD" src="https://img.shields.io/badge/license-TBD-lightgrey">
+</p>
 
-## Features
+---
 
-- **Redis compatible** — RESP2 protocol. Any Redis client works out of the box.
-- **Two-tier storage** — in-memory hot tier for sub-millisecond reads, on-disk cold tier for durability. Transparent promotion and eviction between tiers.
-- **Durable writes** — writes are not acknowledged until committed to the append-only queue. A crash never loses an acknowledged write.
-- **Smart compaction** — the cold consumer's compaction buffer collapses intermediate writes. A key updated 1000 times results in a single disk write.
-- **Pluggable backends** — embedded (zero dependencies) or external (Kafka, DragonflyDB, KVRocks). Mix and match via deployment profiles.
-- **Kubernetes-native** — StatefulSet deployment with PVCs. Redis Cluster protocol for horizontal scaling.
+## What is Abyss?
 
-## Quick Start
+A Redis-compatible KV store built on a Kappa architecture: an append-only
+queue is the single source of truth, and two independent consumers
+materialise that queue into a fast in-memory hot tier and a durable on-disk
+cold tier. Writes are not acknowledged until they are durable in the queue,
+so a crash never costs you an acked write. Data moves between tiers
+automatically. Any Redis client library connects.
+
+## Quick start
 
 ```bash
-# One-time: install vcpkg and set VCPKG_ROOT (see docs/development/building.md)
+# One-time: install vcpkg and export VCPKG_ROOT (see docs/development/building.md)
 
-# Configure and build
 cmake --preset default
 cmake --build build/default
 
@@ -29,39 +43,39 @@ ctest --preset default
 ./build/default/apps/abyss-server/abyss-server
 ```
 
-### Requirements
-
-- CMake 3.25+
-- C++23 compiler (GCC 13+, Clang 17+, Apple Clang 17+)
-- vcpkg with `VCPKG_ROOT` exported in the environment
+Requirements: CMake 3.25+, a C++23 compiler (GCC 13+, Clang 17+, Apple
+Clang 17+), and vcpkg with `VCPKG_ROOT` set.
 
 ## Architecture
 
-```
-                    ┌───────────────┐
-  Redis Client ────▶│  RESP Frontend │
-                    └──────┬────────┘
-                           │ write
-                           ▼
-                    ┌───────────────┐
-                    │    Queue      │  ◄── Single source of truth
-                    │  (append-only │
-                    │     log)      │
-                    └──┬─────────┬──┘
-                       │         │
-            ┌──────────▼──┐  ┌──▼───────────┐
-            │ Hot Consumer │  │ Cold Consumer │
-            │  (eager,     │  │  (smart,      │
-            │   real-time) │  │   compacting) │
-            └──────┬───────┘  └──────┬───────┘
-                   │                 │
-            ┌──────▼───────┐  ┌──────▼───────┐
-            │  Hot Store   │  │  Cold Store  │
-            │ (in-memory)  │  │  (on-disk)   │
-            └──────────────┘  └──────────────┘
-```
+<p align="center">
+  <img alt="Abyss architecture diagram" src="assets/diagrams/architecture.svg" width="720">
+</p>
 
-See the [architecture docs](docs/design/architecture.md) for the full design.
+Five hard invariants drive the design:
+
+1. The queue is the single source of truth — no dual writes.
+2. A client never receives OK for a lost write.
+3. Hot and cold consumers are independent — neither blocks the other.
+4. Recovery is pure queue replay; the cold store is never read during recovery.
+5. No silent degradation — backpressure surfaces as metrics and errors.
+
+The authoritative diagram and the full design rationale live in
+[`docs/design/architecture.md`](docs/design/architecture.md).
+
+## Features
+
+- **Redis compatible.** RESP2 protocol. Any Redis client works out of the box.
+- **Two-tier storage.** In-memory hot tier for sub-millisecond reads, on-disk
+  cold tier for durability. Transparent promotion and eviction.
+- **Durable writes.** Writes are not acknowledged until committed to the
+  append-only queue. A crash never loses an acknowledged write.
+- **Smart compaction.** The cold consumer collapses intermediate writes — a
+  key updated 1000 times results in a single disk write.
+- **Pluggable backends.** Embedded (zero dependencies) or external (Kafka,
+  DragonflyDB, KVRocks). Mix and match via deployment profiles.
+- **Kubernetes-native.** StatefulSet deployment with PVCs; Redis Cluster
+  protocol for horizontal scaling.
 
 ## Documentation
 
@@ -69,22 +83,27 @@ See the [architecture docs](docs/design/architecture.md) for the full design.
 |----------|-------------|
 | [Architecture](docs/design/architecture.md) | System design, component model, deployment profiles |
 | [Requirements](docs/design/requirements.md) | Performance targets, durability guarantees, milestones |
-| [Design Proposals](docs/design/proposals/) | Detailed designs for each subsystem (ADP-001 through ADP-009) |
+| [Design Proposals](docs/design/proposals/) | Detailed designs for each subsystem (ADP-001 through ADP-012) |
 | [Deployment](docs/operations/deployment.md) | Kubernetes, Helm, configuration reference |
 | [Observability](docs/operations/observability.md) | Metrics, health endpoints, logging |
 | [Failure Modes](docs/operations/failure-modes.md) | Backpressure, failure scenarios, recovery |
 | [Building](docs/development/building.md) | Build from source, presets, dependencies |
 | [Testing](docs/development/testing.md) | Test strategy, running tests |
+| [Branding](docs/branding.md) | Visual identity, asset workflow |
 
-## Project Status
+## Project status
 
-Abyss is in early development. The project structure and interfaces are defined. Implementation of Phase 1 (embedded profile, single pod) is in progress.
+**Phase 1 (embedded profile, single pod) — in progress.** The queue, RESP
+frontend, hot and cold consumers, eviction, recovery, prefix-based eviction,
+hash commands, fan-out, and FLUSHDB are implemented. Cluster protocol and
+horizontal scaling are tracked under later phases.
 
-See [Requirements — Milestones](docs/design/requirements.md#milestones) for the full roadmap.
+See [Requirements — Milestones](docs/design/requirements.md#milestones) for
+the full roadmap.
 
 ## Contributing
 
-### Building from Source
+### Building from source
 
 ```bash
 git clone https://github.com/callumc34/abyss.git
@@ -95,15 +114,15 @@ cmake --build build/default
 ctest --preset default
 ```
 
-### Code Style
+### Code style
 
 - Google C++ Style Guide
-- `.cpp` file extension, `#pragma once` header guards
+- `.cpp` extension, `#pragma once` header guards
 - 100-column limit, enforced via `.clang-format`
-- Thread safety annotations on all mutex-guarded members
+- Thread-safety annotations on all mutex-guarded members
 - Minimal comments — the code should be readable without them
 
-### Running Checks
+### Running checks
 
 ```bash
 # Format
@@ -118,13 +137,6 @@ cmake --preset asan && cmake --build build/asan && ctest --test-dir build/asan
 cmake --preset tsan && cmake --build build/tsan && ctest --test-dir build/tsan
 ```
 
-### Pull Requests
-
-- One focused change per PR.
-- All tests must pass. New functionality needs tests.
-- Run clang-format before submitting.
-- Design changes should reference the relevant ADP (Abyss Design Proposal).
-
 ## License
 
-TBD
+TBD.

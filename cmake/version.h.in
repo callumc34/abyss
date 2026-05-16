@@ -7,9 +7,8 @@ inline constexpr int kVersionMinor = @abyss_VERSION_MINOR@;
 inline constexpr int kVersionPatch = @abyss_VERSION_PATCH@;
 inline constexpr const char* kVersion = "@abyss_VERSION@";
 
-// Best-effort: short git commit at configure time, or "unknown" outside a
-// git checkout. Build date is the configure-time timestamp.
 inline constexpr const char* kBuildCommit = "@ABYSS_BUILD_COMMIT@";
 inline constexpr const char* kBuildDate = "@ABYSS_BUILD_DATE@";
+inline constexpr const char* kBuildType = "@ABYSS_BUILD_TYPE@";
 
 }  // namespace abyss

@@ -1,10 +1,12 @@
 #include <CLI/CLI.hpp>
 #include <atomic>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
 
+#include "abyss/branding/banner.h"
 #include "abyss/config/config.h"
 #include "abyss/log/log.h"
 #include "abyss/version.h"
@@ -40,7 +42,7 @@ int main(int argc, char* argv[]) {
   constexpr auto kDefaultDataDir = "/tmp/abyss";
 
   CLI::App app{"abyss — Redis-compatible hot-cold tiered KV store"};
-  app.set_version_flag("--version", abyss::kVersion);
+  app.set_version_flag("--version", abyss::branding::VersionLine({}));
 
   std::string config_path;
   std::string data_dir = kDefaultDataDir;
@@ -49,6 +51,7 @@ int main(int argc, char* argv[]) {
   std::optional<uint16_t> metrics_port_override;
   std::optional<uint32_t> shard_count_override;
   intptr_t ready_fd = -1;
+  bool no_banner = false;
 
   app.add_option("-c,--config", config_path, "Path to YAML config file (ABYSS_CONFIG_PATH)");
   app.add_option("-p,--port", port_override,
@@ -72,6 +75,8 @@ int main(int argc, char* argv[]) {
                  "listener is bound, one JSON line ({\"bind\":\"...\",\"port\":N,"
                  "\"admin_bind\":\"...\",\"admin_port\":N,\"metrics_bind\":\"...\","
                  "\"metrics_port\":N}) is written and the handle is closed.");
+  app.add_flag("--no-banner", no_banner,
+               "Suppress the startup banner (also honoured via ABYSS_NO_BANNER=1)");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -106,6 +111,10 @@ int main(int argc, char* argv[]) {
                        {"err", std::string_view{r.error().message()}});
     return EXIT_FAILURE;
   }
+
+  abyss::branding::PrintBanner(stderr,
+                               {.suppressed = no_banner || abyss::branding::SuppressedByEnv(),
+                                .profile = std::string_view{config.profile}});
 
   abyss::log::Init(config.log);
 
