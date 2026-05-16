@@ -64,8 +64,10 @@ class ColdConsumer {
     uint32_t mode_transitions = 0;
   };
 
+  // `eviction_policy` is borrowed; the server owns the single instance and
+  // outlives every consumer.
   ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard, Config config,
-               core::EvictionPolicy eviction_policy,
+               const core::EvictionPolicy& eviction_policy,
                core::SteadyClockFn steady_clock = core::DefaultSteadyClock,
                core::WallClockFn wall_clock = core::DefaultWallClock);
   ~ColdConsumer();
@@ -150,7 +152,7 @@ class ColdConsumer {
   core::ColdStore& cold_store_;
   core::ShardId shard_;
   Config config_;
-  core::EvictionPolicy eviction_policy_;
+  const core::EvictionPolicy& eviction_policy_;
   core::SteadyClockFn steady_clock_;
   core::WallClockFn wall_clock_;
   FlushStrategy strategy_;

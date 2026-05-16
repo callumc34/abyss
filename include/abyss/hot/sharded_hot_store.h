@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "abyss/core/eviction_policy.h"
 #include "abyss/core/hot_store.h"
 #include "abyss/hot/single_shard_store.h"
 
@@ -17,6 +18,9 @@ namespace abyss::hot {
 struct ShardedHotStoreConfig {
   size_t max_memory_bytes = 4294967296;
   uint32_t shard_count = 64;
+  // Borrowed from the server's single EvictionPolicy. Must outlive the store.
+  // Nullable for tests that don't exercise eviction (DefaultPolicy is used).
+  const core::EvictionPolicy* eviction_policy = nullptr;
   core::SteadyClockFn steady_clock = core::DefaultSteadyClock;
   core::WallClockFn wall_clock = core::DefaultWallClock;
 };
@@ -32,14 +36,14 @@ class ShardedHotStore : public core::HotStore {
 
   core::Result<core::RespValue> Exec(
       const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
-  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op,
-                                      core::EvictionTTL eviction) override;
-  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
-                                core::EvictionTTL eviction) override;
+  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op) override;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Flush() override;
 
-  void DrainAccessBuffers(core::SteadyTime now, core::EvictionTTL eviction);
+  // Refreshes the deadline for every buffered access, using the per-key
+  // eviction cached on each Entry at Apply time. See ADP-002 §Eviction.
+  void DrainAccessBuffers(core::SteadyTime now);
   size_t EvictExpired(core::SteadyTime now);
 
   uint32_t shard_count() const { return config_.shard_count; }
@@ -55,15 +59,17 @@ class ShardedHotStore : public core::HotStore {
   };
 
   Shard& ShardFor(std::string_view key);
+  core::EvictionTTL ResolveEviction(std::string_view key) const;
 
   core::Result<core::RespValue> ExecMultiStringGet(const core::ops::MultiStringGet& op);
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
 
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op);
-  core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op,
-                                                    core::EvictionTTL eviction);
+  core::Result<core::RespValue> ApplyMultiStringSet(const core::ops::MultiStringSet& op);
 
   ShardedHotStoreConfig config_;
+  // Fallback when config_.eviction_policy is null; keeps Resolve() infallible.
+  core::EvictionPolicy default_policy_;
   std::vector<std::unique_ptr<Shard>> shards_;
 };
 

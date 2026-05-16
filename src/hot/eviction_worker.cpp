@@ -32,7 +32,7 @@ void EvictionWorker::Stop() {
 
 void EvictionWorker::TickOnce() {
   const auto now = steady_clock_();
-  store_.DrainAccessBuffers(now, config_.default_eviction);
+  store_.DrainAccessBuffers(now);
   store_.EvictExpired(now);
 }
 

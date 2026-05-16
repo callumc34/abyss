@@ -12,7 +12,7 @@ ABYSS_LOG_COMPONENT("abyss.hot.store")
 
 namespace abyss::hot {
 
-ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(config) {
+ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(std::move(config)) {
   SingleShardConfig shard_config{
       .max_memory_bytes = config_.max_memory_bytes / config_.shard_count,
       .steady_clock = config_.steady_clock,
@@ -30,6 +30,12 @@ ShardedHotStore::~ShardedHotStore() = default;
 
 ShardedHotStore::Shard& ShardedHotStore::ShardFor(std::string_view key) {
   return *shards_[core::ComputeShard(key, config_.shard_count)];
+}
+
+core::EvictionTTL ShardedHotStore::ResolveEviction(std::string_view key) const {
+  const auto& policy =
+      config_.eviction_policy != nullptr ? *config_.eviction_policy : default_policy_;
+  return policy.Resolve(key);
 }
 
 core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op,
@@ -106,17 +112,18 @@ core::Result<core::RespValue> ShardedHotStore::ExecExists(const core::ops::Exist
   return core::RespValue::Integer(total);
 }
 
-core::Result<core::RespValue> ShardedHotStore::Apply(
-    const core::ops::WriteOp& op, core::EvictionTTL eviction) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+core::Result<core::RespValue> ShardedHotStore::Apply(const core::ops::WriteOp& op)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   return std::visit(
-      [this, &op, eviction](const auto& o) -> core::Result<core::RespValue> {
+      [this, &op](const auto& o) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, core::ops::Del>) {
           return ApplyDel(o);
         } else if constexpr (std::is_same_v<T, core::ops::MultiStringSet>) {
-          return ApplyMultiStringSet(o, eviction);
+          return ApplyMultiStringSet(o);
         } else {
-          auto key = core::ops::PrimaryKey(core::ops::WriteOp{o});
+          const auto key = core::ops::PrimaryKey(core::ops::WriteOp{o});
+          const auto eviction = ResolveEviction(key);
           auto& shard = ShardFor(key);
           std::unique_lock lock(shard.mutex);
           return shard.store.Apply(op, eviction);
@@ -136,6 +143,7 @@ core::Result<core::RespValue> ShardedHotStore::ApplyDel(const core::ops::Del& op
   for (const auto& [shard_id, keys] : shard_keys) {
     auto& shard = *shards_[shard_id];
     std::unique_lock lock(shard.mutex);
+    // DEL ignores eviction; pass zero — SingleShardStore::ApplyDel doesn't read it.
     core::ops::Del shard_op{.keys = keys};
     auto result = shard.store.Apply(core::ops::WriteOp{shard_op}, core::EvictionTTL{0});
     if (!result.has_value()) return std::unexpected(result.error());
@@ -145,7 +153,7 @@ core::Result<core::RespValue> ShardedHotStore::ApplyDel(const core::ops::Del& op
 }
 
 core::Result<core::RespValue> ShardedHotStore::ApplyMultiStringSet(
-    const core::ops::MultiStringSet& op, core::EvictionTTL eviction) {
+    const core::ops::MultiStringSet& op) {
   std::map<uint32_t, std::vector<const core::ops::MultiStringSet::Entry*>> shard_entries;
   for (const auto& entry : op.entries) {
     auto shard_id = core::ComputeShard(entry.key, config_.shard_count);
@@ -156,6 +164,7 @@ core::Result<core::RespValue> ShardedHotStore::ApplyMultiStringSet(
     auto& shard = *shards_[shard_id];
     std::unique_lock lock(shard.mutex);
     for (const auto* entry : entries) {
+      const auto eviction = ResolveEviction(entry->key);
       core::ops::StringSet set_op{.key = entry->key, .value = entry->value};
       auto result = shard.store.Apply(core::ops::WriteOp{set_op}, eviction);
       if (!result.has_value()) return std::unexpected(result.error());
@@ -164,10 +173,9 @@ core::Result<core::RespValue> ShardedHotStore::ApplyMultiStringSet(
   return core::RespValue::SimpleString("OK");
 }
 
-core::Result<void> ShardedHotStore::ApplyBatch(std::span<const core::ops::WriteOp> ops,
-                                               core::EvictionTTL eviction) {
+core::Result<void> ShardedHotStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
   for (const auto& op : ops) {
-    auto result = Apply(op, eviction);
+    auto result = Apply(op);
     if (!result.has_value()) return std::unexpected(result.error());
   }
   return {};
@@ -193,7 +201,7 @@ core::Result<void> ShardedHotStore::Flush() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   return {};
 }
 
-void ShardedHotStore::DrainAccessBuffers(core::SteadyTime now, core::EvictionTTL eviction) {
+void ShardedHotStore::DrainAccessBuffers(core::SteadyTime now) {
   for (auto& shard : shards_) {
     std::vector<std::string> keys;
     {
@@ -203,7 +211,7 @@ void ShardedHotStore::DrainAccessBuffers(core::SteadyTime now, core::EvictionTTL
     if (keys.empty()) continue;
     std::unique_lock lock(shard->mutex);
     for (const auto& key : keys) {
-      shard->store.RefreshAccess(key, now, eviction);
+      shard->store.RefreshAccess(key, now);
     }
   }
 }

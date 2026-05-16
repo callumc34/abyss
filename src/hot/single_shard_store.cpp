@@ -335,6 +335,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
       TrackRemove(it->second, op.key);
       it->second.type = Entry::Type::kString;
       it->second.value = std::string(op.value);
+      it->second.eviction = eviction;
       it->second.eviction_deadline = config_.steady_clock() + eviction;
       it->second.last_access = config_.steady_clock();
       it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
@@ -343,6 +344,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
     }
     TrackRemove(it->second, op.key);
     std::get<std::string>(it->second.value) = std::string(op.value);
+    it->second.eviction = eviction;
     it->second.eviction_deadline = config_.steady_clock() + eviction;
     it->second.last_access = config_.steady_clock();
     it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
@@ -391,6 +393,7 @@ core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::Set
   for (auto member : op.members) {
     if (members.insert(std::string(member)).second) ++added;
   }
+  entry.eviction = eviction;
   entry.eviction_deadline = config_.steady_clock() + eviction;
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
@@ -452,6 +455,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyZsetAdd(const core::ops::Zs
     zset.score_members[e.score].insert(std::move(member));
   }
 
+  entry.eviction = eviction;
   entry.eviction_deadline = config_.steady_clock() + eviction;
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
@@ -516,6 +520,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashSet(const core::ops::Ha
       field_it->second = std::string(fv.value);
     }
   }
+  entry.eviction = eviction;
   entry.eviction_deadline = config_.steady_clock() + eviction;
   entry.last_access = config_.steady_clock();
   TrackInsert(entry, op.key);
@@ -584,12 +589,11 @@ core::Result<core::RespValue> SingleShardStore::ApplyPersist(const core::ops::Pe
 
 // --- Maintenance ---
 
-void SingleShardStore::RefreshAccess(std::string_view key, core::SteadyTime now,
-                                     core::EvictionTTL eviction) {
+void SingleShardStore::RefreshAccess(std::string_view key, core::SteadyTime now) {
   auto it = entries_.find(std::string(key));
   if (it == entries_.end()) return;
   it->second.last_access = now;
-  it->second.eviction_deadline = now + eviction;
+  it->second.eviction_deadline = now + it->second.eviction;
 }
 
 size_t SingleShardStore::EvictExpired(core::SteadyTime now) {
@@ -659,6 +663,7 @@ Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type
   auto [it, inserted] = entries_.try_emplace(std::string(key));
   if (inserted) {
     it->second.type = type;
+    it->second.eviction = eviction;
     it->second.eviction_deadline = config_.steady_clock() + eviction;
     it->second.last_access = config_.steady_clock();
     switch (type) {

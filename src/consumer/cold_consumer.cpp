@@ -21,13 +21,13 @@ constexpr size_t kDefaultLowWaterDenominator = 4;
 }  // namespace
 
 ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard,
-                           Config config, core::EvictionPolicy eviction_policy,
+                           Config config, const core::EvictionPolicy& eviction_policy,
                            core::SteadyClockFn steady_clock, core::WallClockFn wall_clock)
     : queue_(queue),
       cold_store_(cold_store),
       shard_(shard),
       config_(config),
-      eviction_policy_(std::move(eviction_policy)),
+      eviction_policy_(eviction_policy),
       steady_clock_(std::move(steady_clock)),
       wall_clock_(std::move(wall_clock)),
       strategy_(config_.quiet_threshold, config_.safety_margin, config_.jitter_fraction),

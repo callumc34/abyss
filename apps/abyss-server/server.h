@@ -16,6 +16,7 @@
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/eviction_policy.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/engine/recovery_coordinator.h"
 #include "abyss/engine/tiering_engine.h"
@@ -62,6 +63,11 @@ class Server {
 
   // Component graph. Declaration order = construction order.
   // Destruction is reverse — dependents destroyed before their dependencies.
+  //
+  // Single source of truth for per-prefix eviction. Borrowed by ShardedHotStore,
+  // HotConsumerPool, ColdConsumerPool — declared above them so it outlives
+  // every borrower. Do not reorder.
+  std::unique_ptr<core::EvictionPolicy> eviction_policy_;
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<hot::ShardedHotStore> hot_store_;
   std::unique_ptr<core::ColdStore> cold_store_;

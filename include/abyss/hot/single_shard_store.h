@@ -47,6 +47,8 @@ struct Entry {
   Value value;
   core::SteadyTime eviction_deadline;
   core::SteadyTime last_access;
+  // Resolved per-prefix eviction for this key.
+  core::EvictionTTL eviction{};
   int64_t abs_ttl_ms = 0;
 
   size_t ApproximateBytes() const;
@@ -62,7 +64,9 @@ class SingleShardStore {
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::EvictionTTL eviction);
 
-  void RefreshAccess(std::string_view key, core::SteadyTime now, core::EvictionTTL eviction);
+  // Extends the eviction deadline using the per-key cached eviction recorded
+  // at Apply time. No-op if the key is absent.
+  void RefreshAccess(std::string_view key, core::SteadyTime now);
   size_t EvictExpired(core::SteadyTime now);
   size_t EvictLru(size_t target_bytes);
 
