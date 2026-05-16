@@ -15,8 +15,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "abyss/platform/net.h"
 
@@ -77,10 +79,29 @@ ReadyPorts ParseReadyLine(std::string_view line) {
   };
 }
 
+std::string SubstituteDataDir(std::string_view yaml, std::string_view data_dir) {
+  constexpr std::string_view kPlaceholder{"${DATA_DIR}"};
+  std::string out;
+  out.reserve(yaml.size());
+  size_t pos = 0;
+  while (pos < yaml.size()) {
+    const auto hit = yaml.find(kPlaceholder, pos);
+    if (hit == std::string_view::npos) {
+      out.append(yaml.substr(pos));
+      break;
+    }
+    out.append(yaml.substr(pos, hit - pos));
+    out.append(data_dir);
+    pos = hit + kPlaceholder.size();
+  }
+  return out;
+}
+
 #ifdef _WIN32
 
 std::string BuildCommandLine(const char* binary, const std::string& data_dir,
-                             const std::string& shard_count, const std::string& ready_fd) {
+                             const std::string& shard_count, const std::string& ready_fd,
+                             const std::string& config_path) {
   std::string cmd;
   cmd.reserve(256);
   cmd += '"';
@@ -91,6 +112,11 @@ std::string BuildCommandLine(const char* binary, const std::string& data_dir,
   cmd += shard_count;
   cmd += " --ready-fd ";
   cmd += ready_fd;
+  if (!config_path.empty()) {
+    cmd += " --config \"";
+    cmd += config_path;
+    cmd += '"';
+  }
   return cmd;
 }
 
@@ -123,7 +149,7 @@ void ClosePipe(pipe_handle_t* h) {
 
 }  // namespace
 
-TestServer::TestServer(Config config) : config_(config), data_dir_("system_test") {}
+TestServer::TestServer(Config config) : config_(std::move(config)), data_dir_("system_test") {}
 
 TestServer::~TestServer() {
   if (IsRunning()) Kill();
@@ -140,6 +166,22 @@ bool TestServer::Start() {
 
   const std::string data_str = data_dir_.String();
   const std::string shard_str = std::to_string(config_.shard_count);
+
+  std::string config_path;
+  if (!config_.config_yaml.empty()) {
+    config_path = data_dir_.Sub("config.yaml").string();
+    const std::string body = SubstituteDataDir(config_.config_yaml, data_str);
+    std::ofstream out(config_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      skip_reason_ = "open config.yaml failed: " + config_path;
+      return false;
+    }
+    out.write(body.data(), static_cast<std::streamsize>(body.size()));
+    if (!out) {
+      skip_reason_ = "write config.yaml failed: " + config_path;
+      return false;
+    }
+  }
 
 #ifdef _WIN32
   SECURITY_ATTRIBUTES sa{};
@@ -165,7 +207,7 @@ bool TestServer::Start() {
   PROCESS_INFORMATION pi{};
   STARTUPINFOA si{};
   si.cb = sizeof(si);
-  std::string cmd_line = BuildCommandLine(binary, data_str, shard_str, ready_str);
+  std::string cmd_line = BuildCommandLine(binary, data_str, shard_str, ready_str, config_path);
   const BOOL ok = CreateProcessA(binary, cmd_line.data(), nullptr, nullptr, TRUE, 0, nullptr,
                                  nullptr, &si, &pi);
   CloseHandle(write_handle);
@@ -189,6 +231,21 @@ bool TestServer::Start() {
 
   const std::string ready_str = std::to_string(pipe_fds[1]);
 
+  // Build argv before fork; the child inherits these via copy-on-write.
+  std::vector<std::string> arg_storage = {
+      "abyss-server",   "--port",     "0",          "--admin-port", "0",
+      "--metrics-port", "0",          "--data-dir", data_str,       "--shard-count",
+      shard_str,        "--ready-fd", ready_str,
+  };
+  if (!config_path.empty()) {
+    arg_storage.emplace_back("--config");
+    arg_storage.push_back(config_path);
+  }
+  std::vector<char*> argv;
+  argv.reserve(arg_storage.size() + 1);
+  for (auto& s : arg_storage) argv.push_back(s.data());
+  argv.push_back(nullptr);
+
   const pid_t pid = ::fork();
   if (pid < 0) {
     const int err = errno;
@@ -201,10 +258,7 @@ bool TestServer::Start() {
 
   if (pid == 0) {
     ::close(pipe_fds[0]);
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-    ::execl(binary, "abyss-server", "--port", "0", "--admin-port", "0", "--metrics-port", "0",
-            "--data-dir", data_str.c_str(), "--shard-count", shard_str.c_str(), "--ready-fd",
-            ready_str.c_str(), nullptr);
+    ::execv(binary, argv.data());
     ::_exit(127);
   }
 
@@ -407,31 +461,32 @@ void SystemTest::TearDown() { client_.Close(); }
 uint16_t SystemTest::ServerPort() { return shared_server_->Port(); }
 
 void IsolatedServerTest::SetUp() {
-  if (!server_.Start()) {
-    GTEST_SKIP() << server_.SkipReason();
+  server_ = std::make_unique<TestServer>(MakeServerConfig());
+  if (!server_->Start()) {
+    GTEST_SKIP() << server_->SkipReason();
   }
-  if (!client_.Connect("127.0.0.1", server_.Port())) {
-    GTEST_SKIP() << "cannot connect to server on port " << server_.Port();
+  if (!client_.Connect("127.0.0.1", server_->Port())) {
+    GTEST_SKIP() << "cannot connect to server on port " << server_->Port();
   }
 }
 
 void IsolatedServerTest::TearDown() {
   client_.Close();
-  server_.Stop();
+  if (server_) server_->Stop();
 }
 
 void IsolatedServerTest::RestartServer() {
   client_.Close();
-  server_.Stop();
-  ASSERT_TRUE(server_.Start()) << server_.SkipReason();
-  ASSERT_TRUE(client_.Connect("127.0.0.1", server_.Port()));
+  server_->Stop();
+  ASSERT_TRUE(server_->Start()) << server_->SkipReason();
+  ASSERT_TRUE(client_.Connect("127.0.0.1", server_->Port()));
 }
 
 void IsolatedServerTest::KillAndRestartServer() {
   client_.Close();
-  server_.Kill();
-  ASSERT_TRUE(server_.Start()) << server_.SkipReason();
-  ASSERT_TRUE(client_.Connect("127.0.0.1", server_.Port()));
+  server_->Kill();
+  ASSERT_TRUE(server_->Start()) << server_->SkipReason();
+  ASSERT_TRUE(client_.Connect("127.0.0.1", server_->Port()));
 }
 
 void IsolatedDataServerTest::SetUp() {

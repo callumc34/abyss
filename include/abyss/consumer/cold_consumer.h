@@ -20,6 +20,7 @@
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/consumer_metrics.h"
+#include "abyss/metrics/metrics.h"
 
 namespace abyss::consumer {
 
@@ -200,6 +201,12 @@ class ColdConsumer {
   std::atomic<uint64_t> entries_dropped_abs_ttl_{0};
   std::atomic<uint32_t> mode_transitions_{0};
   std::atomic<Mode> mode_{Mode::kNormal};
+
+  metrics::CounterHandle flush_reason_quiet_;
+  metrics::CounterHandle flush_reason_deadline_;
+  metrics::CounterHandle flush_reason_pressure_;
+  metrics::CounterHandle flush_total_success_;
+  metrics::CounterHandle flush_total_failure_;
 };
 
 }  // namespace abyss::consumer

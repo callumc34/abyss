@@ -14,6 +14,7 @@
 #include "abyss/core/queue.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/metrics/metrics.h"
 
 namespace abyss::engine {
 
@@ -105,6 +106,12 @@ class TieringEngine : public core::CommandDispatcher {
   std::atomic<uint64_t> flush_consumer_timeouts_{0};
   std::atomic<uint64_t> flush_append_failures_{0};
   std::atomic<uint64_t> read_buffer_wait_timeouts_{0};
+
+  metrics::CounterHandle hits_hot_;
+  metrics::CounterHandle hits_buffer_;
+  metrics::CounterHandle hits_cold_;
+  metrics::CounterHandle misses_;
+  metrics::CounterHandle promotions_;
 };
 
 }  // namespace abyss::engine

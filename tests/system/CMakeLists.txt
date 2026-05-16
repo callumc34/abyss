@@ -20,6 +20,8 @@ add_executable(abyss_system_tests
   commands_test.cpp
   protocol_test.cpp
   tiering_test.cpp
+  tiered_read_test.cpp
+  compaction_efficiency_test.cpp
   durability_test.cpp
   operational_test.cpp
   health_test.cpp

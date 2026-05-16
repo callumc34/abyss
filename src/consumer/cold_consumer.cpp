@@ -8,6 +8,7 @@
 
 #include "abyss/core/ops.h"
 #include "abyss/log/log.h"
+#include "abyss/metrics/names.h"
 
 ABYSS_LOG_COMPONENT("abyss.cold.consumer")
 
@@ -33,7 +34,19 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
       steady_clock_(std::move(steady_clock)),
       wall_clock_(std::move(wall_clock)),
       strategy_(config_.quiet_threshold, config_.safety_margin, config_.jitter_fraction),
-      buffer_(strategy_, steady_clock_, config_.rng_seed) {}
+      buffer_(strategy_, steady_clock_, config_.rng_seed) {
+  auto& reg = metrics::Registry::Instance();
+  flush_reason_quiet_ =
+      reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kQuiet);
+  flush_reason_deadline_ =
+      reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kDeadline);
+  flush_reason_pressure_ =
+      reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kPressure);
+  flush_total_success_ =
+      reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kSuccess);
+  flush_total_failure_ =
+      reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kFailure);
+}
 
 ColdConsumer::~ColdConsumer() { Stop(); }
 
@@ -88,6 +101,18 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
   size_t count = 0;
   for (const auto& entry : *result) {
     const auto seq = entry.seq;
+    // Queue.Read uses the persisted ack offset as its read floor and
+    // re-delivers everything above it on every call. Cold's low-water-mark
+    // ack policy pins that floor below any unflushed buffer entry, so without
+    // this guard the consumer re-absorbs the same entries each iteration,
+    // advancing `last_modified` and pushing quiet flushes past the eviction
+    // deadline.
+    //
+    // FIXME: queue API conflates ack offset with read offset; long-term fix is
+    // to track read offset separately on the queue side.
+    if (drained_anything_ && seq <= latest_drained_seq_.load(std::memory_order_acquire)) {
+      continue;
+    }
     std::visit(
         [this, &entry, &count](const auto& payload) {
           using T = std::decay_t<decltype(payload)>;
@@ -155,6 +180,10 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
 
     for (const auto& entry : *read) {
       const auto seq = entry.seq;
+      // Same re-delivery guard as DrainWithBatch; see comment there.
+      if (drained_anything_ && seq <= latest_drained_seq_.load(std::memory_order_acquire)) {
+        continue;
+      }
       std::visit(
           [this, &entry](const auto& payload) {
             using T = std::decay_t<decltype(payload)>;
@@ -431,25 +460,37 @@ bool ColdConsumer::ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggre
     applied = ApplyBatchWithRetry(std::move(surviving));
   }
 
-  if (applied && surviving_count > 0) {
-    if (aggressive) {
-      flushes_aggressive_.fetch_add(surviving_count, std::memory_order_relaxed);
-    } else {
-      if (quiet_count > 0) flushes_quiet_.fetch_add(quiet_count, std::memory_order_relaxed);
-      if (deadline_count > 0) {
-        flushes_deadline_.fetch_add(deadline_count, std::memory_order_relaxed);
+  if (surviving_count > 0) {
+    if (applied) {
+      flush_total_success_.Increment(static_cast<double>(surviving_count));
+      if (aggressive) {
+        flushes_aggressive_.fetch_add(surviving_count, std::memory_order_relaxed);
+        flush_reason_pressure_.Increment(static_cast<double>(surviving_count));
+      } else {
+        if (quiet_count > 0) {
+          flushes_quiet_.fetch_add(quiet_count, std::memory_order_relaxed);
+          flush_reason_quiet_.Increment(static_cast<double>(quiet_count));
+        }
+        if (deadline_count > 0) {
+          flushes_deadline_.fetch_add(deadline_count, std::memory_order_relaxed);
+          flush_reason_deadline_.Increment(static_cast<double>(deadline_count));
+        }
       }
+    } else {
+      flush_total_failure_.Increment(static_cast<double>(surviving_count));
     }
 
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - flush_start)
-                                .count();
-    ABYSS_LOG_DEBUG("cold flush", {"shard", static_cast<int64_t>(shard_)},
-                    {"entries", static_cast<uint64_t>(surviving_count)},
-                    {"quiet", static_cast<uint64_t>(quiet_count)},
-                    {"deadline", static_cast<uint64_t>(deadline_count)}, {"aggressive", aggressive},
-                    {"dropped_ttl", static_cast<uint64_t>(dropped)},
-                    {"duration_ms", static_cast<int64_t>(elapsed_ms)});
+    if (applied) {
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - flush_start)
+                                  .count();
+      ABYSS_LOG_DEBUG("cold flush", {"shard", static_cast<int64_t>(shard_)},
+                      {"entries", static_cast<uint64_t>(surviving_count)},
+                      {"quiet", static_cast<uint64_t>(quiet_count)},
+                      {"deadline", static_cast<uint64_t>(deadline_count)},
+                      {"aggressive", aggressive}, {"dropped_ttl", static_cast<uint64_t>(dropped)},
+                      {"duration_ms", static_cast<int64_t>(elapsed_ms)});
+    }
   }
 
   TryAdvanceAck();

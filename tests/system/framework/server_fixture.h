@@ -18,6 +18,8 @@ class TestServer {
   struct Config {
     uint32_t shard_count = 4;
     std::chrono::milliseconds ready_timeout{5000};
+
+    std::string config_yaml;
   };
 
   TestServer() : TestServer(Config{}) {}
@@ -84,13 +86,18 @@ class IsolatedServerTest : public ::testing::Test {
   void TearDown() override;
 
   RedisClient& Client() { return client_; }
-  const TestServer& Server() const { return server_; }
+  const TestServer& Server() const { return *server_; }
 
   void RestartServer();
   void KillAndRestartServer();
 
+  // Override to customize the server configuration for a fixture. The default
+  // produces a TestServer launched against compile-time server defaults
+  // (matches pre-extension behaviour).
+  virtual TestServer::Config MakeServerConfig() const { return TestServer::Config{}; }
+
  private:
-  TestServer server_;
+  std::unique_ptr<TestServer> server_;
   RedisClient client_;
 };
 

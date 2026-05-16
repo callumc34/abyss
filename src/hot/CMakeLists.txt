@@ -6,6 +6,6 @@ add_library(abyss_hot
 add_library(abyss::hot ALIAS abyss_hot)
 
 target_link_libraries(abyss_hot
-  PUBLIC abyss::core
+  PUBLIC abyss::core abyss::metrics
   PRIVATE abyss::log
 )

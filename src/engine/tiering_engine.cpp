@@ -14,6 +14,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
+#include "abyss/metrics/names.h"
 
 ABYSS_LOG_COMPONENT("abyss.engine")
 
@@ -30,7 +31,14 @@ TieringEngine::TieringEngine(core::Queue& queue, core::HotStore& hot_store,
       buffer_router_(buffer_router),
       hot_progress_(hot_progress),
       rpc_(rpc),
-      config_(config) {}
+      config_(config) {
+  auto& reg = metrics::Registry::Instance();
+  hits_hot_ = reg.Counter(metrics::names::kHitsTotal, metrics::Tier::kHot);
+  hits_buffer_ = reg.Counter(metrics::names::kHitsTotal, metrics::Tier::kBuffer);
+  hits_cold_ = reg.Counter(metrics::names::kHitsTotal, metrics::Tier::kCold);
+  misses_ = reg.Counter(metrics::names::kMissesTotal);
+  promotions_ = reg.Counter(metrics::names::kPromotionsTotal);
+}
 
 namespace {
 
@@ -100,6 +108,7 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
 core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::ops::ReadOp& op) {
   auto hot_result = hot_store_.Exec(op);
   if (hot_result.has_value()) {
+    hits_hot_.Increment();
     return hot_result;
   }
   if (hot_result.error().code() != core::ErrorCode::kNotFound) {
@@ -125,13 +134,19 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
   if (!key.empty()) {
     auto buffer_result = buffer_router_.Read(key);
     if (buffer_result.has_value()) {
+      hits_buffer_.Increment();
       return buffer_result;
     }
   }
 
   auto cold_result = cold_store_.Exec(op);
-  if (cold_result.has_value() && !cold_result->IsNull() && !key.empty()) {
-    PromoteThroughQueue(key);
+  if (cold_result.has_value() && !cold_result->IsNull()) {
+    hits_cold_.Increment();
+    if (!key.empty()) {
+      PromoteThroughQueue(key);
+    }
+  } else if (cold_result.has_value()) {
+    misses_.Increment();
   }
   return cold_result;
 }
@@ -154,14 +169,38 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
   const auto key = core::ops::PrimaryKey(op);
   const auto overlay = buffer_router_.HashOverlayFor(key);
 
+  // Tracks whether cold answered any portion of the read. Cold-hit semantics
+  // win over buffer-hit when both contributed (ADP-006 §Metrics).
+  bool touched_cold = false;
+
+  auto record_outcome = [&](const core::Result<core::RespValue>& result) {
+    if (!result.has_value()) return;
+    if (touched_cold) {
+      hits_cold_.Increment();
+    } else {
+      hits_buffer_.Increment();
+    }
+  };
+
   switch (overlay.kind) {
-    case consumer::HashOverlay::Kind::kTombstone:
-      return TombstoneResponse(op);
+    case consumer::HashOverlay::Kind::kTombstone: {
+      auto r = TombstoneResponse(op);
+      hits_buffer_.Increment();
+      return r;
+    }
     case consumer::HashOverlay::Kind::kWrongType:
       return WrongType();
-    case consumer::HashOverlay::Kind::kNotPresent:
-      // No buffer state; cold answers canonically.
-      return cold_store_.Exec(op);
+    case consumer::HashOverlay::Kind::kNotPresent: {
+      auto cold = cold_store_.Exec(op);
+      if (cold.has_value()) {
+        if (cold->IsNull()) {
+          misses_.Increment();
+        } else {
+          hits_cold_.Increment();
+        }
+      }
+      return cold;
+    }
     case consumer::HashOverlay::Kind::kHash:
       break;
   }
@@ -169,16 +208,34 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
   // Per-field reads: ask the overlay first, fall back to cold per-unknown.
   if (const auto* get = std::get_if<core::ops::HashGet>(&op)) {
     const auto field = std::string(get->field);
-    if (overlay.removed_fields.contains(field)) return core::RespValue::Null();
+    if (overlay.removed_fields.contains(field)) {
+      hits_buffer_.Increment();
+      return core::RespValue::Null();
+    }
     auto it = overlay.fields.find(field);
-    if (it != overlay.fields.end()) return core::RespValue::BulkString(it->second);
-    return cold_store_.Exec(op);
+    if (it != overlay.fields.end()) {
+      hits_buffer_.Increment();
+      return core::RespValue::BulkString(it->second);
+    }
+    touched_cold = true;
+    auto r = cold_store_.Exec(op);
+    record_outcome(r);
+    return r;
   }
   if (const auto* hex = std::get_if<core::ops::HashFieldExists>(&op)) {
     const auto field = std::string(hex->field);
-    if (overlay.removed_fields.contains(field)) return core::RespValue::Integer(0);
-    if (overlay.fields.contains(field)) return core::RespValue::Integer(1);
-    return cold_store_.Exec(op);
+    if (overlay.removed_fields.contains(field)) {
+      hits_buffer_.Increment();
+      return core::RespValue::Integer(0);
+    }
+    if (overlay.fields.contains(field)) {
+      hits_buffer_.Increment();
+      return core::RespValue::Integer(1);
+    }
+    touched_cold = true;
+    auto r = cold_store_.Exec(op);
+    record_outcome(r);
+    return r;
   }
   if (const auto* hmget = std::get_if<core::ops::HashMultiGet>(&op)) {
     std::vector<core::RespValue> out;
@@ -194,6 +251,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
         out.push_back(core::RespValue::BulkString(it->second));
         continue;
       }
+      touched_cold = true;
       auto cold_one = cold_store_.Exec(core::ops::ReadOp{core::ops::HashGet{
           .key = hmget->key,
           .field = field,
@@ -201,10 +259,17 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
       if (!cold_one.has_value()) return std::unexpected(cold_one.error());
       out.push_back(std::move(*cold_one));
     }
-    return core::RespValue::Array(std::move(out));
+    auto r = core::RespValue::Array(std::move(out));
+    if (touched_cold) {
+      hits_cold_.Increment();
+    } else {
+      hits_buffer_.Increment();
+    }
+    return r;
   }
 
   // Full-collection reads: take cold's HGETALL and apply the overlay.
+  touched_cold = true;
   auto cold_all = cold_store_.Exec(core::ops::ReadOp{core::ops::HashGetAll{.key = key}});
   if (!cold_all.has_value()) return std::unexpected(cold_all.error());
   auto merged = DecodeColdHashMap(*cold_all);
@@ -214,6 +279,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
   for (const auto& [field, value] : overlay.fields) {
     merged[field] = value;
   }
+  hits_cold_.Increment();
 
   if (std::holds_alternative<core::ops::HashLen>(op)) {
     return core::RespValue::Integer(static_cast<int64_t>(merged.size()));
@@ -328,6 +394,7 @@ void TieringEngine::PromoteThroughQueue(std::string_view key) {
       .payload = core::entry::Write{.cmd = std::move(**promotion)},
   };
   const core::ShardId shard = core::ComputeShard(key, config_.shard_count);
+  promotions_.Increment();
   // Best-effort: client already has the cold value; never block the read path.
   auto appended = queue_.Append(shard, std::move(entry));
   if (!appended.has_value()) {
