@@ -104,6 +104,22 @@ class HotConsumerTest : public ::testing::Test {
     return future;
   }
 
+  // Same as AppendWithRpc but also returns the assigned sequence id. Used by
+  // tests that need to assert against the seq the consumer will settle.
+  struct AppendedRpc {
+    core::SequenceId seq;
+    std::future<core::RespValue> future;
+  };
+  AppendedRpc AppendWithRpcAndSeq(std::vector<std::string> args) {
+    auto pending = queue_->BeginAppend(0, MakeWrite(std::move(args)));
+    EXPECT_TRUE(pending.has_value());
+    const core::SequenceId seq = pending->seq();
+    auto future = rpc_.Register(seq);
+    pending->Publish();
+    EXPECT_TRUE(pending->durable().get().has_value());
+    return {seq, std::move(future)};
+  }
+
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   std::unique_ptr<testing::TempDir> dir_;
   std::unique_ptr<queue::WalQueue> queue_;
@@ -141,6 +157,27 @@ TEST_F(HotConsumerTest, AppliesEntriesInQueueOrder) {
   auto read = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k"}});
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "3");
+}
+
+// The engine's WaitForBufferConsistency gate (ADP-006 §Read Path) reads
+// HighestSettledSeq the instant a write's RPC future resolves; the hot consumer
+// must therefore publish settled-seq BEFORE calling Fulfill. C++ guarantees
+// every write a producer makes before std::promise::set_value is visible to the
+// waiter after std::future::get, so this assertion is sound under the fixed
+// ordering. A regression that swaps the lines back exposes a race window that
+// preemption between Fulfill and MarkSettled can land inside — the loop is sized
+// to surface it on contended runners.
+TEST_F(HotConsumerTest, SettledSeqVisibleWhenWriteRpcResolves) {
+  StartConsumer();
+  for (uint64_t i = 1; i <= 64; ++i) {
+    auto [seq, future] = AppendWithRpcAndSeq({"SET", "k" + std::to_string(i), "v"});
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready) << "iter=" << i;
+    auto value = future.get();
+    ASSERT_TRUE(value.IsSimpleString()) << "iter=" << i;
+    EXPECT_GE(consumer_->HighestSettledSeq(), seq)
+        << "iter=" << i << " seq=" << seq
+        << " — settled-seq must be visible at the moment the RPC future resolves";
+  }
 }
 
 TEST_F(HotConsumerTest, WrongTypeFlowsThroughRpcAndAcks) {

@@ -88,9 +88,11 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "ABYSS_WERROR": "ON",
+        "ABYSS_BUILD_PERF": "OFF",
         "VCPKG_TARGET_TRIPLET": "x64-windows-static-release",
         "VCPKG_HOST_TRIPLET": "x64-windows-static-release",
-        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets"
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
+        "VCPKG_MANIFEST_FEATURES": "builtin-cold"
       }
     }
   ],

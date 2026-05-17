@@ -38,6 +38,9 @@ class SyncRedisClient {
   std::string ReadSome(size_t n,
                        std::chrono::milliseconds timeout = std::chrono::milliseconds{2000}) const;
 
+  // Use this for request/response flows rather than ReadSome.
+  std::string ReadReply(std::chrono::milliseconds timeout = std::chrono::milliseconds{10000}) const;
+
   ::abyss::platform::Socket Fd() const noexcept { return fd_; }
 
  private:
