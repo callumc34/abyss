@@ -101,6 +101,16 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
   ASSERT_TRUE(before.has_value());
   EXPECT_EQ(before->AsString(), "expiring");
 
+  // Drive cold to absorb-and-flush the SET so the buffer is empty for k1 and
+  // cold's latest_drained_seq matches hot's settled seq. The engine's
+  // buffer-consistency gate on hot-miss reads (ADP-006) requires this in
+  // production where the cold consumer runs continuously; the harness's
+  // cold pool is intentionally idle, so the test drives the drain itself.
+  const auto shard = core::ComputeShard("k1", testing::IntegrationHarness::kShardCount);
+  auto& cold_consumer = harness_.ColdPool().ConsumerFor(shard);
+  cold_consumer.Drain();
+  cold_consumer.FlushUnscheduled();
+
   harness_.Clock().Advance(6000ms);
 
   core::ops::WriteOp cold_op{core::ops::StringSet{.key = "k1", .value = "cold_fallback"}};
@@ -321,10 +331,11 @@ TEST_F(TieringIntegrationTest, PromotionQueueFailureIncrementsCounter) {
   EXPECT_EQ(harness_.Engine().Snapshot().promotion_append_failures, 1U);
 }
 
-// Hash multi-field reads must not merge a stale buffer overlay against cold:
-// if the cold consumer has absorbed an HSET but not yet the subsequent HDEL
-// that emptied the hash, the engine would otherwise resurrect the deleted
-// fields. The wait gate parks the read until cold catches up to hot.
+// Hot-miss reads must not consult the buffer overlay against cold while the
+// cold consumer lags hot: a not-yet-absorbed delete leaves the overlay
+// reporting state hot has already revoked. The wait gate parks the read
+// until cold catches up to hot's settled seq. Covered for hash, string, and
+// existence-probe paths.
 TEST_F(TieringIntegrationTest, HashReadWithStaleBufferWaitsForColdConsumer) {
   // SeedHot dispatches a Write through the engine: hot applies and fulfils the
   // RPC, hot's HighestSettledSeq advances. The cold consumer is not running in
@@ -367,7 +378,49 @@ TEST_F(TieringIntegrationTest, HashReadTimesOutWhenColdConsumerWedged) {
   ASSERT_TRUE(result.has_value()) << result.error().message();
   ASSERT_TRUE(result->IsError());
   EXPECT_GE(elapsed, 100ms);
-  EXPECT_EQ(harness_.Engine().Snapshot().hash_read_buffer_wait_timeouts, 1U);
+  EXPECT_EQ(harness_.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
+}
+
+// Same race as the hash case but for a scalar: SET then DEL through hot, with
+// cold having only absorbed the SET, leaves the buffer holding the deleted
+// value. Without the gate a GET would surface it; with the gate the read
+// waits, the buffer absorbs the DEL (tombstone), and GET returns nil.
+TEST_F(TieringIntegrationTest, StringReadWithStaleBufferWaitsForColdConsumer) {
+  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
+  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();  // buffer now holds k=v.
+  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
+
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_TRUE(result->IsNull()) << "expected nil, got: " << result->AsString();
+}
+
+// EXISTS probe must observe the same gate — a stale buffer reporting kPresent
+// after hot already DEL'd the key would resurrect the count.
+TEST_F(TieringIntegrationTest, ExistsProbeWaitsForColdConsumer) {
+  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
+  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
+
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result =
+      harness_.Engine().DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsInteger());
+  EXPECT_EQ(result->AsInteger(), 0);
 }
 
 }  // namespace

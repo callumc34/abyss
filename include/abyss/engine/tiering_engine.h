@@ -42,7 +42,10 @@ struct TieringEngineMetrics {
   uint64_t flush_durable_failures = 0;
   uint64_t flush_consumer_timeouts = 0;
   uint64_t flush_append_failures = 0;
-  uint64_t hash_read_buffer_wait_timeouts = 0;
+  // Reads that fell through hot but timed out waiting for the cold consumer
+  // to catch up to hot's settled seq — surface as an error rather than serving
+  // a buffer/cold snapshot that lags hot.
+  uint64_t read_buffer_wait_timeouts = 0;
 };
 
 class TieringEngine : public core::CommandDispatcher {
@@ -81,6 +84,13 @@ class TieringEngine : public core::CommandDispatcher {
 
   core::Result<bool> ProbeKeyExists(std::string_view key);
 
+  // Returns true if the per-shard cold consumer has caught up to hot's settled
+  // seq within the configured budget; false on timeout. Callers that surface
+  // staleness through the buffer overlay (single-key reads after hot miss,
+  // ProbeKeyExists) gate on this so they never merge against an overlay older
+  // than hot's view. See ADP-006 §Read Path.
+  bool WaitForBufferConsistency(std::string_view key);
+
   core::Queue& queue_;
   core::HotStore& hot_store_;
   core::ColdStore& cold_store_;
@@ -94,7 +104,7 @@ class TieringEngine : public core::CommandDispatcher {
   std::atomic<uint64_t> flush_durable_failures_{0};
   std::atomic<uint64_t> flush_consumer_timeouts_{0};
   std::atomic<uint64_t> flush_append_failures_{0};
-  std::atomic<uint64_t> hash_read_buffer_wait_timeouts_{0};
+  std::atomic<uint64_t> read_buffer_wait_timeouts_{0};
 };
 
 }  // namespace abyss::engine

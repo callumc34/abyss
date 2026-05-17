@@ -73,15 +73,16 @@ Buffer hits do **not** promote. The cold consumer owns data in the buffer and wi
 
 The buffer read acquires a shared lock on the `shared_mutex`. Multiple I/O threads can read from the buffer concurrently. The cold consumer acquires an exclusive lock only when absorbing new entries or removing flushed entries.
 
-### Hash multi-field merge: buffer-consistency gate
+### Buffer-consistency gate on hot miss
 
-For hash multi-field reads (`HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HMGET`, `HEXISTS`) on a hot miss, the tiering engine merges cold's persisted state with the compaction buffer's hash overlay (see ADP-005 §Hashes). The overlay is the cold consumer's eventually-consistent view of the queue, which may lag the hot consumer: a write that hot has already applied (and the client observed `+OK` for) is not visible to the buffer until the cold consumer absorbs it.
+Whenever a read misses hot and the engine is about to consult the buffer overlay and/or cold (single-key reads, multi-field hash merges, `EXISTS` probes), it first waits for the per-shard cold consumer to catch up to hot's `HighestSettledSeq`. The overlay is the cold consumer's eventually-consistent view of the queue, which may lag hot — a write that hot has already applied (and the client observed `+OK` for) is not visible to the buffer until the cold consumer absorbs it.
 
-Without coordination, the lag breaks read-after-write. Concretely, if hot has just applied an `HDEL` that emptied the hash (so the hot store removed the key) but the cold consumer has only absorbed the earlier `HSET`, the overlay would report the pre-`HDEL` fields. Merging those into cold (which is empty for this key) resurrects the deleted fields.
+Without this gate, the lag breaks read-after-write in two equivalent shapes:
 
-Before snapshotting the overlay, the engine compares the per-shard cold consumer's `latest_drained_seq` against hot's `HighestSettledSeq` and waits (poll with short back-off) until cold catches up, bounded by `engine.buffer_consistency_wait_timeout_ms` (default 100ms). The wait is microseconds in steady state; the timeout fires only if the cold consumer is wedged, in which case the engine surfaces a Redis error rather than serving a stale merge — failing closed preserves the invariant.
+- `SET k v` then `DEL k` then `GET k`: if the cold consumer has absorbed the `SET` but not the `DEL`, the buffer holds `k=v` (stale) and the read returns `v` instead of `nil`.
+- `HSET h a 1 b 2` then `HDEL h a b` then `HGETALL h`: if the cold consumer has absorbed the `HSET` but not the `HDEL`, the overlay reports `{a:1, b:2}` and the merge against empty cold resurrects the deleted fields.
 
-This gate is specific to the hash merge path. Single-key reads (`GET`, `SISMEMBER`, `ZSCORE`, per-field `HGET`/`HEXISTS`) do not merge across tiers: each tier answers independently and the hot/buffer ordering above is sufficient.
+The gate compares the per-shard cold consumer's `latest_drained_seq` against hot's `HighestSettledSeq` and polls with a short back-off until cold catches up, bounded by `engine.buffer_consistency_wait_timeout_ms` (default 100ms). The wait is microseconds in steady state; the timeout fires only if the cold consumer is wedged, in which case the engine surfaces a Redis error rather than serving stale data — failing closed preserves the invariant. The wait does not apply to hot hits, which are authoritative.
 
 ### Cold Hit Promotion
 
@@ -157,7 +158,7 @@ Every read records which tier served the response:
 3. Buffer hits do not promote. Cold hits do promote (via queue append).
 4. A write is never acknowledged until both the queue fsync and hot consumer apply are complete.
 5. The promise registry is bounded: entries are removed on fulfillment or timeout. A stalled consumer causes promise timeouts, not unbounded registry growth.
-6. Hash multi-field reads merge cold with the buffer overlay only after the per-shard cold consumer has caught up to hot's settled seq. If the wait exceeds `engine.buffer_consistency_wait_timeout_ms`, the engine returns a Redis error rather than serving a merge against a stale overlay.
+6. Reads that miss hot consult the buffer overlay and/or cold only after the per-shard cold consumer has caught up to hot's settled seq. If the wait exceeds `engine.buffer_consistency_wait_timeout_ms`, the engine returns a Redis error rather than serving against a stale overlay.
 
 ## Trade-offs
 

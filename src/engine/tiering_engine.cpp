@@ -106,13 +106,22 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
     return hot_result;
   }
 
-  // Hash reads require buffer-overlay merge: the buffer holds a delta over
-  // cold, so neither tier alone has the full state when hot misses.
+  // Hot missed; we'll consult the buffer overlay and/or cold. The overlay is
+  // the cold consumer's eventually-consistent view of the queue and may lag
+  // hot — if hot just deleted the key (DEL, or HDEL emptying a hash) and the
+  // cold consumer has not yet absorbed the delete, the overlay still reports
+  // the pre-delete state and we'd serve a value hot has already revoked.
+  // Gate on cold catching up to hot's settled seq. See ADP-006 §Read Path.
+  auto key = core::ops::PrimaryKey(op);
+  if (!WaitForBufferConsistency(key)) {
+    return core::RespValue::Error(
+        core::ErrorPrefix::kErr, "read timed out waiting for compaction buffer to catch up to hot");
+  }
+
   if (IsHashRead(op)) {
     return DispatchHashRead(op);
   }
 
-  auto key = core::ops::PrimaryKey(op);
   if (!key.empty()) {
     auto buffer_result = buffer_router_.Read(key);
     if (buffer_result.has_value()) {
@@ -127,20 +136,22 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
   return cold_result;
 }
 
-core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::ReadOp& op) {
-  const auto key = core::ops::PrimaryKey(op);
-
-  // Hot returned NotFound, so we'll be merging cold with the buffer overlay.
+bool TieringEngine::WaitForBufferConsistency(std::string_view key) {
+  if (key.empty()) return true;
   const auto shard = core::ComputeShard(key, config_.shard_count);
   const auto target_seq = hot_progress_.HighestSettledSeq(shard);
-  if (target_seq > 0 && !buffer_router_.WaitForDrainedSeq(
-                            shard, target_seq, config_.buffer_consistency_wait_timeout)) {
-    hash_read_buffer_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-    return core::RespValue::Error(
-        core::ErrorPrefix::kErr,
-        "hash read timed out waiting for compaction buffer to catch up to hot");
+  if (target_seq == 0) return true;
+  if (buffer_router_.WaitForDrainedSeq(shard, target_seq,
+                                       config_.buffer_consistency_wait_timeout)) {
+    return true;
   }
+  read_buffer_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
 
+core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::ReadOp& op) {
+  // Caller (DispatchSingleKeyRead) has already waited for buffer consistency.
+  const auto key = core::ops::PrimaryKey(op);
   const auto overlay = buffer_router_.HashOverlayFor(key);
 
   switch (overlay.kind) {
@@ -281,6 +292,15 @@ core::Result<bool> TieringEngine::ProbeKeyExists(std::string_view key) {
     return std::unexpected(hot.error());
   }
 
+  // Hot miss: the buffer probe is about to override cold, so gate on it being
+  // at least as current as hot. Without this a not-yet-absorbed DEL could be
+  // missed and we'd report kPresent for a key hot has already removed.
+  if (!WaitForBufferConsistency(key)) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kTimeout,
+                    "EXISTS timed out waiting for compaction buffer to catch up to hot"});
+  }
+
   // Buffer probe overrides cold: a not-yet-flushed DEL means the key is absent.
   switch (buffer_router_.Probe(key)) {
     case consumer::BufferKeyPresence::kPresent:
@@ -325,8 +345,7 @@ TieringEngineMetrics TieringEngine::Snapshot() const {
       .flush_durable_failures = flush_durable_failures_.load(std::memory_order_relaxed),
       .flush_consumer_timeouts = flush_consumer_timeouts_.load(std::memory_order_relaxed),
       .flush_append_failures = flush_append_failures_.load(std::memory_order_relaxed),
-      .hash_read_buffer_wait_timeouts =
-          hash_read_buffer_wait_timeouts_.load(std::memory_order_relaxed),
+      .read_buffer_wait_timeouts = read_buffer_wait_timeouts_.load(std::memory_order_relaxed),
   };
 }
 
