@@ -133,7 +133,7 @@ TEST_F(ShardedHotStoreTest, EvictExpiredAcrossShards) {
 
   clock_.Advance(1100ms);
   auto evicted = short_store.EvictExpired(clock_.SteadyNow());
-  EXPECT_GE(evicted, 1U);
+  EXPECT_GE(evicted.Total(), 1U);
 }
 
 // --- Concurrency ---
@@ -224,7 +224,9 @@ TEST(ShardedHotStorePrefixEvictionTest, MixedPrefixesResolvePerEntry) {
   // session:a expires at 1s — visible after advancing past 1s.
   clock.Advance(1100ms);
   auto evicted = store.EvictExpired(clock.SteadyNow());
-  EXPECT_EQ(evicted, 1U) << "only session:a should be evicted at 1.1s";
+  EXPECT_EQ(evicted.Total(), 1U) << "only session:a should be evicted at 1.1s";
+  EXPECT_EQ(evicted.by_deadline, 1U);
+  EXPECT_EQ(evicted.by_ttl, 0U);
 
   core::ops::StringGet get_session{.key = "session:a"};
   EXPECT_FALSE(store.Exec(core::ops::ReadOp{get_session}).has_value());
@@ -264,10 +266,10 @@ TEST(ShardedHotStorePrefixEvictionTest, RefreshUsesPerKeyEvictionFromEntry) {
   // is that refresh used the per-key 2s eviction: deadline is now+2s = 3.5s
   // since write start, so the key is still alive at 2.5s but evicts at 3.5s+.
   clock.Advance(1500ms);
-  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()), 0U)
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).Total(), 0U)
       << "key should still be alive at refreshed_at + 1.5s";
   clock.Advance(600ms);
-  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()), 1U)
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).Total(), 1U)
       << "key must evict by refreshed_at + 2.1s (per-prefix eviction is 2s)";
 }
 

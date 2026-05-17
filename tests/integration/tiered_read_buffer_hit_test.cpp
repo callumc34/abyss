@@ -66,7 +66,7 @@ TEST_F(TieredReadBufferHitTest, ReadAfterHotEvictionFallsThroughToBuffer) {
   // for the harness) by a wide margin.
   harness_.Clock().Advance(48h);
   const auto evicted = harness_.ShardedHot().EvictExpired(harness_.Clock().SteadyNow());
-  ASSERT_GE(evicted, 1U) << "expected key_b to evict from hot";
+  ASSERT_GE(evicted.Total(), 1U) << "expected key_b to evict from hot";
 
   auto buffer_read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "key_b"}));
   ASSERT_TRUE(buffer_read.has_value()) << buffer_read.error().message();

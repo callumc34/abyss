@@ -680,20 +680,27 @@ void SingleShardStore::RefreshAccess(std::string_view key, core::SteadyTime now)
   it->second.eviction_deadline = now + it->second.eviction;
 }
 
-size_t SingleShardStore::EvictExpired(core::SteadyTime now) {
-  size_t count = 0;
+SingleShardStore::EvictExpiredReport SingleShardStore::EvictExpired(core::SteadyTime now) {
+  EvictExpiredReport report;
   for (auto it = entries_.begin(); it != entries_.end();) {
-    if (it->second.eviction_deadline <= now || IsExpiredByTtl(it->second, config_.wall_clock)) {
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
+    const bool ttl_expired = IsExpiredByTtl(it->second, config_.wall_clock);
+    const bool deadline_elapsed = it->second.eviction_deadline <= now;
+    if (ttl_expired || deadline_elapsed) {
       TrackRemove(it->second, it->first);
       key_count_--;
       eviction_count_++;
       it = entries_.erase(it);
-      ++count;
+      if (ttl_expired) {
+        ++report.by_ttl;
+      } else {
+        ++report.by_deadline;
+      }
     } else {
       ++it;
     }
   }
-  return count;
+  return report;
 }
 
 size_t SingleShardStore::EvictLru(size_t target_bytes) {

@@ -434,11 +434,13 @@ TEST_F(SingleShardStoreTest, EvictExpiredRemovesOldKeys) {
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
   auto before = store_.EvictExpired(clock_.SteadyNow());
-  EXPECT_EQ(before, 0U);
+  EXPECT_EQ(before.Total(), 0U);
 
   clock_.Advance(1100ms);
   auto after = store_.EvictExpired(clock_.SteadyNow());
-  EXPECT_EQ(after, 1U);
+  EXPECT_EQ(after.Total(), 1U);
+  EXPECT_EQ(after.by_deadline, 1U);
+  EXPECT_EQ(after.by_ttl, 0U);
 
   auto result = GetString("k");
   EXPECT_FALSE(result.has_value());
@@ -454,7 +456,43 @@ TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
 
   clock_.Advance(700ms);
   auto evicted = store_.EvictExpired(clock_.SteadyNow());
-  EXPECT_EQ(evicted, 0U);
+  EXPECT_EQ(evicted.Total(), 0U);
+}
+
+TEST_F(SingleShardStoreTest, EvictExpiredAttributesTtlReason) {
+  // Long eviction so the deadline never fires; rely on abs_ttl_ms to drive
+  // removal and assert the by_ttl counter, not by_deadline.
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  SetString("k", "v", static_cast<uint64_t>(now_ms + 1000));
+
+  auto before = store_.EvictExpired(clock_.SteadyNow());
+  EXPECT_EQ(before.by_ttl, 0U);
+  EXPECT_EQ(before.by_deadline, 0U);
+
+  clock_.Advance(1500ms);
+  auto after = store_.EvictExpired(clock_.SteadyNow());
+  EXPECT_EQ(after.by_ttl, 1U) << "abs TTL drove removal";
+  EXPECT_EQ(after.by_deadline, 0U) << "eviction deadline is far in the future";
+}
+
+TEST_F(SingleShardStoreTest, EvictExpiredTtlWinsWhenBothApply) {
+  // Short eviction + short TTL. The deadline check is `<=`, the TTL check
+  // is `>=` on wall-ms — at clock advance both fire on the same entry. The
+  // metric must attribute to TTL because the semantic outcome is "deleted
+  // entirely" not "moved tier".
+  core::ops::StringSet op{.key = "k", .value = "v"};
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  op.abs_ttl_ms = static_cast<uint64_t>(now_ms + 500);
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
+
+  clock_.Advance(1500ms);
+  auto report = store_.EvictExpired(clock_.SteadyNow());
+  EXPECT_EQ(report.by_ttl, 1U);
+  EXPECT_EQ(report.by_deadline, 0U);
 }
 
 TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {

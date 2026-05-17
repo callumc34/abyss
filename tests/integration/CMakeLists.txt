@@ -1,6 +1,7 @@
 add_executable(abyss_integration_tests
   tiering_integration_test.cpp
   tiered_read_buffer_hit_test.cpp
+  two_ttl_test.cpp
 )
 
 target_link_libraries(abyss_integration_tests PRIVATE

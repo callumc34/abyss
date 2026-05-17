@@ -152,11 +152,14 @@ void ShardedHotStore::DrainAccessBuffers(core::SteadyTime now) {
   }
 }
 
-size_t ShardedHotStore::EvictExpired(core::SteadyTime now) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  size_t total = 0;
+SingleShardStore::EvictExpiredReport ShardedHotStore::EvictExpired(core::SteadyTime now)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  SingleShardStore::EvictExpiredReport total;
   for (auto& shard : shards_) {
     std::unique_lock lock(shard->mutex);
-    total += shard->store.EvictExpired(now);
+    const auto r = shard->store.EvictExpired(now);
+    total.by_deadline += r.by_deadline;
+    total.by_ttl += r.by_ttl;
   }
   return total;
 }

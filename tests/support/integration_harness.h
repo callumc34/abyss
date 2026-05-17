@@ -37,10 +37,14 @@ class IntegrationHarness {
   // short timeout explicitly.
   struct Config {
     std::chrono::milliseconds buffer_consistency_wait_timeout{2000};
+    std::optional<core::EvictionPolicy> eviction_policy;
   };
 
   IntegrationHarness() : IntegrationHarness(Config{}) {}
   explicit IntegrationHarness(Config cfg) {
+    if (cfg.eviction_policy.has_value()) {
+      eviction_policy_ = std::move(*cfg.eviction_policy);
+    }
     tmp_dir_ = std::filesystem::temp_directory_path() /
                ("abyss_test_" + std::to_string(abyss::platform::fs::ProcessId()));
     std::filesystem::create_directories(tmp_dir_);
@@ -48,6 +52,7 @@ class IntegrationHarness {
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
         .max_memory_bytes = kHotMemory,
         .shard_count = kShardCount,
+        .eviction_policy = &eviction_policy_,
         .steady_clock = clock_.SteadyFn(),
         .wall_clock = clock_.WallFn(),
     });

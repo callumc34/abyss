@@ -67,7 +67,12 @@ class SingleShardStore {
   // Extends the eviction deadline using the per-key cached eviction recorded
   // at Apply time. No-op if the key is absent.
   void RefreshAccess(std::string_view key, core::SteadyTime now);
-  size_t EvictExpired(core::SteadyTime now);
+  struct EvictExpiredReport {
+    size_t by_deadline = 0;
+    size_t by_ttl = 0;
+    size_t Total() const { return by_deadline + by_ttl; }
+  };
+  EvictExpiredReport EvictExpired(core::SteadyTime now);
   size_t EvictLru(size_t target_bytes);
 
   core::MemoryStats Stats() const;

@@ -51,6 +51,7 @@ class EvictionWorker {
   std::condition_variable wake_cv_;
 
   metrics::CounterHandle evicted_total_;
+  metrics::CounterHandle ttl_expired_total_;
 };
 
 }  // namespace abyss::hot
