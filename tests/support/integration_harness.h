@@ -29,7 +29,18 @@ class IntegrationHarness {
   static constexpr uint32_t kShardCount = 4;
   static constexpr size_t kHotMemory = 4UL * 1024UL * 1024UL;
 
-  IntegrationHarness() {
+  // Test-side defaults for engine knobs. The production default for the
+  // buffer-consistency wait is 100 ms ([ADP-006]); the harness widens it
+  // because the Stale-buffer tests want to assert logical correctness, not
+  // race the production timeout. Tests that exercise the timeout path
+  // (HashReadTimesOutWhenColdConsumerWedged) construct a harness with a
+  // short timeout explicitly.
+  struct Config {
+    std::chrono::milliseconds buffer_consistency_wait_timeout{2000};
+  };
+
+  IntegrationHarness() : IntegrationHarness(Config{}) {}
+  explicit IntegrationHarness(Config cfg) {
     tmp_dir_ = std::filesystem::temp_directory_path() /
                ("abyss_test_" + std::to_string(abyss::platform::fs::ProcessId()));
     std::filesystem::create_directories(tmp_dir_);
@@ -53,14 +64,9 @@ class IntegrationHarness {
 
     InstallQueueMocks();
 
-    core::EvictionPolicy eviction_policy{std::chrono::seconds{86400}};
     cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
-        eviction_policy, *rpc_, clock_.SteadyFn(), clock_.WallFn());
-
-    engine_ = std::make_unique<engine::TieringEngine>(
-        queue_, *hot_, *cold_, *cold_pool_, *rpc_,
-        engine::TieringEngineConfig{.shard_count = kShardCount});
+        eviction_policy_, *rpc_, clock_.SteadyFn(), clock_.WallFn());
 
     hot_pool_ =
         std::make_unique<consumer::HotConsumerPool>(queue_, *hot_, *rpc_, *apply_notifier_,
@@ -72,7 +78,15 @@ class IntegrationHarness {
                                                                 .read_timeout = core::Duration{10},
                                                             },
                                                     },
-                                                    eviction_policy);
+                                                    eviction_policy_);
+
+    engine_ = std::make_unique<engine::TieringEngine>(
+        queue_, *hot_, *cold_, *cold_pool_, *hot_pool_, *rpc_,
+        engine::TieringEngineConfig{
+            .shard_count = kShardCount,
+            .buffer_consistency_wait_timeout = cfg.buffer_consistency_wait_timeout,
+        });
+
     hot_pool_->Start();
   }
 
@@ -166,6 +180,7 @@ class IntegrationHarness {
 
   std::filesystem::path tmp_dir_;
   TestClock clock_;
+  core::EvictionPolicy eviction_policy_{std::chrono::seconds{86400}};
   uint64_t next_seq_ = 1;
 
   ::testing::NiceMock<MockQueue> queue_;

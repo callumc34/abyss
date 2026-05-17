@@ -1,7 +1,9 @@
 #include "abyss/consumer/cold_consumer_pool.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
@@ -84,6 +86,21 @@ BufferKeyPresence ColdConsumerPool::Probe(std::string_view key) const {
 HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {
   const auto shard = ShardForKey(key);
   return consumers_[shard]->Buffer().HashOverlayFor(key);
+}
+
+bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
+                                         std::chrono::milliseconds timeout) {
+  if (shard >= consumers_.size()) return false;
+  const auto& consumer = *consumers_[shard];
+  // Tight loop with a short back-off — typical wait is microseconds because
+  // the cold consumer absorbs at queue-read cadence.
+  constexpr auto kPollInterval = std::chrono::microseconds{100};
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (consumer.LatestDrainedSeq() < target_seq) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(kPollInterval);
+  }
+  return true;
 }
 
 core::ShardId ColdConsumerPool::ShardForKey(std::string_view key) const {

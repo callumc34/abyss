@@ -232,8 +232,10 @@ TEST_F(TcpServerComponentTest, SlowClientHardLimitsWithoutAffectingOthers) {
   EXPECT_EQ(healthy.Command({"PING"}), "+PONG\r\n");
 
   // Server should hard-limit-close the slow connection. Poll ActiveConnections
-  // until only the healthy client remains.
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  // until only the healthy client remains. Deadline sized for sanitizer
+  // overhead — pushing 32 MiB through the reactor and the kernel write buffer
+  // takes seconds under TSAN. Healthy builds break out in <1 s.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
   while (std::chrono::steady_clock::now() < deadline && server.ActiveConnections() > 1) {
     std::this_thread::sleep_for(std::chrono::milliseconds{50});
   }

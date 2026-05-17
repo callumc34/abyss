@@ -235,10 +235,11 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
     }
   }
 
+  // Publish settled-seq BEFORE fulfilling the RPC to avoid preempt issues.
+  MarkSettledAndMaybeAck(entry.seq);
   const core::RpcId rpc_id = core::MakeRpcId(config_.shard, entry.seq);
   (void)rpc_.Fulfill(rpc_id, std::move(result));
   apply_notifier_.NotifyApplied(rpc_id);
-  MarkSettledAndMaybeAck(entry.seq);
 }
 
 // Block-and-scan: hold the Conditional, wait for the Resolved to apply.
@@ -296,11 +297,14 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
 
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
 
+  // Persist the Flush ack BEFORE fulfilling the RPC. See the equivalent comment
+  // in ColdConsumer::HandleFlush.
+  MarkSettledAndMaybeAck(entry.seq);
+
   const core::RpcId rpc_id = core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq);
   (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
   apply_notifier_.NotifyApplied(rpc_id);
   counters_.applied.fetch_add(1, std::memory_order_relaxed);
-  MarkSettledAndMaybeAck(entry.seq);
 }
 
 void HotConsumer::HandleResolved(const core::QueueEntry& entry,
@@ -343,14 +347,14 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
     }
   }
 
+  if (had_pending) MarkSettledAndMaybeAck(resolved.ref);
+  MarkSettledAndMaybeAck(entry.seq);
+
   // The resolver awaits NotifyApplied on the conditional's RpcId before
   // fulfilling the client RPC. The Resolved entry's own RpcId has no
   // resolver-side waiter today, but we notify for symmetry with future RPCs.
   apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, resolved.ref));
   apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, entry.seq));
-
-  if (had_pending) MarkSettledAndMaybeAck(resolved.ref);
-  MarkSettledAndMaybeAck(entry.seq);
 }
 
 core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCommand>& ops,

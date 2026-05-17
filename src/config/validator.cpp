@@ -1,7 +1,6 @@
 #include "validator.h"
 
 #include <algorithm>
-#include <array>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -212,6 +211,10 @@ core::Result<void> ValidateEngine(const EngineConfig& e) {
   if (e.min_rpc_wait_fraction <= 0.0 || e.min_rpc_wait_fraction >= 1.0) {
     return std::unexpected(InvalidArg("engine.min_rpc_wait_fraction", "must be in (0.0, 1.0)"));
   }
+  if (e.buffer_consistency_wait_timeout.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("engine.buffer_consistency_wait_timeout_ms", "must be > 0 milliseconds"));
+  }
   return {};
 }
 
@@ -315,19 +318,19 @@ core::Result<void> ValidateRetentionVsEviction(const Config& c) {
 
 // NOLINTNEXTLINE(misc-unused-parameters)
 core::Result<void> ValidatePortCollisions(const Config& c) {
-  const std::array<std::pair<uint16_t, std::string_view>, 3> ports = {{
+  const std::vector<std::pair<uint16_t, std::string_view>> ports = {
       {c.net.port, "net.port"},
       {c.metrics.port, "metrics.port"},
       {c.admin.port, "admin.port"},
-  }};
-  for (const auto* lhs_it = ports.begin(); lhs_it != ports.end(); ++lhs_it) {
-    if (lhs_it->first == 0) continue;  // ephemeral; resolved at bind time
-    for (const auto* rhs_it = std::next(lhs_it); rhs_it != ports.end(); ++rhs_it) {
-      if (lhs_it->first == rhs_it->first) {
+  };
+  for (size_t i = 0; i < ports.size(); ++i) {
+    if (ports[i].first == 0) continue;  // ephemeral; resolved at bind time
+    for (size_t j = i + 1; j < ports.size(); ++j) {
+      if (ports[i].first == ports[j].first) {
         std::string msg = "collides with ";
-        msg += rhs_it->second;
+        msg += ports[j].second;
         msg += " (both bound to the same port)";
-        return std::unexpected(InvalidArg(std::string(lhs_it->second), msg));
+        return std::unexpected(InvalidArg(std::string(ports[i].second), msg));
       }
     }
   }

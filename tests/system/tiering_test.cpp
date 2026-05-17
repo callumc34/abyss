@@ -50,12 +50,16 @@ TEST_F(TieringTest, EvictionUnderMemoryPressure) {
 }
 
 TEST_F(TieringTest, TtlExpiryRemovesKey) {
-  EXPECT_TRUE(Client().Command({"SET", "k", "v", "PX", "200"}).IsOk());
+  // TTL sized to outlast the SET→GET round trip under TSAN/ASAN, where the
+  // round trip alone can exceed a tight TTL and lazy expiry trips the first
+  // GET. The 2 s / 2.5 s pair is the smallest stable budget; the assertion
+  // is about expiry semantics, not timing precision.
+  EXPECT_TRUE(Client().Command({"SET", "k", "v", "PX", "2000"}).IsOk());
 
   auto before = Client().Command({"GET", "k"});
   EXPECT_TRUE(before.IsBulk());
 
-  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  std::this_thread::sleep_for(std::chrono::milliseconds{2500});
 
   auto after = Client().Command({"GET", "k"});
   EXPECT_TRUE(after.IsNil()) << "key should have expired";

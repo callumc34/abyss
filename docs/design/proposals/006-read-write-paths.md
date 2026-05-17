@@ -73,6 +73,17 @@ Buffer hits do **not** promote. The cold consumer owns data in the buffer and wi
 
 The buffer read acquires a shared lock on the `shared_mutex`. Multiple I/O threads can read from the buffer concurrently. The cold consumer acquires an exclusive lock only when absorbing new entries or removing flushed entries.
 
+### Buffer-consistency gate on hot miss
+
+Whenever a read misses hot and the engine is about to consult the buffer overlay and/or cold (single-key reads, multi-field hash merges, `EXISTS` probes), it first waits for the per-shard cold consumer to catch up to hot's `HighestSettledSeq`. The overlay is the cold consumer's eventually-consistent view of the queue, which may lag hot — a write that hot has already applied (and the client observed `+OK` for) is not visible to the buffer until the cold consumer absorbs it.
+
+Without this gate, the lag breaks read-after-write in two equivalent shapes:
+
+- `SET k v` then `DEL k` then `GET k`: if the cold consumer has absorbed the `SET` but not the `DEL`, the buffer holds `k=v` (stale) and the read returns `v` instead of `nil`.
+- `HSET h a 1 b 2` then `HDEL h a b` then `HGETALL h`: if the cold consumer has absorbed the `HSET` but not the `HDEL`, the overlay reports `{a:1, b:2}` and the merge against empty cold resurrects the deleted fields.
+
+The gate compares the per-shard cold consumer's `latest_drained_seq` against hot's `HighestSettledSeq` and polls with a short back-off until cold catches up, bounded by `engine.buffer_consistency_wait_timeout_ms` (default 100ms). The wait is microseconds in steady state; the timeout fires only if the cold consumer is wedged, in which case the engine surfaces a Redis error rather than serving stale data — failing closed preserves the invariant. The wait does not apply to hot hits, which are authoritative.
+
 ### Cold Hit Promotion
 
 Cold store hits **do** promote via the queue. This gives the promoted key:
@@ -102,6 +113,8 @@ Client ──▶ RESP Frontend ──▶ For every owned shard:
 Each shard receives a `Flush` queue entry. The hot consumer wipes its in-memory store and fulfils its per-shard flush RPC. The cold consumer drops its compaction buffer (pre-Flush writes never reach cold), wipes the cold store, and fulfils its RPC. The Resolver clears its existence cache, emits Skip Resolveds for any pre-Flush Conditional whose Resolved had not yet been issued (so consumers' block-and-scan can drain past the parked Conditionals), and fulfils its RPC.
 
 The client sees `+OK` only when every consumer on every shard has applied the wipe. Partial fan-out failures (a shard's durable wait or any consumer's apply timeout) surface as a Redis error; the Flush entries that did land remain durable in the queue and apply on consumer catch-up. A retry of FLUSHDB is idempotent at the wipe level.
+
+**Durability invariant — Flush ack precedes RPC fulfilment.** Each consumer persists its per-shard Flush ack *before* fulfilling the Flush RPC that the engine waits on. Without this, FLUSHDB could return `+OK` while a peer shard's persisted ack is still pre-Flush; a crash in that window would leave recovery to re-process the missed Flush, and because `ColdStore::Wipe` is global (single RocksDB instance), a replay-time Wipe in any shard destroys data that a parallel shard's replay has already flushed to cold disk after its own Flush. The invariant holds uniformly across hot/cold/resolver consumers — even where the store is in-memory and self-correcting on recovery — so a future persistent hot snapshot does not inherit the race.
 
 Multi-pod (Phase 2+) extends this naturally: each pod receives the broadcast at the RESP layer and runs the same fan-out across its owned shards. There is no cross-pod synchronisation step.
 
@@ -145,6 +158,7 @@ Every read records which tier served the response:
 3. Buffer hits do not promote. Cold hits do promote (via queue append).
 4. A write is never acknowledged until both the queue fsync and hot consumer apply are complete.
 5. The promise registry is bounded: entries are removed on fulfillment or timeout. A stalled consumer causes promise timeouts, not unbounded registry growth.
+6. Reads that miss hot consult the buffer overlay and/or cold only after the per-shard cold consumer has caught up to hot's settled seq. If the wait exceeds `engine.buffer_consistency_wait_timeout_ms`, the engine returns a Redis error rather than serving against a stale overlay.
 
 ## Trade-offs
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <optional>
 #include <string_view>
 
@@ -31,6 +32,11 @@ class CompactionBufferRouter : public core::Reader {
   virtual BufferKeyPresence Probe(std::string_view key) const = 0;
 
   virtual HashOverlay HashOverlayFor(std::string_view key) const = 0;
+
+  // Blocks until the shard's cold consumer has drained through `target_seq`,
+  // or `timeout` elapses. Returns true on catch-up, false on timeout.
+  virtual bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
+                                 std::chrono::milliseconds timeout) = 0;
 };
 
 }  // namespace abyss::consumer

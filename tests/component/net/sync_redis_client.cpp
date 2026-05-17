@@ -165,7 +165,7 @@ bool SyncRedisClient::SendRaw(const std::string& bytes) const {
 
 std::string SyncRedisClient::Command(std::initializer_list<std::string> args) const {
   if (!SendRaw(Encode(std::vector<std::string>(args)))) return {};
-  return ReadSome(4096);
+  return ReadReply();
 }
 
 std::string SyncRedisClient::ReadSome(size_t n, std::chrono::milliseconds timeout) const {
@@ -176,6 +176,70 @@ std::string SyncRedisClient::ReadSome(size_t n, std::chrono::milliseconds timeou
   if (r <= 0) return {};
   buf.resize(static_cast<size_t>(r));
   return buf;
+}
+
+std::string SyncRedisClient::ReadReply(std::chrono::milliseconds timeout) const {
+  if (fd_ == kInvalidSocket) return {};
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+  auto remaining = [&]() {
+    const auto now = std::chrono::steady_clock::now();
+    return now >= deadline ? std::chrono::milliseconds{0}
+                           : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+  };
+
+  auto read_byte = [&](char& c) -> bool {
+    const auto r = remaining();
+    if (r.count() <= 0) return false;
+    if (!WaitReadable(fd_, r)) return false;
+    const auto n = pnet::Recv(fd_, &c, 1, 0);
+    return n == 1;
+  };
+
+  auto read_line = [&](std::string& out) -> bool {
+    char c{};
+    while (read_byte(c)) {
+      out.push_back(c);
+      if (out.size() >= 2 && out[out.size() - 2] == '\r' && out.back() == '\n') {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  std::string out;
+  if (!read_line(out) || out.size() < 3) return {};
+
+  switch (out[0]) {
+    case '+':
+    case '-':
+    case ':':
+      return out;
+    case '$': {
+      // Null bulk: $-1\r\n.
+      if (out.size() >= 5 && out[1] == '-' && out[2] == '1') return out;
+      int64_t len = 0;
+      for (size_t i = 1; i + 1 < out.size(); ++i) {
+        if (out[i] == '\r') break;
+        if (out[i] < '0' || out[i] > '9') return {};
+        len = (len * 10) + (out[i] - '0');
+      }
+      const size_t want = static_cast<size_t>(len) + 2;  // payload + \r\n
+      out.reserve(out.size() + want);
+      char c{};
+      for (size_t i = 0; i < want; ++i) {
+        if (!read_byte(c)) return {};
+        out.push_back(c);
+      }
+      return out;
+    }
+    case '*':
+      // Arrays aren't exercised by the component tests today; returning the
+      // header keeps the door open without committing to recursive parsing.
+      return out;
+    default:
+      return {};
+  }
 }
 
 }  // namespace abyss::component_test

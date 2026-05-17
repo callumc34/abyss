@@ -28,6 +28,8 @@ set(ABYSS_MSVC_WARNINGS
   # Suppress warnings for legacy POSIX-named CRT functions used in tests.
   /D_CRT_SECURE_NO_WARNINGS
   /D_CRT_NONSTDC_NO_DEPRECATION
+  # Suppress windows.h's min/max macros so std::min/std::max parse correctly.
+  /DNOMINMAX
 )
 
 target_compile_options(abyss_compiler_options INTERFACE

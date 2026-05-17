@@ -40,6 +40,12 @@ class EmptyBufferRouter : public CompactionBufferRouter {
   consumer::HashOverlay HashOverlayFor(std::string_view /*key*/) const override {
     return consumer::HashOverlay{};
   }
+  // Resolver tests don't depend on cold-consumer drain; report "caught up" so
+  // the engine's gate never blocks.
+  bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId /*target_seq*/,
+                         std::chrono::milliseconds /*timeout*/) override {
+    return true;
+  }
 };
 
 class ResolverTest : public ::testing::Test {

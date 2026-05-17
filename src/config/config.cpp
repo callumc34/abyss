@@ -126,6 +126,7 @@ core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
   return SectionDecoder(cur)
       .Optional("write_timeout_ms", out.write_timeout)
       .Optional("min_rpc_wait_fraction", out.min_rpc_wait_fraction)
+      .Optional("buffer_consistency_wait_timeout_ms", out.buffer_consistency_wait_timeout)
       .Finish();
 }
 

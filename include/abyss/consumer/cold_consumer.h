@@ -120,6 +120,11 @@ class ColdConsumer {
   Metrics Snapshot() const;
   Mode CurrentMode() const { return mode_.load(std::memory_order_acquire); }
 
+  // Highest queue seq this consumer has drained.
+  core::SequenceId LatestDrainedSeq() const {
+    return latest_drained_seq_.load(std::memory_order_acquire);
+  }
+
  private:
   void RunLoop();
 

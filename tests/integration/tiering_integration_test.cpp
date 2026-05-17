@@ -5,12 +5,14 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/queue/append_result.h"
 #include "integration_harness.h"
@@ -98,6 +100,16 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
   auto before = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
   ASSERT_TRUE(before.has_value());
   EXPECT_EQ(before->AsString(), "expiring");
+
+  // Drive cold to absorb-and-flush the SET so the buffer is empty for k1 and
+  // cold's latest_drained_seq matches hot's settled seq. The engine's
+  // buffer-consistency gate on hot-miss reads (ADP-006) requires this in
+  // production where the cold consumer runs continuously; the harness's
+  // cold pool is intentionally idle, so the test drives the drain itself.
+  const auto shard = core::ComputeShard("k1", testing::IntegrationHarness::kShardCount);
+  auto& cold_consumer = harness_.ColdPool().ConsumerFor(shard);
+  cold_consumer.Drain();
+  cold_consumer.FlushUnscheduled();
 
   harness_.Clock().Advance(6000ms);
 
@@ -317,6 +329,108 @@ TEST_F(TieringIntegrationTest, PromotionQueueFailureIncrementsCounter) {
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "cv");
   EXPECT_EQ(harness_.Engine().Snapshot().promotion_append_failures, 1U);
+}
+
+// Hot-miss reads must not consult the buffer overlay against cold while the
+// cold consumer lags hot: a not-yet-absorbed delete leaves the overlay
+// reporting state hot has already revoked. The wait gate parks the read
+// until cold catches up to hot's settled seq. Covered for hash, string, and
+// existence-probe paths.
+TEST_F(TieringIntegrationTest, HashReadWithStaleBufferWaitsForColdConsumer) {
+  // SeedHot dispatches a Write through the engine: hot applies and fulfils the
+  // RPC, hot's HighestSettledSeq advances. The cold consumer is not running in
+  // the harness, so cold's latest_drained_seq stays at 0 until we Drain.
+  ASSERT_TRUE(harness_.SeedHot({"HSET", "h", "a", "1", "b", "2"}).has_value());
+  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
+  // Drain only HSET into the buffer, leaving the buffer "stale" — overlay will
+  // report fields={a:1,b:2} until cold catches up to the HDEL.
+  harness_.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness_.SeedHot({"HDEL", "h", "a", "b"}).value().AsInteger(), 2);
+
+  // Without the wait gate, HGETALL would see overlay.fields={a:1,b:2}, merge
+  // with empty cold, and return a non-empty array. The peer thread drains the
+  // queued HDEL after a short delay so the gate succeeds within its budget.
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsArray());
+  EXPECT_TRUE(result->AsArray().empty());
+}
+
+// When the cold consumer is wedged the engine surfaces a timeout rather than
+// serving a stale merge — failing closed is the documented contract.
+TEST(TieringIntegrationTimeoutTest, HashReadTimesOutWhenColdConsumerWedged) {
+  // Builds a harness with a tight wait budget specifically to exercise the
+  // timeout path. The default harness widens the budget so the Stale-buffer
+  // tests don't race the production timeout on slower runners.
+  constexpr auto kTimeout = std::chrono::milliseconds{100};
+  testing::IntegrationHarness harness{
+      testing::IntegrationHarness::Config{.buffer_consistency_wait_timeout = kTimeout}};
+  const auto cmd = [](std::initializer_list<std::string> args) {
+    return core::RespCommand{.args = std::vector<std::string>(args)};
+  };
+
+  ASSERT_TRUE(harness.SeedHot({"HSET", "h", "a", "1"}).has_value());
+  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
+  harness.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness.SeedHot({"HDEL", "h", "a"}).value().AsInteger(), 1);
+
+  // No advancer — cold stays behind. The configured timeout fires.
+  const auto t0 = std::chrono::steady_clock::now();
+  auto result = harness.Engine().DispatchRead("HGETALL", cmd({"HGETALL", "h"}));
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsError());
+  EXPECT_GE(elapsed, kTimeout);
+  EXPECT_EQ(harness.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
+}
+
+// Same race as the hash case but for a scalar: SET then DEL through hot, with
+// cold having only absorbed the SET, leaves the buffer holding the deleted
+// value. Without the gate a GET would surface it; with the gate the read
+// waits, the buffer absorbs the DEL (tombstone), and GET returns nil.
+TEST_F(TieringIntegrationTest, StringReadWithStaleBufferWaitsForColdConsumer) {
+  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
+  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();  // buffer now holds k=v.
+  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
+
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_TRUE(result->IsNull()) << "expected nil, got: " << result->AsString();
+}
+
+// EXISTS probe must observe the same gate — a stale buffer reporting kPresent
+// after hot already DEL'd the key would resurrect the count.
+TEST_F(TieringIntegrationTest, ExistsProbeWaitsForColdConsumer) {
+  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
+  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
+
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result =
+      harness_.Engine().DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsInteger());
+  EXPECT_EQ(result->AsInteger(), 0);
 }
 
 }  // namespace

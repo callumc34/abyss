@@ -110,6 +110,10 @@ struct EngineConfig {
   // Prevents a slow fsync from starving the RPC wait to ~0ms. The total write
   // latency is therefore bounded by `write_timeout * (1 + min_rpc_wait_fraction)`.
   double min_rpc_wait_fraction = 0.5;
+
+  // Bounds how long DispatchHashRead waits for the cold consumer to catch up
+  // to hot's settled seq before snapshotting the buffer overlay.
+  std::chrono::milliseconds buffer_consistency_wait_timeout{100};
 };
 
 struct MetricsConfig {
