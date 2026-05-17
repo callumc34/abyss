@@ -57,10 +57,6 @@ class IntegrationHarness {
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
         eviction_policy_, *rpc_, clock_.SteadyFn(), clock_.WallFn());
 
-    engine_ = std::make_unique<engine::TieringEngine>(
-        queue_, *hot_, *cold_, *cold_pool_, *rpc_,
-        engine::TieringEngineConfig{.shard_count = kShardCount});
-
     hot_pool_ =
         std::make_unique<consumer::HotConsumerPool>(queue_, *hot_, *rpc_, *apply_notifier_,
                                                     consumer::HotConsumerPool::Config{
@@ -72,6 +68,11 @@ class IntegrationHarness {
                                                             },
                                                     },
                                                     eviction_policy_);
+
+    engine_ = std::make_unique<engine::TieringEngine>(
+        queue_, *hot_, *cold_, *cold_pool_, *hot_pool_, *rpc_,
+        engine::TieringEngineConfig{.shard_count = kShardCount});
+
     hot_pool_->Start();
   }
 

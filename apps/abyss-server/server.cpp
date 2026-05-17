@@ -149,14 +149,6 @@ bool Server::Initialize() {
       },
       *eviction_policy_, *consumer_rpc_);
 
-  engine_ = std::make_unique<engine::TieringEngine>(
-      *queue_, *hot_store_, *cold_store_, *cold_pool_, *consumer_rpc_,
-      engine::TieringEngineConfig{
-          .shard_count = hot_store_->shard_count(),
-          .write_timeout = config_.engine.write_timeout,
-          .min_rpc_wait_fraction = config_.engine.min_rpc_wait_fraction,
-      });
-
   hot_pool_ = std::make_unique<consumer::HotConsumerPool>(
       *queue_, *hot_store_, *consumer_rpc_, *apply_notifier_,
       consumer::HotConsumerPool::Config{
@@ -169,6 +161,15 @@ bool Server::Initialize() {
               },
       },
       *eviction_policy_);
+
+  engine_ = std::make_unique<engine::TieringEngine>(
+      *queue_, *hot_store_, *cold_store_, *cold_pool_, *hot_pool_, *consumer_rpc_,
+      engine::TieringEngineConfig{
+          .shard_count = hot_store_->shard_count(),
+          .write_timeout = config_.engine.write_timeout,
+          .min_rpc_wait_fraction = config_.engine.min_rpc_wait_fraction,
+          .buffer_consistency_wait_timeout = config_.engine.buffer_consistency_wait_timeout,
+      });
 
   hot_eviction_worker_ =
       std::make_unique<hot::EvictionWorker>(*hot_store_, hot::EvictionWorker::Config{

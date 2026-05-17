@@ -53,6 +53,8 @@ class ColdConsumerPool : public CompactionBufferRouter {
   core::Result<core::RespValue> Read(std::string_view key) const override;
   BufferKeyPresence Probe(std::string_view key) const override;
   HashOverlay HashOverlayFor(std::string_view key) const override;
+  bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
+                         std::chrono::milliseconds timeout) override;
 
   void Start();
   void Stop();

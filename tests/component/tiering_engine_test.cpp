@@ -14,6 +14,7 @@
 
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
+#include "abyss/consumer/hot_consumer_progress.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/shard_router.h"
@@ -44,9 +45,24 @@ class SingleBufferRouter : public consumer::CompactionBufferRouter {
   consumer::HashOverlay HashOverlayFor(std::string_view key) const override {
     return buffer_.HashOverlayFor(key);
   }
+  // Component-level engine tests run without a cold consumer thread, so the
+  // wait is a structural no-op: there is no producer to advance the seq.
+  // Returning true models "already caught up", which is the steady-state
+  // expectation outside the slow-cold race we cover in integration tests.
+  bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId /*target_seq*/,
+                         std::chrono::milliseconds /*timeout*/) override {
+    return true;
+  }
 
  private:
   consumer::CompactionBuffer& buffer_;
+};
+
+// Engine has no live HotConsumerPool in these tests; report 0 ("nothing
+// settled yet") so DispatchHashRead skips the wait entirely.
+class NullHotProgress : public consumer::HotConsumerProgress {
+ public:
+  core::SequenceId HighestSettledSeq(core::ShardId /*shard*/) const override { return 0; }
 };
 
 class TieringEngineTest : public ::testing::Test {
@@ -57,16 +73,20 @@ class TieringEngineTest : public ::testing::Test {
   testing::MockColdStore cold_;
   consumer::CompactionBuffer buffer_;
   SingleBufferRouter router_{buffer_};
+  NullHotProgress hot_progress_;
   core::ConsumerRpc rpc_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr uint32_t kShardCount = 16;
   static constexpr std::chrono::milliseconds kWriteTimeout = 1s;
 
   TieringEngine MakeEngine() {
-    return {
-        queue_, hot_,
-        cold_,  router_,
-        rpc_,   TieringEngineConfig{.shard_count = kShardCount, .write_timeout = kWriteTimeout}};
+    return {queue_,
+            hot_,
+            cold_,
+            router_,
+            hot_progress_,
+            rpc_,
+            TieringEngineConfig{.shard_count = kShardCount, .write_timeout = kWriteTimeout}};
   }
 
   core::RespCommand MakeCmd(std::initializer_list<std::string> args) {
@@ -453,7 +473,7 @@ TEST_F(TieringEngineTest, WriteFsyncFailureCancelsRpcAndPropagates) {
 
 TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
   TieringEngineConfig fast{.shard_count = kShardCount, .write_timeout = 50ms};
-  TieringEngine engine(queue_, hot_, cold_, router_, rpc_, fast);
+  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, fast);
 
   EXPECT_CALL(queue_, BeginAppend(_, _))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
@@ -700,7 +720,7 @@ TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
       .write_timeout = 100ms,
       .min_rpc_wait_fraction = 0.5,
   };
-  TieringEngine engine(queue_, hot_, cold_, router_, rpc_, cfg);
+  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
 
   constexpr core::SequenceId kSeq = 201;
   const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);

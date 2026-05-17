@@ -211,6 +211,10 @@ core::Result<void> ValidateEngine(const EngineConfig& e) {
   if (e.min_rpc_wait_fraction <= 0.0 || e.min_rpc_wait_fraction >= 1.0) {
     return std::unexpected(InvalidArg("engine.min_rpc_wait_fraction", "must be in (0.0, 1.0)"));
   }
+  if (e.buffer_consistency_wait_timeout.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("engine.buffer_consistency_wait_timeout_ms", "must be > 0 milliseconds"));
+  }
   return {};
 }
 

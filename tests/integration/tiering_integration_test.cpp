@@ -5,12 +5,14 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/queue/append_result.h"
 #include "integration_harness.h"
@@ -317,6 +319,55 @@ TEST_F(TieringIntegrationTest, PromotionQueueFailureIncrementsCounter) {
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "cv");
   EXPECT_EQ(harness_.Engine().Snapshot().promotion_append_failures, 1U);
+}
+
+// Hash multi-field reads must not merge a stale buffer overlay against cold:
+// if the cold consumer has absorbed an HSET but not yet the subsequent HDEL
+// that emptied the hash, the engine would otherwise resurrect the deleted
+// fields. The wait gate parks the read until cold catches up to hot.
+TEST_F(TieringIntegrationTest, HashReadWithStaleBufferWaitsForColdConsumer) {
+  // SeedHot dispatches a Write through the engine: hot applies and fulfils the
+  // RPC, hot's HighestSettledSeq advances. The cold consumer is not running in
+  // the harness, so cold's latest_drained_seq stays at 0 until we Drain.
+  ASSERT_TRUE(harness_.SeedHot({"HSET", "h", "a", "1", "b", "2"}).has_value());
+  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
+  // Drain only HSET into the buffer, leaving the buffer "stale" — overlay will
+  // report fields={a:1,b:2} until cold catches up to the HDEL.
+  harness_.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness_.SeedHot({"HDEL", "h", "a", "b"}).value().AsInteger(), 2);
+
+  // Without the wait gate, HGETALL would see overlay.fields={a:1,b:2}, merge
+  // with empty cold, and return a non-empty array. The peer thread drains the
+  // queued HDEL after a short delay so the gate succeeds within its budget.
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsArray());
+  EXPECT_TRUE(result->AsArray().empty());
+}
+
+// When the cold consumer is wedged the engine surfaces a timeout rather than
+// serving a stale merge — failing closed is the documented contract.
+TEST_F(TieringIntegrationTest, HashReadTimesOutWhenColdConsumerWedged) {
+  ASSERT_TRUE(harness_.SeedHot({"HSET", "h", "a", "1"}).has_value());
+  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness_.SeedHot({"HDEL", "h", "a"}).value().AsInteger(), 1);
+
+  // No advancer — cold stays behind. The engine's default 100ms timeout fires.
+  const auto t0 = std::chrono::steady_clock::now();
+  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsError());
+  EXPECT_GE(elapsed, 100ms);
+  EXPECT_EQ(harness_.Engine().Snapshot().hash_read_buffer_wait_timeouts, 1U);
 }
 
 }  // namespace

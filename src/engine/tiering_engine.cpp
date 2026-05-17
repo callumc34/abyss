@@ -22,11 +22,13 @@ namespace abyss::engine {
 TieringEngine::TieringEngine(core::Queue& queue, core::HotStore& hot_store,
                              core::ColdStore& cold_store,
                              consumer::CompactionBufferRouter& buffer_router,
+                             const consumer::HotConsumerProgress& hot_progress,
                              core::ConsumerRpc& rpc, TieringEngineConfig config)
     : queue_(queue),
       hot_store_(hot_store),
       cold_store_(cold_store),
       buffer_router_(buffer_router),
+      hot_progress_(hot_progress),
       rpc_(rpc),
       config_(config) {}
 
@@ -127,6 +129,18 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
 
 core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::ReadOp& op) {
   const auto key = core::ops::PrimaryKey(op);
+
+  // Hot returned NotFound, so we'll be merging cold with the buffer overlay.
+  const auto shard = core::ComputeShard(key, config_.shard_count);
+  const auto target_seq = hot_progress_.HighestSettledSeq(shard);
+  if (target_seq > 0 && !buffer_router_.WaitForDrainedSeq(
+                            shard, target_seq, config_.buffer_consistency_wait_timeout)) {
+    hash_read_buffer_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+    return core::RespValue::Error(
+        core::ErrorPrefix::kErr,
+        "hash read timed out waiting for compaction buffer to catch up to hot");
+  }
+
   const auto overlay = buffer_router_.HashOverlayFor(key);
 
   switch (overlay.kind) {
@@ -311,6 +325,8 @@ TieringEngineMetrics TieringEngine::Snapshot() const {
       .flush_durable_failures = flush_durable_failures_.load(std::memory_order_relaxed),
       .flush_consumer_timeouts = flush_consumer_timeouts_.load(std::memory_order_relaxed),
       .flush_append_failures = flush_append_failures_.load(std::memory_order_relaxed),
+      .hash_read_buffer_wait_timeouts =
+          hash_read_buffer_wait_timeouts_.load(std::memory_order_relaxed),
   };
 }
 
