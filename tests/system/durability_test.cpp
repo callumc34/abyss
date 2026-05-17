@@ -23,22 +23,134 @@ TEST_F(DurabilityTestFixture, DataSurvivesCleanRestart) {
   EXPECT_EQ(r2.String(), "value2");
 }
 
-TEST_F(DurabilityTestFixture, DataSurvivesKill) {
-  constexpr int kKeys = 100;
+TEST_F(DurabilityTestFixture, AcknowledgedWritesSurviveSigkill) {
+  // Property: any write the client received +OK for must survive SIGKILL.
+  // The pre-kill loop asserts every ack so the post-recovery check is
+  // unambiguous — if a key is missing or wrong-valued, it's a durability
+  // regression, not a precondition failure.
+  constexpr int kKeys = 1000;
+
   for (int i = 0; i < kKeys; ++i) {
-    std::string key = "kill_" + std::to_string(i);
-    ASSERT_TRUE(Client().Command({"SET", key, "v"}).IsOk());
+    const std::string key = "acked_" + std::to_string(i);
+    const std::string value = "value_for_" + std::to_string(i);
+    ASSERT_TRUE(Client().Command({"SET", key, value}).IsOk()) << "pre-kill SET refused at i=" << i;
   }
 
   KillAndRestartServer();
 
   int recovered = 0;
+  int missing = 0;
+  int mismatched = 0;
+  std::vector<std::string> first_failures;
   for (int i = 0; i < kKeys; ++i) {
-    std::string key = "kill_" + std::to_string(i);
-    auto r = Client().Command({"GET", key});
-    if (r.IsBulk() && r.String() == "v") ++recovered;
+    const std::string key = "acked_" + std::to_string(i);
+    const std::string expected = "value_for_" + std::to_string(i);
+    const auto r = Client().Command({"GET", key});
+    if (r.IsBulk() && r.String() == expected) {
+      ++recovered;
+    } else if (r.IsNil()) {
+      ++missing;
+      if (first_failures.size() < 5) first_failures.push_back(key + ":missing");
+    } else {
+      ++mismatched;
+      if (first_failures.size() < 5) {
+        first_failures.push_back(key + ":got=" + r.String());
+      }
+    }
   }
-  EXPECT_EQ(recovered, kKeys) << "all committed keys should survive SIGKILL";
+
+  std::string sample;
+  for (const auto& f : first_failures) {
+    if (!sample.empty()) sample += ", ";
+    sample += f;
+  }
+  EXPECT_EQ(recovered, kKeys) << "missing=" << missing << " mismatched=" << mismatched << " first=["
+                              << sample << "]";
+}
+
+TEST_F(DurabilityTestFixture, PipelinedAcksAllSurviveSigkill) {
+  // Group commit batches concurrent in-flight writes into a single fsync;
+  // a regression in batch boundary handling (ADP-009 §1.1 batch_last_seq)
+  // could lose the closing entry of a batch while preserving prior ones.
+  // The sequential test cannot surface that — this one ships every write
+  // into the same window.
+  constexpr int kKeys = 1000;
+
+  std::vector<std::vector<std::string>> writes;
+  writes.reserve(kKeys);
+  for (int i = 0; i < kKeys; ++i) {
+    writes.push_back({"SET", "pipe_" + std::to_string(i), "pv_" + std::to_string(i)});
+  }
+
+  const auto replies = Client().Pipeline(writes);
+  ASSERT_EQ(replies.size(), static_cast<size_t>(kKeys));
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(replies[i].IsOk()) << "pipelined SET refused at i=" << i << " reply=" << replies[i];
+  }
+
+  KillAndRestartServer();
+
+  int recovered = 0;
+  std::vector<std::string> first_failures;
+  for (int i = 0; i < kKeys; ++i) {
+    const std::string key = "pipe_" + std::to_string(i);
+    const std::string expected = "pv_" + std::to_string(i);
+    const auto r = Client().Command({"GET", key});
+    if (r.IsBulk() && r.String() == expected) {
+      ++recovered;
+    } else if (first_failures.size() < 5) {
+      first_failures.push_back(key + (r.IsNil() ? ":missing" : ":got=" + r.String()));
+    }
+  }
+
+  std::string sample;
+  for (const auto& f : first_failures) {
+    if (!sample.empty()) sample += ", ";
+    sample += f;
+  }
+  EXPECT_EQ(recovered, kKeys) << "first=[" << sample << "]";
+}
+
+TEST_F(DurabilityTestFixture, CollectionWritesSurviveSigkill) {
+  // Closes set + zset + collection-tombstone (DEL) durability. Strings and
+  // hashes are covered by AcknowledgedWritesSurviveSigkill and
+  // HmsetSurvivesCrashAndRestart.
+
+  ASSERT_TRUE(Client().Command({"SADD", "set_a", "a", "b", "c"}).IsInteger());
+  ASSERT_TRUE(Client().Command({"SADD", "set_a", "d"}).IsInteger());
+  ASSERT_TRUE(Client().Command({"SREM", "set_a", "b"}).IsInteger());
+
+  ASSERT_TRUE(Client().Command({"ZADD", "zset_a", "1", "x", "2", "y", "3", "z"}).IsInteger());
+  ASSERT_TRUE(Client().Command({"ZADD", "zset_a", "5", "x"}).IsInteger());  // re-score
+  ASSERT_TRUE(Client().Command({"ZREM", "zset_a", "y"}).IsInteger());
+
+  ASSERT_TRUE(Client().Command({"SADD", "doomed_set", "ghost"}).IsInteger());
+  ASSERT_EQ(Client().Command({"DEL", "doomed_set"}).Integer(), 1);
+
+  KillAndRestartServer();
+
+  EXPECT_EQ(Client().Command({"SCARD", "set_a"}).Integer(), 3);
+  EXPECT_EQ(Client().Command({"SISMEMBER", "set_a", "a"}).Integer(), 1);
+  EXPECT_EQ(Client().Command({"SISMEMBER", "set_a", "b"}).Integer(), 0)
+      << "SREM must propagate through replay";
+  EXPECT_EQ(Client().Command({"SISMEMBER", "set_a", "c"}).Integer(), 1);
+  EXPECT_EQ(Client().Command({"SISMEMBER", "set_a", "d"}).Integer(), 1);
+
+  EXPECT_EQ(Client().Command({"ZCARD", "zset_a"}).Integer(), 2);
+  // ZSCORE+ZCARD are the only zset reads core::ops::ParseReadOp wires today
+  // (ZRANGE et al. are registered at the RESP layer but the engine rejects
+  // them — separate gap). std::stod absorbs whatever double format is emitted.
+  const auto x_score = Client().Command({"ZSCORE", "zset_a", "x"});
+  ASSERT_TRUE(x_score.IsBulk()) << "ZSCORE x: " << x_score;
+  EXPECT_DOUBLE_EQ(std::stod(x_score.String()), 5.0);
+  const auto z_score = Client().Command({"ZSCORE", "zset_a", "z"});
+  ASSERT_TRUE(z_score.IsBulk()) << "ZSCORE z: " << z_score;
+  EXPECT_DOUBLE_EQ(std::stod(z_score.String()), 3.0);
+  EXPECT_TRUE(Client().Command({"ZSCORE", "zset_a", "y"}).IsNil())
+      << "ZREM must propagate through replay";
+
+  EXPECT_EQ(Client().Command({"EXISTS", "doomed_set"}).Integer(), 0)
+      << "collection DEL must propagate through replay";
 }
 
 TEST_F(DurabilityTestFixture, WalReplayPreservesLastWrite) {

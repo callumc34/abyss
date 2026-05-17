@@ -37,6 +37,8 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
 
 ABYSS_LOG_COMPONENT("abyss.cold.store")
 
@@ -191,6 +193,9 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   std::mt19937_64 rng{0};  // NOLINT(bugprone-random-generator-seed): re-seeded at Create.
   // Per-shard cold consumers fan in here on FLUSHDB; serialises the shared backend wipe.
   std::mutex wipe_mu;
+  // Bumped on every successful TTL-driven delete from either path: lazy
+  // expiry on read or the active TtlScanner.
+  mutable metrics::CounterHandle ttl_expired_total;
 
   uint64_t NowMs() const { return WallMs(config.wall_clock); }
 
@@ -330,6 +335,8 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
   };
 
   auto impl = std::make_unique<Impl>();
+  impl->ttl_expired_total =
+      metrics::Registry::Instance().Counter(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold);
   std::vector<rocksdb::ColumnFamilyHandle*> cf_handles;
   rocksdb::OptimisticTransactionDB* raw_db = nullptr;
   auto status = rocksdb::OptimisticTransactionDB::Open(db_opts, config.data_path, cf_descs,
@@ -1380,6 +1387,7 @@ core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireStringIfStillExpired(
   if (!commit.ok()) {
     return std::unexpected(FromStatus(commit, "expire string commit"));
   }
+  ttl_expired_total.Increment();
   return ExpireOutcome::kDeleted;
 }
 
@@ -1485,6 +1493,7 @@ core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireCollectionIfStillExpired(
   if (!commit.ok()) {
     return std::unexpected(FromStatus(commit, "expire collection commit"));
   }
+  ttl_expired_total.Increment();
   return ExpireOutcome::kDeleted;
 }
 

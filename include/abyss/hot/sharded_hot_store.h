@@ -44,7 +44,8 @@ class ShardedHotStore : public core::HotStore {
   // Refreshes the deadline for every buffered access, using the per-key
   // eviction cached on each Entry at Apply time. See ADP-002 §Eviction.
   void DrainAccessBuffers(core::SteadyTime now);
-  size_t EvictExpired(core::SteadyTime now);
+  using EvictExpiredReport = SingleShardStore::EvictExpiredReport;
+  EvictExpiredReport EvictExpired(core::SteadyTime now);
 
   uint32_t shard_count() const { return config_.shard_count; }
 

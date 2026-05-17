@@ -23,6 +23,8 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 
 namespace abyss::cold::backends {
 namespace {
@@ -122,6 +124,35 @@ TEST_F(TtlFixture, ZeroTtlNeverExpires) {
   EXPECT_EQ(r->AsString(), "v");
 }
 
+TEST_F(TtlFixture, LazyStringExpiryBumpsTtlExpiredMetric) {
+  // Lazy expiry on read funnels through ExpireStringIfStillExpired, which is
+  // the chokepoint for cold-tier kTtlExpiredTotal. Without the increment the
+  // operator can't tell scanner-driven deletes apart from lazy deletes — and
+  // the acceptance suite has no metric to pin the cold side of the property.
+  abyss::metrics::testing::Reset();
+  auto store = OpenStore();
+  const auto baseline =
+      metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
+          .value_or(0.0);
+
+  core::ops::WriteOp op = core::ops::StringSet{
+      .key = "k",
+      .value = "v",
+      .abs_ttl_ms = clock_.Now() + 100,
+  };
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  clock_.Advance(200);
+
+  auto r = store->Exec(core::ops::StringGet{.key = "k"});
+  ASSERT_TRUE(r.has_value());
+  EXPECT_TRUE(r->IsNull());
+
+  const auto after =
+      metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
+          .value_or(0.0);
+  EXPECT_EQ(after, baseline + 1.0) << "lazy expiry should bump kTtlExpiredTotal{tier=cold} once";
+}
+
 TEST_F(TtlFixture, StringExpiryDeletesBackingRecord) {
   auto store = OpenStore();
   std::string k = "k";
@@ -193,6 +224,39 @@ TEST_F(TtlFixture, CollectionWithoutTtlSurvivesTimeAdvance) {
   clock_.Advance(1'000'000'000);
   auto card = store->Exec(core::ops::SetCard{.key = "s"});
   EXPECT_EQ(card->AsInteger(), 1);
+}
+
+TEST_F(TtlFixture, LazyCollectionExpiryBumpsTtlExpiredMetric) {
+  // Mirrors the string case: collection lazy expiry funnels through
+  // ExpireCollectionIfStillExpired, which must increment the same metric so
+  // the acceptance test can observe TTL-driven collection deletion at the
+  // cold tier.
+  abyss::metrics::testing::Reset();
+
+  const std::string key = "s";
+  std::vector<std::string> members = {"a", "b"};
+  std::vector<std::string_view> views(members.begin(), members.end());
+  std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
+  {
+    auto store = OpenStore();
+    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  }
+
+  InjectExpiredMeta(path_.string(), format::kTypeSetMember, key, members.size());
+
+  // Re-open the store to force the lazy-expiry path on the first read.
+  auto store = OpenStore();
+  const auto baseline =
+      metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
+          .value_or(0.0);
+
+  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = key})->AsInteger(), 0);
+
+  const auto after =
+      metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
+          .value_or(0.0);
+  EXPECT_EQ(after, baseline + 1.0)
+      << "lazy collection expiry should bump kTtlExpiredTotal{tier=cold} once";
 }
 
 TEST_F(TtlFixture, SetReadOnExpiredCollectionReturnsEmptyAndPurges) {

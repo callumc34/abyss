@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/names.h"
 
 ABYSS_LOG_COMPONENT("abyss.hot.eviction")
 
@@ -10,7 +11,11 @@ namespace abyss::hot {
 
 EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
                                core::SteadyClockFn steady_clock)
-    : store_(store), config_(config), steady_clock_(std::move(steady_clock)) {}
+    : store_(store), config_(config), steady_clock_(std::move(steady_clock)) {
+  auto& reg = metrics::Registry::Instance();
+  evicted_total_ = reg.Counter(metrics::names::kEvictedTotal);
+  ttl_expired_total_ = reg.Counter(metrics::names::kTtlExpiredTotal, metrics::Tier::kHot);
+}
 
 EvictionWorker::~EvictionWorker() { Stop(); }
 
@@ -33,7 +38,13 @@ void EvictionWorker::Stop() {
 void EvictionWorker::TickOnce() {
   const auto now = steady_clock_();
   store_.DrainAccessBuffers(now);
-  store_.EvictExpired(now);
+  const auto report = store_.EvictExpired(now);
+  if (report.by_deadline > 0) {
+    evicted_total_.Increment(static_cast<double>(report.by_deadline));
+  }
+  if (report.by_ttl > 0) {
+    ttl_expired_total_.Increment(static_cast<double>(report.by_ttl));
+  }
 }
 
 void EvictionWorker::Run() {

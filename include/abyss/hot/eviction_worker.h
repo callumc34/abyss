@@ -8,6 +8,7 @@
 
 #include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/metrics/metrics.h"
 
 namespace abyss::hot {
 
@@ -48,6 +49,9 @@ class EvictionWorker {
   std::thread thread_;
   std::mutex wake_mutex_;
   std::condition_variable wake_cv_;
+
+  metrics::CounterHandle evicted_total_;
+  metrics::CounterHandle ttl_expired_total_;
 };
 
 }  // namespace abyss::hot
