@@ -29,7 +29,18 @@ class IntegrationHarness {
   static constexpr uint32_t kShardCount = 4;
   static constexpr size_t kHotMemory = 4UL * 1024UL * 1024UL;
 
-  IntegrationHarness() {
+  // Test-side defaults for engine knobs. The production default for the
+  // buffer-consistency wait is 100 ms ([ADP-006]); the harness widens it
+  // because the Stale-buffer tests want to assert logical correctness, not
+  // race the production timeout. Tests that exercise the timeout path
+  // (HashReadTimesOutWhenColdConsumerWedged) construct a harness with a
+  // short timeout explicitly.
+  struct Config {
+    std::chrono::milliseconds buffer_consistency_wait_timeout{2000};
+  };
+
+  IntegrationHarness() : IntegrationHarness(Config{}) {}
+  explicit IntegrationHarness(Config cfg) {
     tmp_dir_ = std::filesystem::temp_directory_path() /
                ("abyss_test_" + std::to_string(abyss::platform::fs::ProcessId()));
     std::filesystem::create_directories(tmp_dir_);
@@ -71,7 +82,10 @@ class IntegrationHarness {
 
     engine_ = std::make_unique<engine::TieringEngine>(
         queue_, *hot_, *cold_, *cold_pool_, *hot_pool_, *rpc_,
-        engine::TieringEngineConfig{.shard_count = kShardCount});
+        engine::TieringEngineConfig{
+            .shard_count = kShardCount,
+            .buffer_consistency_wait_timeout = cfg.buffer_consistency_wait_timeout,
+        });
 
     hot_pool_->Start();
   }

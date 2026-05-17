@@ -364,21 +364,31 @@ TEST_F(TieringIntegrationTest, HashReadWithStaleBufferWaitsForColdConsumer) {
 
 // When the cold consumer is wedged the engine surfaces a timeout rather than
 // serving a stale merge — failing closed is the documented contract.
-TEST_F(TieringIntegrationTest, HashReadTimesOutWhenColdConsumerWedged) {
-  ASSERT_TRUE(harness_.SeedHot({"HSET", "h", "a", "1"}).has_value());
-  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
-  harness_.ColdPool().ConsumerFor(shard).Drain();
-  ASSERT_EQ(harness_.SeedHot({"HDEL", "h", "a"}).value().AsInteger(), 1);
+TEST(TieringIntegrationTimeoutTest, HashReadTimesOutWhenColdConsumerWedged) {
+  // Builds a harness with a tight wait budget specifically to exercise the
+  // timeout path. The default harness widens the budget so the Stale-buffer
+  // tests don't race the production timeout on slower runners.
+  constexpr auto kTimeout = std::chrono::milliseconds{100};
+  testing::IntegrationHarness harness{
+      testing::IntegrationHarness::Config{.buffer_consistency_wait_timeout = kTimeout}};
+  const auto cmd = [](std::initializer_list<std::string> args) {
+    return core::RespCommand{.args = std::vector<std::string>(args)};
+  };
 
-  // No advancer — cold stays behind. The engine's default 100ms timeout fires.
+  ASSERT_TRUE(harness.SeedHot({"HSET", "h", "a", "1"}).has_value());
+  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
+  harness.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness.SeedHot({"HDEL", "h", "a"}).value().AsInteger(), 1);
+
+  // No advancer — cold stays behind. The configured timeout fires.
   const auto t0 = std::chrono::steady_clock::now();
-  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
+  auto result = harness.Engine().DispatchRead("HGETALL", cmd({"HGETALL", "h"}));
   const auto elapsed = std::chrono::steady_clock::now() - t0;
 
   ASSERT_TRUE(result.has_value()) << result.error().message();
   ASSERT_TRUE(result->IsError());
-  EXPECT_GE(elapsed, 100ms);
-  EXPECT_EQ(harness_.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
+  EXPECT_GE(elapsed, kTimeout);
+  EXPECT_EQ(harness.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
 }
 
 // Same race as the hash case but for a scalar: SET then DEL through hot, with
