@@ -115,14 +115,13 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
     return hot_result;
   }
 
-  // Hot missed; we'll consult the buffer overlay and/or cold. The overlay is
-  // the cold consumer's eventually-consistent view of the queue and may lag
-  // hot — if hot just deleted the key (DEL, or HDEL emptying a hash) and the
-  // cold consumer has not yet absorbed the delete, the overlay still reports
-  // the pre-delete state and we'd serve a value hot has already revoked.
-  // Gate on cold catching up to hot's settled seq. See ADP-006 §Read Path.
+  // Hot missed, so the key is unknown to hot (a recent delete would be a
+  // tombstone, handled above). A whole-key string read is genuinely absent and
+  // cold is equally current, so it serves now; a collection read can race a
+  // buffered partial mutation (SREM/HDEL), so it gates on cold. See ADP-006.
   auto key = core::ops::PrimaryKey(op);
-  if (!WaitForBufferConsistency(key)) {
+  const bool needs_buffer_consistency = !std::holds_alternative<core::ops::StringGet>(op);
+  if (needs_buffer_consistency && !WaitForBufferConsistency(key)) {
     return core::RespValue::Error(
         core::ErrorPrefix::kErr, "read timed out waiting for compaction buffer to catch up to hot");
   }
@@ -351,16 +350,21 @@ core::Result<core::RespValue> TieringEngine::FanOutExists(const core::RespComman
 }
 
 core::Result<bool> TieringEngine::ProbeKeyExists(std::string_view key) {
-  auto hot = hot_store_.Exec(core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
-  if (hot.has_value()) {
-    if (hot->IsInteger() && hot->AsInteger() > 0) return true;
-  } else if (hot.error().code() != core::ErrorCode::kNotFound) {
-    return std::unexpected(hot.error());
+  // Hot is authoritative for recent writes and deletes: a present key exists, a
+  // tombstone is an authoritative delete. Both short-circuit without consulting
+  // the lagging overlay. See ADP-006 §Read Path.
+  switch (hot_store_.Probe(key)) {
+    case core::HotKeyPresence::kPresent:
+      return true;
+    case core::HotKeyPresence::kTombstoned:
+      return false;
+    case core::HotKeyPresence::kAbsent:
+      break;
   }
 
-  // Hot miss: the buffer probe is about to override cold, so gate on it being
-  // at least as current as hot. Without this a not-yet-absorbed DEL could be
-  // missed and we'd report kPresent for a key hot has already removed.
+  // Hot doesn't know the key. It may be a hot-evicted collection with a buffered
+  // partial mutation, so the buffer probe (which overrides cold) must be at
+  // least as current as hot before it can suppress a stale cold residual.
   if (!WaitForBufferConsistency(key)) {
     return std::unexpected(
         core::Error{core::ErrorCode::kTimeout,

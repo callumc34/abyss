@@ -29,8 +29,10 @@ class EvictionWorkerTest : public ::testing::Test {
 };
 
 TEST_F(EvictionWorkerTest, TickOnceDrainsBuffersAndEvicts) {
-  ASSERT_TRUE(
-      store_.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}}).has_value());
+  ASSERT_TRUE(store_
+                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
+                         /*seq=*/0)
+                  .has_value());
 
   EvictionWorker worker(store_, EvictionWorker::Config{.tick = 50ms}, clock_.SteadyFn());
 
@@ -54,18 +56,20 @@ TEST_F(EvictionWorkerTest, TickAttributesEvictionVsTtl) {
   // Eviction-only entry: no TTL, eviction policy is 1s.
   ASSERT_TRUE(store_
                   .Apply(core::ops::WriteOp{core::ops::StringSet{
-                      .key = "evict_only",
-                      .value = "v",
-                      .abs_ttl_ms = 0,
-                  }})
+                             .key = "evict_only",
+                             .value = "v",
+                             .abs_ttl_ms = 0,
+                         }},
+                         /*seq=*/0)
                   .has_value());
   // TTL entry: short TTL inside the eviction window, so TTL fires first.
   ASSERT_TRUE(store_
                   .Apply(core::ops::WriteOp{core::ops::StringSet{
-                      .key = "ttl_key",
-                      .value = "v",
-                      .abs_ttl_ms = static_cast<uint64_t>(now_ms + 500),
-                  }})
+                             .key = "ttl_key",
+                             .value = "v",
+                             .abs_ttl_ms = static_cast<uint64_t>(now_ms + 500),
+                         }},
+                         /*seq=*/0)
                   .has_value());
 
   EvictionWorker worker(store_, EvictionWorker::Config{.tick = 50ms}, clock_.SteadyFn());
@@ -100,6 +104,40 @@ TEST_F(EvictionWorkerTest, DoubleStartIsNoop) {
   worker.Start();
   EXPECT_TRUE(worker.Running());
   worker.Stop();
+}
+
+TEST_F(EvictionWorkerTest, TickReclaimsTombstonesAtOrBelowHorizon) {
+  abyss::metrics::testing::Reset();
+
+  ASSERT_TRUE(store_
+                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
+                         /*seq=*/0)
+                  .has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, /*seq=*/5).has_value());
+  ASSERT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+
+  core::SequenceId horizon = 4;
+  EvictionWorker worker(
+      store_,
+      EvictionWorker::Config{.tick = 50ms,
+                             .tombstone_horizon = [&](core::ShardId) { return horizon; }},
+      clock_.SteadyFn());
+
+  // Horizon below the delete seq: cold has not caught up, tombstone is kept.
+  worker.TickOnce();
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+  EXPECT_EQ(
+      metrics::testing::GetCounterValue(metrics::names::kHotTombstonesReclaimedTotal).value_or(0.0),
+      0.0);
+
+  // Horizon reaches the delete seq: cold has absorbed it, tombstone reclaimed.
+  horizon = 5;
+  worker.TickOnce();
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
+  EXPECT_EQ(
+      metrics::testing::GetCounterValue(metrics::names::kHotTombstonesReclaimedTotal).value_or(0.0),
+      1.0);
 }
 
 }  // namespace

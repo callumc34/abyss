@@ -171,10 +171,15 @@ bool Server::Initialize() {
           .buffer_consistency_wait_timeout = config_.engine.buffer_consistency_wait_timeout,
       });
 
-  hot_eviction_worker_ =
-      std::make_unique<hot::EvictionWorker>(*hot_store_, hot::EvictionWorker::Config{
-                                                             .tick = config_.hot.eviction_tick,
-                                                         });
+  hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
+      *hot_store_, hot::EvictionWorker::Config{
+                       .tick = config_.hot.eviction_tick,
+                       // GC tombstones once the shard's cold consumer drains past them.
+                       .tombstone_horizon =
+                           [pool = cold_pool_.get()](core::ShardId shard) {
+                             return pool->ConsumerFor(shard).LatestDrainedSeq();
+                           },
+                   });
   resolver_pool_ = std::make_unique<consumer::ResolverPool>(
       *queue_, *cold_store_, *cold_pool_, *consumer_rpc_, *apply_notifier_,
       consumer::ResolverPool::Config{
@@ -457,10 +462,12 @@ void Server::Shutdown() {
     tcp_server_->Stop();
   }
 
+  // Stop the eviction worker before the cold pool: its tombstone-GC tick reads
+  // the cold consumers' drained seq, so it must not run once the pool stops.
+  if (hot_eviction_worker_) hot_eviction_worker_->Stop();
   if (cold_pool_) cold_pool_->Stop();
   if (hot_pool_) hot_pool_->Stop();
   if (resolver_pool_) resolver_pool_->Stop();
-  if (hot_eviction_worker_) hot_eviction_worker_->Stop();
   if (cold_store_) {
     if (auto r = cold_store_->Stop(); !r.has_value()) {
       ABYSS_LOG_WARN("cold store stop failed", {"err", std::string_view{r.error().message()}});

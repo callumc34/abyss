@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -126,6 +127,10 @@ class ColdConsumer {
     return latest_drained_seq_.load(std::memory_order_acquire);
   }
 
+  // Blocks until this consumer drains through `target` (true) or `timeout`
+  // elapses (false). Signal-driven by the drain loop, not a poll.
+  bool WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout);
+
  private:
   void RunLoop();
 
@@ -156,6 +161,7 @@ class ColdConsumer {
   size_t LowWaterBytes() const;
   void UpdateMode(size_t current_bytes);
   void TryAdvanceAck();
+  void NotifyDrained();
 
   core::Queue& queue_;
   core::ColdStore& cold_store_;
@@ -181,6 +187,10 @@ class ColdConsumer {
   // seq 0"; prevents Ack(0) before any entry has been appended.
   bool drained_anything_ = false;
   std::atomic<uint64_t> flushes_applied_{0};
+
+  // Guards the read-consistency wait.
+  std::mutex drain_wait_mu_;
+  std::condition_variable drain_wait_cv_;
 
   struct PendingConditional {
     core::SequenceId seq = 0;

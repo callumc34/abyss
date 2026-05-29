@@ -549,8 +549,7 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
 
   // Hot has no record; cold is never consulted because the buffer probe is
   // authoritative on the tombstone.
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(hot_, Probe(_)).WillOnce(Return(core::HotKeyPresence::kAbsent));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
@@ -560,7 +559,7 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
 
 TEST_F(TieringEngineTest, ExistsCountsDuplicatesRedisStyle) {
   auto engine = MakeEngine();
-  EXPECT_CALL(hot_, Exec(_, _)).Times(2).WillRepeatedly(Return(core::RespValue::Integer(1)));
+  EXPECT_CALL(hot_, Probe(_)).Times(2).WillRepeatedly(Return(core::HotKeyPresence::kPresent));
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k", "k"}));
   ASSERT_TRUE(result.has_value());

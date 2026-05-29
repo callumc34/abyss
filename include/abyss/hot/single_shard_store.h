@@ -51,6 +51,10 @@ struct Entry {
   core::EvictionTTL eviction{};
   int64_t abs_ttl_ms = 0;
 
+  // Marks a deleted key whose delete cold may not have absorbed yet.
+  bool tombstoned = false;
+  core::SequenceId tombstone_seq = 0;
+
   size_t ApproximateBytes() const;
 };
 
@@ -60,9 +64,21 @@ class SingleShardStore {
 
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const;
 
-  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction);
-  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
-                                core::EvictionTTL eviction);
+  // `seq` is the queue seq of the op; it is recorded on the tombstone a delete
+  // leaves behind so the GC can reclaim it once cold catches up. Defaults to 0
+  // (the earliest position) for callers that do not exercise tombstone GC.
+  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction,
+                                      core::SequenceId seq = 0);
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops, core::EvictionTTL eviction,
+                                core::SequenceId seq = 0);
+
+  // Existence verdict distinguishing a delete-tombstone (authoritatively
+  // absent) from a true miss (consult the next tier). See core::HotKeyPresence.
+  core::HotKeyPresence Probe(std::string_view key) const;
+
+  // Reclaims tombstones whose delete seq is <= `horizon` — cold has absorbed
+  // those deletes, so the buffer/cold view now reflects them. Live keys remain.
+  size_t GcTombstones(core::SequenceId horizon);
 
   // Extends the eviction deadline using the per-key cached eviction recorded
   // at Apply time. No-op if the key is absent.
@@ -97,18 +113,18 @@ class SingleShardStore {
 
   core::Result<core::RespValue> ApplyStringSet(const core::ops::StringSet& op,
                                                core::EvictionTTL eviction);
-  core::Result<core::RespValue> ApplyDel(const core::ops::Del& op);
+  core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
   core::Result<core::RespValue> ApplySetAdd(const core::ops::SetAdd& op,
                                             core::EvictionTTL eviction);
-  core::Result<core::RespValue> ApplySetRem(const core::ops::SetRem& op);
+  core::Result<core::RespValue> ApplySetRem(const core::ops::SetRem& op, core::SequenceId seq);
   core::Result<core::RespValue> ApplyZsetAdd(const core::ops::ZsetAdd& op,
                                              core::EvictionTTL eviction);
-  core::Result<core::RespValue> ApplyZsetRem(const core::ops::ZsetRem& op);
+  core::Result<core::RespValue> ApplyZsetRem(const core::ops::ZsetRem& op, core::SequenceId seq);
   core::Result<core::RespValue> ApplyHashSet(const core::ops::HashSet& op,
                                              core::EvictionTTL eviction);
   core::Result<core::RespValue> ApplyHashMSet(const core::ops::HashMSet& op,
                                               core::EvictionTTL eviction);
-  core::Result<core::RespValue> ApplyHashDel(const core::ops::HashDel& op);
+  core::Result<core::RespValue> ApplyHashDel(const core::ops::HashDel& op, core::SequenceId seq);
   core::Result<core::RespValue> ApplyExpire(const core::ops::Expire& op);
   core::Result<core::RespValue> ApplyPersist(const core::ops::Persist& op);
 
@@ -117,6 +133,9 @@ class SingleShardStore {
   Entry& GetOrCreateEntry(std::string_view key, Entry::Type type, core::EvictionTTL eviction);
   core::Result<const Entry*> FindTypedEntry(std::string_view key, Entry::Type expected) const;
   void RemoveEntry(const std::string& key);
+  // Converts a live entry into a tombstone: releases the value, drops it from
+  // key_count, and stamps the delete seq. Idempotent on an existing tombstone.
+  void TombstoneEntry(Entry& entry, std::string_view key, core::SequenceId seq);
   void TrackInsert(const Entry& entry, std::string_view key);
   void TrackRemove(const Entry& entry, std::string_view key);
 

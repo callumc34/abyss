@@ -92,8 +92,10 @@ class HotConsumer {
   // Applies materialised ops from a Resolved entry. `reference_at` is the
   // Conditional's appended_at, used for the eviction-window skip-stale check
   // (per ADP-011: Resolved takes effect at the Conditional's seq position).
+  // `seq` is the Resolved entry's queue seq — the position the cold consumer
+  // drains the materialised ops at, so a delete's tombstone is keyed to it.
   core::Result<void> ApplyResolvedOps(const std::vector<core::RespCommand>& ops,
-                                      core::WallTime reference_at);
+                                      core::WallTime reference_at, core::SequenceId seq);
 
   // Skip-stale gates. Both consult the entry's wall-clock appended_at and
   // the parsed op's `abs_ttl_ms` (when present). Active only in replay mode.

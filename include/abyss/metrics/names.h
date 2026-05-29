@@ -411,6 +411,11 @@ inline constexpr CounterDesc<> kEvictedTotal{
     .help = "Keys evicted from the hot store.",
 };
 
+inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{
+    .name = "abyss_hot_tombstones_reclaimed_total",
+    .help = "Delete tombstones reclaimed from the hot store after the cold consumer caught up.",
+};
+
 inline constexpr CounterDesc<> kPromotionsTotal{
     .name = "abyss_promotions_total",
     .help = "Cold hits promoted back to the hot store.",

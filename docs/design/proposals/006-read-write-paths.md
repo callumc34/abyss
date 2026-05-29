@@ -73,16 +73,16 @@ Buffer hits do **not** promote. The cold consumer owns data in the buffer and wi
 
 The buffer read acquires a shared lock on the `shared_mutex`. Multiple I/O threads can read from the buffer concurrently. The cold consumer acquires an exclusive lock only when absorbing new entries or removing flushed entries.
 
-### Buffer-consistency gate on hot miss
+### Hot-tier delete tombstones and the read-consistency gate
 
-Whenever a read misses hot and the engine is about to consult the buffer overlay and/or cold (single-key reads, multi-field hash merges, `EXISTS` probes), it first waits for the per-shard cold consumer to catch up to hot's `HighestSettledSeq`. The overlay is the cold consumer's eventually-consistent view of the queue, which may lag hot — a write that hot has already applied (and the client observed `+OK` for) is not visible to the buffer until the cold consumer absorbs it.
+A read that misses hot may need to consult the compaction buffer overlay and/or cold. That overlay is the cold consumer's eventually-consistent view of the queue and can lag hot — a write hot has already applied (and the client observed `+OK` for) is not visible to the buffer until the cold consumer absorbs it. Naively consulting the overlay on a hot miss breaks read-after-write whenever the lagging state is a *deletion*:
 
-Without this gate, the lag breaks read-after-write in two equivalent shapes:
+- `SET k v` then `DEL k` then `GET k`: if cold absorbed the `SET` but not the `DEL`, a stale overlay returns `v` instead of `nil`.
+- `HSET h a 1 b 2` then `HDEL h a b` then `HGETALL h`: a stale overlay resurrects the deleted fields.
 
-- `SET k v` then `DEL k` then `GET k`: if the cold consumer has absorbed the `SET` but not the `DEL`, the buffer holds `k=v` (stale) and the read returns `v` instead of `nil`.
-- `HSET h a 1 b 2` then `HDEL h a b` then `HGETALL h`: if the cold consumer has absorbed the `HSET` but not the `HDEL`, the overlay reports `{a:1, b:2}` and the merge against empty cold resurrects the deleted fields.
+Hot resolves this for the common case by retaining a **delete tombstone**. When the hot consumer applies a delete (`DEL`/`GETDEL`, or an `SREM`/`ZREM`/`HDEL` that empties a collection), it keeps an authoritative "absent" marker stamped with the delete's queue seq instead of erasing the key. A read of a tombstone returns `nil`/empty directly from hot — it never consults the overlay and never waits. The tombstone is reclaimed by the eviction worker once the per-shard cold consumer's drained seq passes the delete's seq, at which point the overlay and cold reflect the delete and a true miss is safe. Tombstones do not count toward `DBSIZE`. See [ADP-002](002-hot-store.md) §Delete Tombstones.
 
-The gate compares the per-shard cold consumer's `latest_drained_seq` against hot's `HighestSettledSeq` and polls with a short back-off until cold catches up, bounded by `engine.buffer_consistency_wait_timeout_ms` (default 100ms). The wait is microseconds in steady state; the timeout fires only if the cold consumer is wedged, in which case the engine surfaces a Redis error rather than serving stale data — failing closed preserves the invariant. The wait does not apply to hot hits, which are authoritative.
+This makes read-after-delete — and the read hot path generally — gate-free. A residual wait remains only for a read that genuinely misses hot (a key hot has never held or has evicted) **and** must merge a collection overlay, because a partial mutation (`SREM`/`HDEL`) against a *cold-resident* collection lands only in the buffer, which hot cannot tombstone. For those reads the engine waits for the per-shard cold consumer's `latest_drained_seq` to reach hot's `HighestSettledSeq` before consulting the overlay, bounded by `engine.buffer_consistency_wait_timeout_ms` (default 100ms). The wait is **signal-driven** — the cold consumer's drain loop wakes waiters via a condition variable; it does not poll. The timeout fires only if the cold consumer is wedged, in which case the engine returns a Redis error rather than serving stale data: failing closed preserves the invariant. String reads, deletes, and hot hits never wait. Eliminating this residual wait for cold-resident collection mutations is tracked as a follow-up (hot-side field tombstones).
 
 ### Cold Hit Promotion
 
@@ -158,7 +158,7 @@ Every read records which tier served the response:
 3. Buffer hits do not promote. Cold hits do promote (via queue append).
 4. A write is never acknowledged until both the queue fsync and hot consumer apply are complete.
 5. The promise registry is bounded: entries are removed on fulfillment or timeout. A stalled consumer causes promise timeouts, not unbounded registry growth.
-6. Reads that miss hot consult the buffer overlay and/or cold only after the per-shard cold consumer has caught up to hot's settled seq. If the wait exceeds `engine.buffer_consistency_wait_timeout_ms`, the engine returns a Redis error rather than serving against a stale overlay.
+6. A recent delete is an authoritative hot tombstone: reads of a deleted key (`GET`, `EXISTS`, emptied-collection reads) return `nil`/empty from hot without consulting the lagging overlay or waiting. A read that genuinely misses hot **and** must merge a collection overlay waits — signal-driven, not polling — for the per-shard cold consumer to reach hot's settled seq; if the wait exceeds `engine.buffer_consistency_wait_timeout_ms` the engine returns a Redis error rather than serving a stale overlay. Tombstones are reclaimed once cold has drained past the delete and do not count toward `DBSIZE`.
 
 ## Trade-offs
 

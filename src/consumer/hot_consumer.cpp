@@ -218,7 +218,7 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
       } else if (replaying && ShouldSkipForAbsTtlElapsed(AbsTtlMs(*op), wall_now)) {
         counters_.replay_skipped_abs_ttl.fetch_add(1, std::memory_order_relaxed);
       } else {
-        auto applied = store_.Apply(*op);
+        auto applied = store_.Apply(*op, entry.seq);
         if (!applied.has_value()) {
           counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
           if (applied.error().code() != core::ErrorCode::kWrongType) {
@@ -336,7 +336,7 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
   const bool wiped_by_flush = flush_high > 0 && resolved.ref < flush_high;
 
   if (!wiped_by_flush && resolved.decision == core::Decision::kApply) {
-    auto applied = ApplyResolvedOps(resolved.materialised_ops, reference_at);
+    auto applied = ApplyResolvedOps(resolved.materialised_ops, reference_at, entry.seq);
     if (!applied.has_value()) {
       counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
       if (applied.error().code() != core::ErrorCode::kWrongType) {
@@ -358,7 +358,8 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
 }
 
 core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCommand>& ops,
-                                                 core::WallTime reference_at) {
+                                                 core::WallTime reference_at,
+                                                 core::SequenceId seq) {
   const bool replaying = replay_mode_.load(std::memory_order_acquire);
   const auto wall_now = config_.wall_clock();
 
@@ -385,7 +386,7 @@ core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCom
     }
 
     // Reply value is constructed by the Resolver; discard here.
-    auto applied = store_.Apply(*op);
+    auto applied = store_.Apply(*op, seq);
     if (!applied.has_value()) return std::unexpected(applied.error());
     counters_.applied.fetch_add(1, std::memory_order_relaxed);
   }

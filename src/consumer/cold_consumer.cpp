@@ -133,6 +133,8 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
     latest_drained_seq_.store(seq, std::memory_order_release);
     drained_anything_ = true;
   }
+  // Wake any read-consistency waiters now that the drained seq has advanced.
+  if (!result->empty()) NotifyDrained();
   return count;
 }
 
@@ -328,6 +330,7 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   // return OK to the client while a peer shard's cold ack is still pre-Flush.
   latest_drained_seq_.store(entry.seq, std::memory_order_release);
   drained_anything_ = true;
+  NotifyDrained();
   TryAdvanceAck();
 
   const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
@@ -639,6 +642,23 @@ void ColdConsumer::TryAdvanceAck() {
 
   last_ack_seq_.store(target, std::memory_order_release);
   first_ack_recorded_ = true;
+}
+
+bool ColdConsumer::WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout) {
+  if (latest_drained_seq_.load(std::memory_order_acquire) >= target) return true;
+  std::unique_lock lock(drain_wait_mu_);
+  return drain_wait_cv_.wait_for(lock, timeout, [this, target] {
+    return latest_drained_seq_.load(std::memory_order_acquire) >= target;
+  });
+}
+
+void ColdConsumer::NotifyDrained() {
+  // Take and release the wait mutex so a waiter sitting between its predicate
+  // check and entering wait() cannot miss this wakeup, then notify.
+  {
+    const std::scoped_lock lock(drain_wait_mu_);
+  }
+  drain_wait_cv_.notify_all();
 }
 
 ColdConsumer::Metrics ColdConsumer::Snapshot() const {
