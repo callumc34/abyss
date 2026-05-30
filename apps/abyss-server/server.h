@@ -41,7 +41,7 @@ class Server {
   Server& operator=(Server&&) = delete;
 
   bool Initialize();
-  void Run(const std::atomic<bool>& stop);
+  bool Run(const std::atomic<bool>& stop);
   void Shutdown();
   bool IsReady() const { return ready_.load(std::memory_order_acquire); }
   bool IsShuttingDown() const { return shutting_down_.load(std::memory_order_acquire); }

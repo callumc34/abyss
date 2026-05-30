@@ -321,8 +321,8 @@ bool Server::Initialize() {
 #endif
 }
 
-void Server::Run(const std::atomic<bool>& stop) {
-  if (!tcp_server_) return;
+bool Server::Run(const std::atomic<bool>& stop) {
+  if (!tcp_server_) return false;
 
   // Bind admin and metrics first so /healthz and /ready answer immediately.
   // /ready will report 503 (recovery_complete=false) until the coordinator
@@ -330,7 +330,7 @@ void Server::Run(const std::atomic<bool>& stop) {
   if (admin_http_) {
     if (auto r = admin_http_->Start(); !r.has_value()) {
       ABYSS_LOG_CRITICAL("admin http start failed", {"err", std::string_view{r.error().message()}});
-      return;
+      return false;
     }
   }
   if (metrics_http_) {
@@ -338,7 +338,7 @@ void Server::Run(const std::atomic<bool>& stop) {
       ABYSS_LOG_CRITICAL("metrics http start failed",
                          {"err", std::string_view{r.error().message()}});
       if (admin_http_) admin_http_->Stop();
-      return;
+      return false;
     }
   }
 
@@ -349,7 +349,7 @@ void Server::Run(const std::atomic<bool>& stop) {
     ABYSS_LOG_CRITICAL("tcp server start failed", {"err", std::string_view{r.error().message()}});
     if (admin_http_) admin_http_->Stop();
     if (metrics_http_) metrics_http_->Stop();
-    return;
+    return false;
   }
   config_.net.port = tcp_server_->BoundPort();
   if (stats_) stats_->SetTcpPort(config_.net.port);
@@ -369,7 +369,7 @@ void Server::Run(const std::atomic<bool>& stop) {
       ABYSS_LOG_CRITICAL("recovery failed; shutting down",
                          {"err", std::string_view{r.error().message()}});
       Shutdown();
-      return;
+      return false;
     }
   }
 
@@ -399,6 +399,7 @@ void Server::Run(const std::atomic<bool>& stop) {
   }
 
   Shutdown();
+  return true;
 }
 
 void Server::NotifyReady() {
