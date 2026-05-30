@@ -317,11 +317,8 @@ TEST_F(ColdConsumerTest, HighWaterTriggersAggressiveMode) {
   EXPECT_EQ(c->Buffer().Size(), 0);
 }
 
-// Pins the ordering "queue.Ack precedes rpc.Fulfill" for Flush. ColdStore::Wipe
-// is global, so a Flush observed-but-not-acked at kill time leaves recovery to
-// re-Wipe and destroy post-Flush data applied by another shard's parallel
-// replay. The engine reports FLUSHDB OK only after the Flush RPC is fulfilled;
-// fulfilling before the ack persists is exactly the durability hole.
+// Pins "queue.Ack precedes rpc.Fulfill" for Flush: the engine returns FLUSHDB
+// +OK on RPC fulfilment, so the per-shard ack must be durable first (ADP-006).
 TEST_F(ColdConsumerTest, FlushAckPersistedBeforeRpcFulfilled) {
   auto c = MakeConsumer();
 
@@ -338,7 +335,7 @@ TEST_F(ColdConsumerTest, FlushAckPersistedBeforeRpcFulfilled) {
         return core::Result<void>{};
       });
 
-  EXPECT_CALL(cold_, Wipe()).WillOnce(Return(core::Result<void>{}));
+  EXPECT_CALL(cold_, Wipe(kShard)).WillOnce(Return(core::Result<void>{}));
 
   std::vector<core::QueueEntry> entries;
   entries.push_back(core::QueueEntry{

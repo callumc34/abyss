@@ -59,6 +59,7 @@ class IntegrationHarness {
 
     auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
         .data_path = (tmp_dir_ / "cold").string(),
+        .shard_count = kShardCount,
         .write_buffer_size_bytes = 1024UL * 1024UL,
         .wall_clock = clock_.WallFn(),
     });

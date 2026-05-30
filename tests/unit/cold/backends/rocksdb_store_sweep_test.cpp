@@ -31,6 +31,10 @@ namespace {
 
 using namespace std::chrono_literals;
 
+// Single shard: key encoding and the raw meta injection must agree on the slot
+// count (ADP-010).
+constexpr uint32_t kFixtureShardCount = 1;
+
 struct TestClock {
   std::shared_ptr<std::atomic<uint64_t>> now_ms =
       std::make_shared<std::atomic<uint64_t>>(1'000'000);
@@ -62,7 +66,7 @@ void InjectExpiredMeta(const std::string& path, uint8_t inner_type, std::string_
   rocksdb::DBOptions db_opts;
   ASSERT_TRUE(rocksdb::DB::Open(db_opts, path, descs, &handles, &db).ok());
 
-  const auto meta_key = ::abyss::cold::format::EncodeMetaKey(inner_type, key);
+  const auto meta_key = ::abyss::cold::format::EncodeMetaKey(inner_type, key, kFixtureShardCount);
   const auto meta_value = ::abyss::cold::format::EncodeMetaValue({
       .flags = ::abyss::cold::format::kFlagHasTtl,
       .abs_ttl_ms = 1,
@@ -101,6 +105,7 @@ class SweepFixture : public ::testing::Test {
   std::unique_ptr<RocksdbStore> OpenStore() {
     RocksdbConfig config;
     config.data_path = path_.string();
+    config.shard_count = kFixtureShardCount;
     config.wall_clock = clock_.Fn();
     config.ttl_scanner_mode = TtlScanner::ExecutionMode::kManualTick;
     config.ttl_scanner.base_sample_size = 200;

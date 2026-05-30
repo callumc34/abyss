@@ -39,12 +39,22 @@ RocksDB `WriteBatch` operations span column families atomically, so the invarian
 Redis keys are binary-safe — they may contain any byte, including `\x00`. This rules out sentinel-separator schemes (`h:<key>:<field>`, `h:<key>\x00<field>`). Composite keys instead use length-prefix encoding:
 
 ```
-<type:1B> <keylen:varint> <key bytes> <field-or-member bytes>
+<type:1B> <shard:2B BE> <keylen:varint> <key bytes> <field-or-member bytes>
 ```
 
-`varint` is the unsigned LEB128 encoding (1 byte for keys ≤ 127 bytes, which covers the overwhelming majority of Redis key lengths in practice). The length prefix does not need to be decoded for prefix scans; iterating `<type><keylen><key>` is guaranteed to return only entries belonging to that key, because the next byte after `<key>` is the start of the field/member, not a separator that user data could collide with.
+`varint` is the unsigned LEB128 encoding (1 byte for keys ≤ 127 bytes, which covers the overwhelming majority of Redis key lengths in practice). The length prefix does not need to be decoded for prefix scans; iterating `<type><shard><keylen><key>` is guaranteed to return only entries belonging to that key, because the next byte after `<key>` is the start of the field/member, not a separator that user data could collide with.
 
-Strings (`0x01`) and the format-version record (`0xFF`) do not have a field/member tail, so they omit the length prefix and the key bytes form the entire suffix.
+Strings (`0x01`) and the format-version record (`0xFF`) have no field/member tail, so they omit the length prefix and the key bytes form the entire suffix. The format-version record is a global system record and omits the shard slot entirely (see below).
+
+### Shard Slot
+
+The 2-byte big-endian shard slot immediately follows the type byte on every data key. Its value is `ComputeShard(key, shard_count)` — the same xxHash router that the frontend, hot store, and consumers use, so a key's slot is identical across every tier and is a pure function of the Redis key (never of the field/member). It is *not* part of the user key; it is a physical partition tag.
+
+A single embedded RocksDB instance backs all of a pod's logical shards (Phase 1, single-pod). The slot turns that one physical store into `shard_count` contiguous, non-overlapping key ranges — one per shard — without any per-shard column family or database. The motivating requirement is the broadcast wipe (FLUSHDB): a per-shard `Flush` must clear exactly its own shard's slice and nothing else, so the bytes that identify a shard's slice must be a leading, range-contiguous key prefix. Placing the slot *after* the type byte (rather than first) keeps each type's range globally contiguous, so the TTL sampler, the `EXISTS`/`TYPE` bloom probe, and the format-version record are unaffected by the slot's introduction.
+
+The slot is fixed at 2 bytes, capping the deployable shard count at 65536 — far above the planned horizontal shard count. This Phase-1 partition tag is also the Phase-2 migration unit: a shard's slice is a single contiguous key range, trivially exportable when shards become pods (architecture.md: "Phase 1's internal sharding boundaries match Phase 2's pod boundaries").
+
+The meta record places the slot between its type byte and the inner type: `<0x02> <shard:2B> <inner_type:1B> <key>` (see below).
 
 #### Type Byte Allocations
 
@@ -67,7 +77,7 @@ Type bytes are never reused or reordered. New Redis types take new bytes from th
 #### String (`0x01`)
 
 ```
-Key:    0x01 <key>
+Key:    0x01 <shard:2B> <key>
 Value:  <flags:1> <abs_ttl_ms:8 BE> <payload bytes>
 ```
 
@@ -82,7 +92,7 @@ Inlining TTL in the string value avoids a second `Get` on the string read path, 
 #### Meta Record (`0x02`)
 
 ```
-Key:    0x02 <inner_type:1> <key>
+Key:    0x02 <shard:2B> <inner_type:1> <key>
 Value:  <flags:1> <abs_ttl_ms:8 BE> <cardinality:8 BE>
 ```
 
@@ -95,14 +105,14 @@ When a collection's cardinality drops to zero, the meta record is deleted along 
 #### Hash Field (`0x03`)
 
 ```
-Key:    0x03 <keylen:varint> <key> <field>
+Key:    0x03 <shard:2B> <keylen:varint> <key> <field>
 Value:  <field value bytes>
 ```
 
 #### Set Member (`0x04`)
 
 ```
-Key:    0x04 <keylen:varint> <key> <member>
+Key:    0x04 <shard:2B> <keylen:varint> <key> <member>
 Value:  empty
 ```
 
@@ -111,7 +121,7 @@ Empty value as sentinel — existence of the KV is the membership signal.
 #### Zset Member-Indexed (`0x05`)
 
 ```
-Key:    0x05 <keylen:varint> <key> <member>
+Key:    0x05 <shard:2B> <keylen:varint> <key> <member>
 Value:  <score:8 IEEE 754 double, native endianness>
 ```
 
@@ -120,7 +130,7 @@ Used for `ZSCORE` and `ZINCRBY` reads. Member-keyed lookup is the natural index 
 #### Zset Score-Indexed (`0x06`, in `zset_score_idx` CF)
 
 ```
-Key:    0x06 <keylen:varint> <key> <score:8 sortable, BE> <member>
+Key:    0x06 <shard:2B> <keylen:varint> <key> <score:8 sortable, BE> <member>
 Value:  empty
 ```
 
@@ -147,7 +157,7 @@ Value:  <version:2 BE> <reserved bytes>
 
 Written once at store initialization. Read on every `open()` to detect mismatched on-disk encoding. A version mismatch fails `open()` with a migration-required error rather than reading data with the wrong decoder.
 
-The current version is `1`. Bumping the version requires a one-shot migration; no migration tooling is in scope for Phase 1, but the version byte exists so it is possible.
+The current version is `2`. Version `1` predates the shard slot; its keys lack the 2-byte tag, so a v1 store would be misdecoded by a v2 binary and `open()` rejects it. Bumping the version requires a one-shot migration; no migration tooling is in scope for Phase 1 (greenfield: dev/test stores are wiped), but the version byte exists so it is possible.
 
 ### Tombstones (Deletes)
 
@@ -168,6 +178,19 @@ The current version is `1`. Bumping the version requires a one-shot migration; n
 Phase 1 doesn't strictly need long-lived snapshots, so most of these would not bite immediately. But "doesn't bite immediately" is exactly how tech debt accrues: the encoding decision propagates into every read path, and removing `DeleteRange` later means revisiting all of it. Iterate-and-delete has none of these caveats. Its only cost is O(cardinality) at delete time — and cardinality is bounded by what we're willing to write to a collection in the first place. Bulk deletes of multi-million-member collections are rare; even when they happen, RocksDB handles a single batched WriteBatch of that size cleanly.
 
 The encoding scheme itself does not preclude `DeleteRange` — length-prefix keys give exact-byte prefix ranges. If a future workload demonstrates iterate-and-delete is the bottleneck, `DeleteRange` can be enabled per-operation as a tunable without changing the on-disk layout.
+
+#### Per-shard wipe (FLUSHDB)
+
+A FLUSHDB broadcasts one `entry::Flush` per shard (ADP-006 §Broadcast Write Path). Each shard's cold consumer wipes **only its own slice**: for that shard, `DeleteRange` over `[<type><shard>, successor(<type><shard>))` for each primary type in the default CF, plus the zset score-index slice in its CF. Because the shard slot is a leading, range-contiguous key prefix, a shard's slice is a set of bounded ranges that touch no other shard's keys. This is what makes the broadcast wipe safe under independent per-shard ordering: a lagging shard's wipe during parallel recovery replay (ADP-007) can never destroy a peer shard's already-flushed post-Flush data, because it does not address the peer's slice. The global wipe this replaced had exactly that cross-shard data-loss race.
+
+`DeleteRange` *is* used here, and this is a deliberate exception to the iterate-and-delete decision above — not a contradiction of it. The reasoning that rejected `DeleteRange` for the per-key `DEL` path does not apply to a full-shard administrative wipe:
+
+- FLUSHDB is rare and administrative, not a steady-state per-key cost.
+- The wiped range becomes empty, so no *live* key pays the range-tombstone read tax; the tombstones are non-overlapping per shard and are garbage-collected at the next compaction.
+- Post-wipe writes carry higher sequence numbers and are not shadowed by the tombstone.
+- The alternative — iterate-and-delete over an entire shard's keyspace — is O(total keys) for a wipe-everything operation, strictly worse than the per-key `DEL` case where cardinality is bounded.
+
+The format-version record (`0xFF`, no shard slot) lies outside every per-shard data range, so it survives the wipe and the next `open()` still finds it.
 
 ### TTL Encoding Summary
 
@@ -201,7 +224,7 @@ Probe-with-bloom is the default. The registry would add write amplification on t
 
 ### Worked Examples
 
-Assume key `k = "user:42"` (7 bytes), no TTL unless stated. `varint(7)` is `0x07`.
+Assume key `k = "user:42"` (7 bytes), no TTL unless stated. `varint(7)` is `0x07`. The 2-byte shard slot that follows each type byte is **elided** below for readability — its value is `ComputeShard(key, shard_count)` and is identical for every record of a given key.
 
 **`SET user:42 "alice"`:**
 ```
@@ -261,6 +284,7 @@ zset_score_idx CF:  0x06 0x03 "z:1" <sortable(2.5)> "b"        →  ∅
 5. The format-version record is read on every `open()`. A mismatch fails the open with a migration-required error rather than reading data with the wrong decoder.
 6. Type bytes are immutable. Once allocated, a type byte's meaning never changes. New types take new bytes from the reserved range.
 7. TTL is sourced exclusively from the primary record (inline for strings, meta for collections). No separate TTL index exists; lazy and active expiry both consult the primary record per ADP-003.
+8. Every data key carries a 2-byte shard slot immediately after the type byte, equal to `ComputeShard(key, shard_count)`. The slot is a pure function of the Redis key (never the field/member), so all records of a key share one slot, and read/write/wipe agree on a key's slice by construction. A per-shard wipe deletes exactly the slices whose slot equals that shard and no others. The format-version record (`0xFF`) carries no slot.
 
 ## Trade-offs
 

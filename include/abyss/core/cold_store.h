@@ -32,9 +32,9 @@ class ColdStore : public Reader {
 
   virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops) = 0;
 
-  // Drops every key in the cold store. Backends shared across shards must
-  // make this idempotent — every per-shard Flush funnels through the same wipe.
-  virtual Result<void> Wipe() = 0;
+  // Drops every key owned by `shard` and no other shard's. Per-shard so a
+  // lagging shard's FLUSHDB replay can't clobber a peer's data (ADP-006, 010).
+  virtual Result<void> Wipe(ShardId shard) = 0;
 
   virtual Result<StorageStats> Stats() = 0;
   virtual Result<void> Compact() = 0;

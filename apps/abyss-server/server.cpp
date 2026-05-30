@@ -118,6 +118,8 @@ bool Server::Initialize() {
 
   auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
       .data_path = config_.cold.data_path,
+      // Must match the hot/consumer shard count.
+      .shard_count = hot_store_->shard_count(),
       .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
       .ttl_scanner = config_.cold.ttl_scanner,
   });

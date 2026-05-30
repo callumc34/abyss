@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 #include "abyss/core/result.h"
+#include "abyss/core/types.h"
 
 namespace abyss::cold::format {
 
@@ -17,8 +19,13 @@ inline constexpr uint8_t kTypeZsetMember = 0x05;
 inline constexpr uint8_t kTypeZsetScoreIndex = 0x06;
 inline constexpr uint8_t kTypeFormatVersion = 0xFF;
 
-// Version stored in the format-version record.
-inline constexpr uint16_t kFormatVersion = 1;
+// Shard-slot width: a fixed 2-byte big-endian tag after the type byte (ADP-010),
+// caps shard count at 65536. RocksdbStore::Create enforces the bound.
+inline constexpr size_t kShardBytes = 2;
+inline constexpr uint32_t kMaxShardCount = 1U << (8 * kShardBytes);
+
+// v2 added the shard slot; a v1 store has an incompatible layout and fails open().
+inline constexpr uint16_t kFormatVersion = 2;
 
 // Value flag bits.
 inline constexpr uint8_t kFlagHasTtl = 0x01;
@@ -30,18 +37,26 @@ core::Result<uint64_t> DecodeVarint(std::string_view& bytes);
 
 uint64_t SortableDouble(double d);
 
-std::string EncodeStringKey(std::string_view key);
-std::string EncodeMetaKey(uint8_t inner_type, std::string_view key);
-std::string EncodeHashFieldKey(std::string_view key, std::string_view field);
-std::string EncodeSetMemberKey(std::string_view key, std::string_view member);
-std::string EncodeZsetMemberKey(std::string_view key, std::string_view member);
-std::string EncodeZsetScoreIndexKey(std::string_view key, double score, std::string_view member);
+// Data-key encoders. The slot is derived from `key` (not passed in) so read,
+// write, and wipe can't disagree on a key's slice. `shard_count` in [1, kMaxShardCount].
+std::string EncodeStringKey(std::string_view key, uint32_t shard_count);
+std::string EncodeMetaKey(uint8_t inner_type, std::string_view key, uint32_t shard_count);
+std::string EncodeHashFieldKey(std::string_view key, std::string_view field, uint32_t shard_count);
+std::string EncodeSetMemberKey(std::string_view key, std::string_view member, uint32_t shard_count);
+std::string EncodeZsetMemberKey(std::string_view key, std::string_view member,
+                                uint32_t shard_count);
+std::string EncodeZsetScoreIndexKey(std::string_view key, double score, std::string_view member,
+                                    uint32_t shard_count);
 std::string EncodeFormatVersionKey();
 
-std::string HashFieldPrefix(std::string_view key);
-std::string SetMemberPrefix(std::string_view key);
-std::string ZsetMemberPrefix(std::string_view key);
-std::string ZsetScoreIndexPrefix(std::string_view key);
+std::string HashFieldPrefix(std::string_view key, uint32_t shard_count);
+std::string SetMemberPrefix(std::string_view key, uint32_t shard_count);
+std::string ZsetMemberPrefix(std::string_view key, uint32_t shard_count);
+std::string ZsetScoreIndexPrefix(std::string_view key, uint32_t shard_count);
+
+// <type><shard:2> — the prefix bounding one shard's slice of one type, used to
+// build the wipe range [ShardTypePrefix(t, s), successor).
+std::string ShardTypePrefix(uint8_t type, core::ShardId shard);
 
 struct StringValue {
   uint8_t flags = 0;

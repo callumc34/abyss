@@ -15,7 +15,7 @@ class MockColdStore : public core::ColdStore {
               (const core::ops::ReadOp& op, std::optional<core::Duration> deadline), (override));
   MOCK_METHOD(core::Result<void>, ApplyBatch, (std::span<const core::ops::WriteOp> ops),
               (override));
-  MOCK_METHOD(core::Result<void>, Wipe, (), (override));
+  MOCK_METHOD(core::Result<void>, Wipe, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::StorageStats>, Stats, (), (override));
   MOCK_METHOD(core::Result<void>, Compact, (), (override));
   MOCK_METHOD((core::Result<std::optional<core::RespCommand>>), GetPromotionCommand,
