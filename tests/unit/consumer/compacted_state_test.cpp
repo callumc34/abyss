@@ -104,8 +104,11 @@ TEST_F(CompactedStateTest, SetAddThenRemDisjoint) {
   state_.Absorb(WriteOp{SetRem{.key = "k", .members = {"d"}}});
 
   auto ops = state_.Emit();
-  ASSERT_EQ(ops.size(), 1);
+  ASSERT_EQ(ops.size(), 2);
   EXPECT_EQ(std::get<SetAdd>(ops[0]).members.size(), 3);
+  auto& removed = std::get<SetRem>(ops[1]).members;
+  ASSERT_EQ(removed.size(), 1);
+  EXPECT_EQ(removed[0], "d");
 }
 
 TEST_F(CompactedStateTest, SetAddThenRemSameMember) {
@@ -113,10 +116,13 @@ TEST_F(CompactedStateTest, SetAddThenRemSameMember) {
   state_.Absorb(WriteOp{SetRem{.key = "k", .members = {"b"}}});
 
   auto ops = state_.Emit();
-  ASSERT_EQ(ops.size(), 1);
+  ASSERT_EQ(ops.size(), 2);
   auto& members = std::get<SetAdd>(ops[0]).members;
   ASSERT_EQ(members.size(), 1);
   EXPECT_EQ(members[0], "a");
+  auto& removed = std::get<SetRem>(ops[1]).members;
+  ASSERT_EQ(removed.size(), 1);
+  EXPECT_EQ(removed[0], "b");
 }
 
 TEST_F(CompactedStateTest, SetRemThenAddSameMember) {
@@ -130,12 +136,17 @@ TEST_F(CompactedStateTest, SetRemThenAddSameMember) {
   EXPECT_EQ(members[0], "a");
 }
 
-TEST_F(CompactedStateTest, SetRemAllMembersEmitsNothing) {
+TEST_F(CompactedStateTest, SetRemAllMembersStillEmitsRem) {
   state_.Absorb(WriteOp{SetAdd{.key = "k", .members = {"a"}}});
   state_.Absorb(WriteOp{SetRem{.key = "k", .members = {"a"}}});
 
+  // The member may exist in cold from an earlier window; the net removal must
+  // still be emitted even though the add cancelled within this window.
   auto ops = state_.Emit();
-  EXPECT_TRUE(ops.empty());
+  ASSERT_EQ(ops.size(), 1);
+  auto& removed = std::get<SetRem>(ops[0]).members;
+  ASSERT_EQ(removed.size(), 1);
+  EXPECT_EQ(removed[0], "a");
 }
 
 TEST_F(CompactedStateTest, DelThenSetAddClearsTombstone) {
@@ -177,10 +188,13 @@ TEST_F(CompactedStateTest, ZsetAddThenRemRemovesMember) {
   state_.Absorb(WriteOp{ZsetRem{.key = "k", .members = {"a"}}});
 
   auto ops = state_.Emit();
-  ASSERT_EQ(ops.size(), 1);
+  ASSERT_EQ(ops.size(), 2);
   auto& entries = std::get<ZsetAdd>(ops[0]).entries;
   ASSERT_EQ(entries.size(), 1);
   EXPECT_EQ(entries[0].member, "b");
+  auto& removed = std::get<ZsetRem>(ops[1]).members;
+  ASSERT_EQ(removed.size(), 1);
+  EXPECT_EQ(removed[0], "a");
 }
 
 TEST_F(CompactedStateTest, ZsetRemThenAddSameMember) {
@@ -223,10 +237,13 @@ TEST_F(CompactedStateTest, HashSetThenDelRemovesField) {
   state_.Absorb(WriteOp{HashDel{.key = "k", .fields = {"f1"}}});
 
   auto ops = state_.Emit();
-  ASSERT_EQ(ops.size(), 1);
+  ASSERT_EQ(ops.size(), 2);
   auto& fields = std::get<HashSet>(ops[0]).fields;
   ASSERT_EQ(fields.size(), 1);
   EXPECT_EQ(fields[0].field, "f2");
+  auto& removed = std::get<HashDel>(ops[1]).fields;
+  ASSERT_EQ(removed.size(), 1);
+  EXPECT_EQ(removed[0], "f1");
 }
 
 TEST_F(CompactedStateTest, HashMSetAbsorbsLikeHashSet) {
@@ -339,6 +356,53 @@ TEST_F(CompactedStateTest, EmitOnTombstoneReturnsEmpty) {
   state_.Absorb(WriteOp{StringSet{.key = "k", .value = "v"}});
   state_.Absorb(WriteOp{Del{.keys = {"k"}}});
   EXPECT_TRUE(state_.Emit().empty());
+}
+
+// --- Multi-window removals ---
+// The state is reset (or freshly created) after every flush, so a removal in a
+// later window has no matching addition to cancel against. Emit must still
+// surface the removal so cold drops the member flushed in the earlier window.
+
+TEST_F(CompactedStateTest, SetRemOnFreshStateEmitsRem) {
+  state_.Absorb(WriteOp{SetRem{.key = "k", .members = {"a", "b"}}});
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<SetRem>(ops[0]));
+  EXPECT_EQ(std::get<SetRem>(ops[0]).members.size(), 2);
+}
+
+TEST_F(CompactedStateTest, ZsetRemOnFreshStateEmitsRem) {
+  state_.Absorb(WriteOp{ZsetRem{.key = "k", .members = {"a"}}});
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<ZsetRem>(ops[0]));
+  ASSERT_EQ(std::get<ZsetRem>(ops[0]).members.size(), 1);
+  EXPECT_EQ(std::get<ZsetRem>(ops[0]).members[0], "a");
+}
+
+TEST_F(CompactedStateTest, HashDelOnFreshStateEmitsDel) {
+  state_.Absorb(WriteOp{HashDel{.key = "k", .fields = {"f"}}});
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<HashDel>(ops[0]));
+  ASSERT_EQ(std::get<HashDel>(ops[0]).fields.size(), 1);
+  EXPECT_EQ(std::get<HashDel>(ops[0]).fields[0], "f");
+}
+
+TEST_F(CompactedStateTest, AddThenResetThenRemEmitsRem) {
+  state_.Absorb(WriteOp{HashSet{.key = "k", .fields = {{.field = "f", .value = "v"}}}});
+  ASSERT_FALSE(state_.Emit().empty());
+
+  state_.Reset();
+  state_.Absorb(WriteOp{HashDel{.key = "k", .fields = {"f"}}});
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<HashDel>(ops[0]));
+  EXPECT_EQ(std::get<HashDel>(ops[0]).fields[0], "f");
 }
 
 }  // namespace

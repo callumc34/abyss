@@ -183,6 +183,15 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
         }
       }
+      // Net removals must reach cold.
+      if (!set_removed_members_.empty()) {
+        std::vector<std::string_view> removed;
+        removed.reserve(set_removed_members_.size());
+        for (const auto& m : set_removed_members_) {
+          removed.emplace_back(m);
+        }
+        result.emplace_back(core::ops::SetRem{.key = {}, .members = std::move(removed)});
+      }
       break;
     case DataType::kZset:
       if (!zset_members_.empty()) {
@@ -196,6 +205,14 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
         }
       }
+      if (!zset_removed_members_.empty()) {
+        std::vector<std::string_view> removed;
+        removed.reserve(zset_removed_members_.size());
+        for (const auto& m : zset_removed_members_) {
+          removed.emplace_back(m);
+        }
+        result.emplace_back(core::ops::ZsetRem{.key = {}, .members = std::move(removed)});
+      }
       break;
     case DataType::kHash:
       if (!hash_fields_.empty()) {
@@ -208,6 +225,14 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
         if (abs_ttl_ms_ > 0) {
           result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
         }
+      }
+      if (!hash_removed_fields_.empty()) {
+        std::vector<std::string_view> removed;
+        removed.reserve(hash_removed_fields_.size());
+        for (const auto& f : hash_removed_fields_) {
+          removed.emplace_back(f);
+        }
+        result.emplace_back(core::ops::HashDel{.key = {}, .fields = std::move(removed)});
       }
       break;
   }
