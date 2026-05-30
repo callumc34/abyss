@@ -144,8 +144,8 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 
-  server.Run(g_shutdown_requested);
+  const auto result = server.Run(g_shutdown_requested);
 
   ABYSS_LOG_INFO("abyss stopped", {"signal", static_cast<int64_t>(g_shutdown_signal.load())});
-  return EXIT_SUCCESS;
+  return result.has_value() ? EXIT_SUCCESS : EXIT_FAILURE;
 }

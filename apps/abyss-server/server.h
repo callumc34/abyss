@@ -17,6 +17,7 @@
 #include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
+#include "abyss/core/result.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/engine/recovery_coordinator.h"
 #include "abyss/engine/tiering_engine.h"
@@ -41,7 +42,7 @@ class Server {
   Server& operator=(Server&&) = delete;
 
   bool Initialize();
-  void Run(const std::atomic<bool>& stop);
+  core::Result<void> Run(const std::atomic<bool>& stop);
   void Shutdown();
   bool IsReady() const { return ready_.load(std::memory_order_acquire); }
   bool IsShuttingDown() const { return shutting_down_.load(std::memory_order_acquire); }
