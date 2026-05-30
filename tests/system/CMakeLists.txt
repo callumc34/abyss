@@ -21,6 +21,7 @@ add_executable(abyss_system_tests
   protocol_test.cpp
   tiering_test.cpp
   tiered_read_test.cpp
+  read_after_write_test.cpp
   compaction_efficiency_test.cpp
   durability_test.cpp
   operational_test.cpp
