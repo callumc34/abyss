@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-04-15
+**Updated:** 2026-05-31
 
 ## Context
 
@@ -111,8 +111,9 @@ Every command is classified along two axes.
 | `kWritePath` | Unconditional write: queue append → hot apply | Consumer RPC ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) |
 | `kConditionalWrite` | Conditional: resolver resolves ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) | Consumer RPC |
 | `kConsumerRpc` | Requires live consumer state (e.g. `DBSIZE`, `OBJECT IDLETIME`) | Consumer RPC |
+| `kFlush` | Broadcast wipe (`FLUSHDB`/`FLUSHALL`): per-shard `Flush` entry, fan-out apply ([ADP-006](006-read-write-paths.md) §Broadcast Write Path) | Consumer RPC (per shard × consumer) |
 
-The request pipeline (issue #34) becomes a data-driven 5-way dispatch against the command registry, not a growing switch.
+The request pipeline (issue #34) becomes a data-driven 6-way dispatch against the command registry, not a growing switch.
 
 ### Container Commands and Subcommands
 
@@ -129,7 +130,7 @@ When a container is invoked with no subcommand argument (e.g. `COMMAND` alone), 
 
 ### Command Registry (Phase 1)
 
-Phase 1 restricts the surface to **direct key access and modification only** — no enumeration (`KEYS`, `SCAN`, `RANDOMKEY`), no global operations (`FLUSHDB`, `FLUSHALL`), no pub/sub, no scripting, no transactions (groundwork exists in ADP-011; activation deferred), no streams.
+Phase 1 restricts the surface to **direct key access and modification**, plus the `FLUSHDB`/`FLUSHALL` global wipe (routed through the queue as a broadcast write — [ADP-006](006-read-write-paths.md) §Broadcast Write Path) — no enumeration (`KEYS`, `SCAN`, `RANDOMKEY`), no other global operations (`SWAPDB`, `MOVE`, `SELECT`), no pub/sub, no scripting, no transactions (groundwork exists in ADP-011; activation deferred), no streams.
 
 Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "at least |n|".
 
@@ -173,6 +174,15 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 | `CLUSTER MYID` | 2 | Bulk string (node UUID) |
 | `CLUSTER KEYSLOT key` | 3 | Integer (`CRC16(key) mod 16384`) |
 | `CLUSTER COUNTKEYSINSLOT slot` | 3 | Integer |
+
+**Admin — broadcast write (global wipe):**
+
+| Command | Arity | Class | Dispatch | Response |
+|---------|-------|-------|----------|----------|
+| `FLUSHDB [ASYNC\|SYNC]` | -1 | Write | Flush | `+OK` |
+| `FLUSHALL [ASYNC\|SYNC]` | -1 | Write | Flush | `+OK` |
+
+Both route through the queue as a per-shard `Flush` broadcast and ack only after every consumer on every owned shard has applied the wipe ([ADP-006](006-read-write-paths.md) §Broadcast Write Path). The `ASYNC`/`SYNC` modifier is accepted (hence arity -1) but ignored — the wipe is always synchronous. Single-pod Phase 1 has only DB 0, so `FLUSHALL` and `FLUSHDB` are equivalent. Both are `loading_safe = false`: during recovery they return `LOADING`.
 
 **Strings (direct key only):**
 
@@ -272,7 +282,7 @@ When the hot store does not hold the key — typical after eviction — multi-fi
 **Excluded in Phase 1** (reject with `ERR unknown command`):
 
 - Enumeration — `KEYS`, `SCAN`, `HSCAN`, `SSCAN`, `ZSCAN`, `RANDOMKEY`
-- Global — `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `MOVE`, `SELECT` (non-zero DB)
+- Global — `SWAPDB`, `MOVE`, `SELECT` (non-zero DB). `FLUSHDB`/`FLUSHALL` are **supported** — see §Command Registry above and [ADP-006](006-read-write-paths.md) §Broadcast Write Path.
 - Transactions — `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` ([ADP-011](011-conditional-writes-and-consumer-rpc.md) lays the groundwork; activation deferred to Phase 2+)
 - Pub/sub — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB`
 - Scripting — `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` (`NOSCRIPT` where Redis semantics demand it)
