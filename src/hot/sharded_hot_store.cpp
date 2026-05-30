@@ -75,43 +75,51 @@ core::Result<core::RespValue> ShardedHotStore::ExecExists(const core::ops::Exist
   return core::RespValue::Integer(total);
 }
 
-core::Result<core::RespValue> ShardedHotStore::Apply(const core::ops::WriteOp& op)
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+core::Result<core::RespValue> ShardedHotStore::Apply(
+    const core::ops::WriteOp& op, core::SequenceId seq) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   return std::visit(
-      [this, &op](const auto& o) -> core::Result<core::RespValue> {
+      [this, &op, seq](const auto& o) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, core::ops::Del>) {
-          return ApplyDel(o);
+          return ApplyDel(o, seq);
         } else {
           const auto key = core::ops::PrimaryKey(core::ops::WriteOp{o});
           const auto eviction = ResolveEviction(key);
           auto& shard = ShardFor(key);
           std::unique_lock lock(shard.mutex);
-          return shard.store.Apply(op, eviction);
+          return shard.store.Apply(op, eviction, seq);
         }
       },
       op);
 }
 
+core::HotKeyPresence ShardedHotStore::Probe(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  auto& shard = ShardFor(key);
+  std::shared_lock lock(shard.mutex);
+  return shard.store.Probe(key);
+}
+
 // Engine fan-out always issues Del{single key}. The vector iteration is
 // preserved so resolver-materialised single-key Dels and any future single-key
 // Del callers share the same path; multi-key Del WAL entries no longer occur.
-core::Result<core::RespValue> ShardedHotStore::ApplyDel(const core::ops::Del& op) {
+core::Result<core::RespValue> ShardedHotStore::ApplyDel(const core::ops::Del& op,
+                                                        core::SequenceId seq) {
   int64_t total_removed = 0;
   for (auto key : op.keys) {
     auto& shard = ShardFor(key);
     std::unique_lock lock(shard.mutex);
     core::ops::Del shard_op{.keys = {key}};
-    auto result = shard.store.Apply(core::ops::WriteOp{shard_op}, core::EvictionTTL{0});
+    auto result = shard.store.Apply(core::ops::WriteOp{shard_op}, core::EvictionTTL{0}, seq);
     if (!result.has_value()) return std::unexpected(result.error());
     total_removed += result->AsInteger();
   }
   return core::RespValue::Integer(total_removed);
 }
 
-core::Result<void> ShardedHotStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
+core::Result<void> ShardedHotStore::ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                               core::SequenceId seq) {
   for (const auto& op : ops) {
-    auto result = Apply(op);
+    auto result = Apply(op, seq);
     if (!result.has_value()) return std::unexpected(result.error());
   }
   return {};
@@ -162,6 +170,17 @@ SingleShardStore::EvictExpiredReport ShardedHotStore::EvictExpired(core::SteadyT
     total.by_ttl += r.by_ttl;
   }
   return total;
+}
+
+size_t ShardedHotStore::GcTombstones(const std::function<core::SequenceId(core::ShardId)>& horizon)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  size_t reclaimed = 0;
+  for (core::ShardId shard = 0; shard < config_.shard_count; ++shard) {
+    auto& s = *shards_[shard];
+    std::unique_lock lock(s.mutex);
+    reclaimed += s.store.GcTombstones(horizon(shard));
+  }
+  return reclaimed;
 }
 
 }  // namespace abyss::hot

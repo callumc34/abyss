@@ -30,7 +30,7 @@ class ShardedHotStoreTest : public ::testing::Test {
 
   void SetString(std::string_view key, std::string_view value) {
     core::ops::StringSet op{.key = key, .value = value};
-    auto result = store_.Apply(core::ops::WriteOp{op});
+    auto result = store_.Apply(core::ops::WriteOp{op}, /*seq=*/0);
     ASSERT_TRUE(result.has_value()) << result.error().message();
   }
 
@@ -87,8 +87,23 @@ TEST_F(ShardedHotStoreTest, ExistsSingleKey) {
 TEST_F(ShardedHotStoreTest, DelSingleKey) {
   SetString("x", "1");
   core::ops::Del del_op{.keys = {"x"}};
-  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{del_op}).has_value());
-  EXPECT_FALSE(GetString("x").has_value());
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{del_op}, /*seq=*/1).has_value());
+  // DEL tombstones the key: a subsequent read is an authoritative nil, not a
+  // miss that would fall through to a lagging overlay.
+  auto result = GetString("x");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsNull());
+}
+
+TEST_F(ShardedHotStoreTest, ProbeRoutesPerShard) {
+  SetString("live", "1");
+  SetString("dead", "1");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"dead"}}}, /*seq=*/2).has_value());
+
+  EXPECT_EQ(store_.Probe("live"), core::HotKeyPresence::kPresent);
+  EXPECT_EQ(store_.Probe("dead"), core::HotKeyPresence::kTombstoned);
+  EXPECT_EQ(store_.Probe("never"), core::HotKeyPresence::kAbsent);
 }
 
 // --- Stats aggregation ---
@@ -129,7 +144,7 @@ TEST_F(ShardedHotStoreTest, EvictExpiredAcrossShards) {
   }};
 
   core::ops::StringSet op{.key = "temp", .value = "v"};
-  ASSERT_TRUE(short_store.Apply(core::ops::WriteOp{op}).has_value());
+  ASSERT_TRUE(short_store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
 
   clock_.Advance(1100ms);
   auto evicted = short_store.EvictExpired(clock_.SteadyNow());
@@ -162,7 +177,7 @@ TEST_F(ShardedHotStoreTest, ConcurrentWriteAndRead) {
       auto key = "w:" + std::to_string(i);
       auto value = std::to_string(i);
       core::ops::StringSet op{.key = key, .value = value};
-      (void)store_.Apply(core::ops::WriteOp{op});
+      (void)store_.Apply(core::ops::WriteOp{op}, /*seq=*/0);
     }
   });
 
@@ -218,7 +233,7 @@ TEST(ShardedHotStorePrefixEvictionTest, MixedPrefixesResolvePerEntry) {
   for (const auto& [k, v] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
            {"session:a", "1"}, {"ephemeral:b", "2"}, {"other:c", "3"}}) {
     core::ops::StringSet op{.key = k, .value = v};
-    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}).has_value());
+    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
   }
 
   // session:a expires at 1s — visible after advancing past 1s.
@@ -253,7 +268,7 @@ TEST(ShardedHotStorePrefixEvictionTest, RefreshUsesPerKeyEvictionFromEntry) {
   }};
 
   core::ops::StringSet write_op{.key = "session:k", .value = "v"};
-  ASSERT_TRUE(store.Apply(core::ops::WriteOp{write_op}).has_value());
+  ASSERT_TRUE(store.Apply(core::ops::WriteOp{write_op}, /*seq=*/0).has_value());
 
   // Read after 1s — buffered as an access — then drain to refresh.
   clock.Advance(1s);

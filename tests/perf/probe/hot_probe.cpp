@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
         .abs_ttl_ms = 0,
     };
     abyss::core::ops::WriteOp op = set_op;
-    auto rc = hot.Apply(op);
+    auto rc = hot.Apply(op, /*seq=*/0);
     if (!rc.has_value()) {
       std::cerr << "preload failed at key " << i << ": " << rc.error().message() << '\n';
       return 1;
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
           .abs_ttl_ms = 0,
       };
       abyss::core::ops::WriteOp write = set_op;
-      auto rc = hot.Apply(write);
+      auto rc = hot.Apply(write, /*seq=*/0);
       if (!rc.has_value()) error_count.fetch_add(1, std::memory_order_relaxed);
     }
   };

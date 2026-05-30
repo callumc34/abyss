@@ -11,10 +11,11 @@ namespace abyss::hot {
 
 EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
                                core::SteadyClockFn steady_clock)
-    : store_(store), config_(config), steady_clock_(std::move(steady_clock)) {
+    : store_(store), config_(std::move(config)), steady_clock_(std::move(steady_clock)) {
   auto& reg = metrics::Registry::Instance();
   evicted_total_ = reg.Counter(metrics::names::kEvictedTotal);
   ttl_expired_total_ = reg.Counter(metrics::names::kTtlExpiredTotal, metrics::Tier::kHot);
+  tombstones_reclaimed_total_ = reg.Counter(metrics::names::kHotTombstonesReclaimedTotal);
 }
 
 EvictionWorker::~EvictionWorker() { Stop(); }
@@ -44,6 +45,15 @@ void EvictionWorker::TickOnce() {
   }
   if (report.by_ttl > 0) {
     ttl_expired_total_.Increment(static_cast<double>(report.by_ttl));
+  }
+  // Reclaim delete tombstones the cold consumer has now absorbed. Bounded by
+  // cold's drained seq per shard so a tombstone never outlives the window in
+  // which a lagging buffer/cold could still serve the pre-delete state.
+  if (config_.tombstone_horizon) {
+    const size_t reclaimed = store_.GcTombstones(config_.tombstone_horizon);
+    if (reclaimed > 0) {
+      tombstones_reclaimed_total_.Increment(static_cast<double>(reclaimed));
+    }
   }
 }
 

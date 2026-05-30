@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -19,6 +20,7 @@ class EvictionWorker {
  public:
   struct Config {
     std::chrono::milliseconds tick{1000};
+    std::function<core::SequenceId(core::ShardId)> tombstone_horizon;
   };
 
   EvictionWorker(ShardedHotStore& store, Config config,
@@ -52,6 +54,7 @@ class EvictionWorker {
 
   metrics::CounterHandle evicted_total_;
   metrics::CounterHandle ttl_expired_total_;
+  metrics::CounterHandle tombstones_reclaimed_total_;
 };
 
 }  // namespace abyss::hot

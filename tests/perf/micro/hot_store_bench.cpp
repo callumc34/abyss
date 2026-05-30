@@ -43,7 +43,7 @@ struct HotFixture {
       const auto key = KeyFor(i);
       const core::ops::StringSet set_op{.key = key, .value = value, .abs_ttl_ms = 0};
       const core::ops::WriteOp op = set_op;
-      auto rc = store.Apply(op);
+      auto rc = store.Apply(op, /*seq=*/0);
       if (!rc.has_value()) std::abort();
     }
   }
@@ -73,7 +73,7 @@ void BM_HotStringSet(benchmark::State& state) {
     const auto key = KeyFor(i % key_count);
     const core::ops::StringSet set_op{.key = key, .value = fixture.value, .abs_ttl_ms = 0};
     const core::ops::WriteOp op = set_op;
-    benchmark::DoNotOptimize(fixture.store.Apply(op));
+    benchmark::DoNotOptimize(fixture.store.Apply(op, /*seq=*/0));
     ++i;
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));

@@ -331,43 +331,99 @@ TEST_F(TieringIntegrationTest, PromotionQueueFailureIncrementsCounter) {
   EXPECT_EQ(harness_.Engine().Snapshot().promotion_append_failures, 1U);
 }
 
-// Hot-miss reads must not consult the buffer overlay against cold while the
-// cold consumer lags hot: a not-yet-absorbed delete leaves the overlay
-// reporting state hot has already revoked. The wait gate parks the read
-// until cold catches up to hot's settled seq. Covered for hash, string, and
-// existence-probe paths.
-TEST_F(TieringIntegrationTest, HashReadWithStaleBufferWaitsForColdConsumer) {
-  // SeedHot dispatches a Write through the engine: hot applies and fulfils the
-  // RPC, hot's HighestSettledSeq advances. The cold consumer is not running in
-  // the harness, so cold's latest_drained_seq stays at 0 until we Drain.
+// A recent delete becomes an authoritative hot tombstone, so reads of a deleted
+// key answer from hot without consulting — or waiting on — the lagging overlay.
+
+// Helper: a finds a key on the same shard as `key` so a primer write can
+// advance hot's settled seq for that shard without touching `key` itself.
+namespace {
+std::string SameShardPrimer(std::string_view key) {
+  const auto shard = core::ComputeShard(key, testing::IntegrationHarness::kShardCount);
+  for (int i = 0;; ++i) {
+    std::string candidate = "primer" + std::to_string(i);
+    if (core::ComputeShard(candidate, testing::IntegrationHarness::kShardCount) == shard) {
+      return candidate;
+    }
+  }
+}
+}  // namespace
+
+TEST_F(TieringIntegrationTest, DeletedScalarReadsNilGateFree) {
+  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
+  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();                    // cold absorbs the SET only.
+  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);  // hot tombstone; cold lags it.
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k"}));
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_TRUE(result->IsNull());
+  EXPECT_LT(elapsed, 500ms) << "tombstone read must not wait on the cold consumer";
+  EXPECT_EQ(harness_.Engine().Snapshot().read_buffer_wait_timeouts, 0U);
+}
+
+TEST_F(TieringIntegrationTest, DeletedKeyExistsReturnsZeroGateFree) {
+  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
+  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
+  harness_.ColdPool().ConsumerFor(shard).Drain();
+  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto result =
+      harness_.Engine().DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->AsInteger(), 0);
+  EXPECT_LT(elapsed, 500ms) << "tombstone EXISTS must not wait on the cold consumer";
+}
+
+TEST_F(TieringIntegrationTest, EmptiedHashReadsEmptyGateFree) {
   ASSERT_TRUE(harness_.SeedHot({"HSET", "h", "a", "1", "b", "2"}).has_value());
   const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
-  // Drain only HSET into the buffer, leaving the buffer "stale" — overlay will
-  // report fields={a:1,b:2} until cold catches up to the HDEL.
   harness_.ColdPool().ConsumerFor(shard).Drain();
-  ASSERT_EQ(harness_.SeedHot({"HDEL", "h", "a", "b"}).value().AsInteger(), 2);
+  ASSERT_EQ(harness_.SeedHot({"HDEL", "h", "a", "b"}).value().AsInteger(),
+            2);  // empties → tombstone
 
-  // Without the wait gate, HGETALL would see overlay.fields={a:1,b:2}, merge
-  // with empty cold, and return a non-empty array. The peer thread drains the
-  // queued HDEL after a short delay so the gate succeeds within its budget.
-  std::thread advancer([&] {
-    std::this_thread::sleep_for(20ms);
-    harness_.ColdPool().ConsumerFor(shard).Drain();
-  });
+  const auto t0 = std::chrono::steady_clock::now();
   auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
-  advancer.join();
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
 
   ASSERT_TRUE(result.has_value()) << result.error().message();
   ASSERT_TRUE(result->IsArray());
   EXPECT_TRUE(result->AsArray().empty());
+  EXPECT_LT(elapsed, 500ms)
+      << "emptied-collection tombstone read must not wait on the cold consumer";
 }
 
-// When the cold consumer is wedged the engine surfaces a timeout rather than
-// serving a stale merge — failing closed is the documented contract.
-TEST(TieringIntegrationTimeoutTest, HashReadTimesOutWhenColdConsumerWedged) {
-  // Builds a harness with a tight wait budget specifically to exercise the
-  // timeout path. The default harness widens the budget so the Stale-buffer
-  // tests don't race the production timeout on slower runners.
+// The residual gate still applies to a collection key hot has NEVER held: such
+// a read must consult the overlay, so it waits for cold to catch up to hot's
+// settled seq. Here the consumer catches up mid-wait and the read then succeeds.
+TEST_F(TieringIntegrationTest, HotAbsentCollectionReadWaitsThenSucceeds) {
+  core::ops::WriteOp h{core::ops::HashSet{.key = "ch", .fields = {{.field = "a", .value = "1"}}}};
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&h, 1}).has_value());
+
+  const auto shard = core::ComputeShard("ch", testing::IntegrationHarness::kShardCount);
+  ASSERT_TRUE(harness_.SeedHot({"SET", SameShardPrimer("ch"), "v"}).has_value());
+
+  std::thread advancer([&] {
+    std::this_thread::sleep_for(20ms);
+    harness_.ColdPool().ConsumerFor(shard).Drain();
+  });
+  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "ch"}));
+  advancer.join();
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_TRUE(result->IsArray());
+  EXPECT_EQ(result->AsArray().size(), 2U) << "cold's {a:1} surfaces after the gate succeeds";
+}
+
+// When the cold consumer is wedged behind hot and a collection read must
+// consult the overlay (hot has never held the key), the engine fails closed
+// with a timeout rather than serving a stale merge.
+TEST(TieringIntegrationTimeoutTest, CollectionReadTimesOutWhenColdConsumerWedged) {
   constexpr auto kTimeout = std::chrono::milliseconds{100};
   testing::IntegrationHarness harness{
       testing::IntegrationHarness::Config{.buffer_consistency_wait_timeout = kTimeout}};
@@ -375,62 +431,18 @@ TEST(TieringIntegrationTimeoutTest, HashReadTimesOutWhenColdConsumerWedged) {
     return core::RespCommand{.args = std::vector<std::string>(args)};
   };
 
-  ASSERT_TRUE(harness.SeedHot({"HSET", "h", "a", "1"}).has_value());
-  const auto shard = core::ComputeShard("h", testing::IntegrationHarness::kShardCount);
-  harness.ColdPool().ConsumerFor(shard).Drain();
-  ASSERT_EQ(harness.SeedHot({"HDEL", "h", "a"}).value().AsInteger(), 1);
+  // Advance hot's settled seq on the read key's shard via a colliding primer,
+  // and never drain cold — so the gate on a hot-absent collection read fires.
+  ASSERT_TRUE(harness.SeedHot({"SET", SameShardPrimer("ch"), "v"}).has_value());
 
-  // No advancer — cold stays behind. The configured timeout fires.
   const auto t0 = std::chrono::steady_clock::now();
-  auto result = harness.Engine().DispatchRead("HGETALL", cmd({"HGETALL", "h"}));
+  auto result = harness.Engine().DispatchRead("HGETALL", cmd({"HGETALL", "ch"}));
   const auto elapsed = std::chrono::steady_clock::now() - t0;
 
   ASSERT_TRUE(result.has_value()) << result.error().message();
   ASSERT_TRUE(result->IsError());
   EXPECT_GE(elapsed, kTimeout);
   EXPECT_EQ(harness.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
-}
-
-// Same race as the hash case but for a scalar: SET then DEL through hot, with
-// cold having only absorbed the SET, leaves the buffer holding the deleted
-// value. Without the gate a GET would surface it; with the gate the read
-// waits, the buffer absorbs the DEL (tombstone), and GET returns nil.
-TEST_F(TieringIntegrationTest, StringReadWithStaleBufferWaitsForColdConsumer) {
-  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
-  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
-  harness_.ColdPool().ConsumerFor(shard).Drain();  // buffer now holds k=v.
-  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
-
-  std::thread advancer([&] {
-    std::this_thread::sleep_for(20ms);
-    harness_.ColdPool().ConsumerFor(shard).Drain();
-  });
-  auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k"}));
-  advancer.join();
-
-  ASSERT_TRUE(result.has_value()) << result.error().message();
-  EXPECT_TRUE(result->IsNull()) << "expected nil, got: " << result->AsString();
-}
-
-// EXISTS probe must observe the same gate — a stale buffer reporting kPresent
-// after hot already DEL'd the key would resurrect the count.
-TEST_F(TieringIntegrationTest, ExistsProbeWaitsForColdConsumer) {
-  ASSERT_TRUE(harness_.SeedHot({"SET", "k", "v"}).has_value());
-  const auto shard = core::ComputeShard("k", testing::IntegrationHarness::kShardCount);
-  harness_.ColdPool().ConsumerFor(shard).Drain();
-  ASSERT_EQ(harness_.SeedHot({"DEL", "k"}).value().AsInteger(), 1);
-
-  std::thread advancer([&] {
-    std::this_thread::sleep_for(20ms);
-    harness_.ColdPool().ConsumerFor(shard).Drain();
-  });
-  auto result =
-      harness_.Engine().DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
-  advancer.join();
-
-  ASSERT_TRUE(result.has_value()) << result.error().message();
-  ASSERT_TRUE(result->IsInteger());
-  EXPECT_EQ(result->AsInteger(), 0);
 }
 
 }  // namespace

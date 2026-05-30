@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "abyss/core/eviction_policy.h"
@@ -36,8 +38,10 @@ class ShardedHotStore : public core::HotStore {
 
   core::Result<core::RespValue> Exec(
       const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
-  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op) override;
-  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
+  core::Result<core::RespValue> Apply(const core::ops::WriteOp& op, core::SequenceId seq) override;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                core::SequenceId seq) override;
+  core::HotKeyPresence Probe(std::string_view key) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Wipe() override;
 
@@ -46,6 +50,9 @@ class ShardedHotStore : public core::HotStore {
   void DrainAccessBuffers(core::SteadyTime now);
   using EvictExpiredReport = SingleShardStore::EvictExpiredReport;
   EvictExpiredReport EvictExpired(core::SteadyTime now);
+
+  // Reclaims each shard's tombstones at or below that shard's horizon.
+  size_t GcTombstones(const std::function<core::SequenceId(core::ShardId)>& horizon);
 
   uint32_t shard_count() const { return config_.shard_count; }
 
@@ -63,7 +70,7 @@ class ShardedHotStore : public core::HotStore {
   core::EvictionTTL ResolveEviction(std::string_view key) const;
 
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
-  core::Result<core::RespValue> ApplyDel(const core::ops::Del& op);
+  core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
 
   ShardedHotStoreConfig config_;
   // Fallback when config_.eviction_policy is null; keeps Resolve() infallible.

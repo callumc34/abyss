@@ -54,6 +54,14 @@ The resolved per-key eviction is computed once at apply time (longest-prefix win
 
 **Absolute TTL:** If a key has an absolute `ttl` set (via Redis `SET ... EX`, `EXPIRE`, etc.), the hot store tracks this separately. When the absolute TTL expires, the key is deleted — not just evicted. It is removed from both hot and cold. This is different from eviction: TTL expiry means the data is gone.
 
+### Delete Tombstones
+
+A delete is not the same as an eviction. When the hot consumer applies a delete — `DEL`/`GETDEL`, or an `SREM`/`ZREM`/`HDEL` that empties a collection — it does not simply erase the key: it retains a **tombstone** stamped with the delete's queue sequence id. The tombstone makes hot authoritative about the deletion. A read of a tombstoned key returns `nil`/empty directly from hot, so it never falls through to the compaction buffer or cold, which may still hold the pre-delete value until the cold consumer absorbs the delete. This is what lets the read path skip the buffer-consistency wait for the common read-after-delete case — see [ADP-006](006-read-write-paths.md) §Hot-tier delete tombstones and the read-consistency gate.
+
+A tombstone is reclaimed by the `EvictionWorker` once the per-shard cold consumer's drained sequence id has passed the delete's seq: at that point the buffer and cold reflect the delete, so a plain miss is safe. The worker reads the cold consumers' drained seq through a narrow horizon function injected at construction, so the hot store stays unaware of the consumer layer. Tombstone memory is therefore bounded by the delete rate times the hot→cold lag, surfaced via `abyss_hot_tombstones_reclaimed_total`. A tombstone never counts toward `DBSIZE` or the key count, and a subsequent write to a tombstoned key revives it as a live key.
+
+TTL expiry is **not** tombstoned: hot, the compaction buffer, and cold each apply the same absolute TTL deterministically, so a TTL-expired hot miss is safe to serve from cold without a tombstone.
+
 ### Hot Consumer
 
 The hot consumer runs as a dedicated thread **per shard owned by this pod**. Each thread tails its shard's queue partition and applies writes to the hot store. Phase 1 (single pod) owns every shard; Phase 2+ owns a subset; the per-shard ownership model is invariant across phases and migrates cleanly to a thread-per-core runtime in Phase 4. One consumer per shard matches how external brokers (Kafka, NATS) model partition consumption and keeps per-shard state independent — a stalled shard never blocks another.
@@ -97,7 +105,8 @@ hot_consumer:
 2. `Apply` sets the eviction timer to the configured duration for the key's prefix.
 3. A key evicted from hot is never deleted — it remains available in cold.
 4. A key whose absolute TTL has expired is deleted from hot (and cold, via the cold store's expiry mechanism).
-5. The hot consumer is always an in-process thread, even when the hot store backend is external. This is required for the write promise lifecycle — the promise fulfillment must be an in-process synchronisation, not a network round trip.
+5. A delete leaves a tombstone in hot (stamped with the delete's queue seq), not an erasure: reads of a deleted key are authoritatively absent from hot until the cold consumer has drained past the delete, at which point the eviction worker reclaims the tombstone. Tombstones do not count toward the key count.
+6. The hot consumer is always an in-process thread, even when the hot store backend is external. This is required for the write promise lifecycle — the promise fulfillment must be an in-process synchronisation, not a network round trip.
 
 ## Trade-offs
 

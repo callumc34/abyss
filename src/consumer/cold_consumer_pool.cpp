@@ -3,7 +3,6 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
-#include <thread>
 
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
@@ -91,16 +90,9 @@ HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {
 bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                                          std::chrono::milliseconds timeout) {
   if (shard >= consumers_.size()) return false;
-  const auto& consumer = *consumers_[shard];
-  // Tight loop with a short back-off — typical wait is microseconds because
-  // the cold consumer absorbs at queue-read cadence.
-  constexpr auto kPollInterval = std::chrono::microseconds{100};
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (consumer.LatestDrainedSeq() < target_seq) {
-    if (std::chrono::steady_clock::now() >= deadline) return false;
-    std::this_thread::sleep_for(kPollInterval);
-  }
-  return true;
+  // Signal-driven wait on the owning consumer — the drain loop wakes us when it
+  // advances past the target, so a hot-miss read never busy-polls the reactor.
+  return consumers_[shard]->WaitForDrainedSeq(target_seq, timeout);
 }
 
 core::ShardId ColdConsumerPool::ShardForKey(std::string_view key) const {

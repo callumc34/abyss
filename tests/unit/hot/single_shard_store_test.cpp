@@ -138,10 +138,12 @@ TEST_F(SingleShardStoreTest, SetRemLastMemberRemovesKey) {
   core::ops::SetRem rem_op{.key = "myset", .members = {"only"}};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{rem_op}, kEviction).has_value());
 
+  // Emptying the set deletes the key; it now reads as an authoritative 0 via a
+  // tombstone rather than a miss that would fall through. See ADP-006 §Read Path.
   core::ops::SetCard card_op{.key = "myset"};
   auto result = store_.Exec(core::ops::ReadOp{card_op});
-  EXPECT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kNotFound);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 0);
 }
 
 // --- Sorted set operations ---
@@ -384,9 +386,11 @@ TEST_F(SingleShardStoreTest, DelRemovesKey) {
   core::ops::Del del_op{.keys = {"key1"}};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{del_op}, kEviction).has_value());
 
+  // DEL leaves a tombstone: the key reads as an authoritative nil (success),
+  // not a miss, so the read never falls through to a lagging overlay.
   auto result = GetString("key1");
-  EXPECT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kNotFound);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsNull());
 }
 
 TEST_F(SingleShardStoreTest, DelNonExistentIsNoop) {
@@ -552,7 +556,11 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   auto del_result = store_.Apply(core::ops::WriteOp{del_op}, kEviction);
   auto after_delete = store_.Stats();
   EXPECT_EQ(after_delete.key_count, 0U);
-  EXPECT_EQ(after_delete.used_bytes, 0U);
+  // The delete leaves a tombstone, so a small footprint remains until
+  // GcTombstones reclaims the entry (proven separately). It is never larger
+  // than the live entry — the value is released (modulo small-string capacity).
+  EXPECT_GT(after_delete.used_bytes, 0U);
+  EXPECT_LE(after_delete.used_bytes, after_insert.used_bytes);
 }
 
 // --- Wipe ---
@@ -584,6 +592,141 @@ TEST_F(SingleShardStoreTest, ApplyBatchMultipleOps) {
   auto b = GetString("b");
   ASSERT_TRUE(b.has_value());
   EXPECT_EQ(b->AsString(), "2");
+}
+
+// --- Delete tombstones (ADP-006 §Read Path) ---
+
+TEST_F(SingleShardStoreTest, ProbeReportsPresentTombstonedAbsent) {
+  SetString("live", "v");
+  SetString("dead", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"dead"}}}, kEviction, 1).has_value());
+
+  EXPECT_EQ(store_.Probe("live"), core::HotKeyPresence::kPresent);
+  EXPECT_EQ(store_.Probe("dead"), core::HotKeyPresence::kTombstoned);
+  EXPECT_EQ(store_.Probe("never"), core::HotKeyPresence::kAbsent);
+}
+
+TEST_F(SingleShardStoreTest, TtlExpiredProbesAbsentNotTombstoned) {
+  // A TTL-expired key is not a tombstone: cold applies the same expiry, so the
+  // read must be free to fall through rather than answer authoritatively.
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  SetString("k", "v", static_cast<uint64_t>(now_ms - 1000));
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
+}
+
+TEST_F(SingleShardStoreTest, DeletedKeyExcludedFromKeyCount) {
+  SetString("k", "v");
+  EXPECT_EQ(store_.Stats().key_count, 1U);
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+  EXPECT_EQ(store_.Stats().key_count, 0U);
+}
+
+TEST_F(SingleShardStoreTest, ExistsTreatsTombstoneAsAbsent) {
+  SetString("a", "1");
+  SetString("b", "2");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"b"}}}, kEviction, 1).has_value());
+
+  core::ops::Exists op{.keys = {"a", "b", "c"}};
+  auto r = store_.Exec(core::ops::ReadOp{op});
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 1) << "only the live key counts";
+}
+
+TEST_F(SingleShardStoreTest, EmptiedHashReadsAuthoritativeEmpty) {
+  core::ops::HashSet set{.key = "h", .fields = {{.field = "f", .value = "1"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set}, kEviction).has_value());
+  core::ops::HashDel del{.key = "h", .fields = {"f"}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{del}, kEviction, 2).has_value());
+
+  EXPECT_EQ(store_.Probe("h"), core::HotKeyPresence::kTombstoned);
+  auto all = store_.Exec(core::ops::ReadOp{core::ops::HashGetAll{.key = "h"}});
+  ASSERT_TRUE(all.has_value());
+  ASSERT_TRUE(all->IsArray());
+  EXPECT_TRUE(all->AsArray().empty());
+  auto len = store_.Exec(core::ops::ReadOp{core::ops::HashLen{.key = "h"}});
+  ASSERT_TRUE(len.has_value());
+  EXPECT_EQ(len->AsInteger(), 0);
+}
+
+TEST_F(SingleShardStoreTest, SetAfterDeleteResurrectsKey) {
+  SetString("k", "v1");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 5).has_value());
+  ASSERT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+
+  SetString("k", "v2");
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kPresent);
+  EXPECT_EQ(store_.Stats().key_count, 1U);
+  auto r = GetString("k");
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsString(), "v2");
+}
+
+TEST_F(SingleShardStoreTest, WriteDifferentTypeToTombstonedKey) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+
+  // SADD on a tombstoned (formerly string) key revives it as a set; no WRONGTYPE.
+  core::ops::SetAdd add{.key = "k", .members = {"m"}};
+  auto r = store_.Apply(core::ops::WriteOp{add}, kEviction);
+  ASSERT_TRUE(r.has_value()) << r.error().message();
+  EXPECT_EQ(store_.Stats().key_count, 1U);
+
+  auto members = store_.Exec(core::ops::ReadOp{core::ops::SetMembers{.key = "k"}});
+  ASSERT_TRUE(members.has_value());
+  EXPECT_EQ(members->AsArray().size(), 1U);
+}
+
+TEST_F(SingleShardStoreTest, GcTombstonesReclaimsAtOrBelowHorizon) {
+  SetString("a", "1");
+  SetString("b", "2");
+  SetString("c", "3");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"a"}}}, kEviction, 10).has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"b"}}}, kEviction, 20).has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"c"}}}, kEviction, 30).has_value());
+
+  EXPECT_EQ(store_.GcTombstones(20), 2U) << "reclaims deletes at seq <= 20";
+  EXPECT_EQ(store_.Probe("a"), core::HotKeyPresence::kAbsent);
+  EXPECT_EQ(store_.Probe("b"), core::HotKeyPresence::kAbsent);
+  EXPECT_EQ(store_.Probe("c"), core::HotKeyPresence::kTombstoned) << "seq 30 not yet covered";
+
+  EXPECT_EQ(store_.GcTombstones(30), 1U);
+  EXPECT_EQ(store_.Probe("c"), core::HotKeyPresence::kAbsent);
+}
+
+TEST_F(SingleShardStoreTest, GcReclaimsTombstoneFootprintAndPreservesLiveKeys) {
+  SetString("live", "v");
+  SetString("dead", "v");
+  const auto live_only_bytes = [&] {
+    core::ops::Del del{.keys = {"dead"}};
+    EXPECT_TRUE(store_.Apply(core::ops::WriteOp{del}, kEviction, 7).has_value());
+    return store_.Stats().used_bytes;
+  }();
+  EXPECT_GT(live_only_bytes, 0U);
+
+  // A horizon below the delete seq must not reclaim the tombstone.
+  EXPECT_EQ(store_.GcTombstones(6), 0U);
+  EXPECT_EQ(store_.Probe("dead"), core::HotKeyPresence::kTombstoned);
+
+  EXPECT_EQ(store_.GcTombstones(7), 1U);
+  EXPECT_EQ(store_.Probe("dead"), core::HotKeyPresence::kAbsent);
+  EXPECT_LT(store_.Stats().used_bytes, live_only_bytes) << "tombstone footprint reclaimed";
+
+  // The live key is untouched throughout.
+  EXPECT_EQ(store_.Probe("live"), core::HotKeyPresence::kPresent);
+  EXPECT_EQ(store_.Stats().key_count, 1U);
+  auto r = GetString("live");
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsString(), "v");
 }
 
 }  // namespace
