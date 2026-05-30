@@ -129,7 +129,12 @@ core::Result<void> HttpServer::Start() {
   impl_->server.Patch(".*", dispatch);
   impl_->server.Options(".*", dispatch);
 
-  const int bound = impl_->server.bind_to_any_port(config_.bind, config_.port);
+  int bound = -1;
+  if (config_.port == 0) {
+    bound = impl_->server.bind_to_any_port(config_.bind);
+  } else if (impl_->server.bind_to_port(config_.bind, config_.port)) {
+    bound = config_.port;
+  }
   if (bound <= 0) {
     std::string msg = "http bind failed: ";
     msg += config_.bind;
