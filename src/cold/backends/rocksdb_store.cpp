@@ -436,6 +436,7 @@ core::Result<void> RocksdbStore::Wipe() {
 
   // OptimisticTransactionDB doesn't expose DeleteRange; go through the base DB.
   rocksdb::WriteOptions wo;
+  wo.sync = true;
   rocksdb::DB* base = impl_->db->GetBaseDB();
   auto status = base->DeleteRange(wo, impl_->default_cf.get(), data_begin, data_end);
   if (!status.ok()) {
