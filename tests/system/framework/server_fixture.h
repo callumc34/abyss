@@ -56,11 +56,12 @@ class TestServer {
 };
 
 // Class-scoped shared server via SetUpTestSuite / TearDownTestSuite. One
-// server per TEST_F class; different classes parallelize. Use
-// IsolatedServerTest instead when a test restarts the server or asserts
-// against non-keyspace state. Tests that mutate the keyspace must use
-// IsolatedDataServerTest (or its alias DataCommandTest) — sharing a server
-// across data tests has no FLUSHDB to fall back on for cleanup.
+// server per TEST_F class; different classes parallelize. Bare SystemTest has
+// no keyspace cleanup between tests, so tests that mutate the keyspace must use
+// a data fixture: DataCommandTest (= SharedDataServerTest: class-shared,
+// FLUSHDB-in-SetUp) for light writes, or IsolatedDataServerTest (fresh server
+// per test, no FLUSHDB) for restart/kill or write-heavy tests. Use
+// IsolatedServerTest for restart or clean-baseline metric tests.
 class SystemTest : public ::testing::Test {
  public:
   static void SetUpTestSuite();
