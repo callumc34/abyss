@@ -108,6 +108,7 @@ void BM_RecoveryColdHot(benchmark::State& state) {
 
     auto cold = cold::backends::RocksdbStore::Create({
         .data_path = dir.path() + "/cold",
+        .shard_count = kShardCount,
         .write_buffer_size_bytes = 64 * 1024 * 1024,
     });
     if (!cold.has_value()) state.SkipWithError("cold open");

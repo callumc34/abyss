@@ -1,6 +1,8 @@
 #include <set>
 #include <string>
 
+#include "abyss/core/shard_router.h"
+#include "abyss/core/types.h"
 #include "server_fixture.h"
 
 namespace abyss::system_test {
@@ -429,6 +431,46 @@ TEST_F(FlushTest, WritesAfterFlushSurvive) {
   auto after = Client().Command({"GET", "after"});
   ASSERT_TRUE(after.IsBulk());
   EXPECT_EQ(after.String(), "y");
+}
+
+// End-to-end multi-shard FLUSHDB: clears every shard, and post-wipe writes
+// across shards all survive. Isolated (not shared) fixture: write-heavy + a
+// fresh server avoids the shared fixture's FLUSHDB-in-SetUp interaction.
+class FlushMultiShardTest : public IsolatedDataServerTest {};
+
+TEST_F(FlushMultiShardTest, MultiShardFlushClearsAllAndPostWritesSurvive) {
+  // Mirrors the TestServer default; only used to assert the seed spans shards.
+  constexpr uint32_t kServerShardCount = 4;
+  constexpr int kKeys = 40;
+
+  std::set<core::ShardId> seeded_shards;
+  for (int i = 0; i < kKeys; ++i) {
+    const std::string k = "pre:" + std::to_string(i);
+    ASSERT_TRUE(Client().Command({"SET", k, "v" + std::to_string(i)}).IsOk());
+    seeded_shards.insert(core::ComputeShard(k, kServerShardCount));
+  }
+  ASSERT_TRUE(Client().Command({"SADD", "pre:set", "a", "b"}).IsInteger());
+  ASSERT_TRUE(Client().Command({"HSET", "pre:hash", "f", "v"}).IsInteger());
+  ASSERT_GT(seeded_shards.size(), 1U) << "seed did not span multiple shards";
+
+  ASSERT_EQ(Client().Command({"FLUSHDB"}).String(), "OK");
+
+  for (int i = 0; i < kKeys; ++i) {
+    EXPECT_TRUE(Client().Command({"GET", "pre:" + std::to_string(i)}).IsNil())
+        << "pre:" << i << " survived FLUSHDB";
+  }
+  EXPECT_EQ(Client().Command({"SCARD", "pre:set"}).Integer(), 0);
+  EXPECT_EQ(Client().Command({"HLEN", "pre:hash"}).Integer(), 0);
+
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(
+        Client().Command({"SET", "post:" + std::to_string(i), "p" + std::to_string(i)}).IsOk());
+  }
+  for (int i = 0; i < kKeys; ++i) {
+    auto r = Client().Command({"GET", "post:" + std::to_string(i)});
+    ASSERT_TRUE(r.IsBulk()) << "post:" << i << " lost after FLUSHDB";
+    EXPECT_EQ(r.String(), "p" + std::to_string(i));
+  }
 }
 
 }  // namespace

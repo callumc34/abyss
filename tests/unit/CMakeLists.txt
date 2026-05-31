@@ -81,6 +81,7 @@ if(ABYSS_WITH_ROCKSDB)
     cold/backends/rocksdb_store_collections_test.cpp
     cold/backends/rocksdb_store_ttl_test.cpp
     cold/backends/rocksdb_store_sweep_test.cpp
+    cold/backends/rocksdb_store_wipe_test.cpp
   )
   target_include_directories(abyss_cold_tests SYSTEM PRIVATE
     $<TARGET_PROPERTY:RocksDB::rocksdb,INTERFACE_INCLUDE_DIRECTORIES>

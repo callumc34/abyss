@@ -3,6 +3,8 @@
 #include <bit>
 #include <cstring>
 
+#include "abyss/core/shard_router.h"
+
 namespace abyss::cold::format {
 namespace {
 
@@ -16,6 +18,12 @@ void AppendU8(std::string& out, uint8_t v) { out.push_back(static_cast<char>(v))
 void AppendU16BE(std::string& out, uint16_t v) {
   out.push_back(static_cast<char>((v >> 8) & 0xFF));
   out.push_back(static_cast<char>(v & 0xFF));
+}
+
+// Derives the slot from the key (not the caller) so encode/read/wipe agree.
+void AppendShard(std::string& out, std::string_view key, uint32_t shard_count) {
+  const core::ShardId shard = core::ComputeShard(key, shard_count);
+  AppendU16BE(out, static_cast<uint16_t>(shard));
 }
 
 void AppendU64BE(std::string& out, uint64_t v) {
@@ -90,54 +98,63 @@ uint64_t SortableDouble(double d) {
 
 // --- Key encoders -----------------------------------------------------------
 
-std::string EncodeStringKey(std::string_view key) {
+std::string EncodeStringKey(std::string_view key, uint32_t shard_count) {
   std::string out;
-  out.reserve(1 + key.size());
+  out.reserve(1 + kShardBytes + key.size());
   AppendU8(out, kTypeString);
+  AppendShard(out, key, shard_count);
   out.append(key);
   return out;
 }
 
-std::string EncodeMetaKey(uint8_t inner_type, std::string_view key) {
+std::string EncodeMetaKey(uint8_t inner_type, std::string_view key, uint32_t shard_count) {
   std::string out;
-  out.reserve(2 + key.size());
+  out.reserve(2 + kShardBytes + key.size());
   AppendU8(out, kTypeMeta);
+  AppendShard(out, key, shard_count);
   AppendU8(out, inner_type);
   out.append(key);
   return out;
 }
 
-std::string EncodeHashFieldKey(std::string_view key, std::string_view field) {
+std::string EncodeHashFieldKey(std::string_view key, std::string_view field, uint32_t shard_count) {
   std::string out;
-  out.reserve(1 + 10 + key.size() + field.size());
+  out.reserve(1 + kShardBytes + 10 + key.size() + field.size());
   AppendU8(out, kTypeHashField);
+  AppendShard(out, key, shard_count);
   AppendLengthPrefixedKey(out, key);
   out.append(field);
   return out;
 }
 
-std::string EncodeSetMemberKey(std::string_view key, std::string_view member) {
+std::string EncodeSetMemberKey(std::string_view key, std::string_view member,
+                               uint32_t shard_count) {
   std::string out;
-  out.reserve(1 + 10 + key.size() + member.size());
+  out.reserve(1 + kShardBytes + 10 + key.size() + member.size());
   AppendU8(out, kTypeSetMember);
+  AppendShard(out, key, shard_count);
   AppendLengthPrefixedKey(out, key);
   out.append(member);
   return out;
 }
 
-std::string EncodeZsetMemberKey(std::string_view key, std::string_view member) {
+std::string EncodeZsetMemberKey(std::string_view key, std::string_view member,
+                                uint32_t shard_count) {
   std::string out;
-  out.reserve(1 + 10 + key.size() + member.size());
+  out.reserve(1 + kShardBytes + 10 + key.size() + member.size());
   AppendU8(out, kTypeZsetMember);
+  AppendShard(out, key, shard_count);
   AppendLengthPrefixedKey(out, key);
   out.append(member);
   return out;
 }
 
-std::string EncodeZsetScoreIndexKey(std::string_view key, double score, std::string_view member) {
+std::string EncodeZsetScoreIndexKey(std::string_view key, double score, std::string_view member,
+                                    uint32_t shard_count) {
   std::string out;
-  out.reserve(1 + 10 + key.size() + 8 + member.size());
+  out.reserve(1 + kShardBytes + 10 + key.size() + 8 + member.size());
   AppendU8(out, kTypeZsetScoreIndex);
+  AppendShard(out, key, shard_count);
   AppendLengthPrefixedKey(out, key);
   AppendU64BE(out, SortableDouble(score));
   out.append(member);
@@ -157,26 +174,39 @@ std::string EncodeFormatVersionKey() {
 
 namespace {
 
-std::string TypedLengthPrefix(uint8_t type, std::string_view key) {
+std::string TypedLengthPrefix(uint8_t type, std::string_view key, uint32_t shard_count) {
   std::string out;
-  out.reserve(1 + 10 + key.size());
+  out.reserve(1 + kShardBytes + 10 + key.size());
   AppendU8(out, type);
+  AppendShard(out, key, shard_count);
   AppendLengthPrefixedKey(out, key);
   return out;
 }
 
 }  // namespace
 
-std::string HashFieldPrefix(std::string_view key) { return TypedLengthPrefix(kTypeHashField, key); }
-
-std::string SetMemberPrefix(std::string_view key) { return TypedLengthPrefix(kTypeSetMember, key); }
-
-std::string ZsetMemberPrefix(std::string_view key) {
-  return TypedLengthPrefix(kTypeZsetMember, key);
+std::string HashFieldPrefix(std::string_view key, uint32_t shard_count) {
+  return TypedLengthPrefix(kTypeHashField, key, shard_count);
 }
 
-std::string ZsetScoreIndexPrefix(std::string_view key) {
-  return TypedLengthPrefix(kTypeZsetScoreIndex, key);
+std::string SetMemberPrefix(std::string_view key, uint32_t shard_count) {
+  return TypedLengthPrefix(kTypeSetMember, key, shard_count);
+}
+
+std::string ZsetMemberPrefix(std::string_view key, uint32_t shard_count) {
+  return TypedLengthPrefix(kTypeZsetMember, key, shard_count);
+}
+
+std::string ZsetScoreIndexPrefix(std::string_view key, uint32_t shard_count) {
+  return TypedLengthPrefix(kTypeZsetScoreIndex, key, shard_count);
+}
+
+std::string ShardTypePrefix(uint8_t type, core::ShardId shard) {
+  std::string out;
+  out.reserve(1 + kShardBytes);
+  AppendU8(out, type);
+  AppendU16BE(out, static_cast<uint16_t>(shard));
+  return out;
 }
 
 // --- String value codec -----------------------------------------------------

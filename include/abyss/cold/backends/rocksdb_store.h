@@ -25,6 +25,8 @@ enum class CompactionStyle : std::uint8_t {
 
 struct RocksdbConfig {
   std::string data_path;
+  // Must equal the hot/consumer shard count.
+  uint32_t shard_count = 1;
   size_t write_buffer_size_bytes = 67108864;
   uint32_t max_write_buffer_number = 4;
   uint32_t bloom_filter_bits_per_key = 10;
@@ -50,7 +52,7 @@ class RocksdbStore : public core::ColdStore {
   core::Result<core::RespValue> Exec(
       const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
-  core::Result<void> Wipe() override;
+  core::Result<void> Wipe(core::ShardId shard) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
   core::Result<std::optional<core::RespCommand>> GetPromotionCommand(std::string_view key) override;

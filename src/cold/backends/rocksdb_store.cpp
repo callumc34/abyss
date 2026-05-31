@@ -191,8 +191,6 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   CfHandle zset_score_idx_cf;
   std::unique_ptr<TtlScanner> ttl_scanner;
   std::mt19937_64 rng{0};  // NOLINT(bugprone-random-generator-seed): re-seeded at Create.
-  // Per-shard cold consumers fan in here on FLUSHDB; serialises the shared backend wipe.
-  std::mutex wipe_mu;
   // Bumped on every successful TTL-driven delete from either path: lazy
   // expiry on read or the active TtlScanner.
   mutable metrics::CounterHandle ttl_expired_total;
@@ -316,6 +314,13 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 // --- Factory & lifecycle ----------------------------------------------------
 
 core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig config) {
+  if (config.shard_count < 1 || config.shard_count > fmt::kMaxShardCount) {
+    return std::unexpected(
+        Error(ErrorCode::kInvalidArgument, "cold store shard_count must be in [1, " +
+                                               std::to_string(fmt::kMaxShardCount) + "], got " +
+                                               std::to_string(config.shard_count)));
+  }
+
   std::error_code ec;
   std::filesystem::create_directories(config.data_path, ec);
   if (ec) {
@@ -424,28 +429,32 @@ core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> 
   return impl_->ApplyBatch(ops);
 }
 
-core::Result<void> RocksdbStore::Wipe() {
-  const std::scoped_lock wipe_lock(impl_->wipe_mu);
+core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
+  // DeleteRange per <type><shard> slice, batched into one synced write. The
+  // batch is atomic and fsynced (wo.sync) so a post-wipe crash can't resurrect
+  // pre-Flush data once the cold consumer's ack is durable (#136). DeleteRange
+  // is the sanctioned exception for this bounded admin wipe (not the per-key
+  // DEL path); see ADP-010 §Per-shard wipe. 0xFF (format version) is outside
+  // every range, so it survives.
+  rocksdb::WriteBatch batch;
+  for (const uint8_t type : {fmt::kTypeString, fmt::kTypeMeta, fmt::kTypeHashField,
+                             fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
+    const auto begin = fmt::ShardTypePrefix(type, shard);
+    auto s = batch.DeleteRange(impl_->default_cf.get(), begin, LexicographicSuccessor(begin));
+    if (!s.ok()) return std::unexpected(FromStatus(s, "Wipe: DeleteRange default_cf"));
+  }
+  const auto score_begin = fmt::ShardTypePrefix(fmt::kTypeZsetScoreIndex, shard);
+  if (auto s = batch.DeleteRange(impl_->zset_score_idx_cf.get(), score_begin,
+                                 LexicographicSuccessor(score_begin));
+      !s.ok()) {
+    return std::unexpected(FromStatus(s, "Wipe: DeleteRange zset_score_idx_cf"));
+  }
 
-  // Data prefixes 0x01..0x06 (ADP-010); system-records prefix 0xFF preserved
-  // so the next Open() still finds the format-version record.
-  const std::string data_begin(1, '\x01');
-  const std::string data_end(1, '\x06');
-  const std::string score_begin(1, '\x06');
-  const std::string score_end(1, '\x07');
-
-  // OptimisticTransactionDB doesn't expose DeleteRange; go through the base DB.
   rocksdb::WriteOptions wo;
   wo.sync = true;
-  rocksdb::DB* base = impl_->db->GetBaseDB();
-  auto status = base->DeleteRange(wo, impl_->default_cf.get(), data_begin, data_end);
-  if (!status.ok()) {
-    return std::unexpected(FromStatus(status, "Wipe: DeleteRange default_cf"));
-  }
-  status = base->DeleteRange(wo, impl_->zset_score_idx_cf.get(), score_begin, score_end);
-  if (!status.ok()) {
-    return std::unexpected(FromStatus(status, "Wipe: DeleteRange zset_score_idx_cf"));
-  }
+  // OptimisticTransactionDB hides DeleteRange/WriteBatch; go through the base DB.
+  auto status = impl_->db->GetBaseDB()->Write(wo, &batch);
+  if (!status.ok()) return std::unexpected(FromStatus(status, "Wipe: Write"));
   return {};
 }
 
@@ -494,7 +503,7 @@ core::Result<void> RocksdbStore::Compact() {
 core::Result<std::optional<core::RespCommand>> RocksdbStore::GetPromotionCommand(
     std::string_view key) {
   // Strings only for now; collection promotion is additive here.
-  const auto encoded_key = fmt::EncodeStringKey(key);
+  const auto encoded_key = fmt::EncodeStringKey(key, impl_->config.shard_count);
   std::string raw;
   auto status = impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded_key, &raw);
   if (status.IsNotFound()) return std::optional<core::RespCommand>{};
@@ -582,7 +591,7 @@ core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::Wri
 
 core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::StringGet& op,
                                                    std::optional<core::Duration> deadline) const {
-  const auto encoded_key = fmt::EncodeStringKey(op.key);
+  const auto encoded_key = fmt::EncodeStringKey(op.key, config.shard_count);
   std::string raw;
   auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded_key, &raw);
   if (status.IsNotFound()) return RespValue::Null();
@@ -605,7 +614,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetIsMember&
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Integer(0);
 
-  const auto encoded = fmt::EncodeSetMemberKey(op.key, op.member);
+  const auto encoded = fmt::EncodeSetMemberKey(op.key, op.member, config.shard_count);
   std::string raw;
   auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Integer(0);
@@ -621,7 +630,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
 
   std::vector<RespValue> members;
   members.reserve((*meta)->cardinality);
-  const auto prefix = fmt::SetMemberPrefix(op.key);
+  const auto prefix = fmt::SetMemberPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
       nullptr, default_cf.get(), prefix,
       [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
@@ -646,7 +655,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetScore& o
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Null();
 
-  const auto encoded = fmt::EncodeZsetMemberKey(op.key, op.member);
+  const auto encoded = fmt::EncodeZsetMemberKey(op.key, op.member, config.shard_count);
   std::string raw;
   auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Null();
@@ -679,7 +688,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     // Lex range on member names, using the member-indexed CF. Bounds: if min
     // is empty, start at prefix; otherwise begin at the given member. Same
     // for max.
-    const auto prefix = fmt::ZsetMemberPrefix(op.key);
+    const auto prefix = fmt::ZsetMemberPrefix(op.key, config.shard_count);
     auto r =
         ScanPrefix(nullptr, default_cf.get(), prefix,
                    [&](std::string_view full_key, std::string_view value) -> core::Result<bool> {
@@ -698,7 +707,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     auto max = ParseScoreBound(op.max.empty() ? "+inf" : op.max, /*is_min=*/false);
     if (!max.has_value()) return std::unexpected(max.error());
 
-    const auto prefix = fmt::ZsetScoreIndexPrefix(op.key);
+    const auto prefix = fmt::ZsetScoreIndexPrefix(op.key, config.shard_count);
     // Each score-index key is: prefix || 8-byte sortable score || member.
     const auto score_offset = prefix.size();
     auto r = ScanPrefix(
@@ -787,7 +796,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGet& op,
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Null();
 
-  const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field);
+  const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field, config.shard_count);
   std::string raw;
   auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Null();
@@ -803,7 +812,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
 
   std::vector<RespValue> pairs;
   pairs.reserve((*meta)->cardinality * 2);
-  const auto prefix = fmt::HashFieldPrefix(op.key);
+  const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
       nullptr, default_cf.get(), prefix,
       [&](std::string_view full_key, std::string_view value) -> core::Result<bool> {
@@ -829,7 +838,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashMultiGet
 
   const auto read_opts = MakeReadOptions(deadline);
   for (auto field : op.fields) {
-    const auto encoded = fmt::EncodeHashFieldKey(op.key, field);
+    const auto encoded = fmt::EncodeHashFieldKey(op.key, field, config.shard_count);
     std::string raw;
     auto status = db->Get(read_opts, default_cf.get(), encoded, &raw);
     if (status.IsNotFound()) {
@@ -849,7 +858,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashFieldExi
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Integer(0);
 
-  const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field);
+  const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field, config.shard_count);
   std::string raw;
   auto status = db->Get(MakeReadOptions(deadline), default_cf.get(), encoded, &raw);
   if (status.IsNotFound()) return RespValue::Integer(0);
@@ -865,7 +874,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
 
   std::vector<RespValue> keys;
   keys.reserve((*meta)->cardinality);
-  const auto prefix = fmt::HashFieldPrefix(op.key);
+  const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
       nullptr, default_cf.get(), prefix,
       [&](std::string_view full_key, std::string_view /*value*/) -> core::Result<bool> {
@@ -884,7 +893,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
 
   std::vector<RespValue> vals;
   vals.reserve((*meta)->cardinality);
-  const auto prefix = fmt::HashFieldPrefix(op.key);
+  const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r =
       ScanPrefix(nullptr, default_cf.get(), prefix,
                  [&](std::string_view /*full_key*/, std::string_view value) -> core::Result<bool> {
@@ -919,7 +928,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::StringSet& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
   const uint8_t flags = (op.abs_ttl_ms == 0) ? 0 : fmt::kFlagHasTtl;
-  const auto encoded_key = fmt::EncodeStringKey(op.key);
+  const auto encoded_key = fmt::EncodeStringKey(op.key, config.shard_count);
   const auto encoded_value = fmt::EncodeStringValue({
       .flags = flags,
       .abs_ttl_ms = op.abs_ttl_ms,
@@ -933,7 +942,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::StringSet& op,
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Del& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
   for (auto key : op.keys) {
-    const auto string_key = fmt::EncodeStringKey(key);
+    const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
     auto s = wb.Delete(default_cf.get(), string_key);
     if (!s.ok()) return std::unexpected(FromStatus(s, "DEL string"));
 
@@ -955,7 +964,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::SetAdd& op,
 
   int64_t added = 0;
   for (auto member : op.members) {
-    const auto encoded = fmt::EncodeSetMemberKey(op.key, member);
+    const auto encoded = fmt::EncodeSetMemberKey(op.key, member, config.shard_count);
     std::string existing;
     auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), encoded,
                                   &existing);
@@ -979,7 +988,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::SetRem& op,
 
   int64_t removed = 0;
   for (auto member : op.members) {
-    const auto encoded = fmt::EncodeSetMemberKey(op.key, member);
+    const auto encoded = fmt::EncodeSetMemberKey(op.key, member, config.shard_count);
     std::string existing;
     auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), encoded,
                                   &existing);
@@ -1000,7 +1009,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetAdd& op,
 
   int64_t added = 0;
   for (const auto& entry : op.entries) {
-    const auto member_key = fmt::EncodeZsetMemberKey(op.key, entry.member);
+    const auto member_key = fmt::EncodeZsetMemberKey(op.key, entry.member, config.shard_count);
     std::string existing;
     auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), member_key,
                                   &existing);
@@ -1021,7 +1030,8 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetAdd& op,
     }
 
     if (had_old) {
-      const auto old_score_key = fmt::EncodeZsetScoreIndexKey(op.key, old_score, entry.member);
+      const auto old_score_key =
+          fmt::EncodeZsetScoreIndexKey(op.key, old_score, entry.member, config.shard_count);
       auto del = wb.Delete(zset_score_idx_cf.get(), old_score_key);
       if (!del.ok()) return std::unexpected(FromStatus(del, "ZADD old score index delete"));
     }
@@ -1029,7 +1039,8 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetAdd& op,
     auto member_put = wb.Put(default_cf.get(), member_key, EncodeZsetMemberScoreValue(entry.score));
     if (!member_put.ok()) return std::unexpected(FromStatus(member_put, "ZADD member"));
 
-    const auto score_key = fmt::EncodeZsetScoreIndexKey(op.key, entry.score, entry.member);
+    const auto score_key =
+        fmt::EncodeZsetScoreIndexKey(op.key, entry.score, entry.member, config.shard_count);
     auto score_put = wb.Put(zset_score_idx_cf.get(), score_key, "");
     if (!score_put.ok()) return std::unexpected(FromStatus(score_put, "ZADD score index"));
 
@@ -1047,7 +1058,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetRem& op,
 
   int64_t removed = 0;
   for (auto member : op.members) {
-    const auto member_key = fmt::EncodeZsetMemberKey(op.key, member);
+    const auto member_key = fmt::EncodeZsetMemberKey(op.key, member, config.shard_count);
     std::string existing;
     auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), member_key,
                                   &existing);
@@ -1059,7 +1070,8 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetRem& op,
     auto del_member = wb.Delete(default_cf.get(), member_key);
     if (!del_member.ok()) return std::unexpected(FromStatus(del_member, "ZREM member"));
 
-    const auto score_key = fmt::EncodeZsetScoreIndexKey(op.key, *decoded, member);
+    const auto score_key =
+        fmt::EncodeZsetScoreIndexKey(op.key, *decoded, member, config.shard_count);
     auto del_score = wb.Delete(zset_score_idx_cf.get(), score_key);
     if (!del_score.ok()) return std::unexpected(FromStatus(del_score, "ZREM score index"));
     ++removed;
@@ -1075,7 +1087,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashSet& op,
 
   int64_t added = 0;
   for (const auto& fv : op.fields) {
-    const auto encoded = fmt::EncodeHashFieldKey(op.key, fv.field);
+    const auto encoded = fmt::EncodeHashFieldKey(op.key, fv.field, config.shard_count);
     std::string existing;
     auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), encoded,
                                   &existing);
@@ -1104,7 +1116,7 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashDel& op,
 
   int64_t removed = 0;
   for (auto field : op.fields) {
-    const auto encoded = fmt::EncodeHashFieldKey(op.key, field);
+    const auto encoded = fmt::EncodeHashFieldKey(op.key, field, config.shard_count);
     std::string existing;
     auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), encoded,
                                   &existing);
@@ -1123,8 +1135,9 @@ namespace {
 // Predicate (NX/XX/GT/LT) was resolved upstream; this just rewrites flags+TTL.
 core::Result<void> ApplyTtlChange(rocksdb::WriteBatchWithIndex& wb, rocksdb::DB& db,
                                   rocksdb::ColumnFamilyHandle& cf, std::string_view key,
-                                  uint8_t new_flags, uint64_t new_abs_ttl_ms) {
-  const auto string_key = fmt::EncodeStringKey(key);
+                                  uint8_t new_flags, uint64_t new_abs_ttl_ms,
+                                  uint32_t shard_count) {
+  const auto string_key = fmt::EncodeStringKey(key, shard_count);
   std::string raw;
   auto s = wb.GetFromBatchAndDB(&db, rocksdb::ReadOptions(), &cf, string_key, &raw);
   if (s.ok()) {
@@ -1144,7 +1157,7 @@ core::Result<void> ApplyTtlChange(rocksdb::WriteBatchWithIndex& wb, rocksdb::DB&
   }
 
   for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
-    const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+    const auto meta_key = fmt::EncodeMetaKey(inner_type, key, shard_count);
     std::string meta_raw;
     auto ms = wb.GetFromBatchAndDB(&db, rocksdb::ReadOptions(), &cf, meta_key, &meta_raw);
     if (ms.IsNotFound()) continue;
@@ -1169,12 +1182,14 @@ core::Result<void> ApplyTtlChange(rocksdb::WriteBatchWithIndex& wb, rocksdb::DB&
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Expire& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
-  return ApplyTtlChange(wb, *db, *default_cf, op.key, fmt::kFlagHasTtl, op.abs_ttl_ms);
+  return ApplyTtlChange(wb, *db, *default_cf, op.key, fmt::kFlagHasTtl, op.abs_ttl_ms,
+                        config.shard_count);
 }
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Persist& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
-  return ApplyTtlChange(wb, *db, *default_cf, op.key, /*new_flags=*/0, /*new_abs_ttl_ms=*/0);
+  return ApplyTtlChange(wb, *db, *default_cf, op.key, /*new_flags=*/0, /*new_abs_ttl_ms=*/0,
+                        config.shard_count);
 }
 
 // --- DEL --------------------------------------------------------------------
@@ -1188,7 +1203,7 @@ core::Result<RespValue> RocksdbStore::Impl::ExecDel(const core::ops::Del& op) co
     bool counted = false;
 
     // String record.
-    const auto string_key = fmt::EncodeStringKey(key);
+    const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
     std::string raw;
     auto s = db->Get(rocksdb::ReadOptions(), default_cf.get(), string_key, &raw);
     if (s.ok()) {
@@ -1205,7 +1220,7 @@ core::Result<RespValue> RocksdbStore::Impl::ExecDel(const core::ops::Del& op) co
 
     // Collection records — a well-formed key has at most one collection type.
     for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
-      const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+      const auto meta_key = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
       std::string meta_raw;
       auto ms = db->Get(rocksdb::ReadOptions(), default_cf.get(), meta_key, &meta_raw);
       if (ms.IsNotFound()) continue;
@@ -1231,7 +1246,7 @@ core::Result<RespValue> RocksdbStore::Impl::ExecDel(const core::ops::Del& op) co
 
 core::Result<std::optional<fmt::MetaValue>> RocksdbStore::Impl::ReadMetaIfLive(
     uint8_t inner_type, std::string_view key) const {
-  const auto encoded = fmt::EncodeMetaKey(inner_type, key);
+  const auto encoded = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   std::string raw;
   auto s = db->Get(rocksdb::ReadOptions(), default_cf.get(), encoded, &raw);
   if (s.IsNotFound()) return std::optional<fmt::MetaValue>{};
@@ -1248,7 +1263,7 @@ core::Result<std::optional<fmt::MetaValue>> RocksdbStore::Impl::ReadMetaIfLive(
 
 core::Result<std::optional<fmt::MetaValue>> RocksdbStore::Impl::ReadMetaForWrite(
     rocksdb::WriteBatchWithIndex& wb, uint8_t inner_type, std::string_view key) const {
-  const auto encoded = fmt::EncodeMetaKey(inner_type, key);
+  const auto encoded = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   std::string raw;
   auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), encoded, &raw);
   if (s.IsNotFound()) return std::optional<fmt::MetaValue>{};
@@ -1288,7 +1303,7 @@ core::Result<void> RocksdbStore::Impl::ApplyMetaDelta(rocksdb::WriteBatchWithInd
   }
   next.cardinality = static_cast<uint64_t>(updated);
 
-  const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+  const auto meta_key = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   if (next.cardinality == 0) {
     auto s = wb.Delete(default_cf.get(), meta_key);
     if (!s.ok()) return std::unexpected(FromStatus(s, "ApplyMetaDelta delete"));
@@ -1305,13 +1320,13 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
   std::string member_prefix;
   switch (inner_type) {
     case fmt::kTypeHashField:
-      member_prefix = fmt::HashFieldPrefix(key);
+      member_prefix = fmt::HashFieldPrefix(key, config.shard_count);
       break;
     case fmt::kTypeSetMember:
-      member_prefix = fmt::SetMemberPrefix(key);
+      member_prefix = fmt::SetMemberPrefix(key, config.shard_count);
       break;
     case fmt::kTypeZsetMember:
-      member_prefix = fmt::ZsetMemberPrefix(key);
+      member_prefix = fmt::ZsetMemberPrefix(key, config.shard_count);
       break;
     default:
       return std::unexpected(
@@ -1328,7 +1343,7 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
   if (!r.has_value()) return std::unexpected(r.error());
 
   if (inner_type == fmt::kTypeZsetMember) {
-    const auto score_prefix = fmt::ZsetScoreIndexPrefix(key);
+    const auto score_prefix = fmt::ZsetScoreIndexPrefix(key, config.shard_count);
     auto zr = ScanPrefix(&wb, zset_score_idx_cf.get(), score_prefix,
                          [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
                            auto s = wb.Delete(zset_score_idx_cf.get(), ToSlice(full_key));
@@ -1339,7 +1354,7 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
     if (!zr.has_value()) return std::unexpected(zr.error());
   }
 
-  const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+  const auto meta_key = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   auto s = wb.Delete(default_cf.get(), meta_key);
   if (!s.ok()) return std::unexpected(FromStatus(s, "meta delete"));
   return {};
@@ -1355,7 +1370,7 @@ core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireStringIfStillExpired(
   rocksdb::ReadOptions read_opts;
   read_opts.snapshot = txn->GetSnapshot();
 
-  const auto encoded_key = fmt::EncodeStringKey(key);
+  const auto encoded_key = fmt::EncodeStringKey(key, config.shard_count);
   std::string raw;
   auto s = txn->GetForUpdate(read_opts, default_cf.get(), encoded_key, &raw);
   if (s.IsNotFound()) {
@@ -1397,13 +1412,13 @@ core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireCollectionIfStillExpired(
   std::string member_prefix;
   switch (inner_type) {
     case fmt::kTypeHashField:
-      member_prefix = fmt::HashFieldPrefix(key);
+      member_prefix = fmt::HashFieldPrefix(key, config.shard_count);
       break;
     case fmt::kTypeSetMember:
-      member_prefix = fmt::SetMemberPrefix(key);
+      member_prefix = fmt::SetMemberPrefix(key, config.shard_count);
       break;
     case fmt::kTypeZsetMember:
-      member_prefix = fmt::ZsetMemberPrefix(key);
+      member_prefix = fmt::ZsetMemberPrefix(key, config.shard_count);
       break;
     default:
       return std::unexpected(
@@ -1418,7 +1433,7 @@ core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireCollectionIfStillExpired(
   rocksdb::ReadOptions read_opts;
   read_opts.snapshot = txn->GetSnapshot();
 
-  const auto meta_key = fmt::EncodeMetaKey(inner_type, key);
+  const auto meta_key = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   std::string raw_meta;
   auto s = txn->GetForUpdate(read_opts, default_cf.get(), meta_key, &raw_meta);
   if (s.IsNotFound()) {
@@ -1461,7 +1476,7 @@ core::Result<ExpireOutcome> RocksdbStore::Impl::ExpireCollectionIfStillExpired(
   }
 
   if (inner_type == fmt::kTypeZsetMember) {
-    const auto score_prefix = fmt::ZsetScoreIndexPrefix(key);
+    const auto score_prefix = fmt::ZsetScoreIndexPrefix(key, config.shard_count);
     std::string score_upper = LexicographicSuccessor(score_prefix);
     rocksdb::Slice score_upper_slice(score_upper);
     rocksdb::ReadOptions score_iter_opts = read_opts;
@@ -1538,10 +1553,12 @@ core::Result<void> RocksdbStore::Impl::SampleAndExpireString(SweepReport& report
   ++report.sampled_strings;
 
   const auto encoded_key = ToSv(it->key());
-  if (encoded_key.empty() || static_cast<uint8_t>(encoded_key[0]) != fmt::kTypeString) {
+  if (encoded_key.size() < 1 + fmt::kShardBytes ||
+      static_cast<uint8_t>(encoded_key[0]) != fmt::kTypeString) {
     return {};
   }
-  const auto user_key = std::string(encoded_key.substr(1));
+  // Layout: <kTypeString><shard:kShardBytes><user key> (ADP-010).
+  const auto user_key = std::string(encoded_key.substr(1 + fmt::kShardBytes));
   const auto value = ToSv(it->value());
 
   auto decoded = fmt::DecodeStringValue(value);
@@ -1602,15 +1619,17 @@ core::Result<void> RocksdbStore::Impl::SampleAndExpireMeta(SweepReport& report) 
   ++report.sampled_collections;
 
   const auto encoded_key = ToSv(it->key());
-  if (encoded_key.size() < 2 || static_cast<uint8_t>(encoded_key[0]) != fmt::kTypeMeta) {
+  // Layout: <kTypeMeta><shard:kShardBytes><inner_type><user key> (ADP-010).
+  if (encoded_key.size() < 2 + fmt::kShardBytes ||
+      static_cast<uint8_t>(encoded_key[0]) != fmt::kTypeMeta) {
     return {};
   }
-  const auto inner_type = static_cast<uint8_t>(encoded_key[1]);
+  const auto inner_type = static_cast<uint8_t>(encoded_key[1 + fmt::kShardBytes]);
   if (inner_type != fmt::kTypeHashField && inner_type != fmt::kTypeSetMember &&
       inner_type != fmt::kTypeZsetMember) {
     return {};
   }
-  const auto user_key = std::string(encoded_key.substr(2));
+  const auto user_key = std::string(encoded_key.substr(2 + fmt::kShardBytes));
   const auto value = ToSv(it->value());
 
   auto decoded = fmt::DecodeMetaValue(value);
@@ -1645,7 +1664,7 @@ core::Result<void> RocksdbStore::Impl::SampleAndExpireMeta(SweepReport& report) 
 }
 
 core::Result<bool> RocksdbStore::Impl::AnyLiveRecord(std::string_view key) const {
-  const auto string_key = fmt::EncodeStringKey(key);
+  const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
   std::string raw;
   auto s = db->Get(rocksdb::ReadOptions(), default_cf.get(), string_key, &raw);
   if (s.ok()) {

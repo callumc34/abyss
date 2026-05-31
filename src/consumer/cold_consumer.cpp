@@ -310,7 +310,7 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
     }
   }
 
-  auto wiped = cold_store_.Wipe();
+  auto wiped = cold_store_.Wipe(shard_);
   if (!wiped.has_value()) {
     counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
     ABYSS_LOG_ERROR("cold wipe failed", {"shard", static_cast<int64_t>(shard_)},

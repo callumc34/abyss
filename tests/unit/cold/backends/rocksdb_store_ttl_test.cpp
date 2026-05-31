@@ -29,6 +29,10 @@
 namespace abyss::cold::backends {
 namespace {
 
+// Single shard: the fixture stores one logical shard, so key encoding and the
+// raw meta injection below must agree on this slot count (ADP-010).
+constexpr uint32_t kFixtureShardCount = 1;
+
 // Test clock backed by a shared atomic so the fixture can advance time while
 // the store holds a WallClockFn capturing the same atomic by reference.
 struct TestClock {
@@ -71,6 +75,7 @@ class TtlFixture : public ::testing::Test {
   std::unique_ptr<RocksdbStore> OpenStore() {
     RocksdbConfig config;
     config.data_path = path_.string();
+    config.shard_count = kFixtureShardCount;
     config.wall_clock = clock_.Fn();
     auto store = RocksdbStore::Create(config);
     EXPECT_TRUE(store.has_value()) << (store.has_value() ? "" : store.error().message());
@@ -201,7 +206,7 @@ void InjectExpiredMeta(const std::string& path, uint8_t inner_type, std::string_
   rocksdb::DBOptions db_opts;
   ASSERT_TRUE(rocksdb::DB::Open(db_opts, path, descs, &handles, &db).ok());
 
-  const auto meta_key = ::abyss::cold::format::EncodeMetaKey(inner_type, key);
+  const auto meta_key = ::abyss::cold::format::EncodeMetaKey(inner_type, key, kFixtureShardCount);
   const auto meta_value = ::abyss::cold::format::EncodeMetaValue({
       .flags = ::abyss::cold::format::kFlagHasTtl,
       .abs_ttl_ms = 1,  // millisecond 1 after epoch — deeply expired under any clock

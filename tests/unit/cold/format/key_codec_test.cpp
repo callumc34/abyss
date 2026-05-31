@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include "abyss/core/shard_router.h"
+
 namespace abyss::cold::format {
 namespace {
 
@@ -118,43 +120,51 @@ TEST(SortableDoubleTest, EncodedBytesAreLexComparable) {
 // A sample of binary-unsafe bytes that may appear in user keys.
 const std::string kBinaryUnsafeKey{'u', '\x00', 's', 'e', '\xFF', 'r'};
 
-TEST(KeyEncoderTest, StringKeyIsTypePlusKey) {
-  const auto encoded = EncodeStringKey("foo");
-  ASSERT_EQ(encoded.size(), 4u);
+// Single-shard count: ComputeShard always yields slot 0, so the slot bytes are
+// 0x00 0x00 and these layout tests isolate the type/length-prefix structure
+// from shard routing.
+constexpr uint32_t kOneShard = 1;
+
+TEST(KeyEncoderTest, StringKeyIsTypePlusShardPlusKey) {
+  const auto encoded = EncodeStringKey("foo", kOneShard);
+  ASSERT_EQ(encoded.size(), 1u + kShardBytes + 3u);
   EXPECT_EQ(static_cast<uint8_t>(encoded[0]), kTypeString);
-  EXPECT_EQ(encoded.substr(1), "foo");
+  EXPECT_EQ(static_cast<uint8_t>(encoded[1]), 0u);  // slot 0, big-endian high byte
+  EXPECT_EQ(static_cast<uint8_t>(encoded[2]), 0u);  // slot 0, low byte
+  EXPECT_EQ(encoded.substr(1 + kShardBytes), "foo");
 }
 
 TEST(KeyEncoderTest, StringKeyHandlesEmbeddedNullBytes) {
-  const auto encoded = EncodeStringKey(kBinaryUnsafeKey);
-  EXPECT_EQ(encoded.size(), 1u + kBinaryUnsafeKey.size());
+  const auto encoded = EncodeStringKey(kBinaryUnsafeKey, kOneShard);
+  EXPECT_EQ(encoded.size(), 1u + kShardBytes + kBinaryUnsafeKey.size());
   EXPECT_EQ(static_cast<uint8_t>(encoded[0]), kTypeString);
-  EXPECT_EQ(encoded.substr(1), kBinaryUnsafeKey);
+  EXPECT_EQ(encoded.substr(1 + kShardBytes), kBinaryUnsafeKey);
 }
 
-TEST(KeyEncoderTest, MetaKeyIncludesInnerType) {
-  const auto encoded = EncodeMetaKey(kTypeHashField, "h");
-  ASSERT_EQ(encoded.size(), 3u);
+TEST(KeyEncoderTest, MetaKeyShardPrecedesInnerType) {
+  const auto encoded = EncodeMetaKey(kTypeHashField, "h", kOneShard);
+  ASSERT_EQ(encoded.size(), 2u + kShardBytes + 1u);
   EXPECT_EQ(static_cast<uint8_t>(encoded[0]), kTypeMeta);
-  EXPECT_EQ(static_cast<uint8_t>(encoded[1]), kTypeHashField);
-  EXPECT_EQ(encoded.substr(2), "h");
+  EXPECT_EQ(static_cast<uint8_t>(encoded[1 + kShardBytes]), kTypeHashField);
+  EXPECT_EQ(encoded.substr(2 + kShardBytes), "h");
 }
 
 TEST(KeyEncoderTest, HashFieldKeyIsLengthPrefixed) {
-  const auto encoded = EncodeHashFieldKey("h:1", "name");
-  // 0x03 | varint(3) | "h:1" | "name"
-  ASSERT_EQ(encoded.size(), 1u + 1u + 3u + 4u);
+  const auto encoded = EncodeHashFieldKey("h:1", "name", kOneShard);
+  // 0x03 | shard:2 | varint(3) | "h:1" | "name"
+  ASSERT_EQ(encoded.size(), 1u + kShardBytes + 1u + 3u + 4u);
   EXPECT_EQ(static_cast<uint8_t>(encoded[0]), kTypeHashField);
-  EXPECT_EQ(static_cast<uint8_t>(encoded[1]), 3u);
-  EXPECT_EQ(encoded.substr(2, 3), "h:1");
-  EXPECT_EQ(encoded.substr(5), "name");
+  EXPECT_EQ(static_cast<uint8_t>(encoded[1 + kShardBytes]), 3u);
+  EXPECT_EQ(encoded.substr(2 + kShardBytes, 3), "h:1");
+  EXPECT_EQ(encoded.substr(2 + kShardBytes + 3), "name");
 }
 
 TEST(KeyEncoderTest, PrefixScanIsolatesOneKeyFromAnother) {
   // "foo" and "fooX" would collide under naive concatenation; the length prefix
-  // must prevent a prefix scan of "foo" from matching "fooX" entries.
-  const auto prefix_foo = HashFieldPrefix("foo");
-  const auto entry_foox = EncodeHashFieldKey("fooX", "field");
+  // must prevent a prefix scan of "foo" from matching "fooX" entries. Pinned at
+  // one shard so the slot bytes match and only the length prefix isolates.
+  const auto prefix_foo = HashFieldPrefix("foo", kOneShard);
+  const auto entry_foox = EncodeHashFieldKey("fooX", "field", kOneShard);
   EXPECT_FALSE(std::string_view{entry_foox}.starts_with(prefix_foo));
 }
 
@@ -162,25 +172,67 @@ TEST(KeyEncoderTest, PrefixScanIsolatesBinaryUnsafeKeys) {
   // Keys containing '\x00' must still be disambiguated by length prefix.
   const std::string k1 = std::string{'a', '\x00', 'b'};       // "a\0b" length 3
   const std::string k2 = std::string{'a', '\x00', 'b', 'c'};  // "a\0bc" length 4
-  const auto prefix_k1 = HashFieldPrefix(k1);
-  const auto entry_k2 = EncodeHashFieldKey(k2, "f");
+  const auto prefix_k1 = HashFieldPrefix(k1, kOneShard);
+  const auto entry_k2 = EncodeHashFieldKey(k2, "f", kOneShard);
   EXPECT_FALSE(std::string_view{entry_k2}.starts_with(prefix_k1));
 }
 
 TEST(KeyEncoderTest, PrefixMatchesOwnHashFieldEntries) {
-  const auto prefix = HashFieldPrefix("h");
-  const auto entry = EncodeHashFieldKey("h", "f");
+  const auto prefix = HashFieldPrefix("h", kOneShard);
+  const auto entry = EncodeHashFieldKey("h", "f", kOneShard);
   EXPECT_TRUE(std::string_view{entry}.starts_with(prefix));
 }
 
 TEST(KeyEncoderTest, ZsetScoreIndexOrdersByScoreThenMember) {
-  const auto lower_score = EncodeZsetScoreIndexKey("z", 1.0, "bbb");
-  const auto higher_score_earlier_member = EncodeZsetScoreIndexKey("z", 2.0, "aaa");
+  const auto lower_score = EncodeZsetScoreIndexKey("z", 1.0, "bbb", kOneShard);
+  const auto higher_score_earlier_member = EncodeZsetScoreIndexKey("z", 2.0, "aaa", kOneShard);
   EXPECT_LT(lower_score, higher_score_earlier_member);
 
-  const auto same_score_earlier_member = EncodeZsetScoreIndexKey("z", 1.0, "aaa");
-  const auto same_score_later_member = EncodeZsetScoreIndexKey("z", 1.0, "bbb");
+  const auto same_score_earlier_member = EncodeZsetScoreIndexKey("z", 1.0, "aaa", kOneShard);
+  const auto same_score_later_member = EncodeZsetScoreIndexKey("z", 1.0, "bbb", kOneShard);
   EXPECT_LT(same_score_earlier_member, same_score_later_member);
+}
+
+// --- Shard slot (ADP-010) ---------------------------------------------------
+
+TEST(KeyEncoderTest, ShardSlotIsComputeShardBigEndian) {
+  constexpr uint32_t kShards = 256;
+  const std::string key = "user:42";
+  const auto encoded = EncodeStringKey(key, kShards);
+  ASSERT_GE(encoded.size(), 1u + kShardBytes);
+  const auto slot = static_cast<uint32_t>((static_cast<uint8_t>(encoded[1]) << 8) |
+                                          static_cast<uint8_t>(encoded[2]));
+  EXPECT_EQ(slot, core::ComputeShard(key, kShards));
+}
+
+TEST(KeyEncoderTest, CollectionSlotDerivesFromKeyNotMember) {
+  // The slot must depend only on the Redis key, never on the field/member, so
+  // every record for a key lands in the same shard slice (and a per-shard wipe
+  // catches all of them).
+  constexpr uint32_t kShards = 256;
+  const std::string key = "myset";
+  const auto a = EncodeSetMemberKey(key, "memberA", kShards);
+  const auto b = EncodeSetMemberKey(key, "memberB", kShards);
+  EXPECT_EQ(a.substr(1, kShardBytes), b.substr(1, kShardBytes));
+  const auto slot =
+      static_cast<uint32_t>((static_cast<uint8_t>(a[1]) << 8) | static_cast<uint8_t>(a[2]));
+  EXPECT_EQ(slot, core::ComputeShard(key, kShards));
+}
+
+TEST(KeyEncoderTest, ShardTypePrefixBoundsOnlyItsOwnSlice) {
+  // The wipe deletes [ShardTypePrefix(type, shard), successor). A key must be
+  // covered by its own slot's prefix and by no other slot's.
+  constexpr uint32_t kShards = 256;
+  const std::string key = "abc";
+  const auto shard = core::ComputeShard(key, kShards);
+  const auto encoded = EncodeStringKey(key, kShards);
+
+  const auto own = ShardTypePrefix(kTypeString, shard);
+  EXPECT_TRUE(std::string_view{encoded}.starts_with(own));
+
+  const auto other =
+      ShardTypePrefix(kTypeString, static_cast<core::ShardId>((shard + 1) % kShards));
+  EXPECT_FALSE(std::string_view{encoded}.starts_with(other));
 }
 
 TEST(KeyEncoderTest, FormatVersionKeyIsByteExact) {
