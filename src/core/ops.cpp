@@ -37,6 +37,18 @@ Result<uint64_t> ParseUint64(std::string_view s) {
   return value;
 }
 
+Result<int64_t> ParseInt64(std::string_view s) {
+  int64_t value = 0;
+  const auto* begin = s.data();
+  const auto* end = s.data() + s.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end) {
+    return std::unexpected(
+        Error(ErrorCode::kInvalidArgument, "not a valid integer: '" + std::string(s) + "'"));
+  }
+  return value;
+}
+
 std::string AsciiUpper(std::string_view s) {
   std::string out(s);
   for (char& c : out) {
@@ -109,15 +121,109 @@ Result<ReadOp> ParseHvals(const RespCommand& cmd) { return ReadOp{HashVals{.key 
 
 Result<ReadOp> ParseHlen(const RespCommand& cmd) { return ReadOp{HashLen{.key = cmd.args[1]}}; }
 
+// Parses the trailing `LIMIT offset count` clause starting at args[i]. On
+// success advances `i` past the clause and writes offset/count into `op`.
+Result<void> ParseLimitClause(const RespCommand& cmd, size_t& i, ZsetRange& op) {
+  if (i + 2 >= cmd.args.size()) {
+    return std::unexpected(SyntaxError("syntax error — LIMIT requires offset and count"));
+  }
+  auto offset = ParseInt64(cmd.args[i + 1]);
+  if (!offset.has_value()) return std::unexpected(offset.error());
+  auto count = ParseInt64(cmd.args[i + 2]);
+  if (!count.has_value()) return std::unexpected(count.error());
+  op.offset = *offset;
+  op.count = *count;
+  i += 3;
+  return {};
+}
+
+// ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES].
+// Index, score, and lex modes share one variant; the by_score/by_lex flags pick
+// the bound interpretation downstream (hot ExecZsetRange and cold Handle).
+Result<ReadOp> ParseZrange(const RespCommand& cmd) {
+  ZsetRange op{.key = cmd.args[1], .min = cmd.args[2], .max = cmd.args[3]};
+  for (size_t i = 4; i < cmd.args.size();) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt == "BYSCORE") {
+      op.by_score = true;
+      ++i;
+    } else if (opt == "BYLEX") {
+      op.by_lex = true;
+      ++i;
+    } else if (opt == "REV") {
+      op.rev = true;
+      ++i;
+    } else if (opt == "WITHSCORES") {
+      op.with_scores = true;
+      ++i;
+    } else if (opt == "LIMIT") {
+      auto limit = ParseLimitClause(cmd, i, op);
+      if (!limit.has_value()) return std::unexpected(limit.error());
+    } else {
+      return std::unexpected(SyntaxError("syntax error — unknown ZRANGE option '" + opt + "'"));
+    }
+  }
+  if (op.by_score && op.by_lex) {
+    return std::unexpected(SyntaxError("syntax error — BYSCORE and BYLEX are mutually exclusive"));
+  }
+  return ReadOp{op};
+}
+
+// ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count].
+Result<ReadOp> ParseZrangeByScore(const RespCommand& cmd) {
+  ZsetRange op{.key = cmd.args[1], .min = cmd.args[2], .max = cmd.args[3], .by_score = true};
+  for (size_t i = 4; i < cmd.args.size();) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt == "WITHSCORES") {
+      op.with_scores = true;
+      ++i;
+    } else if (opt == "LIMIT") {
+      auto limit = ParseLimitClause(cmd, i, op);
+      if (!limit.has_value()) return std::unexpected(limit.error());
+    } else {
+      return std::unexpected(
+          SyntaxError("syntax error — unknown ZRANGEBYSCORE option '" + opt + "'"));
+    }
+  }
+  return ReadOp{op};
+}
+
+// ZRANGEBYLEX key min max [LIMIT offset count]. WITHSCORES is not valid for lex.
+Result<ReadOp> ParseZrangeByLex(const RespCommand& cmd) {
+  ZsetRange op{.key = cmd.args[1], .min = cmd.args[2], .max = cmd.args[3], .by_lex = true};
+  for (size_t i = 4; i < cmd.args.size();) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt == "LIMIT") {
+      auto limit = ParseLimitClause(cmd, i, op);
+      if (!limit.has_value()) return std::unexpected(limit.error());
+    } else {
+      return std::unexpected(
+          SyntaxError("syntax error — unknown ZRANGEBYLEX option '" + opt + "'"));
+    }
+  }
+  return ReadOp{op};
+}
+
 const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
   // MGET / EXISTS are intentionally absent: the engine decomposes them in
   // DispatchFanOut and never round-trips through ParseReadOp.
   static const std::unordered_map<std::string_view, ReadParserFn> table{
-      {"GET", ParseGet},         {"SISMEMBER", ParseSismember}, {"SMEMBERS", ParseSmembers},
-      {"SCARD", ParseScard},     {"ZSCORE", ParseZscore},       {"ZCARD", ParseZcard},
-      {"HGET", ParseHget},       {"HGETALL", ParseHgetall},     {"HMGET", ParseHmget},
-      {"HEXISTS", ParseHexists}, {"HKEYS", ParseHkeys},         {"HVALS", ParseHvals},
+      {"GET", ParseGet},
+      {"SISMEMBER", ParseSismember},
+      {"SMEMBERS", ParseSmembers},
+      {"SCARD", ParseScard},
+      {"ZSCORE", ParseZscore},
+      {"ZCARD", ParseZcard},
+      {"HGET", ParseHget},
+      {"HGETALL", ParseHgetall},
+      {"HMGET", ParseHmget},
+      {"HEXISTS", ParseHexists},
+      {"HKEYS", ParseHkeys},
+      {"HVALS", ParseHvals},
       {"HLEN", ParseHlen},
+      {"ZRANGE", ParseZrange},
+      {"ZRANGEBYSCORE", ParseZrangeByScore},
+      {"ZRANGEBYLEX", ParseZrangeByLex},
   };
   return table;
 }

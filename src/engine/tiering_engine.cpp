@@ -38,6 +38,7 @@ TieringEngine::TieringEngine(core::Queue& queue, core::HotStore& hot_store,
   hits_cold_ = reg.Counter(metrics::names::kHitsTotal, metrics::Tier::kCold);
   misses_ = reg.Counter(metrics::names::kMissesTotal);
   promotions_ = reg.Counter(metrics::names::kPromotionsTotal);
+  cold_scan_deadline_exceeded_ = reg.Counter(metrics::names::kColdScanDeadlineExceededTotal);
 }
 
 namespace {
@@ -50,6 +51,27 @@ bool IsHashRead(const core::ops::ReadOp& op) {
          std::holds_alternative<core::ops::HashKeys>(op) ||
          std::holds_alternative<core::ops::HashVals>(op) ||
          std::holds_alternative<core::ops::HashLen>(op);
+}
+
+// Set/zset SCALAR reads the compaction buffer can answer authoritatively:
+// the buffer overlay holds the exact (member, score, cardinality) delta for a
+// hot-evicted collection. Routed through MergeCollectionScalar so the buffer
+// tier is never skipped (ENGINE-2).
+bool IsCollectionScalarRead(const core::ops::ReadOp& op) {
+  return std::holds_alternative<core::ops::SetIsMember>(op) ||
+         std::holds_alternative<core::ops::SetCard>(op) ||
+         std::holds_alternative<core::ops::ZsetScore>(op) ||
+         std::holds_alternative<core::ops::ZsetCard>(op);
+}
+
+// Cold reads that scan a whole collection rather than a single point. These get
+// the larger cold_scan_deadline (COLD-2); their latency scales with cardinality.
+bool IsCollectionScan(const core::ops::ReadOp& op) {
+  return std::holds_alternative<core::ops::SetMembers>(op) ||
+         std::holds_alternative<core::ops::ZsetRange>(op) ||
+         std::holds_alternative<core::ops::HashGetAll>(op) ||
+         std::holds_alternative<core::ops::HashKeys>(op) ||
+         std::holds_alternative<core::ops::HashVals>(op);
 }
 
 core::RespValue WrongType() {
@@ -105,6 +127,53 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
   return DispatchSingleKeyRead(*op);
 }
 
+core::Duration TieringEngine::ColdDeadlineFor(const core::ops::ReadOp& op) const {
+  return IsCollectionScan(op) ? config_.cold_scan_deadline : config_.cold_read_deadline;
+}
+
+core::Result<core::RespValue> TieringEngine::ColdExec(const core::ops::ReadOp& op) {
+  auto result = cold_store_.Exec(op, ColdDeadlineFor(op));
+  if (!result.has_value() && result.error().code() == core::ErrorCode::kTimeout &&
+      IsCollectionScan(op)) {
+    // A cold scan exceeded its deadline. Surface the error to the client and a
+    // metric so an operator sees a legitimately-large collection being capped;
+    // never serve a silently truncated partial result (decision 4).
+    cold_scan_deadline_exceeded_.Increment();
+  }
+  return result;
+}
+
+core::Result<core::RespValue> TieringEngine::MergeCollectionScalar(const core::ops::ReadOp& op) {
+  // Buffer overlay first: a buffered partial SREM/ZREM (or a tombstone) against
+  // a cold-resident collection must win over cold's stale residual
+  // (read-after-write). Mirrors DispatchHashRead's kWrongType short-circuit.
+  auto buffered = buffer_router_.Exec(op);
+  if (buffered.has_value()) {
+    hits_buffer_.Increment();
+    return buffered;
+  }
+  if (buffered.error().code() == core::ErrorCode::kWrongType) {
+    return core::RespValue::Error(core::ErrorPrefix::kWrongType,
+                                  "Operation against a key holding the wrong kind of value");
+  }
+  if (buffered.error().code() != core::ErrorCode::kNotFound) {
+    return std::unexpected(buffered.error());
+  }
+
+  // True buffer miss: fall through to cold with the point-read deadline.
+  auto cold_result = ColdExec(op);
+  if (cold_result.has_value() && !cold_result->IsNull()) {
+    hits_cold_.Increment();
+    auto key = core::ops::PrimaryKey(op);
+    if (!key.empty()) {
+      PromoteThroughQueue(key);
+    }
+  } else if (cold_result.has_value()) {
+    misses_.Increment();
+  }
+  return cold_result;
+}
+
 core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::ops::ReadOp& op) {
   auto hot_result = hot_store_.Exec(op);
   if (hot_result.has_value()) {
@@ -130,6 +199,14 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
     return DispatchHashRead(op);
   }
 
+  // Set/zset scalar reads go through the uniform overlay (buffer first, then
+  // cold-with-deadline) so the buffer tier is never skipped (ENGINE-2).
+  if (IsCollectionScalarRead(op)) {
+    return MergeCollectionScalar(op);
+  }
+
+  // Remaining shapes (string GET, full-collection scans): the buffer answers
+  // string reads via the StringGet fast path; scans defer to cold.
   if (!key.empty()) {
     auto buffer_result = buffer_router_.Read(key);
     if (buffer_result.has_value()) {
@@ -138,7 +215,7 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
     }
   }
 
-  auto cold_result = cold_store_.Exec(op);
+  auto cold_result = ColdExec(op);
   if (cold_result.has_value() && !cold_result->IsNull()) {
     hits_cold_.Increment();
     if (!key.empty()) {
@@ -153,6 +230,12 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyRead(const core::o
 bool TieringEngine::WaitForBufferConsistency(std::string_view key) {
   if (key.empty()) return true;
   const auto shard = core::ComputeShard(key, config_.shard_count);
+  // HighestSettledSeq is now the applied FLOOR (HOTC-7): min(highest_applied,
+  // oldest_pending_conditional - 1). A floor of 0 means nothing has settled yet
+  // on this shard (fresh shard, or the oldest pending conditional is still
+  // unresolved at seq 1), so there is no settled hot state the buffer could
+  // lag — skipping the wait is correct. The floor never advances past an
+  // unresolved conditional, so a non-zero target is a real catch-up point.
   const auto target_seq = hot_progress_.HighestSettledSeq(shard);
   if (target_seq == 0) return true;
   if (buffer_router_.WaitForDrainedSeq(shard, target_seq,
@@ -190,7 +273,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
     case consumer::HashOverlay::Kind::kWrongType:
       return WrongType();
     case consumer::HashOverlay::Kind::kNotPresent: {
-      auto cold = cold_store_.Exec(op);
+      auto cold = ColdExec(op);
       if (cold.has_value()) {
         if (cold->IsNull()) {
           misses_.Increment();
@@ -217,7 +300,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
       return core::RespValue::BulkString(it->second);
     }
     touched_cold = true;
-    auto r = cold_store_.Exec(op);
+    auto r = ColdExec(op);
     record_outcome(r);
     return r;
   }
@@ -232,7 +315,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
       return core::RespValue::Integer(1);
     }
     touched_cold = true;
-    auto r = cold_store_.Exec(op);
+    auto r = ColdExec(op);
     record_outcome(r);
     return r;
   }
@@ -251,7 +334,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
         continue;
       }
       touched_cold = true;
-      auto cold_one = cold_store_.Exec(core::ops::ReadOp{core::ops::HashGet{
+      auto cold_one = ColdExec(core::ops::ReadOp{core::ops::HashGet{
           .key = hmget->key,
           .field = field,
       }});
@@ -269,7 +352,7 @@ core::Result<core::RespValue> TieringEngine::DispatchHashRead(const core::ops::R
 
   // Full-collection reads: take cold's HGETALL and apply the overlay.
   touched_cold = true;
-  auto cold_all = cold_store_.Exec(core::ops::ReadOp{core::ops::HashGetAll{.key = key}});
+  auto cold_all = ColdExec(core::ops::ReadOp{core::ops::HashGetAll{.key = key}});
   if (!cold_all.has_value()) return std::unexpected(cold_all.error());
   auto merged = DecodeColdHashMap(*cold_all);
   for (const auto& removed : overlay.removed_fields) {
@@ -381,7 +464,7 @@ core::Result<bool> TieringEngine::ProbeKeyExists(std::string_view key) {
       break;
   }
 
-  auto cold = cold_store_.Exec(core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
+  auto cold = ColdExec(core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
   if (!cold.has_value()) {
     if (cold.error().code() == core::ErrorCode::kNotFound) return false;
     return std::unexpected(cold.error());

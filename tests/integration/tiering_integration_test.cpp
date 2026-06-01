@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -443,6 +444,62 @@ TEST(TieringIntegrationTimeoutTest, CollectionReadTimesOutWhenColdConsumerWedged
   ASSERT_TRUE(result->IsError());
   EXPECT_GE(elapsed, kTimeout);
   EXPECT_EQ(harness.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
+}
+
+// COLD-3 coupling: ZRANGEBYLEX must return byte-identical results whether the
+// zset is served from hot or, after eviction, from cold — across a battery of
+// lex bounds. Guards the hot/cold view-equivalence the COLD-3 bundle requires.
+TEST_F(TieringIntegrationTest, ZrangeByLexHotColdEquivalence) {
+  static constexpr const char* kKey = "z";
+  // Equal scores so the order is purely lexicographic.
+  ASSERT_TRUE(harness_.SeedHot({"ZADD", kKey, "0", "a", "0", "b", "0", "c", "0", "d"}).has_value());
+
+  struct Case {
+    const char* min;
+    const char* max;
+  };
+  // ZRANGEBYLEX has no REV option in Redis (REV lives on the unified ZRANGE);
+  // the by_lex rev path is covered by the hot/cold unit tests.
+  const std::vector<Case> cases = {
+      {"[b", "(d"}, {"-", "+"}, {"(a", "[c"}, {"[a", "[d"}, {"[x", "[z"},  // empty slice
+      {"(d", "[a"},                                                        // empty (min > max)
+  };
+
+  // Order-preserving projection of a ZRANGEBYLEX reply to member strings.
+  auto to_members = [](const core::RespValue& v) {
+    std::vector<std::string> out;
+    for (const auto& e : v.AsArray()) out.push_back(e.AsString());
+    return out;
+  };
+  auto run = [&](const Case& c) {
+    return harness_.Engine().DispatchRead(
+        "ZRANGEBYLEX",
+        core::RespCommand{.args = std::vector<std::string>{"ZRANGEBYLEX", kKey, c.min, c.max}});
+  };
+
+  std::vector<std::vector<std::string>> hot_results;
+  hot_results.reserve(cases.size());
+  for (const auto& c : cases) {
+    auto r = run(c);
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    hot_results.push_back(to_members(*r));
+  }
+
+  // Flush the zset to cold, then evict it from hot so the same reads now route
+  // through the cold tier via the overlay.
+  const auto shard = core::ComputeShard(kKey, testing::IntegrationHarness::kShardCount);
+  auto& cold_consumer = harness_.ColdPool().ConsumerFor(shard);
+  cold_consumer.Drain();
+  cold_consumer.FlushUnscheduled();
+  harness_.Clock().Advance(48h);
+  ASSERT_GE(harness_.ShardedHot().EvictExpired(harness_.Clock().SteadyNow()).Total(), 1U);
+
+  for (size_t i = 0; i < cases.size(); ++i) {
+    auto cold = run(cases[i]);
+    ASSERT_TRUE(cold.has_value()) << cold.error().message();
+    EXPECT_EQ(to_members(*cold), hot_results[i])
+        << "hot/cold ZRANGEBYLEX divergence for [" << cases[i].min << ", " << cases[i].max << "]";
+  }
 }
 
 }  // namespace

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -599,6 +600,112 @@ TEST_F(CollectionsFixture, MixedBatchLandsAllOps) {
   EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "set"})->AsInteger(), 2);
   EXPECT_EQ(store->Exec(core::ops::ZsetScore{.key = "zset", .member = "m"})->AsString(), "1");
   EXPECT_EQ(store->Exec(core::ops::HashGet{.key = "hash", .field = "f"})->AsString(), "fv");
+}
+
+// --- COLD-3: ZRANGEBYLEX bounds --------------------------------------------
+
+TEST_F(CollectionsFixture, ZrangeByLexAppliesInclusiveAndExclusiveBounds) {
+  auto store = OpenStore();
+  std::string key = "z";
+  // Equal scores so the order is purely lexicographic (Redis ZRANGEBYLEX).
+  std::vector<core::ops::ZsetAdd::Entry> entries = {
+      {.score = 0.0, .member = "a"},
+      {.score = 0.0, .member = "b"},
+      {.score = 0.0, .member = "c"},
+      {.score = 0.0, .member = "d"},
+  };
+  std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+
+  // [b (d -> {b, c}.
+  auto r1 = store->Exec(core::ops::ZsetRange{.key = key, .min = "[b", .max = "(d", .by_lex = true});
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(ArrayToStrings(*r1), (std::vector<std::string>{"b", "c"}));
+
+  // - + -> all.
+  auto r2 = store->Exec(core::ops::ZsetRange{.key = key, .min = "-", .max = "+", .by_lex = true});
+  ASSERT_TRUE(r2.has_value());
+  EXPECT_EQ(ArrayToStrings(*r2), (std::vector<std::string>{"a", "b", "c", "d"}));
+
+  // (a [c -> {b, c}.
+  auto r3 = store->Exec(core::ops::ZsetRange{.key = key, .min = "(a", .max = "[c", .by_lex = true});
+  ASSERT_TRUE(r3.has_value());
+  EXPECT_EQ(ArrayToStrings(*r3), (std::vector<std::string>{"b", "c"}));
+}
+
+TEST_F(CollectionsFixture, ZrangeByLexEmptyReversedAndMalformedBounds) {
+  auto store = OpenStore();
+  std::string key = "z";
+  std::vector<core::ops::ZsetAdd::Entry> entries = {
+      {.score = 0.0, .member = "a"},
+      {.score = 0.0, .member = "b"},
+      {.score = 0.0, .member = "c"},
+      {.score = 0.0, .member = "d"},
+  };
+  std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+
+  // min lexically > max -> empty.
+  auto empty =
+      store->Exec(core::ops::ZsetRange{.key = key, .min = "[d", .max = "[a", .by_lex = true});
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_TRUE(empty->AsArray().empty());
+
+  // rev reverses the lex slice.
+  auto rev = store->Exec(
+      core::ops::ZsetRange{.key = key, .min = "-", .max = "+", .by_lex = true, .rev = true});
+  ASSERT_TRUE(rev.has_value());
+  ASSERT_EQ(rev->AsArray().size(), 4U);
+  EXPECT_EQ(rev->AsArray()[0].AsString(), "d");
+  EXPECT_EQ(rev->AsArray()[3].AsString(), "a");
+
+  // offset/count narrow within the lex slice.
+  auto narrowed = store->Exec(core::ops::ZsetRange{
+      .key = key, .min = "-", .max = "+", .by_lex = true, .offset = 1, .count = 2});
+  ASSERT_TRUE(narrowed.has_value());
+  ASSERT_EQ(narrowed->AsArray().size(), 2U);
+  EXPECT_EQ(narrowed->AsArray()[0].AsString(), "b");
+  EXPECT_EQ(narrowed->AsArray()[1].AsString(), "c");
+
+  // A bare value with no [ or ( prefix is a clean error, never a throw.
+  auto bad = store->Exec(core::ops::ZsetRange{.key = key, .min = "b", .max = "+", .by_lex = true});
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+// --- COLD-2: scan deadline --------------------------------------------------
+
+TEST_F(CollectionsFixture, ScanHandlersHonorGenerousDeadline) {
+  auto store = OpenStore();
+  std::string key = "s";
+  std::vector<std::string> members = {"a", "b", "c"};
+  std::vector<std::string_view> views(members.begin(), members.end());
+  std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+
+  // A generous deadline returns the full result.
+  auto full = store->Exec(core::ops::SetMembers{.key = key}, std::chrono::milliseconds{1000});
+  ASSERT_TRUE(full.has_value());
+  EXPECT_EQ(ArrayToStrings(*full), (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST_F(CollectionsFixture, LargeCollectionScanAbortsOnZeroDeadline) {
+  auto store = OpenStore();
+  std::string key = "big";
+  // A large set so the scan does real iterator work and the elapsed deadline is
+  // checked at iterator-step granularity.
+  std::vector<std::string> members;
+  members.reserve(5000);
+  for (int i = 0; i < 5000; ++i) members.push_back("member_" + std::to_string(i));
+  std::vector<std::string_view> views(members.begin(), members.end());
+  std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+
+  // An already-elapsed deadline (zero) fails closed at the Exec guard with
+  // kTimeout — the scan is bounded, never unbounded (COLD-2 / invariant 5).
+  auto timed_out = store->Exec(core::ops::SetMembers{.key = key}, std::chrono::milliseconds{0});
+  ASSERT_FALSE(timed_out.has_value());
+  EXPECT_EQ(timed_out.error().code(), core::ErrorCode::kTimeout);
 }
 
 }  // namespace

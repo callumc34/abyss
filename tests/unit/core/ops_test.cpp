@@ -41,6 +41,77 @@ TEST(ParseReadOpTest, RejectsUnknownCommand) {
   ASSERT_FALSE(op.has_value());
 }
 
+TEST(ParseReadOpTest, ZrangePlainIsIndexMode) {
+  RespCommand cmd{{"ZRANGE", "z", "0", "-1"}};
+  auto op = ParseReadOp("ZRANGE", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* zr = std::get_if<ZsetRange>(&*op);
+  ASSERT_NE(zr, nullptr);
+  EXPECT_EQ(zr->key, "z");
+  EXPECT_EQ(zr->min, "0");
+  EXPECT_EQ(zr->max, "-1");
+  EXPECT_FALSE(zr->by_score);
+  EXPECT_FALSE(zr->by_lex);
+}
+
+TEST(ParseReadOpTest, ZrangeByScoreFlagAndWithScores) {
+  RespCommand cmd{{"ZRANGE", "z", "1", "3", "BYSCORE", "WITHSCORES"}};
+  auto op = ParseReadOp("ZRANGE", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* zr = std::get_if<ZsetRange>(&*op);
+  ASSERT_NE(zr, nullptr);
+  EXPECT_TRUE(zr->by_score);
+  EXPECT_FALSE(zr->by_lex);
+  EXPECT_TRUE(zr->with_scores);
+}
+
+TEST(ParseReadOpTest, ZrangeByLexWithLimitAndRev) {
+  RespCommand cmd{{"ZRANGE", "z", "[a", "(c", "BYLEX", "REV", "LIMIT", "1", "2"}};
+  auto op = ParseReadOp("ZRANGE", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* zr = std::get_if<ZsetRange>(&*op);
+  ASSERT_NE(zr, nullptr);
+  EXPECT_TRUE(zr->by_lex);
+  EXPECT_FALSE(zr->by_score);
+  EXPECT_TRUE(zr->rev);
+  EXPECT_EQ(zr->offset, 1);
+  EXPECT_EQ(zr->count, 2);
+}
+
+TEST(ParseReadOpTest, ZrangeByScoreCommandSetsByScore) {
+  RespCommand cmd{{"ZRANGEBYSCORE", "z", "-inf", "+inf"}};
+  auto op = ParseReadOp("ZRANGEBYSCORE", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* zr = std::get_if<ZsetRange>(&*op);
+  ASSERT_NE(zr, nullptr);
+  EXPECT_TRUE(zr->by_score);
+  EXPECT_FALSE(zr->by_lex);
+}
+
+TEST(ParseReadOpTest, ZrangeByLexCommandSetsByLex) {
+  RespCommand cmd{{"ZRANGEBYLEX", "z", "[b", "(d"}};
+  auto op = ParseReadOp("ZRANGEBYLEX", cmd);
+  ASSERT_TRUE(op.has_value());
+  auto* zr = std::get_if<ZsetRange>(&*op);
+  ASSERT_NE(zr, nullptr);
+  EXPECT_TRUE(zr->by_lex);
+  EXPECT_FALSE(zr->by_score);
+  EXPECT_EQ(zr->min, "[b");
+  EXPECT_EQ(zr->max, "(d");
+}
+
+TEST(ParseReadOpTest, ZrangeBySCoreAndByLexMutuallyExclusive) {
+  RespCommand cmd{{"ZRANGE", "z", "0", "1", "BYSCORE", "BYLEX"}};
+  auto op = ParseReadOp("ZRANGE", cmd);
+  EXPECT_FALSE(op.has_value());
+}
+
+TEST(ParseReadOpTest, ZrangeLimitRequiresTwoArgs) {
+  RespCommand cmd{{"ZRANGE", "z", "0", "1", "LIMIT", "5"}};
+  auto op = ParseReadOp("ZRANGE", cmd);
+  EXPECT_FALSE(op.has_value());
+}
+
 TEST(ParseWriteOpTest, ParsesSet) {
   RespCommand cmd{{"SET", "k", "v"}};
   auto op = ParseWriteOp("SET", cmd);

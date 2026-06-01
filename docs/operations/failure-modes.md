@@ -11,6 +11,7 @@
 | Poisoned cold flush batch | A structurally-undecodable op (`kCorruption`/`kInvalidArgument`) cannot be applied. The batch is reinserted and the loop backs off (capped exponential) instead of busy-spinning a core. The shard's WAL stays pinned below the poison. | Inspect `abyss_cold_consumer_backoff_total{reason="poisoned"}` and the `cold apply batch poisoned` CRITICAL log. Operator intervention required to clear the bad entry. |
 | Queue WAL PVC full | Queue `Append()` fails. Writes return Redis errors to clients. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). |
 | Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
+| Cold scan exceeds the scan deadline | A large `SMEMBERS`/`ZRANGE`/`HGETALL` served from cold could not complete within `cold_scan_deadline`. The read fails closed with a timeout error to the client rather than returning a silently truncated result. | Inspect `abyss_cold_scan_deadline_exceeded_total`. Raise `cold_scan_deadline` for workloads with large cold-resident collections, or address the cold-volume I/O pressure (compaction, disk) that slowed the scan. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
 | Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
 | Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). With any retention `fsync_policy` this is a **refuse-to-start** condition — a persisted ack could outrun durable storage, violating "no OK for a lost write". | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk). As a deliberate, durability-disabling override, set `fsync_policy: none`. Watch `abyss_fs_durable_dir_supported`. |
@@ -95,6 +96,32 @@ This is fail-closed (invariant 5): a failed or slow checkpoint **pins** the ack 
 
 - **Metrics to watch:** `abyss_cold_checkpoint_total{status}` (success/failure), `abyss_cold_checkpoint_duration_seconds` (fsync cost), `abyss_cold_checkpoint_interval_seconds` (observed cadence — confirms the bound is being honoured), and `abyss_cold_consumer_backoff_total{reason}` (idle/poisoned/backpressure loop backoff).
 - A rising checkpoint interval or duration is the early signal that the cold volume's fsync is becoming a throughput bottleneck before the WAL fills.
+
+## Cold Read Deadline (Point Reads and Scans)
+
+Every read served from the cold tier carries a finite deadline, so a cold read can never block a
+reactor thread unboundedly under disk pressure or for a pathologically large key (invariant 5).
+The bound is enforced inside the storage engine (`rocksdb::ReadOptions::deadline`), so it covers
+both point reads and prefix scans — not just an ad-hoc wrapper.
+
+There are two knobs because the two access shapes have different latency budgets:
+
+- `cold_read_deadline` (default **5ms**) bounds cold **point reads** (GET/SISMEMBER/ZSCORE/HGET/
+  HMGET/HEXISTS/SCARD/ZCARD/EXISTS). This is the ADP-003 <5ms p99 cold-read SLA.
+- `cold_scan_deadline` (default **50ms**) bounds cold **collection scans** (SMEMBERS/ZRANGE/
+  HGETALL/HKEYS/HVALS), whose latency scales with cardinality. Set it generously enough to serve
+  your largest cold-resident collection.
+
+This is fail-closed, not best-effort truncation: a scan that overruns its deadline returns a
+timeout **error** to the client and increments `abyss_cold_scan_deadline_exceeded_total` — it
+never returns a partial/silently-capped array that the client would mistake for the full set.
+
+- **Metric to watch:** `abyss_cold_scan_deadline_exceeded_total`. A non-zero, rising rate means a
+  legitimately-large collection is being capped by the deadline.
+- **Tuning:** raise `cold_scan_deadline` for workloads with large cold collections, or relieve
+  the cold-volume I/O pressure (compaction backlog, slow disk) that is slowing the scan. The
+  deadline is best-effort at iterator-step granularity, so a single very large SST block read can
+  overshoot slightly; size the deadline with margin rather than at the exact p99.
 
 ## Hot Consumer Stall
 

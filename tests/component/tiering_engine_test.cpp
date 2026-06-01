@@ -397,6 +397,163 @@ TEST_F(TieringEngineTest, HexistsBufferRemovedFieldReturnsZero) {
   EXPECT_EQ(result->AsInteger(), 0);
 }
 
+// --- ENGINE-2: uniform overlay for set/zset SCALAR reads --------------------
+
+TEST_F(TieringEngineTest, ScardReadsBufferDeltaNotStaleCold) {
+  auto engine = MakeEngine();
+  // The set was flushed to cold with {a,b,c}; a partial SREM landed only in the
+  // buffer. The buffer overlay must win: SCARD reflects 2, not cold's 3.
+  buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"a", "b", "c"}}},
+                 core::EvictionTTL{86400});
+  buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // Cold must NOT be consulted: the buffer answers authoritatively.
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchRead("SCARD", MakeCmd({"SCARD", "s"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 2);
+}
+
+TEST_F(TieringEngineTest, SismemberReflectsBufferedRemoval) {
+  auto engine = MakeEngine();
+  buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"a", "b"}}},
+                 core::EvictionTTL{86400});
+  buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .Times(2)
+      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto present = engine.DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "s", "a"}));
+  ASSERT_TRUE(present.has_value());
+  EXPECT_EQ(present->AsInteger(), 1);
+  auto removed = engine.DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "s", "b"}));
+  ASSERT_TRUE(removed.has_value());
+  EXPECT_EQ(removed->AsInteger(), 0);
+}
+
+TEST_F(TieringEngineTest, ZsetScalarBufferOverridesColdResidual) {
+  auto engine = MakeEngine();
+  // ZADD then ZREM only in the buffer: ZSCORE is nil and ZCARD is 0.
+  buffer_.Absorb("z",
+                 core::ops::WriteOp{
+                     core::ops::ZsetAdd{.key = "z", .entries = {{.score = 1.0, .member = "m"}}}},
+                 core::EvictionTTL{86400});
+  buffer_.Absorb("z", core::ops::WriteOp{core::ops::ZsetRem{.key = "z", .members = {"m"}}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .Times(2)
+      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto score = engine.DispatchRead("ZSCORE", MakeCmd({"ZSCORE", "z", "m"}));
+  ASSERT_TRUE(score.has_value());
+  EXPECT_TRUE(score->IsNull());
+  auto card = engine.DispatchRead("ZCARD", MakeCmd({"ZCARD", "z"}));
+  ASSERT_TRUE(card.has_value());
+  EXPECT_EQ(card->AsInteger(), 0);
+}
+
+TEST_F(TieringEngineTest, CollectionScalarBufferMissFallsThroughToCold) {
+  auto engine = MakeEngine();
+  // No buffer entry for the key: each scalar shape falls through to cold.
+  EXPECT_CALL(hot_, Exec(_, _))
+      .Times(4)
+      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _))
+      .WillOnce(Return(core::RespValue::Integer(3)))         // SCARD
+      .WillOnce(Return(core::RespValue::Integer(1)))         // SISMEMBER
+      .WillOnce(Return(core::RespValue::BulkString("2.5")))  // ZSCORE
+      .WillOnce(Return(core::RespValue::Integer(5)));        // ZCARD
+
+  EXPECT_EQ(engine.DispatchRead("SCARD", MakeCmd({"SCARD", "s"}))->AsInteger(), 3);
+  EXPECT_EQ(engine.DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "s", "x"}))->AsInteger(), 1);
+  EXPECT_EQ(engine.DispatchRead("ZSCORE", MakeCmd({"ZSCORE", "z", "m"}))->AsString(), "2.5");
+  EXPECT_EQ(engine.DispatchRead("ZCARD", MakeCmd({"ZCARD", "z"}))->AsInteger(), 5);
+}
+
+TEST_F(TieringEngineTest, CollectionScalarWrongTypeFromBufferShortCircuits) {
+  auto engine = MakeEngine();
+  // Buffer holds a string for "k"; SCARD must surface WRONGTYPE without cold.
+  buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
+                 core::EvictionTTL{86400});
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+
+  auto result = engine.DispatchRead("SCARD", MakeCmd({"SCARD", "k"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->IsError());
+}
+
+// --- COLD-2 + ENGINE-2 coherence: cold scalar read carries the deadline -----
+
+TEST_F(TieringEngineTest, CollectionScalarColdReadCarriesPointReadDeadline) {
+  TieringEngineConfig cfg{.shard_count = kShardCount,
+                          .write_timeout = kWriteTimeout,
+                          .cold_read_deadline = 5ms,
+                          .cold_scan_deadline = 50ms};
+  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // The scalar read routed to cold must carry the point-read deadline (COLD-2):
+  // a deadline-bounded read, never an unbounded one.
+  EXPECT_CALL(cold_, Exec(_, std::optional<core::Duration>(5ms)))
+      .WillOnce(Return(core::RespValue::Integer(7)));
+
+  auto result = engine.DispatchRead("SCARD", MakeCmd({"SCARD", "s"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsInteger(), 7);
+}
+
+TEST_F(TieringEngineTest, CollectionScanColdReadCarriesScanDeadline) {
+  TieringEngineConfig cfg{.shard_count = kShardCount,
+                          .write_timeout = kWriteTimeout,
+                          .cold_read_deadline = 5ms,
+                          .cold_scan_deadline = 50ms};
+  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // A full-collection scan (SMEMBERS) gets the larger scan deadline.
+  EXPECT_CALL(cold_, Exec(_, std::optional<core::Duration>(50ms)))
+      .WillOnce(Return(core::RespValue::Array(
+          {core::RespValue::BulkString("a"), core::RespValue::BulkString("b")})));
+
+  auto result = engine.DispatchRead("SMEMBERS", MakeCmd({"SMEMBERS", "s"}));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->IsArray());
+  EXPECT_EQ(result->AsArray().size(), 2U);
+}
+
+TEST_F(TieringEngineTest, ColdScanDeadlineExceededSurfacesErrorNotPartial) {
+  TieringEngineConfig cfg{.shard_count = kShardCount,
+                          .write_timeout = kWriteTimeout,
+                          .cold_read_deadline = 5ms,
+                          .cold_scan_deadline = 50ms};
+  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
+
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  // Cold fails closed with a timeout on a large scan. The engine surfaces the
+  // error to the client, never a silently truncated array (decision 4).
+  EXPECT_CALL(cold_, Exec(_, std::optional<core::Duration>(50ms)))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kTimeout, "scan deadline"))));
+
+  auto result = engine.DispatchRead("SMEMBERS", MakeCmd({"SMEMBERS", "big"}));
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
+}
+
 // --- Write path ---
 
 TEST_F(TieringEngineTest, WriteSuccessReturnsConsumerResult) {

@@ -35,6 +35,20 @@ struct TieringEngineConfig {
   // How long DispatchHashRead waits for the cold consumer to catch up to hot
   // before consulting the buffer overlay.
   std::chrono::milliseconds buffer_consistency_wait_timeout{100};
+
+  // Deadline carried into every cold point-read at the engine→cold edge. The
+  // 5ms default is the ADP-003 <5ms p99 cold-read SLA: a point read that cannot
+  // be served within the bound fails closed (kTimeout) rather than blocking a
+  // reactor thread (invariant 5).
+  std::chrono::milliseconds cold_read_deadline{5};
+
+  // Deadline carried into cold collection scans (SMEMBERS/ZRANGE/HGETALL/…).
+  // Scans over a large cold-resident collection legitimately take longer than a
+  // point read, so this knob is separate and larger; operators tune it for
+  // their largest collections. A scan that exceeds it surfaces a deadline error
+  // and the cold-scan-deadline-exceeded metric — never a silently truncated
+  // result (decision 4 / invariant 5). See docs/operations/failure-modes.md.
+  std::chrono::milliseconds cold_scan_deadline{50};
 };
 
 struct TieringEngineMetrics {
@@ -72,6 +86,27 @@ class TieringEngine : public core::CommandDispatcher {
   void PromoteThroughQueue(std::string_view key);
   core::Result<core::RespValue> DispatchHashRead(const core::ops::ReadOp& op);
   core::Result<core::RespValue> DispatchSingleKeyRead(const core::ops::ReadOp& op);
+
+  // Uniform Hot → Buffer → Cold overlay for set/zset SCALAR reads
+  // (SISMEMBER/SCARD/ZSCORE/ZCARD): the buffer overlay (Exec) is consulted
+  // FIRST so a buffered partial SREM/ZREM against a cold-resident collection
+  // wins (read-after-write), and a true buffer miss (kNotFound) falls through
+  // to cold WITH the cold-read deadline. No collection read shape may skip the
+  // buffer tier (ADP-006 invariant 1 — fixes ENGINE-2). The caller has already
+  // gated on WaitForBufferConsistency.
+  core::Result<core::RespValue> MergeCollectionScalar(const core::ops::ReadOp& op);
+
+  // Cold deadline appropriate to the op shape: scans (SMEMBERS/ZRANGE/HGETALL/
+  // HKEYS/HVALS) get cold_scan_deadline, everything else the cold_read_deadline
+  // point-read SLA. Threaded into every engine→cold Exec so no cold path is
+  // unbounded (COLD-2).
+  core::Duration ColdDeadlineFor(const core::ops::ReadOp& op) const;
+
+  // The single engine→cold read edge: runs cold_store_.Exec with the
+  // shape-appropriate deadline (COLD-2). A deadline-exceeded scan (kTimeout)
+  // bumps the cold-scan-deadline-exceeded metric and surfaces the error
+  // verbatim — never a silently truncated partial result (decision 4).
+  core::Result<core::RespValue> ColdExec(const core::ops::ReadOp& op);
   core::Result<core::RespValue> DispatchSingleKeyWrite(core::RespCommand cmd);
 
   core::Result<core::RespValue> FanOutMget(const core::RespCommand& cmd);
@@ -112,6 +147,7 @@ class TieringEngine : public core::CommandDispatcher {
   metrics::CounterHandle hits_cold_;
   metrics::CounterHandle misses_;
   metrics::CounterHandle promotions_;
+  metrics::CounterHandle cold_scan_deadline_exceeded_;
 };
 
 }  // namespace abyss::engine

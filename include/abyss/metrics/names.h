@@ -494,6 +494,17 @@ inline constexpr CounterDesc<> kPromotionsTotal{
     .help = "Cold hits promoted back to the hot store.",
 };
 
+// A cold collection scan (SMEMBERS/ZRANGE/HGETALL/HKEYS/HVALS) exceeded the
+// configured cold_scan_deadline and was failed closed with a deadline error
+// rather than returning a silently truncated result. A rising rate means a
+// legitimately large collection is being capped — operators tune
+// cold_scan_deadline. See docs/operations/failure-modes.md (decision 4 /
+// invariant 5).
+inline constexpr CounterDesc<> kColdScanDeadlineExceededTotal{
+    .name = "abyss_cold_scan_deadline_exceeded_total",
+    .help = "Cold collection scans aborted because they exceeded the cold-scan deadline.",
+};
+
 inline constexpr GaugeDesc<> kNetConnectionsActive{
     .name = "abyss_net_connections_active",
     .help = "Currently open TCP connections.",

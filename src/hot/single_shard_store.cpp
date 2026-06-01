@@ -65,6 +65,45 @@ core::Result<int64_t> ParseIndexBound(std::string_view s, int64_t empty_default)
   return value;
 }
 
+// A parsed ZRANGEBYLEX bound. Redis lex syntax: `[value` (inclusive), `(value`
+// (exclusive), `-` (negative infinity), `+` (positive infinity). A bare value
+// with no prefix is a syntax error. Total and non-throwing — it never inspects
+// a numeric conversion, so it follows C11's from_chars/Result discipline by
+// surfacing malformed input as a clean error rather than unwinding.
+struct LexBound {
+  std::string value;
+  bool exclusive = false;
+  bool neg_inf = false;
+  bool pos_inf = false;
+};
+
+core::Result<LexBound> ParseLexBound(std::string_view s) {
+  if (s == "-") return LexBound{.neg_inf = true};
+  if (s == "+") return LexBound{.pos_inf = true};
+  if (!s.empty() && s.front() == '[') {
+    return LexBound{.value = std::string(s.substr(1)), .exclusive = false};
+  }
+  if (!s.empty() && s.front() == '(') {
+    return LexBound{.value = std::string(s.substr(1)), .exclusive = true};
+  }
+  return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument,
+                                     "not a valid lex range bound: '" + std::string(s) + "'"));
+}
+
+// True iff `member` is at or above the lex lower bound `min`.
+bool LexAtOrAboveMin(std::string_view member, const LexBound& min) {
+  if (min.neg_inf) return true;
+  if (min.pos_inf) return false;
+  return min.exclusive ? member > min.value : member >= min.value;
+}
+
+// True iff `member` is at or below the lex upper bound `max`.
+bool LexAtOrBelowMax(std::string_view member, const LexBound& max) {
+  if (max.pos_inf) return true;
+  if (max.neg_inf) return false;
+  return max.exclusive ? member < max.value : member <= max.value;
+}
+
 // The single key a read op targets, or nullopt for the multi-key Exists probe
 // (which resolves presence per key rather than producing one shaped reply).
 std::optional<std::string_view> SingleKeyOf(const core::ops::ReadOp& op) {
@@ -278,7 +317,35 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
   const auto& zset = std::get<ZsetValue>((*result)->value);
   std::vector<core::RespValue> elements;
 
-  if (op.by_score) {
+  if (op.by_lex) {
+    auto min_parsed = ParseLexBound(op.min);
+    if (!min_parsed.has_value()) return std::unexpected(min_parsed.error());
+    auto max_parsed = ParseLexBound(op.max);
+    if (!max_parsed.has_value()) return std::unexpected(max_parsed.error());
+
+    // Lex range is over member names in pure lexicographic order (Redis assumes
+    // equal scores). member_scores keys are the members; collect and sort so
+    // the order matches cold's member-indexed CF scan byte-for-byte.
+    std::vector<std::string_view> members;
+    members.reserve(zset.member_scores.size());
+    for (const auto& [member, score] : zset.member_scores) {
+      if (LexAtOrAboveMin(member, *min_parsed) && LexAtOrBelowMax(member, *max_parsed)) {
+        members.emplace_back(member);
+      }
+    }
+    std::ranges::sort(members);
+    if (op.rev) std::ranges::reverse(members);
+
+    int64_t start = std::max<int64_t>(op.offset, 0);
+    int64_t count = op.count < 0 ? static_cast<int64_t>(members.size()) : op.count;
+    if (std::cmp_less(start, members.size())) {
+      auto end = std::min(start + count, static_cast<int64_t>(members.size()));
+      for (int64_t i = start; i < end; ++i) {
+        elements.push_back(
+            core::RespValue::BulkString(std::string(members[static_cast<size_t>(i)])));
+      }
+    }
+  } else if (op.by_score) {
     auto min_parsed = ParseScoreBound(op.min, -std::numeric_limits<double>::infinity());
     if (!min_parsed.has_value()) return std::unexpected(min_parsed.error());
     auto max_parsed = ParseScoreBound(op.max, std::numeric_limits<double>::infinity());
@@ -789,6 +856,10 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::Ha
 core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Expire& op) {
   auto it = entries_.find(std::string(op.key));
   if (it == entries_.end()) return core::RespValue::Integer(0);
+  // A tombstone is logically absent (mirrors FindLiveEntry/Probe). EXPIRE on a
+  // deleted-but-not-yet-GC'd key returns 0 and must not resurrect or mutate the
+  // tombstone — the tombstone is reclaimed by GcTombstones, not by a TTL op.
+  if (it->second.tombstoned) return core::RespValue::Integer(0);
   if (IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
     return core::RespValue::Integer(0);
@@ -802,6 +873,8 @@ core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Exp
 core::Result<core::RespValue> SingleShardStore::ApplyPersist(const core::ops::Persist& op) {
   auto it = entries_.find(std::string(op.key));
   if (it == entries_.end()) return core::RespValue::Integer(0);
+  // A tombstone is logically absent: PERSIST returns 0 and leaves it untouched.
+  if (it->second.tombstoned) return core::RespValue::Integer(0);
   if (IsExpiredByTtl(it->second, config_.wall_clock)) {
     RemoveEntry(std::string(op.key));
     return core::RespValue::Integer(0);

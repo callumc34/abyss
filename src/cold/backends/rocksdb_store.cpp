@@ -68,6 +68,10 @@ ErrorCode MapStatusCode(const rocksdb::Status& status) {
   if (status.IsCorruption()) return ErrorCode::kCorruption;
   if (status.IsIOError()) return ErrorCode::kUnavailable;
   if (status.IsInvalidArgument()) return ErrorCode::kInvalidArgument;
+  // A read whose ReadOptions::deadline elapsed surfaces as TimedOut. Map it to
+  // kTimeout so the engine fails the scan closed and bumps the cold-scan
+  // deadline metric rather than treating it as an internal fault (COLD-2).
+  if (status.IsTimedOut()) return ErrorCode::kTimeout;
   return ErrorCode::kInternal;
 }
 
@@ -156,6 +160,42 @@ core::Result<ScoreBound> ParseScoreBound(std::string_view s, bool is_min) {
   }
   out.value = v;
   return out;
+}
+
+// Parsed ZRANGEBYLEX bound. Redis lex syntax: `[value` (inclusive), `(value`
+// (exclusive), `-` (negative infinity), `+` (positive infinity). A bare value
+// is a syntax error. Total and non-throwing, mirroring ParseScoreBound and the
+// hot-side ParseLexBound so cold and hot agree on validity bit-for-bit.
+struct LexBound {
+  std::string value;
+  bool exclusive = false;
+  bool neg_inf = false;
+  bool pos_inf = false;
+};
+
+core::Result<LexBound> ParseLexBound(std::string_view s) {
+  if (s == "-") return LexBound{.neg_inf = true};
+  if (s == "+") return LexBound{.pos_inf = true};
+  if (!s.empty() && s.front() == '[') {
+    return LexBound{.value = std::string(s.substr(1)), .exclusive = false};
+  }
+  if (!s.empty() && s.front() == '(') {
+    return LexBound{.value = std::string(s.substr(1)), .exclusive = true};
+  }
+  return std::unexpected(
+      Error(ErrorCode::kInvalidArgument, "not a valid lex range bound: '" + std::string(s) + "'"));
+}
+
+bool LexAtOrAboveMin(std::string_view member, const LexBound& min) {
+  if (min.neg_inf) return true;
+  if (min.pos_inf) return false;
+  return min.exclusive ? member > min.value : member >= min.value;
+}
+
+bool LexAtOrBelowMax(std::string_view member, const LexBound& max) {
+  if (max.pos_inf) return true;
+  if (max.neg_inf) return false;
+  return max.exclusive ? member < max.value : member <= max.value;
 }
 
 // Decodes a zset member-indexed value: 8 bytes of native-endian IEEE 754.
@@ -321,10 +361,14 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 
   core::Result<bool> AnyLiveRecord(std::string_view key) const;
 
-  // Generic prefix scan.
+  // Generic prefix scan. `deadline` (relative duration from now) is threaded
+  // into rocksdb::ReadOptions::deadline via MakeReadOptions so a scan over a
+  // large collection fails closed with a timeout rather than running unbounded
+  // (COLD-2 / invariant 5). nullopt leaves the scan unbounded (write path).
   template <typename Fn>
   core::Result<void> ScanPrefix(rocksdb::WriteBatchWithIndex* wb, rocksdb::ColumnFamilyHandle* cf,
-                                std::string_view prefix, const Fn& fn) const;
+                                std::string_view prefix, std::optional<core::Duration> deadline,
+                                const Fn& fn) const;
 };
 
 // --- Factory & lifecycle ----------------------------------------------------
@@ -685,8 +729,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetIsMember&
   return RespValue::Integer(1);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::SetMembers& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetMembers& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -695,7 +739,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   members.reserve((*meta)->cardinality);
   const auto prefix = fmt::SetMemberPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
-      nullptr, default_cf.get(), prefix,
+      nullptr, default_cf.get(), prefix, deadline,
       [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
         members.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
         return true;
@@ -737,8 +781,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::ZsetRange& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetRange& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -748,17 +792,24 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   ordered.reserve((*meta)->cardinality);
 
   if (op.by_lex) {
-    // Lex range on member names, using the member-indexed CF. Bounds: if min
-    // is empty, start at prefix; otherwise begin at the given member. Same
-    // for max.
+    // Lex range on member names, using the member-indexed CF (which iterates in
+    // pure member byte-lex order). The min/max [/(/-/+ bounds are applied per
+    // member so the slice matches the hot tier's ExecZsetRange by_lex branch.
+    auto min_bound = ParseLexBound(op.min);
+    if (!min_bound.has_value()) return std::unexpected(min_bound.error());
+    auto max_bound = ParseLexBound(op.max);
+    if (!max_bound.has_value()) return std::unexpected(max_bound.error());
+
     const auto prefix = fmt::ZsetMemberPrefix(op.key, config.shard_count);
     auto r =
-        ScanPrefix(nullptr, default_cf.get(), prefix,
+        ScanPrefix(nullptr, default_cf.get(), prefix, deadline,
                    [&](std::string_view full_key, std::string_view value) -> core::Result<bool> {
-                     auto m = std::string(full_key.substr(prefix.size()));
+                     auto member = full_key.substr(prefix.size());
+                     if (!LexAtOrAboveMin(member, *min_bound)) return true;
+                     if (!LexAtOrBelowMax(member, *max_bound)) return false;  // past upper, stop
                      auto s = DecodeZsetMemberScore(value);
                      if (!s.has_value()) return std::unexpected(s.error());
-                     ordered.emplace_back(std::move(m), *s);
+                     ordered.emplace_back(std::string(member), *s);
                      return true;
                    });
     if (!r.has_value()) return std::unexpected(r.error());
@@ -774,7 +825,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     // Each score-index key is: prefix || 8-byte sortable score || member.
     const auto score_offset = prefix.size();
     auto r = ScanPrefix(
-        nullptr, zset_score_idx_cf.get(), prefix,
+        nullptr, zset_score_idx_cf.get(), prefix, deadline,
         [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
           if (full_key.size() < score_offset + 8) {
             return std::unexpected(Error(ErrorCode::kCorruption, "zset score-index key too short"));
@@ -867,8 +918,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGet& op,
   return RespValue::BulkString(std::move(raw));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::HashGetAll& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGetAll& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -877,7 +928,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   pairs.reserve((*meta)->cardinality * 2);
   const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
-      nullptr, default_cf.get(), prefix,
+      nullptr, default_cf.get(), prefix, deadline,
       [&](std::string_view full_key, std::string_view value) -> core::Result<bool> {
         pairs.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
         pairs.push_back(RespValue::BulkString(std::string(value)));
@@ -929,8 +980,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashFieldExi
   return RespValue::Integer(1);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::HashKeys& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashKeys& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -939,7 +990,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   keys.reserve((*meta)->cardinality);
   const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
-      nullptr, default_cf.get(), prefix,
+      nullptr, default_cf.get(), prefix, deadline,
       [&](std::string_view full_key, std::string_view /*value*/) -> core::Result<bool> {
         keys.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
         return true;
@@ -948,8 +999,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   return RespValue::Array(std::move(keys));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::HashVals& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashVals& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
   if (!meta->has_value()) return RespValue::Array({});
@@ -958,7 +1009,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   vals.reserve((*meta)->cardinality);
   const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r =
-      ScanPrefix(nullptr, default_cf.get(), prefix,
+      ScanPrefix(nullptr, default_cf.get(), prefix, deadline,
                  [&](std::string_view /*full_key*/, std::string_view value) -> core::Result<bool> {
                    vals.push_back(RespValue::BulkString(std::string(value)));
                    return true;
@@ -1399,7 +1450,7 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
           Error(ErrorCode::kInternal, "IterateAndDeleteCollection: unknown inner type"));
   }
 
-  auto r = ScanPrefix(&wb, default_cf.get(), member_prefix,
+  auto r = ScanPrefix(&wb, default_cf.get(), member_prefix, std::nullopt,
                       [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
                         auto s = wb.Delete(default_cf.get(), ToSlice(full_key));
                         if (!s.ok())
@@ -1410,7 +1461,7 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
 
   if (inner_type == fmt::kTypeZsetMember) {
     const auto score_prefix = fmt::ZsetScoreIndexPrefix(key, config.shard_count);
-    auto zr = ScanPrefix(&wb, zset_score_idx_cf.get(), score_prefix,
+    auto zr = ScanPrefix(&wb, zset_score_idx_cf.get(), score_prefix, std::nullopt,
                          [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
                            auto s = wb.Delete(zset_score_idx_cf.get(), ToSlice(full_key));
                            if (!s.ok())
@@ -1756,10 +1807,12 @@ core::Result<bool> RocksdbStore::Impl::AnyLiveRecord(std::string_view key) const
 template <typename Fn>
 core::Result<void> RocksdbStore::Impl::ScanPrefix(rocksdb::WriteBatchWithIndex* wb,
                                                   rocksdb::ColumnFamilyHandle* cf,
-                                                  std::string_view prefix, const Fn& fn) const {
+                                                  std::string_view prefix,
+                                                  std::optional<core::Duration> deadline,
+                                                  const Fn& fn) const {
   std::string upper_storage = LexicographicSuccessor(prefix);
   rocksdb::Slice upper_slice(upper_storage);
-  rocksdb::ReadOptions ro;
+  rocksdb::ReadOptions ro = MakeReadOptions(deadline);
   if (!upper_storage.empty()) {
     ro.iterate_upper_bound = &upper_slice;
   }

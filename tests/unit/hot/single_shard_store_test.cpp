@@ -1009,5 +1009,141 @@ TEST_F(SingleShardStoreTest, GcReclaimsTombstoneFootprintAndPreservesLiveKeys) {
   EXPECT_EQ(r->AsString(), "v");
 }
 
+// --- HOT-4: EXPIRE/PERSIST on a tombstoned key ------------------------------
+
+TEST_F(SingleShardStoreTest, ExpireOnTombstonedKeyReturnsZeroNoMutation) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+  ASSERT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  auto r = store_.Apply(core::ops::WriteOp{core::ops::Expire{
+                            .key = "k", .abs_ttl_ms = static_cast<uint64_t>(now_ms + 100000)}},
+                        kEviction, 2);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 0) << "EXPIRE on a tombstone is a no-op returning 0";
+  // The tombstone is untouched: still tombstoned (not resurrected), GC reclaims
+  // it by horizon, and a read still falls through as absent.
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, PexpireatOnTombstonedKeyReturnsZero) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+
+  // PEXPIREAT parses to the same Expire write op as EXPIRE; both must no-op.
+  auto r =
+      store_.Apply(core::ops::WriteOp{core::ops::Expire{.key = "k", .abs_ttl_ms = 99999999999ULL}},
+                   kEviction, 2);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 0);
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, PersistOnTombstonedKeyReturnsZero) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+
+  auto r = store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 2);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 0) << "PERSIST on a tombstone is a no-op returning 0";
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, ExpirePersistOnTombstoneDoNotPerturbEvictionCounters) {
+  // HOT-7 split: EvictExpired skips tombstones before the count branch, so a
+  // tombstone routed through EXPIRE/PERSIST must not bleak into the ttl_expired
+  // vs deadline counters. Drive a tombstone through both ops, then EvictExpired
+  // and assert neither bucket counts the tombstone.
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Expire{.key = "k", .abs_ttl_ms = 1}}, kEviction, 2)
+          .has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 3).has_value());
+
+  clock_.Advance(1500ms);
+  auto report = store_.EvictExpired(clock_.SteadyNow());
+  EXPECT_EQ(report.by_ttl, 0U) << "tombstone is skipped, never counted as a TTL expiry";
+  EXPECT_EQ(report.by_deadline, 0U) << "tombstone is skipped, never counted as an eviction";
+  // The tombstone survives until GC, not the eviction deadline.
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, ExpirePersistAfterTombstoneGcStillAbsent) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 5).has_value());
+  // GC reclaims the tombstone (horizon >= tombstone_seq), so the key is now
+  // fully absent and the entries_.end() guard returns 0.
+  EXPECT_EQ(store_.GcTombstones(5), 1U);
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
+
+  auto e = store_.Apply(core::ops::WriteOp{core::ops::Expire{.key = "k", .abs_ttl_ms = 1}},
+                        kEviction, 6);
+  ASSERT_TRUE(e.has_value());
+  EXPECT_EQ(e->AsInteger(), 0);
+  auto p = store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 7);
+  ASSERT_TRUE(p.has_value());
+  EXPECT_EQ(p->AsInteger(), 0);
+}
+
+TEST_F(SingleShardStoreTest, ExpireOnLiveKeyStillReturnsOne) {
+  // Regression guard: the tombstone short-circuit must not affect live keys.
+  SetString("k", "v");
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  auto r = store_.Apply(core::ops::WriteOp{core::ops::Expire{
+                            .key = "k", .abs_ttl_ms = static_cast<uint64_t>(now_ms + 100000)}},
+                        kEviction, 1);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 1);
+}
+
+// --- COLD-3 coupling: hot ZRANGEBYLEX by_lex branch -------------------------
+
+TEST_F(SingleShardStoreTest, HotZrangeByLexAppliesBounds) {
+  // Equal scores so the order is purely lexicographic.
+  core::ops::ZsetAdd add{.key = "z",
+                         .entries = {{.score = 0.0, .member = "a"},
+                                     {.score = 0.0, .member = "b"},
+                                     {.score = 0.0, .member = "c"},
+                                     {.score = 0.0, .member = "d"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+
+  auto collect = [&](std::string_view min, std::string_view max, bool rev = false) {
+    auto r = store_.Exec(core::ops::ReadOp{
+        core::ops::ZsetRange{.key = "z", .min = min, .max = max, .by_lex = true, .rev = rev}});
+    EXPECT_TRUE(r.has_value());
+    std::vector<std::string> out;
+    for (const auto& e : r->AsArray()) out.push_back(e.AsString());
+    return out;
+  };
+
+  EXPECT_EQ(collect("[b", "(d"), (std::vector<std::string>{"b", "c"}));
+  EXPECT_EQ(collect("-", "+"), (std::vector<std::string>{"a", "b", "c", "d"}));
+  EXPECT_EQ(collect("(a", "[c"), (std::vector<std::string>{"b", "c"}));
+  EXPECT_EQ(collect("-", "+", /*rev=*/true), (std::vector<std::string>{"d", "c", "b", "a"}));
+}
+
+TEST_F(SingleShardStoreTest, HotZrangeByLexMalformedBoundIsCleanError) {
+  core::ops::ZsetAdd add{.key = "z", .entries = {{.score = 0.0, .member = "a"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+
+  // A bare value with no [ or ( prefix must surface a clean error, never throw.
+  auto r = store_.Exec(
+      core::ops::ReadOp{core::ops::ZsetRange{.key = "z", .min = "a", .max = "+", .by_lex = true}});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
 }  // namespace
 }  // namespace abyss::hot
