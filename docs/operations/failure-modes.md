@@ -7,6 +7,8 @@
 | Pod crash (embedded) | Hot store lost. WAL + cold store intact on PVC. | Pod restarts. Queue replay rebuilds hot store. Cold consumer catches up from its last ack point. |
 | Pod crash (external) | In-process orchestrator lost. External stores (Redis, Kafka, KVRocks) retain data. | Pod restarts, resumes queue consumption. |
 | Cold store PVC full | Cold consumer's `apply_batch()` fails. Cold consumer stalls. Queue grows. Eventually queue fills and writes fail. | Provision more cold storage. |
+| Cold store cannot fsync (checkpoint fails) | The cold consumer applies flushes to the memtable but `Checkpoint()` (durable WAL fsync) fails, so it does **not** advance its WAL ack — the WAL is retained, not reaped. No acked write is lost; the queue keeps growing until the fsync path recovers. | Inspect `abyss_cold_checkpoint_total{status="failure"}` and the cold-store volume. Resolve the I/O fault; the ack resumes advancing once a checkpoint succeeds. |
+| Poisoned cold flush batch | A structurally-undecodable op (`kCorruption`/`kInvalidArgument`) cannot be applied. The batch is reinserted and the loop backs off (capped exponential) instead of busy-spinning a core. The shard's WAL stays pinned below the poison. | Inspect `abyss_cold_consumer_backoff_total{reason="poisoned"}` and the `cold apply batch poisoned` CRITICAL log. Operator intervention required to clear the bad entry. |
 | Queue WAL PVC full | Queue `Append()` fails. Writes return Redis errors to clients. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). |
 | Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
@@ -80,6 +82,19 @@ If the cold consumer stalls (cold store I/O errors, bugs, resource exhaustion):
 - **Metric to watch:** `abyss_cold_buffer_oldest_entry_age_seconds` and `abyss_cold_consumer_lag_entries`.
 
 The cold consumer stall is the most insidious failure because it has no immediate client-visible impact. Writes succeed, reads work (from hot + buffer). The danger is delayed: if the buffer eventually exceeds its high-water mark, it switches to aggressive flush mode. If the stall persists long enough, the queue fills and writes fail.
+
+## Cold Durability Checkpoint
+
+"Cold acked seq N" means **N is on cold's stable storage AND N is past the durable WAL tail** — never merely "handed to RocksDB". The cold consumer makes this true with a two-phase write/checkpoint:
+
+- `ApplyBatch` is a cheap memtable write (`sync=false`); it does not fsync.
+- `Checkpoint` (`FlushWAL(sync=true)`) makes every prior batch durable. It fires on a **bounded cadence** — at most every `checkpoint_max_flushes` applied batches or `checkpoint_min_interval` — so a burst of small flushes amortises into one fsync rather than an fsync-per-batch storm (`F_FULLFSYNC` is expensive on macOS).
+- The cold WAL ack only advances to `min(low_water, last_checkpointed_seq, DurableSeq(shard))`. It can never outrun cold's own durable storage nor the durable WAL tail, so the segment reaper never releases WAL retention for data that is not yet durable on both tiers.
+
+This is fail-closed (invariant 5): a failed or slow checkpoint **pins** the ack (back-pressure), it does not silently advance.
+
+- **Metrics to watch:** `abyss_cold_checkpoint_total{status}` (success/failure), `abyss_cold_checkpoint_duration_seconds` (fsync cost), `abyss_cold_checkpoint_interval_seconds` (observed cadence — confirms the bound is being honoured), and `abyss_cold_consumer_backoff_total{reason}` (idle/poisoned/backpressure loop backoff).
+- A rising checkpoint interval or duration is the early signal that the cold volume's fsync is becoming a throughput bottleneck before the WAL fills.
 
 ## Hot Consumer Stall
 

@@ -22,10 +22,12 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -195,6 +197,12 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   // expiry on read or the active TtlScanner.
   mutable metrics::CounterHandle ttl_expired_total;
 
+  // Per-shard durable frontier recorded by Checkpoint. Guards the recorded
+  // value against concurrent ApplyBatch/Checkpoint from a single consumer; the
+  // cold ack is computed from the value Checkpoint returns, not read here.
+  std::mutex checkpoint_mu;
+  std::unordered_map<core::ShardId, core::SequenceId> checkpointed_seq;
+
   uint64_t NowMs() const { return WallMs(config.wall_clock); }
 
   // TtlScannerBackend.
@@ -204,8 +212,16 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 
   core::Result<RespValue> Exec(const core::ops::ReadOp& op,
                                std::optional<core::Duration> deadline) const;
-  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) const;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                core::SequenceId highest_wal_seq);
+  core::Result<void> Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq);
   core::Result<RespValue> ExecDel(const core::ops::Del& op) const;
+
+  // Writes a fully-built batch and fsyncs the WAL before returning, so the
+  // standalone-command write (ExecDel) is durable on return without relying on
+  // a later cold checkpoint. ApplyBatch deliberately does NOT route through
+  // this — its durability comes from the amortised checkpoint.
+  core::Result<void> WriteDurable(rocksdb::WriteBatch* batch, std::string_view context) const;
 
   // --- Read handlers -------------------------------------------------------
 
@@ -332,6 +348,12 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
   rocksdb::DBOptions db_opts;
   db_opts.create_if_missing = true;
   db_opts.create_missing_column_families = true;
+  // ApplyBatch writes the WAL with sync=false (memtable + RocksDB WAL buffer
+  // only); durability is established by an explicit FlushWAL(sync=true) in
+  // Checkpoint. manual_wal_flush keeps those sync=false writes out of the OS
+  // until the checkpoint, so a checkpoint is the single group-amortised fsync
+  // of the WAL tail rather than one fsync per micro-flush (A6 / XDUR-1).
+  db_opts.manual_wal_flush = true;
 
   const auto cf_opts = MakeCfOptions(config);
   const std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs{
@@ -376,6 +398,12 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
         impl->db->Put(rocksdb::WriteOptions(), impl->default_cf.get(), format_key, format_value);
     if (!status.ok()) {
       return std::unexpected(FromStatus(status, "RocksdbStore::Create: Put format version"));
+    }
+    // manual_wal_flush keeps the Put in the WAL buffer; flush+fsync it now so a
+    // crash before the first cold checkpoint can't lose the format marker.
+    status = impl->db->FlushWAL(/*sync=*/true);
+    if (!status.ok()) {
+      return std::unexpected(FromStatus(status, "RocksdbStore::Create: FlushWAL format version"));
     }
   } else {
     return std::unexpected(FromStatus(status, "RocksdbStore::Create: Get format version"));
@@ -425,8 +453,13 @@ core::Result<RespValue> RocksdbStore::Exec(const core::ops::ReadOp& op,
   return impl_->Exec(op, deadline);
 }
 
-core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
-  return impl_->ApplyBatch(ops);
+core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                            core::SequenceId highest_wal_seq) {
+  return impl_->ApplyBatch(ops, highest_wal_seq);
+}
+
+core::Result<void> RocksdbStore::Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq) {
+  return impl_->Checkpoint(shard, up_to_wal_seq);
 }
 
 core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
@@ -450,12 +483,9 @@ core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
     return std::unexpected(FromStatus(s, "Wipe: DeleteRange zset_score_idx_cf"));
   }
 
-  rocksdb::WriteOptions wo;
-  wo.sync = true;
-  // OptimisticTransactionDB hides DeleteRange/WriteBatch; go through the base DB.
-  auto status = impl_->db->GetBaseDB()->Write(wo, &batch);
-  if (!status.ok()) return std::unexpected(FromStatus(status, "Wipe: Write"));
-  return {};
+  // DeleteRange + synced write: atomic and fsynced so a post-wipe crash can't
+  // resurrect pre-Flush data once the cold consumer's ack is durable (#136).
+  return impl_->WriteDurable(&batch, "Wipe: Write");
 }
 
 core::Result<RespValue> RocksdbStore::ExecDel(const core::ops::Del& op) {
@@ -574,7 +604,8 @@ rocksdb::ReadOptions RocksdbStore::Impl::MakeReadOptions(
   return opts;
 }
 
-core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::WriteOp> ops) const {
+core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                                  core::SequenceId /*highest_wal_seq*/) {
   rocksdb::WriteBatchWithIndex wb(rocksdb::BytewiseComparator(), 0, /*overwrite_key=*/true);
 
   for (const auto& op : ops) {
@@ -582,8 +613,40 @@ core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::Wri
     if (!r.has_value()) return r;
   }
 
+  // Default WriteOptions: sync=false. With manual_wal_flush the WAL stays in
+  // RocksDB's buffer; this is a memtable-only write. Durability is established
+  // by a later Checkpoint(FlushWAL sync=true), never per batch (A6). The cold
+  // consumer tracks highest_wal_seq and gates its ack on the checkpointed seq,
+  // so it is not recorded here.
   auto status = db->Write(rocksdb::WriteOptions(), wb.GetWriteBatch());
   if (!status.ok()) return std::unexpected(FromStatus(status, "ApplyBatch"));
+  return {};
+}
+
+core::Result<void> RocksdbStore::Impl::Checkpoint(core::ShardId shard,
+                                                  core::SequenceId up_to_wal_seq) {
+  // FlushWAL flushes RocksDB's WAL buffer to the OS and, with sync=true,
+  // fsyncs it — one group-amortised fsync of the WAL tail for every ApplyBatch
+  // since the last checkpoint. Idempotent: a checkpoint with nothing dirty is
+  // a cheap flush of an empty buffer.
+  auto status = db->FlushWAL(/*sync=*/true);
+  if (!status.ok()) return std::unexpected(FromStatus(status, "Checkpoint: FlushWAL"));
+
+  const std::scoped_lock lock(checkpoint_mu);
+  auto& recorded = checkpointed_seq[shard];
+  recorded = std::max(recorded, up_to_wal_seq);
+  return {};
+}
+
+core::Result<void> RocksdbStore::Impl::WriteDurable(rocksdb::WriteBatch* batch,
+                                                    std::string_view context) const {
+  rocksdb::WriteOptions wo;
+  wo.sync = true;
+  // OptimisticTransactionDB hides plain WriteBatch writes; go through the base
+  // DB. sync=true forces FlushWAL+fsync of this write regardless of
+  // manual_wal_flush, so the standalone command is durable on return.
+  auto status = db->GetBaseDB()->Write(wo, batch);
+  if (!status.ok()) return std::unexpected(FromStatus(status, context));
   return {};
 }
 
@@ -1237,8 +1300,11 @@ core::Result<RespValue> RocksdbStore::Impl::ExecDel(const core::ops::Del& op) co
     if (counted) ++deleted;
   }
 
-  auto status = db->Write(rocksdb::WriteOptions(), wb.GetWriteBatch());
-  if (!status.ok()) return std::unexpected(FromStatus(status, "DEL"));
+  // Standalone DEL command path (not the cold-flush path): make it durable on
+  // return rather than waiting for a later cold checkpoint (XERR-1 / COLD-1).
+  if (auto r = WriteDurable(wb.GetWriteBatch(), "DEL"); !r.has_value()) {
+    return std::unexpected(r.error());
+  }
   return RespValue::Integer(deleted);
 }
 

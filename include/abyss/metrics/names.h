@@ -98,6 +98,24 @@ constexpr std::string_view ToStringView(FlushReason r) noexcept {
   return {};
 }
 
+// Why the cold consumer's drain/flush loop is backing off rather than making
+// progress. kIdle = nothing to drain or flush; kPoisoned = a terminal apply
+// failure pinned the batch; kBackpressure = the cold store is unwritable /
+// the durable gate is not yet satisfied.
+enum class BackoffReason : uint8_t { kIdle, kPoisoned, kBackpressure };
+
+constexpr std::string_view ToStringView(BackoffReason r) noexcept {
+  switch (r) {
+    case BackoffReason::kIdle:
+      return "idle";
+    case BackoffReason::kPoisoned:
+      return "poisoned";
+    case BackoffReason::kBackpressure:
+      return "backpressure";
+  }
+  return {};
+}
+
 enum class CloseReason : uint8_t {
   kClient,
   kIdle,
@@ -180,6 +198,10 @@ struct LabelKeyOf<FlushReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<BackoffReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
 struct LabelKeyOf<CloseReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
@@ -213,6 +235,7 @@ struct LabelKeyOf<TtlSubject> {
 inline std::string ToLabelString(Tier t) { return std::string(ToStringView(t)); }
 inline std::string ToLabelString(FlushStatus s) { return std::string(ToStringView(s)); }
 inline std::string ToLabelString(FlushReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(BackoffReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
@@ -405,6 +428,29 @@ inline constexpr CounterDesc<FlushStatus> kColdFlushTotal{
 inline constexpr CounterDesc<FlushReason> kColdFlushReasonTotal{
     .name = "abyss_cold_flush_reason_total",
     .help = "Cold consumer flush operations by trigger reason.",
+};
+
+inline constexpr CounterDesc<FlushStatus> kColdCheckpointTotal{
+    .name = "abyss_cold_checkpoint_total",
+    .help = "Cold-store durable checkpoints (FlushWAL sync=true) by outcome.",
+};
+
+inline constexpr HistogramDesc<> kColdCheckpointDurationSeconds{
+    .name = "abyss_cold_checkpoint_duration_seconds",
+    .help = "Cold-store checkpoint (durable WAL fsync) latency.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr GaugeDesc<> kColdCheckpointIntervalSeconds{
+    .name = "abyss_cold_checkpoint_interval_seconds",
+    .help =
+        "Observed wall interval between cold-store checkpoints; surfaces the bounded "
+        "checkpoint cadence so its fsync cost is not a hidden knob.",
+};
+
+inline constexpr CounterDesc<BackoffReason> kColdConsumerBackoffTotal{
+    .name = "abyss_cold_consumer_backoff_total",
+    .help = "Cold consumer loop backoff events by reason (idle, poisoned, backpressure).",
 };
 
 // Tier domain for this metric is limited to {kHot, kCold}; kBuffer is invalid.

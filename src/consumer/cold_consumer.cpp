@@ -46,6 +46,18 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
       reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kSuccess);
   flush_total_failure_ =
       reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kFailure);
+  checkpoint_total_success_ =
+      reg.Counter(metrics::names::kColdCheckpointTotal, metrics::FlushStatus::kSuccess);
+  checkpoint_total_failure_ =
+      reg.Counter(metrics::names::kColdCheckpointTotal, metrics::FlushStatus::kFailure);
+  checkpoint_duration_ = reg.Histogram(metrics::names::kColdCheckpointDurationSeconds);
+  checkpoint_interval_ = reg.Gauge(metrics::names::kColdCheckpointIntervalSeconds);
+  backoff_idle_ =
+      reg.Counter(metrics::names::kColdConsumerBackoffTotal, metrics::BackoffReason::kIdle);
+  backoff_poisoned_ =
+      reg.Counter(metrics::names::kColdConsumerBackoffTotal, metrics::BackoffReason::kPoisoned);
+  backoff_backpressure_ =
+      reg.Counter(metrics::names::kColdConsumerBackoffTotal, metrics::BackoffReason::kBackpressure);
 }
 
 ColdConsumer::~ColdConsumer() { Stop(); }
@@ -56,7 +68,13 @@ void ColdConsumer::Start() {
   thread_ = std::thread(&ColdConsumer::RunLoop, this);
 }
 
-void ColdConsumer::RequestStop() { stop_requested_.store(true, std::memory_order_release); }
+void ColdConsumer::RequestStop() {
+  {
+    const std::scoped_lock lock(stop_mu_);
+    stop_requested_.store(true, std::memory_order_release);
+  }
+  stop_cv_.notify_all();
+}
 
 void ColdConsumer::Join() {
   if (!running_.load(std::memory_order_acquire)) return;
@@ -71,11 +89,37 @@ void ColdConsumer::Stop() {
 
 void ColdConsumer::RunLoop() {
   ABYSS_LOG_DEBUG("cold consumer started", {"shard", static_cast<int64_t>(shard_)});
+  auto backoff = config_.loop_initial_backoff;
   while (!stop_requested_.load(std::memory_order_acquire)) {
-    Drain();
+    const size_t drained = Drain();
     if (stop_requested_.load(std::memory_order_acquire)) break;
-    Flush();
+    const FlushOutcome outcome = Flush();
     CheckBlockAndScanTimeout();
+
+    // Backoff state machine (XRES-5): re-iterate immediately on progress
+    // (fresh drain or a flush that wrote), otherwise sleep on a capped
+    // exponential backoff so a poisoned/unwritable/idle shard never busy-spins.
+    const bool made_progress = drained > 0 || outcome == FlushOutcome::kProgress;
+    if (made_progress) {
+      backoff = config_.loop_initial_backoff;
+      continue;
+    }
+    switch (outcome) {
+      case FlushOutcome::kPoisoned:
+        backoff_poisoned_.Increment();
+        break;
+      case FlushOutcome::kBackpressure:
+        backoff_backpressure_.Increment();
+        break;
+      case FlushOutcome::kIdle:
+      case FlushOutcome::kProgress:
+        backoff_idle_.Increment();
+        break;
+    }
+    std::unique_lock lock(stop_mu_);
+    stop_cv_.wait_for(lock, backoff,
+                      [this] { return stop_requested_.load(std::memory_order_acquire); });
+    backoff = std::min(backoff * 2, config_.loop_max_backoff);
   }
   ABYSS_LOG_DEBUG("cold consumer stopped", {"shard", static_cast<int64_t>(shard_)},
                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())},
@@ -225,7 +269,7 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
   // right semantic for "make this buffer empty before declaring recovery
   // done." Bounded by max_flush_batch_size per call; loop until empty.
   while (!cancel.load(std::memory_order_acquire) && buffer_.Size() > 0) {
-    if (!FlushUnscheduled()) {
+    if (FlushUnscheduled() != FlushOutcome::kProgress) {
       // No progress: either the buffer reported entries but FlushOldest
       // returned none (shouldn't happen for non-empty buffer with target=0),
       // or ApplyBatchWithRetry hit a poisoned batch and reinserted them. The
@@ -235,7 +279,9 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
       return std::unexpected(core::Error{core::ErrorCode::kInternal, "cold replay flush stalled"});
     }
   }
-  TryAdvanceAck();
+  // Force a checkpoint so the post-recovery ack is durable-gated even when the
+  // drain flushed fewer batches than the steady-state cadence (XDUR-1).
+  TryAdvanceAck(/*force_checkpoint=*/true);
 
   if (cancel.load(std::memory_order_acquire) && buffer_.Size() > 0) {
     return std::unexpected(
@@ -326,11 +372,31 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
   flushes_applied_.fetch_add(1, std::memory_order_relaxed);
 
+  // Wipe is a synced (durable) write, so the Flush seq is on cold's stable
+  // storage on return — advance the checkpoint frontier so the ack clamp lets
+  // it through without a second FlushWAL. Pre-Flush applied-uncheckpointed
+  // data was discarded by the Wipe, so its frontier no longer matters.
+  if (entry.seq > last_checkpointed_seq_.load(std::memory_order_acquire)) {
+    last_checkpointed_seq_.store(entry.seq, std::memory_order_release);
+    highest_applied_uncheckpointed_seq_.store(entry.seq, std::memory_order_release);
+  }
+
   // Persist the Flush ack BEFORE fulfilling the RPC. Without this, FLUSHDB can
   // return OK to the client while a peer shard's cold ack is still pre-Flush.
   latest_drained_seq_.store(entry.seq, std::memory_order_release);
   drained_anything_ = true;
   NotifyDrained();
+  // The Flush RPC is fulfilled synchronously here, so the ack must reach
+  // entry.seq in this call. The cold data is durable (Wipe is synced), but the
+  // fail-closed WAL Ack gate also requires entry.seq to be past the durable WAL
+  // tail. The Flush entry was appended just before this; wait briefly for its
+  // group-commit fsync so the ack clamp does not reject it (XDUR-1). A timeout
+  // is non-fatal: TryAdvanceAck clamps and the RPC returns retry below.
+  auto durable = queue_.AwaitDurable(shard_, entry.seq, config_.queue_read_timeout);
+  if (!durable.has_value() || !*durable) {
+    ABYSS_LOG_DEBUG("cold flush awaiting WAL durability", {"shard", static_cast<int64_t>(shard_)},
+                    {"seq", static_cast<uint64_t>(entry.seq)});
+  }
   TryAdvanceAck();
 
   const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
@@ -403,7 +469,7 @@ void ColdConsumer::CheckBlockAndScanTimeout() {
   }
 }
 
-bool ColdConsumer::Flush() {
+ColdConsumer::FlushOutcome ColdConsumer::Flush() {
   UpdateMode(buffer_.BytesEstimate());
 
   const auto now = steady_clock_();
@@ -413,33 +479,40 @@ bool ColdConsumer::Flush() {
                              : buffer_.FlushReady(now, config_.max_flush_batch_size);
 
   if (to_flush.empty()) {
+    // Nothing due to flush. Still try to advance the ack: a checkpoint may now
+    // be due, or DurableSeq may have caught up to already-checkpointed data.
     TryAdvanceAck();
-    return false;
+    return FlushOutcome::kIdle;
   }
 
   return ApplyFlushBatch(std::move(to_flush), aggressive, flush_start);
 }
 
-bool ColdConsumer::FlushUnscheduled() {
+ColdConsumer::FlushOutcome ColdConsumer::FlushUnscheduled() {
   const auto flush_start = std::chrono::steady_clock::now();
   auto to_flush = buffer_.FlushOldest(/*target_bytes=*/0, config_.max_flush_batch_size);
   if (to_flush.empty()) {
     TryAdvanceAck();
-    return false;
+    return FlushOutcome::kIdle;
   }
   // Replay flushes count as aggressive in the per-flush trigger metric — they
   // bypass the quiet/deadline strategy.
   return ApplyFlushBatch(std::move(to_flush), /*aggressive=*/true, flush_start);
 }
 
-bool ColdConsumer::ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggressive,
-                                   std::chrono::steady_clock::time_point flush_start) {
+ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
+    std::vector<BufferEntry> to_flush, bool aggressive,
+    std::chrono::steady_clock::time_point flush_start) {
   const auto wall_now = wall_clock_();
   std::vector<BufferEntry> surviving;
   surviving.reserve(to_flush.size());
   uint64_t dropped = 0;
   uint64_t quiet_count = 0;
   uint64_t deadline_count = 0;
+  // Highest WAL seq this flush materialises (informational; passed to
+  // ApplyBatch). The ack frontier is derived from the live buffer state in
+  // TryAdvanceAck, not from this, so a reinserted failed batch re-pins it.
+  const core::SequenceId batch_highest_seq = HighestSeqOf(to_flush);
   for (auto& entry : to_flush) {
     if (AbsTtlExpired(entry, wall_now)) {
       ++dropped;
@@ -458,10 +531,11 @@ bool ColdConsumer::ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggre
   }
 
   const size_t surviving_count = surviving.size();
-  bool applied = true;
+  FlushOutcome outcome = FlushOutcome::kProgress;
   if (!surviving.empty()) {
-    applied = ApplyBatchWithRetry(std::move(surviving));
+    outcome = ApplyBatchWithRetry(std::move(surviving), batch_highest_seq);
   }
+  const bool applied = outcome == FlushOutcome::kProgress;
 
   if (surviving_count > 0) {
     if (applied) {
@@ -497,7 +571,7 @@ bool ColdConsumer::ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggre
   }
 
   TryAdvanceAck();
-  return applied;
+  return outcome;
 }
 
 std::vector<core::ops::WriteOp> ColdConsumer::BuildBatchOps(
@@ -531,46 +605,45 @@ std::vector<core::ops::WriteOp> ColdConsumer::BuildBatchOps(
   return ops;
 }
 
-bool ColdConsumer::ApplyBatchWithRetry(std::vector<BufferEntry> entries) {
+core::SequenceId ColdConsumer::HighestSeqOf(const std::vector<BufferEntry>& entries) {
+  core::SequenceId highest = 0;
+  for (const auto& entry : entries) {
+    highest = std::max(highest, entry.first_seen_seq);
+  }
+  return highest;
+}
+
+ColdConsumer::FlushOutcome ColdConsumer::ApplyBatchWithRetry(std::vector<BufferEntry> entries,
+                                                             core::SequenceId highest_wal_seq) {
   std::vector<core::ops::Del> del_storage;
   auto ops = BuildBatchOps(entries, del_storage);
 
-  auto backoff = config_.retry_initial_backoff;
-  bool logged_first_failure = false;
-  while (!stop_requested_.load(std::memory_order_acquire)) {
-    auto result = cold_store_.ApplyBatch(std::span<const core::ops::WriteOp>(ops));
-    if (result.has_value()) {
-      ops_flushed_.fetch_add(ops.size(), std::memory_order_relaxed);
-      return true;
-    }
-
-    const auto code = result.error().code();
-    const bool terminal =
-        code == core::ErrorCode::kCorruption || code == core::ErrorCode::kInvalidArgument;
-    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-    if (terminal) {
-      apply_poisoned_.fetch_add(1, std::memory_order_relaxed);
-      ABYSS_LOG_CRITICAL("cold apply batch poisoned", {"shard", static_cast<int64_t>(shard_)},
-                         {"batch", static_cast<uint64_t>(ops.size())},
-                         {"err", std::string_view{result.error().message()}});
-      // Retrying a poisoned batch burns CPU without progressing; reinsert and bail.
-      buffer_.Reinsert(std::move(entries));
-      return false;
-    }
-    retry_attempts_.fetch_add(1, std::memory_order_relaxed);
-    if (!logged_first_failure) {
-      logged_first_failure = true;
-      ABYSS_LOG_ERROR("cold apply batch failed; retrying", {"shard", static_cast<int64_t>(shard_)},
-                      {"batch", static_cast<uint64_t>(ops.size())},
-                      {"err", std::string_view{result.error().message()}});
-    }
-
-    std::this_thread::sleep_for(backoff);
-    backoff = std::min(backoff * 2, config_.retry_max_backoff);
+  auto result = cold_store_.ApplyBatch(std::span<const core::ops::WriteOp>(ops), highest_wal_seq);
+  if (result.has_value()) {
+    ops_flushed_.fetch_add(ops.size(), std::memory_order_relaxed);
+    return FlushOutcome::kProgress;
   }
 
+  const auto code = result.error().code();
+  const bool terminal =
+      code == core::ErrorCode::kCorruption || code == core::ErrorCode::kInvalidArgument;
+  counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+  // Reinsert so the entries are replayed on the next iteration. The RunLoop
+  // (not a blocking sleep here) applies bounded backoff between attempts so a
+  // poisoned or unwritable shard never busy-spins (XRES-5).
   buffer_.Reinsert(std::move(entries));
-  return false;
+  if (terminal) {
+    apply_poisoned_.fetch_add(1, std::memory_order_relaxed);
+    ABYSS_LOG_CRITICAL("cold apply batch poisoned", {"shard", static_cast<int64_t>(shard_)},
+                       {"batch", static_cast<uint64_t>(ops.size())},
+                       {"err", std::string_view{result.error().message()}});
+    return FlushOutcome::kPoisoned;
+  }
+  retry_attempts_.fetch_add(1, std::memory_order_relaxed);
+  ABYSS_LOG_ERROR("cold apply batch failed; will retry", {"shard", static_cast<int64_t>(shard_)},
+                  {"batch", static_cast<uint64_t>(ops.size())},
+                  {"err", std::string_view{result.error().message()}});
+  return FlushOutcome::kBackpressure;
 }
 
 bool ColdConsumer::AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const {
@@ -611,7 +684,48 @@ void ColdConsumer::UpdateMode(size_t current_bytes) {
   }
 }
 
-void ColdConsumer::TryAdvanceAck() {
+bool ColdConsumer::MaybeCheckpoint(core::SequenceId up_to, bool force) {
+  const auto checkpointed = last_checkpointed_seq_.load(std::memory_order_acquire);
+  // Nothing new to make durable since the last checkpoint: a FlushWAL would be
+  // a no-op fsync. Skip it (idempotent + cheap, but pointless).
+  if (up_to <= checkpointed) return true;
+  // Track the highest seq applied to cold's memtable but not yet checkpointed,
+  // so the cadence/observability reflects outstanding durable work.
+  highest_applied_uncheckpointed_seq_.store(up_to, std::memory_order_release);
+
+  const auto now = std::chrono::steady_clock::now();
+  const bool cadence_due = ++flushes_since_checkpoint_ >= config_.checkpoint_max_flushes ||
+                           (now - last_checkpoint_at_) >= config_.checkpoint_min_interval;
+  if (!force && !cadence_due) return true;
+
+  const auto start = std::chrono::steady_clock::now();
+  auto result = cold_store_.Checkpoint(shard_, up_to);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  checkpoint_duration_.Observe(
+      std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count());
+
+  if (!result.has_value()) {
+    checkpoint_total_failure_.Increment();
+    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
+    ABYSS_LOG_ERROR("cold checkpoint failed; ack pinned", {"shard", static_cast<int64_t>(shard_)},
+                    {"up_to_wal_seq", static_cast<uint64_t>(up_to)},
+                    {"err", std::string_view{result.error().message()}});
+    return false;
+  }
+
+  checkpoint_total_success_.Increment();
+  if (last_checkpoint_at_.time_since_epoch().count() != 0) {
+    checkpoint_interval_.Set(
+        std::chrono::duration_cast<std::chrono::duration<double>>(now - last_checkpoint_at_)
+            .count());
+  }
+  last_checkpoint_at_ = now;
+  flushes_since_checkpoint_ = 0;
+  last_checkpointed_seq_.store(up_to, std::memory_order_release);
+  return true;
+}
+
+void ColdConsumer::TryAdvanceAck(bool force_checkpoint) {
   if (!drained_anything_) return;
 
   const auto oldest_unflushed = buffer_.OldestPendingSeq();
@@ -623,6 +737,9 @@ void ColdConsumer::TryAdvanceAck() {
   if (oldest_unflushed.has_value() && *oldest_unflushed == 0) return;
   if (oldest_pending_cond.has_value() && *oldest_pending_cond == 0) return;
 
+  // Low-water target: every seq <= this has been flushed to cold's memtable
+  // (entries still in the buffer pin `oldest_unflushed`; a failed apply is
+  // reinserted and re-pins it, so this never includes un-applied data).
   core::SequenceId target = drained;
   if (oldest_unflushed.has_value()) {
     target = std::min(target, *oldest_unflushed - 1);
@@ -631,8 +748,35 @@ void ColdConsumer::TryAdvanceAck() {
     target = std::min(target, *oldest_pending_cond - 1);
   }
 
+  // (1) Make the cold data for `target` durable (on the bounded cadence, or
+  // unconditionally when forced) so the ack below can advance past it (A6). A
+  // failed checkpoint pins the ack (back-pressure, not silent advance) —
+  // last_checkpointed_seq_ stays put.
+  MaybeCheckpoint(target, force_checkpoint);
+
+  // (2) Cold-durability clamp: the ack can never pass data not yet on cold's
+  // stable storage (the FlushWAL checkpoint frontier) — XDUR-1/COLDC-1.
+  target = std::min(target, last_checkpointed_seq_.load(std::memory_order_acquire));
+
+  // (3) WAL-durability clamp (A1): the ack can never pass the durable WAL tail.
+  // Clamp to DurableSeq so the fail-closed retention-Ack gate never rejects us,
+  // turning `ERR cold flush ack persist failed` into clean back-pressure.
+  if (auto durable = queue_.DurableSeq(shard_); durable.has_value()) {
+    target = std::min(target, *durable);
+  } else {
+    counters_.ack_failures.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
   const auto last_ack = last_ack_seq_.load(std::memory_order_acquire);
   if (first_ack_recorded_ && target <= last_ack) return;
+  // Before the first ack we cannot tell "target 0 = ack seq 0" from "nothing
+  // durable yet"; if cold has checkpointed nothing, ack nothing this round and
+  // retry next round once a checkpoint lands.
+  if (!first_ack_recorded_ && target == 0 &&
+      last_checkpointed_seq_.load(std::memory_order_acquire) == 0) {
+    return;
+  }
 
   auto ack = queue_.Ack(core::kColdConsumer, shard_, target);
   if (!ack.has_value()) {

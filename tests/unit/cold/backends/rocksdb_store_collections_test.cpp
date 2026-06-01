@@ -72,7 +72,7 @@ TEST_F(CollectionsFixture, SetAddThenMembersReturnsAll) {
   std::vector<std::string> members = {"a", "b", "c"};
   std::vector<std::string_view> views(members.begin(), members.end());
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto result = store->Exec(core::ops::SetMembers{.key = key});
   ASSERT_TRUE(result.has_value());
@@ -89,7 +89,7 @@ TEST_F(CollectionsFixture, SetIsMemberReturnsCorrectly) {
   std::vector<std::string> members = {"present"};
   std::vector<std::string_view> views(members.begin(), members.end());
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto hit = store->Exec(core::ops::SetIsMember{.key = key, .member = "present"});
   ASSERT_TRUE(hit.has_value());
@@ -106,11 +106,11 @@ TEST_F(CollectionsFixture, SetRemOnNonMemberIsNoop) {
   std::vector<std::string> members = {"a", "b"};
   std::vector<std::string_view> views(members.begin(), members.end());
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   std::vector<std::string_view> rem = {"nope"};
   std::vector<core::ops::WriteOp> rem_ops = {core::ops::SetRem{.key = key, .members = rem}};
-  ASSERT_TRUE(store->ApplyBatch(rem_ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(rem_ops, 0).has_value());
 
   auto card = store->Exec(core::ops::SetCard{.key = key});
   EXPECT_EQ(card->AsInteger(), 2);
@@ -122,11 +122,11 @@ TEST_F(CollectionsFixture, SetRemLastMemberDeletesMeta) {
   std::vector<std::string> members = {"only"};
   std::vector<std::string_view> views(members.begin(), members.end());
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   std::vector<std::string_view> rem = {"only"};
   std::vector<core::ops::WriteOp> rem_ops = {core::ops::SetRem{.key = key, .members = rem}};
-  ASSERT_TRUE(store->ApplyBatch(rem_ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(rem_ops, 0).has_value());
 
   auto card = store->Exec(core::ops::SetCard{.key = key});
   ASSERT_TRUE(card.has_value());
@@ -146,8 +146,8 @@ TEST_F(CollectionsFixture, SetAddDuplicatesDoNotBumpCardinality) {
   std::vector<std::string_view> v2(second.begin(), second.end());
   std::vector<core::ops::WriteOp> ops1 = {core::ops::SetAdd{.key = key, .members = v1}};
   std::vector<core::ops::WriteOp> ops2 = {core::ops::SetAdd{.key = key, .members = v2}};
-  ASSERT_TRUE(store->ApplyBatch(ops1).has_value());
-  ASSERT_TRUE(store->ApplyBatch(ops2).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops1, 0).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops2, 0).has_value());
 
   auto card = store->Exec(core::ops::SetCard{.key = key});
   EXPECT_EQ(card->AsInteger(), 3);
@@ -163,7 +163,7 @@ TEST_F(CollectionsFixture, HashSetThenGetAllReturnsPairs) {
       {.field = "f2", .value = "v2"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto result = store->Exec(core::ops::HashGetAll{.key = key});
   ASSERT_TRUE(result.has_value());
@@ -176,7 +176,7 @@ TEST_F(CollectionsFixture, HashGetFieldOrNull) {
   std::string key = "h";
   std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "present", .value = "yes"}};
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto hit = store->Exec(core::ops::HashGet{.key = key, .field = "present"});
   ASSERT_TRUE(hit.has_value());
@@ -194,8 +194,8 @@ TEST_F(CollectionsFixture, HashSetOverwritesFieldWithoutCardinalityBump) {
   std::vector<core::ops::HashSet::FieldValue> fvs2 = {{.field = "f", .value = "v2"}};
   std::vector<core::ops::WriteOp> ops1 = {core::ops::HashSet{.key = key, .fields = fvs1}};
   std::vector<core::ops::WriteOp> ops2 = {core::ops::HashSet{.key = key, .fields = fvs2}};
-  ASSERT_TRUE(store->ApplyBatch(ops1).has_value());
-  ASSERT_TRUE(store->ApplyBatch(ops2).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops1, 0).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops2, 0).has_value());
 
   auto get = store->Exec(core::ops::HashGet{.key = key, .field = "f"});
   EXPECT_EQ(get->AsString(), "v2");
@@ -211,7 +211,7 @@ TEST_F(CollectionsFixture, HashMSetRoundTripsLikeHashSet) {
       {.field = "b", .value = "2"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::HashMSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto all = store->Exec(core::ops::HashGetAll{.key = key});
   ASSERT_TRUE(all.has_value());
@@ -227,7 +227,7 @@ TEST_F(CollectionsFixture, HashLenReturnsCachedCardinality) {
       {.field = "c", .value = "3"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto len = store->Exec(core::ops::HashLen{.key = key});
   ASSERT_TRUE(len.has_value());
@@ -246,7 +246,7 @@ TEST_F(CollectionsFixture, HashKeysAndValsReturnProjections) {
       {.field = "b", .value = "2"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto keys = store->Exec(core::ops::HashKeys{.key = key});
   ASSERT_TRUE(keys.has_value());
@@ -269,7 +269,7 @@ TEST_F(CollectionsFixture, HashMultiGetReturnsArrayWithNulls) {
       {.field = "b", .value = "2"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   std::vector<std::string_view> req = {"a", "missing", "b"};
   auto r = store->Exec(core::ops::HashMultiGet{.key = key, .fields = req});
@@ -295,7 +295,7 @@ TEST_F(CollectionsFixture, HashFieldExistsReturns1Or0) {
   std::string key = "h";
   std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "a", .value = "1"}};
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   EXPECT_EQ(store->Exec(core::ops::HashFieldExists{.key = key, .field = "a"})->AsInteger(), 1);
   EXPECT_EQ(store->Exec(core::ops::HashFieldExists{.key = key, .field = "missing"})->AsInteger(),
@@ -312,11 +312,11 @@ TEST_F(CollectionsFixture, HashDelRemovesOnlyNamedFields) {
       {.field = "c", .value = "3"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   std::vector<std::string_view> to_del = {"a", "c", "nope"};
   std::vector<core::ops::WriteOp> del_ops = {core::ops::HashDel{.key = key, .fields = to_del}};
-  ASSERT_TRUE(store->ApplyBatch(del_ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(del_ops, 0).has_value());
 
   auto all = store->Exec(core::ops::HashGetAll{.key = key});
   ASSERT_EQ(all->AsArray().size(), 2U);
@@ -334,7 +334,7 @@ TEST_F(CollectionsFixture, ZsetAddThenScore) {
       {.score = 2.0, .member = "m2"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto s1 = store->Exec(core::ops::ZsetScore{.key = key, .member = "m1"});
   ASSERT_TRUE(s1.has_value());
@@ -354,8 +354,8 @@ TEST_F(CollectionsFixture, ZsetAddOverwriteReplacesScoreIndex) {
   std::vector<core::ops::ZsetAdd::Entry> e2 = {{.score = 99.0, .member = "m"}};
   std::vector<core::ops::WriteOp> ops1 = {core::ops::ZsetAdd{.key = key, .entries = e1}};
   std::vector<core::ops::WriteOp> ops2 = {core::ops::ZsetAdd{.key = key, .entries = e2}};
-  ASSERT_TRUE(store->ApplyBatch(ops1).has_value());
-  ASSERT_TRUE(store->ApplyBatch(ops2).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops1, 0).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops2, 0).has_value());
 
   auto score = store->Exec(core::ops::ZsetScore{.key = key, .member = "m"});
   EXPECT_EQ(score->AsString(), "99");
@@ -381,7 +381,7 @@ TEST_F(CollectionsFixture, ZsetRangeByScoreExclusiveBounds) {
       {.score = 3.0, .member = "c"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto exclusive_min =
       store->Exec(core::ops::ZsetRange{.key = key, .min = "(1", .max = "3", .by_score = true});
@@ -404,7 +404,7 @@ TEST_F(CollectionsFixture, ZsetRangeByScoreWithScoresAndRev) {
       {.score = 3.0, .member = "c"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto result = store->Exec(core::ops::ZsetRange{.key = key,
                                                  .min = "-inf",
@@ -430,7 +430,7 @@ TEST_F(CollectionsFixture, ZsetRangeByScoreOffsetCount) {
       {.score = 4.0, .member = "d"}, {.score = 5.0, .member = "e"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto result = store->Exec(core::ops::ZsetRange{
       .key = key, .min = "-inf", .max = "+inf", .by_score = true, .offset = 1, .count = 2});
@@ -449,7 +449,7 @@ TEST_F(CollectionsFixture, ZsetRangeIndexBased) {
       {.score = 3.0, .member = "c"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   // ZRANGE z 0 -1 — all members in score order.
   auto all = store->Exec(core::ops::ZsetRange{.key = key, .min = "0", .max = "-1"});
@@ -473,11 +473,11 @@ TEST_F(CollectionsFixture, ZsetRemRemovesScoreIndex) {
       {.score = 2.0, .member = "b"},
   };
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   std::vector<std::string_view> rem = {"a"};
   std::vector<core::ops::WriteOp> rem_ops = {core::ops::ZsetRem{.key = key, .members = rem}};
-  ASSERT_TRUE(store->ApplyBatch(rem_ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(rem_ops, 0).has_value());
 
   auto card = store->Exec(core::ops::ZsetCard{.key = key});
   EXPECT_EQ(card->AsInteger(), 1);
@@ -522,7 +522,7 @@ TEST_F(CollectionsFixture, DelRemovesCollectionSubKeys) {
       core::ops::ZsetAdd{.key = "z", .entries = zentries},
       core::ops::HashSet{.key = "h", .fields = fvs},
   };
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   core::ops::Del del_op;
   del_op.keys = {"s", "z", "h"};
@@ -549,7 +549,7 @@ TEST_F(CollectionsFixture, DelCountsStringAndCollectionMix) {
       core::ops::StringSet{.key = "str", .value = sv},
       core::ops::SetAdd{.key = "set", .members = member_views},
   };
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   core::ops::Del del_op;
   del_op.keys = {"str", "set", "never-set"};
@@ -569,7 +569,7 @@ TEST_F(CollectionsFixture, ExistsCountsStringsAndCollections) {
       core::ops::StringSet{.key = "str", .value = sv},
       core::ops::SetAdd{.key = "set", .members = member_views},
   };
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   core::ops::Exists exists_op;
   exists_op.keys = {"str", "set", "missing"};
@@ -593,7 +593,7 @@ TEST_F(CollectionsFixture, MixedBatchLandsAllOps) {
       core::ops::ZsetAdd{.key = "zset", .entries = zentries},
       core::ops::HashSet{.key = "hash", .fields = fvs},
   };
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   EXPECT_EQ(store->Exec(core::ops::StringGet{.key = "str"})->AsString(), "v");
   EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "set"})->AsInteger(), 2);

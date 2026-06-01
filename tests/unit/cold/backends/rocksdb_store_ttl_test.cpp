@@ -94,7 +94,7 @@ TEST_F(TtlFixture, StringWithFutureTtlReturnsValue) {
   std::string v = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 60'000};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   auto r = store->Exec(core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
@@ -107,7 +107,7 @@ TEST_F(TtlFixture, StringWithPastTtlReturnsNull) {
   std::string v = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() - 1};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   auto r = store->Exec(core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
@@ -120,7 +120,7 @@ TEST_F(TtlFixture, ZeroTtlNeverExpires) {
   std::string v = "v";
   // abs_ttl_ms=0 with flag-clear means "no TTL" regardless of clock.
   core::ops::WriteOp op = core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = 0};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   // Avoid overflow issues
   clock_.SetTo(1'000'000'000'000ULL);
@@ -145,7 +145,7 @@ TEST_F(TtlFixture, LazyStringExpiryBumpsTtlExpiredMetric) {
       .value = "v",
       .abs_ttl_ms = clock_.Now() + 100,
   };
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
   clock_.Advance(200);
 
   auto r = store->Exec(core::ops::StringGet{.key = "k"});
@@ -164,7 +164,7 @@ TEST_F(TtlFixture, StringExpiryDeletesBackingRecord) {
   std::string v = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 100};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   clock_.Advance(200);
 
@@ -224,7 +224,7 @@ TEST_F(TtlFixture, CollectionWithoutTtlSurvivesTimeAdvance) {
   std::vector<std::string> members = {"only"};
   std::vector<std::string_view> views(members.begin(), members.end());
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = "s", .members = views}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   clock_.Advance(1'000'000'000);
   auto card = store->Exec(core::ops::SetCard{.key = "s"});
@@ -244,7 +244,7 @@ TEST_F(TtlFixture, LazyCollectionExpiryBumpsTtlExpiredMetric) {
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
   {
     auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
   }
 
   InjectExpiredMeta(path_.string(), format::kTypeSetMember, key, members.size());
@@ -271,7 +271,7 @@ TEST_F(TtlFixture, SetReadOnExpiredCollectionReturnsEmptyAndPurges) {
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
   {
     auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
   }
 
   InjectExpiredMeta(path_.string(), format::kTypeSetMember, key, members.size());
@@ -287,7 +287,7 @@ TEST_F(TtlFixture, SetReadOnExpiredCollectionReturnsEmptyAndPurges) {
   std::vector<std::string> fresh = {"c"};
   std::vector<std::string_view> fresh_views(fresh.begin(), fresh.end());
   std::vector<core::ops::WriteOp> add = {core::ops::SetAdd{.key = key, .members = fresh_views}};
-  ASSERT_TRUE(store->ApplyBatch(add).has_value());
+  ASSERT_TRUE(store->ApplyBatch(add, 0).has_value());
   EXPECT_EQ(store->Exec(core::ops::SetCard{.key = key})->AsInteger(), 1);
   EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = key, .member = "c"})->AsInteger(), 1);
   EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = key, .member = "a"})->AsInteger(), 0);
@@ -299,7 +299,7 @@ TEST_F(TtlFixture, WriteOnExpiredCollectionPurgesOldMembersFirst) {
   std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
   {
     auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
   }
 
   InjectExpiredMeta(path_.string(), format::kTypeHashField, key, 1);
@@ -309,7 +309,7 @@ TEST_F(TtlFixture, WriteOnExpiredCollectionPurgesOldMembersFirst) {
   // new add, so the caller never observes a mixed state.
   std::vector<core::ops::HashSet::FieldValue> new_fvs = {{.field = "new", .value = "v"}};
   std::vector<core::ops::WriteOp> add = {core::ops::HashSet{.key = key, .fields = new_fvs}};
-  ASSERT_TRUE(store->ApplyBatch(add).has_value());
+  ASSERT_TRUE(store->ApplyBatch(add, 0).has_value());
 
   auto all = store->Exec(core::ops::HashGetAll{.key = key});
   ASSERT_EQ(all->AsArray().size(), 2U);
@@ -323,7 +323,7 @@ TEST_F(TtlFixture, RemOnExpiredCollectionIsNoop) {
   std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
   {
     auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
   }
 
   InjectExpiredMeta(path_.string(), format::kTypeZsetMember, key, 1);
@@ -331,7 +331,7 @@ TEST_F(TtlFixture, RemOnExpiredCollectionIsNoop) {
   auto store = OpenStore();
   std::vector<std::string_view> rem = {"m"};
   std::vector<core::ops::WriteOp> rem_ops = {core::ops::ZsetRem{.key = key, .members = rem}};
-  ASSERT_TRUE(store->ApplyBatch(rem_ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(rem_ops, 0).has_value());
 
   // After the no-op REM, the collection must be fully purged — no score index
   // orphans, no stale member records.
@@ -348,7 +348,7 @@ TEST_F(TtlFixture, ExistsDoesNotCountExpiredCollection) {
   std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
   {
     auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
   }
   InjectExpiredMeta(path_.string(), format::kTypeSetMember, key, 1);
 
@@ -366,7 +366,7 @@ TEST_F(TtlFixture, ConcurrentReadsOnExpiredKeyAreSafe) {
   std::string v = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 10};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   clock_.Advance(1'000);
 
@@ -398,7 +398,7 @@ TEST_F(TtlFixture, LazyExpiryDoesNotClobberConcurrentWrite) {
   // Write an expired value as the starting state.
   core::ops::WriteOp expired =
       core::ops::StringSet{.key = k, .value = "old", .abs_ttl_ms = clock_.Now() - 1};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&expired, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&expired, 1}, 0).has_value());
 
   std::atomic<bool> stop_writer{false};
   std::thread writer([&]() {
@@ -408,7 +408,7 @@ TEST_F(TtlFixture, LazyExpiryDoesNotClobberConcurrentWrite) {
           .value = "fresh",
           .abs_ttl_ms = clock_.Now() + 60'000,
       };
-      auto r = store->ApplyBatch(std::span{&rewrite, 1});
+      auto r = store->ApplyBatch(std::span{&rewrite, 1}, 0);
       (void)r;
     }
   });

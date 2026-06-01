@@ -155,7 +155,7 @@ TEST_F(SweepFixture, ExpiredStringsAreSweptWithoutBeingRead) {
         .abs_ttl_ms = clock_.Now() - 1,
     });
   }
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto r = store->RunScannerTickForTesting();
   ASSERT_TRUE(r.has_value());
@@ -169,7 +169,7 @@ TEST_F(SweepFixture, FutureTtlIsNotDeleted) {
   std::string v = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 60'000};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   for (int i = 0; i < 5; ++i) {
     auto r = store->RunScannerTickForTesting();
@@ -187,7 +187,7 @@ TEST_F(SweepFixture, NoTtlIsNotDeleted) {
   std::string k = "untimed";
   std::string v = "v";
   core::ops::WriteOp op = core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = 0};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   for (int i = 0; i < 5; ++i) {
     auto r = store->RunScannerTickForTesting();
@@ -212,7 +212,7 @@ TEST_F(SweepFixture, RepeatedSweepsRemoveAllExpired) {
         .value = "v",
         .abs_ttl_ms = clock_.Now() + 60'000,
     };
-    ASSERT_TRUE(store->ApplyBatch(std::span{&live, 1}).has_value());
+    ASSERT_TRUE(store->ApplyBatch(std::span{&live, 1}, 0).has_value());
 
     auto& dead_key = keys_.emplace_back("dead:" + std::to_string(i));
     core::ops::WriteOp dead = core::ops::StringSet{
@@ -220,7 +220,7 @@ TEST_F(SweepFixture, RepeatedSweepsRemoveAllExpired) {
         .value = "v",
         .abs_ttl_ms = clock_.Now() - 1,
     };
-    ASSERT_TRUE(store->ApplyBatch(std::span{&dead, 1}).has_value());
+    ASSERT_TRUE(store->ApplyBatch(std::span{&dead, 1}, 0).has_value());
   }
 
   // Run the scanner enough times for random sampling to converge.
@@ -250,7 +250,7 @@ TEST_F(SweepFixture, ExpiredHashCollectionIsCleanedByScanner) {
     std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "f", .value = "v"}};
     std::vector<core::ops::WriteOp> ops = {
         core::ops::HashSet{.key = std::string_view{key}, .fields = fvs}};
-    ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
   }
   InjectExpiredMeta(path_.string(), format::kTypeHashField, key, 1);
 
@@ -306,7 +306,7 @@ TEST_F(SweepFixture, ConcurrentReSetTriggersCasConflict) {
         .abs_ttl_ms = clock_.Now() - 1,
     });
   }
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   std::atomic<bool> stop_writer{false};
   std::thread writer([&]() {
@@ -321,7 +321,7 @@ TEST_F(SweepFixture, ConcurrentReSetTriggersCasConflict) {
             .abs_ttl_ms = clock_.Now() + 60'000,
         });
       }
-      auto r = store->ApplyBatch(rewrites);
+      auto r = store->ApplyBatch(rewrites, 0);
       (void)r;  // ignore failures from a torn-down store
     }
   });

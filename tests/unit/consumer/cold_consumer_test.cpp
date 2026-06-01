@@ -3,10 +3,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -60,7 +62,7 @@ class ColdConsumerTest : public ::testing::Test {
   void SetUp() override {
     ON_CALL(queue_, Read(_, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
     ON_CALL(queue_, Ack(_, _, _)).WillByDefault(Return(core::Result<void>{}));
-    ON_CALL(cold_, ApplyBatch(_)).WillByDefault(Return(core::Result<void>{}));
+    ON_CALL(cold_, ApplyBatch(_, _)).WillByDefault(Return(core::Result<void>{}));
   }
 
   std::unique_ptr<ColdConsumer> MakeConsumer(ColdConsumer::Config cfg = {}) {
@@ -171,8 +173,8 @@ TEST_F(ColdConsumerTest, QuietWindowElapsedTriggersApplyBatch) {
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
   std::vector<std::pair<std::string, std::string>> observed_sets;
-  EXPECT_CALL(cold_, ApplyBatch(_))
-      .WillOnce([&observed_sets](std::span<const core::ops::WriteOp> ops) {
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillOnce([&observed_sets](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
         for (const auto& op : ops) {
           if (const auto* s = std::get_if<core::ops::StringSet>(&op)) {
             observed_sets.emplace_back(std::string(s->key), std::string(s->value));
@@ -207,8 +209,8 @@ TEST_F(ColdConsumerTest, TombstoneFlushesAsDelToCold) {
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
   std::vector<std::string> observed_dels;
-  EXPECT_CALL(cold_, ApplyBatch(_))
-      .WillOnce([&observed_dels](std::span<const core::ops::WriteOp> ops) {
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillOnce([&observed_dels](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
         for (const auto& op : ops) {
           if (const auto* d = std::get_if<core::ops::Del>(&op)) {
             for (auto k : d->keys) observed_dels.emplace_back(k);
@@ -242,7 +244,7 @@ TEST_F(ColdConsumerTest, FlushRetriesOnTransientApplyFailure) {
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
-  EXPECT_CALL(cold_, ApplyBatch(_))
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
       .WillOnce(Return(std::unexpected(core::Error{core::ErrorCode::kUnavailable, "transient"})))
       .WillOnce(Return(std::unexpected(core::Error{core::ErrorCode::kUnavailable, "transient"})))
       .WillOnce(Return(core::Result<void>{}));
@@ -251,7 +253,12 @@ TEST_F(ColdConsumerTest, FlushRetriesOnTransientApplyFailure) {
   c->Flush();
   clock_.Advance(31s);
   c->Drain();
-  c->Flush();  // Retries inside ApplyBatchWithRetry until success.
+  // A transient apply failure now reinserts the batch and reports kBackpressure;
+  // the loop (here driven manually) re-attempts on each pass. After two transient
+  // failures the third pass succeeds.
+  c->Flush();  // 1st ApplyBatch: transient, reinserted.
+  c->Flush();  // 2nd ApplyBatch: transient, reinserted.
+  c->Flush();  // 3rd ApplyBatch: success.
 
   const auto snap = c->Snapshot();
   EXPECT_EQ(snap.apply_failures, 2U);
@@ -275,7 +282,7 @@ TEST_F(ColdConsumerTest, AbsTtlExpiredEntryIsDroppedWithoutApply) {
       "k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = ttl_ms}},
       core::EvictionTTL{3600}, /*seq=*/1);
 
-  EXPECT_CALL(cold_, ApplyBatch(_)).Times(0);
+  EXPECT_CALL(cold_, ApplyBatch(_, _)).Times(0);
 
   clock_.Advance(60s);
   c->Drain();
@@ -304,7 +311,7 @@ TEST_F(ColdConsumerTest, HighWaterTriggersAggressiveMode) {
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
   // Expect at least one ApplyBatch when aggressive mode triggers flush.
-  EXPECT_CALL(cold_, ApplyBatch(_)).Times(AtLeast(1));
+  EXPECT_CALL(cold_, ApplyBatch(_, _)).Times(AtLeast(1));
 
   c->Drain();
   c->Flush();
@@ -425,6 +432,146 @@ TEST_F(ColdConsumerTest, AckBoundedByOldestPendingSeq) {
   EXPECT_EQ(ack_seq, 1U);
 }
 
+// --- Cold-durability ack gate (XDUR-1) ---------------------------------------
+
+TEST_F(ColdConsumerTest, AckGatedOnCheckpointBeforeAdvancing) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  cfg.checkpoint_max_flushes = 1;  // Checkpoint every flush so the ack can advance.
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  // Checkpoint must be issued before the ack advances, and for a seq <= the
+  // applied frontier.
+  core::SequenceId checkpointed_seq = 0;
+  EXPECT_CALL(cold_, Checkpoint(kShard, _))
+      .WillRepeatedly([&checkpointed_seq](core::ShardId, core::SequenceId s) {
+        checkpointed_seq = s;
+        return core::Result<void>{};
+      });
+  core::SequenceId ack_seq = 0;
+  EXPECT_CALL(queue_, Ack(core::kColdConsumer, kShard, _))
+      .WillRepeatedly([&ack_seq](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        ack_seq = s;
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  c->Flush();
+  clock_.Advance(31s);
+  c->Drain();
+  c->Flush();
+
+  EXPECT_EQ(checkpointed_seq, 1U);
+  EXPECT_EQ(ack_seq, 1U);
+  EXPECT_LE(ack_seq, checkpointed_seq) << "ack advanced past the cold checkpoint frontier";
+}
+
+TEST_F(ColdConsumerTest, AckBlockedWhenCheckpointFails) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  cfg.checkpoint_max_flushes = 1;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  // Checkpoint fails — the cold flush is applied (memtable) but not durable, so
+  // the ack must NOT advance and the WAL stays pinned.
+  EXPECT_CALL(cold_, Checkpoint(kShard, _))
+      .WillRepeatedly(Return(std::unexpected(core::Error{core::ErrorCode::kUnavailable, "fsync"})));
+  EXPECT_CALL(queue_, Ack(_, _, _)).Times(0);
+
+  c->Drain();
+  c->Flush();
+  clock_.Advance(31s);
+  c->Drain();
+  c->Flush();
+
+  EXPECT_EQ(c->Snapshot().last_ack_seq, 0U) << "ack advanced despite a failed checkpoint";
+}
+
+TEST_F(ColdConsumerTest, AckClampedToDurableSeq) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  cfg.checkpoint_max_flushes = 1;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "a", "v"}));
+  entries.push_back(MakeWriteEntry(2, {"SET", "b", "v"}));
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  // Only seq 1 is durable in the WAL; the cold ack must clamp to it even though
+  // both seqs were drained, checkpointed, and otherwise ackable.
+  EXPECT_CALL(queue_, DurableSeq(kShard)).WillRepeatedly(Return(core::Result<core::SequenceId>(1)));
+  core::SequenceId ack_seq = 0;
+  EXPECT_CALL(queue_, Ack(core::kColdConsumer, kShard, _))
+      .WillRepeatedly([&ack_seq](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        ack_seq = s;
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  c->Flush();
+  clock_.Advance(31s);
+  c->Drain();
+  c->Flush();
+
+  EXPECT_EQ(ack_seq, 1U) << "ack advanced past the durable WAL tail";
+}
+
+// --- Loop backoff (XRES-5) ---------------------------------------------------
+
+TEST_F(ColdConsumerTest, PoisonedBatchBacksOffInsteadOfBusySpin) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;  // Flush eagerly so the poison is hit each loop.
+  cfg.jitter_fraction = 0.0;
+  cfg.loop_initial_backoff = 5ms;
+  cfg.loop_max_backoff = 20ms;
+  cfg.queue_read_timeout = 1ms;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  // Terminal failure on every apply: without backoff the loop would re-apply
+  // thousands of times over a short window; with capped backoff it is bounded.
+  std::atomic<int> apply_calls{0};
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([&apply_calls](std::span<const core::ops::WriteOp>, core::SequenceId) {
+        apply_calls.fetch_add(1, std::memory_order_relaxed);
+        return core::Result<void>(
+            std::unexpected(core::Error{core::ErrorCode::kCorruption, "poison"}));
+      });
+
+  c->Start();
+  std::this_thread::sleep_for(150ms);
+  c->Stop();
+
+  // 150ms with a 5ms->20ms capped backoff bounds attempts well under a busy
+  // spin (which would be 10k+). A generous ceiling keeps the test non-flaky.
+  EXPECT_LE(apply_calls.load(), 60) << "poisoned batch busy-spun instead of backing off";
+  EXPECT_GE(apply_calls.load(), 1);
+  EXPECT_GT(c->Snapshot().apply_poisoned, 0U);
+}
+
 // --- Queue-read error handling (C2) ------------------------------------------
 
 TEST_F(ColdConsumerTest, QueueReadUnavailableStopsLoop) {
@@ -477,7 +624,7 @@ TEST_F(ColdConsumerTest, FlushDoesNotRetryOnTerminalError) {
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
   // kCorruption is terminal — retrying won't help.
-  EXPECT_CALL(cold_, ApplyBatch(_))
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
       .WillOnce(Return(std::unexpected(core::Error{core::ErrorCode::kCorruption, "bad data"})));
 
   c->Drain();

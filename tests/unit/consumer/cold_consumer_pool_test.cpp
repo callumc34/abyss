@@ -39,7 +39,7 @@ class ColdConsumerPoolWaitTest : public ::testing::Test {
   void SetUp() override {
     ON_CALL(queue_, Read(_, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
     ON_CALL(queue_, Ack(_, _, _)).WillByDefault(Return(core::Result<void>{}));
-    ON_CALL(cold_, ApplyBatch(_)).WillByDefault(Return(core::Result<void>{}));
+    ON_CALL(cold_, ApplyBatch(_, _)).WillByDefault(Return(core::Result<void>{}));
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)

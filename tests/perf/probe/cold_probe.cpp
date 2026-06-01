@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
     };
     batch.emplace_back(set_op);
     if (batch.size() >= kBatchSize) {
-      auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{batch});
+      auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{batch}, 0);
       if (!rc.has_value()) {
         std::cerr << "preload ApplyBatch failed: " << rc.error().message() << '\n';
         return 1;
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     }
   }
   if (!batch.empty()) {
-    auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{batch});
+    auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{batch}, 0);
     if (!rc.has_value()) {
       std::cerr << "preload final ApplyBatch failed: " << rc.error().message() << '\n';
       return 1;
@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
           .abs_ttl_ms = 0,
       };
       std::array<abyss::core::ops::WriteOp, 1> ops{set_op};
-      auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{ops});
+      auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{ops}, 0);
       if (!rc.has_value()) error_count.fetch_add(1, std::memory_order_relaxed);
     }
   };
