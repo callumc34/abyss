@@ -3,74 +3,78 @@
 #include <algorithm>
 #include <future>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace abyss::core {
 
-ApplyNotifier::ApplyNotifier(ApplyNotifierConfig config) {
-  const auto count = std::max<uint32_t>(1, config.registry_shard_count);
+AppliedSeqNotifier::AppliedSeqNotifier(AppliedSeqNotifierConfig config) {
+  const auto count = std::max<uint32_t>(1, config.shard_count);
   shards_.reserve(count);
   for (uint32_t i = 0; i < count; ++i) {
-    auto shard = std::make_unique<Shard>();
-    shard->recent_fired.assign(late_window_size_per_shard_, 0);
-    shards_.push_back(std::move(shard));
+    shards_.push_back(std::make_unique<Shard>());
   }
 }
 
-ApplyNotifier::Shard& ApplyNotifier::ShardFor(RpcId id) const {
-  return *shards_[id % shards_.size()];
+AppliedSeqNotifier::Shard& AppliedSeqNotifier::ShardFor(ShardId shard) const {
+  return *shards_[shard % shards_.size()];
 }
 
-std::future<void> ApplyNotifier::AwaitApplied(RpcId id) {
-  auto& shard = ShardFor(id);
-  const std::scoped_lock lock(shard.mu);
+std::future<void> AppliedSeqNotifier::AwaitApplied(ShardId shard, SequenceId seq) {
+  auto& s = ShardFor(shard);
+  const std::scoped_lock lock(s.mu);
 
-  // Late-arrival: return ready if already fired within the recent window.
-  for (auto fired : shard.recent_fired) {
-    if (fired == id) {
-      std::promise<void> p;
-      p.set_value();
-      return p.get_future();
-    }
+  // Already applied at or past seq: ready immediately. kNoSeqApplied is the
+  // largest possible value, so guard it explicitly before the >= compare.
+  const auto applied = s.applied_seq.load(std::memory_order_acquire);
+  if (applied != kNoSeqApplied && applied >= seq) {
+    std::promise<void> p;
+    p.set_value();
+    return p.get_future();
   }
 
-  auto [it, inserted] = shard.pending.try_emplace(id);
-  if (!inserted) {
-    // Duplicate Await: original waiter keeps its future; duplicate gets a broken one.
-    std::promise<void> broken;
-    return broken.get_future();
-  }
-  return it->second.get_future();
+  std::promise<void> p;
+  auto fut = p.get_future();
+  s.waiters.emplace(seq, std::move(p));
+  return fut;
 }
 
-void ApplyNotifier::NotifyApplied(RpcId id) {
-  auto& shard = ShardFor(id);
-  std::promise<void> to_fulfill;
-  bool fulfill = false;
+void AppliedSeqNotifier::NotifyApplied(ShardId shard, SequenceId seq) {
+  auto& s = ShardFor(shard);
+  std::vector<std::promise<void>> to_fulfill;
   {
-    const std::scoped_lock lock(shard.mu);
-    auto it = shard.pending.find(id);
-    if (it != shard.pending.end()) {
-      to_fulfill = std::move(it->second);
-      shard.pending.erase(it);
-      fulfill = true;
+    const std::scoped_lock lock(s.mu);
+
+    // All advances happen under the lock, so a plain monotonic max suffices.
+    // `seq` is a real value, so the new high-water is never kNoSeqApplied.
+    const auto cur = s.applied_seq.load(std::memory_order_relaxed);
+    const auto high = (cur == kNoSeqApplied || seq > cur) ? seq : cur;
+    s.applied_seq.store(high, std::memory_order_release);
+
+    auto end = s.waiters.upper_bound(high);
+    for (auto it = s.waiters.begin(); it != end; ++it) {
+      to_fulfill.push_back(std::move(it->second));
     }
-    shard.recent_fired[shard.recent_cursor] = id;
-    shard.recent_cursor = (shard.recent_cursor + 1) % shard.recent_fired.size();
+    s.waiters.erase(s.waiters.begin(), end);
   }
-  if (fulfill) to_fulfill.set_value();
+  for (auto& p : to_fulfill) p.set_value();
 }
 
-bool ApplyNotifier::Cancel(RpcId id) {
-  auto& shard = ShardFor(id);
-  const std::scoped_lock lock(shard.mu);
-  return shard.pending.erase(id) > 0;
+bool AppliedSeqNotifier::Cancel(ShardId shard, SequenceId seq) {
+  auto& s = ShardFor(shard);
+  const std::scoped_lock lock(s.mu);
+  return s.waiters.erase(seq) > 0;
 }
 
-size_t ApplyNotifier::PendingCount() const {
+SequenceId AppliedSeqNotifier::AppliedSeq(ShardId shard) const {
+  return ShardFor(shard).applied_seq.load(std::memory_order_acquire);
+}
+
+size_t AppliedSeqNotifier::PendingCount() const {
   size_t total = 0;
-  for (const auto& shard : shards_) {
-    const std::scoped_lock lock(shard->mu);
-    total += shard->pending.size();
+  for (const auto& s : shards_) {
+    const std::scoped_lock lock(s->mu);
+    total += s->waiters.size();
   }
   return total;
 }

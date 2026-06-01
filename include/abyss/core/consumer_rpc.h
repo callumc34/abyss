@@ -17,9 +17,19 @@ namespace abyss::core {
 
 using RpcId = uint64_t;
 
-// Per-shard seqs collide at the registry; pack shard in top 16 bits, seq in lower 48.
+// Upper bound on hot.shard_count for in-memory RpcId packing: the shard field
+// occupies bits [48,62] (15 bits), keeping bit 63 reserved for the flush tag.
+// The cold on-disk envelope (1<<16) is wider; that is the on-disk slot width,
+// not this in-memory packing limit. Validated centrally at config load.
+inline constexpr uint32_t kRpcMaxShardCount = 1U << 15;
+static_assert((kRpcMaxShardCount - 1) < (1U << 15));
+
+// Per-shard seqs collide at the registry; pack shard in bits [48,62] and seq in
+// bits [0,48). Bit 63 is forced clear so the write-RpcId space [0,2^63) stays
+// disjoint from the flush-tag space [2^63,2^64) for every valid shard.
 inline RpcId MakeRpcId(ShardId shard, SequenceId seq) {
-  return (static_cast<RpcId>(shard) << 48) | (static_cast<RpcId>(seq) & ((RpcId{1} << 48) - 1));
+  return ((static_cast<RpcId>(shard) & ((RpcId{1} << 15) - 1)) << 48) |
+         (static_cast<RpcId>(seq) & ((RpcId{1} << 48) - 1));
 }
 
 // Flush RPC id: [tag=1][7 bits consumer][16 bits shard][40 bits seq]. The high

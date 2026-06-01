@@ -66,7 +66,9 @@ class IntegrationHarness {
     cold_ = std::move(cold_result).value();
 
     rpc_ = std::make_unique<core::ConsumerRpc>();
-    apply_notifier_ = std::make_unique<core::ApplyNotifier>();
+    apply_notifier_ = std::make_unique<core::AppliedSeqNotifier>(core::AppliedSeqNotifierConfig{
+        .shard_count = kShardCount,
+    });
 
     InstallQueueMocks();
 
@@ -198,7 +200,7 @@ class IntegrationHarness {
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> rpc_;
-  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
+  std::unique_ptr<core::AppliedSeqNotifier> apply_notifier_;
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 };

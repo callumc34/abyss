@@ -2,6 +2,7 @@ add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
   core/consumer_rpc_test.cpp
+  core/apply_notifier_test.cpp
   core/fire_and_forget_test.cpp
   core/ops_test.cpp
   core/eviction_policy_test.cpp

@@ -834,10 +834,9 @@ void Resolver::HandleFlush(const core::QueueEntry& entry) {
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
   flushes_observed_.fetch_add(1, std::memory_order_relaxed);
 
-  const core::RpcId rpc_id =
-      core::MakeFlushRpcId(core::kResolverConsumer, config_.shard, entry.seq);
-  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
-  apply_notifier_.NotifyApplied(rpc_id);
+  (void)rpc_.Fulfill(core::MakeFlushRpcId(core::kResolverConsumer, config_.shard, entry.seq),
+                     core::RespValue::SimpleString("OK"));
+  apply_notifier_.NotifyApplied(config_.shard, entry.seq);
 }
 
 void Resolver::ProcessEntry(const core::QueueEntry& entry) {
@@ -868,44 +867,63 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
               keys.emplace_back(payload.cmd.args[1]);
             }
           }
-          auto stripe_idxs = StripeIndicesFor(keys);
-          std::vector<std::unique_lock<std::mutex>> locks;
-          locks.reserve(stripe_idxs.size());
-          for (auto idx : stripe_idxs) locks.emplace_back(stripes_[idx]);
-
-          auto resolved = Decide(entry, payload);
-
-          core::QueueEntry out{
-              .seq = 0,
-              .appended_at = core::WallClock::now(),
-              .payload = resolved,
-          };
-          auto append = queue_.Append(config_.shard, std::move(out));
           const core::RpcId client_rpc_id = core::MakeRpcId(config_.shard, entry.seq);
-          if (!append.has_value()) {
-            append_failures_.fetch_add(1, std::memory_order_relaxed);
-            ABYSS_LOG_ERROR("resolver append failed",
-                            {"shard", static_cast<int64_t>(config_.shard)},
-                            {"seq", static_cast<uint64_t>(entry.seq)},
-                            {"err", std::string_view{append.error().message()}});
-            (void)rpc_.Fulfill(client_rpc_id,
-                               core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                      "resolver could not append decision"));
-            return;
+          core::entry::Resolved resolved;
+          core::SequenceId resolved_seq = 0;
+
+          // The stripe locks serialise per-key Decide+Append+cache-update in
+          // queue order (ADP-011 inv 4). They are released here, before the
+          // latency-bound hot-apply wait and the RPC fulfilment, so a sibling
+          // key sharing a stripe is never blocked behind another op's wait.
+          {
+            auto stripe_idxs = StripeIndicesFor(keys);
+            std::vector<std::unique_lock<std::mutex>> locks;
+            locks.reserve(stripe_idxs.size());
+            for (auto idx : stripe_idxs) locks.emplace_back(stripes_[idx]);
+
+            resolved = Decide(entry, payload);
+
+            core::QueueEntry out{
+                .seq = 0,
+                .appended_at = core::WallClock::now(),
+                .payload = resolved,
+            };
+            auto append = queue_.Append(config_.shard, std::move(out));
+            if (!append.has_value()) {
+              append_failures_.fetch_add(1, std::memory_order_relaxed);
+              ABYSS_LOG_ERROR("resolver append failed",
+                              {"shard", static_cast<int64_t>(config_.shard)},
+                              {"seq", static_cast<uint64_t>(entry.seq)},
+                              {"err", std::string_view{append.error().message()}});
+              (void)rpc_.Fulfill(client_rpc_id,
+                                 core::RespValue::Error(core::ErrorPrefix::kErr,
+                                                        "resolver could not append decision"));
+              return;
+            }
+            resolved_seq = append->seq;
+
+            if (resolved.decision == core::Decision::kApply) {
+              decisions_apply_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              decisions_skip_.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            UpdateCacheFromResolved(entry.seq, resolved);
           }
 
-          if (resolved.decision == core::Decision::kApply) {
-            decisions_apply_.fetch_add(1, std::memory_order_relaxed);
+          // Block until hot applies — required for read-your-write. On timeout
+          // the write stays durable and applies on catch-up, but the client
+          // must NOT see success (mirrors the unconditional write path), so
+          // fulfil with an error instead of the decision's return value.
+          if (WaitForHotApply(resolved_seq)) {
+            (void)rpc_.Fulfill(client_rpc_id, std::move(resolved.return_value));
           } else {
-            decisions_skip_.fetch_add(1, std::memory_order_relaxed);
+            (void)rpc_.Fulfill(
+                client_rpc_id,
+                core::RespValue::Error(core::ErrorPrefix::kErr,
+                                       "write durable in queue but consumer did not apply within "
+                                       "timeout"));
           }
-
-          UpdateCacheFromResolved(entry.seq, resolved);
-
-          // Block until hot applies — required for read-your-write.
-          (void)WaitForHotApply(append->seq);
-
-          (void)rpc_.Fulfill(client_rpc_id, std::move(resolved.return_value));
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
           UpdateCacheFromResolved(entry.seq, payload);
         }
@@ -954,8 +972,7 @@ void Resolver::Run() {
 }
 
 bool Resolver::WaitForHotApply(core::SequenceId seq) {
-  const core::RpcId id = core::MakeRpcId(config_.shard, seq);
-  auto fut = apply_notifier_.AwaitApplied(id);
+  auto fut = apply_notifier_.AwaitApplied(config_.shard, seq);
   if (fut.wait_for(config_.hot_apply_wait) == std::future_status::ready) {
     try {
       fut.get();
@@ -965,7 +982,7 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
     }
   }
   apply_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-  apply_notifier_.Cancel(id);
+  apply_notifier_.Cancel(config_.shard, seq);
   ABYSS_LOG_WARN("resolver hot-apply wait timeout", {"shard", static_cast<int64_t>(config_.shard)},
                  {"seq", static_cast<uint64_t>(seq)});
   return false;

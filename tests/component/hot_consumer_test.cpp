@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/apply_notifier.h"
@@ -94,6 +95,21 @@ class HotConsumerTest : public ::testing::Test {
     return e;
   }
 
+  // Publishes an arbitrary entry payload and returns its assigned seq.
+  core::SequenceId AppendPayload(std::variant<core::entry::Write, core::entry::Conditional,
+                                              core::entry::Resolved, core::entry::Flush>
+                                     payload) {
+    core::QueueEntry e;
+    e.appended_at = core::WallClock::now();
+    e.payload = std::move(payload);
+    auto pending = queue_->BeginAppend(0, std::move(e));
+    EXPECT_TRUE(pending.has_value());
+    const core::SequenceId seq = pending->seq();
+    pending->Publish();
+    EXPECT_TRUE(pending->durable().get().has_value());
+    return seq;
+  }
+
   // BeginAppend → Register → Publish, matching the engine's write path.
   std::future<core::RespValue> AppendWithRpc(std::vector<std::string> args) {
     auto pending = queue_->BeginAppend(0, MakeWrite(std::move(args)));
@@ -178,6 +194,60 @@ TEST_F(HotConsumerTest, SettledSeqVisibleWhenWriteRpcResolves) {
         << "iter=" << i << " seq=" << seq
         << " — settled-seq must be visible at the moment the RPC future resolves";
   }
+}
+
+// HOTC-7: HighestSettledSeq is the settled FLOOR, not a raw max. With a
+// Conditional pending at seq M and a later Write applied at seq N>M, the floor
+// must clamp to M-1 (never N), because M's outcome is still undecided. Once the
+// matching Resolved for M applies, the floor advances past N.
+TEST_F(HotConsumerTest, HighestSettledSeqClampedBehindPendingConditional) {
+  StartConsumer();
+
+  // Advance settled past seq 0 first so the pending Conditional below lands at a
+  // seq M > 0 — the unsigned-seq-0 clamp guard cannot clamp below seq 0.
+  auto warmup = AppendWithRpcAndSeq({"SET", "warm", "0"});
+  ASSERT_EQ(warmup.future.wait_for(5s), std::future_status::ready);
+  ASSERT_TRUE(warmup.future.get().IsSimpleString());
+
+  // A Conditional that the consumer holds pending (no Resolved emitted by hot;
+  // the resolver would normally emit it).
+  const core::SequenceId m = AppendPayload(core::entry::Conditional{
+      .cmd = core::RespCommand{{"SETNX", "k", "v"}},
+      .flags = core::PredicateFlags::kNx,
+  });
+  ASSERT_GT(m, 0U);
+
+  // A later unconditional Write at seq N > M, fulfilled via its RPC so we know
+  // it has been applied.
+  auto [n, future] = AppendWithRpcAndSeq({"SET", "other", "1"});
+  ASSERT_GT(n, m);
+  ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+  ASSERT_TRUE(future.get().IsSimpleString());
+
+  // Wait for the consumer to observe the pending Conditional, then assert the
+  // floor never exceeds M-1 despite N being applied.
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (consumer_->PendingConditionalCount() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_EQ(consumer_->PendingConditionalCount(), 1U);
+  EXPECT_EQ(consumer_->HighestSettledSeq(), m - 1)
+      << "floor must clamp behind the pending Conditional at " << m;
+
+  // Now the matching Resolved for M applies (kSkip is fine — it just settles M).
+  AppendPayload(core::entry::Resolved{
+      .ref = m,
+      .decision = core::Decision::kSkip,
+      .materialised_ops = {},
+      .return_value = core::RespValue::Integer(0),
+  });
+
+  const auto deadline2 = std::chrono::steady_clock::now() + 2s;
+  while (consumer_->HighestSettledSeq() < n && std::chrono::steady_clock::now() < deadline2) {
+    std::this_thread::sleep_for(2ms);
+  }
+  EXPECT_GE(consumer_->HighestSettledSeq(), n)
+      << "floor must advance past N once the Conditional at M resolves";
 }
 
 TEST_F(HotConsumerTest, WrongTypeFlowsThroughRpcAndAcks) {

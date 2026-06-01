@@ -169,3 +169,15 @@ Every read records which tier served the response:
 **Why promote from cold via queue instead of writing directly to hot?** The queue is the sole write path. If we wrote directly to hot, the promoted key would not have a queue entry and would be lost on crash. Promoting through the queue gives the key a fresh entry that survives recovery. The cold consumer harmlessly re-absorbs it (the cold store already has the data, so the compacted flush is a no-op).
 
 **Why block the write handler on both fsync and hot apply?** The client expects that after receiving OK, a subsequent read returns the written value. If we only waited for fsync, there would be a window where the write is durable but not yet readable from hot. The client might read stale data immediately after a successful write. Waiting for both ensures read-after-write consistency.
+
+## Amendment: the settled seq is a floor, not a raw max
+
+**Status:** Accepted amendment to Accepted ADP-006. Resolves finding HOTC-7.
+
+Invariant 6 documents the read-consistency gate as waiting for the cold consumer's latest-drained seq to reach the hot consumer's highest settled seq, defined as "applied **and** any pending conditional has resolved". The original implementation advanced that signal to the highest hot-applied seq, including sequences that belong to conditional writes whose decision had not yet been applied. A read gated on that value could therefore observe a tier state reflecting an undecided conditional.
+
+This amendment redefines the highest settled seq as the **settled floor**: the highest sequence that is both hot-applied and not behind any unresolved pending conditional — equivalently, the lesser of the highest applied seq and one below the oldest pending conditional's seq. The read-consistency gate consumes this floor, so it never waits on, nor passes a read against, a sequence whose conditional outcome is still undecided. The hot consumer maintains the floor as a separate monotonic value computed once per settle — the same clamp already used to derive the ack target — and publishes it to both the ack and the progress signal. The unsigned-seq-0 guard already present on the ack path is reused, so a conditional pending at seq 0 leaves the floor at its prior value rather than underflowing.
+
+This supersedes the implicit reading of invariant 6 that equated the highest settled seq with the highest applied seq. The gate's externally observable behaviour and the consumer-independence invariant (invariant 3) are otherwise unchanged.
+
+**Implications.** Strengthens read-your-write correctness for conditional writes (`SET NX`, `SETNX`, `MSETNX`, `ZADD GT/LT`, `EXPIRE NX`, `RENAMENX`, `COPY`, `HSETNX`) without changing cold/hot consumer independence. No on-disk or wire format change. When the floor is genuinely 0 on a fresh shard the gate early-out (nothing settled yet) remains correct.

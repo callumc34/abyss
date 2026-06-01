@@ -237,9 +237,8 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
 
   // Publish settled-seq BEFORE fulfilling the RPC to avoid preempt issues.
   MarkSettledAndMaybeAck(entry.seq);
-  const core::RpcId rpc_id = core::MakeRpcId(config_.shard, entry.seq);
-  (void)rpc_.Fulfill(rpc_id, std::move(result));
-  apply_notifier_.NotifyApplied(rpc_id);
+  (void)rpc_.Fulfill(core::MakeRpcId(config_.shard, entry.seq), std::move(result));
+  apply_notifier_.NotifyApplied(config_.shard, entry.seq);
 }
 
 // Block-and-scan: hold the Conditional, wait for the Resolved to apply.
@@ -253,7 +252,7 @@ void HotConsumer::HandleConditional(core::QueueEntry entry,
         seq, PendingConditional{.entry = std::move(entry),
                                 .received_at = std::chrono::steady_clock::now()});
   }
-  apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, seq));
+  apply_notifier_.NotifyApplied(config_.shard, seq);
 }
 
 void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
@@ -274,9 +273,8 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
     }
   }
   for (auto seq : cancelled) {
-    const core::RpcId rpc_id = core::MakeRpcId(config_.shard, seq);
-    rpc_.Cancel(rpc_id);
-    apply_notifier_.NotifyApplied(rpc_id);
+    rpc_.Cancel(core::MakeRpcId(config_.shard, seq));
+    apply_notifier_.NotifyApplied(config_.shard, seq);
   }
 
   auto wiped = store_.Wipe();
@@ -286,11 +284,10 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
                     {"seq", static_cast<uint64_t>(entry.seq)},
                     {"err", std::string_view{wiped.error().message()}});
     // Fulfil the RPC with the error so the engine surfaces it instead of timing out.
-    const core::RpcId rpc_id = core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq);
-    rpc_.Fulfill(rpc_id,
+    rpc_.Fulfill(core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq),
                  core::RespValue::Error(core::ErrorPrefix::kErr,
                                         "hot store wipe failed: " + wiped.error().message()));
-    apply_notifier_.NotifyApplied(rpc_id);
+    apply_notifier_.NotifyApplied(config_.shard, entry.seq);
     MarkSettledAndMaybeAck(entry.seq);
     return;
   }
@@ -301,9 +298,9 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
   // in ColdConsumer::HandleFlush.
   MarkSettledAndMaybeAck(entry.seq);
 
-  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq);
-  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
-  apply_notifier_.NotifyApplied(rpc_id);
+  (void)rpc_.Fulfill(core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq),
+                     core::RespValue::SimpleString("OK"));
+  apply_notifier_.NotifyApplied(config_.shard, entry.seq);
   counters_.applied.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -350,11 +347,12 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
   if (had_pending) MarkSettledAndMaybeAck(resolved.ref);
   MarkSettledAndMaybeAck(entry.seq);
 
-  // The resolver awaits NotifyApplied on the conditional's RpcId before
-  // fulfilling the client RPC. The Resolved entry's own RpcId has no
-  // resolver-side waiter today, but we notify for symmetry with future RPCs.
-  apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, resolved.ref));
-  apply_notifier_.NotifyApplied(core::MakeRpcId(config_.shard, entry.seq));
+  // The resolver awaits NotifyApplied on the Resolved entry's own seq (the
+  // appended decision) before fulfilling the client RPC. Notify both the
+  // Conditional ref and this entry's seq so the per-shard high-water covers both
+  // positions; the monotonic CAS-max keeps the larger.
+  apply_notifier_.NotifyApplied(config_.shard, resolved.ref);
+  apply_notifier_.NotifyApplied(config_.shard, entry.seq);
 }
 
 core::Result<void> HotConsumer::ApplyResolvedOps(const std::vector<core::RespCommand>& ops,
@@ -421,6 +419,8 @@ void HotConsumer::MarkSettledAndMaybeAck(core::SequenceId seq) {
   }
 
   // Clamp ack behind any pending Conditional so its Resolved isn't acked-past.
+  // The same clamped value is the published settled floor (HighestSettledSeq):
+  // it never exceeds an unresolved pending Conditional.
   core::SequenceId target = seq;
   std::optional<core::SequenceId> oldest_pending;
   {
@@ -431,6 +431,14 @@ void HotConsumer::MarkSettledAndMaybeAck(core::SequenceId seq) {
   }
   if (oldest_pending.has_value() && *oldest_pending > 0 && *oldest_pending - 1 < target) {
     target = *oldest_pending - 1;
+  }
+
+  // Publish the floor monotonically. Reuse the cold consumer's unsigned-seq-0
+  // guard: a clamp to *oldest_pending - 1 when oldest_pending == 0 underflows,
+  // already excluded above, so target here is a real settled seq.
+  auto floor = settled_floor_.load(std::memory_order_acquire);
+  while (target > floor) {
+    if (settled_floor_.compare_exchange_weak(floor, target, std::memory_order_acq_rel)) break;
   }
 
   core::FireAndForget(queue_.Ack(core::kHotConsumer, config_.shard, target),
