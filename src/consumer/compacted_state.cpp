@@ -20,13 +20,24 @@ struct AbsorbVisitor {
   std::unordered_set<std::string>& zset_removed_members;
   std::unordered_map<std::string, std::string>& hash_fields;
   std::unordered_set<std::string>& hash_removed_fields;
+  CompactedState::BaseInvalidation& base_invalidation;
+  CompactedState::TtlIntent& ttl_intent;
 
   void operator()(const core::ops::StringSet& s) {
-    // SET overrides any existing type.
+    // SET overrides any existing type. A SET over a cold-resident collection or
+    // hash must wipe the prior type's slices first (COLDC-3); a SET over a
+    // string (or fresh state) overwrites the same key and needs no leading Del.
+    if (type == CompactedState::DataType::kSet || type == CompactedState::DataType::kZset ||
+        type == CompactedState::DataType::kHash) {
+      base_invalidation = CompactedState::BaseInvalidation::kDeleteAll;
+    }
     type = CompactedState::DataType::kString;
     is_tombstone = false;
     string_value = std::string(s.value);
     abs_ttl_ms = s.abs_ttl_ms;
+    // SET carries its own TTL inline; reset the trailing-op intent so a prior
+    // EXPIRE/PERSIST in this window does not double-encode over the new value.
+    ttl_intent = CompactedState::TtlIntent::kUnchanged;
     set_members.clear();
     set_removed_members.clear();
     zset_members.clear();
@@ -36,8 +47,14 @@ struct AbsorbVisitor {
   }
 
   void operator()(const core::ops::Del& /*unused*/) {
+    // A DEL resets all accumulated state and pins a destructive base
+    // invalidation so a subsequent re-add in the same window emits a leading
+    // Del that clears any cold-resident slices of any prior type (ADP-004
+    // invariant 3, COLDC-3).
     type = CompactedState::DataType::kNone;
     is_tombstone = true;
+    base_invalidation = CompactedState::BaseInvalidation::kDeleteAll;
+    ttl_intent = CompactedState::TtlIntent::kUnchanged;
     string_value.reset();
     abs_ttl_ms = 0;
     set_members.clear();
@@ -48,9 +65,15 @@ struct AbsorbVisitor {
     hash_removed_fields.clear();
   }
 
-  void operator()(const core::ops::Expire& e) { abs_ttl_ms = e.abs_ttl_ms; }
+  void operator()(const core::ops::Expire& e) {
+    abs_ttl_ms = e.abs_ttl_ms;
+    ttl_intent = CompactedState::TtlIntent::kSetTo;
+  }
 
-  void operator()(const core::ops::Persist& /*unused*/) { abs_ttl_ms = 0; }
+  void operator()(const core::ops::Persist& /*unused*/) {
+    abs_ttl_ms = 0;
+    ttl_intent = CompactedState::TtlIntent::kCleared;
+  }
 
   void operator()(const core::ops::SetAdd& s) {
     if (type != CompactedState::DataType::kSet && type != CompactedState::DataType::kNone) {
@@ -148,6 +171,8 @@ void CompactedState::Absorb(const core::ops::WriteOp& op) {
       .zset_removed_members = zset_removed_members_,
       .hash_fields = hash_fields_,
       .hash_removed_fields = hash_removed_fields_,
+      .base_invalidation = base_invalidation_,
+      .ttl_intent = ttl_intent_,
   };
   std::visit(visitor, op);
 }
@@ -159,11 +184,21 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
     return result;
   }
 
+  // Lossless ordering (A4): leading destructive Del, then type add ops, then
+  // rem ops, then exactly one trailing TTL op. Keys are patched by
+  // BuildBatchOps. The leading Del is applied before the re-adds within the
+  // same WriteBatchWithIndex so cold wipes prior slices of any type first.
+  if (base_invalidation_ == BaseInvalidation::kDeleteAll) {
+    result.emplace_back(core::ops::Del{.keys = {}});
+  }
+
   switch (type_) {
     case DataType::kNone:
       break;
     case DataType::kString:
       if (string_value_.has_value()) {
+        // For strings, the TTL intent folds into StringSet.abs_ttl_ms; the
+        // trailing TTL op is suppressed to avoid double-encoding.
         result.emplace_back(core::ops::StringSet{
             .key = {},
             .value = *string_value_,
@@ -179,9 +214,6 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           members.emplace_back(m);
         }
         result.emplace_back(core::ops::SetAdd{.key = {}, .members = std::move(members)});
-        if (abs_ttl_ms_ > 0) {
-          result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
-        }
       }
       // Net removals must reach cold.
       if (!set_removed_members_.empty()) {
@@ -201,9 +233,6 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           entries.push_back({.score = score, .member = member});
         }
         result.emplace_back(core::ops::ZsetAdd{.key = {}, .entries = std::move(entries)});
-        if (abs_ttl_ms_ > 0) {
-          result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
-        }
       }
       if (!zset_removed_members_.empty()) {
         std::vector<std::string_view> removed;
@@ -222,9 +251,6 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
           fields.push_back({.field = field, .value = value});
         }
         result.emplace_back(core::ops::HashSet{.key = {}, .fields = std::move(fields)});
-        if (abs_ttl_ms_ > 0) {
-          result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
-        }
       }
       if (!hash_removed_fields_.empty()) {
         std::vector<std::string_view> removed;
@@ -235,6 +261,17 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
         result.emplace_back(core::ops::HashDel{.key = {}, .fields = std::move(removed)});
       }
       break;
+  }
+
+  // Exactly one trailing TTL op for collections (COLDC-2). Strings fold the TTL
+  // into StringSet above, so the trailing op is suppressed for kString. An
+  // EXPIRE/PERSIST-only window on a kNone non-tombstone state emits only this.
+  if (type_ != DataType::kString && ttl_intent_ != TtlIntent::kUnchanged) {
+    if (ttl_intent_ == TtlIntent::kSetTo) {
+      result.emplace_back(core::ops::Expire{.key = {}, .abs_ttl_ms = abs_ttl_ms_});
+    } else {
+      result.emplace_back(core::ops::Persist{.key = {}});
+    }
   }
 
   return result;
@@ -303,6 +340,8 @@ void CompactedState::Reset() {
   zset_members_.clear();
   zset_removed_members_.clear();
   is_tombstone_ = false;
+  base_invalidation_ = BaseInvalidation::kNone;
+  ttl_intent_ = TtlIntent::kUnchanged;
 }
 
 }  // namespace abyss::consumer

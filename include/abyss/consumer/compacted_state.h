@@ -16,6 +16,17 @@ class CompactedState {
  public:
   enum class DataType : uint8_t { kNone, kString, kHash, kSet, kZset };
 
+  // Records that the window contained a destructive reset (DEL, or a type
+  // change that invalidates a prior cold-resident type slice) before any
+  // surviving additive state. Emit prepends a Del so cold wipes all prior
+  // slices for the key before the re-adds land.
+  enum class BaseInvalidation : uint8_t { kNone, kDeleteAll };
+
+  // Disambiguates "no TTL touched this window" from "TTL explicitly cleared",
+  // so Emit produces a trailing Persist for kCleared and Expire for kSetTo
+  // independent of whether any member-bearing op exists.
+  enum class TtlIntent : uint8_t { kUnchanged, kSetTo, kCleared };
+
   void Absorb(const core::ops::WriteOp& op);
   std::vector<core::ops::WriteOp> Emit() const;
   void Reset();
@@ -61,6 +72,11 @@ class CompactedState {
   std::unordered_set<std::string> zset_removed_members_;
 
   bool is_tombstone_ = false;
+
+  // Window-collapse bookkeeping (over already-absolute, parser-derived TTLs).
+  // `abs_ttl_ms_` is the kSetTo payload; neither field introduces a TTL clock.
+  BaseInvalidation base_invalidation_ = BaseInvalidation::kNone;
+  TtlIntent ttl_intent_ = TtlIntent::kUnchanged;
 };
 
 }  // namespace abyss::consumer

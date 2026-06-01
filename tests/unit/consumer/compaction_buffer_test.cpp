@@ -702,5 +702,62 @@ TEST_F(CompactionBufferTest, ClearDropsEntriesAndHeap) {
   EXPECT_EQ(r->AsString(), "v");
 }
 
+// ---------------------------------------------------------------------------
+// COLDC-4: bounded flush heap (per-key dedup + heap-overhead accounting)
+// ---------------------------------------------------------------------------
+
+TEST_F(CompactionBufferTest, HotKeyDoesNotPushDuplicateHeapEntryWhenScheduleUnchanged) {
+  // Two absorbs of the same key at the SAME clock instant do not move the
+  // schedule, so the heap holds a single live entry, not two.
+  AbsorbString("hot", "v1");
+  EXPECT_EQ(buffer_.HeapDepth(), 1U);
+  AbsorbString("hot", "v2");
+  EXPECT_EQ(buffer_.HeapDepth(), 1U);
+
+  // Correctness preserved: the key still flushes exactly once.
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1U);
+  EXPECT_EQ(buffer_.HeapDepth(), 0U);
+}
+
+TEST_F(CompactionBufferTest, BytesEstimateIncludesHeapOverhead) {
+  // A hot key whose quiet deadline keeps sliding (distinct instants) retains a
+  // stale heap entry per slide. BytesEstimate must charge that occupancy so the
+  // growth surfaces as pressure rather than silent unbounded heap growth.
+  AbsorbString("hot", "v");
+  const auto single = buffer_.BytesEstimate();
+  const auto single_depth = buffer_.HeapDepth();
+  ASSERT_EQ(single_depth, 1U);
+
+  constexpr int kSlides = 50;
+  for (int i = 0; i < kSlides; ++i) {
+    clock_.Advance(1s);  // moves last_modified -> new schedule -> new heap entry
+    AbsorbString("hot", "v");
+  }
+
+  // One live entry per distinct schedule (the original plus each slide).
+  EXPECT_EQ(buffer_.HeapDepth(), static_cast<size_t>(1 + kSlides));
+  // The estimate grew with the retained heap entries (heap overhead is charged).
+  EXPECT_GT(buffer_.BytesEstimate(), single + static_cast<size_t>(kSlides));
+}
+
+TEST_F(CompactionBufferTest, HeapOverheadReleasedAfterFlush) {
+  // Drive heap growth, then flush; the stale-skip pops must release their
+  // overhead so the estimate returns to zero (no upward leak).
+  AbsorbString("hot", "v");
+  for (int i = 0; i < 20; ++i) {
+    clock_.Advance(1s);
+    AbsorbString("hot", "v");
+  }
+  ASSERT_GT(buffer_.HeapDepth(), 1U);
+
+  clock_.Advance(120s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1U);
+  EXPECT_EQ(buffer_.HeapDepth(), 0U);
+  EXPECT_EQ(buffer_.BytesEstimate(), 0U);
+}
+
 }  // namespace
 }  // namespace abyss::consumer

@@ -58,7 +58,20 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
   auto next = strategy_.NextFlushTime(entry, entry.eviction);
   entry.last_trigger = next.trigger;
   const auto scheduled = next.time + entry.jitter_offset;
-  flush_heap_.push({scheduled, key});
+  // Dedup (COLDC-4): re-absorbs that do not move the schedule (same clock
+  // instant) reuse the live heap entry instead of pushing a stale duplicate.
+  // A fresh entry always has a default-constructed scheduled_in_heap_ and so
+  // gets its first push here.
+  if (!is_new && entry.scheduled_in_heap_ == scheduled) {
+    return;
+  }
+  PushHeapEntry(entry, scheduled);
+}
+
+void CompactionBuffer::PushHeapEntry(BufferEntry& entry, core::SteadyTime scheduled) {
+  entry.scheduled_in_heap_ = scheduled;
+  heap_overhead_bytes_ += kHeapEntryOverhead + entry.key.size();
+  flush_heap_.push({scheduled, entry.key});
 }
 
 namespace {
@@ -239,6 +252,9 @@ std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size
     auto heap_time = flush_heap_.top().scheduled_time;
     auto heap_key = flush_heap_.top().key;
     flush_heap_.pop();
+    // Charge the pop against the heap budget regardless of whether the entry is
+    // accepted below — every push had a matching charge (COLDC-4).
+    heap_overhead_bytes_ -= kHeapEntryOverhead + heap_key.size();
 
     auto it = entries_.find(heap_key);
     if (it == entries_.end()) continue;
@@ -262,10 +278,14 @@ std::vector<BufferEntry> CompactionBuffer::FlushOldest(size_t target_bytes, size
   const std::unique_lock lock(mutex_);
   std::vector<BufferEntry> result;
 
-  while (!flush_heap_.empty() && result.size() < max_count && bytes_estimate_ > target_bytes) {
+  // Compare the combined estimate (entry bytes + heap overhead) against the
+  // target so heap-driven pressure actually drains, mirroring BytesEstimate().
+  while (!flush_heap_.empty() && result.size() < max_count &&
+         bytes_estimate_ + heap_overhead_bytes_ > target_bytes) {
     auto heap_time = flush_heap_.top().scheduled_time;
     auto heap_key = flush_heap_.top().key;
     flush_heap_.pop();
+    heap_overhead_bytes_ -= kHeapEntryOverhead + heap_key.size();
 
     auto it = entries_.find(heap_key);
     if (it == entries_.end()) continue;
@@ -292,8 +312,8 @@ void CompactionBuffer::Reinsert(std::vector<BufferEntry> entries) ABYSS_NO_THREA
     const auto next = strategy_.NextFlushTime(entry, entry.eviction);
     entry.last_trigger = next.trigger;
     const auto scheduled = next.time + entry.jitter_offset;
-    entries_.insert_or_assign(key, std::move(entry));
-    flush_heap_.push({scheduled, key});
+    auto [it, _] = entries_.insert_or_assign(key, std::move(entry));
+    PushHeapEntry(it->second, scheduled);
   }
 }
 
@@ -315,6 +335,7 @@ void CompactionBuffer::Clear() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   decltype(flush_heap_) empty;
   flush_heap_.swap(empty);
   bytes_estimate_ = 0;
+  heap_overhead_bytes_ = 0;
 }
 
 size_t CompactionBuffer::Size() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
@@ -324,7 +345,12 @@ size_t CompactionBuffer::Size() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
 
 size_t CompactionBuffer::BytesEstimate() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
-  return bytes_estimate_;
+  return bytes_estimate_ + heap_overhead_bytes_;
+}
+
+size_t CompactionBuffer::HeapDepth() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  return flush_heap_.size();
 }
 
 std::chrono::milliseconds CompactionBuffer::ComputeJitter() {

@@ -301,5 +301,108 @@ TEST_F(TwoTtlIntegrationTest, S3_SetEvictsThenTtlExpires) {
       << "TTL must remove the set entirely";
 }
 
+// --- COLDC-2: EXPIRE/PERSIST-only window reaches cold ----------------------
+// A TTL set/cleared in a window AFTER the value has already flushed to cold was
+// silently dropped pre-fix (Emit produced nothing). The standalone trailing TTL
+// op must now reach cold's meta record.
+
+TEST_F(TwoTtlIntegrationTest, COLDC2_StandaloneExpireOnAlreadyColdSetReachesCold) {
+  // Window 1: build the set and flush it to cold with NO TTL.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c2set", "a", "b"})).has_value());
+  DrainAndFlushCold("c2set");
+  EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2set"}))->AsInteger(), 2);
+
+  // Window 2 (a fresh compaction window): EXPIRE only — no member-bearing op.
+  const auto ttl_ms = WallMs() + 3000;
+  ASSERT_TRUE(
+      harness_.Engine()
+          .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2set", std::to_string(ttl_ms)}))
+          .has_value());
+  DrainAndFlushCold("c2set");
+
+  // The standalone Expire must have rewritten cold's meta TTL: past the TTL the
+  // cold lazy-expiry strips the set entirely.
+  harness_.Clock().Advance(4s);
+  auto card = harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2set"}));
+  ASSERT_TRUE(card.has_value());
+  EXPECT_EQ(card->AsInteger(), 0)
+      << "standalone EXPIRE window was dropped; cold never saw the TTL (COLDC-2)";
+}
+
+TEST_F(TwoTtlIntegrationTest, COLDC2_StandalonePersistOnAlreadyColdSetClearsTtl) {
+  // Window 1: build a set WITH a TTL and flush to cold.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c2p", "a", "b"})).has_value());
+  const auto ttl_ms = WallMs() + 3000;
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2p", std::to_string(ttl_ms)}))
+                  .has_value());
+  DrainAndFlushCold("c2p");
+
+  // Window 2: PERSIST only — clears the TTL on the already-cold set.
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("PERSIST", MakeCmd({"PERSIST", "c2p"})).has_value());
+  DrainAndFlushCold("c2p");
+
+  // Past the original TTL the set must still be live — the PERSIST window
+  // reached cold and cleared the meta TTL flag.
+  harness_.Clock().Advance(4s);
+  auto card = harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2p"}));
+  ASSERT_TRUE(card.has_value());
+  EXPECT_EQ(card->AsInteger(), 2)
+      << "standalone PERSIST window was dropped; cold kept the stale TTL (COLDC-2)";
+}
+
+// --- COLDC-3: DEL/type-change before re-add wipes prior cold slices --------
+
+TEST_F(TwoTtlIntegrationTest, COLDC3_DelThenReaddDoesNotResurrectColdSetMembers) {
+  // Window 1: set {a,b,c} flushed to cold.
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "a", "b", "c"}))
+                  .has_value());
+  DrainAndFlushCold("c3set");
+  EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 3);
+
+  // Window 2: DEL then re-add a single different member. Emit prepends a Del so
+  // cold wipes a/b/c before the re-add lands.
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("DEL", MakeCmd({"DEL", "c3set"})).has_value());
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "x"})).has_value());
+  DrainAndFlushCold("c3set");
+
+  // Drive the key out of hot so SCARD/SISMEMBER resolve against cold.
+  (void)harness_.ShardedHot().Wipe();
+
+  EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 1)
+      << "DEL-then-readd resurrected stale cold members (COLDC-3)";
+  EXPECT_EQ(harness_.Engine()
+                .DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "c3set", "a"}))
+                ->AsInteger(),
+            0);
+  EXPECT_EQ(harness_.Engine()
+                .DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "c3set", "x"}))
+                ->AsInteger(),
+            1);
+}
+
+TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
+  // A within-window type change (HSET then SET before any flush) is the
+  // COLDC-3 case the leading-Del covers: Emit prepends a Del so cold never
+  // receives the stale hash slices in the first place.
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "c3t", "f1", "v1", "f2", "v2"}))
+                  .has_value());
+  // Same compaction window — no DrainAndFlushCold between the two writes.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c3t", "now-a-string"})).has_value());
+  DrainAndFlushCold("c3t");
+
+  (void)harness_.ShardedHot().Wipe();
+
+  EXPECT_EQ(harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}))->AsString(),
+            "now-a-string");
+  // The prior hash fields must not survive the type change.
+  EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c3t"}))->AsInteger(), 0);
+}
+
 }  // namespace
 }  // namespace abyss::engine

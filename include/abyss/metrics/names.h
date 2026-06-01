@@ -415,6 +415,11 @@ inline constexpr GaugeDesc<> kColdBufferBytes{
     .help = "Estimated memory usage of the compaction buffer.",
 };
 
+inline constexpr GaugeDesc<> kColdFlushHeapDepth{
+    .name = "abyss_cold_flush_heap_depth",
+    .help = "Live entries in the compaction buffer's flush heap; surfaces heap growth.",
+};
+
 inline constexpr CounterDesc<Tier> kHitsTotal{
     .name = "abyss_hits_total",
     .help = "Read hits by tier.",
@@ -461,6 +466,13 @@ inline constexpr GaugeDesc<> kColdCheckpointIntervalSeconds{
 inline constexpr CounterDesc<BackoffReason> kColdConsumerBackoffTotal{
     .name = "abyss_cold_consumer_backoff_total",
     .help = "Cold consumer loop backoff events by reason (idle, poisoned, backpressure).",
+};
+
+inline constexpr CounterDesc<> kColdParsePoisonTotal{
+    .name = "abyss_cold_parse_poison_total",
+    .help =
+        "Structurally-undecodable WAL ops the cold consumer could not materialise. Each pins WAL "
+        "retention below the poison seq for the shard until operator intervention (fail-closed).",
 };
 
 // Tier domain for this metric is limited to {kHot, kCold}; kBuffer is invalid.

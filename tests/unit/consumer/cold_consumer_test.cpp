@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -136,9 +137,16 @@ TEST_F(ColdConsumerTest, DrainSkipsResolvedSkipDecision) {
   EXPECT_EQ(c->Buffer().Size(), 0);
 }
 
-TEST_F(ColdConsumerTest, DrainCountsParseFailuresAndContinues) {
-  auto c = MakeConsumer();
+// --- XERR-5: cold parse-poison quarantine ------------------------------------
 
+TEST_F(ColdConsumerTest, ParsePoisonDoesNotAdvanceAckPastUnabsorbedSeq) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  // seq 1 is structurally undecodable (poison); seq 2 is a valid SET that still
+  // absorbs. The ack must NOT pass the un-materialised seq 1 (XERR-5).
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"BOGUS", "key"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "k", "v"}));
@@ -147,11 +155,112 @@ TEST_F(ColdConsumerTest, DrainCountsParseFailuresAndContinues) {
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
+  // The valid SET (seq 2) must still reach cold — the poison quarantines the
+  // ack frontier, it does not drop the surrounding writes.
+  bool saw_set = false;
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([&saw_set](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
+        for (const auto& op : ops) {
+          if (const auto* s = std::get_if<core::ops::StringSet>(&op);
+              s != nullptr && s->key == "k") {
+            saw_set = true;
+          }
+        }
+        return core::Result<void>{};
+      });
+
+  core::SequenceId ack_seq = 0;
+  bool acked = false;
+  EXPECT_CALL(queue_, Ack(core::kColdConsumer, kShard, _))
+      .WillRepeatedly([&ack_seq, &acked](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        ack_seq = s;
+        acked = true;
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  c->Flush();
+  clock_.Advance(31s);
   c->Drain();
   c->Flush();
 
-  EXPECT_EQ(c->Buffer().Size(), 1);
-  EXPECT_EQ(c->Snapshot().parse_failures, 1U);
+  // The valid SET absorbed and reached cold (the write is not lost).
+  EXPECT_TRUE(saw_set) << "the valid write surrounding the poison was dropped";
+  EXPECT_EQ(c->Snapshot().parse_poison, 1U);
+  // The drained frontier is pinned below the poison (seq 1 -> floor 0).
+  EXPECT_EQ(c->Snapshot().latest_drained_seq, 0U);
+  // Either no ack was issued, or it stayed at the floor (never >= poison seq 1).
+  if (acked) EXPECT_EQ(ack_seq, 0U) << "ack advanced past the poison entry";
+}
+
+TEST_F(ColdConsumerTest, ParsePoisonEmitsCriticalMetricAndStalls) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  cfg.loop_initial_backoff = 5ms;
+  cfg.loop_max_backoff = 20ms;
+  cfg.queue_read_timeout = 1ms;
+  auto c = MakeConsumer(cfg);
+
+  // A single poison Write at seq 5 re-delivered every loop (the ack floor never
+  // passes it). The loop must back off rather than busy-spin.
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(5, {"BOGUS", "key"}));
+  std::atomic<int> read_calls{0};
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillRepeatedly(
+          [&entries, &read_calls](core::ConsumerId, core::ShardId, size_t, core::Duration) {
+            read_calls.fetch_add(1, std::memory_order_relaxed);
+            return entries;  // queue keeps re-delivering the un-acked poison
+          });
+
+  core::SequenceId max_ack = 0;
+  EXPECT_CALL(queue_, Ack(_, _, _))
+      .WillRepeatedly([&max_ack](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        max_ack = std::max(max_ack, s);
+        return core::Result<void>{};
+      });
+
+  c->Start();
+  std::this_thread::sleep_for(150ms);
+  c->Stop();
+
+  EXPECT_GT(c->Snapshot().parse_poison, 0U);
+  EXPECT_LT(max_ack, 5U) << "ack advanced to or past the poison seq";
+  // Capped 5ms->20ms backoff bounds reads well under a busy spin (10k+).
+  EXPECT_LE(read_calls.load(), 80) << "poison entry busy-spun instead of backing off";
+}
+
+TEST_F(ColdConsumerTest, ResolvedMaterialisedOpPoisonClampsAck) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  // A Resolved whose materialised op fails ParseWriteOp; the poison floors the
+  // ack at ref-1 and increments parse_poison.
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(
+      MakeResolvedEntry(7, core::Decision::kApply, std::vector<std::string>{"BOGUS", "key"}));
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  core::SequenceId max_ack = 0;
+  EXPECT_CALL(queue_, Ack(_, _, _))
+      .WillRepeatedly([&max_ack](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        max_ack = std::max(max_ack, s);
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  c->Flush();
+  clock_.Advance(31s);
+  c->Drain();
+  c->Flush();
+
+  EXPECT_EQ(c->Snapshot().parse_poison, 1U);
+  EXPECT_LT(max_ack, 7U) << "ack advanced to or past the resolved poison ref";
 }
 
 // Multi-key DEL/MSET WAL entries no longer occur — the engine decomposes

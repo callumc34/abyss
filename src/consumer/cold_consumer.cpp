@@ -58,6 +58,8 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
       reg.Counter(metrics::names::kColdConsumerBackoffTotal, metrics::BackoffReason::kPoisoned);
   backoff_backpressure_ =
       reg.Counter(metrics::names::kColdConsumerBackoffTotal, metrics::BackoffReason::kBackpressure);
+  parse_poison_total_ = reg.Counter(metrics::names::kColdParsePoisonTotal);
+  flush_heap_depth_ = reg.Gauge(metrics::names::kColdFlushHeapDepth);
 }
 
 ColdConsumer::~ColdConsumer() { Stop(); }
@@ -91,30 +93,44 @@ void ColdConsumer::RunLoop() {
   ABYSS_LOG_DEBUG("cold consumer started", {"shard", static_cast<int64_t>(shard_)});
   auto backoff = config_.loop_initial_backoff;
   while (!stop_requested_.load(std::memory_order_acquire)) {
+    const core::SequenceId drained_before = latest_drained_seq_.load(std::memory_order_acquire);
     const size_t drained = Drain();
     if (stop_requested_.load(std::memory_order_acquire)) break;
     const FlushOutcome outcome = Flush();
     CheckBlockAndScanTimeout();
 
+    // A poison clamp pins latest_drained_seq_ below the un-materialised entry,
+    // so the queue re-delivers it every loop. Drain() still returns a non-zero
+    // count (it re-handles the poison), but the drained FRONTIER does not
+    // advance — treat that as no-progress so a poison entry backs off on the
+    // capped exponential instead of busy-spinning (XERR-5 ⋀ C3 backoff).
+    const bool poison_pinned = oldest_poison_seq_.load(std::memory_order_acquire) != kNoPoison;
+    const core::SequenceId drained_after = latest_drained_seq_.load(std::memory_order_acquire);
+    const bool drain_advanced = drained > 0 && (!poison_pinned || drained_after != drained_before);
+
     // Backoff state machine (XRES-5): re-iterate immediately on progress
-    // (fresh drain or a flush that wrote), otherwise sleep on a capped
+    // (frontier advanced or a flush that wrote), otherwise sleep on a capped
     // exponential backoff so a poisoned/unwritable/idle shard never busy-spins.
-    const bool made_progress = drained > 0 || outcome == FlushOutcome::kProgress;
+    const bool made_progress = drain_advanced || outcome == FlushOutcome::kProgress;
     if (made_progress) {
       backoff = config_.loop_initial_backoff;
       continue;
     }
-    switch (outcome) {
-      case FlushOutcome::kPoisoned:
-        backoff_poisoned_.Increment();
-        break;
-      case FlushOutcome::kBackpressure:
-        backoff_backpressure_.Increment();
-        break;
-      case FlushOutcome::kIdle:
-      case FlushOutcome::kProgress:
-        backoff_idle_.Increment();
-        break;
+    if (poison_pinned) {
+      backoff_poisoned_.Increment();
+    } else {
+      switch (outcome) {
+        case FlushOutcome::kPoisoned:
+          backoff_poisoned_.Increment();
+          break;
+        case FlushOutcome::kBackpressure:
+          backoff_backpressure_.Increment();
+          break;
+        case FlushOutcome::kIdle:
+        case FlushOutcome::kProgress:
+          backoff_idle_.Increment();
+          break;
+      }
     }
     std::unique_lock lock(stop_mu_);
     stop_cv_.wait_for(lock, backoff,
@@ -143,6 +159,7 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
   }
 
   size_t count = 0;
+  core::SequenceId batch_poison = kNoPoison;
   for (const auto& entry : *result) {
     const auto seq = entry.seq;
     // Queue.Read uses the persisted ack offset as its read floor and
@@ -157,16 +174,17 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
     if (drained_anything_ && seq <= latest_drained_seq_.load(std::memory_order_acquire)) {
       continue;
     }
+    std::optional<core::SequenceId> poison;
     std::visit(
-        [this, &entry, &count](const auto& payload) {
+        [this, &entry, &count, &poison](const auto& payload) {
           using T = std::decay_t<decltype(payload)>;
           if constexpr (std::is_same_v<T, core::entry::Write>) {
-            HandleWrite(entry, payload);
+            poison = HandleWrite(entry, payload);
             ++count;
           } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
             HandleConditional(entry, payload);
           } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-            HandleResolved(entry, payload);
+            poison = HandleResolved(entry, payload);
             ++count;
           } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
             HandleFlush(entry);
@@ -174,7 +192,12 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
           }
         },
         entry.payload);
-    latest_drained_seq_.store(seq, std::memory_order_release);
+    if (poison.has_value()) batch_poison = std::min(batch_poison, *poison);
+    // Pin the drained frontier below the lowest poison seen so far: the
+    // un-materialised entry stays unacked and the WAL retains it (XERR-5).
+    const core::SequenceId frontier =
+        batch_poison == kNoPoison ? seq : std::min(seq, batch_poison - 1);
+    latest_drained_seq_.store(frontier, std::memory_order_release);
     drained_anything_ = true;
   }
   // Wake any read-consistency waiters now that the drained seq has advanced.
@@ -224,27 +247,34 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
       continue;
     }
 
+    core::SequenceId batch_poison = kNoPoison;
     for (const auto& entry : *read) {
       const auto seq = entry.seq;
       // Same re-delivery guard as DrainWithBatch; see comment there.
       if (drained_anything_ && seq <= latest_drained_seq_.load(std::memory_order_acquire)) {
         continue;
       }
+      std::optional<core::SequenceId> poison;
       std::visit(
-          [this, &entry](const auto& payload) {
+          [this, &entry, &poison](const auto& payload) {
             using T = std::decay_t<decltype(payload)>;
             if constexpr (std::is_same_v<T, core::entry::Write>) {
-              HandleWrite(entry, payload);
+              poison = HandleWrite(entry, payload);
             } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
               HandleConditional(entry, payload);
             } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-              HandleResolved(entry, payload);
+              poison = HandleResolved(entry, payload);
             } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
               HandleFlush(entry);
             }
           },
           entry.payload);
-      latest_drained_seq_.store(seq, std::memory_order_release);
+      if (poison.has_value()) batch_poison = std::min(batch_poison, *poison);
+      // Same poison clamp as DrainWithBatch: never advance the drained frontier
+      // past an un-materialised entry, so recovery re-reads it next run (XERR-5).
+      const core::SequenceId frontier =
+          batch_poison == kNoPoison ? seq : std::min(seq, batch_poison - 1);
+      latest_drained_seq_.store(frontier, std::memory_order_release);
       drained_anything_ = true;
     }
 
@@ -296,15 +326,17 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
   return {};
 }
 
-void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
+std::optional<core::SequenceId> ColdConsumer::HandleWrite(const core::QueueEntry& entry,
+                                                          const core::entry::Write& write) {
   if (write.cmd.args.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    return;
+    RecordPoison(entry.seq, "empty write command");
+    return entry.seq;
   }
   const uint64_t wall_now_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
           .count());
-  AbsorbResolvedOp(write.cmd, entry.seq, wall_now_ms);
+  return AbsorbResolvedOp(write.cmd, entry.seq, wall_now_ms);
 }
 
 void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
@@ -315,27 +347,35 @@ void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
       seq, PendingConditional{.seq = seq, .received_at = std::chrono::steady_clock::now()});
 }
 
-void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
-                                  const core::entry::Resolved& resolved) {
+std::optional<core::SequenceId> ColdConsumer::HandleResolved(
+    const core::QueueEntry& entry, const core::entry::Resolved& resolved) {
   {
     const std::scoped_lock lock(pending_mu_);
     pending_conditionals_.erase(resolved.ref);
   }
   // Drop if the Conditional ref lives on the wiped side of a Flush.
   const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
-  if (flush_high > 0 && resolved.ref < flush_high) return;
-  if (resolved.decision != core::Decision::kApply) return;
+  if (flush_high > 0 && resolved.ref < flush_high) return std::nullopt;
+  if (resolved.decision != core::Decision::kApply) return std::nullopt;
   // Materialised ops use PXAT so wall_now_ms is unused; pass appended_at for symmetry.
   const uint64_t wall_now_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
           .count());
+  std::optional<core::SequenceId> poison;
   for (const auto& cmd : resolved.materialised_ops) {
     if (cmd.args.empty()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
+      RecordPoison(resolved.ref, "empty resolved materialised op");
+      poison = resolved.ref;
       continue;
     }
-    AbsorbResolvedOp(cmd, resolved.ref, wall_now_ms);
+    // Non-poison ops in the same Resolved still absorb; only the poison seq is
+    // returned so the ack pins below it.
+    if (auto p = AbsorbResolvedOp(cmd, resolved.ref, wall_now_ms); p.has_value()) {
+      poison = p;
+    }
   }
+  return poison;
 }
 
 void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
@@ -411,24 +451,41 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
 }
 
-bool ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq,
-                                    uint64_t wall_now_ms) {
+std::optional<core::SequenceId> ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd,
+                                                               core::SequenceId seq,
+                                                               uint64_t wall_now_ms) {
   auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, wall_now_ms);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    RecordPoison(seq, "ParseWriteOp failed");
+    return seq;
   }
 
   auto key = core::ops::PrimaryKey(*op);
   if (key.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    RecordPoison(seq, "empty primary key");
+    return seq;
   }
 
   const std::string key_str(key);
   auto eviction = eviction_policy_.Resolve(key_str);
   buffer_.Absorb(key_str, *op, eviction, seq);
-  return true;
+  return std::nullopt;
+}
+
+void ColdConsumer::RecordPoison(core::SequenceId seq, std::string_view reason) {
+  parse_poison_.fetch_add(1, std::memory_order_relaxed);
+  parse_poison_total_.Increment();
+  // Lower oldest_poison_seq_ toward seq (single-writer loop thread, but keep it
+  // a CAS-min so any future concurrency stays correct).
+  core::SequenceId prev = oldest_poison_seq_.load(std::memory_order_acquire);
+  while (seq < prev &&
+         !oldest_poison_seq_.compare_exchange_weak(prev, seq, std::memory_order_acq_rel)) {
+  }
+  ABYSS_LOG_CRITICAL("cold parse poison; WAL retention pinned below seq",
+                     {"shard", static_cast<int64_t>(shard_)}, {"seq", static_cast<uint64_t>(seq)},
+                     {"reason", reason});
 }
 
 std::optional<core::SequenceId> ColdConsumer::OldestPendingConditional() const {
@@ -730,12 +787,16 @@ void ColdConsumer::TryAdvanceAck(bool force_checkpoint) {
 
   const auto oldest_unflushed = buffer_.OldestPendingSeq();
   const auto oldest_pending_cond = OldestPendingConditional();
+  const auto poison = oldest_poison_seq_.load(std::memory_order_acquire);
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
 
   // Unsigned seq space has no "before 0" — at seq 0 the ack must stay put,
   // else Read skips seq 0 (`from_seq = offset + 1`).
   if (oldest_unflushed.has_value() && *oldest_unflushed == 0) return;
   if (oldest_pending_cond.has_value() && *oldest_pending_cond == 0) return;
+  // A poison at seq 0 pins the whole shard at the floor: nothing can be acked
+  // without passing the un-materialised entry (XERR-5, fail-closed).
+  if (poison == 0) return;
 
   // Low-water target: every seq <= this has been flushed to cold's memtable
   // (entries still in the buffer pin `oldest_unflushed`; a failed apply is
@@ -746,6 +807,14 @@ void ColdConsumer::TryAdvanceAck(bool force_checkpoint) {
   }
   if (oldest_pending_cond.has_value()) {
     target = std::min(target, *oldest_pending_cond - 1);
+  }
+  // Poison clamp (XERR-5): never ack past a structurally-undecodable entry the
+  // cold view could not materialise. Pins WAL retention below the poison for
+  // the whole shard until operator intervention. Composes with C3's
+  // checkpoint-gated ack below — it only lowers the target, which the gate
+  // already tolerates.
+  if (poison != kNoPoison) {
+    target = std::min(target, poison - 1);
   }
 
   // (1) Make the cold data for `target` durable (on the bounded cadence, or
@@ -810,6 +879,7 @@ ColdConsumer::Metrics ColdConsumer::Snapshot() const {
   Metrics out;
   out.buffer_entries = buffer_.Size();
   out.buffer_bytes = buffer_.BytesEstimate();
+  flush_heap_depth_.Set(static_cast<double>(buffer_.HeapDepth()));
   out.mode = mode_.load(std::memory_order_acquire);
   out.flushes_quiet = flushes_quiet_.load(std::memory_order_relaxed);
   out.flushes_deadline = flushes_deadline_.load(std::memory_order_relaxed);
@@ -820,6 +890,7 @@ ColdConsumer::Metrics ColdConsumer::Snapshot() const {
   out.apply_poisoned = apply_poisoned_.load(std::memory_order_relaxed);
   out.retry_attempts = retry_attempts_.load(std::memory_order_relaxed);
   out.parse_failures = common.parse_failures;
+  out.parse_poison = parse_poison_.load(std::memory_order_relaxed);
   out.queue_read_failures = common.queue_read_failures;
   out.last_ack_seq = last_ack_seq_.load(std::memory_order_acquire);
   out.latest_drained_seq = latest_drained_seq_.load(std::memory_order_acquire);

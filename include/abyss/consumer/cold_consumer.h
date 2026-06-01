@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -75,6 +76,10 @@ class ColdConsumer {
     uint64_t apply_poisoned = 0;
     uint64_t retry_attempts = 0;
     uint64_t parse_failures = 0;
+    // Structurally-undecodable ops that pinned the WAL retention floor below
+    // their seq (XERR-5). Distinct from parse_failures (the legacy counter,
+    // retained for the empty-cmd / empty-key cases that are not poison).
+    uint64_t parse_poison = 0;
     uint64_t queue_read_failures = 0;
     core::SequenceId last_ack_seq = 0;
     core::SequenceId latest_drained_seq = 0;
@@ -148,14 +153,25 @@ class ColdConsumer {
  private:
   void RunLoop();
 
-  void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
+  // Handlers return the poison seq (the un-materialised WAL seq) when an op is
+  // structurally undecodable, std::nullopt otherwise. The drain loop clamps the
+  // drained/ack frontier below it so the WAL retains the entry (XERR-5).
+  std::optional<core::SequenceId> HandleWrite(const core::QueueEntry& entry,
+                                              const core::entry::Write& write);
   void HandleConditional(const core::QueueEntry& entry, const core::entry::Conditional& cond);
-  void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
+  std::optional<core::SequenceId> HandleResolved(const core::QueueEntry& entry,
+                                                 const core::entry::Resolved& resolved);
   void HandleFlush(const core::QueueEntry& entry);
 
   // `wall_now_ms` must be the entry's appended_at so hot and cold materialise
-  // identical absolute TTLs from PX/EX args.
-  bool AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t wall_now_ms);
+  // identical absolute TTLs from PX/EX args. Returns the seq as poison when the
+  // op cannot be parsed into a materialisable WriteOp (XERR-5).
+  std::optional<core::SequenceId> AbsorbResolvedOp(const core::RespCommand& cmd,
+                                                   core::SequenceId seq, uint64_t wall_now_ms);
+
+  // Records `seq` as poison: increments the metric, logs CRITICAL, and lowers
+  // oldest_poison_seq_ so TryAdvanceAck pins the ack below it.
+  void RecordPoison(core::SequenceId seq, std::string_view reason);
 
   std::optional<core::SequenceId> OldestPendingConditional() const ABYSS_EXCLUDES(pending_mu_);
   void CheckBlockAndScanTimeout();
@@ -245,9 +261,17 @@ class ColdConsumer {
       ABYSS_GUARDED_BY(pending_mu_);
   bool block_and_scan_warning_emitted_ = false;
 
+  // Lowest seq of a structurally-undecodable op the cold consumer could not
+  // materialise (XERR-5). The ack/drain frontier is pinned below it so the WAL
+  // retains the un-materialised entry until operator intervention. kNoPoison
+  // (max) means no poison seen this run; set monotonically downward.
+  static constexpr core::SequenceId kNoPoison = std::numeric_limits<core::SequenceId>::max();
+  std::atomic<core::SequenceId> oldest_poison_seq_{kNoPoison};
+
   metrics::ConsumerCounters counters_;
   std::atomic<uint64_t> retry_attempts_{0};
   std::atomic<uint64_t> apply_poisoned_{0};
+  std::atomic<uint64_t> parse_poison_{0};
   std::atomic<uint64_t> flushes_quiet_{0};
   std::atomic<uint64_t> flushes_deadline_{0};
   std::atomic<uint64_t> flushes_aggressive_{0};
@@ -268,6 +292,9 @@ class ColdConsumer {
   metrics::CounterHandle backoff_idle_;
   metrics::CounterHandle backoff_poisoned_;
   metrics::CounterHandle backoff_backpressure_;
+  metrics::CounterHandle parse_poison_total_;
+  // Updated from the const Snapshot() accessor (observability side-effect only).
+  mutable metrics::GaugeHandle flush_heap_depth_;
 };
 
 }  // namespace abyss::consumer
