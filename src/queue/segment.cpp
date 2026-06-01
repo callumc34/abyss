@@ -199,7 +199,7 @@ core::Result<void> Segment::Fsync() const {
   if (!file_.valid()) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync on closed segment"});
   }
-  return pfs::Fsync(file_);
+  return pfs::Fsync(file_, pfs::SyncMode::kDurable);
 }
 
 core::Result<void> Segment::Seal() {
@@ -209,7 +209,9 @@ core::Result<void> Segment::Seal() {
   }
   const size_t offset = write_offset_.load(std::memory_order_relaxed);
   if (auto r = pfs::Ftruncate(file_, offset); !r.has_value()) return std::unexpected(r.error());
-  if (auto r = pfs::Fsync(file_); !r.has_value()) return std::unexpected(r.error());
+  if (auto r = pfs::Fsync(file_, pfs::SyncMode::kDurable); !r.has_value()) {
+    return std::unexpected(r.error());
+  }
   sealed_ = true;
   return {};
 }

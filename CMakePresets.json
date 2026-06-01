@@ -82,6 +82,15 @@
       }
     },
     {
+      "name": "macos",
+      "inherits": "default",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
       "name": "windows",
       "inherits": "default",
       "condition": {
@@ -109,6 +118,7 @@
     { "name": "bench", "configurePreset": "bench" },
     { "name": "cloud-only", "configurePreset": "cloud-only" },
     { "name": "container", "configurePreset": "container" },
+    { "name": "macos", "configurePreset": "macos" },
     { "name": "windows", "configurePreset": "windows" }
   ],
   "testPresets": [
@@ -172,6 +182,20 @@
       "output": { "outputOnFailure": true },
       "execution": {
         "jobs": 4,
+        "scheduleRandom": true,
+        "noTestsAction": "error",
+        "timeout": 180
+      },
+      "filter": {
+        "exclude": { "label": "perf-micro|perf-probe|perf-load" }
+      }
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos",
+      "output": { "outputOnFailure": true },
+      "execution": {
+        "jobs": 8,
         "scheduleRandom": true,
         "noTestsAction": "error",
         "timeout": 180

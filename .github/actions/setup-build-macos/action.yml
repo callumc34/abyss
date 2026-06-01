@@ -1,0 +1,46 @@
+name: Setup Abyss Build Environment (macOS)
+description: Install Ninja and mono, bootstrap vcpkg at the manifest baseline, and wire up the GitHub Packages NuGet feed as the vcpkg binary cache. Apple Clang ships with the runner's Xcode.
+
+inputs:
+  github_token:
+    description: GITHUB_TOKEN with packages:write to authenticate with the NuGet feed.
+    required: true
+  github_owner:
+    description: Repository owner whose GitHub Packages NuGet feed hosts the vcpkg binary cache.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install build tools
+      shell: bash
+      run: |
+        brew install ninja mono
+
+    - name: Bootstrap vcpkg
+      shell: bash
+      run: |
+        BASELINE=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
+        git init "${HOME}/vcpkg"
+        git -C "${HOME}/vcpkg" remote add origin https://github.com/microsoft/vcpkg.git
+        git -C "${HOME}/vcpkg" fetch --depth 1 origin "${BASELINE}"
+        git -C "${HOME}/vcpkg" checkout FETCH_HEAD
+        "${HOME}/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+        echo "VCPKG_ROOT=${HOME}/vcpkg" >> "${GITHUB_ENV}"
+
+    - name: Configure GitHub Packages NuGet feed
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        GITHUB_OWNER: ${{ inputs.github_owner }}
+      run: |
+        set -eu
+        NUGET="$("${HOME}/vcpkg/vcpkg" fetch nuget | tail -n1)"
+        FEED="https://nuget.pkg.github.com/${GITHUB_OWNER}/index.json"
+        mono "${NUGET}" sources add \
+          -Source "${FEED}" \
+          -StorePasswordInClearText \
+          -Name GitHub \
+          -Username "${GITHUB_OWNER}" \
+          -Password "${GITHUB_TOKEN}"
+        mono "${NUGET}" setapikey "${GITHUB_TOKEN}" -Source "${FEED}"

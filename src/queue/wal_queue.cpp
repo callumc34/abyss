@@ -7,6 +7,9 @@
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/file_offset_store.h"
 #include "shard_state.h"
 
@@ -39,6 +42,30 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
   if (ec) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInternal, "create wal_path: " + ec.message()});
+  }
+
+  // Surface the volume's real durability posture before any ack is given
+  // (invariant 5). A retention-bearing policy on a volume that cannot make
+  // directory renames durable is a refuse-to-start condition: the persisted-ack
+  // <= durable-tail contract A1 relies on cannot hold there.
+  const bool durability_required = config.commit.policy != FsyncPolicy::kNone;
+  if (auto cap = platform::fs::ProbeDurability(config.wal_path); cap.has_value()) {
+    metrics::Registry::Instance()
+        .Gauge(metrics::names::kFsDurableDirSupported)
+        .Set(cap->dir_sync_supported ? 1.0 : 0.0);
+    ABYSS_LOG_INFO("WAL durability probe", {"path", std::string_view{config.wal_path}},
+                   {"dir_sync_supported", cap->dir_sync_supported},
+                   {"fsync_backend", static_cast<int64_t>(cap->backend)});
+    if (durability_required && !cap->dir_sync_supported) {
+      ABYSS_LOG_CRITICAL("data volume cannot make directory entries durable",
+                         {"path", std::string_view{config.wal_path}});
+      return std::unexpected(core::Error{
+          core::ErrorCode::kFailedPrecondition,
+          "data volume does not support durable directory fsync; refusing to start with a "
+          "retention fsync policy (set fsync_policy=none to override at the cost of durability)"});
+    }
+  } else {
+    return std::unexpected(cap.error());
   }
 
   std::unique_ptr<WalQueue> queue(new WalQueue(std::move(config)));

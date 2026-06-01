@@ -11,6 +11,32 @@
 | Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
 | Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
+| Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). With any retention `fsync_policy` this is a **refuse-to-start** condition — a persisted ack could outrun durable storage, violating "no OK for a lost write". | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk). As a deliberate, durability-disabling override, set `fsync_policy: none`. Watch `abyss_fs_durable_dir_supported`. |
+
+## Durability Capability Gate
+
+Durability ("a write that returned OK survives power loss") depends on the data volume's
+`fsync` actually reaching stable media — including the directory entry that links a freshly
+created or renamed file. Not every volume can do this: FAT/exFAT, some network shares, and some
+overlay/tmpfs mounts silently drop directory syncs.
+
+Abyss makes this observable and fail-closed rather than silently degrading (invariant 5):
+
+- At startup the WAL open path probes the data volume and emits
+  `abyss_fs_durable_dir_supported` (1 = durable directory fsync available, 0 = not).
+- The per-OS `fsync` backend is logged at startup (`fsync_backend` on the `WAL durability probe`
+  line): macOS uses `F_FULLFSYNC` (the only Darwin call that pushes the drive cache to platter),
+  Linux uses `fsync`, Windows uses `FlushFileBuffers` (rename durability via
+  `MOVEFILE_WRITE_THROUGH`).
+- If the volume cannot make directory entries durable **and** a retention `fsync_policy`
+  (`per_write` or `group_commit`) is configured, startup fails with a `kFailedPrecondition`
+  error rather than accepting writes it cannot honour.
+- The same check is enforced at the point of every durability-critical atomic write (node
+  identity, consumer offsets): a directory-sync-unsupported volume returns an error instead of
+  reporting a durable commit.
+
+To run on a volume that genuinely cannot provide durable directory fsync, set
+`fsync_policy: none` — this disables durability by design and logs a CRITICAL warning at startup.
 
 ## Backpressure Cascade
 

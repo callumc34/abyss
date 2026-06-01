@@ -17,6 +17,7 @@ enum class ErrorCode : uint8_t {
   kCorruption,
   kIncomplete,
   kWrongType,
+  kFailedPrecondition,
 };
 
 class Error {

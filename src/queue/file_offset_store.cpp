@@ -268,7 +268,15 @@ core::Result<void> FileOffsetStore::WriteShardFile(core::ConsumerId consumer, co
     return std::unexpected(r.error());
   }
 
-  return pfs::FsyncDir(std::filesystem::path(consumer_dir));
+  auto dir_sync = pfs::FsyncDir(std::filesystem::path(consumer_dir));
+  if (!dir_sync.has_value()) return std::unexpected(dir_sync.error());
+  if (*dir_sync == pfs::DirSyncOutcome::kUnsupported) {
+    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
+                                       "offset directory durability unsupported on volume '" +
+                                           consumer_dir +
+                                           "'; a persisted ack could outrun durable storage"});
+  }
+  return {};
 }
 
 }  // namespace abyss::queue

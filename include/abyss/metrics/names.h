@@ -310,6 +310,13 @@ inline constexpr HistogramDesc<> kColdFlushBatchSize{
     .buckets = buckets::kBatchSize,
 };
 
+inline constexpr GaugeDesc<> kFsDurableDirSupported{
+    .name = "abyss_fs_durable_dir_supported",
+    .help =
+        "1 if the data volume can make directory entries durable (fsync), else 0. A 0 on a "
+        "durability-required deployment is a refuse-to-start condition.",
+};
+
 inline constexpr GaugeDesc<> kHotConsumerLagEntries{
     .name = "abyss_hot_consumer_lag_entries",
     .help = "Entries between hot consumer position and queue head.",

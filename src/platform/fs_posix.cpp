@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -25,6 +26,19 @@ core::Error MakeErrno(core::ErrorCode code, const char* what) {
   msg.append(std::strerror(errno));
   return {code, std::move(msg)};
 }
+
+std::atomic<std::uint64_t> g_durable_fallbacks{0};
+
+#ifdef __APPLE__
+std::atomic<std::uint64_t> g_full_fsync_calls{0};
+
+int RealFullFsync(int fd) {
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+  return ::fcntl(fd, F_FULLFSYNC);
+}
+
+std::atomic<testing::FullFsyncFn> g_full_fsync_fn{&RealFullFsync};
+#endif
 
 int ToOpenFlags(OpenOptions opts) {
   int flags = 0;
@@ -149,7 +163,23 @@ core::Result<void> Ftruncate(const File& f, std::uint64_t size) {
   return {};
 }
 
-core::Result<void> Fsync(const File& f) {
+core::Result<void> Fsync(const File& f, SyncMode mode) {
+#ifdef __APPLE__
+  if (mode == SyncMode::kDurable) {
+    g_full_fsync_calls.fetch_add(1, std::memory_order_relaxed);
+    const auto full_fsync = g_full_fsync_fn.load(std::memory_order_acquire);
+    if (full_fsync(f.get()) == 0) return {};
+    // F_FULLFSYNC is unsupported on some volumes (e.g. certain network/overlay
+    // filesystems). Fall back to the strongest barrier that volume does
+    // support; any other error (e.g. EIO) is a real durability failure.
+    if (errno != ENOTSUP && errno != EOPNOTSUPP) {
+      return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "fcntl(F_FULLFSYNC)"));
+    }
+    g_durable_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  }
+#else
+  (void)mode;
+#endif
   if (::fsync(f.get()) < 0) {
     return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "fsync"));
   }
@@ -182,26 +212,73 @@ core::Result<void> Rename(const std::filesystem::path& from, const std::filesyst
   return {};
 }
 
-core::Result<void> FsyncDir(const std::filesystem::path& dir) {
+core::Result<DirSyncOutcome> FsyncDir(const std::filesystem::path& dir) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
   const int fd = ::open(dir.c_str(), O_RDONLY);
   if (fd < 0) {
-    if (errno == EPERM || errno == EINVAL || errno == ENOTSUP) return {};
+    if (errno == EPERM || errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+      return DirSyncOutcome::kUnsupported;
+    }
     return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "open dir for fsync"));
   }
-  if (::fsync(fd) < 0 && errno != EINVAL && errno != ENOTSUP) {
-    const int saved = errno;
-    while (::close(fd) < 0 && errno == EINTR) {
+  const int rc = ::fsync(fd);
+  const int saved = errno;
+  while (::close(fd) < 0 && errno == EINTR) {
+  }
+  if (rc < 0) {
+    if (saved == EINVAL || saved == ENOTSUP || saved == EOPNOTSUPP) {
+      return DirSyncOutcome::kUnsupported;
     }
     errno = saved;
     return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "fsync dir"));
   }
-  while (::close(fd) < 0 && errno == EINTR) {
-  }
-  return {};
+  return DirSyncOutcome::kSynced;
+}
+
+core::Result<DurabilityCapability> ProbeDurability(const std::filesystem::path& data_dir) {
+  DurabilityCapability cap;
+#ifdef __APPLE__
+  cap.backend = FsyncBackend::kFullFsync;
+#else
+  cap.backend = FsyncBackend::kFsync;
+#endif
+  auto dir = FsyncDir(data_dir);
+  if (!dir.has_value()) return std::unexpected(dir.error());
+  cap.dir_sync_supported = (*dir == DirSyncOutcome::kSynced);
+  return cap;
 }
 
 std::uint64_t ProcessId() noexcept { return static_cast<std::uint64_t>(::getpid()); }
+
+namespace testing {
+
+std::uint64_t DurableFsyncFallbackCount() noexcept {
+  return g_durable_fallbacks.load(std::memory_order_relaxed);
+}
+
+void ResetDurableFsyncFallbackCount() noexcept {
+  g_durable_fallbacks.store(0, std::memory_order_relaxed);
+}
+
+#ifdef __APPLE__
+void SetFullFsyncForTesting(FullFsyncFn fn) noexcept {
+  g_full_fsync_fn.store(fn != nullptr ? fn : &RealFullFsync, std::memory_order_release);
+}
+
+std::uint64_t FullFsyncCallCount() noexcept {
+  return g_full_fsync_calls.load(std::memory_order_relaxed);
+}
+
+void ResetFullFsyncCallCount() noexcept { g_full_fsync_calls.store(0, std::memory_order_relaxed); }
+#else
+void SetFullFsyncForTesting(FullFsyncFn /*fn*/) noexcept {}
+
+std::uint64_t FullFsyncCallCount() noexcept { return 0; }
+
+void ResetFullFsyncCallCount() noexcept {}
+#endif
+
+}  // namespace testing
 
 }  // namespace abyss::platform::fs
 

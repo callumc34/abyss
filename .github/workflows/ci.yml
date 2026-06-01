@@ -75,6 +75,13 @@ jobs:
     uses: ./.github/workflows/_build-windows.yml
     secrets: inherit
 
+  build-macos:
+    name: Build (macOS)
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
+    uses: ./.github/workflows/_build-macos.yml
+    secrets: inherit
+
   sanitizer:
     name: Sanitizer
     needs: [changes, build]
@@ -98,7 +105,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-24.04
-    needs: [changes, format, build, build-windows, sanitizer, docker]
+    needs: [changes, format, build, build-windows, build-macos, sanitizer, docker]
     if: always()
     timeout-minutes: 2
     steps:
