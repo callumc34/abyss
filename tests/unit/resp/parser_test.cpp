@@ -252,5 +252,67 @@ TEST(ParserTest, EmptyBufferIsIncomplete) {
   EXPECT_EQ(r.error().code(), core::ErrorCode::kIncomplete);
 }
 
+// RESP-1: a multibulk header declaring a count far above the limit is Malformed
+// BEFORE any reserve()/allocation. Pre-fix this reserved billions of elements
+// and crashed (length_error/bad_alloc).
+TEST(ParserTest, HugeArrayCountIsMalformedNotCrash) {
+  std::string input = "*9999999999999999999\r\n";  // overflows int64 parse -> Malformed
+  auto r = Parser::Parse(Bytes(input));
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+TEST(ParserTest, ArrayCountAboveLimitIsMalformed) {
+  ParserLimits limits;
+  const std::string over = "*" + std::to_string(limits.max_array_elements + 1) + "\r\n";
+  auto r = Parser::Parse(Bytes(over), limits);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+TEST(ParserTest, ArrayCountAtLimitIsAcceptedFraming) {
+  // At the limit the count itself is accepted (the frame is then Incomplete
+  // because the elements aren't present) — proves the boundary is inclusive.
+  ParserLimits limits;
+  const std::string at_limit = "*" + std::to_string(limits.max_array_elements) + "\r\n";
+  auto r = Parser::Parse(Bytes(at_limit), limits);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kIncomplete);
+}
+
+TEST(ParserTest, HugeBulkLengthIsMalformedNotCrash) {
+  ParserLimits limits;
+  const std::string over = "$" + std::to_string(limits.max_bulk_len + 1) + "\r\n";
+  auto r = Parser::Parse(Bytes(over), limits);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+// RESP-2: a fully-received inline line with an unbalanced quote can never be
+// satisfied, so it is Malformed — not kIncomplete (which would stall forever).
+TEST(ParserTest, UnterminatedInlineDoubleQuoteIsMalformed) {
+  std::string input = "SET key \"oops\r\n";
+  auto r = Parser::ParseCommand(Bytes(input));
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+  EXPECT_NE(std::string(r.error().message()).find("unbalanced quotes"), std::string::npos);
+}
+
+TEST(ParserTest, UnterminatedInlineSingleQuoteIsMalformed) {
+  std::string input = "SET k 'oops\r\n";
+  auto r = Parser::ParseCommand(Bytes(input));
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+// RESP-2 regression guard: a genuinely-incomplete inline buffer (no terminator
+// yet) still returns kIncomplete so legitimate streaming is not broken.
+TEST(ParserTest, TrulyIncompleteInlineStillIncomplete) {
+  std::string input = "SET key \"oo";  // no \n yet
+  auto r = Parser::ParseCommand(Bytes(input));
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kIncomplete);
+}
+
 }  // namespace
 }  // namespace abyss::resp

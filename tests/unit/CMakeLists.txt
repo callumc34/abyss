@@ -36,6 +36,7 @@ target_include_directories(abyss_queue_tests PRIVATE
 
 target_link_libraries(abyss_queue_tests PRIVATE
   abyss::queue
+  abyss::metrics
   abyss::test_support
   GTest::gtest_main
 )

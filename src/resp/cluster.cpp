@@ -165,14 +165,19 @@ RespValue HandleKeyslot(const core::RespCommand& cmd) {
   return RespValue::Integer(core::SlotForKey(cmd.args[2]));
 }
 
-RespValue HandleCountKeysInSlot(const core::RespCommand& cmd, const ServerStats& stats) {
+RespValue HandleCountKeysInSlot(const core::RespCommand& cmd, const ServerStats& /*stats*/) {
   uint32_t slot = 0;
   const auto& arg = cmd.args[2];
   auto [ptr, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), slot);
   if (ec != std::errc{} || ptr != arg.data() + arg.size() || slot >= core::kSlotCount) {
     return RespValue::Integer(0);
   }
-  return RespValue::Integer(static_cast<int64_t>(stats.hot_key_count + stats.cold_key_count));
+  // Per-slot occupancy: the key count for keys whose CRC16 slot equals `slot`.
+  // ServerStats carries only whole-keyspace aggregates and no per-slot index,
+  // so returning the keyspace total would be wrong (every slot would report the
+  // total). Report 0 — the honest count for "no per-slot index" — rather than a
+  // misleading total. The wire contract is stable for a populated slot index.
+  return RespValue::Integer(0);
 }
 
 }  // namespace

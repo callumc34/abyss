@@ -437,6 +437,14 @@ inline constexpr CounterDesc<> kQueueAppendedTotal{
     .help = "Total entries appended to the queue.",
 };
 
+inline constexpr CounterDesc<> kWalDecodeCorruptionTotal{
+    .name = "abyss_wal_decode_corruption_total",
+    .help =
+        "CRC-valid WAL entries that failed structural decode during recovery. Genuine corruption "
+        "of durably-acked data; recovery fail-stops (never truncates) so acked data is not "
+        "silently discarded.",
+};
+
 inline constexpr CounterDesc<FlushStatus> kColdFlushTotal{
     .name = "abyss_cold_flush_total",
     .help = "Cold consumer flush operations by outcome.",

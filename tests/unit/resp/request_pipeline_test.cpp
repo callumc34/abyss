@@ -111,7 +111,7 @@ TEST(RequestPipelineTest, RespPing) {
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n"), output);
   EXPECT_GT(result.bytes_consumed, 0U);
-  EXPECT_FALSE(result.close_requested);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kNone);
   EXPECT_EQ(ToStr(output), "+PONG\r\n");
 }
 
@@ -141,7 +141,7 @@ TEST(RequestPipelineTest, QuitSetsCloseRequested) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("*1\r\n$4\r\nQUIT\r\n"), output);
-  EXPECT_TRUE(result.close_requested);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kClientQuit);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
 }
 
@@ -696,8 +696,8 @@ TEST(RequestPipelineTest, ClusterInfoReportsOk) {
   EXPECT_NE(response.AsString().find("cluster_slots_assigned:16384"), std::string::npos);
 }
 
-TEST(RequestPipelineTest, ClusterCountKeysInSlotUsesTotal) {
-  FakeStats stats(StandardStats());
+TEST(RequestPipelineTest, ClusterCountKeysInSlotIsNotKeyspaceTotal) {
+  FakeStats stats(StandardStats());  // hot_key_count=3, cold_key_count=7
   NodeIdentity identity("33333333-3333-4333-8333-333333333333");
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
@@ -705,7 +705,9 @@ TEST(RequestPipelineTest, ClusterCountKeysInSlotUsesTotal) {
   pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$1\r\n0\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
-  EXPECT_EQ(response.AsInteger(), 10);
+  // Per-slot count for a valid slot must NOT be the whole-keyspace total (10).
+  EXPECT_NE(response.AsInteger(), 10);
+  EXPECT_EQ(response.AsInteger(), 0);
 }
 
 TEST(RequestPipelineTest, ClusterCountKeysOutOfRangeReturnsZero) {
@@ -785,6 +787,40 @@ TEST(RequestPipelineTest, PartialFrameLeftForCaller) {
   auto result = pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$3\r\nhe"), output);
   EXPECT_EQ(result.bytes_consumed, 0U);
   EXPECT_TRUE(output.empty());
+}
+
+// RESP-3: an unframable RESP frame emits a -ERR and asks the caller to close.
+TEST(RequestPipelineTest, ProtocolErrorSetsCloseReason) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  // A negative multibulk count with trailing junk is a fully-delimited bad frame.
+  auto result = pipeline.Process(Bytes("*-5\r\nGARBAGE\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
+}
+
+// RESP-2: an inline command with an unterminated quote is a protocol error
+// (closes), not an indefinite kIncomplete stall. Pre-fix this consumed 0 bytes
+// forever and the connection hung.
+TEST(RequestPipelineTest, UnterminatedQuoteProducesErrorAndConsumesAll) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  const std::string input = "SET key \"oops\r\n";
+  auto result = pipeline.Process(Bytes(input), output);
+  EXPECT_EQ(result.bytes_consumed, input.size());
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
+  EXPECT_NE(ToStr(output).find("unbalanced quotes"), std::string::npos);
+}
+
+// RESP-1: a multibulk declaring a huge element count is rejected as a protocol
+// error before any allocation; no crash/OOM, and the caller is told to close.
+TEST(RequestPipelineTest, HugeArrayCountIsProtocolErrorNotCrash) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  auto result = pipeline.Process(Bytes("*2000000000\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, PipelinedFramesAreAllProcessed) {

@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "abyss/core/queue_entry.h"
@@ -21,6 +23,37 @@ core::QueueEntry MakeWriteEntry(core::SequenceId seq, std::vector<std::string> a
   e.appended_at = core::WallClock::now();
   e.payload = core::entry::Write{.cmd = core::RespCommand{std::move(args)}};
   return e;
+}
+
+// Builds a CRC-valid kResolved WAL frame (format_minor 1) whose return_value
+// section is exactly `return_value_bytes`. Used to exercise the decode-time
+// return_value parse: a CRC-valid frame whose return_value is RESP-unparseable
+// (or declares a huge inner count) must surface as corruption, never a silent
+// nil or a crash.
+std::vector<std::byte> MakeResolvedFrameWithReturnValue(
+    core::SequenceId seq, const std::vector<std::byte>& return_value_bytes) {
+  std::vector<std::byte> body;
+  binary::WriteU8(body, static_cast<uint8_t>(WalEntryType::kResolved));
+  binary::WriteU64LE(body, seq);
+  binary::WriteI64LE(body, 0);  // appended_us
+  binary::WriteU64LE(body, 0);  // ref
+  binary::WriteU8(body, 0);     // decision (kApply)
+  binary::WriteU32LE(body, 0);  // materialised_ops count = 0
+  binary::WriteU32LE(body, static_cast<uint32_t>(return_value_bytes.size()));
+  body.insert(body.end(), return_value_bytes.begin(), return_value_bytes.end());
+  binary::WriteU64LE(body, seq);  // batch_last_seq (minor 1)
+
+  std::vector<std::byte> frame;
+  binary::WriteU32LE(frame, static_cast<uint32_t>(body.size()));
+  frame.insert(frame.end(), body.begin(), body.end());
+  binary::WriteU32LE(frame, Crc32c(std::span<const std::byte>(body)));
+  return frame;
+}
+
+std::vector<std::byte> ToBytes(std::string_view s) {
+  std::vector<std::byte> out(s.size());
+  std::memcpy(out.data(), s.data(), s.size());
+  return out;
 }
 
 void ExpectWriteEqual(const core::QueueEntry& a, const core::QueueEntry& b) {
@@ -403,6 +436,50 @@ TEST(WalEntryTest, FlushEntryBatchedWithSibling) {
   ASSERT_TRUE(decoded.has_value());
   EXPECT_EQ(decoded->entry.seq, 100U);
   EXPECT_EQ(decoded->batch_last_seq, 101U);
+}
+
+// QUEUE-6: a CRC-valid Resolved frame whose return_value cannot be parsed must
+// surface as corruption (so recovery fails-stop), NOT be silently replaced with
+// a default-constructed nil. The failure is classified kCorruptFrame so the
+// segment scanner halts rather than truncating durably-acked data.
+TEST(WalEntryTest, CorruptResolvedReturnValueIsCorruptionNotNil) {
+  // A bare type byte with no terminator is a fully-present-but-unparseable RESP
+  // value (the parser cannot frame "+OK" without CRLF in a closed span).
+  const auto frame = MakeResolvedFrameWithReturnValue(20, ToBytes("+unterminated"));
+
+  WalDecodeFailure failure = WalDecodeFailure::kNone;
+  auto decoded = DecodeWalEntry(frame, kWalFormatMinor, failure);
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
+  EXPECT_NE(std::string(decoded.error().message()).find("return_value"), std::string::npos);
+  // CRC validated, so the structure failure is genuine corruption -> halt.
+  EXPECT_EQ(failure, WalDecodeFailure::kCorruptFrame);
+}
+
+// RESP-1 (WAL reuse): a CRC-valid Resolved frame whose return_value declares a
+// huge inner array count must NOT abort recovery via length_error/bad_alloc.
+// The bounded parser rejects it before allocating, and it surfaces as corruption.
+TEST(WalEntryTest, ReplayHugeInnerArrayCountIsCorruptionNotCrash) {
+  const auto frame = MakeResolvedFrameWithReturnValue(21, ToBytes("*2000000000\r\n"));
+
+  WalDecodeFailure failure = WalDecodeFailure::kNone;
+  auto decoded = DecodeWalEntry(frame, kWalFormatMinor, failure);
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
+  EXPECT_EQ(failure, WalDecodeFailure::kCorruptFrame);
+}
+
+// Regression guard: a CRC-valid Resolved frame whose return_value IS parseable
+// still round-trips (the QUEUE-6 fix did not break the happy path).
+TEST(WalEntryTest, ValidResolvedReturnValueStillDecodes) {
+  const auto frame = MakeResolvedFrameWithReturnValue(22, ToBytes("+OK\r\n"));
+
+  auto decoded = DecodeWalEntry(frame);
+  ASSERT_TRUE(decoded.has_value());
+  auto* resolved = std::get_if<core::entry::Resolved>(&decoded->entry.payload);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_TRUE(resolved->return_value.IsSimpleString());
+  EXPECT_EQ(resolved->return_value.AsString(), "OK");
 }
 
 }  // namespace

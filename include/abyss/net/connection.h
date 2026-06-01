@@ -93,7 +93,9 @@ class Connection {
   void MaybePauseReading();
   void MaybeResumeReading();
   bool EnforceWriteHardLimit();
-  void DispatchPipelineOutput();
+  // Returns bytes consumed by the pipeline this pass; maps the pipeline's
+  // close signal onto pending_close_.
+  size_t DispatchPipelineOutput();
   void RecordReadBufferHighWater();
   void TouchActivity();
 
@@ -123,7 +125,10 @@ class Connection {
 
   core::SteadyTime last_activity_;
   bool reading_paused_ = false;
-  bool close_after_drain_ = false;
+  // A close the pipeline/transport requested; fires deterministically once the
+  // pending write buffer drains. Replaces the old close_after_drain_ bool so
+  // the close reason is carried, not just the fact of a close.
+  std::optional<metrics::CloseReason> pending_close_;
   bool closed_ = false;
   std::optional<metrics::CloseReason> close_reason_;
 };

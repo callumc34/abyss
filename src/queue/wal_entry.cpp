@@ -232,11 +232,17 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes, u
         return std::unexpected(Corrupted("truncated return_value"));
       }
       auto resp_bytes = cursor.first(resp_len);
+      // Bound the parse with the replay envelope: a crafted inner array/bulk
+      // count cannot abort recovery via length_error/bad_alloc (RESP-1). A
+      // parse failure on a CRC-valid frame is genuine corruption — surface it
+      // (kCorruptFrame is already set above) instead of silently substituting
+      // nil, so recovery fails-stop and the corruption counter is bumped
+      // (QUEUE-6). It is never left as a default-constructed kNull.
       auto parsed_resp =
-          resp::Parser::Parse({reinterpret_cast<const uint8_t*>(resp_bytes.data()), resp_len});
-      core::RespValue return_value;
-      if (parsed_resp.has_value()) {
-        return_value = std::move(parsed_resp->value);
+          resp::Parser::Parse({reinterpret_cast<const uint8_t*>(resp_bytes.data()), resp_len},
+                              resp::ParserLimits::ForWalReplay());
+      if (!parsed_resp.has_value()) {
+        return std::unexpected(Corrupted("return_value parse failed"));
       }
       cursor = cursor.subspan(resp_len);
 
@@ -244,7 +250,7 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes, u
           .ref = ref,
           .decision = static_cast<core::Decision>(decision),
           .materialised_ops = std::move(mat_ops),
-          .return_value = std::move(return_value),
+          .return_value = std::move(parsed_resp->value),
       };
       break;
     }

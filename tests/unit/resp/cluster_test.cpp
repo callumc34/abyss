@@ -39,6 +39,10 @@ core::RespCommand KeyslotCmd(std::string key) {
   return core::RespCommand{.args = {"CLUSTER", "KEYSLOT", std::move(key)}};
 }
 
+core::RespCommand CountKeysCmd(std::string slot) {
+  return core::RespCommand{.args = {"CLUSTER", "COUNTKEYSINSLOT", std::move(slot)}};
+}
+
 // Collects the [first,last] ranges from a CLUSTER SLOTS reply.
 std::vector<std::pair<int64_t, int64_t>> SlotRangesOf(const RespValue& reply) {
   std::vector<std::pair<int64_t, int64_t>> ranges;
@@ -139,6 +143,35 @@ TEST(ClusterTest, KeyslotHonoursHashtagCoLocation) {
   const auto a = HandleCluster("KEYSLOT", KeyslotCmd("{user1}.a"), stats, identity).AsInteger();
   const auto b = HandleCluster("KEYSLOT", KeyslotCmd("{user1}.b"), stats, identity).AsInteger();
   EXPECT_EQ(a, b);
+}
+
+// RESP-4: COUNTKEYSINSLOT must return the per-slot count, never the whole-
+// keyspace total. With keys seeded across slots, a single valid slot's count
+// is not the aggregate (which would wrongly report the same total for every
+// slot).
+TEST(ClusterTest, CountKeysInSlotIsNotKeyspaceTotal) {
+  ServerStats s = MakeStats(/*shard_count=*/8);
+  s.hot_key_count = 10;
+  s.cold_key_count = 5;
+  const FakeStats stats(s);
+  const NodeIdentity identity("66666666-6666-4666-8666-666666666666");
+
+  const auto reply = HandleCluster("COUNTKEYSINSLOT", CountKeysCmd("5"), stats, identity);
+  ASSERT_TRUE(reply.IsInteger());
+  EXPECT_NE(reply.AsInteger(), 15);  // not the keyspace total
+  EXPECT_EQ(reply.AsInteger(), 0);
+}
+
+TEST(ClusterTest, CountKeysInSlotInvalidSlotIsZero) {
+  ServerStats s = MakeStats(/*shard_count=*/8);
+  s.hot_key_count = 10;
+  s.cold_key_count = 5;
+  const FakeStats stats(s);
+  const NodeIdentity identity("77777777-7777-4777-8777-777777777777");
+
+  EXPECT_EQ(HandleCluster("COUNTKEYSINSLOT", CountKeysCmd("99999"), stats, identity).AsInteger(),
+            0);
+  EXPECT_EQ(HandleCluster("COUNTKEYSINSLOT", CountKeysCmd("abc"), stats, identity).AsInteger(), 0);
 }
 
 }  // namespace

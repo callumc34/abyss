@@ -59,8 +59,10 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
                                        std::string("Protocol error: ") + parsed.error().message());
       auto bytes = Serializer::Serialize(response);
       output.insert(output.end(), bytes.begin(), bytes.end());
-      // Cannot resync on malformed input; consume the lot and let the caller close.
+      // Unframable input: emit the error, consume the lot, and fail-closed so
+      // the connection is torn down once the reply drains.
       consumed = input.size();
+      close_reason_ = ProcessCloseReason::kProtocolError;
       break;
     }
     auto response = Dispatch(parsed->command);
@@ -68,11 +70,11 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
     output.insert(output.end(), bytes.begin(), bytes.end());
     consumed += parsed->bytes_consumed;
 
-    if (close_requested_) {
+    if (close_reason_ != ProcessCloseReason::kNone) {
       break;
     }
   }
-  return {.bytes_consumed = consumed, .close_requested = close_requested_};
+  return {.bytes_consumed = consumed, .close_reason = close_reason_};
 }
 
 RespValue RequestPipeline::Dispatch(const RespCommand& cmd) {
@@ -314,7 +316,7 @@ RespValue RequestPipeline::HandleEcho(const RespCommand& cmd) {
 }
 
 RespValue RequestPipeline::HandleQuit() {
-  close_requested_ = true;
+  close_reason_ = ProcessCloseReason::kClientQuit;
   return RespValue::SimpleString("OK");
 }
 

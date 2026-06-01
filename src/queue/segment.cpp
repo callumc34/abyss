@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
 #include "abyss/platform/fs.h"
 #include "abyss/queue/wal_entry.h"
 #include "binary_io.h"
@@ -138,6 +140,9 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
           // A CRC-valid frame whose structure could not be decoded is genuine
           // corruption of durably-acked data. Fail-stop: truncating here would
           // silently discard acked data (invariants 1/2). Decision 6.
+          metrics::Registry::Instance()
+              .Counter(metrics::names::kWalDecodeCorruptionTotal)
+              .Increment();
           ABYSS_LOG_CRITICAL("WAL decode corruption", {"path", std::string_view{path}},
                              {"shard", static_cast<int64_t>(header->shard_id)},
                              {"base_seq", static_cast<uint64_t>(header->base_seq)},
