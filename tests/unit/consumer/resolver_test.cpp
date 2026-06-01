@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -96,6 +97,39 @@ class ResolverTest : public ::testing::Test {
     EXPECT_CALL(queue_, Ack(_, _, _)).WillRepeatedly(Return(core::Result<void>{}));
   }
 
+  // Captures the highest acked seq for kResolverConsumer. Fail-closed: an Ack
+  // past durable_seq_ returns kFailedPrecondition (mirrors the real WAL gate),
+  // so a clamp bug surfaces as a rejected ack rather than silent success.
+  void StubQueueAckCapture() {
+    EXPECT_CALL(queue_, Ack(core::kResolverConsumer, 0, _))
+        .WillRepeatedly(
+            [this](core::ConsumerId, core::ShardId, core::SequenceId seq) -> core::Result<void> {
+              if (seq > durable_seq_.load()) {
+                return std::unexpected(
+                    core::Error(core::ErrorCode::kFailedPrecondition, "ack past durable (test)"));
+              }
+              auto cur = acked_seq_.load();
+              while (seq > cur && !acked_seq_.compare_exchange_weak(cur, seq)) {
+              }
+              ack_called_.store(true);
+              return core::Result<void>{};
+            });
+  }
+
+  // Drives DurableSeq/AwaitDurable off the test-controlled durable_seq_ so a
+  // test can hold a Resolved non-durable then release it.
+  void StubControllableDurability() {
+    EXPECT_CALL(queue_, DurableSeq(0))
+        .WillRepeatedly([this](core::ShardId) -> core::Result<core::SequenceId> {
+          return durable_seq_.load();
+        });
+    EXPECT_CALL(queue_, AwaitDurable(0, _, _))
+        .WillRepeatedly(
+            [this](core::ShardId, core::SequenceId seq, core::Duration) -> core::Result<bool> {
+              return durable_seq_.load() >= seq;
+            });
+  }
+
   core::QueueEntry MakeConditional(core::SequenceId seq, std::vector<std::string> args,
                                    core::PredicateFlags flags) {
     return MakeConditionalAt(seq, std::move(args), flags, core::WallClock::now());
@@ -133,6 +167,12 @@ class ResolverTest : public ::testing::Test {
   Resolver::Config config_;
   std::vector<core::QueueEntry> appended_;
   core::SequenceId next_appended_seq_ = 1000;
+  // Test-controlled durable watermark for the durability-clamp tests. Default
+  // max() = "everything durable" so tests not exercising durability are
+  // unaffected (matches MockQueue's permissive default).
+  std::atomic<core::SequenceId> durable_seq_{std::numeric_limits<core::SequenceId>::max()};
+  std::atomic<core::SequenceId> acked_seq_{0};
+  std::atomic<bool> ack_called_{false};
   // Tests never cancel — pass to ReplayForRecovery to satisfy the API.
   std::atomic<bool> cancel_{false};
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -371,6 +411,87 @@ TEST_F(ResolverRunTest, ConditionalStillSerialisesSameKeyInQueueOrder) {
   EXPECT_EQ(first->decision, core::Decision::kApply);
   EXPECT_EQ(second->ref, 11U);
   EXPECT_EQ(second->decision, core::Decision::kSkip);
+}
+
+// XDUR-2: the resolver's persisted retention ack must never outrun the durable
+// tail. With the group committer "paused" (durable_seq_ held below the emitted
+// Resolved's seq), the resolver appends the Resolved for Conditional 10 but its
+// persisted ack stays clamped below 10 — a crash here would re-read and
+// re-decide the Conditional. Once the Resolved becomes durable the ack advances
+// to 10. Pre-fix the resolver acked the Conditional's seq on drain progress,
+// losing the Resolved across a crash in the fsync-coalescing window.
+TEST_F(ResolverRunTest, AckClampedBehindNonDurableResolved) {
+  config_.hot_apply_wait = std::chrono::milliseconds{30};
+  config_.durable_wait_timeout = std::chrono::milliseconds{30};
+  StubQueueReadRepeating({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
+  StubQueueAppendCapture();  // Resolved is appended at seq 1000.
+  StubQueueAckCapture();
+  StubControllableDurability();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+
+  // Nothing durable yet: the committer is "paused".
+  durable_seq_.store(0);
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  resolver.Start();
+
+  // Wait until the Resolved has been appended (the resolver has processed the
+  // Conditional). The ack must remain clamped below the Conditional's seq.
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (appended_.empty() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  ASSERT_EQ(appended_.size(), 1U);
+  // Give the Run loop several ack cycles to (incorrectly) advance, if it would.
+  std::this_thread::sleep_for(100ms);
+  EXPECT_LT(acked_seq_.load(), 10U) << "ack advanced past Conditional before Resolved durable";
+
+  // Release durability for the Resolved (seq 1000).
+  durable_seq_.store(2000);
+  apply_notifier_.NotifyApplied(0, 2000);
+
+  const auto ack_deadline = std::chrono::steady_clock::now() + 3s;
+  while (acked_seq_.load() < 10U && std::chrono::steady_clock::now() < ack_deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  resolver.Stop();
+
+  EXPECT_GE(acked_seq_.load(), 10U) << "ack did not advance after Resolved became durable";
+  EXPECT_GE(resolver.GetSnapshot().resolver_durable_floor, 10U);
+}
+
+// XDUR-2 / XERR-3 client path (mirror-assert): the conditional client ack is
+// NOT returned success until the Resolved is durable AND hot-applied. On a
+// durability timeout the client receives an ERROR (never the success value);
+// the write stays durable in the WAL and re-applies on catch-up.
+TEST_F(ResolverRunTest, ConditionalDurabilityTimeoutReturnsError) {
+  config_.hot_apply_wait = std::chrono::milliseconds{1000};
+  config_.durable_wait_timeout = std::chrono::milliseconds{30};
+  StubQueueReadRepeating({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
+  StubQueueAppendCapture();
+  StubQueueAck();
+  StubControllableDurability();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+
+  // The Resolved (seq 1000) never becomes durable -> durability wait times out.
+  durable_seq_.store(0);
+  // Hot would apply, proving durability is checked FIRST: even with apply ready,
+  // the non-durable Resolved must yield an error.
+  apply_notifier_.NotifyApplied(0, 2000);
+
+  auto client = rpc_.Register(core::MakeRpcId(0, 10));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  resolver.Start();
+
+  ASSERT_EQ(client.wait_for(5s), std::future_status::ready);
+  auto reply = client.get();
+  resolver.Stop();
+
+  EXPECT_TRUE(reply.IsError()) << reply.AsString();
+  EXPECT_GE(resolver.GetSnapshot().durable_wait_timeouts, 1U);
+  // The Resolved was still appended (durable in the WAL, will apply on catch-up).
+  ASSERT_EQ(appended_.size(), 1U);
 }
 
 TEST_F(ResolverTest, RecoveryRebuildsCacheFromExistingResolved) {
@@ -622,6 +743,54 @@ TEST_F(ResolverTest, DelPurgesFieldsThenHsetnxApplies) {
   const auto* resolved = FindResolvedFor(appended_, 12);
   ASSERT_NE(resolved, nullptr);
   EXPECT_EQ(resolved->decision, core::Decision::kApply);
+}
+
+// HOTC-5: ReplayForRecovery re-decides a dangling Conditional and appends a
+// fresh Resolved. The terminal recovery ack must NOT advance past the dangling
+// until that re-emitted Resolved is durable — otherwise a crash after the
+// offset fsync but before the Resolved fsync loses both, leaving the conditional
+// permanently unresolved. While the re-emitted Resolved is non-durable the
+// terminal Ack is refused (replay returns kUnavailable, offset clamped to the
+// per-scan low-water); once AwaitDurable confirms, replay succeeds and acks past
+// the dangling.
+TEST_F(ResolverTest, RecoveryAckGatedOnReemittedResolvedDurability) {
+  // A dangling Conditional at seq 10 with no matching Resolved. Re-served from
+  // the persisted offset on each replay until the ack advances past it (the
+  // real WAL behaviour: Read starts at ack_offset + 1). Within a single replay,
+  // the resolver's highest_seen dedup stops re-processing.
+  EXPECT_CALL(queue_, Read(core::kResolverConsumer, 0, _, _))
+      .WillRepeatedly([this](core::ConsumerId, core::ShardId, size_t,
+                             core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+        if (acked_seq_.load() >= 10U) return std::vector<core::QueueEntry>{};
+        return std::vector<core::QueueEntry>{
+            MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
+      });
+  StubQueueAppendCapture();  // re-emitted Resolved is appended at seq 1000.
+  StubQueueAckCapture();
+  StubControllableDurability();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+
+  // The per-scan low-water clamp acks behind the dangling (seq 9); allow that,
+  // but the re-emitted Resolved (seq 1000) is NOT yet durable.
+  durable_seq_.store(9);
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  auto r1 = resolver.ReplayForRecovery(cancel_);
+
+  // Barrier refuses to advance the terminal ack past the dangling.
+  ASSERT_FALSE(r1.has_value());
+  EXPECT_EQ(r1.error().code(), core::ErrorCode::kUnavailable);
+  EXPECT_LT(acked_seq_.load(), 10U) << "acked past dangling before re-emitted Resolved durable";
+  EXPECT_GE(resolver.GetSnapshot().durable_wait_timeouts, 1U);
+  // The re-decided Resolved WAS appended (durable in the WAL, just not fsynced).
+  ASSERT_FALSE(appended_.empty());
+
+  // Now the re-emitted Resolved is durable: a retry of the replay advances the
+  // terminal ack past the dangling.
+  durable_seq_.store(2000);
+  auto r2 = resolver.ReplayForRecovery(cancel_);
+  ASSERT_TRUE(r2.has_value()) << r2.error().message();
+  EXPECT_GE(acked_seq_.load(), 10U) << "ack did not advance after re-emitted Resolved durable";
 }
 
 }  // namespace

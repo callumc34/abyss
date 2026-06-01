@@ -607,6 +607,19 @@ inline constexpr GaugeDesc<> kRecoveryResolverEntriesTarget{
     .help = "Total entries the resolver must scan during recovery, all shards.",
 };
 
+// Conditional-write durability pressure: the resolver could not confirm a
+// self-emitted Resolved's WAL fsync within its budget before fulfilling the
+// client (steady state) or before advancing the recovery ack past a re-decided
+// dangling. A non-zero rate means conditional acks are stalling/erroring on
+// durable-layer latency, not silently losing writes (the Resolved stays in the
+// WAL and applies on catch-up). Surfaces XDUR-2 / HOTC-5 (no silent degradation).
+inline constexpr CounterDesc<> kResolverDurableWaitTimeoutsTotal{
+    .name = "abyss_resolver_durable_wait_timeouts_total",
+    .help =
+        "Resolver self-emitted Resolved durability waits that timed out before "
+        "the conditional ack (steady-state) or the recovery ack barrier.",
+};
+
 inline constexpr GaugeDesc<> kRecoveryColdEntriesReplayed{
     .name = "abyss_recovery_cold_entries_replayed",
     .help = "Live entries drained by the cold consumer during recovery, all shards.",

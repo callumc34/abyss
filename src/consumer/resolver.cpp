@@ -31,6 +31,14 @@ std::string AsciiUpper(std::string_view s) {
   return out;
 }
 
+// Monotonic CAS-max advance: raises `target` to `value` iff `value` is larger.
+void AdvanceMaxSeq(std::atomic<core::SequenceId>& target, core::SequenceId value) {
+  auto cur = target.load(std::memory_order_relaxed);
+  while (value > cur && !target.compare_exchange_weak(cur, value, std::memory_order_release,
+                                                      std::memory_order_relaxed)) {
+  }
+}
+
 uint64_t WallMs(core::WallTime t) {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count());
@@ -152,6 +160,7 @@ Resolver::Snapshot Resolver::GetSnapshot() const {
   s.cold_timeouts = cold_timeouts_.load(std::memory_order_relaxed);
   s.cold_errors = cold_errors_.load(std::memory_order_relaxed);
   s.apply_wait_timeouts = apply_wait_timeouts_.load(std::memory_order_relaxed);
+  s.durable_wait_timeouts = durable_wait_timeouts_.load(std::memory_order_relaxed);
   s.append_failures = append_failures_.load(std::memory_order_relaxed);
   s.parse_failures = parse_failures_.load(std::memory_order_relaxed);
   s.replayed_resolveds_emitted = replayed_resolveds_emitted_.load(std::memory_order_relaxed);
@@ -159,6 +168,7 @@ Resolver::Snapshot Resolver::GetSnapshot() const {
   s.flush_skip_resolveds_emitted = flush_skip_resolveds_emitted_.load(std::memory_order_relaxed);
   s.latest_drained_seq = latest_drained_seq_.load(std::memory_order_relaxed);
   s.last_ack_seq = last_ack_seq_.load(std::memory_order_relaxed);
+  s.resolver_durable_floor = resolver_durable_floor_.load(std::memory_order_relaxed);
   s.latest_flush_seq = latest_flush_seq_.load(std::memory_order_relaxed);
   s.cache_entries = cache_.Size();
   s.cache_bytes = cache_.BytesEstimate();
@@ -911,11 +921,32 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
             UpdateCacheFromResolved(entry.seq, entry.appended_at, resolved);
           }
 
+          // Track the highest Resolved seq this resolver has emitted; the
+          // steady-state ack clamp (Run) holds the persisted offset behind any
+          // Conditional whose Resolved is not yet durable (XDUR-2). Resolveds
+          // are appended monotonically after their Conditionals, so this is the
+          // durability target the durable-floor advances behind.
+          AdvanceMaxSeq(highest_emitted_resolved_seq_, resolved_seq);
+
+          // Two independent waits, durability FIRST (invariant 3). A
+          // durable-layer failure takes precedence over an apply timeout
+          // (mirrors the write path, tiering_engine.cpp). The client conditional
+          // ack must land only after the Resolved is durable AND hot-applied; on
+          // EITHER wait failing the client gets an error, never the success
+          // value — the write stays durable in the WAL and applies on catch-up.
+          if (!AwaitResolvedDurable(resolved_seq, config_.durable_wait_timeout)) {
+            (void)rpc_.Fulfill(
+                client_rpc_id,
+                core::RespValue::Error(core::ErrorPrefix::kErr,
+                                       "conditional write durable wait exceeded timeout; will "
+                                       "apply on consumer catch-up"));
+            return;
+          }
+
           // Block until hot applies — required for read-your-write. On timeout
           // the write stays durable and applies on catch-up, but the client
-          // must NOT see success (mirrors the unconditional write path), so
-          // fulfil with an error instead of the decision's return value.
-          if (WaitForHotApply(resolved_seq)) {
+          // must NOT see success (mirrors the unconditional write path).
+          if (WaitForHotApply(resolved_seq, config_.hot_apply_wait)) {
             (void)rpc_.Fulfill(client_rpc_id, std::move(resolved.return_value));
           } else {
             (void)rpc_.Fulfill(
@@ -955,12 +986,39 @@ void Resolver::Run() {
       drained_anything = true;
     }
     if (drained_anything) {
+      // Kafka HW vs LEO: latest_drained_seq_ is read progress (log-end); the
+      // persisted retention ack is the high-watermark and must never outrun the
+      // durable tail. A Conditional at X may have emitted a Resolved at Y > X
+      // that is published+hot-applied+client-OK'd but not yet fsynced; acking
+      // past X then would let a crash lose Y while recovery seeds past X and
+      // never re-decides it (XDUR-2). So we ack a Conditional X only once every
+      // Resolved emitted for Conditionals <= X is durable. The durability
+      // target is max(drained, highest emitted Resolved seq): Resolveds sit at
+      // seqs > their Conditionals, so confirming the highest emitted Resolved
+      // is durable also satisfies the fail-closed Ack gate (seq <= DurableSeq).
       const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
+      const auto durable_target =
+          std::max(drained, highest_emitted_resolved_seq_.load(std::memory_order_acquire));
+      // Confirm (with a bounded wait, never an unbounded block) that every
+      // Resolved emitted for drained Conditionals is durable before advancing
+      // the floor. AwaitDurable returns true iff DurableSeq >= durable_target
+      // within the timeout.
+      auto durable = queue_.AwaitDurable(config_.shard, durable_target, config_.read_timeout);
+      const bool floor_advanced = durable.has_value() && *durable;
+      if (floor_advanced) {
+        AdvanceMaxSeq(resolver_durable_floor_, drained);
+      }
+      // The ack never passes the durable floor (clamped behind any Conditional
+      // whose Resolved is not yet durable). Unsigned seq 0 is ambiguous before
+      // the first confirmed floor, so the first ack is gated on a confirmed
+      // durable advance rather than on target > 0.
+      const auto target = resolver_durable_floor_.load(std::memory_order_acquire);
       const auto last = last_ack_seq_.load(std::memory_order_acquire);
-      if (!first_ack_recorded || drained > last) {
-        auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, drained);
+      const bool can_first_ack = !first_ack_recorded && floor_advanced;
+      if (can_first_ack || (first_ack_recorded && target > last)) {
+        auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, target);
         if (ack.has_value()) {
-          last_ack_seq_.store(drained, std::memory_order_release);
+          last_ack_seq_.store(target, std::memory_order_release);
           first_ack_recorded = true;
         }
       }
@@ -971,9 +1029,9 @@ void Resolver::Run() {
   ABYSS_LOG_DEBUG("resolver stopped", {"shard", static_cast<int64_t>(config_.shard)});
 }
 
-bool Resolver::WaitForHotApply(core::SequenceId seq) {
+bool Resolver::WaitForHotApply(core::SequenceId seq, std::chrono::milliseconds timeout) {
   auto fut = apply_notifier_.AwaitApplied(config_.shard, seq);
-  if (fut.wait_for(config_.hot_apply_wait) == std::future_status::ready) {
+  if (fut.wait_for(timeout) == std::future_status::ready) {
     try {
       fut.get();
       return true;
@@ -985,6 +1043,17 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
   apply_notifier_.Cancel(config_.shard, seq);
   ABYSS_LOG_WARN("resolver hot-apply wait timeout", {"shard", static_cast<int64_t>(config_.shard)},
                  {"seq", static_cast<uint64_t>(seq)});
+  return false;
+}
+
+bool Resolver::AwaitResolvedDurable(core::SequenceId resolved_seq,
+                                    std::chrono::milliseconds timeout) {
+  auto durable = queue_.AwaitDurable(config_.shard, resolved_seq, timeout);
+  if (durable.has_value() && *durable) return true;
+  durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  ABYSS_LOG_WARN("resolver resolved-durable wait timeout",
+                 {"shard", static_cast<int64_t>(config_.shard)},
+                 {"seq", static_cast<uint64_t>(resolved_seq)});
   return false;
 }
 
@@ -1118,6 +1187,11 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
 
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
   core::SequenceId highest_seen = 0;
+  // Highest seq of any Resolved this replay re-emits (pre-flush Skips and
+  // terminal dangling re-decisions). The terminal Ack barrier (HOTC-5) awaits
+  // this seq's WAL fsync before advancing the recovery offset past the
+  // danglings, so cold/hot never replay a non-durable re-emitted Resolved.
+  core::SequenceId highest_reemitted_seq = 0;
   while (true) {
     if (cancel.load(std::memory_order_acquire)) {
       ABYSS_LOG_WARN("resolver replay cancelled during scan",
@@ -1172,6 +1246,7 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
                                   {"err", std::string_view{append.error().message()}});
                   continue;
                 }
+                highest_reemitted_seq = std::max(highest_reemitted_seq, append->seq);
                 flush_skip_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
                 dangling.erase(d_seq);
               }
@@ -1234,15 +1309,48 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
           {"seq", static_cast<uint64_t>(seq)}, {"err", std::string_view{append.error().message()}});
       return std::unexpected(append.error());
     }
+    highest_reemitted_seq = std::max(highest_reemitted_seq, append->seq);
     UpdateCacheFromResolved(seq, entry.appended_at, resolved);
     replayed_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
   }
 
+  // HOTC-5 recovery barrier: the terminal Ack jumps past the danglings (which
+  // sit at seqs <= drained) to latest_drained_seq_. Before advancing the
+  // persisted offset past a dangling whose Resolved was just re-emitted, that
+  // re-emitted Resolved MUST be durable — otherwise a crash after the offset
+  // fsync but before the Resolved fsync loses both the Conditional (now
+  // acked-past, never re-read) and its Resolved, leaving it permanently
+  // unresolved. AwaitDurable on the highest re-emitted seq is the flush barrier
+  // (subsumes a separate FlushDurable). On barrier timeout we leave the ack at
+  // the already-correct per-scan low-water clamp and return kUnavailable so the
+  // RecoveryCoordinator retries the shard — partial progress is durable and
+  // resumable (the replay-cancel contract). The terminal ack is additionally
+  // clamped to DurableSeq so the fail-closed retention-Ack gate never rejects
+  // it (turns disk back-pressure into a clean retry, not a hard error).
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
   if (drained > 0) {
-    core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, drained),
-                        append_failures_);
-    last_ack_seq_.store(drained, std::memory_order_release);
+    if (highest_reemitted_seq > 0) {
+      auto durable =
+          queue_.AwaitDurable(config_.shard, highest_reemitted_seq, config_.durable_wait_timeout);
+      if (!durable.has_value() || !*durable) {
+        durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        ABYSS_LOG_WARN("resolver recovery durability barrier timed out; offset left clamped",
+                       {"shard", static_cast<int64_t>(config_.shard)},
+                       {"reemitted_seq", static_cast<uint64_t>(highest_reemitted_seq)});
+        return std::unexpected(
+            core::Error{core::ErrorCode::kUnavailable,
+                        "resolver recovery: re-emitted Resolved not yet durable"});
+      }
+    }
+    core::SequenceId ack_to = drained;
+    if (auto durable_seq = queue_.DurableSeq(config_.shard); durable_seq.has_value()) {
+      ack_to = std::min(ack_to, *durable_seq);
+    }
+    if (ack_to > last_ack_seq_.load(std::memory_order_acquire)) {
+      core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, ack_to),
+                          append_failures_);
+      last_ack_seq_.store(ack_to, std::memory_order_release);
+    }
   }
 
   ABYSS_LOG_INFO("resolver replay complete", {"shard", static_cast<int64_t>(config_.shard)},
