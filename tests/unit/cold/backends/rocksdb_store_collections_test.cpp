@@ -708,5 +708,176 @@ TEST_F(CollectionsFixture, LargeCollectionScanAbortsOnZeroDeadline) {
   EXPECT_EQ(timed_out.error().code(), core::ErrorCode::kTimeout);
 }
 
+// --- Cross-window type change drops stale slices (COLDC-6) -------------------
+//
+// Each test establishes a key as one type in one ApplyBatch, then re-establishes
+// it as a different type in a SEPARATE ApplyBatch — the cold analogue of two
+// compaction windows where the later window's CompactedState emits no leading
+// Del because it has no in-window signal that cold already holds the prior type.
+// The store must drop the prior type's slices on the type-establishing apply, or
+// the prior type resurrects on read.
+
+TEST_F(CollectionsFixture, HashThenStringDropsStaleHash) {
+  auto store = OpenStore();
+  std::string key = "k";
+
+  std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "f", .value = "hv"}};
+  std::vector<core::ops::WriteOp> hash_ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(hash_ops, 0).has_value());
+
+  std::vector<core::ops::WriteOp> str_ops = {core::ops::StringSet{.key = key, .value = "sv"}};
+  ASSERT_TRUE(store->ApplyBatch(str_ops, 0).has_value());
+
+  auto get = store->Exec(core::ops::StringGet{.key = key});
+  ASSERT_TRUE(get.has_value());
+  EXPECT_EQ(get->AsString(), "sv");
+
+  // No stale hash fields: HLEN/HGETALL must see nothing — but the key is now a
+  // string, so the read-side surfaces WRONGTYPE rather than a resurrected count.
+  // A resurrected hash would instead return a positive integer here.
+  auto hlen = store->Exec(core::ops::HashLen{.key = key});
+  ASSERT_FALSE(hlen.has_value()) << "stale hash resurrected after SET";
+  EXPECT_EQ(hlen.error().code(), core::ErrorCode::kWrongType);
+}
+
+TEST_F(CollectionsFixture, StringThenHashDropsStaleString) {
+  auto store = OpenStore();
+  std::string key = "k";
+
+  std::vector<core::ops::WriteOp> str_ops = {core::ops::StringSet{.key = key, .value = "sv"}};
+  ASSERT_TRUE(store->ApplyBatch(str_ops, 0).has_value());
+
+  std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "f", .value = "hv"}};
+  std::vector<core::ops::WriteOp> hash_ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(hash_ops, 0).has_value());
+
+  auto hget = store->Exec(core::ops::HashGet{.key = key, .field = "f"});
+  ASSERT_TRUE(hget.has_value());
+  EXPECT_EQ(hget->AsString(), "hv");
+
+  // The string slice must be gone; GET on the now-hash key sees no resurrected
+  // string. (GET returns null for a non-string key in the cold layer.)
+  auto get = store->Exec(core::ops::StringGet{.key = key});
+  ASSERT_TRUE(get.has_value());
+  EXPECT_TRUE(get->IsNull()) << "stale string resurrected after HSET";
+}
+
+TEST_F(CollectionsFixture, SetThenZsetDropsStaleSet) {
+  auto store = OpenStore();
+  std::string key = "k";
+
+  std::vector<std::string> members = {"a", "b"};
+  std::vector<std::string_view> views(members.begin(), members.end());
+  std::vector<core::ops::WriteOp> set_ops = {core::ops::SetAdd{.key = key, .members = views}};
+  ASSERT_TRUE(store->ApplyBatch(set_ops, 0).has_value());
+
+  std::vector<core::ops::ZsetAdd::Entry> entries = {{.score = 1.0, .member = "z"}};
+  std::vector<core::ops::WriteOp> zset_ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
+  ASSERT_TRUE(store->ApplyBatch(zset_ops, 0).has_value());
+
+  auto zcard = store->Exec(core::ops::ZsetCard{.key = key});
+  ASSERT_TRUE(zcard.has_value());
+  EXPECT_EQ(zcard->AsInteger(), 1);
+
+  // The set is now a zset: SCARD must not report the stale set cardinality.
+  auto scard = store->Exec(core::ops::SetCard{.key = key});
+  ASSERT_FALSE(scard.has_value()) << "stale set resurrected after ZADD";
+  EXPECT_EQ(scard.error().code(), core::ErrorCode::kWrongType);
+}
+
+TEST_F(CollectionsFixture, StringThenSetDropsStaleString) {
+  auto store = OpenStore();
+  std::string key = "k";
+
+  std::vector<core::ops::WriteOp> str_ops = {core::ops::StringSet{.key = key, .value = "sv"}};
+  ASSERT_TRUE(store->ApplyBatch(str_ops, 0).has_value());
+
+  std::vector<std::string> members = {"x"};
+  std::vector<std::string_view> views(members.begin(), members.end());
+  std::vector<core::ops::WriteOp> set_ops = {core::ops::SetAdd{.key = key, .members = views}};
+  ASSERT_TRUE(store->ApplyBatch(set_ops, 0).has_value());
+
+  auto scard = store->Exec(core::ops::SetCard{.key = key});
+  ASSERT_TRUE(scard.has_value());
+  EXPECT_EQ(scard->AsInteger(), 1);
+
+  auto get = store->Exec(core::ops::StringGet{.key = key});
+  ASSERT_TRUE(get.has_value());
+  EXPECT_TRUE(get->IsNull()) << "stale string resurrected after SADD";
+}
+
+// The zset score index is a separate column family; a set->zset change must not
+// leave the prior set's member slices behind to corrupt a later ZRANGE.
+TEST_F(CollectionsFixture, ZsetAfterSetHasNoStaleMembers) {
+  auto store = OpenStore();
+  std::string key = "k";
+
+  std::vector<std::string> members = {"a", "b", "c"};
+  std::vector<std::string_view> views(members.begin(), members.end());
+  std::vector<core::ops::WriteOp> set_ops = {core::ops::SetAdd{.key = key, .members = views}};
+  ASSERT_TRUE(store->ApplyBatch(set_ops, 0).has_value());
+
+  std::vector<core::ops::ZsetAdd::Entry> entries = {{.score = 2.0, .member = "z"}};
+  std::vector<core::ops::WriteOp> zset_ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
+  ASSERT_TRUE(store->ApplyBatch(zset_ops, 0).has_value());
+
+  auto range = store->Exec(core::ops::ZsetRange{.key = key, .min = "0", .max = "-1"});
+  ASSERT_TRUE(range.has_value());
+  ASSERT_TRUE(range->IsArray());
+  ASSERT_EQ(range->AsArray().size(), 1U);
+  EXPECT_EQ(range->AsArray()[0].AsString(), "z");
+}
+
+// --- Read-side WRONGTYPE for a foreign cold type (COLDC-6 read facet) --------
+
+TEST_F(CollectionsFixture, CollectionReadOnStringKeyReturnsWrongType) {
+  auto store = OpenStore();
+  std::string key = "k";
+  std::vector<core::ops::WriteOp> str_ops = {core::ops::StringSet{.key = key, .value = "sv"}};
+  ASSERT_TRUE(store->ApplyBatch(str_ops, 0).has_value());
+
+  auto hlen = store->Exec(core::ops::HashLen{.key = key});
+  ASSERT_FALSE(hlen.has_value());
+  EXPECT_EQ(hlen.error().code(), core::ErrorCode::kWrongType);
+
+  auto scard = store->Exec(core::ops::SetCard{.key = key});
+  ASSERT_FALSE(scard.has_value());
+  EXPECT_EQ(scard.error().code(), core::ErrorCode::kWrongType);
+}
+
+TEST_F(CollectionsFixture, CollectionReadOnForeignCollectionReturnsWrongType) {
+  auto store = OpenStore();
+  std::string key = "k";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "f", .value = "v"}};
+  std::vector<core::ops::WriteOp> hash_ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(hash_ops, 0).has_value());
+
+  auto scard = store->Exec(core::ops::SetCard{.key = key});
+  ASSERT_FALSE(scard.has_value());
+  EXPECT_EQ(scard.error().code(), core::ErrorCode::kWrongType);
+
+  auto zcard = store->Exec(core::ops::ZsetCard{.key = key});
+  ASSERT_FALSE(zcard.has_value());
+  EXPECT_EQ(zcard.error().code(), core::ErrorCode::kWrongType);
+}
+
+TEST_F(CollectionsFixture, MatchingCollectionReadIsNotWrongType) {
+  auto store = OpenStore();
+  std::string key = "k";
+  std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "f", .value = "v"}};
+  std::vector<core::ops::WriteOp> hash_ops = {core::ops::HashSet{.key = key, .fields = fvs}};
+  ASSERT_TRUE(store->ApplyBatch(hash_ops, 0).has_value());
+
+  // A missing field on the right-typed key is a clean null, never WRONGTYPE.
+  auto hget = store->Exec(core::ops::HashGet{.key = key, .field = "absent"});
+  ASSERT_TRUE(hget.has_value());
+  EXPECT_TRUE(hget->IsNull());
+
+  // A read of an entirely absent key is a clean empty/0, never WRONGTYPE.
+  auto absent = store->Exec(core::ops::HashLen{.key = "no_such_key"});
+  ASSERT_TRUE(absent.has_value());
+  EXPECT_EQ(absent->AsInteger(), 0);
+}
+
 }  // namespace
 }  // namespace abyss::cold::backends

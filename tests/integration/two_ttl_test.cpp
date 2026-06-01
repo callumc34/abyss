@@ -418,5 +418,56 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
   }
 }
 
+// --- COLDC-6: cross-window implicit type change drops prior cold slices -----
+
+TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
+  // The COLDC-6 case the leading-Del does NOT cover: the type change spans two
+  // compaction windows. Window 1 flushes the hash to cold; window 2's
+  // CompactedState starts fresh and emits a SET with no leading Del — it has no
+  // in-window signal that cold already holds a hash for the key. The cold apply
+  // must drop the stale hash slices when it establishes the key as a string, or
+  // the hash resurrects on read.
+
+  // Window 1: hash flushed to cold on its own.
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "c6t", "f1", "v1", "f2", "v2"}))
+                  .has_value());
+  DrainAndFlushCold("c6t");
+  EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c6t"}))->AsInteger(), 2);
+
+  // Window 2 (separate flush): SET the same key to a string.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c6t", "now-a-string"})).has_value());
+  DrainAndFlushCold("c6t");
+
+  // Drive the key out of hot so the reads resolve against the buffer/cold tiers.
+  (void)harness_.ShardedHot().Wipe();
+
+  auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c6t"}));
+  ASSERT_TRUE(getv.has_value());
+  EXPECT_EQ(getv->AsString(), "now-a-string");
+
+  // The prior hash fields must not survive the cross-window type change. The key
+  // is now a string, so HLEN is EITHER WRONGTYPE (a type-aware tier resolves it)
+  // OR integer 0 (a tier with no hash slice resolves it). A positive field count
+  // is the failure — it means the stale hash slices survived (the COLDC-6 bug).
+  auto hlen = harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c6t"}));
+  if (hlen.has_value()) {
+    EXPECT_TRUE(hlen->IsInteger() && hlen->AsInteger() == 0)
+        << "stale hash fields survived the cross-window type change (COLDC-6)";
+  } else {
+    EXPECT_EQ(hlen.error().code(), core::ErrorCode::kWrongType)
+        << "unexpected HLEN error: " << hlen.error().message();
+  }
+
+  auto hgetall = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "c6t"}));
+  if (hgetall.has_value()) {
+    EXPECT_TRUE(hgetall->IsArray() && hgetall->AsArray().empty())
+        << "HGETALL resurrected stale hash fields after cross-window type change (COLDC-6)";
+  } else {
+    EXPECT_EQ(hgetall.error().code(), core::ErrorCode::kWrongType);
+  }
+}
+
 }  // namespace
 }  // namespace abyss::engine
