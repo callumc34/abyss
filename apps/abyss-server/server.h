@@ -18,6 +18,7 @@
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/result.h"
+#include "abyss/core/topology_manifest.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/engine/recovery_coordinator.h"
 #include "abyss/engine/tiering_engine.h"
@@ -69,6 +70,8 @@ class Server {
   // HotConsumerPool, ColdConsumerPool — declared above them so it outlives
   // every borrower. Do not reorder.
   std::unique_ptr<core::EvictionPolicy> eviction_policy_;
+  // Validated cluster topology. Written/checked before any data subsystem opens.
+  std::unique_ptr<core::TopologyManifest> topology_;
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<hot::ShardedHotStore> hot_store_;
   std::unique_ptr<core::ColdStore> cold_store_;

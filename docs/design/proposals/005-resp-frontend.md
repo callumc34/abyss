@@ -4,6 +4,8 @@
 **Created:** 2026-04-09
 **Updated:** 2026-05-31
 
+> **§CLUSTER Commands refined by [ADP-014](014-slot-routing-and-topology.md).** `CLUSTER KEYSLOT` still returns the `CRC16` wire slot unchanged. `CLUSTER SLOTS`/`SHARDS` now advertise slot ranges grouped by their owning shard (resolved through slot-to-shard mapping) rather than a single full-range stub; in single-pod the ranges still cover the whole slot space, partitioned disjointly by shard. The `MOVED` path (gated behind multi-pod) computes its target from slot ownership, so a redirect always names the pod whose shard owns the key. Invariant 8's "only the slot-to-pod mapping differs between phases" is upgraded: that mapping is now explicit, slot-derived, and tested, not coincidental.
+
 ## Context
 
 Abyss exposes a TCP listener implementing the Redis wire protocol (RESP2). Any standard Redis client library connects without modification — no custom SDKs, no protocol extensions. The frontend is responsible for parsing commands, classifying them, and routing them to the appropriate subsystem.

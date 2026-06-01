@@ -158,6 +158,22 @@ TEST(RocksdbStoreLifecycleTest, RejectsMismatchedFormatVersion) {
   EXPECT_EQ(reopened.error().code(), core::ErrorCode::kCorruption);
 }
 
+TEST(RocksdbStoreLifecycleTest, RejectsLegacyEpochTwoStore) {
+  // ADP-014 bumped the cold epoch from 2 (xxHash placement) to 3 (slot-derived).
+  // A store stamped with the old epoch must be rejected by the per-open gate.
+  TempDir dir;
+  {
+    auto store = RocksdbStore::Create(ConfigFor(dir));
+    ASSERT_TRUE(store.has_value()) << store.error().message();
+  }
+
+  OverwriteFormatVersionRecord(dir.path(), fmt::EncodeFormatVersionValue(2));
+
+  auto reopened = RocksdbStore::Create(ConfigFor(dir));
+  ASSERT_FALSE(reopened.has_value());
+  EXPECT_EQ(reopened.error().code(), core::ErrorCode::kCorruption);
+}
+
 TEST(RocksdbStoreLifecycleTest, RejectsTruncatedFormatVersion) {
   TempDir dir;
   {

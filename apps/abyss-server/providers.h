@@ -31,7 +31,7 @@ class ServerStatsImpl : public resp::ServerStatsProvider {
 
   ServerStatsImpl(core::Queue& queue, core::HotStore& hot, core::ColdStore* cold,
                   std::string version, std::string bind_address, std::string advertise_address,
-                  std::string mode, uint16_t tcp_port);
+                  std::string mode, uint16_t tcp_port, uint32_t shard_count);
 
   void SetTcpPort(uint16_t port) noexcept;
 
@@ -49,6 +49,7 @@ class ServerStatsImpl : public resp::ServerStatsProvider {
   std::string advertise_address_;
   std::string mode_;
   std::atomic<uint16_t> tcp_port_;
+  uint32_t shard_count_;
   ConnectionCountFn connection_count_;
   std::chrono::steady_clock::time_point started_at_;
   uint64_t process_id_;

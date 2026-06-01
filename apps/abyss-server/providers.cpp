@@ -48,7 +48,8 @@ void AppendNumericEntry(std::vector<resp::ConfigProvider::Entry>& entries,
 
 ServerStatsImpl::ServerStatsImpl(core::Queue& queue, core::HotStore& hot, core::ColdStore* cold,
                                  std::string version, std::string bind_address,
-                                 std::string advertise_address, std::string mode, uint16_t tcp_port)
+                                 std::string advertise_address, std::string mode, uint16_t tcp_port,
+                                 uint32_t shard_count)
     : queue_(queue),
       hot_(hot),
       cold_(cold),
@@ -57,6 +58,7 @@ ServerStatsImpl::ServerStatsImpl(core::Queue& queue, core::HotStore& hot, core::
       advertise_address_(std::move(advertise_address)),
       mode_(std::move(mode)),
       tcp_port_(tcp_port),
+      shard_count_(shard_count),
       started_at_(std::chrono::steady_clock::now()),
       process_id_(CurrentProcessId()) {}
 
@@ -93,6 +95,7 @@ resp::ServerStats ServerStatsImpl::Snapshot() const {
                           .count();
   out.uptime_seconds = static_cast<uint32_t>(uptime > 0 ? uptime : 0);
   out.tcp_port = tcp_port_.load(std::memory_order_relaxed);
+  out.shard_count = shard_count_;
   out.version = version_;
   out.bind_address = bind_address_;
   out.advertise_address = advertise_address_;

@@ -10,6 +10,8 @@ add_executable(abyss_core_tests
   core/queue_entry_test.cpp
   core/shard_router_test.cpp
   core/slot_test.cpp
+  core/slot_shard_map_test.cpp
+  core/topology_manifest_test.cpp
   core/atomic_file_test.cpp
 )
 
@@ -44,6 +46,7 @@ add_executable(abyss_resp_tests
   resp/command_registry_test.cpp
   resp/request_pipeline_test.cpp
   resp/node_identity_test.cpp
+  resp/cluster_test.cpp
 )
 
 target_link_libraries(abyss_resp_tests PRIVATE

@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "abyss/core/slot_shard_map.h"
+
 namespace abyss::core {
 namespace {
 
@@ -14,6 +16,19 @@ TEST(ShardRouterTest, ConsistentForSameKey) {
   auto a = ComputeShard("mykey", 64);
   auto b = ComputeShard("mykey", 64);
   EXPECT_EQ(a, b);
+}
+
+// ADP-014: placement is now slot-derived, not xxHash. ComputeShard is exactly
+// ShardForSlot(SlotForKey(key)), and keys sharing a {hashtag} co-locate.
+TEST(ShardRouterTest, IsSlotDerivedPlacement) {
+  for (const char* k : {"", "a", "foo", "key:42", "{tag}x", "user1000"}) {
+    EXPECT_EQ(ComputeShard(k, 64), ShardForSlot(SlotForKey(k), 64)) << "key=" << k;
+  }
+}
+
+TEST(ShardRouterTest, HashtagCoLocation) {
+  EXPECT_EQ(ComputeShard("{user}.a", 64), ComputeShard("{user}.b", 64));
+  EXPECT_EQ(ComputeShard("{user}.a", 16), ComputeShard("{user}", 16));
 }
 
 TEST(ShardRouterTest, DeterministicKnownValue) {

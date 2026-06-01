@@ -38,15 +38,17 @@ uint16_t Crc16(std::string_view data) noexcept {
   return crc;
 }
 
-std::string_view HashtagContent(std::string_view key) {
+std::string_view HashtagContent(std::string_view key) noexcept {
   const auto open = key.find('{');
   if (open == std::string_view::npos) return key;
   const auto close = key.find('}', open + 1);
   if (close == std::string_view::npos || close == open + 1) return key;
-  return key.substr(open + 1, close - open - 1);
+  // Construct the view directly (noexcept) rather than substr, whose bounds
+  // check can throw; `open`/`close` are valid positions from find by construction.
+  return {key.data() + open + 1, close - open - 1};
 }
 
-uint16_t KeySlot(std::string_view key) {
+uint16_t KeySlot(std::string_view key) noexcept {
   return static_cast<uint16_t>(Crc16(HashtagContent(key)) % kSlotCount);
 }
 

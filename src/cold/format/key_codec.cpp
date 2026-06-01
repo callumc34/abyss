@@ -20,7 +20,9 @@ void AppendU16BE(std::string& out, uint16_t v) {
   out.push_back(static_cast<char>(v & 0xFF));
 }
 
-// Derives the slot from the key (not the caller) so encode/read/wipe agree.
+// Derives the shard from the key (not the caller) so encode/read/wipe agree.
+// ComputeShard routes through the wire slot (ADP-014), so the prefix is the
+// slot-derived shard and a key's slice is identical across every tier.
 void AppendShard(std::string& out, std::string_view key, uint32_t shard_count) {
   const core::ShardId shard = core::ComputeShard(key, shard_count);
   AppendU16BE(out, static_cast<uint16_t>(shard));

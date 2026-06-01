@@ -7,6 +7,7 @@
 
 #include "abyss/core/resp_types.h"
 #include "abyss/core/slot.h"
+#include "abyss/core/slot_shard_map.h"
 #include "abyss/resp/admin_handlers.h"
 #include "abyss/resp/node_identity.h"
 #include "abyss/resp/server_stats.h"
@@ -28,51 +29,94 @@ uint16_t BusPort(uint16_t tcp_port) {
   return static_cast<uint16_t>(tcp_port + kClusterBusPortOffset);
 }
 
+// One owning shard's contiguous slot range. ShardForSlot is monotonic in slot
+// (contiguous range division), so each shard owns exactly one [first,last] run.
+struct SlotRange {
+  core::ShardId shard;
+  uint16_t first;
+  uint16_t last;
+};
+
+// The per-shard partition of [0, kSlotCount) that CLUSTER SLOTS/SHARDS advertise
+// and that MOVED targeting resolves through (ADP-014). In single-pod every shard
+// maps to this node, so the union of ranges is the full slot space, disjoint.
+std::vector<SlotRange> OwnedSlotRanges(uint32_t shard_count) {
+  std::vector<SlotRange> ranges;
+  if (shard_count == 0) shard_count = 1;
+  uint32_t slot = 0;
+  while (slot < core::kSlotCount) {
+    const core::ShardId shard = core::ShardForSlot(static_cast<uint16_t>(slot), shard_count);
+    uint32_t last = slot;
+    while (last + 1 < core::kSlotCount &&
+           core::ShardForSlot(static_cast<uint16_t>(last + 1), shard_count) == shard) {
+      ++last;
+    }
+    ranges.push_back({
+        .shard = shard,
+        .first = static_cast<uint16_t>(slot),
+        .last = static_cast<uint16_t>(last),
+    });
+    slot = last + 1;
+  }
+  return ranges;
+}
+
 RespValue HandleSlots(const ServerStats& stats, const NodeIdentity& identity) {
-  return RespValue::Array({
-      RespValue::Array({
-          RespValue::Integer(0),
-          RespValue::Integer(static_cast<int64_t>(core::kSlotCount) - 1),
-          RespValue::Array({
-              RespValue::BulkString(std::string(AdvertiseAddress(stats))),
-              RespValue::Integer(stats.tcp_port),
-              RespValue::BulkString(std::string(identity.Id())),
-          }),
-      }),
-  });
+  // One entry per owning shard, each advertising its contiguous slot range and
+  // this node (single-pod owns every shard). The ranges cover [0, kSlotCount)
+  // disjointly, so a cluster-aware client always finds the owner of any slot.
+  std::vector<RespValue> entries;
+  for (const auto& r : OwnedSlotRanges(stats.shard_count)) {
+    entries.push_back(RespValue::Array({
+        RespValue::Integer(r.first),
+        RespValue::Integer(r.last),
+        RespValue::Array({
+            RespValue::BulkString(std::string(AdvertiseAddress(stats))),
+            RespValue::Integer(stats.tcp_port),
+            RespValue::BulkString(std::string(identity.Id())),
+        }),
+    }));
+  }
+  return RespValue::Array(std::move(entries));
 }
 
 RespValue HandleShards(const ServerStats& stats, const NodeIdentity& identity) {
   const auto addr = AdvertiseAddress(stats);
-  return RespValue::Array({
-      RespValue::Array({
-          RespValue::BulkString("slots"),
-          RespValue::Array({
-              RespValue::Integer(0),
-              RespValue::Integer(static_cast<int64_t>(core::kSlotCount) - 1),
-          }),
-          RespValue::BulkString("nodes"),
-          RespValue::Array({
-              RespValue::Array({
-                  RespValue::BulkString("id"),
-                  RespValue::BulkString(std::string(identity.Id())),
-                  RespValue::BulkString("endpoint"),
-                  RespValue::BulkString(std::string(addr)),
-                  RespValue::BulkString("ip"),
-                  RespValue::BulkString(std::string(addr)),
-                  RespValue::BulkString("port"),
-                  RespValue::Integer(stats.tcp_port),
-                  RespValue::BulkString("role"),
-                  RespValue::BulkString(std::string(stats.role)),
-                  RespValue::BulkString("health"),
-                  RespValue::BulkString("online"),
-              }),
-          }),
-      }),
-  });
+  std::vector<RespValue> shards;
+  for (const auto& r : OwnedSlotRanges(stats.shard_count)) {
+    shards.push_back(RespValue::Array({
+        RespValue::BulkString("slots"),
+        RespValue::Array({
+            RespValue::Integer(r.first),
+            RespValue::Integer(r.last),
+        }),
+        RespValue::BulkString("nodes"),
+        RespValue::Array({
+            RespValue::Array({
+                RespValue::BulkString("id"),
+                RespValue::BulkString(std::string(identity.Id())),
+                RespValue::BulkString("endpoint"),
+                RespValue::BulkString(std::string(addr)),
+                RespValue::BulkString("ip"),
+                RespValue::BulkString(std::string(addr)),
+                RespValue::BulkString("port"),
+                RespValue::Integer(stats.tcp_port),
+                RespValue::BulkString("role"),
+                RespValue::BulkString(std::string(stats.role)),
+                RespValue::BulkString("health"),
+                RespValue::BulkString("online"),
+            }),
+        }),
+    }));
+  }
+  return RespValue::Array(std::move(shards));
 }
 
 RespValue HandleNodes(const ServerStats& stats, const NodeIdentity& identity) {
+  // CLUSTER NODES lists each node once with all its owned slot ranges trailing
+  // on the line. Single-pod owns every range, so they collapse to 0-<max>, but
+  // the ranges are computed (not stubbed) so multi-pod is correct by the same
+  // line builder.
   std::string line;
   line.append(identity.Id());
   line.push_back(' ');
@@ -81,8 +125,15 @@ RespValue HandleNodes(const ServerStats& stats, const NodeIdentity& identity) {
   line.append(std::to_string(stats.tcp_port));
   line.push_back('@');
   line.append(std::to_string(BusPort(stats.tcp_port)));
-  line.append(" myself,master - 0 0 0 connected 0-");
-  line.append(std::to_string(core::kSlotCount - 1));
+  line.append(" myself,master - 0 0 0 connected");
+  for (const auto& r : OwnedSlotRanges(stats.shard_count)) {
+    line.push_back(' ');
+    line.append(std::to_string(r.first));
+    if (r.last != r.first) {
+      line.push_back('-');
+      line.append(std::to_string(r.last));
+    }
+  }
   line.push_back('\n');
   return RespValue::BulkString(std::move(line));
 }
@@ -109,7 +160,9 @@ RespValue HandleMyId(const NodeIdentity& identity) {
 }
 
 RespValue HandleKeyslot(const core::RespCommand& cmd) {
-  return RespValue::Integer(core::KeySlot(cmd.args[2]));
+  // The WIRE slot (CRC16/16384, hashtag-honouring) — the value a cluster-aware
+  // client routes by. Placement derives the data shard from this same slot.
+  return RespValue::Integer(core::SlotForKey(cmd.args[2]));
 }
 
 RespValue HandleCountKeysInSlot(const core::RespCommand& cmd, const ServerStats& stats) {

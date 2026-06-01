@@ -16,6 +16,7 @@
 #include <unistd.h>
 #endif
 
+#include "abyss/core/topology_manifest.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/resp/command_registry.h"
@@ -23,6 +24,7 @@
 
 #ifdef ABYSS_HAVE_ROCKSDB
 #include "abyss/cold/backends/rocksdb_store.h"
+#include "abyss/cold/format/key_codec.h"
 #endif
 
 ABYSS_LOG_COMPONENT("abyss.server")
@@ -62,6 +64,27 @@ bool Server::Initialize() {
     ABYSS_LOG_CRITICAL("create cold store directory failed",
                        {"path", std::string_view{config_.cold.data_path}}, {"err", ec.message()});
     return false;
+  }
+
+  // The FIRST data-dir action: validate (or, on a fresh dir, durably persist)
+  // the cluster topology before WAL/cold/consumers open. A changed shard_count
+  // or cold-encoding epoch refuses to start rather than silently re-routing the
+  // WAL shard dirs and re-encoding every cold key prefix (ADP-014, finding G1).
+  {
+    core::TopologyDescriptor descriptor{
+        .shard_count = config_.hot.shard_count,
+        .cold_format_epoch = cold::format::kFormatVersion,
+        .wire_slot_hash = core::kWireSlotScheme,
+        .data_shard_hash = core::kDataShardScheme,
+    };
+    auto manifest = core::TopologyManifest::OpenOrValidate(config_.queue.wal_path, descriptor);
+    if (!manifest.has_value()) {
+      ABYSS_LOG_CRITICAL("topology manifest validation failed; refusing to start",
+                         {"path", std::string_view{config_.queue.wal_path}},
+                         {"err", std::string_view{manifest.error().message()}});
+      return false;
+    }
+    topology_ = std::make_unique<core::TopologyManifest>(std::move(*manifest));
   }
 
   std::vector<core::EvictionRule> overrides;
@@ -218,7 +241,8 @@ bool Server::Initialize() {
 
   stats_ = std::make_unique<ServerStatsImpl>(
       *queue_, *hot_store_, cold_store_.get(), std::string{kVersion}, config_.net.bind,
-      /*advertise_address=*/std::string{}, /*mode=*/"standalone", config_.net.port);
+      /*advertise_address=*/std::string{}, /*mode=*/"standalone", config_.net.port,
+      hot_store_->shard_count());
   config_provider_ = std::make_unique<ConfigProviderImpl>(config_);
   // The coordinator is the single source of truth for "still recovering."
   // queue.IsRecovering() handles WAL self-recovery (synchronous today,
