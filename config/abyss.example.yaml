@@ -36,7 +36,10 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
+  # Largest single value accepted (default 64 MiB; up to 512 MiB). Must be at
+  # least ~1 KiB below segment_size_bytes so one value fits a fixed-size segment.
+  max_value_size_bytes: 67108864
   min_retention_seconds: 86400
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000

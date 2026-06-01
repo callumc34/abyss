@@ -15,6 +15,8 @@
 #include "abyss/platform/fs.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
+#include "binary_io.h"
+#include "crc32c.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -278,6 +280,45 @@ TEST_F(SegmentTest, TornTail_CrcMismatch) {
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->entries.size(), 1U);
   ExpectWriteArgs(read->entries[0], {"SET", "a", "1"});
+}
+
+// Decision 6: a CRC-VALID frame whose body cannot be structurally decoded is
+// genuine corruption of durably-acked data. Recovery (Segment::Open) must
+// FAIL-STOP with kCorruption, never silently truncate-and-continue (which would
+// discard acked data, breaking invariants 1/2). Contrast the TornTail_* tests,
+// which DO truncate a CRC-invalid/incomplete tail.
+TEST_F(SegmentTest, CrcValidStructuralCorruptionHaltsRecovery) {
+  const auto path = SegPath();
+  size_t good_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+    good_offset = seg->write_offset();
+  }
+
+  // Hand-craft a frame whose body has an unknown entry type (0xFF) but whose
+  // CRC matches the body — so it passes the CRC check yet fails the structural
+  // decode. This is the exact "valid CRC, invalid structure" case.
+  std::vector<std::byte> body;
+  binary::WriteU8(body, 0xFF);  // unknown entry type
+  binary::WriteU64LE(body, 1);  // seq
+  binary::WriteI64LE(body, 0);  // appended_us
+  binary::WriteU32LE(body, 0);  // (read as arg_count for a Write; unreachable)
+  std::vector<std::byte> frame;
+  binary::WriteU32LE(frame, static_cast<uint32_t>(body.size()));
+  frame.insert(frame.end(), body.begin(), body.end());
+  binary::WriteU32LE(frame, Crc32c(std::span<const std::byte>(body)));
+
+  {
+    auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+    ASSERT_TRUE(f.has_value());
+    ASSERT_TRUE(pfs::Pwrite(*f, frame.data(), frame.size(), good_offset).has_value());
+  }
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_FALSE(seg.has_value());
+  EXPECT_EQ(seg.error().code(), core::ErrorCode::kCorruption);
 }
 
 TEST_F(SegmentTest, AppendAfterRecovery) {

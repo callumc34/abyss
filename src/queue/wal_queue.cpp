@@ -107,6 +107,7 @@ core::Result<void> WalQueue::Initialize() {
         .shard = shard,
         .directory = shard_dir.string(),
         .segment_size_bytes = config_.segment_size_bytes,
+        .max_value_size_bytes = config_.max_value_size_bytes,
         .commit = config_.commit,
         .on_rotate = [this] { RunReaper(); },
     });
@@ -193,10 +194,36 @@ core::Result<void> WalQueue::Ack(core::ConsumerId consumer, core::ShardId shard,
     SetVolatileOffset(consumer, shard, seq);
     return {};
   }
+  // Fail-closed durability gate (QUEUE-2/XERR-2/XDUR-1/XDUR-2/HOTC-5): a
+  // retention consumer's persisted offset can never advance past the durable
+  // WAL tail. Consumers (cold/resolver) clamp to DurableSeq or AwaitDurable
+  // before acking; this is the backstop. Under fsync_none durable_seq tracks
+  // the published seq so the gate is a correct no-op (Decision 1). HasDurable
+  // disambiguates the seq-0 edge: a 0 watermark with nothing durable must
+  // reject ack(0), but once seq 0 is durable the same ack is accepted.
+  const bool any_durable = shards_[shard]->HasDurable();
+  const core::SequenceId durable = shards_[shard]->DurableSeq();
+  if (!any_durable || seq > durable) {
+    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
+                                       "ack seq " + std::to_string(seq) +
+                                           " exceeds durable WAL tail " + std::to_string(durable) +
+                                           " for shard " + std::to_string(shard)});
+  }
   auto set = offsets_->Set(consumer, shard, seq);
   if (!set.has_value()) return set;
   RunReaper();
   return {};
+}
+
+core::Result<core::SequenceId> WalQueue::DurableSeq(core::ShardId shard) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->DurableSeq();
+}
+
+core::Result<bool> WalQueue::AwaitDurable(core::ShardId shard, core::SequenceId seq,
+                                          core::Duration timeout) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->AwaitDurable(seq, timeout);
 }
 
 core::Result<core::SequenceId> WalQueue::OldestRetained(core::ShardId shard) {

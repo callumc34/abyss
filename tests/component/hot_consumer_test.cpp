@@ -45,7 +45,7 @@ class HotConsumerTest : public ::testing::Test {
                    .interval = std::chrono::microseconds{500},
                    .max_bytes = 1024UL * 1024UL},
         .min_retention = 10s,
-        .retention_consumers = {core::kHotConsumer},
+        .volatile_consumers = {core::kHotConsumer},
     });
     ASSERT_TRUE(queue_result.has_value()) << queue_result.error().message();
     queue_ = std::move(*queue_result);

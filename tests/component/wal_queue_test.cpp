@@ -177,7 +177,9 @@ TEST_F(WalQueueTest, ReadAdvancesByAck) {
   OpenWith(DefaultConfig());
 
   for (int i = 0; i < 4; ++i) {
-    ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", std::to_string(i)})).has_value());
+    auto r = queue_->Append(0, MakeWrite({"SET", "k", std::to_string(i)}));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(r->durable.get().has_value());  // gate: durable before retention ack
   }
 
   auto read1 = queue_->Read(core::kHotConsumer, 0, 10, 100ms);
@@ -315,7 +317,9 @@ TEST_F(WalQueueTest, RecoveryPreservesEntries) {
 TEST_F(WalQueueTest, RecoveryPreservesOffsets) {
   {
     OpenWith(DefaultConfig());
-    ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
+    auto r = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(r->durable.get().has_value());  // durable before retention ack
     ASSERT_TRUE(queue_->Ack(core::kHotConsumer, 0, 0).has_value());
     queue_.reset();
   }
@@ -399,7 +403,9 @@ TEST_F(WalQueueTest, StatsReflectsState) {
 TEST_F(WalQueueTest, OldestRetainedTracksAcks) {
   OpenWith(DefaultConfig());
   for (int i = 0; i < 3; ++i) {
-    ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", std::to_string(i)})).has_value());
+    auto r = queue_->Append(0, MakeWrite({"SET", "k", std::to_string(i)}));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(r->durable.get().has_value());  // gate requires durability first
   }
 
   ASSERT_TRUE(queue_->Ack(core::kHotConsumer, 0, 1).has_value());
@@ -410,14 +416,87 @@ TEST_F(WalQueueTest, OldestRetainedTracksAcks) {
   EXPECT_EQ(*oldest, 0U);  // cold is behind, so min is 0
 }
 
-TEST_F(WalQueueTest, AppendTooLargeRejected) {
+TEST_F(WalQueueTest, AppendAboveMaxValueSizeRejected) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 128;
+  cfg.max_value_size_bytes = 4096;
   OpenWith(cfg);
 
+  // A value above max_value_size_bytes is rejected with kValueTooLarge, the
+  // distinct G11 error that references the value ceiling (not segment size).
   auto r = queue_->Append(0, MakeWrite({"SET", "k", std::string(10000, 'x')}));
   ASSERT_FALSE(r.has_value());
-  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kValueTooLarge);
+}
+
+// QUEUE-2: a retention consumer cannot ack past the durable WAL tail. With a
+// very wide group-commit interval the first publish's fsync does not land, so
+// the cold ack is fail-closed (kFailedPrecondition). A later append trips the
+// byte threshold, flushing both writes; the same ack then succeeds.
+TEST_F(WalQueueTest, RetentionAckBeyondDurableSeqRejected) {
+  auto cfg = DefaultConfig();
+  cfg.segment_size_bytes = 1024 * 1024;
+  // Wide interval so no time-based flush fires; a byte threshold the small
+  // first entry stays under but the large second entry deterministically trips.
+  cfg.commit.interval = std::chrono::microseconds{10'000'000};
+  cfg.commit.max_bytes = 100'000;
+  OpenWith(cfg);
+
+  // First publish (visible to readers) but not yet fsynced (small, under the
+  // byte threshold; the wide interval means no time-based flush).
+  auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "k", "v"}));
+  ASSERT_TRUE(pending.has_value());
+  const core::SequenceId seq0 = pending->seq();
+  DurabilityFuture durable0 = std::move(pending->durable());
+  pending->Publish();
+
+  // DurableSeq lags the published seq, so the retention ack is fail-closed.
+  auto durable_now = queue_->DurableSeq(0);
+  ASSERT_TRUE(durable_now.has_value());
+  EXPECT_LT(*durable_now, seq0 + 1);
+  auto rejected = queue_->Ack(core::kColdConsumer, 0, seq0);
+  ASSERT_FALSE(rejected.has_value());
+  EXPECT_EQ(rejected.error().code(), core::ErrorCode::kFailedPrecondition);
+
+  // A second, large append crosses max_bytes, tripping a flush of both entries.
+  auto second = queue_->Append(0, MakeWrite({"SET", "k", std::string(200'000, 'x')}));
+  ASSERT_TRUE(second.has_value());
+  ASSERT_TRUE(durable0.get().has_value());
+  ASSERT_TRUE(second->durable.get().has_value());
+
+  // Now seq0 is durable and the same retention ack is accepted.
+  auto awaited = queue_->AwaitDurable(0, seq0, 1s);
+  ASSERT_TRUE(awaited.has_value());
+  EXPECT_TRUE(*awaited);
+  EXPECT_GE(*queue_->DurableSeq(0), seq0);
+  EXPECT_TRUE(queue_->Ack(core::kColdConsumer, 0, seq0).has_value());
+}
+
+// G11: a value far larger than what a small segment would hold but within
+// max_value_size_bytes is accepted, readable back, and survives reopen.
+TEST_F(WalQueueTest, ValueWithinMaxValueSizeAcceptedAndRecovers) {
+  auto cfg = DefaultConfig();
+  // A 1 MiB value into a fixed-size segment sized to hold it (no jumbo segment).
+  cfg.segment_size_bytes = 4 * 1024 * 1024;
+  cfg.max_value_size_bytes = 2 * 1024 * 1024;
+  cfg.min_retention = 0s;
+  const std::string big(1024 * 1024, 'v');
+
+  {
+    OpenWith(cfg);
+    auto r = queue_->Append(0, MakeWrite({"SET", "big", big}));
+    ASSERT_TRUE(r.has_value()) << "1 MiB value must be accepted";
+    ASSERT_TRUE(r->durable.get().has_value());
+    queue_.reset();
+  }
+
+  OpenWith(cfg);
+  auto read = queue_->Read(core::kHotConsumer, 0, 10, 100ms);
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->size(), 1U);
+  const auto* w = std::get_if<core::entry::Write>(&read->front().payload);
+  ASSERT_NE(w, nullptr);
+  ASSERT_EQ(w->cmd.args.size(), 3U);
+  EXPECT_EQ(w->cmd.args[2].size(), big.size());
 }
 
 TEST_F(WalQueueTest, IsRecoveringFalseAfterOpen) {
@@ -447,27 +526,37 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
   std::atomic<bool> stop{false};
   std::vector<core::SequenceId> observed_seqs;
   std::thread consumer([this, &stop, &observed_seqs] {
-    core::SequenceId ack = 0;
-    bool first = true;
+    // Reads see the published tail (invariant 3) but a retention ack is clamped
+    // to the durable tail (the A1 gate), so a read can legitimately re-deliver a
+    // published-but-not-yet-acked entry. Record each seq exactly once and ack up
+    // to the durable tail, as every real retention consumer must.
+    core::SequenceId next_record = 0;
+    auto clamped_ack = [this](core::SequenceId target) {
+      auto durable = queue_->DurableSeq(0);
+      if (!durable.has_value() || *durable == 0) return;
+      ASSERT_TRUE(queue_->Ack(core::kHotConsumer, 0, std::min(target, *durable)).has_value());
+    };
+    auto consume = [&](const std::vector<core::QueueEntry>& entries) {
+      for (const auto& e : entries) {
+        if (e.seq == next_record) {
+          observed_seqs.push_back(e.seq);
+          ++next_record;
+        }
+      }
+    };
     while (!stop.load(std::memory_order_acquire)) {
       auto read = queue_->Read(core::kHotConsumer, 0, 128, 50ms);
       if (!read.has_value() || read->empty()) continue;
-      for (const auto& e : *read) {
-        observed_seqs.push_back(e.seq);
-      }
-      ack = read->back().seq;
-      if (first || ack > 0) {
-        ASSERT_TRUE(queue_->Ack(core::kHotConsumer, 0, ack).has_value());
-        first = false;
-      }
+      consume(*read);
+      clamped_ack(read->back().seq);
     }
     for (;;) {
       auto read = queue_->Read(core::kHotConsumer, 0, 128, 10ms);
       if (!read.has_value() || read->empty()) break;
-      for (const auto& e : *read) {
-        observed_seqs.push_back(e.seq);
-      }
-      ASSERT_TRUE(queue_->Ack(core::kHotConsumer, 0, read->back().seq).has_value());
+      consume(*read);
+      // Final drain: wait for durability so the terminal ack reflects all reads.
+      (void)queue_->AwaitDurable(0, read->back().seq, 1s);
+      clamped_ack(read->back().seq);
     }
   });
 
@@ -536,7 +625,9 @@ TEST_F(WalQueueTest, ActiveSegmentNeverDeleted) {
   cfg.min_retention = 0s;
   OpenWith(cfg);
 
-  ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "a", "1"})).has_value());
+  auto appended = queue_->Append(0, MakeWrite({"SET", "a", "1"}));
+  ASSERT_TRUE(appended.has_value());
+  ASSERT_TRUE(appended->durable.get().has_value());  // durable before retention ack
   ASSERT_TRUE(queue_->Ack(core::kHotConsumer, 0, 0).has_value());
   ASSERT_TRUE(queue_->Ack(core::kColdConsumer, 0, 0).has_value());
 
@@ -628,6 +719,10 @@ TEST_F(WalQueueTest, TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace) {
       for (auto& e : *read) {
         EXPECT_EQ(e.seq, next++);
         rpc.Fulfill(e.seq, core::RespValue::SimpleString("OK"));
+        // The A1 gate clamps a retention ack to the durable tail; await this
+        // seq's durability so the read offset advances (the producer fsyncs
+        // each write, so the wait is short).
+        (void)queue_->AwaitDurable(0, e.seq, 1s);
         [[maybe_unused]] auto ack = queue_->Ack(core::kHotConsumer, 0, e.seq);
       }
       return true;

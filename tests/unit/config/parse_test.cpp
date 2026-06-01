@@ -29,7 +29,7 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
   min_retention_seconds: 86400
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000
@@ -101,7 +101,7 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
 
   EXPECT_EQ(cfg->queue.backend, "builtin_wal");
   EXPECT_EQ(cfg->queue.wal_path, "/data/wal");
-  EXPECT_EQ(cfg->queue.segment_size_bytes, 67108864U);
+  EXPECT_EQ(cfg->queue.segment_size_bytes, 134217728U);
   EXPECT_EQ(cfg->queue.min_retention, std::chrono::seconds{86400});
   EXPECT_EQ(cfg->queue.fsync_policy, "group_commit");
   EXPECT_EQ(cfg->queue.group_commit_interval_us, 1000U);

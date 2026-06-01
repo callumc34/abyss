@@ -127,8 +127,17 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last
 
 core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
                                              uint8_t format_minor) {
+  WalDecodeFailure ignored = WalDecodeFailure::kNone;
+  return DecodeWalEntry(bytes, format_minor, ignored);
+}
+
+core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes, uint8_t format_minor,
+                                             WalDecodeFailure& failure) {
   using namespace binary;
   const size_t initial_size = bytes.size();
+
+  // Pre-CRC failures are torn tails (a partially-written, never-acked record).
+  failure = WalDecodeFailure::kTornTail;
 
   uint32_t body_len = 0;
   if (!ReadU32LE(bytes, body_len)) {
@@ -149,6 +158,10 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
   if (Crc32c(body) != stored_crc) {
     return std::unexpected(Corrupted("body CRC mismatch"));
   }
+
+  // The CRC validated: any further failure is genuine corruption of a
+  // durably-written frame, not a torn tail.
+  failure = WalDecodeFailure::kCorruptFrame;
 
   std::span<const std::byte> cursor = body;
 
@@ -254,6 +267,7 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
     batch_last_seq = raw;
   }
 
+  failure = WalDecodeFailure::kNone;
   return DecodedWalEntry{
       .entry = std::move(qe),
       .bytes_consumed = initial_size - bytes.size(),

@@ -28,11 +28,25 @@ struct DecodedWalEntry {
   core::SequenceId batch_last_seq = 0;
 };
 
+// Classifies a decode failure for the recovery scanner (Decision 6).
+//   kNone        — decode succeeded.
+//   kTornTail    — incomplete bytes or a failed CRC: a partially-written tail
+//                  from a crash. Safe to truncate (the write was never acked).
+//   kCorruptFrame— the CRC validated but the body structure could not be
+//                  decoded: genuine corruption of durably-acked data. Recovery
+//                  must fail-stop, never truncate-and-continue.
+enum class WalDecodeFailure : uint8_t { kNone, kTornTail, kCorruptFrame };
+
 // Encode one WAL entry.
 size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last_seq,
                       std::vector<std::byte>& out);
 
 core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes,
                                              uint8_t format_minor = kWalFormatMinor);
+
+// As DecodeWalEntry, but on failure sets `failure` so the scanner can decide
+// between truncating a torn tail and halting on genuine corruption.
+core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes, uint8_t format_minor,
+                                             WalDecodeFailure& failure);
 
 }  // namespace abyss::queue

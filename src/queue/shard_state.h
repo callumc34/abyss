@@ -24,7 +24,11 @@ namespace abyss::queue {
 struct ShardStateConfig {
   core::ShardId shard = 0;
   std::string directory;
-  size_t segment_size_bytes = 67108864;
+  size_t segment_size_bytes = 134217728;
+  // Largest single encoded entry the shard will accept. Decoupled from
+  // segment_size_bytes; the validator guarantees a segment can always hold one
+  // max-size entry, so segments stay fixed-size (no jumbo segments).
+  size_t max_value_size_bytes = 67108864;
   GroupCommitConfig commit;
   // Called after a successful rotation.
   std::function<void()> on_rotate;
@@ -54,6 +58,16 @@ class ShardState {
   size_t total_entries() const;
   size_t total_bytes() const;
 
+  // Highest seq whose group-commit fsync has completed for this shard. Sealed
+  // segments are fully fsynced at Seal, so the watermark is the max of the
+  // active committer's durable seq and the highest sealed seq.
+  core::SequenceId DurableSeq() const;
+  // True if any seq is durable for this shard, from either the active committer
+  // or an already-fully-fsynced sealed/recovered segment. Disambiguates the
+  // seq-0 watermark (0 = "none durable" vs "seq 0 durable").
+  bool HasDurable() const;
+  bool AwaitDurable(core::SequenceId seq, core::Duration timeout) const;
+
   std::vector<SegmentRegistry::SealedSegmentInfo> ListSealedSegments() const;
   core::Result<void> RemoveSegment(core::SequenceId base_seq);
 
@@ -78,8 +92,16 @@ class ShardState {
   std::shared_ptr<Segment> active_ ABYSS_GUARDED_BY(append_mu_);
   std::vector<std::shared_ptr<Segment>> sealed_ ABYSS_GUARDED_BY(append_mu_);
   core::SequenceId next_seq_ ABYSS_GUARDED_BY(append_mu_) = 0;
+  // Highest seq covered by a sealed (fully fsynced) segment. Durable even
+  // though it no longer belongs to the active committer.
+  core::SequenceId highest_sealed_seq_ ABYSS_GUARDED_BY(append_mu_) = 0;
+  // True once a sealed/recovered segment carries any committed entry, so the
+  // seq-0 case (highest_sealed_seq_ == 0) is not mistaken for "none durable".
+  bool has_sealed_durable_ ABYSS_GUARDED_BY(append_mu_) = false;
 
-  std::unique_ptr<GroupCommitter> committer_;
+  // shared_ptr (not unique_ptr) so a consumer waiting in AwaitDurable keeps the
+  // committer alive across a concurrent Rotate that swaps it out.
+  std::shared_ptr<GroupCommitter> committer_ ABYSS_GUARDED_BY(append_mu_);
 };
 
 }  // namespace abyss::queue

@@ -24,7 +24,9 @@ class ShardState;
 
 struct WalConfig {
   std::string wal_path;
-  size_t segment_size_bytes = 67108864;
+  size_t segment_size_bytes = 134217728;
+  // Largest single encoded entry accepted; decoupled from segment_size_bytes.
+  size_t max_value_size_bytes = 67108864;
   size_t shard_count = 1;
   GroupCommitConfig commit;
   std::chrono::seconds min_retention{86400};
@@ -57,6 +59,9 @@ class WalQueue : public core::Queue, public SegmentRegistry {
                                                    core::Duration timeout) override;
   core::Result<void> Ack(core::ConsumerId consumer, core::ShardId shard,
                          core::SequenceId seq) override;
+  core::Result<core::SequenceId> DurableSeq(core::ShardId shard) override;
+  core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
+                                  core::Duration timeout) override;
   core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override;
   core::Result<core::SequenceId> TailSeq(core::ShardId shard) override;
   core::Result<core::SequenceId> AckOffset(core::ConsumerId consumer, core::ShardId shard) override;

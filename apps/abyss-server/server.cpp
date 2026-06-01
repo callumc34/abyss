@@ -89,6 +89,7 @@ bool Server::Initialize() {
   auto queue_result = queue::WalQueue::Open(queue::WalConfig{
       .wal_path = config_.queue.wal_path,
       .segment_size_bytes = config_.queue.segment_size_bytes,
+      .max_value_size_bytes = config_.queue.max_value_size_bytes,
       .shard_count = hot_store_->shard_count(),
       .commit =
           {
@@ -114,7 +115,11 @@ bool Server::Initialize() {
   queue_ = std::move(*queue_result);
 
   consumer_rpc_ = std::make_unique<core::ConsumerRpc>(config_.consumer_rpc);
-  apply_notifier_ = std::make_unique<core::ApplyNotifier>();
+  // Must be indexed by the REAL shard count, not the default, or AwaitApplied /
+  // NotifyApplied misroute across the modulo and read-your-write silently
+  // breaks (ENGINE-3 wiring; the notifier requires the true shard_count).
+  apply_notifier_ = std::make_unique<core::AppliedSeqNotifier>(
+      core::AppliedSeqNotifierConfig{.shard_count = hot_store_->shard_count()});
 
   auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
       .data_path = config_.cold.data_path,

@@ -1,13 +1,17 @@
 #include "shard_state.h"
 
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 #include <iomanip>
+#include <optional>
 #include <regex>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
 
@@ -17,12 +21,26 @@ namespace abyss::queue {
 
 namespace {
 
+namespace pfs = abyss::platform::fs;
+
 constexpr int kSegmentNameWidth = 20;
 
 std::string FormatSegmentName(core::SequenceId base_seq) {
   std::ostringstream oss;
   oss << std::setw(kSegmentNameWidth) << std::setfill('0') << base_seq << ".log";
   return oss.str();
+}
+
+// Checked, non-throwing decimal parse. Returns nullopt on overflow or any
+// non-numeric trailing content so a damaged directory entry is skipped rather
+// than aborting recovery with an uncaught std::out_of_range (QUEUE-3).
+std::optional<core::SequenceId> ParseSeqChecked(std::string_view text) {
+  core::SequenceId value = 0;
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end) return std::nullopt;
+  return value;
 }
 
 core::Result<std::vector<core::SequenceId>> EnumerateSegmentBaseSeqs(const std::string& dir) {
@@ -40,10 +58,34 @@ core::Result<std::vector<core::SequenceId>> EnumerateSegmentBaseSeqs(const std::
     const auto name = entry.path().filename().string();
     std::smatch match;
     if (!std::regex_match(name, match, pattern)) continue;
-    result.push_back(static_cast<core::SequenceId>(std::stoull(match[1].str())));
+    auto parsed = ParseSeqChecked(match[1].str());
+    if (!parsed.has_value()) {
+      // 20 digits can exceed UINT64_MAX (e.g. 99999999999999999999). A name
+      // that cannot be a real base_seq is not a segment we wrote; skip it.
+      ABYSS_LOG_WARN("skipping unparseable segment name", {"dir", std::string_view{dir}},
+                     {"name", std::string_view{name}});
+      continue;
+    }
+    result.push_back(*parsed);
   }
   std::ranges::sort(result);
   return result;
+}
+
+// fsync the shard directory so a freshly created/rotated segment's name->inode
+// link is on stable media before the segment can ack any write (QUEUE-1/NET-6).
+// FsyncDir "unsupported" is a hard error here (invariant 5): we must not ack a
+// write whose segment's directory entry is not durable.
+core::Result<void> FsyncShardDir(const std::string& dir) {
+  auto out = pfs::FsyncDir(std::filesystem::path(dir));
+  if (!out.has_value()) return std::unexpected(out.error());
+  if (*out == pfs::DirSyncOutcome::kUnsupported) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kFailedPrecondition,
+                    "shard directory durability unsupported on volume '" + dir +
+                        "'; a segment's directory entry cannot be made durable"});
+  }
+  return {};
 }
 
 class ShardStatePublisher final : public AppendPublisher {
@@ -123,7 +165,7 @@ core::Result<void> ShardState::Initialize() {
     return [captured = std::move(seg)] { return captured->Fsync(); };
   };
 
-  committer_ = std::make_unique<GroupCommitter>(config_.commit, make_fsync_fn(active_));
+  committer_ = std::make_shared<GroupCommitter>(config_.commit, make_fsync_fn(active_));
   return {};
 }
 
@@ -140,6 +182,13 @@ core::Result<void> ShardState::CreateInitialSegment() {
   const auto path = std::filesystem::path(config_.directory) / FormatSegmentName(0);
   auto seg = Segment::Create(path.string(), header, config_.segment_size_bytes);
   if (!seg.has_value()) return std::unexpected(seg.error());
+
+  // Durably link the new segment's name before it can ack a write.
+  if (auto sync = FsyncShardDir(config_.directory); !sync.has_value()) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return std::unexpected(sync.error());
+  }
 
   active_ = std::make_shared<Segment>(std::move(*seg));
   next_seq_ = active_->next_seq();
@@ -187,6 +236,13 @@ core::Result<void> ShardState::OpenExistingSegments() {
       if (auto sealed = segment->Seal(); !sealed.has_value()) {
         return std::unexpected(sealed.error());
       }
+      const auto sealed_base = segment->base_seq();
+      const auto sealed_next = segment->next_seq();
+      if (sealed_next > sealed_base) {
+        // Segment holds at least one committed entry; it is fully fsynced.
+        highest_sealed_seq_ = std::max(highest_sealed_seq_, sealed_next - 1);
+        has_sealed_durable_ = true;
+      }
       sealed_.push_back(std::move(segment));
     }
   }
@@ -212,13 +268,21 @@ core::Result<void> ShardState::Rotate() {
   auto new_seg = Segment::Create(new_path.string(), header, config_.segment_size_bytes);
   if (!new_seg.has_value()) return std::unexpected(new_seg.error());
 
-  // If drain or seal fail after we've created the new file on disk, unlink it
-  // so a later Open doesn't see an orphan that would be misread as the active
-  // segment.
+  // If a later fallible step fails after we've created the new file on disk,
+  // unlink it so a later Open doesn't see an orphan that would be misread as
+  // the active segment.
   const auto unlink_orphan = [&new_path] {
     std::error_code ec;
     std::filesystem::remove(new_path, ec);
   };
+
+  // Durably link the new segment's name into the shard directory before it
+  // becomes the active append target (QUEUE-1/NET-6). FsyncDir failure leaves
+  // us in the pre-rotate state with the orphan removed.
+  if (auto sync = FsyncShardDir(config_.directory); !sync.has_value()) {
+    unlink_orphan();
+    return std::unexpected(sync.error());
+  }
 
   auto drain = committer_->Drain();
   if (!drain.has_value()) {
@@ -231,14 +295,20 @@ core::Result<void> ShardState::Rotate() {
     return std::unexpected(sealed.error());
   }
 
-  // Every fallible step has succeeded. We can commit.
+  // Every fallible step has succeeded. We can commit. The sealed segment is
+  // fully fsynced, so its highest seq is durable even after the committer swap.
   const auto sealed_base = active_->base_seq();
   const auto sealed_bytes = active_->write_offset();
   const auto sealed_entries = active_->entry_count();
+  const auto sealed_next = active_->next_seq();
+  if (sealed_next > sealed_base) {
+    highest_sealed_seq_ = std::max(highest_sealed_seq_, sealed_next - 1);
+    has_sealed_durable_ = true;
+  }
   sealed_.push_back(std::move(active_));
   committer_.reset();
   active_ = std::make_shared<Segment>(std::move(*new_seg));
-  committer_ = std::make_unique<GroupCommitter>(config_.commit,
+  committer_ = std::make_shared<GroupCommitter>(config_.commit,
                                                 [captured = active_] { return captured->Fsync(); });
 
   ABYSS_LOG_DEBUG("segment rotated", {"shard", static_cast<int64_t>(config_.shard)},
@@ -261,9 +331,15 @@ core::Result<PendingAppend> ShardState::BeginAppend(core::QueueEntry entry) {
   std::vector<std::byte> buf;
   EncodeWalEntry(entry, entry.seq, buf);
 
-  if (buf.size() > config_.segment_size_bytes - kSegmentHeaderSize) {
-    return std::unexpected(
-        core::Error{core::ErrorCode::kInvalidArgument, "entry exceeds segment capacity"});
+  // Cap on the entry size, not the segment size: a value within
+  // max_value_size_bytes is always acceptable. The validator guarantees a
+  // fixed-size segment can hold one max-size entry, so a value at the ceiling
+  // fits after at most one rotation (no jumbo segments — Decision 2).
+  if (buf.size() > config_.max_value_size_bytes) {
+    return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
+                                       "entry of " + std::to_string(buf.size()) +
+                                           " bytes exceeds queue.max_value_size_bytes (" +
+                                           std::to_string(config_.max_value_size_bytes) + ")"});
   }
 
   bool rotated = false;
@@ -278,7 +354,7 @@ core::Result<PendingAppend> ShardState::BeginAppend(core::QueueEntry entry) {
   next_seq_ = entry.seq + 1;
 
   const core::SequenceId seq = entry.seq;
-  DurabilityFuture future = committer_->Submit(*written);
+  DurabilityFuture future = committer_->Submit(*written, seq);
 
   auto publisher =
       std::make_unique<ShardStatePublisher>(read_cv_, std::move(lock), config_.on_rotate, rotated);
@@ -309,14 +385,23 @@ core::Result<PendingBatchAppend> ShardState::BeginAppendBatch(
   for (const auto& entry : owned) {
     std::vector<std::byte> buf;
     EncodeWalEntry(entry, last_seq, buf);
+    if (buf.size() > config_.max_value_size_bytes) {
+      return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
+                                         "batch entry of " + std::to_string(buf.size()) +
+                                             " bytes exceeds queue.max_value_size_bytes (" +
+                                             std::to_string(config_.max_value_size_bytes) + ")"});
+    }
     total_bytes += buf.size();
     encoded.push_back(std::move(buf));
   }
 
-  const size_t capacity = config_.segment_size_bytes - kSegmentHeaderSize;
-  if (total_bytes > capacity) {
+  // A batch is appended atomically to one segment after at most one rotation,
+  // so it must fit a single fixed-size segment. Phrase the check as an addition
+  // to avoid the unsigned underflow a small segment_size_bytes used to trigger
+  // (QUEUE-4); the validator floors segment_size_bytes above the header.
+  if (total_bytes + kSegmentHeaderSize > config_.segment_size_bytes) {
     return std::unexpected(
-        core::Error{core::ErrorCode::kInvalidArgument, "batch exceeds segment capacity"});
+        core::Error{core::ErrorCode::kResourceExhausted, "batch exceeds segment capacity"});
   }
 
   bool rotated = false;
@@ -334,7 +419,7 @@ core::Result<PendingBatchAppend> ShardState::BeginAppendBatch(
     next_seq_ = owned[i].seq + 1;
   }
 
-  DurabilityFuture future = committer_->Submit(written_bytes);
+  DurabilityFuture future = committer_->Submit(written_bytes, last_seq);
 
   auto publisher =
       std::make_unique<ShardStatePublisher>(read_cv_, std::move(lock), config_.on_rotate, rotated);
@@ -416,6 +501,38 @@ core::SequenceId ShardState::tail_seq() const {
     return sealed_.front()->base_seq();
   }
   return active_ ? active_->base_seq() : 0;
+}
+
+core::SequenceId ShardState::DurableSeq() const {
+  const std::scoped_lock lock(append_mu_);
+  core::SequenceId durable = highest_sealed_seq_;
+  if (committer_) {
+    durable = std::max(durable, committer_->DurableSeq());
+  }
+  return durable;
+}
+
+bool ShardState::HasDurable() const {
+  const std::scoped_lock lock(append_mu_);
+  if (has_sealed_durable_) return true;
+  return committer_ && committer_->HasDurable();
+}
+
+bool ShardState::AwaitDurable(core::SequenceId seq, core::Duration timeout) const {
+  // Snapshot the active committer under the lock (a shared_ptr keeps it alive
+  // across a concurrent Rotate), then wait without the lock so the commit
+  // thread can advance the watermark and appends can proceed.
+  std::shared_ptr<GroupCommitter> committer;
+  {
+    const std::scoped_lock lock(append_mu_);
+    // A sealed segment covering seq is already durable. Guard the seq-0 case
+    // with has_sealed_durable_ so a 0 watermark with no sealed data does not
+    // falsely satisfy the wait.
+    if (has_sealed_durable_ && highest_sealed_seq_ >= seq) return true;
+    committer = committer_;
+  }
+  if (!committer) return false;
+  return committer->AwaitDurable(seq, timeout);
 }
 
 size_t ShardState::total_entries() const {

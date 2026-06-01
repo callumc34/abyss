@@ -50,6 +50,10 @@ class FileOffsetStore : public OffsetStore {
   core::Result<void> WriteShardFile(core::ConsumerId consumer, core::ShardId shard,
                                     core::SequenceId seq) const;
 
+  // Unlink leftover *.offset.tmp.* orphans (a crash between write and rename)
+  // in `dir` (QUEUE-7). Best-effort: removal errors are logged, not fatal.
+  static void SweepTempFiles(const std::string& dir);
+
   std::string ConsumerDir(core::ConsumerId consumer) const;
   std::string ShardFilePath(core::ConsumerId consumer, core::ShardId shard) const;
   std::string ShardTempPath(core::ConsumerId consumer, core::ShardId shard) const;

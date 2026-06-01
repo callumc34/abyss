@@ -40,7 +40,14 @@ struct ColdConfig {
 struct QueueConfig {
   std::string backend = "builtin_wal";
   std::string wal_path = "/data/wal";
-  size_t segment_size_bytes = 67108864;
+  // 128 MiB: large enough to hold one max-size value plus framing so a max-size
+  // value never needs a variable-size segment (segments stay fixed-size).
+  size_t segment_size_bytes = 134217728;
+  // Largest single value accepted, decoupled from segment_size_bytes. Default
+  // 64 MiB; settable up to Redis's 512 MiB proto-max-bulk-len. The validator
+  // requires segment_size_bytes to hold one max-size entry, so larger values
+  // are rejected with kValueTooLarge rather than tied to the segment knob.
+  size_t max_value_size_bytes = 67108864;
   std::chrono::seconds min_retention{86400};
   std::string fsync_policy = "group_commit";
   uint32_t group_commit_interval_us = 1000;
