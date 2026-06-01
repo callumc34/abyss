@@ -398,10 +398,24 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
 
   (void)harness_.ShardedHot().Wipe();
 
-  EXPECT_EQ(harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}))->AsString(),
-            "now-a-string");
-  // The prior hash fields must not survive the type change.
-  EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c3t"}))->AsInteger(), 0);
+  auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}));
+  ASSERT_TRUE(getv.has_value());
+  EXPECT_EQ(getv->AsString(), "now-a-string");
+
+  // The prior hash fields must not survive the type change. The key is now a
+  // string, so HLEN is EITHER WRONGTYPE (an error Result, when a type-aware tier
+  // — the compaction buffer — resolves it) OR integer 0 (when the cold tier,
+  // which has no hash slice, resolves it). Which one wins depends on whether the
+  // buffer has drained to cold yet, so accept both. The ONLY failure is a
+  // positive field count, which would mean the stale hash slices survived.
+  auto hlen = harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c3t"}));
+  if (hlen.has_value()) {
+    EXPECT_TRUE(hlen->IsInteger() && hlen->AsInteger() == 0)
+        << "stale hash fields survived the type change";
+  } else {
+    EXPECT_EQ(hlen.error().code(), core::ErrorCode::kWrongType)
+        << "unexpected HLEN error: " << hlen.error().message();
+  }
 }
 
 }  // namespace
