@@ -42,6 +42,9 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
       reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kDeadline);
   flush_reason_pressure_ =
       reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kPressure);
+  flush_reason_drain_ =
+      reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kDrain);
+  drain_truncated_ = reg.Counter(metrics::names::kColdDrainTruncatedTotal);
   flush_total_success_ =
       reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kSuccess);
   flush_total_failure_ =
@@ -73,6 +76,18 @@ void ColdConsumer::Start() {
 void ColdConsumer::RequestStop() {
   {
     const std::scoped_lock lock(stop_mu_);
+    stop_requested_.store(true, std::memory_order_release);
+  }
+  stop_cv_.notify_all();
+}
+
+void ColdConsumer::RequestStopAndDrain(std::chrono::steady_clock::time_point deadline) {
+  {
+    const std::scoped_lock lock(stop_mu_);
+    // Publish the deadline before draining_ so RunLoop's DrainAndFlush, which
+    // observes draining_ with acquire, sees a fully-written deadline.
+    drain_deadline_ = deadline;
+    draining_.store(true, std::memory_order_release);
     stop_requested_.store(true, std::memory_order_release);
   }
   stop_cv_.notify_all();
@@ -137,9 +152,62 @@ void ColdConsumer::RunLoop() {
                       [this] { return stop_requested_.load(std::memory_order_acquire); });
     backoff = std::min(backoff * 2, config_.loop_max_backoff);
   }
+  // Graceful stop: drain the buffer to durable cold and advance the ack before
+  // returning (G6). Abrupt stop (RequestStop) skips this and relies on the WAL.
+  if (draining_.load(std::memory_order_acquire)) {
+    DrainAndFlush();
+  }
   ABYSS_LOG_DEBUG("cold consumer stopped", {"shard", static_cast<int64_t>(shard_)},
                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())},
                   {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
+}
+
+void ColdConsumer::DrainAndFlush() {
+  const auto deadline = drain_deadline_;
+  ABYSS_LOG_INFO("cold consumer draining", {"shard", static_cast<int64_t>(shard_)},
+                 {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
+
+  // One final drain of any queue entries the loop may have left behind, so the
+  // flush below carries the freshest tail. Bounded; never blocks past deadline.
+  if (std::chrono::steady_clock::now() < deadline) {
+    DrainWithBatch(config_.queue_read_max_count);
+  }
+
+  // Flush the buffer unconditionally (bypassing the quiet/deadline strategy),
+  // attributed as a drain flush. Bounded by the deadline: if the cold store is
+  // wedged or the buffer is larger than one budget allows, stop and leave the
+  // remainder for WAL replay rather than blocking shutdown forever (invariant 5).
+  bool truncated = false;
+  while (buffer_.Size() > 0) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      truncated = true;
+      break;
+    }
+    if (FlushUnscheduled(metrics::FlushReason::kDrain) != FlushOutcome::kProgress) {
+      // No forward progress (poisoned/unwritable batch reinserted): do not
+      // busy-spin to the deadline — the queue still has the data. Bail and let
+      // replay handle it.
+      truncated = true;
+      break;
+    }
+  }
+
+  // Force a checkpoint so the advanced ack is durable-gated even though the
+  // drain flushed fewer batches than the steady-state cadence (A6 + XDUR-1).
+  // Reuses TryAdvanceAck's existing checkpoint-then-ack gate: it never acks past
+  // the cold checkpoint or the durable WAL tail, so a partial drain is sound.
+  TryAdvanceAck(/*force_checkpoint=*/true);
+
+  if (truncated) {
+    drain_truncated_.Increment();
+    ABYSS_LOG_WARN("cold drain truncated at deadline; remaining buffer replays from WAL",
+                   {"shard", static_cast<int64_t>(shard_)},
+                   {"buffer_entries", static_cast<uint64_t>(buffer_.Size())},
+                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())});
+  } else {
+    ABYSS_LOG_INFO("cold drain complete", {"shard", static_cast<int64_t>(shard_)},
+                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())});
+  }
 }
 
 size_t ColdConsumer::Drain() { return DrainWithBatch(config_.queue_read_max_count); }
@@ -542,24 +610,29 @@ ColdConsumer::FlushOutcome ColdConsumer::Flush() {
     return FlushOutcome::kIdle;
   }
 
-  return ApplyFlushBatch(std::move(to_flush), aggressive, flush_start);
+  return ApplyFlushBatch(std::move(to_flush),
+                         aggressive
+                             ? std::optional<metrics::FlushReason>{metrics::FlushReason::kPressure}
+                             : std::nullopt,
+                         flush_start);
 }
 
-ColdConsumer::FlushOutcome ColdConsumer::FlushUnscheduled() {
+ColdConsumer::FlushOutcome ColdConsumer::FlushUnscheduled(metrics::FlushReason reason) {
   const auto flush_start = std::chrono::steady_clock::now();
   auto to_flush = buffer_.FlushOldest(/*target_bytes=*/0, config_.max_flush_batch_size);
   if (to_flush.empty()) {
     TryAdvanceAck();
     return FlushOutcome::kIdle;
   }
-  // Replay flushes count as aggressive in the per-flush trigger metric — they
-  // bypass the quiet/deadline strategy.
-  return ApplyFlushBatch(std::move(to_flush), /*aggressive=*/true, flush_start);
+  // Bypass-the-strategy flushes (replay or graceful drain) are attributed by
+  // the caller's reason rather than the quiet/deadline per-entry trigger.
+  return ApplyFlushBatch(std::move(to_flush), reason, flush_start);
 }
 
 ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
-    std::vector<BufferEntry> to_flush, bool aggressive,
+    std::vector<BufferEntry> to_flush, std::optional<metrics::FlushReason> aggressive_reason,
     std::chrono::steady_clock::time_point flush_start) {
+  const bool aggressive = aggressive_reason.has_value();
   const auto wall_now = wall_clock_();
   std::vector<BufferEntry> surviving;
   surviving.reserve(to_flush.size());
@@ -599,7 +672,10 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
       flush_total_success_.Increment(static_cast<double>(surviving_count));
       if (aggressive) {
         flushes_aggressive_.fetch_add(surviving_count, std::memory_order_relaxed);
-        flush_reason_pressure_.Increment(static_cast<double>(surviving_count));
+        auto& reason_counter = *aggressive_reason == metrics::FlushReason::kDrain
+                                   ? flush_reason_drain_
+                                   : flush_reason_pressure_;
+        reason_counter.Increment(static_cast<double>(surviving_count));
       } else {
         if (quiet_count > 0) {
           flushes_quiet_.fetch_add(quiet_count, std::memory_order_relaxed);

@@ -104,6 +104,14 @@ class ColdConsumer {
   // queue Read (bounded by config.queue_read_timeout) and returns.
   void RequestStop();
 
+  // Graceful-stop entry point (distinct from the abrupt RequestStop). Sets a
+  // draining flag and a deadline so the loop, on exit, drains the buffer to
+  // cold, checkpoints (A6), and advances the durable ack before stopping —
+  // bounded by `deadline`. Non-blocking; finalised by Join(). Composes with
+  // RequestStop: a graceful stop still wakes the loop the same way, but the
+  // exit path runs the bounded drain instead of dropping the buffer.
+  void RequestStopAndDrain(std::chrono::steady_clock::time_point deadline);
+
   // Wait for the worker thread. Must be preceded by RequestStop.
   void Join();
 
@@ -135,8 +143,10 @@ class ColdConsumer {
   // Replay variant: pops oldest buffer entries regardless of quiet/deadline
   // timing and flushes them. Steady-state Flush() honours the strategy timers
   // and returns kIdle if no entries are due, which deadlocks a replay loop
-  // that has fresh entries with future scheduled_times.
-  FlushOutcome FlushUnscheduled();
+  // that has fresh entries with future scheduled_times. `reason` attributes the
+  // flush in abyss_cold_flush_reason_total — kPressure for replay drains,
+  // kDrain for a graceful-shutdown drain.
+  FlushOutcome FlushUnscheduled(metrics::FlushReason reason = metrics::FlushReason::kPressure);
 
   Metrics Snapshot() const;
   Mode CurrentMode() const { return mode_.load(std::memory_order_acquire); }
@@ -152,6 +162,13 @@ class ColdConsumer {
 
  private:
   void RunLoop();
+
+  // Final drain-to-durable on graceful stop (G6). Flushes the buffer
+  // unconditionally (FlushReason::kDrain), then forces a checkpoint + ack so
+  // the advanced cold ack is durable — bounded by drain_deadline_. On deadline
+  // expiry the remaining buffer is left for WAL replay and the truncation is
+  // surfaced (abyss_cold_drain_truncated_total). Runs once, on RunLoop exit.
+  void DrainAndFlush();
 
   // Handlers return the poison seq (the un-materialised WAL seq) when an op is
   // structurally undecodable, std::nullopt otherwise. The drain loop clamps the
@@ -184,7 +201,11 @@ class ColdConsumer {
 
   // Shared implementation between Flush() and FlushUnscheduled() — once a
   // batch has been popped from the buffer, the apply path is identical.
-  FlushOutcome ApplyFlushBatch(std::vector<BufferEntry> to_flush, bool aggressive,
+  // `aggressive_reason` attributes a bypass-the-strategy flush (replay or
+  // graceful drain) to its FlushReason; scheduled flushes pass nullopt and are
+  // attributed quiet/deadline per entry trigger.
+  FlushOutcome ApplyFlushBatch(std::vector<BufferEntry> to_flush,
+                               std::optional<metrics::FlushReason> aggressive_reason,
                                std::chrono::steady_clock::time_point flush_start);
 
   // Highest first-seen WAL seq among `entries`; passed to ApplyBatch as the
@@ -222,7 +243,12 @@ class ColdConsumer {
   CompactionBuffer buffer_;
 
   std::atomic<bool> stop_requested_{false};
+  // Distinct from stop_requested_: when set, RunLoop runs DrainAndFlush on exit
+  // (a bounded final flush + checkpoint + ack) instead of dropping the buffer.
+  std::atomic<bool> draining_{false};
   std::atomic<bool> running_{false};
+  // Deadline for the graceful drain; only read when draining_ is set.
+  std::chrono::steady_clock::time_point drain_deadline_{};
   std::thread thread_;
   // Wakes the loop's backoff sleep promptly on RequestStop so teardown is not
   // bounded by the current backoff interval.
@@ -283,6 +309,8 @@ class ColdConsumer {
   metrics::CounterHandle flush_reason_quiet_;
   metrics::CounterHandle flush_reason_deadline_;
   metrics::CounterHandle flush_reason_pressure_;
+  metrics::CounterHandle flush_reason_drain_;
+  metrics::CounterHandle drain_truncated_;
   metrics::CounterHandle flush_total_success_;
   metrics::CounterHandle flush_total_failure_;
   metrics::CounterHandle checkpoint_total_success_;

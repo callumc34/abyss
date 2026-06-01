@@ -105,6 +105,7 @@ core::Result<void> ParseColdConsumer(const YamlCursor& cur, ColdConsumerConfig& 
       .Optional("queue_read_timeout_ms", out.queue_read_timeout)
       .Optional("retry_initial_backoff_ms", out.retry_initial_backoff)
       .Optional("retry_max_backoff_ms", out.retry_max_backoff)
+      .Optional("drain_grace_seconds", out.drain_grace)
       .Finish();
 }
 

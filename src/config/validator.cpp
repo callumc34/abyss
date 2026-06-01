@@ -253,6 +253,9 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
     return std::unexpected(
         InvalidArg("cold_consumer.retry_initial_backoff_ms", "must be <= retry_max_backoff_ms"));
   }
+  if (c.drain_grace.count() <= 0) {
+    return std::unexpected(InvalidArg("cold_consumer.drain_grace_seconds", "must be > 0 seconds"));
+  }
   return {};
 }
 

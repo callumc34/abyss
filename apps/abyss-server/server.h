@@ -24,6 +24,7 @@
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/metrics/metrics.h"
 #include "abyss/net/tcp_server.h"
 #include "abyss/queue/wal_queue.h"
 #include "abyss/resp/metrics.h"
@@ -34,6 +35,20 @@ namespace abyss::server {
 
 class Server {
  public:
+  // The single source of truth for the process lifecycle. The client-visible
+  // serving predicate (the RESP LOADING gate and /ready) is derived ONLY from
+  // this value reaching kServing, which happens strictly after recovery
+  // completes AND every consumer pool has started — so there is no state in
+  // which the data plane is open with no consumer to fulfil an RPC (ENGINE-1).
+  // Monotonic forward order; never moves backward.
+  enum class LifecycleState : uint8_t {
+    kInitializing = 0,  // signal handling armed, topology validated, stores opening
+    kRecovering = 1,    // pure queue replay; LOADING asserted, /ready 503
+    kServing = 2,       // pools live + recovery done; LOADING lifted in one edge
+    kDraining = 3,      // graceful SIGTERM drain in progress; LOADING re-asserted
+    kStopped = 4,       // teardown complete
+  };
+
   explicit Server(config::Config config);
   ~Server();
 
@@ -45,8 +60,11 @@ class Server {
   bool Initialize();
   core::Result<void> Run(const std::atomic<bool>& stop);
   void Shutdown();
-  bool IsReady() const { return ready_.load(std::memory_order_acquire); }
-  bool IsShuttingDown() const { return shutting_down_.load(std::memory_order_acquire); }
+
+  LifecycleState Lifecycle() const { return lifecycle_.load(std::memory_order_acquire); }
+  bool IsServing() const { return Lifecycle() == LifecycleState::kServing; }
+  bool IsReady() const { return IsServing(); }
+  bool IsShuttingDown() const { return Lifecycle() >= LifecycleState::kDraining; }
 
   uint16_t AdminBoundPort() const noexcept {
     return admin_http_ != nullptr ? admin_http_->BoundPort() : 0;
@@ -60,6 +78,9 @@ class Server {
 
  private:
   void NotifyReady();
+  // Stores the new state and reflects it on the lifecycle-state gauge. The
+  // single place the state changes, so the metric never drifts from the atomic.
+  void Transition(LifecycleState next);
 
   config::Config config_;
 
@@ -106,8 +127,8 @@ class Server {
   std::unique_ptr<admin::HttpServer> metrics_http_;
 
   intptr_t ready_fd_ = -1;
-  std::atomic<bool> ready_{false};
-  std::atomic<bool> shutting_down_{false};
+  std::atomic<LifecycleState> lifecycle_{LifecycleState::kInitializing};
+  metrics::GaugeHandle lifecycle_gauge_;
 };
 
 }  // namespace abyss::server

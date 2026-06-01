@@ -35,9 +35,17 @@ namespace {
 constexpr std::chrono::milliseconds kStopPollInterval{100};
 }  // namespace
 
-Server::Server(config::Config config) : config_(std::move(config)) {}
+Server::Server(config::Config config) : config_(std::move(config)) {
+  lifecycle_gauge_ = metrics::Registry::Instance().Gauge(metrics::names::kServerLifecycleState);
+  Transition(LifecycleState::kInitializing);
+}
 
 Server::~Server() { Shutdown(); }
+
+void Server::Transition(LifecycleState next) {
+  lifecycle_.store(next, std::memory_order_release);
+  lifecycle_gauge_.Set(static_cast<double>(std::to_underlying(next)));
+}
 
 bool Server::Initialize() {
   if (config_.profile != "embedded") {
@@ -244,15 +252,13 @@ bool Server::Initialize() {
       /*advertise_address=*/std::string{}, /*mode=*/"standalone", config_.net.port,
       hot_store_->shard_count());
   config_provider_ = std::make_unique<ConfigProviderImpl>(config_);
-  // The coordinator is the single source of truth for "still recovering."
-  // queue.IsRecovering() handles WAL self-recovery (synchronous today,
-  // potentially async for external backends); coordinator covers consumer
-  // catch-up in every phase. Either being true keeps LOADING active.
-  loading_ = std::make_unique<LoadingStateImpl>(
-      [queue_ptr = queue_.get(), coordinator_ptr = recovery_coordinator_.get()] {
-        if (queue_ptr != nullptr && queue_ptr->IsRecovering()) return true;
-        return coordinator_ptr != nullptr && coordinator_ptr->IsRecovering();
-      });
+  // The LOADING gate derives from the single lifecycle atomic: data commands
+  // are gated until the state machine reaches kServing, which Server::Run
+  // asserts ONLY after recovery completes AND every consumer pool is live. This
+  // closes the ENGINE-1 window where the gate lifted on coordinator completion
+  // alone, before the pools could fulfil an RPC. The gate is also re-asserted in
+  // kDraining (>kServing is false) so shutdown stops accepting data writes.
+  loading_ = std::make_unique<LoadingStateImpl>([this] { return !IsServing(); });
   resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
 
   resp::PipelineDependencies pipeline_deps{
@@ -358,8 +364,8 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
   }
 
   // Bind admin and metrics first so /healthz and /ready answer immediately.
-  // /ready will report 503 (recovery_complete=false) until the coordinator
-  // marks Phase::kComplete after consumer catch-up.
+  // /ready reports 503 (recovery_complete=false) until lifecycle_ reaches
+  // kServing, i.e. until recovery completes AND the consumer pools are live.
   if (admin_http_) {
     if (auto r = admin_http_->Start(); !r.has_value()) {
       ABYSS_LOG_CRITICAL("admin http start failed", {"err", std::string_view{r.error().message()}});
@@ -375,9 +381,9 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
     }
   }
 
-  // Bind the data-plane listener. The LOADING gate (loading_->IsLoading()
-  // backed by the coordinator) makes data commands return -LOADING until
-  // recovery completes; admin RESP commands stay available throughout.
+  // Bind the data-plane listener. The LOADING gate (loading_->IsLoading(),
+  // backed by lifecycle_ != kServing) makes data commands return -LOADING until
+  // the kServing edge below; admin RESP commands stay available throughout.
   if (auto r = tcp_server_->Start(); !r.has_value()) {
     ABYSS_LOG_CRITICAL("tcp server start failed", {"err", std::string_view{r.error().message()}});
     if (admin_http_) admin_http_->Stop();
@@ -393,10 +399,12 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
                  {"admin_port", static_cast<int64_t>(AdminBoundPort())},
                  {"metrics_port", static_cast<int64_t>(MetricsBoundPort())});
 
-  // Run the recovery state machine. Blocks until all phases complete or the
-  // shutdown signal arrives. On cancellation the coordinator returns
-  // kUnavailable and we fall through to a clean shutdown without flipping
-  // ready_=true — /ready stays 503 until process exit.
+  // Enter recovery: pure queue replay. The LOADING gate stays asserted and
+  // /ready returns 503 throughout (lifecycle_ != kServing). Blocks until all
+  // phases complete or the shutdown signal arrives. On cancellation the
+  // coordinator returns kUnavailable and we fall through to a clean shutdown
+  // without ever reaching kServing — /ready stays 503 until process exit.
+  Transition(LifecycleState::kRecovering);
   if (recovery_coordinator_) {
     if (auto r = recovery_coordinator_->Run(stop); !r.has_value()) {
       ABYSS_LOG_CRITICAL("recovery failed; shutting down",
@@ -407,7 +415,10 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
   }
 
   // Recovery is complete; start the per-shard consumer threads for steady-
-  // state tailing, plus the eviction maintenance worker.
+  // state tailing, plus the eviction maintenance worker. The LOADING gate is
+  // STILL asserted here — it lifts only at the single kServing edge below,
+  // strictly after a hot consumer thread exists to fulfil write/conditional
+  // RPC promises (ENGINE-1: never serve with no consumer).
   if (hot_eviction_worker_) hot_eviction_worker_->Start();
   if (resolver_pool_) resolver_pool_->Start();
   if (cold_pool_) cold_pool_->Start();
@@ -421,7 +432,14 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
     }
   }
 
-  ready_.store(true, std::memory_order_release);
+  // The single gate-lifting edge: pools are live AND recovery is done, so the
+  // LOADING gate (loading_ predicate) and /ready flip in one observable
+  // transition. A late SIGTERM may have arrived during pool startup; if so,
+  // skip kServing and head straight to shutdown so we never open the gate while
+  // already tearing down.
+  if (!stop.load(std::memory_order_acquire)) {
+    Transition(LifecycleState::kServing);
+  }
   // Emit the readiness pipe line only after all subsystems are up — operators
   // and supervisors that wait on it then know the data plane is serving.
   NotifyReady();
@@ -480,15 +498,26 @@ void Server::NotifyReady() {
 }
 
 void Server::Shutdown() {
-  if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
+  // Single-shot guard: only the first caller past kDraining runs teardown.
+  // CAS from any pre-draining state to kDraining; a concurrent/repeat call
+  // observes >=kDraining and returns. (~Server and the Run loop both call
+  // Shutdown.)
+  for (;;) {
+    auto current = lifecycle_.load(std::memory_order_acquire);
+    if (current >= LifecycleState::kDraining) return;
+    if (lifecycle_.compare_exchange_weak(current, LifecycleState::kDraining,
+                                         std::memory_order_acq_rel)) {
+      lifecycle_gauge_.Set(static_cast<double>(std::to_underlying(LifecycleState::kDraining)));
+      break;
+    }
+  }
 
   ABYSS_LOG_INFO("shutdown starting");
 
-  // Flip /ready to 503 first so K8s pulls the pod from Service endpoints
-  // before we tear down the data plane. Admin liveness keeps responding via
-  // the http servers below until they're stopped.
-  ready_.store(false, std::memory_order_release);
-
+  // kDraining re-asserts the LOADING gate and flips /ready to 503 (both derive
+  // from lifecycle_ != kServing) so K8s pulls the pod from Service endpoints
+  // before we tear down the data plane. Admin liveness keeps responding via the
+  // http servers below until they're stopped.
   if (admin_http_) admin_http_->Stop();
   if (metrics_http_) metrics_http_->Stop();
 
@@ -499,7 +528,17 @@ void Server::Shutdown() {
   // Stop the eviction worker before the cold pool: its tombstone-GC tick reads
   // the cold consumers' drained seq, so it must not run once the pool stops.
   if (hot_eviction_worker_) hot_eviction_worker_->Stop();
-  if (cold_pool_) cold_pool_->Stop();
+  // Graceful cold drain (G6): flush the in-memory compaction buffer to durable
+  // cold and advance the cold ack BEFORE the hard stop, bounded by the
+  // shutdown grace budget. A rolling restart no longer discards the buffer and
+  // forces a full cold replay. The drain Checkpoints (durable) before acking,
+  // so the advanced ack is never past durable; on deadline expiry the remaining
+  // slice replays from the WAL (correctness preserved). Cold store is stopped
+  // AFTER the pool so the drain's ApplyBatch sees a live store.
+  if (cold_pool_) {
+    cold_pool_->Stop(
+        std::chrono::duration_cast<std::chrono::milliseconds>(config_.cold_consumer.drain_grace));
+  }
   if (hot_pool_) hot_pool_->Stop();
   if (resolver_pool_) resolver_pool_->Stop();
   if (cold_store_) {
@@ -508,6 +547,7 @@ void Server::Shutdown() {
     }
   }
 
+  Transition(LifecycleState::kStopped);
   ABYSS_LOG_INFO("shutdown complete");
 }
 

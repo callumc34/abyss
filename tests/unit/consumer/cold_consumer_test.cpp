@@ -833,5 +833,119 @@ TEST_F(ColdConsumerTest, StopBeforeStartIsSafe) {
   EXPECT_FALSE(c->IsRunning());
 }
 
+// --- Graceful drain on shutdown (G6) -----------------------------------------
+
+TEST_F(ColdConsumerTest, DrainAndFlushPersistsBufferOnGracefulStop) {
+  ColdConsumer::Config cfg;
+  // Long quiet threshold and a small safety margin (well under the fixture's
+  // 3600s eviction TTL) so neither the quiet nor the eviction-deadline trigger
+  // fires within the test window — the buffered entries survive only because
+  // the graceful drain flushes them.
+  cfg.quiet_threshold = 3600s;
+  cfg.safety_margin = 60s;
+  cfg.jitter_fraction = 0.0;
+  cfg.queue_read_timeout = 5ms;
+  auto c = MakeConsumer(cfg);
+
+  constexpr int kWrites = 5;
+  std::vector<core::QueueEntry> entries;
+  entries.reserve(kWrites);
+  for (int i = 0; i < kWrites; ++i) {
+    entries.push_back(MakeWriteEntry(static_cast<core::SequenceId>(i) + 1,
+                                     {"SET", "k" + std::to_string(i), "v"}));
+  }
+  // Deliver the batch once, then nothing — the loop absorbs all kWrites into the
+  // buffer and (quiet=3600s) leaves them unflushed.
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  std::atomic<int> applied{0};
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([&applied](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
+        applied.fetch_add(static_cast<int>(ops.size()));
+        return core::Result<void>{};
+      });
+  std::atomic<int> checkpoints{0};
+  EXPECT_CALL(cold_, Checkpoint(kShard, _))
+      .WillRepeatedly([&checkpoints](core::ShardId, core::SequenceId) {
+        checkpoints.fetch_add(1);
+        return core::Result<void>{};
+      });
+  std::atomic<core::SequenceId> ack_seq{0};
+  EXPECT_CALL(queue_, Ack(core::kColdConsumer, kShard, _))
+      .WillRepeatedly([&ack_seq](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        ack_seq.store(s);
+        return core::Result<void>{};
+      });
+
+  c->Start();
+  // Let the loop absorb the batch.
+  for (int i = 0; i < 200 && c->Buffer().Size() < static_cast<size_t>(kWrites); ++i) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(c->Buffer().Size(), static_cast<size_t>(kWrites))
+      << "steady loop should have buffered all writes without flushing";
+
+  // Graceful stop with a generous deadline: the drain must flush everything.
+  c->RequestStopAndDrain(std::chrono::steady_clock::now() + 5s);
+  c->Join();
+
+  EXPECT_EQ(c->Buffer().Size(), 0U) << "graceful drain must empty the buffer";
+  EXPECT_EQ(applied.load(), kWrites) << "every buffered write must reach cold";
+  EXPECT_GE(checkpoints.load(), 1) << "drain must checkpoint before advancing the ack";
+  // The drained slice is durable, so the ack advanced past it — a reopen would
+  // NOT need to replay these seqs.
+  EXPECT_EQ(ack_seq.load(), static_cast<core::SequenceId>(kWrites));
+  EXPECT_EQ(c->Snapshot().last_ack_seq, static_cast<core::SequenceId>(kWrites));
+}
+
+TEST_F(ColdConsumerTest, DrainDeadlineTruncatesAndReportsWithoutBlocking) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 3600s;
+  cfg.safety_margin = 60s;
+  cfg.jitter_fraction = 0.0;
+  cfg.queue_read_timeout = 5ms;
+  // Force one entry per flush batch so the wedged ApplyBatch is hit while the
+  // buffer still has work, exercising the deadline path mid-drain.
+  cfg.max_flush_batch_size = 1;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> entries;
+  entries.reserve(4);
+  for (int i = 0; i < 4; ++i) {
+    entries.push_back(MakeWriteEntry(static_cast<core::SequenceId>(i) + 1,
+                                     {"SET", "k" + std::to_string(i), "v"}));
+  }
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  // ApplyBatch sleeps longer than the drain budget, so the deadline elapses
+  // before the buffer empties — the drain must abandon the rest, not block.
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([](std::span<const core::ops::WriteOp>, core::SequenceId) {
+        std::this_thread::sleep_for(60ms);
+        return core::Result<void>{};
+      });
+
+  c->Start();
+  for (int i = 0; i < 200 && c->Buffer().Size() < 4; ++i) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(c->Buffer().Size(), 4U);
+
+  const auto start = std::chrono::steady_clock::now();
+  c->RequestStopAndDrain(std::chrono::steady_clock::now() + 50ms);
+  c->Join();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  // Bounded: Join returns near the deadline (allow one in-flight ApplyBatch +
+  // slack), never an unbounded block on the full buffer.
+  EXPECT_LT(elapsed, 400ms) << "drain must be deadline-bounded, not block on the wedged store";
+  // The remaining slice was left in the buffer for WAL replay (no silent loss).
+  EXPECT_GT(c->Buffer().Size(), 0U) << "truncated drain must leave the rest for replay";
+}
+
 }  // namespace
 }  // namespace abyss::consumer

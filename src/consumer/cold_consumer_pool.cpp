@@ -43,6 +43,22 @@ void ColdConsumerPool::Stop() {
   }
 }
 
+void ColdConsumerPool::Stop(std::chrono::milliseconds drain_budget) {
+  // One shared deadline so the budget bounds the whole drain, not each shard
+  // serially. Request the drain on every consumer first (they drain in
+  // parallel on their own threads), then join.
+  const auto deadline = std::chrono::steady_clock::now() + drain_budget;
+  ABYSS_LOG_INFO("cold consumers draining", {"count", static_cast<int64_t>(consumers_.size())},
+                 {"budget_ms", static_cast<int64_t>(drain_budget.count())});
+  for (auto& consumer : consumers_) {
+    consumer->RequestStopAndDrain(deadline);
+  }
+  for (auto& consumer : consumers_) {
+    consumer->Join();
+  }
+  ABYSS_LOG_INFO("cold consumers drained", {"count", static_cast<int64_t>(consumers_.size())});
+}
+
 bool ColdConsumerPool::IsRunning() const {
   for (const auto& consumer : consumers_) {
     if (consumer->IsRunning()) return true;

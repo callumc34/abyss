@@ -38,6 +38,23 @@ std::string ResolveConfigPath(const std::string& cli_path) {
 
 // NOLINTNEXTLINE(modernize-avoid-c-arrays,bugprone-exception-escape)
 int main(int argc, char* argv[]) {
+  // Install signal handling as the VERY FIRST action (G7): a SIGTERM that
+  // arrives during early startup (banner, config load, store open) is then
+  // honored and triggers a graceful shutdown rather than falling through to the
+  // SIGKILL the K8s grace period would otherwise deliver. The handler only does
+  // atomic stores, so it is async-signal-safe and safe before logging is up.
+#ifndef _WIN32
+  struct sigaction sa{};
+  sa.sa_handler = ShutdownHandler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGTERM, &sa, nullptr);
+  sigaction(SIGINT, &sa, nullptr);
+  signal(SIGPIPE, SIG_IGN);  // NOLINT(cert-err33-c)
+#else
+  signal(SIGINT, ShutdownHandler);
+  signal(SIGTERM, ShutdownHandler);
+#endif
+
   // Local-dev sandbox: used only when neither --config nor --data-dir is given.
   constexpr auto kDefaultDataDir = "/tmp/abyss";
 
@@ -124,18 +141,6 @@ int main(int argc, char* argv[]) {
                  {"port", static_cast<int64_t>(config.net.port)},
                  {"config_path",
                   resolved.empty() ? std::string_view{"<defaults>"} : std::string_view{resolved}});
-
-#ifndef _WIN32
-  struct sigaction sa{};
-  sa.sa_handler = ShutdownHandler;
-  sigemptyset(&sa.sa_mask);
-  sigaction(SIGTERM, &sa, nullptr);
-  sigaction(SIGINT, &sa, nullptr);
-  signal(SIGPIPE, SIG_IGN);  // NOLINT(cert-err33-c)
-#else
-  signal(SIGINT, ShutdownHandler);
-  signal(SIGTERM, ShutdownHandler);
-#endif
 
   abyss::server::Server server(config);
   server.set_ready_fd(ready_fd);

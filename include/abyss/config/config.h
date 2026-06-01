@@ -70,6 +70,12 @@ struct ColdConsumerConfig {
   std::chrono::milliseconds queue_read_timeout{50};
   std::chrono::milliseconds retry_initial_backoff{50};
   std::chrono::milliseconds retry_max_backoff{30000};
+  // Per-shard budget for the graceful SIGTERM drain: each cold consumer
+  // flushes + checkpoints its buffer to durable storage before stopping,
+  // bounded by this deadline (drains run in parallel across shards). On expiry
+  // the remaining slice replays from the WAL. Keep below the K8s
+  // terminationGracePeriodSeconds minus the /ready-flip propagation window.
+  std::chrono::seconds drain_grace{15};
 };
 
 struct RecoveryConfig {

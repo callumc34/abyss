@@ -59,7 +59,7 @@ constexpr std::string_view ToStringView(FlushStatus s) noexcept {
   return {};
 }
 
-enum class FlushReason : uint8_t { kQuiet, kDeadline, kPressure };
+enum class FlushReason : uint8_t { kQuiet, kDeadline, kPressure, kDrain };
 
 enum class RequestStatus : uint8_t { kOk, kError, kLoading, kUnknown, kArity, kNoProto };
 
@@ -94,6 +94,8 @@ constexpr std::string_view ToStringView(FlushReason r) noexcept {
       return "deadline";
     case FlushReason::kPressure:
       return "pressure";
+    case FlushReason::kDrain:
+      return "drain";
   }
   return {};
 }
@@ -686,6 +688,32 @@ inline constexpr GaugeDesc<> kRecoveryHotEntriesTarget{
 inline constexpr GaugeDesc<> kRecoveryDurationSeconds{
     .name = "abyss_recovery_duration_seconds",
     .help = "Wall-clock elapsed time for the current recovery run.",
+};
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+// Encoded as the underlying value of server::Server::LifecycleState:
+// 0=initializing, 1=recovering, 2=serving, 3=draining, 4=stopped. The
+// client-visible LOADING gate is asserted in every state except serving, so
+// this is the single source of truth for "is the data plane open".
+inline constexpr GaugeDesc<> kServerLifecycleState{
+    .name = "abyss_server_lifecycle_state",
+    .help =
+        "Current server lifecycle state (0=initializing, 1=recovering, "
+        "2=serving, 3=draining, 4=stopped).",
+};
+
+// A graceful shutdown drain that hit its deadline before the cold buffer
+// emptied: the remaining slice is left in the WAL for replay (correctness
+// preserved). A non-zero count means the shutdown_grace budget was too small
+// for the buffered work — surfaced rather than silently truncated.
+inline constexpr CounterDesc<> kColdDrainTruncatedTotal{
+    .name = "abyss_cold_drain_truncated_total",
+    .help =
+        "Cold consumer graceful drains that hit the shutdown deadline before the "
+        "buffer emptied; the remaining slice replays from the WAL on next start.",
 };
 
 }  // namespace names
