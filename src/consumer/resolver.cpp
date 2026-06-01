@@ -844,7 +844,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
       [this, &entry](const auto& payload) {
         using T = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<T, core::entry::Write>) {
-          UpdateCacheFromWrite(entry.seq, payload.cmd);
+          ApplyToCache(entry.seq, entry.appended_at, payload.cmd);
         } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
           HandleFlush(entry);
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
@@ -908,7 +908,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
               decisions_skip_.fetch_add(1, std::memory_order_relaxed);
             }
 
-            UpdateCacheFromResolved(entry.seq, resolved);
+            UpdateCacheFromResolved(entry.seq, entry.appended_at, resolved);
           }
 
           // Block until hot applies — required for read-your-write. On timeout
@@ -925,7 +925,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
                                        "timeout"));
           }
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          UpdateCacheFromResolved(entry.seq, payload);
+          UpdateCacheFromResolved(entry.seq, entry.appended_at, payload);
         }
       },
       entry.payload);
@@ -992,85 +992,106 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
 // Cache updates from log entries
 // ---------------------------------------------------------------------------
 
-void Resolver::UpdateCacheFromWrite(core::SequenceId seq, const core::RespCommand& cmd) {
-  if (cmd.args.empty()) return;
-  const auto upper = AsciiUpper(cmd.args[0]);
-  if (upper == "SET") {
-    if (cmd.args.size() < 3) return;
-    auto parsed = ParseSetArgs(cmd, /*now_ms=*/0);  // ttl extracted as-is
-    if (!parsed.valid) return;
-    cache_.UpsertKey(parsed.key, ExistenceCache::KeyMeta{
-                                     .exists = true,
-                                     .type = ExistenceCache::KeyType::kString,
-                                     .abs_ttl_ms = parsed.abs_ttl_ms,
-                                     .latest_seq = seq,
-                                     .string_value = std::string(parsed.value),
-                                 });
-  } else if (upper == "SETEX" || upper == "PSETEX") {
-    if (cmd.args.size() < 4) return;
-    cache_.UpsertKey(cmd.args[1], ExistenceCache::KeyMeta{
-                                      .exists = true,
-                                      .type = ExistenceCache::KeyType::kString,
-                                      .abs_ttl_ms = 0,
-                                      .latest_seq = seq,
-                                      .string_value = std::string(cmd.args[3]),
-                                  });
-  } else if (upper == "DEL" || upper == "UNLINK") {
-    for (size_t i = 1; i < cmd.args.size(); ++i) {
-      cache_.TombstoneKey(cmd.args[i], seq);
-    }
-  } else if (upper == "PERSIST") {
-    if (cmd.args.size() < 2) return;
-    auto cur = cache_.GetKey(cmd.args[1]);
-    ExistenceCache::KeyMeta m = cur.has_value() ? *cur : ExistenceCache::KeyMeta{.exists = true};
-    m.abs_ttl_ms = 0;
-    m.latest_seq = seq;
-    cache_.UpsertKey(cmd.args[1], std::move(m));
-  } else if (upper == "EXPIRE" || upper == "PEXPIRE" || upper == "EXPIREAT" ||
-             upper == "PEXPIREAT" || upper == "PEXPIREAT") {
-    if (cmd.args.size() < 3) return;
-    uint64_t v = 0;
-    if (!ParseUint64(cmd.args[2], v)) return;
-    auto cur = cache_.GetKey(cmd.args[1]);
-    if (!cur.has_value()) return;  // don't materialize a key from EXPIRE alone
-    cur->latest_seq = seq;
-    if (upper == "EXPIRE")
-      cur->abs_ttl_ms = WallMs(core::WallClock::now()) + (v * 1000);
-    else if (upper == "PEXPIRE")
-      cur->abs_ttl_ms = WallMs(core::WallClock::now()) + v;
-    else if (upper == "EXPIREAT")
-      cur->abs_ttl_ms = v * 1000;
-    else
-      cur->abs_ttl_ms = v;
-    cache_.UpsertKey(cmd.args[1], *cur);
+namespace {
+
+// Marks `key` present in the cache as a collection of `type`, preserving any
+// existing absolute TTL, and purges stale members/fields if the prior cached
+// type differed (a type change invalidates the old member/field index).
+void UpsertCollectionKey(ExistenceCache& cache, std::string_view key, ExistenceCache::KeyType type,
+                         core::SequenceId seq) {
+  auto cur = cache.GetKey(key);
+  if (cur.has_value() && cur->exists && cur->type != type) {
+    cache.RemoveMembersAndFields(key);
   }
-  // Member-level cache is demand-driven; UpdateCacheFromResolved fills in
-  // affected entries.
+  ExistenceCache::KeyMeta m = cur.has_value() ? *cur : ExistenceCache::KeyMeta{};
+  m.exists = true;
+  m.type = type;
+  m.latest_seq = seq;
+  m.string_value.reset();
+  cache.UpsertKey(key, std::move(m));
 }
 
-void Resolver::UpdateCacheFromResolved(core::SequenceId seq,
+}  // namespace
+
+void Resolver::ApplyToCache(core::SequenceId seq, core::WallTime appended_at,
+                            const core::RespCommand& cmd) {
+  if (cmd.args.empty()) return;
+  const auto name = AsciiUpper(cmd.args[0]);
+  auto op = core::ops::ParseWriteOp(name, cmd, WallMs(appended_at));
+  // The cache is a hint-only layer; an unparseable write is the hot store's
+  // authoritative parse error to report. Skip cache maintenance silently.
+  if (!op.has_value()) return;
+
+  std::visit(
+      [&](const auto& w) {
+        using T = std::decay_t<decltype(w)>;
+        if constexpr (std::is_same_v<T, core::ops::StringSet>) {
+          if (auto cur = cache_.GetKey(w.key);
+              cur.has_value() && cur->exists && cur->type != ExistenceCache::KeyType::kString) {
+            cache_.RemoveMembersAndFields(w.key);
+          }
+          cache_.UpsertKey(w.key, ExistenceCache::KeyMeta{
+                                      .exists = true,
+                                      .type = ExistenceCache::KeyType::kString,
+                                      .abs_ttl_ms = w.abs_ttl_ms,
+                                      .latest_seq = seq,
+                                      .string_value = std::string(w.value),
+                                  });
+        } else if constexpr (std::is_same_v<T, core::ops::Del>) {
+          for (const auto& key : w.keys) {
+            cache_.RemoveMembersAndFields(key);
+            cache_.TombstoneKey(key, seq);
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::Expire>) {
+          // EXPIRE/PERSIST never materialise a key from nothing.
+          auto cur = cache_.GetKey(w.key);
+          if (!cur.has_value() || !cur->exists) return;
+          cur->abs_ttl_ms = w.abs_ttl_ms;
+          cur->latest_seq = seq;
+          cache_.UpsertKey(w.key, std::move(*cur));
+        } else if constexpr (std::is_same_v<T, core::ops::Persist>) {
+          auto cur = cache_.GetKey(w.key);
+          if (!cur.has_value() || !cur->exists) return;
+          cur->abs_ttl_ms = 0;
+          cur->latest_seq = seq;
+          cache_.UpsertKey(w.key, std::move(*cur));
+        } else if constexpr (std::is_same_v<T, core::ops::SetAdd>) {
+          UpsertCollectionKey(cache_, w.key, ExistenceCache::KeyType::kSet, seq);
+          for (const auto& member : w.members) {
+            cache_.UpsertMember(w.key, member,
+                                ExistenceCache::MemberMeta{.score = 0.0, .latest_seq = seq});
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::SetRem>) {
+          for (const auto& member : w.members) cache_.RemoveMember(w.key, member);
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetAdd>) {
+          UpsertCollectionKey(cache_, w.key, ExistenceCache::KeyType::kZset, seq);
+          for (const auto& e : w.entries) {
+            cache_.UpsertMember(w.key, e.member,
+                                ExistenceCache::MemberMeta{.score = e.score, .latest_seq = seq});
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetRem>) {
+          for (const auto& member : w.members) cache_.RemoveMember(w.key, member);
+        } else if constexpr (std::is_same_v<T, core::ops::HashSet> ||
+                             std::is_same_v<T, core::ops::HashMSet>) {
+          UpsertCollectionKey(cache_, w.key, ExistenceCache::KeyType::kHash, seq);
+          for (const auto& fv : w.fields) {
+            cache_.UpsertField(
+                w.key, fv.field,
+                ExistenceCache::FieldMeta{
+                    .value = std::string(fv.value), .value_known = true, .latest_seq = seq});
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::HashDel>) {
+          for (const auto& field : w.fields) cache_.RemoveField(w.key, field);
+        }
+      },
+      *op);
+}
+
+void Resolver::UpdateCacheFromResolved(core::SequenceId seq, core::WallTime appended_at,
                                        const core::entry::Resolved& resolved) {
   if (resolved.decision != core::Decision::kApply) return;
   for (const auto& cmd : resolved.materialised_ops) {
-    UpdateCacheFromWrite(seq, cmd);
-    if (cmd.args.size() < 2) continue;
-    const auto upper = AsciiUpper(cmd.args[0]);
-    if (upper == "ZADD") {
-      // Update tracked members.
-      for (size_t i = 2; i + 1 < cmd.args.size(); i += 2) {
-        double score = 0.0;
-        if (!ParseDouble(cmd.args[i], score)) continue;
-        cache_.UpsertMember(cmd.args[1], cmd.args[i + 1],
-                            ExistenceCache::MemberMeta{.score = score, .latest_seq = seq});
-      }
-    } else if (upper == "HSET") {
-      for (size_t i = 2; i + 1 < cmd.args.size(); i += 2) {
-        cache_.UpsertField(
-            cmd.args[1], cmd.args[i],
-            ExistenceCache::FieldMeta{
-                .value = std::string(cmd.args[i + 1]), .value_known = true, .latest_seq = seq});
-      }
-    }
+    ApplyToCache(seq, appended_at, cmd);
   }
 }
 
@@ -1120,12 +1141,12 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
           [&](const auto& payload) {
             using T = std::decay_t<decltype(payload)>;
             if constexpr (std::is_same_v<T, core::entry::Write>) {
-              UpdateCacheFromWrite(entry.seq, payload.cmd);
+              ApplyToCache(entry.seq, entry.appended_at, payload.cmd);
             } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
               dangling.emplace(entry.seq, entry);
             } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
               dangling.erase(payload.ref);
-              UpdateCacheFromResolved(entry.seq, payload);
+              UpdateCacheFromResolved(entry.seq, entry.appended_at, payload);
             } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
               HandleFlush(entry);
               // Emit Skip Resolveds for pre-Flush danglings so hot/cold's
@@ -1213,7 +1234,7 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
           {"seq", static_cast<uint64_t>(seq)}, {"err", std::string_view{append.error().message()}});
       return std::unexpected(append.error());
     }
-    UpdateCacheFromResolved(seq, resolved);
+    UpdateCacheFromResolved(seq, entry.appended_at, resolved);
     replayed_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
   }
 

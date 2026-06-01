@@ -209,6 +209,21 @@ void ExistenceCache::RemoveField(std::string_view key, std::string_view field) {
   EvictEntry(it->second, EvictionReason::kCapacity);
 }
 
+void ExistenceCache::RemoveMembersAndFields(std::string_view key) {
+  const std::scoped_lock lock(mu_);
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    const bool match =
+        (it->kind == EntryKind::kMember || it->kind == EntryKind::kField) && it->primary == key;
+    if (!match) {
+      ++it;
+      continue;
+    }
+    auto next = std::next(it);
+    EvictEntry(it, EvictionReason::kCapacity);
+    it = next;
+  }
+}
+
 void ExistenceCache::Clear() {
   const std::scoped_lock lock(mu_);
   entries_.clear();

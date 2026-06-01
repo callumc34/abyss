@@ -92,8 +92,14 @@ class Resolver {
   // for replay determinism (ADP-011 §Decision determinism).
   core::entry::Resolved Decide(const core::QueueEntry& entry, const core::entry::Conditional& cond);
 
-  void UpdateCacheFromResolved(core::SequenceId seq, const core::entry::Resolved& resolved);
-  void UpdateCacheFromWrite(core::SequenceId seq, const core::RespCommand& cmd);
+  void UpdateCacheFromResolved(core::SequenceId seq, core::WallTime appended_at,
+                               const core::entry::Resolved& resolved);
+  // The single deterministic cache-apply path (A3). Parses `cmd` through the
+  // canonical core::ops::ParseWriteOp with wall_now = WallMs(appended_at) — the
+  // same clock the hot store uses — so the existence cache is a pure function
+  // of (entry bytes, appended_at) and replay reproduces every decision
+  // bit-for-bit. Never reads WallClock::now().
+  void ApplyToCache(core::SequenceId seq, core::WallTime appended_at, const core::RespCommand& cmd);
   bool WaitForHotApply(core::SequenceId seq);
 
   // Sorted ascending; dedupes colliding stripes for deadlock-free multi-key.

@@ -5,6 +5,7 @@ add_executable(abyss_core_tests
   core/apply_notifier_test.cpp
   core/fire_and_forget_test.cpp
   core/ops_test.cpp
+  core/varint_test.cpp
   core/eviction_policy_test.cpp
   core/queue_entry_test.cpp
   core/shard_router_test.cpp

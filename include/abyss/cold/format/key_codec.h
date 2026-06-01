@@ -7,8 +7,14 @@
 
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/core/varint.h"
 
 namespace abyss::cold::format {
+
+// The varint codec lives in core::encoding (shared with the existence cache).
+// Re-exported here so existing cold callers keep using the unqualified names.
+using core::encoding::AppendVarint;
+using core::encoding::DecodeVarint;
 
 // Type byte allocations.
 inline constexpr uint8_t kTypeString = 0x01;
@@ -29,11 +35,6 @@ inline constexpr uint16_t kFormatVersion = 2;
 
 // Value flag bits.
 inline constexpr uint8_t kFlagHasTtl = 0x01;
-
-void AppendVarint(std::string& out, uint64_t value);
-
-// Consumes the varint from the front of `bytes` on success and advances.
-core::Result<uint64_t> DecodeVarint(std::string_view& bytes);
 
 uint64_t SortableDouble(double d);
 

@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "abyss/consumer/compaction_buffer_router.h"
@@ -97,11 +98,29 @@ class ResolverTest : public ::testing::Test {
 
   core::QueueEntry MakeConditional(core::SequenceId seq, std::vector<std::string> args,
                                    core::PredicateFlags flags) {
+    return MakeConditionalAt(seq, std::move(args), flags, core::WallClock::now());
+  }
+
+  // Controls `appended_at` so the deterministic cache-apply clock (A3) and the
+  // line-215 expiry guard can be exercised against a known wall-ms value.
+  static core::WallTime At(uint64_t ms) { return core::WallTime{std::chrono::milliseconds{ms}}; }
+
+  core::QueueEntry MakeConditionalAt(core::SequenceId seq, std::vector<std::string> args,
+                                     core::PredicateFlags flags, core::WallTime appended_at) {
     return core::QueueEntry{
         .seq = seq,
-        .appended_at = core::WallClock::now(),
+        .appended_at = appended_at,
         .payload = core::entry::Conditional{.cmd = core::RespCommand{.args = std::move(args)},
                                             .flags = flags},
+    };
+  }
+
+  core::QueueEntry MakeWriteAt(core::SequenceId seq, std::vector<std::string> args,
+                               core::WallTime appended_at) {
+    return core::QueueEntry{
+        .seq = seq,
+        .appended_at = appended_at,
+        .payload = core::entry::Write{.cmd = core::RespCommand{.args = std::move(args)}},
     };
   }
 
@@ -380,6 +399,229 @@ TEST_F(ResolverTest, RecoveryRebuildsCacheFromExistingResolved) {
 
   EXPECT_TRUE(appended_.empty());  // no new Resolveds emitted
   EXPECT_EQ(resolver.GetSnapshot().replayed_resolveds_emitted, 0U);
+}
+
+// Finds the Resolved emitted for conditional `ref` in `appended_`.
+const core::entry::Resolved* FindResolvedFor(const std::vector<core::QueueEntry>& appended,
+                                             core::SequenceId ref) {
+  for (const auto& e : appended) {
+    if (const auto* r = std::get_if<core::entry::Resolved>(&e.payload);
+        r != nullptr && r->ref == ref) {
+      return r;
+    }
+  }
+  return nullptr;
+}
+
+// HOTC-1 / XCONC-1: a relative `SET k v EX 100` must cache an absolute TTL
+// derived from the write's appended_at (not 0+100s ≈ 1970). A follow-up
+// `SET k v2 NX` issued while the key is still live must SKIP.
+TEST_F(ResolverTest, SetWithRelativeExThenSetNxSeesLiveKeyAndSkips) {
+  // T0 = 1_000_000 ms since epoch; the write expires at T0 + 100s.
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"SET", "k", "v", "EX", "100"}, At(1'000'000)),
+      MakeConditionalAt(11, {"SET", "k", "v2", "NX"}, core::PredicateFlags::kNx, At(1'050'000)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  // Cache hit short-circuits cold; stub permissively anyway.
+  EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto* resolved = FindResolvedFor(appended_, 11);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kSkip);  // NX on a live key
+  EXPECT_EQ(resolved->return_value.AsInteger(), 0);
+
+  auto cached = resolver.Cache().GetKey("k");
+  ASSERT_TRUE(cached.has_value());
+  EXPECT_EQ(cached->abs_ttl_ms, 1'000'000U + 100'000U);  // appended_at + 100s, not ~1970
+}
+
+// HOTC-1 edge: a freshly set relative-EX key must not be treated as expired by
+// the line-215 guard when evaluated at a time before the TTL elapses.
+TEST_F(ResolverTest, SetWithRelativeExNotTreatedAsExpiredImmediately) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"SET", "k", "v", "PX", "60000"}, At(2'000'000)),
+      MakeConditionalAt(11, {"SET", "k", "v2", "XX", "KEEPTTL"}, core::PredicateFlags::kXx,
+                        At(2'000'001)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto* resolved = FindResolvedFor(appended_, 11);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kApply);  // XX on a live key applies
+  ASSERT_EQ(resolved->materialised_ops.size(), 1U);
+  // KEEPTTL must carry the original PX-derived absolute TTL through.
+  const auto& set_op = resolved->materialised_ops[0];
+  ASSERT_EQ(set_op.args.size(), 5U);
+  EXPECT_EQ(set_op.args[3], "PXAT");
+  EXPECT_EQ(set_op.args[4], std::to_string(2'000'000U + 60'000U));
+}
+
+// HOTC-2: SETEX must cache a real absolute TTL (not 0). A subsequent
+// `SET k v2 NX` while live must SKIP, and the TTL is appended_at + ttl.
+TEST_F(ResolverTest, SetexThenSetNxSeesLiveKeyAndSkips) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"SETEX", "k", "100", "v"}, At(3'000'000)),
+      MakeConditionalAt(11, {"SET", "k", "v2", "NX"}, core::PredicateFlags::kNx, At(3'050'000)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto* resolved = FindResolvedFor(appended_, 11);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kSkip);
+  auto cached = resolver.Cache().GetKey("k");
+  ASSERT_TRUE(cached.has_value());
+  EXPECT_EQ(cached->abs_ttl_ms, 3'000'000U + 100'000U);
+}
+
+// HOTC-2 edge: once a SETEX key's TTL lapses (evaluated past abs_ttl_ms), a
+// later `SET k NX` must APPLY because the cache treats it as expired/absent.
+TEST_F(ResolverTest, SetexKeyExpiresInCacheAfterTtl) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"SETEX", "k", "1", "v"}, At(4'000'000)),
+      MakeConditionalAt(11, {"SET", "k", "v2", "NX"}, core::PredicateFlags::kNx, At(4'002'000)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  // After cache expiry the lookup falls through; cold reports absent.
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto* resolved = FindResolvedFor(appended_, 11);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kApply);
+}
+
+// XCONC-2: EXPIRE cache TTL must derive from the entry's appended_at, never the
+// replay-time wall clock — so the cached absolute TTL is independent of when
+// recovery runs.
+TEST_F(ResolverTest, ExpireCacheTtlEqualsAppendedAtNotWallNow) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"SET", "k", "v"}, At(5'000'000)),
+      MakeWriteAt(11, {"EXPIRE", "k", "100"}, At(5'000'000)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  auto cached = resolver.Cache().GetKey("k");
+  ASSERT_TRUE(cached.has_value());
+  EXPECT_EQ(cached->abs_ttl_ms, 5'000'000U + 100'000U);
+}
+
+// XCONC-2 determinism: replaying the same slice twice (fresh Resolver each
+// time, wall clock advancing between runs) must produce a byte-identical
+// existence-cache decision for a follow-up EXPIRE NX conditional.
+TEST_F(ResolverTest, ExpireReplayDeterministicAcrossRecovery) {
+  auto run_once = [this]() -> ExistenceCache::KeyMeta {
+    appended_.clear();
+    next_appended_seq_ = 1000;
+    StubQueueReadOnce({
+        MakeWriteAt(10, {"SET", "k", "v"}, At(6'000'000)),
+        MakeWriteAt(11, {"EXPIRE", "k", "100"}, At(6'000'500)),
+        MakeConditionalAt(12, {"EXPIRE", "k", "50", "NX"}, core::PredicateFlags::kNx,
+                          At(6'001'000)),
+    });
+    StubQueueAppendCapture();
+    StubQueueAck();
+    EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
+    Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+    EXPECT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+    const auto* resolved = FindResolvedFor(appended_, 12);
+    EXPECT_NE(resolved, nullptr);
+    // EXPIRE NX on a key that already has a TTL must SKIP.
+    EXPECT_EQ(resolved->decision, core::Decision::kSkip);
+    return resolver.Cache().GetKey("k").value();
+  };
+
+  const auto first = run_once();
+  const auto second = run_once();
+  EXPECT_EQ(first.abs_ttl_ms, second.abs_ttl_ms);
+  EXPECT_EQ(first.abs_ttl_ms, 6'000'500U + 100'000U);
+}
+
+// HOTC-3: a HSET-cached field, then a plain HDEL, then HSETNX on the same field
+// must APPLY (the stale field was invalidated). The HDEL field contains 0x1F so
+// HOTC-4's length-prefixed encoding must address the right entry.
+TEST_F(ResolverTest, HdelThenHsetnxAppliesOnRemovedField) {
+  const std::string field = std::string("f\x1F") + "x";
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"HSET", "h", field, "v"}, At(7'000'000)),
+      MakeWriteAt(11, {"HDEL", "h", field}, At(7'000'100)),
+      MakeConditionalAt(12, {"HSETNX", "h", field, "v2"}, core::PredicateFlags::kNx, At(7'000'200)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  // After RemoveField the field is absent in cache; cold reports field absent.
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Null()));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto* resolved = FindResolvedFor(appended_, 12);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kApply);
+}
+
+// HOTC-3: ZADD-cached member, then ZREM, then `ZADD z NX 2 m` must APPLY.
+TEST_F(ResolverTest, ZremThenZaddNxAppliesOnRemovedMember) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"ZADD", "z", "1", "m"}, At(8'000'000)),
+      MakeWriteAt(11, {"ZREM", "z", "m"}, At(8'000'100)),
+      MakeConditionalAt(12, {"ZADD", "z", "NX", "2", "m"}, core::PredicateFlags::kNx,
+                        At(8'000'200)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Null()));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto* resolved = FindResolvedFor(appended_, 12);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kApply);
+}
+
+// HOTC-3: DEL must purge the key's member/field index, so HSETNX after a
+// DEL+recreate window applies on a previously-cached field.
+TEST_F(ResolverTest, DelPurgesFieldsThenHsetnxApplies) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"HSET", "h", "f", "v"}, At(9'000'000)),
+      MakeWriteAt(11, {"DEL", "h"}, At(9'000'100)),
+      MakeConditionalAt(12, {"HSETNX", "h", "f", "v2"}, core::PredicateFlags::kNx, At(9'000'200)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Null()));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  // kApply proves DEL purged the stale field; otherwise HSETNX would have seen
+  // the cached field and SKIPPED.
+  const auto* resolved = FindResolvedFor(appended_, 12);
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->decision, core::Decision::kApply);
 }
 
 }  // namespace
