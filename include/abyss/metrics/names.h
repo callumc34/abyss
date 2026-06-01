@@ -375,6 +375,16 @@ inline constexpr GaugeDesc<> kHotKeys{
     .help = "Number of keys in the hot store.",
 };
 
+inline constexpr GaugeDesc<> kHotMaxMemoryBytes{
+    .name = "abyss_hot_max_memory_bytes",
+    .help = "Configured hot store memory budget in bytes; 0 means unlimited.",
+};
+
+inline constexpr GaugeDesc<> kHotAccessBufferDepth{
+    .name = "abyss_hot_access_buffer_depth",
+    .help = "Total depth of the per-shard deferred read-access refresh buffers.",
+};
+
 inline constexpr GaugeDesc<> kColdDiskBytes{
     .name = "abyss_cold_disk_bytes",
     .help = "Cold store disk usage in bytes.",
@@ -461,7 +471,17 @@ inline constexpr CounterDesc<Tier> kTtlExpiredTotal{
 
 inline constexpr CounterDesc<> kEvictedTotal{
     .name = "abyss_evicted_total",
-    .help = "Keys evicted from the hot store.",
+    .help = "Keys evicted from the hot store by eviction deadline (tier transition).",
+};
+
+inline constexpr CounterDesc<> kHotMemoryEvictedTotal{
+    .name = "abyss_hot_memory_evicted_total",
+    .help = "Keys evicted from the hot store under memory pressure (LRU tier transition).",
+};
+
+inline constexpr CounterDesc<> kHotAccessBufferDroppedTotal{
+    .name = "abyss_hot_access_buffer_dropped_total",
+    .help = "Deferred read-access refreshes dropped past the access-buffer high-water cap.",
 };
 
 inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{

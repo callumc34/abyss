@@ -137,16 +137,25 @@ core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
                  {"target_seq", static_cast<uint64_t>(target)});
 
   replay_mode_.store(true, std::memory_order_release);
+  // Suppress memory-pressure eviction in the store for the duration of replay:
+  // evicting mid-replay would make the rebuilt hot view depend on memory
+  // timing, breaking deterministic queue replay (invariant 4). The eviction
+  // worker reconverges the ceiling after replay completes.
+  store_.SetReplayMode(true);
   struct ReplayGuard {
     std::atomic<bool>& flag;
-    explicit ReplayGuard(std::atomic<bool>& f) : flag(f) {}
+    core::HotStore& store;
+    ReplayGuard(std::atomic<bool>& f, core::HotStore& s) : flag(f), store(s) {}
     ReplayGuard(const ReplayGuard&) = delete;
     ReplayGuard& operator=(const ReplayGuard&) = delete;
     ReplayGuard(ReplayGuard&&) = delete;
     ReplayGuard& operator=(ReplayGuard&&) = delete;
-    ~ReplayGuard() { flag.store(false, std::memory_order_release); }
+    ~ReplayGuard() {
+      flag.store(false, std::memory_order_release);
+      store.SetReplayMode(false);
+    }
   };
-  ReplayGuard guard(replay_mode_);
+  ReplayGuard guard(replay_mode_, store_);
 
   // The progress signal is "highest_settled_seq has reached target", but
   // both start at 0. To distinguish "target=0 means one entry at seq=0 to

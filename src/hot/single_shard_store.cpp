@@ -1,9 +1,12 @@
 #include "abyss/hot/single_shard_store.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <limits>
 #include <optional>
 #include <ranges>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -22,6 +25,44 @@ int64_t WallMs(const core::WallClockFn& clock) {
 bool IsExpiredByTtl(const Entry& entry, const core::WallClockFn& clock) {
   if (entry.abs_ttl_ms == 0) return false;
   return WallMs(clock) >= entry.abs_ttl_ms;
+}
+
+// Total, non-throwing parse of a ZRANGEBYSCORE bound into a double. A score
+// bound is a remote-supplied string read under a shared lock, so a throwing
+// conversion (std::stod) could unwind through the reactor; std::from_chars
+// never throws and surfaces malformed input as a clean error Result instead.
+// `empty_default`/the -inf/+inf sentinels stand in for an unbounded edge, since
+// from_chars(double) does not itself accept "inf". C8's ParseLexBound should
+// follow this same from_chars/Result discipline for lex bounds.
+core::Result<double> ParseScoreBound(std::string_view s, double empty_default) {
+  if (s.empty()) return empty_default;
+  if (s == "-inf") return -std::numeric_limits<double>::infinity();
+  if (s == "+inf" || s == "inf") return std::numeric_limits<double>::infinity();
+  double value = 0.0;
+  const auto* begin = s.data();
+  const auto* end = s.data() + s.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end) {
+    return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument,
+                                       "not a valid score: '" + std::string(s) + "'"));
+  }
+  return value;
+}
+
+// Total, non-throwing parse of a ZRANGE index bound (a signed integer) into an
+// int64. Empty stands in for the supplied default edge index. Replaces a
+// throwing std::stoll on remote input read under the shared lock.
+core::Result<int64_t> ParseIndexBound(std::string_view s, int64_t empty_default) {
+  if (s.empty()) return empty_default;
+  int64_t value = 0;
+  const auto* begin = s.data();
+  const auto* end = s.data() + s.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end) {
+    return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument,
+                                       "not a valid index: '" + std::string(s) + "'"));
+  }
+  return value;
 }
 
 // The single key a read op targets, or nullopt for the multi-key Exists probe
@@ -87,13 +128,24 @@ size_t Entry::ApproximateBytes() const {
           for (const auto& [m, s] : v.member_scores) {
             bytes += sizeof(m) + m.capacity() + sizeof(s);
           }
+          // The score-ordered index duplicates every member string and adds
+          // map/set node overhead. Counting only member_scores understated a
+          // zset by ~half its real heap; include score_members so used_bytes_
+          // is the single, correct hot-memory oracle.
+          for (const auto& [score, members] : v.score_members) {
+            bytes += sizeof(score) + sizeof(members);
+            for (const auto& m : members) {
+              bytes += sizeof(m) + m.capacity();
+            }
+          }
         }
       },
       value);
   return bytes;
 }
 
-SingleShardStore::SingleShardStore(SingleShardConfig config) : config_(std::move(config)) {}
+SingleShardStore::SingleShardStore(SingleShardConfig config)
+    : config_(std::move(config)), governor_(config_.max_memory_bytes) {}
 
 // --- Read operations (const) ---
 
@@ -227,16 +279,12 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
   std::vector<core::RespValue> elements;
 
   if (op.by_score) {
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    double min_score = -std::numeric_limits<double>::infinity();
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    double max_score = std::numeric_limits<double>::infinity();
-    if (!op.min.empty() && op.min != "-inf") {
-      min_score = std::stod(std::string(op.min));
-    }
-    if (!op.max.empty() && op.max != "+inf") {
-      max_score = std::stod(std::string(op.max));
-    }
+    auto min_parsed = ParseScoreBound(op.min, -std::numeric_limits<double>::infinity());
+    if (!min_parsed.has_value()) return std::unexpected(min_parsed.error());
+    auto max_parsed = ParseScoreBound(op.max, std::numeric_limits<double>::infinity());
+    if (!max_parsed.has_value()) return std::unexpected(max_parsed.error());
+    double min_score = *min_parsed;
+    double max_score = *max_parsed;
 
     if (op.rev) std::swap(min_score, max_score);
 
@@ -279,10 +327,12 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
       std::ranges::reverse(all);
     }
 
-    int64_t min_idx = 0;
-    int64_t max_idx = static_cast<int64_t>(all.size()) - 1;
-    if (!op.min.empty()) min_idx = std::stoll(std::string(op.min));
-    if (!op.max.empty()) max_idx = std::stoll(std::string(op.max));
+    auto min_parsed = ParseIndexBound(op.min, 0);
+    if (!min_parsed.has_value()) return std::unexpected(min_parsed.error());
+    auto max_parsed = ParseIndexBound(op.max, static_cast<int64_t>(all.size()) - 1);
+    if (!max_parsed.has_value()) return std::unexpected(max_parsed.error());
+    int64_t min_idx = *min_parsed;
+    int64_t max_idx = *max_parsed;
 
     if (min_idx < 0) min_idx += static_cast<int64_t>(all.size());
     if (max_idx < 0) max_idx += static_cast<int64_t>(all.size());
@@ -418,7 +468,15 @@ core::Result<core::RespValue> SingleShardStore::ExecExists(const core::ops::Exis
 core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& op,
                                                       core::EvictionTTL eviction,
                                                       core::SequenceId seq) {
-  return std::visit(
+  // Only create/replace ops grow memory; delete/expire ops only shrink it, so
+  // the budget post-check runs solely on growth ops.
+  const bool grows = std::holds_alternative<core::ops::StringSet>(op) ||
+                     std::holds_alternative<core::ops::SetAdd>(op) ||
+                     std::holds_alternative<core::ops::ZsetAdd>(op) ||
+                     std::holds_alternative<core::ops::HashSet>(op) ||
+                     std::holds_alternative<core::ops::HashMSet>(op);
+
+  auto result = std::visit(
       [this, eviction, seq](const auto& o) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, core::ops::StringSet>) {
@@ -449,6 +507,18 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
         }
       },
       op);
+
+  // The write has already applied (and is durable in the queue). Make room by
+  // evicting OTHER LRU victims down to the budget, protecting the just-written
+  // key. If even then the entry cannot fit (a single value larger than the
+  // whole budget, no other victims), surface kResourceExhausted as an admission
+  // signal — the entry is NOT lost, it stays durable in the queue/cold
+  // (invariant 2). Suppressed during replay.
+  if (grows && result.has_value() && !EnsureCapacityFor(core::ops::PrimaryKey(op))) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kResourceExhausted, "hot store memory budget exhausted"));
+  }
+  return result;
 }
 
 core::Result<void> SingleShardStore::ApplyBatch(std::span<const core::ops::WriteOp> ops,
@@ -487,7 +557,10 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
     return core::RespValue::SimpleString("OK");
   }
 
+  // GetOrCreateEntry now tracks an empty-entry baseline; remove it before
+  // re-adding the populated footprint so the create path stays balanced.
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kString, eviction);
+  TrackRemove(entry, op.key);
   entry.value = std::string(op.value);
   entry.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
   TrackInsert(entry, op.key);
@@ -525,6 +598,10 @@ core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::Set
     RemoveEntry(std::string(op.key));
   }
 
+  // GetOrCreateEntry establishes a tracked empty-entry baseline on create or
+  // tombstone-resurrect, so this leading TrackRemove always has a matching
+  // prior TrackInsert (HOT-2). The pattern is then balanced for every case:
+  // remove the old (empty or populated) footprint, mutate, re-add the new one.
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kSet, eviction);
   TrackRemove(entry, op.key);
   auto& members = std::get<SetValue>(entry.value).members;
@@ -762,11 +839,18 @@ SingleShardStore::EvictExpiredReport SingleShardStore::EvictExpired(core::Steady
     if (ttl_expired || deadline_elapsed) {
       TrackRemove(it->second, it->first);
       key_count_--;
-      eviction_count_++;
       it = entries_.erase(it);
+      // Bucket by the entry's actual disposition, not raw iteration: TTL is a
+      // deletion (expired_count_), deadline is a tier transition
+      // (eviction_count_). TTL wins when both fire (the semantic outcome is
+      // "deleted entirely"). Tombstones are already skipped above, so C8's
+      // HOT-4 tombstone-handling change cannot mis-bucket a tombstoned entry
+      // here — only live entries reach this branch.
       if (ttl_expired) {
+        expired_count_++;
         ++report.by_ttl;
       } else {
+        eviction_count_++;
         ++report.by_deadline;
       }
     } else {
@@ -777,12 +861,17 @@ SingleShardStore::EvictExpiredReport SingleShardStore::EvictExpired(core::Steady
 }
 
 size_t SingleShardStore::EvictLru(size_t target_bytes) {
+  return EvictLru(target_bytes, std::string_view{});
+}
+
+size_t SingleShardStore::EvictLru(size_t target_bytes, std::string_view protect_key) {
   if (used_bytes_ <= target_bytes) return 0;
 
   std::vector<std::pair<core::SteadyTime, std::string>> candidates;
   candidates.reserve(entries_.size());
   for (const auto& [key, entry] : entries_) {
     if (entry.tombstoned) continue;
+    if (!protect_key.empty() && key == protect_key) continue;
     candidates.emplace_back(entry.last_access, key);
   }
 
@@ -798,8 +887,28 @@ size_t SingleShardStore::EvictLru(size_t target_bytes) {
   return evicted;
 }
 
+bool SingleShardStore::EnsureCapacityFor(std::string_view protect_key) {
+  // Called post-write: the just-written entry (protect_key) is already counted
+  // in used_bytes_ and must survive, so make room by evicting OTHER LRU keys
+  // down to the budget. Suppressed during replay: evicting mid-replay would
+  // make the rebuilt hot view depend on memory timing, breaking deterministic
+  // queue replay (invariant 4). The eviction worker reconverges after replay.
+  if (replay_mode_ || !governor_.Enabled()) return true;
+  if (!governor_.WouldExceed(used_bytes_, 0)) return true;
+  EvictLru(governor_.Target(0), protect_key);
+  // After evicting every other eligible key, the protected entry may still not
+  // fit (a single value larger than the whole budget). It is already durable in
+  // the queue, so the caller surfaces kResourceExhausted as an admission signal
+  // — not a lost write (invariant 2).
+  return !governor_.WouldExceed(used_bytes_, 0);
+}
+
 core::MemoryStats SingleShardStore::Stats() const {
-  return {.used_bytes = used_bytes_, .key_count = key_count_, .eviction_count = eviction_count_};
+  return {.used_bytes = used_bytes_,
+          .key_count = key_count_,
+          .eviction_count = eviction_count_,
+          .expired_count = expired_count_,
+          .max_bytes = governor_.max_bytes()};
 }
 
 void SingleShardStore::Wipe() {
@@ -856,6 +965,11 @@ Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type
         break;
     }
     key_count_++;
+    // Track the empty-entry baseline so the collection apply paths' balanced
+    // TrackRemove/mutate/TrackInsert pattern has a matching prior insert. The
+    // string-create path (ApplyStringSet) does its own TrackInsert after
+    // setting the value, so it does not go through this baseline.
+    TrackInsert(it->second, key);
   }
   return it->second;
 }

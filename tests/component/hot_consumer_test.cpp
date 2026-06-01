@@ -17,6 +17,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
@@ -417,6 +418,81 @@ TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {
   auto r_c = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "c"}});
   ASSERT_TRUE(r_c.has_value());
   EXPECT_EQ(r_c->AsString(), "3");
+}
+
+// --- Memory-pressure during/after replay (HOT-1) ---
+
+TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
+  // Size a budget far below the replayed working set. During replay every
+  // entry must apply (no kResourceExhausted, no memory apply_failures) so the
+  // rebuilt state matches the pre-crash state; a subsequent eviction-worker
+  // tick reconverges used_bytes <= budget (deterministic replay, invariant 4).
+  constexpr int kEntries = 20;
+  const std::string value(256, 'v');
+
+  // Probe one entry's footprint to size the per-shard budget below the set.
+  hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
+  ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}}, 0)
+                  .has_value());
+  const uint64_t per_entry = probe.Stats()->used_bytes;
+
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      .max_memory_bytes = per_entry * 4,  // holds ~4, replay writes 20
+      .shard_count = 1,
+  });
+
+  for (int i = 0; i < kEntries; ++i) {
+    auto entry = MakeWrite({"SET", "k" + std::to_string(i), value});
+    ASSERT_TRUE(queue_->Append(0, entry).has_value());
+  }
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+
+  // All entries applied; none rejected for memory.
+  EXPECT_EQ(consumer_->Snapshot().applied, static_cast<uint64_t>(kEntries));
+  EXPECT_EQ(consumer_->Snapshot().apply_failures, 0U);
+  EXPECT_EQ(hot_->Stats()->key_count, static_cast<uint64_t>(kEntries));
+  EXPECT_GT(hot_->Stats()->used_bytes, hot_->Stats()->max_bytes)
+      << "over budget during replay (suppressed); enforced only afterward";
+
+  // After replay, the eviction-worker tick reconverges the ceiling.
+  hot::EvictionWorker worker(*hot_, hot::EvictionWorker::Config{.tick = 50ms});
+  worker.TickOnce();
+  EXPECT_LE(hot_->Stats()->used_bytes, hot_->Stats()->max_bytes);
+}
+
+TEST_F(HotConsumerTest, OverBudgetWriteSurfacesOomButStaysDurable) {
+  // A live steady-state write that cannot be admitted yields -OOM to the client
+  // (MapApplyError path) while the queue entry remains durable and the seq is
+  // acked/NotifyApplied — the consumer does not wedge (invariant 1/2).
+  hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
+  ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "small", .value = "v"}}, 0)
+                  .has_value());
+  const uint64_t small_entry = probe.Stats()->used_bytes;
+
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      // Holds a handful of small entries, but a single 1500-char value is far
+      // larger than the whole budget — so "big" can never be admitted.
+      .max_memory_bytes = small_entry * 4,
+      .shard_count = 1,
+  });
+
+  StartConsumer();
+  // Large enough to dwarf the budget but within the WAL segment size.
+  auto fut = AppendWithRpc({"SET", "big", std::string(1500, 'x')});
+  auto reply = fut.get();
+  // The -OOM reply itself proves the entry was durably queued and applied (the
+  // consumer read it from the WAL and produced an apply result); the write is
+  // not lost — it stays in the queue/cold (invariant 2).
+  ASSERT_TRUE(reply.IsError());
+  EXPECT_EQ(reply.ErrorPrefixOf(), core::ErrorPrefix::kOom);
+
+  // The seq still settled (no wedge); a follow-up write is fulfilled normally.
+  auto ok = AppendWithRpc({"SET", "small", "v"});
+  EXPECT_FALSE(ok.get().IsError());
+  EXPECT_EQ(consumer_->PendingConditionalCount(), 0U);
 }
 
 }  // namespace

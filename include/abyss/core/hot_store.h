@@ -16,7 +16,13 @@ namespace abyss::core {
 struct MemoryStats {
   uint64_t used_bytes = 0;
   uint64_t key_count = 0;
+  // Tier transitions (deadline + memory-pressure eviction). Distinct from
+  // expired_count, which counts TTL deletions (HOT-7).
   uint64_t eviction_count = 0;
+  uint64_t expired_count = 0;
+  // Configured memory budget; 0 means unlimited. Lets the exporter publish the
+  // ceiling alongside usage (HOT-1 observability).
+  uint64_t max_bytes = 0;
 };
 
 // Existence verdict for a key in the hot tier. kTombstoned is an authoritative
@@ -47,6 +53,11 @@ class HotStore : public Reader {
 
   // Existence probe distinguishing a recent-delete tombstone from a true miss.
   virtual HotKeyPresence Probe(std::string_view key) = 0;
+
+  // Suppresses memory-pressure eviction while a consumer replays the queue, so
+  // the rebuilt hot view does not depend on memory timing (deterministic
+  // replay, invariant 4). Default no-op for stores without a memory budget.
+  virtual void SetReplayMode(bool /*replaying*/) {}
 
   virtual Result<MemoryStats> Stats() = 0;
   virtual Result<void> Wipe() = 0;

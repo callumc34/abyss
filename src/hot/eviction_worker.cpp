@@ -16,6 +16,12 @@ EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
   evicted_total_ = reg.Counter(metrics::names::kEvictedTotal);
   ttl_expired_total_ = reg.Counter(metrics::names::kTtlExpiredTotal, metrics::Tier::kHot);
   tombstones_reclaimed_total_ = reg.Counter(metrics::names::kHotTombstonesReclaimedTotal);
+  memory_evicted_total_ = reg.Counter(metrics::names::kHotMemoryEvictedTotal);
+  access_buffer_dropped_total_ = reg.Counter(metrics::names::kHotAccessBufferDroppedTotal);
+  hot_memory_bytes_ = reg.Gauge(metrics::names::kHotMemoryBytes);
+  hot_keys_ = reg.Gauge(metrics::names::kHotKeys);
+  hot_max_memory_bytes_ = reg.Gauge(metrics::names::kHotMaxMemoryBytes);
+  hot_access_buffer_depth_ = reg.Gauge(metrics::names::kHotAccessBufferDepth);
 }
 
 EvictionWorker::~EvictionWorker() { Stop(); }
@@ -46,6 +52,15 @@ void EvictionWorker::TickOnce() {
   if (report.by_ttl > 0) {
     ttl_expired_total_.Increment(static_cast<double>(report.by_ttl));
   }
+
+  // Memory-pressure pass: evict LRU down to the per-shard budget. Eviction is a
+  // tier transition (data stays durable in queue/cold), counted distinctly from
+  // deadline evictions (HOT-1/HOT-7). Suppressed implicitly when unlimited.
+  const size_t memory_evicted = store_.EvictToMemoryTarget();
+  if (memory_evicted > 0) {
+    memory_evicted_total_.Increment(static_cast<double>(memory_evicted));
+  }
+
   // Reclaim delete tombstones the cold consumer has now absorbed. Bounded by
   // cold's drained seq per shard so a tombstone never outlives the window in
   // which a lagging buffer/cold could still serve the pre-delete state.
@@ -54,6 +69,22 @@ void EvictionWorker::TickOnce() {
     if (reclaimed > 0) {
       tombstones_reclaimed_total_.Increment(static_cast<double>(reclaimed));
     }
+  }
+
+  // Publish hot-tier usage/budget/backlog so memory pressure is observable
+  // rather than silently growing (invariant 5).
+  const auto stats = store_.Stats();
+  if (stats.has_value()) {
+    hot_memory_bytes_.Set(static_cast<double>(stats->used_bytes));
+    hot_keys_.Set(static_cast<double>(stats->key_count));
+    hot_max_memory_bytes_.Set(static_cast<double>(stats->max_bytes));
+  }
+  const auto access = store_.AccessBufferSnapshot();
+  hot_access_buffer_depth_.Set(static_cast<double>(access.depth));
+  if (access.dropped > reported_access_dropped_) {
+    access_buffer_dropped_total_.Increment(
+        static_cast<double>(access.dropped - reported_access_dropped_));
+    reported_access_dropped_ = access.dropped;
   }
 }
 

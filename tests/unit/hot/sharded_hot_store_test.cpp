@@ -208,6 +208,67 @@ TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
   drainer.join();
 }
 
+// --- Bounded access buffer (XRES-2) ---
+
+TEST(ShardedHotStoreAccessBufferTest, AccessBufferBoundedUnderReadStorm) {
+  abyss::testing::TestClock clock;
+  core::EvictionPolicy policy{core::EvictionTTL{86400}};
+  constexpr size_t kCap = 8;
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL * 1024 * 1024,
+      .shard_count = 1,
+      .access_buffer_high_water = kCap,
+      .eviction_policy = &policy,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+
+  // Seed many distinct keys, then read them all between drains. Distinct keys
+  // defeat de-dup, so the buffer fills to the cap and then drops.
+  for (int i = 0; i < 100; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    core::ops::StringSet op{.key = key, .value = "v"};
+    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+  }
+  for (int i = 0; i < 100; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    auto r = store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
+    EXPECT_TRUE(r.has_value());
+  }
+
+  auto snap = store.AccessBufferSnapshot();
+  EXPECT_LE(snap.depth, kCap) << "buffer must be bounded by the high-water cap";
+  EXPECT_GT(snap.dropped, 0U) << "over-cap refreshes must be counted as drops";
+
+  // Drain resets the buffer and the per-tick de-dup set; reads still serve.
+  store.DrainAccessBuffers(clock.SteadyNow());
+  EXPECT_EQ(store.AccessBufferSnapshot().depth, 0U);
+  auto after = store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k0"}});
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->AsString(), "v");
+}
+
+TEST(ShardedHotStoreAccessBufferTest, AccessBufferDedupsWithinTick) {
+  abyss::testing::TestClock clock;
+  core::EvictionPolicy policy{core::EvictionTTL{86400}};
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL * 1024 * 1024,
+      .shard_count = 1,
+      .access_buffer_high_water = 1024,
+      .eviction_policy = &policy,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  core::ops::StringSet op{.key = "hot", .value = "v"};
+  ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+
+  // 1000 reads of the same key collapse to a single buffered refresh per tick.
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_TRUE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "hot"}}).has_value());
+  }
+  EXPECT_EQ(store.AccessBufferSnapshot().depth, 1U) << "repeated reads de-dup within a tick";
+}
+
 // --- Per-prefix eviction (issue #84) ---
 
 // Per-prefix eviction must resolve per key (was a bug when MSET applied one
