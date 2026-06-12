@@ -106,7 +106,7 @@ RUN bin=build/container/apps/abyss-server/abyss-server; \
       exit 1; \
     fi
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:bd2899c12b335c827750ccf2359879eab09c09b206023dcebea408947d54127c
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985
 
 COPY --from=build /src/build/container/apps/abyss-server/abyss-server /usr/local/bin/abyss-server
 
