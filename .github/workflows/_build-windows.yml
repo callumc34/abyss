@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up build environment
         uses: ./.github/actions/setup-build-windows
