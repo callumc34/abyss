@@ -36,6 +36,12 @@
           ]
         }
       ]
+    },
+    "tests": {
+      "description": "Build the unit, component, integration and system test suites",
+      "dependencies": [
+        "gtest"
+      ]
     }
   }
 }

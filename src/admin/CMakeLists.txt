@@ -3,6 +3,7 @@ add_library(abyss_admin
   http_server.cpp
   json_writer.cpp
   metrics_handler.cpp
+  metrics_snapshotter.cpp
   ready_handler.cpp
   status_handler.cpp
 )
@@ -16,6 +17,7 @@ target_link_libraries(abyss_admin PUBLIC
   abyss::compiler_options
   abyss::core
   abyss::log
+  abyss::metrics
 )
 
 target_link_libraries(abyss_admin PRIVATE

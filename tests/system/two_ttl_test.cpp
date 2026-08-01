@@ -61,7 +61,7 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: "${DATA_DIR}/wal"
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
   min_retention_seconds: 30
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000

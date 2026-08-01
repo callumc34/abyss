@@ -101,6 +101,32 @@ TEST_F(HttpServerTest, HeadReturnsHeadersWithEmptyBody) {
   server.Stop();
 }
 
+// OBS-4: RFC 7231 4.3.2 — HEAD must advertise the Content-Length GET would
+// have sent, not the 0 cpp-httplib stamps on a bodyless response.
+TEST_F(HttpServerTest, HeadAdvertisesSameContentLengthAsGet) {
+  FixedHandler status(HttpResponse::Ok("{\"state\":\"ready\"}\n", "application/json"));
+  FixedHandler metrics(HttpResponse::Ok("# HELP abyss_up 1\nabyss_up 1\n"));
+  HttpServer server(EphemeralConfig());
+  server.AddHandler("/status", &status);
+  server.AddHandler("/metrics", &metrics);
+  ASSERT_TRUE(server.Start().has_value());
+
+  for (const char* path : {"/status", "/metrics"}) {
+    auto get = testing::HttpTestClient::Send("127.0.0.1", server.BoundPort(), "GET", path);
+    ASSERT_TRUE(get.ok) << get.error;
+    ASSERT_EQ(get.status, 200);
+    ASSERT_FALSE(get.body.empty());
+
+    auto head = testing::HttpTestClient::Send("127.0.0.1", server.BoundPort(), "HEAD", path);
+    ASSERT_TRUE(head.ok) << head.error;
+    EXPECT_EQ(head.status, 200) << path;
+    EXPECT_TRUE(head.body.empty()) << path;
+    ASSERT_TRUE(head.headers.contains("Content-Length")) << path;
+    EXPECT_EQ(head.headers.at("Content-Length"), std::to_string(get.body.size())) << path;
+  }
+  server.Stop();
+}
+
 TEST_F(HttpServerTest, ServiceUnavailableHandlerReturns503) {
   FixedHandler handler(HttpResponse::ServiceUnavailable("loading\n"));
   HttpServer server(EphemeralConfig());

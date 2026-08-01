@@ -145,10 +145,11 @@ TEST_F(ColdConsumerTest, ParsePoisonDoesNotAdvanceAckPastUnabsorbedSeq) {
   cfg.jitter_fraction = 0.0;
   auto c = MakeConsumer(cfg);
 
-  // seq 1 is structurally undecodable (poison); seq 2 is a valid SET that still
-  // absorbs. The ack must NOT pass the un-materialised seq 1 (XERR-5).
+  // seq 1 is genuine skew poison: HSET HAS a parser and that parser rejects an
+  // odd field/value list, so another tier accepted bytes cold cannot decode.
+  // seq 2 is a valid SET that still absorbs. The ack must NOT pass seq 1.
   std::vector<core::QueueEntry> entries;
-  entries.push_back(MakeWriteEntry(1, {"BOGUS", "key"}));
+  entries.push_back(MakeWriteEntry(1, {"HSET", "h", "f"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "k", "v"}));
 
   EXPECT_CALL(queue_, Read(_, _, _, _))
@@ -205,7 +206,7 @@ TEST_F(ColdConsumerTest, ParsePoisonEmitsCriticalMetricAndStalls) {
   // A single poison Write at seq 5 re-delivered every loop (the ack floor never
   // passes it). The loop must back off rather than busy-spin.
   std::vector<core::QueueEntry> entries;
-  entries.push_back(MakeWriteEntry(5, {"BOGUS", "key"}));
+  entries.push_back(MakeWriteEntry(5, {"HSET", "h", "f"}));
   std::atomic<int> read_calls{0};
   EXPECT_CALL(queue_, Read(_, _, _, _))
       .WillRepeatedly(
@@ -231,6 +232,80 @@ TEST_F(ColdConsumerTest, ParsePoisonEmitsCriticalMetricAndStalls) {
   EXPECT_LE(read_calls.load(), 80) << "poison entry busy-spun instead of backing off";
 }
 
+// --- ENGINE-9: the idle backoff must not outlast a reader's gate deadline ----
+
+TEST_F(ColdConsumerTest, IdleBackoffIsInterruptedByAReaderWaitingToDrain) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  cfg.queue_read_timeout = 1ms;
+  cfg.loop_initial_backoff = 1ms;
+  // Far longer than the reader's deadline below: if the loop sleeps this out,
+  // the read-consistency gate fails closed on a consumer that is merely idle.
+  cfg.loop_max_backoff = 5000ms;
+  auto c = MakeConsumer(cfg);
+
+  // Idle until the entry appears, so the loop climbs to its backoff ceiling.
+  std::atomic<bool> release{false};
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillRepeatedly([&release](core::ConsumerId, core::ShardId, size_t, core::Duration) {
+        std::vector<core::QueueEntry> out;
+        if (release.load(std::memory_order_acquire)) {
+          out.push_back(MakeWriteEntry(9, {"SET", "k", "v"}));
+        }
+        return out;
+      });
+
+  c->Start();
+  // Let the backoff saturate before anything is available to drain.
+  std::this_thread::sleep_for(120ms);
+  release.store(true, std::memory_order_release);
+
+  // A reader's gate deadline is far shorter than the backoff ceiling. This must
+  // still succeed: waiting is what tells the consumer to stop sleeping.
+  const bool drained = c->WaitForDrainedSeq(9, 500ms);
+  c->Stop();
+
+  EXPECT_TRUE(drained) << "reader's wait expired while the consumer slept out its idle backoff";
+}
+
+// --- XERR-6: a missing parser is a capability gap, not poison -----------------
+
+TEST_F(ColdConsumerTest, WriteWithNoParserIsSkippedNotPoisoned) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  // INCR is registered as a write command but no tier implements a typed op for
+  // it, so hot could not materialise it either. Quarantining here would let any
+  // client pin this shard's WAL retention forever with one ordinary command.
+  std::vector<core::QueueEntry> entries;
+  entries.push_back(MakeWriteEntry(1, {"INCR", "counter"}));
+  entries.push_back(MakeWriteEntry(2, {"SET", "k", "v"}));
+
+  EXPECT_CALL(queue_, Read(_, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  core::SequenceId ack_seq = 0;
+  EXPECT_CALL(queue_, Ack(core::kColdConsumer, kShard, _))
+      .WillRepeatedly([&ack_seq](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        ack_seq = s;
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  c->Flush();
+
+  const auto snap = c->Snapshot();
+  EXPECT_EQ(snap.parse_poison, 0U) << "an unimplemented command was quarantined as poison";
+  EXPECT_EQ(snap.unsupported_ops, 1U);
+  // The frontier moved past both entries: nothing is pinned.
+  EXPECT_EQ(snap.latest_drained_seq, 2U);
+  EXPECT_EQ(ack_seq, 2U) << "WAL retention stayed pinned behind an unimplementable write";
+}
+
 TEST_F(ColdConsumerTest, ResolvedMaterialisedOpPoisonClampsAck) {
   ColdConsumer::Config cfg;
   cfg.quiet_threshold = 30s;
@@ -241,7 +316,7 @@ TEST_F(ColdConsumerTest, ResolvedMaterialisedOpPoisonClampsAck) {
   // ack at ref-1 and increments parse_poison.
   std::vector<core::QueueEntry> entries;
   entries.push_back(
-      MakeResolvedEntry(7, core::Decision::kApply, std::vector<std::string>{"BOGUS", "key"}));
+      MakeResolvedEntry(7, core::Decision::kApply, std::vector<std::string>{"HSET", "h", "f"}));
   EXPECT_CALL(queue_, Read(_, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
@@ -945,6 +1020,51 @@ TEST_F(ColdConsumerTest, DrainDeadlineTruncatesAndReportsWithoutBlocking) {
   EXPECT_LT(elapsed, 400ms) << "drain must be deadline-bounded, not block on the wedged store";
   // The remaining slice was left in the buffer for WAL replay (no silent loss).
   EXPECT_GT(c->Buffer().Size(), 0U) << "truncated drain must leave the rest for replay";
+}
+
+// --- COLDC-5: oldest_unflushed_age lag signal ---------------------------------
+
+TEST_F(ColdConsumerTest, OldestUnflushedAgeIsZeroWhenBufferEmpty) {
+  auto c = MakeConsumer();
+  EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 0ms);
+}
+
+TEST_F(ColdConsumerTest, OldestUnflushedAgePopulated) {
+  auto c = MakeConsumer();
+
+  EXPECT_CALL(queue_, Read(core::kColdConsumer, kShard, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(1, {"SET", "ka", "va"})}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  c->Drain();
+  ASSERT_EQ(c->Buffer().Size(), 1U);
+  EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 0ms);
+
+  clock_.Advance(5s);
+  EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 5000ms);
+}
+
+TEST_F(ColdConsumerTest, OldestUnflushedAgeTracksNextOldestAfterFlush) {
+  auto c = MakeConsumer();
+
+  EXPECT_CALL(queue_, Read(core::kColdConsumer, kShard, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(1, {"SET", "ka", "va"})}))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(2, {"SET", "kb", "vb"})}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  c->Drain();
+  clock_.Advance(10s);
+  c->Drain();
+  ASSERT_EQ(c->Buffer().Size(), 2U);
+
+  // Past "ka"'s quiet deadline (30s + <=3s jitter) but short of "kb"'s.
+  clock_.Advance(24s);
+  EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 34000ms);
+
+  ASSERT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kProgress);
+  ASSERT_EQ(c->Buffer().Size(), 1U);
+  // Not latched at the flushed entry's age: the signal tracks the live minimum.
+  EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 24000ms);
 }
 
 }  // namespace

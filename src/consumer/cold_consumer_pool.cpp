@@ -1,5 +1,6 @@
 #include "abyss/consumer/cold_consumer_pool.h"
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -129,6 +130,7 @@ ColdConsumerPool::AggregateMetrics ColdConsumerPool::Snapshot() const {
     agg.apply_failures += m.apply_failures;
     agg.retry_attempts += m.retry_attempts;
     agg.parse_failures += m.parse_failures;
+    agg.oldest_unflushed_age = std::max(agg.oldest_unflushed_age, m.oldest_unflushed_age);
     if (m.mode == ColdConsumer::Mode::kAggressive) ++agg.shards_in_aggressive_mode;
   }
   return agg;

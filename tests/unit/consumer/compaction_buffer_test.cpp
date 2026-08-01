@@ -512,6 +512,54 @@ TEST_F(CompactionBufferTest, OldestPendingSeqAdvancesAfterFlush) {
 }
 
 // ---------------------------------------------------------------------------
+// COLDC-5: oldest first_seen (ADP-004 lag signal)
+// ---------------------------------------------------------------------------
+
+TEST_F(CompactionBufferTest, OldestFirstSeenEmptyReturnsNullopt) {
+  EXPECT_FALSE(buffer_.OldestFirstSeen().has_value());
+}
+
+TEST_F(CompactionBufferTest, OldestFirstSeenReturnsMinimumAcrossEntries) {
+  const auto t0 = clock_.SteadyNow();
+  AbsorbString("a", "v");
+  clock_.Advance(10s);
+  AbsorbString("b", "v");
+  clock_.Advance(10s);
+  AbsorbString("c", "v");
+
+  auto oldest = buffer_.OldestFirstSeen();
+  ASSERT_TRUE(oldest.has_value());
+  EXPECT_EQ(*oldest, t0);
+}
+
+TEST_F(CompactionBufferTest, OldestFirstSeenUnmovedByReabsorbOfSameKey) {
+  const auto t0 = clock_.SteadyNow();
+  AbsorbString("a", "v1");
+  clock_.Advance(10s);
+  AbsorbString("a", "v2");
+
+  auto oldest = buffer_.OldestFirstSeen();
+  ASSERT_TRUE(oldest.has_value());
+  EXPECT_EQ(*oldest, t0);
+}
+
+TEST_F(CompactionBufferTest, OldestFirstSeenAdvancesToNextOldestAfterFlush) {
+  AbsorbString("a", "v");
+  clock_.Advance(10s);
+  const auto t1 = clock_.SteadyNow();
+  AbsorbString("b", "v");
+
+  // FlushOldest pops in scheduled order; "a" is scheduled 10s ahead of "b".
+  auto flushed = buffer_.FlushOldest(/*target_bytes=*/0, /*max_count=*/1);
+  ASSERT_EQ(flushed.size(), 1U);
+  EXPECT_EQ(flushed[0].key, "a");
+
+  auto oldest = buffer_.OldestFirstSeen();
+  ASSERT_TRUE(oldest.has_value());
+  EXPECT_EQ(*oldest, t1);
+}
+
+// ---------------------------------------------------------------------------
 // FlushOldest (aggressive mode)
 // ---------------------------------------------------------------------------
 

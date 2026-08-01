@@ -11,6 +11,14 @@ TEST(RespValueTest, Null) {
   EXPECT_EQ(v.type(), RespValue::Type::kNull);
 }
 
+TEST(RespValueTest, NullArrayIsDistinctFromNullBulk) {
+  auto v = RespValue::NullArray();
+  EXPECT_TRUE(v.IsNullArray());
+  EXPECT_FALSE(v.IsNull());
+  EXPECT_EQ(v.type(), RespValue::Type::kNullArray);
+  EXPECT_FALSE(RespValue::Null().IsNullArray());
+}
+
 TEST(RespValueTest, SimpleString) {
   auto v = RespValue::SimpleString("OK");
   EXPECT_TRUE(v.IsSimpleString());
@@ -60,6 +68,18 @@ TEST(RespValueTest, ErrorMovedCarriesSlotAndAddress) {
 TEST(RespValueTest, ErrorPrefixOfReturnsTypedEnum) {
   auto v = RespValue::Error(ErrorPrefix::kNoProto, "unsupported protocol version");
   EXPECT_EQ(v.ErrorPrefixOf(), ErrorPrefix::kNoProto);
+}
+
+TEST(RespValueTest, RawErrorKeepsBodyVerbatim) {
+  auto v = RespValue::RawError("WEIRD something");
+  EXPECT_TRUE(v.IsError());
+  EXPECT_EQ(v.AsString(), "WEIRD something");
+  EXPECT_EQ(v.ErrorPrefixOf(), ErrorPrefix::kErr);
+}
+
+TEST(RespValueTest, RawErrorDoesNotRePrependKnownPrefix) {
+  auto v = RespValue::RawError("ERR syntax error");
+  EXPECT_EQ(v.AsString(), "ERR syntax error");
 }
 
 TEST(RespValueTest, ErrorMessageStripsPrefix) {

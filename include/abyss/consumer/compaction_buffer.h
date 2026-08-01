@@ -85,6 +85,10 @@ class CompactionBuffer {
 
   std::optional<core::SequenceId> OldestPendingSeq() const ABYSS_EXCLUDES(mutex_);
 
+  // min(first_seen) over live entries; nullopt when empty. Backs the ADP-004
+  // oldest_unflushed_age lag signal (COLDC-5).
+  std::optional<core::SteadyTime> OldestFirstSeen() const ABYSS_EXCLUDES(mutex_);
+
   // Drops every buffered entry without emitting to cold. Used by FLUSHDB.
   void Clear() ABYSS_EXCLUDES(mutex_);
 

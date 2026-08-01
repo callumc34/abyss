@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -263,6 +264,46 @@ TEST_F(TcpServerComponentTest, AcceptBurstHandledWithoutDrops) {
     EXPECT_EQ(c.Command({"PING"}), "+PONG\r\n");
   }
   EXPECT_EQ(server.ActiveConnections(), 16U);
+
+  server.Stop();
+}
+
+// NET-4: the read-buffer high-water is a fleet-wide max over live connections,
+// not whichever connection wrote the shared gauge last.
+TEST_F(TcpServerComponentTest, ReadBufferHighWaterIsFleetMaxNotLastWriter) {
+  constexpr size_t kBigValueBytes = 64 * 1024;
+  TcpServerConfig cfg = DefaultTestConfig();
+  cfg.io_threads = 2;
+  StubDispatcher dispatcher;
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
+  ASSERT_TRUE(server.Start().has_value());
+
+  component_test::SyncRedisClient small;
+  component_test::SyncRedisClient large;
+  ASSERT_TRUE(small.Connect(server.BoundPort()));
+  ASSERT_TRUE(large.Connect(server.BoundPort()));
+
+  EXPECT_EQ(small.Command({"PING"}), "+PONG\r\n");
+  EXPECT_LT(server.MaxReadBufferHighWaterBytes(), kBigValueBytes);
+
+  EXPECT_EQ(large.Command({"SET", "k", std::string(kBigValueBytes, 'v')}), "+OK\r\n");
+
+  // The reply can reach the client a hair before the reactor folds the new
+  // high-water into its published value.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (server.MaxReadBufferHighWaterBytes() < kBigValueBytes &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  const size_t fleet_max = server.MaxReadBufferHighWaterBytes();
+  EXPECT_GE(fleet_max, kBigValueBytes);
+
+  // A later small read on the other connection must not drag the fleet max down
+  // to the last writer's value.
+  EXPECT_EQ(small.Command({"PING"}), "+PONG\r\n");
+  EXPECT_EQ(small.Command({"PING"}), "+PONG\r\n");
+  EXPECT_GE(server.MaxReadBufferHighWaterBytes(), fleet_max);
 
   server.Stop();
 }

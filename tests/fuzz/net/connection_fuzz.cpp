@@ -65,6 +65,10 @@ class NoopDispatcher : public abyss::core::CommandDispatcher {
       abyss::core::MultiKeyKind /*kind*/, abyss::core::RespCommand /*cmd*/) override {
     return abyss::core::RespValue::SimpleString("OK");
   }
+  abyss::core::Result<abyss::core::RespValue> DispatchFlush(
+      abyss::core::FlushTarget /*target*/) override {
+    return abyss::core::RespValue::SimpleString("OK");
+  }
 };
 
 void SetNonBlocking(int fd) {

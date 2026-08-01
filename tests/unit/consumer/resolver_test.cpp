@@ -5,10 +5,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -678,6 +680,37 @@ TEST_F(ResolverTest, ExpireReplayDeterministicAcrossRecovery) {
   const auto second = run_once();
   EXPECT_EQ(first.abs_ttl_ms, second.abs_ttl_ms);
   EXPECT_EQ(first.abs_ttl_ms, 6'000'500U + 100'000U);
+}
+
+// HOTC-9: every EXPIRE-family variant must reach the cache TTL update exactly
+// once — a mis-copied disjunct in the branch would silently drop one variant.
+TEST_F(ResolverTest, ExpireFamilyAllVariantsUpdateCache) {
+  StubQueueReadOnce({
+      MakeWriteAt(10, {"SET", "a", "v"}, At(10'000'000)),
+      MakeWriteAt(11, {"SET", "b", "v"}, At(10'000'000)),
+      MakeWriteAt(12, {"SET", "c", "v"}, At(10'000'000)),
+      MakeWriteAt(13, {"SET", "d", "v"}, At(10'000'000)),
+      MakeWriteAt(14, {"EXPIRE", "a", "100"}, At(10'000'000)),
+      MakeWriteAt(15, {"PEXPIRE", "b", "200000"}, At(10'000'000)),
+      MakeWriteAt(16, {"EXPIREAT", "c", "10300"}, At(10'000'000)),
+      MakeWriteAt(17, {"PEXPIREAT", "d", "10400000"}, At(10'000'000)),
+  });
+  StubQueueAppendCapture();
+  StubQueueAck();
+  EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  auto expect_ttl = [&resolver](std::string_view key, uint64_t want) {
+    auto cached = resolver.Cache().GetKey(key);
+    ASSERT_TRUE(cached.has_value()) << key;
+    EXPECT_EQ(cached->abs_ttl_ms, want) << key;
+  };
+  expect_ttl("a", 10'100'000U);  // EXPIRE: appended_at + 100s
+  expect_ttl("b", 10'200'000U);  // PEXPIRE: appended_at + 200000ms
+  expect_ttl("c", 10'300'000U);  // EXPIREAT: absolute seconds
+  expect_ttl("d", 10'400'000U);  // PEXPIREAT: absolute milliseconds
 }
 
 // HOTC-3: a HSET-cached field, then a plain HDEL, then HSETNX on the same field

@@ -95,17 +95,36 @@ jobs:
       preset: ${{ matrix.preset }}
     secrets: inherit
 
+  # Short smoke run: proves the harnesses still build and the committed corpora
+  # stay clean. The nightly schedule in _fuzz.yml carries the long budget.
+  fuzz:
+    name: Fuzz
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
+    uses: ./.github/workflows/_fuzz.yml
+    with:
+      duration_seconds: 60
+    secrets: inherit
+
   docker:
     name: Docker
     needs: [changes, build]
     if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
+    # A called workflow can only narrow the caller's token, never widen it, so
+    # the signing and attestation scopes must be granted here or _docker.yml
+    # fails validation before it runs.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_docker.yml
     secrets: inherit
 
   ci:
     name: CI
     runs-on: ubuntu-24.04
-    needs: [changes, format, build, build-windows, build-macos, sanitizer, docker]
+    needs: [changes, format, build, build-windows, build-macos, sanitizer, fuzz, docker]
     if: always()
     timeout-minutes: 2
     steps:

@@ -53,7 +53,6 @@ NetMetrics NetMetrics::Register() {
       .connections_accepted = reg.Counter(metrics::names::kNetConnectionsAcceptedTotal),
       .bytes_in = reg.Counter(metrics::names::kNetBytesInTotal),
       .bytes_out = reg.Counter(metrics::names::kNetBytesOutTotal),
-      .read_buffer_high_water = reg.Gauge(metrics::names::kNetReadBufferHighWaterBytes),
       .backpressure_active = reg.Gauge(metrics::names::kNetBackpressureActive),
       .backpressure_entered = reg.Counter(metrics::names::kNetBackpressureEnteredTotal),
       .backpressure_exited = reg.Counter(metrics::names::kNetBackpressureExitedTotal),
@@ -136,10 +135,13 @@ void Connection::Close(metrics::CloseReason reason) {
   close_reason_ = reason;
   metrics_.Closed(reason).Increment();
   metrics_.connections_active.Decrement();
-  if (reading_paused_) {
+  // Keyed on backpressure_counted_, never on reading_paused_: a pause whose
+  // poller update failed sets the pause flag but never reaches the increment.
+  if (backpressure_counted_) {
     metrics_.backpressure_active.Decrement();
-    reading_paused_ = false;
+    backpressure_counted_ = false;
   }
+  reading_paused_ = false;
 
   // De-register before close: a reused fd number must not deliver to us.
   if (fd_.Valid()) {
@@ -314,8 +316,13 @@ void Connection::MaybePauseReading() {
   if (reading_paused_) return;
   if (WriteBufferBytes() < config_.write_backpressure_bytes) return;
 
+  // reading_paused_ must flip first because SyncPollerInterest derives the
+  // interest mask from it; the gauge moves only once the transition is
+  // committed. A failed Modify closes with backpressure_counted_ still false,
+  // so Close() cannot decrement an increment that never happened.
   reading_paused_ = true;
   if (!SyncPollerInterest()) return;
+  backpressure_counted_ = true;
   metrics_.backpressure_active.Increment();
   metrics_.backpressure_entered.Increment();
   ABYSS_LOG_DEBUG("backpressure paused", {"client_id", client_id_},
@@ -327,18 +334,21 @@ void Connection::MaybeResumeReading() {
   if (WriteBufferBytes() >= config_.write_resume_bytes) return;
 
   reading_paused_ = false;
+  // A failed Modify here leaves backpressure_counted_ set, so the Close() it
+  // triggers drops the gauge exactly once instead of leaking the increment.
   if (!SyncPollerInterest()) return;
+  backpressure_counted_ = false;
   metrics_.backpressure_active.Decrement();
   metrics_.backpressure_exited.Increment();
   ABYSS_LOG_DEBUG("backpressure resumed", {"client_id", client_id_},
                   {"write_bytes", static_cast<uint64_t>(WriteBufferBytes())});
 }
 
+// Deliberately does not touch the process-wide gauge: every connection Setting
+// it makes the value last-writer-wins. The fleet max is folded from these
+// per-connection peaks by the server-scoped snapshotter.
 void Connection::RecordReadBufferHighWater() {
-  if (read_buf_.size() > read_buf_high_water_) {
-    read_buf_high_water_ = read_buf_.size();
-    metrics_.read_buffer_high_water.Set(static_cast<double>(read_buf_high_water_));
-  }
+  read_buf_high_water_ = std::max(read_buf_high_water_, read_buf_.size());
 }
 
 void Connection::TouchActivity() { last_activity_ = clock_(); }

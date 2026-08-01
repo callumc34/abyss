@@ -62,6 +62,7 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
   backoff_backpressure_ =
       reg.Counter(metrics::names::kColdConsumerBackoffTotal, metrics::BackoffReason::kBackpressure);
   parse_poison_total_ = reg.Counter(metrics::names::kColdParsePoisonTotal);
+  unsupported_op_total_ = reg.Counter(metrics::names::kColdUnsupportedOpTotal);
   flush_heap_depth_ = reg.Gauge(metrics::names::kColdFlushHeapDepth);
 }
 
@@ -148,8 +149,20 @@ void ColdConsumer::RunLoop() {
       }
     }
     std::unique_lock lock(stop_mu_);
-    stop_cv_.wait_for(lock, backoff,
-                      [this] { return stop_requested_.load(std::memory_order_acquire); });
+    // A reader blocked on the read-consistency gate needs this shard to drain
+    // NOW; its deadline is far shorter than the idle backoff ceiling. Waking on
+    // that request keeps the gate honest -- it must fire only when the consumer
+    // is genuinely wedged, never merely because it was asleep -- while still
+    // never busy-spinning, since the wake only happens when a reader is waiting.
+    const bool woken_for_reader = stop_cv_.wait_for(lock, backoff, [this] {
+      return stop_requested_.load(std::memory_order_acquire) ||
+             drain_wake_requested_.load(std::memory_order_acquire);
+    });
+    if (woken_for_reader && !stop_requested_.load(std::memory_order_acquire)) {
+      drain_wake_requested_.store(false, std::memory_order_release);
+      backoff = config_.loop_initial_backoff;
+      continue;
+    }
     backoff = std::min(backoff * 2, config_.loop_max_backoff);
   }
   // Graceful stop: drain the buffer to durable cold and advance the ack before
@@ -522,6 +535,21 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
 std::optional<core::SequenceId> ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd,
                                                                core::SequenceId seq,
                                                                uint64_t wall_now_ms) {
+  // A command with no parser at all cannot be materialised by ANY tier in this
+  // build, so hot rejected it too and there is no state for cold to be missing:
+  // both views agree the entry produced nothing. Poisoning here would pin WAL
+  // retention forever over an entry that carries no materialisable write, which
+  // any client could trigger at will. Quarantine is for genuine decoder skew --
+  // a parser that exists and fails on bytes hot accepted.
+  if (!core::ops::HasWriteParser(cmd.Name())) {
+    unsupported_ops_.fetch_add(1, std::memory_order_relaxed);
+    unsupported_op_total_.Increment();
+    ABYSS_LOG_WARN("cold skipping write with no parser in this build",
+                   {"shard", static_cast<int64_t>(shard_)}, {"seq", static_cast<uint64_t>(seq)},
+                   {"cmd", std::string(cmd.Name())});
+    return std::nullopt;
+  }
+
   auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, wall_now_ms);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
@@ -935,6 +963,15 @@ void ColdConsumer::TryAdvanceAck(bool force_checkpoint) {
 
 bool ColdConsumer::WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout) {
   if (latest_drained_seq_.load(std::memory_order_acquire) >= target) return true;
+
+  // Ask the loop to drain now rather than finish its idle backoff, which may be
+  // an order of magnitude longer than this wait's deadline.
+  {
+    const std::scoped_lock wake_lock(stop_mu_);
+    drain_wake_requested_.store(true, std::memory_order_release);
+  }
+  stop_cv_.notify_all();
+
   std::unique_lock lock(drain_wait_mu_);
   return drain_wait_cv_.wait_for(lock, timeout, [this, target] {
     return latest_drained_seq_.load(std::memory_order_acquire) >= target;
@@ -956,6 +993,14 @@ ColdConsumer::Metrics ColdConsumer::Snapshot() const {
   out.buffer_entries = buffer_.Size();
   out.buffer_bytes = buffer_.BytesEstimate();
   flush_heap_depth_.Set(static_cast<double>(buffer_.HeapDepth()));
+  // ADP-004 lag signal: now - min(first_seen). Sampled buffer-first so a
+  // concurrent Absorb cannot yield a first_seen ahead of `now`.
+  const auto oldest_first_seen = buffer_.OldestFirstSeen();
+  const auto now = steady_clock_();
+  out.oldest_unflushed_age =
+      oldest_first_seen.has_value()
+          ? std::chrono::duration_cast<std::chrono::milliseconds>(now - *oldest_first_seen)
+          : std::chrono::milliseconds{0};
   out.mode = mode_.load(std::memory_order_acquire);
   out.flushes_quiet = flushes_quiet_.load(std::memory_order_relaxed);
   out.flushes_deadline = flushes_deadline_.load(std::memory_order_relaxed);
@@ -967,6 +1012,7 @@ ColdConsumer::Metrics ColdConsumer::Snapshot() const {
   out.retry_attempts = retry_attempts_.load(std::memory_order_relaxed);
   out.parse_failures = common.parse_failures;
   out.parse_poison = parse_poison_.load(std::memory_order_relaxed);
+  out.unsupported_ops = unsupported_ops_.load(std::memory_order_relaxed);
   out.queue_read_failures = common.queue_read_failures;
   out.last_ack_seq = last_ack_seq_.load(std::memory_order_acquire);
   out.latest_drained_seq = latest_drained_seq_.load(std::memory_order_acquire);

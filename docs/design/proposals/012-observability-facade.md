@@ -106,7 +106,13 @@ A global default level (INFO in release builds, DEBUG in debug builds); a sink f
 
 ### MetricsConfig
 
-An enabled flag (default true); a bind address; a port (default 9090). Environment overlays via `ABYSS_METRICS_ENABLED`, `ABYSS_METRICS_BIND`, `ABYSS_METRICS_PORT`. The bind and port fields are consumed by the scrape endpoint, not by the facade itself; they live on `MetricsConfig` for configuration locality.
+An enabled flag (default true); a bind address; a port (default 9090); and a snapshot interval (default one second). Environment overlays via `ABYSS_METRICS_ENABLED`, `ABYSS_METRICS_BIND`, `ABYSS_METRICS_PORT`. A present environment override that cannot be parsed fails startup naming the variable, rather than being discarded in favour of a default the operator did not ask for. The bind and port fields are consumed by the scrape endpoint, not by the facade itself; they live on `MetricsConfig` for configuration locality.
+
+### Snapshot-style gauges
+
+Counters and histograms are observed at the event that produces them. Gauges that describe a property of the system at an instant — queue depth, tier key counts and footprints, consumer lag, buffer age, retention-reclamation age — have no such event, and the metrics backend behind this facade exposes no scrape-time collection hook. They are therefore pushed on a fixed cadence by a single server-scoped collector.
+
+Concentrating every such gauge in one collector is deliberate. It keeps stores and consumers free of any dependency on the metrics registry, and it makes "declared but never written" a visible property of one file rather than a silent gap spread across subsystems. The collector reads the same status snapshot the operational HTTP surface renders, so the two can never disagree about the same number. The cadence is an operator knob because each observation samples store statistics, which are cheap but not free.
 
 ## Thread-safety
 

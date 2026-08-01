@@ -577,16 +577,26 @@ core::Result<void> ShardState::RemoveSegment(core::SequenceId base_seq) {
     if (it == sealed_.end()) {
       return {};
     }
-    to_remove = std::move(*it);
-    sealed_.erase(it);
+    to_remove = *it;
     path = to_remove->path();
   }
 
+  // Unlink BEFORE deregistering. Dropping the segment first and failing to
+  // unlink would leave the file on disk with nothing tracking it: no later
+  // sweep would retry it, it would vanish from the retention stats, and the
+  // stuck-reclamation age would read as healthy while the bytes remain.
   std::error_code ec;
   std::filesystem::remove(path, ec);
   if (ec) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInternal, "unlink segment: " + ec.message()});
+  }
+
+  const std::scoped_lock lock(append_mu_);
+  auto it = std::ranges::find_if(
+      sealed_, [&](const std::shared_ptr<Segment>& s) { return s->base_seq() == base_seq; });
+  if (it != sealed_.end()) {
+    sealed_.erase(it);
   }
   return {};
 }

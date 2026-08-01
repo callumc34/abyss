@@ -1,6 +1,7 @@
 #include "validator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -29,6 +30,14 @@ constexpr size_t kSegmentHeaderSize = 32;
 constexpr size_t kMaxEntryEnvelope = 1024;
 // Redis proto-max-bulk-len: the largest single value we ever accept.
 constexpr size_t kMaxAcceptableValueSize = size_t{512} * 1024 * 1024;
+// Upper bound on the cold checkpoint cadence. The cold ack cannot pass data the
+// last checkpoint did not make durable, so this bounds how far the ack — and
+// therefore WAL retention release — can trail the applied frontier.
+constexpr std::chrono::milliseconds kMaxCheckpointMinInterval{60000};
+
+// Snapshot gauges scraped less often than this stop being an alerting signal:
+// Prometheus would sample a value already stale by more than a scrape interval.
+constexpr std::chrono::milliseconds kMaxMetricsSnapshotInterval{60000};
 
 core::Error InvalidArg(std::string path, std::string_view message) {
   std::string msg = std::move(path);
@@ -253,6 +262,35 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
     return std::unexpected(
         InvalidArg("cold_consumer.retry_initial_backoff_ms", "must be <= retry_max_backoff_ms"));
   }
+  // The checkpoint cadence is the cold durability frontier: a zero cadence
+  // fsyncs per batch, and a zero interval is not a cadence at all. Both bounds
+  // must be positive so the ack can only trail durable data by a bounded amount.
+  if (auto r = RequirePositive("cold_consumer.checkpoint_max_flushes", c.checkpoint_max_flushes);
+      !r) {
+    return r;
+  }
+  if (c.checkpoint_min_interval.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.checkpoint_min_interval_ms", "must be > 0 milliseconds"));
+  }
+  if (c.checkpoint_min_interval > kMaxCheckpointMinInterval) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.checkpoint_min_interval_ms",
+                   "must be <= " + std::to_string(kMaxCheckpointMinInterval.count()) +
+                       " milliseconds (bounds the cold durability lag)"));
+  }
+  if (c.loop_initial_backoff.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.loop_initial_backoff_ms", "must be > 0 milliseconds"));
+  }
+  if (c.loop_max_backoff.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.loop_max_backoff_ms", "must be > 0 milliseconds"));
+  }
+  if (c.loop_initial_backoff > c.loop_max_backoff) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.loop_initial_backoff_ms", "must be <= loop_max_backoff_ms"));
+  }
   if (c.drain_grace.count() <= 0) {
     return std::unexpected(InvalidArg("cold_consumer.drain_grace_seconds", "must be > 0 seconds"));
   }
@@ -334,6 +372,14 @@ core::Result<void> ValidateMetrics(const MetricsConfig& m) {
   if (auto r = RequireNonEmpty("metrics.bind", m.bind); !r) return r;
   // port == 0 requests an OS-assigned ephemeral port; the listener reports
   // the bound port via the readiness pipe.
+  if (m.snapshot_interval <= std::chrono::milliseconds::zero()) {
+    return std::unexpected(InvalidArg("metrics.snapshot_interval_ms", "must be > 0"));
+  }
+  if (m.snapshot_interval > kMaxMetricsSnapshotInterval) {
+    return std::unexpected(
+        InvalidArg("metrics.snapshot_interval_ms",
+                   "must be <= " + std::to_string(kMaxMetricsSnapshotInterval.count()) + " ms"));
+  }
   return {};
 }
 

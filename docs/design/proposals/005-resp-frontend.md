@@ -333,9 +333,15 @@ Frontend immediately responds `ERR unknown command '<NAME>', with args beginning
 
 This supersedes the prior ambiguous "classify unknown as write" language.
 
-**2. Known command name, store does not support the operation** — e.g. a future Redis module command in the registry but not yet implemented by the Phase 1 built-in hot store.
+**2. Known command name, malformed arguments** — the command has a typed-operation parser and that parser rejects these arguments.
+
+Arity is a weaker check than the parser: `SET k v BOGUS` and `HSET k f v f` both satisfy their registry arity and are still malformed. The frontend validates such a command against its canonical parser before routing and rejects it with `ERR` (the prefix table's "malformed args" case). Nothing unparseable reaches the queue. Recording a command in the log that no tier can materialise would durably preserve an intent that can never be applied, and the queue is the single source of truth — it should not accumulate entries that are meaningless to every materialised view.
+
+**3. Known command name, no typed-operation parser exists** — the command is in the registry but no tier in this build implements it.
 
 Frontend classifies per the registry and routes. If it is a write, it reaches the queue; the store returns an error at apply time, which is surfaced to the client via Consumer RPC fulfillment with an error value. This preserves the "write bias for safety" intent for known commands whose store support is incomplete.
+
+Consumers must distinguish case 3 from genuine decoder skew. An entry no parser can decode was not applied by any tier, so the materialised views agree it produced nothing and the consumer skips it, counting the occurrence so the gap between the advertised command surface and the implemented one stays visible. Quarantining such an entry — refusing to advance past it — would be wrong: it protects nothing, and it lets any client suspend log retention indefinitely by sending a command the registry advertises. Quarantine is reserved for an entry whose parser exists and fails, which is a real skew bug because another tier accepted the same bytes.
 
 **Arity mismatch** — known command with wrong argument count. Frontend rejects with `ERR wrong number of arguments for '<name>' command`, no queue interaction.
 

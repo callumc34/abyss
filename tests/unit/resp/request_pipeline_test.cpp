@@ -49,6 +49,7 @@ class FakeConfig : public ConfigProvider {
 class StubDispatcher : public core::CommandDispatcher {
  public:
   int flush_calls = 0;
+  int write_calls = 0;
   core::FlushTarget last_target = core::FlushTarget::kThisDb;
 
   core::Result<core::RespValue> DispatchRead(std::string_view /*name*/,
@@ -57,6 +58,7 @@ class StubDispatcher : public core::CommandDispatcher {
   }
   core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/,
                                               core::RespCommand /*cmd*/) override {
+    ++write_calls;
     return core::RespValue::SimpleString("OK");
   }
   core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
@@ -120,6 +122,17 @@ TEST(RequestPipelineTest, PingWithMessageReturnsBulk) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"), output);
   EXPECT_EQ(ToStr(output), "$5\r\nhello\r\n");
+}
+
+// RESP-7: PING keeps registry arity -1; the at-most-one-message bound is
+// enforced by the handler, as in real Redis.
+TEST(RequestPipelineTest, PingExtraArgsIsArityError) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.AsString(), "ERR wrong number of arguments for 'ping' command");
 }
 
 TEST(RequestPipelineTest, InlinePing) {
@@ -202,6 +215,31 @@ TEST(RequestPipelineTest, FlushdbRejectsUnknownModifier) {
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
   EXPECT_EQ(dispatcher.flush_calls, 0);
+}
+
+// ENGINE-7: an unrecognised SET option must be rejected before the write is
+// handed to the dispatcher, so nothing malformed is ever queued.
+TEST(RequestPipelineTest, SetWithUnknownOptionIsRejectedBeforeDispatch) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$5\r\nBOGUS\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
+  EXPECT_EQ(dispatcher.write_calls, 0);
+}
+
+TEST(RequestPipelineTest, SetWithTtlOptionStillDispatches) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n"),
+                   output);
+  EXPECT_EQ(ToStr(output), "+OK\r\n");
+  EXPECT_EQ(dispatcher.write_calls, 1);
 }
 
 TEST(RequestPipelineTest, FlushdbWithoutDispatcherReturnsInternalError) {
@@ -371,14 +409,14 @@ TEST(RequestPipelineTest, CommandInfoReportsGetSpec) {
   ASSERT_TRUE(entry.AsArray()[2].IsArray());
 }
 
-TEST(RequestPipelineTest, CommandInfoUnknownIsNull) {
+// RESP-5: Redis answers an unknown COMMAND INFO name with the array-shaped nil
+// `*-1`, not the bulk nil `$-1`. Asserted on the wire bytes because the parser
+// folds both nil forms back onto kNull.
+TEST(RequestPipelineTest, CommandInfoUnknownIsNullArray) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$7\r\nBOGUSCC\r\n"), output);
-  auto response = ParseResponse(output);
-  ASSERT_TRUE(response.IsArray());
-  ASSERT_EQ(response.AsArray().size(), 1U);
-  EXPECT_TRUE(response.AsArray()[0].IsNull());
+  EXPECT_EQ(ToStr(output), "*1\r\n*-1\r\n");
 }
 
 TEST(RequestPipelineTest, CommandDocsReturnsSummary) {

@@ -560,15 +560,14 @@ core::Result<RespValue> RocksdbStore::ExecDel(const core::ops::Del& op) {
 core::Result<core::StorageStats> RocksdbStore::Stats() {
   core::StorageStats out;
 
+  // Default CF only: every score-index record (0x06) duplicates a member record
+  // (0x05) in the default CF, so summing both CFs double-counts zset members.
   uint64_t num_keys = 0;
   if (impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.estimate-num-keys", &num_keys)) {
     out.key_count += num_keys;
   }
-  if (impl_->db->GetIntProperty(impl_->zset_score_idx_cf.get(), "rocksdb.estimate-num-keys",
-                                &num_keys)) {
-    out.key_count += num_keys;
-  }
 
+  // disk_bytes is physical footprint, so it still spans both column families.
   uint64_t live_bytes = 0;
   if (impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.total-sst-files-size",
                                 &live_bytes)) {

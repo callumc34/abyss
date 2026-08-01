@@ -53,6 +53,11 @@ class TcpServer {
   size_t ActiveConnections() const noexcept {
     return active_count_.load(std::memory_order_relaxed);
   }
+  // Fleet-wide max read-buffer high-water across live connections: the fold of
+  // each reactor's own published max. Reads only atomics, so it is safe
+  // alongside running reactors; like the other accessors it must not race
+  // Start()/Join(), which are the only mutators of the reactor set.
+  size_t MaxReadBufferHighWaterBytes() const noexcept;
   const TcpServerConfig& Config() const noexcept { return config_; }
 
  private:

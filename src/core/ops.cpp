@@ -232,6 +232,13 @@ const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
 
 using WriteParserFn = Result<WriteOp> (*)(const RespCommand&, uint64_t);
 
+// Options the resolver interprets before materialising a plain SET. They carry
+// no meaning here, but must stay legal so both SET parse paths agree on the
+// accepted token set.
+bool IsResolverSetOption(std::string_view opt) {
+  return opt == "NX" || opt == "XX" || opt == "GET" || opt == "KEEPTTL";
+}
+
 Result<WriteOp> ParseSet(const RespCommand& cmd, uint64_t wall_now_ms) {
   uint64_t abs_ttl_ms = 0;
   for (size_t i = 3; i < cmd.args.size(); ++i) {
@@ -251,6 +258,8 @@ Result<WriteOp> ParseSet(const RespCommand& cmd, uint64_t wall_now_ms) {
       } else {
         abs_ttl_ms = *ttl_arg;
       }
+    } else if (!IsResolverSetOption(opt)) {
+      return std::unexpected(SyntaxError("syntax error — unknown SET option '" + opt + "'"));
     }
   }
   return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[2], .abs_ttl_ms = abs_ttl_ms}};
@@ -415,6 +424,8 @@ Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd, uint
   }
   return it->second(cmd, wall_now_ms);
 }
+
+bool HasWriteParser(std::string_view name) { return WriteParsers().contains(name); }
 
 std::string_view PrimaryKey(const ReadOp& op) {
   return std::visit(

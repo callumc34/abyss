@@ -52,6 +52,13 @@ class Reactor {
 
   size_t ConnectionCount() const noexcept { return connections_.size(); }
 
+  // Max read-buffer high-water over this reactor's live connections. The value
+  // is computed on the reactor thread (which exclusively owns connections_) and
+  // published through an atomic, so any thread may read it.
+  size_t MaxReadBufferHighWaterBytes() const noexcept {
+    return static_cast<size_t>(read_buffer_high_water_.load(std::memory_order_acquire));
+  }
+
  private:
   void Run();
   void DrainHandoff();
@@ -59,6 +66,8 @@ class Reactor {
   void RunReaper(core::SteadyTime now);
   void SweepClosed();
   void ForceCloseAll();
+  void ObserveReadBufferHighWater(size_t bytes) noexcept;
+  void RepublishReadBufferHighWater() noexcept;
 
   uint32_t id_;
   TcpServer& server_;
@@ -70,7 +79,11 @@ class Reactor {
   bool listener_armed_ = false;
 
   std::atomic<bool> running_{false};
+  // Set by Start() once a joinable thread is owned. Gates only the destructor
+  // join; external observers keep reading running_ via IsRunning().
+  std::atomic<bool> started_{false};
   std::thread thread_;
+  std::atomic<uint64_t> read_buffer_high_water_{0};
 
   std::unordered_map<uint64_t, std::unique_ptr<Connection>> connections_;
   std::vector<uint64_t> to_close_;

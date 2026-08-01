@@ -84,6 +84,7 @@ class StatusProviderImpl : public admin::StatusProvider {
   using BoolFn = std::function<bool()>;
   using SizeFn = std::function<size_t()>;
   using PortFn = std::function<uint16_t()>;
+  using CountFn = std::function<uint64_t()>;
 
   struct Deps {
     const config::Config* config = nullptr;
@@ -99,6 +100,11 @@ class StatusProviderImpl : public admin::StatusProvider {
     BoolFn loading;
     BoolFn shutting_down;
     SizeFn connection_count;
+    // Segment retention health. Functors rather than a WalQueue* because these
+    // are embedded-WAL concepts with no meaning for an external broker.
+    CountFn reaper_failures;
+    CountFn oldest_eligible_unreaped_age_ms;
+    CountFn read_buffer_high_water_bytes;
     PortFn resp_port;
     PortFn admin_port;
     PortFn metrics_port;

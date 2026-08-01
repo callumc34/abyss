@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <optional>
 #include <vector>
 
 #include "abyss/core/result.h"
@@ -19,6 +21,17 @@ struct SegmentReaperConfig {
 // Synchronous helper that deletes sealed segments.
 class SegmentReaper {
  public:
+  // Summary of one sweep. A removal failure is recorded and skipped past, never
+  // aborted on, so a single stuck segment cannot halt reclamation of the rest.
+  struct ReapOutcome {
+    size_t deleted = 0;
+    size_t failed = 0;
+    std::optional<core::Error> first_error;
+    // Creation time of the oldest segment that was eligible but is still on
+    // disk after the sweep; the leading indicator that retention is stalled.
+    std::optional<core::WallTime> oldest_eligible_unreaped;
+  };
+
   SegmentReaper(SegmentRegistry& registry, const OffsetStore& offsets, SegmentReaperConfig config);
   ~SegmentReaper() = default;
 
@@ -28,7 +41,7 @@ class SegmentReaper {
   SegmentReaper& operator=(SegmentReaper&&) = delete;
 
   // Scan sealed segments once and delete every one that is eligible.
-  core::Result<size_t> RunOnce();
+  [[nodiscard]] core::Result<ReapOutcome> RunOnce();
 
  private:
   bool ShouldDelete(const SegmentRegistry::SealedSegmentInfo& info, core::WallTime now) const;

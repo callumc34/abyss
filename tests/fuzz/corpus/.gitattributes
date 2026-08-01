@@ -1,0 +1,2 @@
+# Seeds are exact byte sequences: no EOL normalisation, no textual diffing.
+* binary

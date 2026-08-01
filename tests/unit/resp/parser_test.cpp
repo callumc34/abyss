@@ -74,11 +74,15 @@ TEST(ParserTest, NullBulkString) {
   EXPECT_TRUE(r->value.IsNull());
 }
 
-TEST(ParserTest, NullArray) {
+// The serializer emits `*-1` for RespValue::NullArray(), but the parser folds
+// both nil forms onto kNull; an inbound null-array is indistinguishable from a
+// null-bulk here.
+TEST(ParserTest, NullArrayParsesAsNullBulk) {
   std::string input = "*-1\r\n";
   auto r = Parser::Parse(Bytes(input));
   ASSERT_TRUE(r.has_value());
   EXPECT_TRUE(r->value.IsNull());
+  EXPECT_FALSE(r->value.IsNullArray());
 }
 
 TEST(ParserTest, EmptyArray) {
@@ -122,6 +126,25 @@ TEST(ParserTest, ErrorValueRoundTripsPrefix) {
   ASSERT_TRUE(r->value.IsError());
   EXPECT_EQ(r->value.AsString(),
             "WRONGTYPE Operation against a key holding the wrong kind of value");
+}
+
+// RESP-6: an unrecognised prefix is kept verbatim rather than being rewritten
+// with an injected "ERR " token.
+TEST(ParserTest, UnknownErrorPrefixKeepsBodyVerbatim) {
+  std::string input = "-WEIRD something\r\n";
+  auto r = Parser::Parse(Bytes(input));
+  ASSERT_TRUE(r.has_value());
+  ASSERT_TRUE(r->value.IsError());
+  EXPECT_EQ(r->value.AsString(), "WEIRD something");
+  EXPECT_EQ(r->value.ErrorPrefixOf(), core::ErrorPrefix::kErr);
+}
+
+TEST(ParserTest, ErrorWithoutPrefixSeparatorKeepsBodyVerbatim) {
+  std::string input = "-BROKEN\r\n";
+  auto r = Parser::Parse(Bytes(input));
+  ASSERT_TRUE(r.has_value());
+  ASSERT_TRUE(r->value.IsError());
+  EXPECT_EQ(r->value.AsString(), "BROKEN");
 }
 
 TEST(ParserTest, PartialSimpleStringIsIncomplete) {

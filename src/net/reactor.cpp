@@ -14,11 +14,13 @@ namespace abyss::net {
 Reactor::Reactor(uint32_t id, TcpServer& server, std::unique_ptr<Poller> poller, bool is_acceptor)
     : id_(id), server_(server), poller_(std::move(poller)), is_acceptor_(is_acceptor) {}
 
+// running_ is set by the worker, so gating on it leaves a window between
+// Start() and the first line of Run() where a joinable thread would go
+// unjoined and ~thread would call std::terminate. started_ closes it.
 Reactor::~Reactor() {
-  if (running_.load(std::memory_order_acquire)) {
-    server_.RequestStop();
-    if (thread_.joinable()) thread_.join();
-  }
+  if (!started_.load(std::memory_order_acquire)) return;
+  server_.RequestStop();
+  if (thread_.joinable()) thread_.join();
 }
 
 core::Result<void> Reactor::AdoptListener(Socket listen_fd) {
@@ -34,7 +36,10 @@ core::Result<void> Reactor::AdoptListener(Socket listen_fd) {
   return {};
 }
 
-void Reactor::Start() { thread_ = std::thread(&Reactor::Run, this); }
+void Reactor::Start() {
+  thread_ = std::thread(&Reactor::Run, this);
+  started_.store(true, std::memory_order_release);
+}
 
 void Reactor::RequestStop() {
   if (auto r = poller_->Wake(); !r) {
@@ -158,6 +163,9 @@ void Reactor::ProcessEvents(std::span<const Event> events) {
 
     if (Has(ev.kinds, EventKind::kReadable)) {
       conn->OnReadable();
+      // A connection's high-water only grows, and only while reading, so
+      // folding it here keeps the published max exact at O(1) per event.
+      ObserveReadBufferHighWater(conn->ReadBufferHighWater());
     }
     if (!conn->IsClosed() && Has(ev.kinds, EventKind::kWritable)) {
       conn->OnWritable();
@@ -187,11 +195,30 @@ void Reactor::SweepClosed() {
   for (const auto& [id, conn] : connections_) {
     if (conn->IsClosed()) to_close_.push_back(id);
   }
+  if (to_close_.empty()) return;
   for (const uint64_t id : to_close_) {
     connections_.erase(id);
     server_.active_count_.fetch_sub(1, std::memory_order_relaxed);
   }
   to_close_.clear();
+  // Departure is the only way the live max can fall, so it is the only place
+  // the incrementally-folded value needs a full recompute.
+  RepublishReadBufferHighWater();
+}
+
+void Reactor::ObserveReadBufferHighWater(size_t bytes) noexcept {
+  const auto value = static_cast<uint64_t>(bytes);
+  if (value > read_buffer_high_water_.load(std::memory_order_relaxed)) {
+    read_buffer_high_water_.store(value, std::memory_order_release);
+  }
+}
+
+void Reactor::RepublishReadBufferHighWater() noexcept {
+  uint64_t max_bytes = 0;
+  for (const auto& [id, conn] : connections_) {
+    max_bytes = std::max(max_bytes, static_cast<uint64_t>(conn->ReadBufferHighWater()));
+  }
+  read_buffer_high_water_.store(max_bytes, std::memory_order_release);
 }
 
 }  // namespace abyss::net

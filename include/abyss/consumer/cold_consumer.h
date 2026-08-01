@@ -80,6 +80,9 @@ class ColdConsumer {
     // their seq (XERR-5). Distinct from parse_failures (the legacy counter,
     // retained for the empty-cmd / empty-key cases that are not poison).
     uint64_t parse_poison = 0;
+    // Writes whose command has no parser in this build. Skipped, never poison:
+    // hot could not materialise them either, so the tiers do not diverge.
+    uint64_t unsupported_ops = 0;
     uint64_t queue_read_failures = 0;
     core::SequenceId last_ack_seq = 0;
     core::SequenceId latest_drained_seq = 0;
@@ -247,6 +250,11 @@ class ColdConsumer {
   // (a bounded final flush + checkpoint + ack) instead of dropping the buffer.
   std::atomic<bool> draining_{false};
   std::atomic<bool> running_{false};
+  // Set by a reader blocked on the read-consistency gate to cut short the idle
+  // backoff. Signalled under stop_mu_ so the loop's wait predicate cannot miss
+  // it; atomic so the loop can clear it without re-locking. Grouped with the
+  // other flags to avoid opening a padding hole next to stop_cv_.
+  std::atomic<bool> drain_wake_requested_{false};
   // Deadline for the graceful drain; only read when draining_ is set.
   std::chrono::steady_clock::time_point drain_deadline_{};
   std::thread thread_;
@@ -298,6 +306,7 @@ class ColdConsumer {
   std::atomic<uint64_t> retry_attempts_{0};
   std::atomic<uint64_t> apply_poisoned_{0};
   std::atomic<uint64_t> parse_poison_{0};
+  std::atomic<uint64_t> unsupported_ops_{0};
   std::atomic<uint64_t> flushes_quiet_{0};
   std::atomic<uint64_t> flushes_deadline_{0};
   std::atomic<uint64_t> flushes_aggressive_{0};
@@ -321,6 +330,7 @@ class ColdConsumer {
   metrics::CounterHandle backoff_poisoned_;
   metrics::CounterHandle backoff_backpressure_;
   metrics::CounterHandle parse_poison_total_;
+  metrics::CounterHandle unsupported_op_total_;
   // Updated from the const Snapshot() accessor (observability side-effect only).
   mutable metrics::GaugeHandle flush_heap_depth_;
 };

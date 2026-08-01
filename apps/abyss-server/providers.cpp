@@ -188,6 +188,14 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
     }
   }
 
+  if (deps_.reaper_failures) s.queue.reaper_failures = deps_.reaper_failures();
+  if (deps_.oldest_eligible_unreaped_age_ms) {
+    s.queue.oldest_eligible_unreaped_age_ms = deps_.oldest_eligible_unreaped_age_ms();
+  }
+  if (deps_.read_buffer_high_water_bytes) {
+    s.connections.read_buffer_high_water_bytes = deps_.read_buffer_high_water_bytes();
+  }
+
   if (deps_.hot_store != nullptr) {
     if (auto hs = deps_.hot_store->Stats(); hs.has_value()) {
       s.hot.key_count = hs->key_count;
@@ -198,6 +206,7 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
   if (deps_.cold_store != nullptr) {
     if (auto cs = deps_.cold_store->Stats(); cs.has_value()) {
       s.cold.key_count = cs->key_count;
+      s.cold.disk_bytes = cs->disk_bytes;
     }
   }
 
@@ -205,6 +214,8 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
     auto agg = deps_.cold_pool->Snapshot();
     s.cold.buffer.entries = agg.buffer_entries;
     s.cold.buffer.bytes = agg.buffer_bytes;
+    s.cold.buffer.oldest_entry_age_ms =
+        static_cast<uint64_t>(std::max<int64_t>(agg.oldest_unflushed_age.count(), 0));
   }
 
   // Aggregate per-shard consumer positions. Min/max captures shard skew

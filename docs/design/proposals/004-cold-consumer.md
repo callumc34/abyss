@@ -147,7 +147,14 @@ cold_consumer:
   queue_read_timeout_ms: 50
   retry_initial_backoff_ms: 50
   retry_max_backoff_ms: 30000
+  checkpoint_max_flushes: 32            # Checkpoint after this many applied batches
+  checkpoint_min_interval_ms: 50        # ...or this interval, whichever comes first
+  loop_initial_backoff_ms: 1            # Idle-loop backoff floor
+  loop_max_backoff_ms: 1000             # Idle-loop backoff ceiling
+  drain_grace_seconds: 15               # Bound on the graceful drain-and-flush
 ```
+
+The checkpoint knobs bound the cold durable-checkpoint cadence. The cold consumer's ack cannot pass data the last checkpoint has not made durable, so together they bound how far WAL retention release trails the applied frontier — trading checkpoint cost against retained WAL.
 
 ## Invariants
 

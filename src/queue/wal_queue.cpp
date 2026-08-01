@@ -1,9 +1,13 @@
 #include "abyss/queue/wal_queue.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iomanip>
+#include <optional>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include "abyss/log/log.h"
@@ -144,8 +148,44 @@ void WalQueue::RunReaper() {
   auto result = reaper_->RunOnce();
   if (!result.has_value()) {
     reaper_failures_.fetch_add(1, std::memory_order_relaxed);
+    metrics::Registry::Instance().Counter(metrics::names::kQueueReaperFailuresTotal).Increment();
     ABYSS_LOG_WARN("segment reaper failed", {"err", std::string_view{result.error().message()}});
+    return;
   }
+
+  const auto& outcome = *result;
+  if (outcome.failed > 0) {
+    reaper_failures_.fetch_add(outcome.failed, std::memory_order_relaxed);
+    metrics::Registry::Instance()
+        .Counter(metrics::names::kQueueReaperFailuresTotal)
+        .Increment(static_cast<double>(outcome.failed));
+    const std::string_view err = outcome.first_error.has_value()
+                                     ? std::string_view{outcome.first_error->message()}
+                                     : std::string_view{"unknown"};
+    ABYSS_LOG_WARN("segment reaper could not reclaim every eligible segment",
+                   {"failed", static_cast<uint64_t>(outcome.failed)},
+                   {"deleted", static_cast<uint64_t>(outcome.deleted)}, {"err", err});
+  }
+  RecordOldestEligibleUnreaped(outcome.oldest_eligible_unreaped);
+}
+
+void WalQueue::RecordOldestEligibleUnreaped(std::optional<core::WallTime> created_at) {
+  int64_t epoch_ms = kNoUnreapedEpochMs;
+  if (created_at.has_value()) {
+    const auto since_epoch = created_at->time_since_epoch();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(since_epoch);
+    epoch_ms = static_cast<int64_t>(ms.count());
+  }
+  oldest_eligible_unreaped_epoch_ms_.store(epoch_ms, std::memory_order_relaxed);
+}
+
+std::optional<core::Duration> WalQueue::OldestEligibleUnreapedAge() const {
+  const int64_t epoch_ms = oldest_eligible_unreaped_epoch_ms_.load(std::memory_order_relaxed);
+  if (epoch_ms == kNoUnreapedEpochMs) return std::nullopt;
+  const auto created_at = core::WallTime{
+      std::chrono::duration_cast<core::WallClock::duration>(std::chrono::milliseconds{epoch_ms})};
+  const auto age = std::chrono::duration_cast<core::Duration>(core::WallClock::now() - created_at);
+  return std::max(core::Duration::zero(), age);
 }
 
 core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {

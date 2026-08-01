@@ -94,22 +94,17 @@ Result<ParseResult> ParseErrorValue(std::span<const uint8_t> buf, size_t pos) {
     return std::unexpected(Incomplete("incomplete error"));
   }
   const std::string_view body = BufSlice(buf, pos, lf - 1);
-  auto space = body.find(' ');
-  if (space == std::string_view::npos) {
-    return ParseResult{.value = RespValue::Error(ErrorPrefix::kErr, std::string(body)),
-                       .bytes_consumed = lf + 1};
+  const auto space = body.find(' ');
+  std::optional<ErrorPrefix> prefix;
+  if (space != std::string_view::npos) {
+    prefix = LookupErrorPrefix(body.substr(0, space));
   }
-  auto prefix_text = body.substr(0, space);
-  auto prefix = LookupErrorPrefix(prefix_text);
-  std::string message;
-  if (prefix.has_value()) {
-    message = std::string(body.substr(space + 1));
-  } else {
-    // Unknown prefix — preserve entire body under kErr so AsString() round-trips.
-    prefix = ErrorPrefix::kErr;
-    message = std::string(body);
+  if (!prefix.has_value()) {
+    // No enumerated prefix to re-derive the body from: keep it verbatim so
+    // re-serialising reproduces the received bytes exactly.
+    return ParseResult{.value = RespValue::RawError(std::string(body)), .bytes_consumed = lf + 1};
   }
-  return ParseResult{.value = RespValue::Error(*prefix, std::move(message)),
+  return ParseResult{.value = RespValue::Error(*prefix, std::string(body.substr(space + 1))),
                      .bytes_consumed = lf + 1};
 }
 

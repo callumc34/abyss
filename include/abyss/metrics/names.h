@@ -273,9 +273,13 @@ struct HistogramDesc {
 
 namespace buckets {
 
-// Six decadal buckets from 100us to 10s. Covers the whole latency spectrum
-// we care about end-to-end without over-binning hot ranges.
-inline constexpr std::array<double, 6> kLatencySeconds{0.0001, 0.001, 0.01, 0.1, 1.0, 10.0};
+// Sub-100us resolution is load-bearing: the hot-read (<100us), hot-write (<50us) and
+// buffer-read (<50us) targets are unresolvable by histogram_quantile without boundaries
+// below them. Upper decades stay coarse so cold (5ms) and queue-append remain resolvable
+// without per-histogram bucket proliferation.
+inline constexpr std::array<double, 14> kLatencySeconds{0.00001, 0.000025, 0.00005, 0.0001, 0.00025,
+                                                        0.0005,  0.001,    0.0025,  0.005,  0.01,
+                                                        0.05,    0.1,      1.0,     10.0};
 
 // Power-of-ten buckets for batch sizes.
 inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
@@ -407,6 +411,16 @@ inline constexpr GaugeDesc<> kQueueDiskBytes{
     .help = "Queue WAL disk usage in bytes.",
 };
 
+inline constexpr CounterDesc<> kQueueReaperFailuresTotal{
+    .name = "abyss_queue_reaper_failures_total",
+    .help = "Segment removals the reaper could not complete; retention reclamation is stalled.",
+};
+
+inline constexpr GaugeDesc<> kQueueOldestEligibleUnreapedAgeSeconds{
+    .name = "abyss_queue_oldest_eligible_unreaped_age_seconds",
+    .help = "Age of the oldest reap-eligible segment still on disk; rises when reaping stalls.",
+};
+
 inline constexpr GaugeDesc<> kColdBufferEntries{
     .name = "abyss_cold_buffer_entries",
     .help = "Number of keys in the compaction buffer.",
@@ -476,6 +490,14 @@ inline constexpr GaugeDesc<> kColdCheckpointIntervalSeconds{
 inline constexpr CounterDesc<BackoffReason> kColdConsumerBackoffTotal{
     .name = "abyss_cold_consumer_backoff_total",
     .help = "Cold consumer loop backoff events by reason (idle, poisoned, backpressure).",
+};
+
+inline constexpr CounterDesc<> kColdUnsupportedOpTotal{
+    .name = "abyss_cold_unsupported_op_total",
+    .help =
+        "WAL writes whose command has no parser in this build. Skipped, not quarantined: no tier "
+        "materialised them, so hot and cold do not diverge. A rising value means the command "
+        "surface advertises more than the storage layer implements.",
 };
 
 inline constexpr CounterDesc<> kColdParsePoisonTotal{

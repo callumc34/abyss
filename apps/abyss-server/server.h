@@ -7,6 +7,7 @@
 #include "abyss/admin/health_handler.h"
 #include "abyss/admin/http_server.h"
 #include "abyss/admin/metrics_handler.h"
+#include "abyss/admin/metrics_snapshotter.h"
 #include "abyss/admin/ready_handler.h"
 #include "abyss/admin/status_handler.h"
 #include "abyss/config/config.h"
@@ -119,6 +120,8 @@ class Server {
   // Admin / metrics HTTP servers. Both are torn down at the head of Shutdown
   // so /ready flips to 503 before consumers stop, giving K8s its drain window.
   std::unique_ptr<StatusProviderImpl> status_provider_;
+  // Reads status_provider_; declared after it so it is destroyed first.
+  std::unique_ptr<admin::MetricsSnapshotter> metrics_snapshotter_;
   std::unique_ptr<admin::HealthHandler> health_handler_;
   std::unique_ptr<admin::ReadyHandler> ready_handler_;
   std::unique_ptr<admin::StatusHandler> status_handler_;

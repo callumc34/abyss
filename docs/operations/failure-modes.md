@@ -93,6 +93,18 @@ failure, an empty command, or an op with an empty primary key — it is a **pois
 decoder/format-skew bug, because hot already accepted the same bytes. Silently skipping it would
 let cold diverge from hot forever and would drop a delivered write from the cold view.
 
+**A missing parser is not a poison.** Quarantine applies only when a parser exists and rejects
+bytes hot accepted. If the command has no parser at all in this build, no tier could materialise
+it — hot rejected it too — so hot and cold already agree that the entry produced no state, and
+there is nothing for cold to be missing. Those entries are skipped and counted on
+`abyss_cold_unsupported_op_total`. Conflating the two would let any client pin a shard's WAL
+retention permanently by sending one command the registry advertises but the storage layer does
+not implement, which is a denial of service rather than a safety property.
+
+A rising `abyss_cold_unsupported_op_total` is not a data-loss signal, but it is a real defect
+signal: it means the command registry advertises a surface wider than the storage layer
+implements, and clients are getting apply-time errors for commands the server accepted.
+
 Instead the cold consumer **quarantines** the poison (fail-closed, invariant 5):
 
 - It does **not** advance its drained frontier or its persisted WAL ack past the poison seq. The
@@ -139,6 +151,36 @@ a delivered write.
 Do not raise the loop backoff ceiling as a "fix" — the backoff only prevents a busy-spin; it does
 not clear the poison. The pin is released only by a successful parse-and-apply (fix forward) or an
 explicit operator ack override (skip).
+
+## WAL Retention Reclamation Stalled
+
+The segment reaper deletes a sealed WAL segment once every consumer has acked past its last seq
+and its age exceeds `min_retention`. A removal can fail for reasons that have nothing to do with
+Abyss — a stale NFS handle, a permissions change, a file still held open by an external process.
+
+The sweep is **skip-and-continue**: a segment that cannot be removed does not abort the pass, so
+one stuck file cannot block reclamation of every later eligible segment. The failure is counted
+rather than swallowed, because an un-reclaimable segment is real disk pressure and invariant 5
+forbids degrading silently.
+
+**Observability:**
+
+- `abyss_queue_reaper_failures_total` — rising means removals are failing. Alert on
+  `rate(abyss_queue_reaper_failures_total[15m]) > 0`.
+- `abyss_queue_oldest_eligible_unreaped_age_seconds` — the leading indicator. Zero when nothing
+  eligible is stuck; a steadily rising value means reclamation is falling behind and the WAL PVC
+  will eventually fill. This is the gauge to page on, since a single stuck segment produces a
+  bounded failure count but an unbounded age.
+- `abyss_queue_disk_bytes` — confirms whether the stall is actually consuming disk.
+
+Note that a rising unreaped age does **not** by itself mean the reaper is broken. A consumer that
+legitimately has not acked yet — a lagging cold consumer, or a shard pinned by the poison
+quarantine above — holds segments back by design. Check `abyss_queue_reaper_failures_total` first:
+non-zero implicates the reaper, zero implicates a consumer that is not acking.
+
+**Recovery:** inspect the first-error message in the reaper's log line for the failing path, and
+resolve the underlying filesystem condition. The next sweep reclaims the segment with no operator
+action beyond that — the reaper retries every eligible segment on each pass.
 
 ## Cold Durability Checkpoint
 

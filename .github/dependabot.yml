@@ -13,3 +13,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+
+  # vcpkg manifest. Bumps builtin-baseline in vcpkg.json, which is the single
+  # pin behind RocksDB, prometheus-cpp, yaml-cpp, cpp-httplib, spdlog and gtest.
+  - package-ecosystem: vcpkg
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

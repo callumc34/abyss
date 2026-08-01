@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -859,6 +861,52 @@ TEST_F(CollectionsFixture, CollectionReadOnForeignCollectionReturnsWrongType) {
   auto zcard = store->Exec(core::ops::ZsetCard{.key = key});
   ASSERT_FALSE(zcard.has_value());
   EXPECT_EQ(zcard.error().code(), core::ErrorCode::kWrongType);
+}
+
+// COLD-4: the score-index CF holds one duplicate record per member, so counting
+// it into key_count double-counts every zset member. disk_bytes, being physical
+// footprint, must still span both column families.
+TEST_F(CollectionsFixture, StatsKeyCountExcludesZsetScoreIndex) {
+  auto store = OpenStore();
+  auto before = store->Stats();
+  ASSERT_TRUE(before.has_value());
+
+  constexpr size_t kMembers = 64;
+  std::vector<std::string> members;
+  members.reserve(kMembers);
+  for (size_t i = 0; i < kMembers; ++i) {
+    members.push_back("zset-member-with-some-length-" + std::to_string(i));
+  }
+  std::vector<core::ops::ZsetAdd::Entry> entries;
+  entries.reserve(kMembers);
+  for (size_t i = 0; i < kMembers; ++i) {
+    entries.push_back({.score = static_cast<double>(i), .member = members[i]});
+  }
+  std::string key = "z";
+  std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+  ASSERT_TRUE(store->Compact().has_value());
+
+  auto after = store->Stats();
+  ASSERT_TRUE(after.has_value());
+  ASSERT_GE(after->key_count, before->key_count);
+  const uint64_t added = after->key_count - before->key_count;
+  EXPECT_GE(added, kMembers);
+  EXPECT_LT(added, 2 * kMembers) << "score-index records counted into key_count";
+
+  // Both CFs hold roughly one record per member, so dropping either from
+  // disk_bytes would halve it relative to the SST bytes actually on disk. The
+  // 3/4 floor absorbs any obsolete SST RocksDB has not yet purged.
+  uint64_t sst_bytes = 0;
+  std::error_code iter_ec;
+  for (const auto& e : std::filesystem::recursive_directory_iterator(path_, iter_ec)) {
+    if (e.path().extension() != ".sst") continue;
+    std::error_code size_ec;
+    const auto size = e.file_size(size_ec);
+    if (!size_ec) sst_bytes += static_cast<uint64_t>(size);
+  }
+  ASSERT_GT(sst_bytes, 0U);
+  EXPECT_GE(after->disk_bytes * 4, sst_bytes * 3) << "disk_bytes dropped a column family";
 }
 
 TEST_F(CollectionsFixture, MatchingCollectionReadIsNotWrongType) {

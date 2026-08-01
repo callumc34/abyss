@@ -1,11 +1,14 @@
 #include "abyss/admin/http_server.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +30,19 @@ namespace abyss::admin {
 
 namespace {
 
+constexpr std::string_view kContentLengthHeader = "Content-Length";
+
+bool IsContentLength(std::string_view key) {
+  if (key.size() != kContentLengthHeader.size()) return false;
+  for (size_t i = 0; i < key.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(key[i])) !=
+        std::tolower(static_cast<unsigned char>(kContentLengthHeader[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 HttpMethod ParseMethod(const std::string& method) {
   if (method == "GET") return HttpMethod::kGet;
   if (method == "HEAD") return HttpMethod::kHead;
@@ -45,10 +61,22 @@ void TranslateRequest(const httplib::Request& src, HttpRequest& dst) {
 
 void TranslateResponse(const HttpResponse& src, httplib::Response& dst) {
   dst.status = src.status;
+  std::string content_length;
+  bool has_content_length = false;
   for (const auto& [key, value] : src.headers) {
+    if (IsContentLength(key)) {
+      content_length = value;
+      has_content_length = true;
+      continue;
+    }
     dst.set_header(key, value);
   }
   dst.set_content(src.body, src.content_type);
+  // cpp-httplib derives Content-Length from the body and stamps 0 on a bodyless
+  // response; an explicitly advertised length (HEAD) must survive that.
+  if (has_content_length && dst.body.empty()) {
+    dst.set_header(std::string(kContentLengthHeader), content_length);
+  }
 }
 
 }  // namespace
@@ -111,8 +139,13 @@ core::Result<void> HttpServer::Start() {
       abyss_res.headers["Allow"] = "GET, HEAD";
     } else {
       abyss_res = handler->Handle(abyss_req);
-      // HEAD: same headers as GET, empty body.
-      if (abyss_req.method == HttpMethod::kHead) abyss_res.body.clear();
+      // HEAD: same headers as GET (RFC 7231 4.3.2 — including the length GET
+      // would have sent), empty body.
+      if (abyss_req.method == HttpMethod::kHead) {
+        abyss_res.headers[std::string(kContentLengthHeader)] =
+            std::to_string(abyss_res.body.size());
+        abyss_res.body.clear();
+      }
     }
 
     TranslateResponse(abyss_res, res);

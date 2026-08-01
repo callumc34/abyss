@@ -111,7 +111,11 @@ int main(int argc, char* argv[]) {
     config = abyss::config::Config::Defaults();
     config.queue.wal_path = data_dir + "/wal";
     config.cold.data_path = data_dir + "/cold";
-    config.ApplyEnvironmentOverrides();
+    if (auto r = config.ApplyEnvironmentOverrides(); !r.has_value()) {
+      ABYSS_LOG_CRITICAL("environment override invalid",
+                         {"err", std::string_view{r.error().message()}});
+      return EXIT_FAILURE;
+    }
     if (auto r = config.Validate(); !r.has_value()) {
       ABYSS_LOG_CRITICAL("config invalid", {"err", std::string_view{r.error().message()}});
       return EXIT_FAILURE;

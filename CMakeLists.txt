@@ -5,6 +5,15 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
       CACHE STRING "Vcpkg toolchain file")
 endif()
 
+# The vcpkg toolchain resolves the manifest during project(), so the test
+# framework has to be requested before that. The presets set
+# VCPKG_MANIFEST_FEATURES in the cache; appending here shadows it for this
+# configure without disturbing the preset value. Mirrors the ABYSS_BUILD_TESTS
+# default (ON) for the case where the cache has not been primed yet.
+if(NOT DEFINED ABYSS_BUILD_TESTS OR ABYSS_BUILD_TESTS)
+  list(APPEND VCPKG_MANIFEST_FEATURES "tests")
+endif()
+
 project(abyss
   VERSION 0.1.0
   LANGUAGES CXX
@@ -208,17 +217,17 @@ endif()
 
 if(ABYSS_BUILD_TESTS)
   enable_testing()
-  include(FetchContent)
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.15.2
+  find_package(GTest CONFIG REQUIRED)
+  set_package_properties(GTest PROPERTIES
+    TYPE REQUIRED
+    DESCRIPTION "Google testing and mocking framework"
+    URL "https://github.com/google/googletest"
+    PURPOSE "Unit, component, integration and system test suites"
   )
-  FetchContent_MakeAvailable(googletest)
   include(cmake/abyss_testing.cmake)
 endif()
 
-if(ABYSS_BUILD_TESTS OR ABYSS_BUILD_BENCHMARKS OR ABYSS_BUILD_PERF)
+if(ABYSS_BUILD_TESTS OR ABYSS_BUILD_BENCHMARKS OR ABYSS_BUILD_PERF OR ABYSS_BUILD_FUZZ)
   add_subdirectory(tests)
 endif()
 

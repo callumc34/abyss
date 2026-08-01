@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "abyss/core/ascii.h"
+#include "abyss/core/ops.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
 #include "abyss/resp/admin_handlers.h"
@@ -185,6 +186,19 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       core::Result<RespValue> result;
       if (flags == core::PredicateFlags::kNone &&
           resolved.parent->dispatch == Dispatch::kWritePath) {
+        // Arity alone is a weaker check than the parser: `HSET k f v f` and
+        // `SET k v BOGUS` both satisfy the registry and are still malformed.
+        // Queueing them would durably record a command no tier can materialise,
+        // so validate against the canonical parser first and reject here. Only
+        // commands that have a parser are checked -- for the rest the registry
+        // is the sole authority and errors surface at apply time.
+        if (core::ops::HasWriteParser(parent.name)) {
+          auto validated = core::ops::ParseWriteOp(parent.name, cmd);
+          if (!validated.has_value()) {
+            return finish(RespValue::Error(MapErrorCode(validated.error().code()),
+                                           std::string{validated.error().message()}));
+          }
+        }
         result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
       } else {
         result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
@@ -308,6 +322,10 @@ RequestPipeline::DispatchOutcome RequestPipeline::HandleAdminStateless(
 
 RespValue RequestPipeline::HandlePing(const RespCommand& cmd) {
   if (cmd.ArgCount() == 1) return RespValue::SimpleString("PONG");
+  // Registry arity stays -1; the one-message upper bound is a PING-only rule.
+  if (cmd.ArgCount() > 2) {
+    return RespValue::Error(ErrorPrefix::kErr, "wrong number of arguments for 'ping' command");
+  }
   return RespValue::BulkString(cmd.args[1]);
 }
 

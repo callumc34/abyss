@@ -110,5 +110,58 @@ TEST_F(ColdConsumerPoolWaitTest, OutOfRangeShardReturnsFalse) {
   EXPECT_FALSE(pool->WaitForDrainedSeq(/*shard=*/2, /*target_seq=*/1, 5ms));
 }
 
+// --- COLDC-5: oldest_unflushed_age aggregation --------------------------------
+
+class ColdConsumerPoolMetricsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ON_CALL(queue_, Read(_, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
+    ON_CALL(queue_, Ack(_, _, _)).WillByDefault(Return(core::Result<void>{}));
+    ON_CALL(cold_, ApplyBatch(_, _)).WillByDefault(Return(core::Result<void>{}));
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  NiceMock<testing::MockQueue> queue_;
+  NiceMock<testing::MockColdStore> cold_;
+  testing::TestClock clock_;
+  core::EvictionPolicy policy_{core::EvictionTTL{3600}};
+  core::ConsumerRpc rpc_;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+
+  std::unique_ptr<ColdConsumerPool> MakePool(uint32_t shard_count = 2) {
+    return std::make_unique<ColdConsumerPool>(
+        queue_, cold_,
+        ColdConsumerPool::Config{.shard_count = shard_count,
+                                 .consumer = ColdConsumer::Config{.rng_seed = 42}},
+        policy_, rpc_, clock_.SteadyFn(), clock_.WallFn());
+  }
+};
+
+TEST_F(ColdConsumerPoolMetricsTest, OldestUnflushedAgeIsZeroWhenAllBuffersEmpty) {
+  auto pool = MakePool();
+  EXPECT_EQ(pool->Snapshot().oldest_unflushed_age, 0ms);
+}
+
+TEST_F(ColdConsumerPoolMetricsTest, OldestUnflushedAgeAggregatesMaxAcrossShards) {
+  auto pool = MakePool(/*shard_count=*/2);
+  EXPECT_CALL(queue_, Read(core::kColdConsumer, 0, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWrite(1)}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+  EXPECT_CALL(queue_, Read(core::kColdConsumer, 1, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWrite(2)}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+
+  pool->ConsumerFor(0).Drain();
+  clock_.Advance(8s);
+  pool->ConsumerFor(1).Drain();
+  clock_.Advance(5s);
+
+  ASSERT_EQ(pool->ConsumerFor(0).Snapshot().oldest_unflushed_age, 13000ms);
+  ASSERT_EQ(pool->ConsumerFor(1).Snapshot().oldest_unflushed_age, 5000ms);
+
+  // Max, not the sum (18s) and not the last shard's (5s).
+  EXPECT_EQ(pool->Snapshot().oldest_unflushed_age, 13000ms);
+}
+
 }  // namespace
 }  // namespace abyss::consumer

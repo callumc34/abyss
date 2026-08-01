@@ -48,6 +48,12 @@ void Server::Transition(LifecycleState next) {
 }
 
 bool Server::Initialize() {
+  // Honour the operator's metrics flag directly rather than relying on the
+  // scrape endpoint simply not being bound. Per ADP-012 a disabled registry
+  // scrapes empty while observation keeps updating state, so enabling it later
+  // does not require any component to consult a flag on a hot path.
+  metrics::Registry::Instance().SetEnabled(config_.metrics.enabled);
+
   if (config_.profile != "embedded") {
     ABYSS_LOG_CRITICAL("unsupported profile", {"profile", std::string_view{config_.profile}},
                        {"supported", std::string_view{"embedded"}});
@@ -183,6 +189,10 @@ bool Server::Initialize() {
                   .queue_read_timeout = config_.cold_consumer.queue_read_timeout,
                   .retry_initial_backoff = config_.cold_consumer.retry_initial_backoff,
                   .retry_max_backoff = config_.cold_consumer.retry_max_backoff,
+                  .checkpoint_max_flushes = config_.cold_consumer.checkpoint_max_flushes,
+                  .checkpoint_min_interval = config_.cold_consumer.checkpoint_min_interval,
+                  .loop_initial_backoff = config_.cold_consumer.loop_initial_backoff,
+                  .loop_max_backoff = config_.cold_consumer.loop_max_backoff,
               },
       },
       *eviction_policy_, *consumer_rpc_);
@@ -310,6 +320,18 @@ bool Server::Initialize() {
           [server_ptr = tcp_server_.get()] {
             return server_ptr != nullptr ? server_ptr->ActiveConnections() : size_t{0};
           },
+      .reaper_failures =
+          [queue_ptr = queue_.get()] {
+            return queue_ptr != nullptr ? queue_ptr->ReaperFailures() : uint64_t{0};
+          },
+      .oldest_eligible_unreaped_age_ms = [queue_ptr = queue_.get()]() -> uint64_t {
+        if (queue_ptr == nullptr) return 0;
+        const auto age = queue_ptr->OldestEligibleUnreapedAge();
+        return static_cast<uint64_t>(age.value_or(core::Duration::zero()).count());
+      },
+      .read_buffer_high_water_bytes = [server_ptr = tcp_server_.get()]() -> uint64_t {
+        return server_ptr != nullptr ? server_ptr->MaxReadBufferHighWaterBytes() : uint64_t{0};
+      },
       .resp_port =
           [server_ptr = tcp_server_.get()] {
             return server_ptr != nullptr ? server_ptr->BoundPort() : uint16_t{0};
@@ -317,6 +339,8 @@ bool Server::Initialize() {
       .admin_port = [this] { return AdminBoundPort(); },
       .metrics_port = [this] { return MetricsBoundPort(); },
   });
+
+  metrics_snapshotter_ = std::make_unique<admin::MetricsSnapshotter>(*status_provider_);
 
   health_handler_ = std::make_unique<admin::HealthHandler>();
   ready_handler_ = std::make_unique<admin::ReadyHandler>(admin::ReadyChecks{
@@ -445,7 +469,18 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
   NotifyReady();
   ABYSS_LOG_INFO("server ready");
 
+  // Snapshot gauges are pushed on their own cadence rather than the stop-poll:
+  // each Observe reads store statistics (including RocksDB property lookups),
+  // which are cheap but not free at the poll rate.
+  auto next_snapshot = std::chrono::steady_clock::now();
   while (!stop.load(std::memory_order_acquire) && tcp_server_->IsRunning()) {
+    if (metrics_snapshotter_) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_snapshot) {
+        metrics_snapshotter_->Observe();
+        next_snapshot = now + config_.metrics.snapshot_interval;
+      }
+    }
     std::this_thread::sleep_for(kStopPollInterval);
   }
 

@@ -5,6 +5,7 @@ add_executable(abyss_core_tests
   core/apply_notifier_test.cpp
   core/fire_and_forget_test.cpp
   core/ops_test.cpp
+  core/ops_set_test.cpp
   core/varint_test.cpp
   core/eviction_policy_test.cpp
   core/queue_entry_test.cpp
@@ -179,10 +180,12 @@ add_executable(abyss_net_tests
   net/connection_idle_test.cpp
   net/connection_lazy_arm_test.cpp
   net/connection_oversize_test.cpp
+  net/reactor_lifecycle_test.cpp
 )
 
 target_include_directories(abyss_net_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/net
+  ${PROJECT_SOURCE_DIR}/src/net
 )
 
 target_link_libraries(abyss_net_tests PRIVATE
@@ -196,6 +199,7 @@ add_executable(abyss_admin_tests
   admin/health_handler_test.cpp
   admin/ready_handler_test.cpp
   admin/metrics_handler_test.cpp
+  admin/metrics_snapshotter_test.cpp
   admin/status_handler_test.cpp
   admin/json_writer_test.cpp
 )

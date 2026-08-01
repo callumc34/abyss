@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 
 #include "abyss/config/config.h"
@@ -106,6 +107,68 @@ cold_consumer:
 )YAML");
   ASSERT_FALSE(cfg.has_value());
   EXPECT_NE(cfg.error().message().find("retry_initial_backoff"), std::string::npos);
+}
+
+TEST(ConfigValidate, AcceptsInRangeColdConsumerCheckpointKnobs) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+cold_consumer:
+  checkpoint_max_flushes: 8
+  checkpoint_min_interval_ms: 250
+  loop_initial_backoff_ms: 5
+  loop_max_backoff_ms: 2000
+)YAML");
+  ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
+  EXPECT_EQ(cfg->cold_consumer.checkpoint_max_flushes, 8U);
+  EXPECT_EQ(cfg->cold_consumer.checkpoint_min_interval, std::chrono::milliseconds{250});
+  EXPECT_EQ(cfg->cold_consumer.loop_initial_backoff, std::chrono::milliseconds{5});
+  EXPECT_EQ(cfg->cold_consumer.loop_max_backoff, std::chrono::milliseconds{2000});
+}
+
+TEST(ConfigValidate, RejectsZeroColdConsumerCheckpointMaxFlushes) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  checkpoint_max_flushes: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("cold_consumer.checkpoint_max_flushes"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroColdConsumerCheckpointInterval) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  checkpoint_min_interval_ms: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("cold_consumer.checkpoint_min_interval_ms"),
+            std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsNegativeColdConsumerCheckpointInterval) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  checkpoint_min_interval_ms: -1\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("checkpoint_min_interval_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsExcessiveColdConsumerCheckpointInterval) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  checkpoint_min_interval_ms: 60001\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("checkpoint_min_interval_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsZeroColdConsumerLoopBackoff) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  loop_initial_backoff_ms: 0\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("cold_consumer.loop_initial_backoff_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsNegativeColdConsumerLoopBackoff) {
+  auto cfg = Config::ParseFromYaml("cold_consumer:\n  loop_max_backoff_ms: -5\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("loop_max_backoff_ms"), std::string::npos);
+}
+
+TEST(ConfigValidate, RejectsColdConsumerLoopInitialBackoffAboveMax) {
+  auto cfg = Config::ParseFromYaml(R"YAML(
+cold_consumer:
+  loop_initial_backoff_ms: 2000
+  loop_max_backoff_ms: 100
+)YAML");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("loop_initial_backoff_ms"), std::string::npos);
 }
 
 TEST(ConfigValidate, RejectsUnknownFsyncPolicy) {

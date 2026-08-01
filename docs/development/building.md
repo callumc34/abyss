@@ -24,7 +24,9 @@ echo 'export VCPKG_ROOT=$HOME/.local/share/vcpkg' >> ~/.profile
 echo 'export PATH="$VCPKG_ROOT:$PATH"' >> ~/.profile
 ```
 
-The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies are declared in `vcpkg.json` and resolved automatically on configure.
+The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies are declared in `vcpkg.json` and resolved automatically on configure. Every dependency — including the test framework — is pinned by the manifest's `builtin-baseline`, so a configure pulls nothing from an unpinned source.
+
+The `tests` manifest feature (googletest) is requested by `CMakeLists.txt` whenever `ABYSS_BUILD_TESTS` is on, on top of whatever `VCPKG_MANIFEST_FEATURES` the preset selects. Configuring with `-DABYSS_BUILD_TESTS=OFF` (the `release` and `container` presets) leaves it out.
 
 ## Dependencies
 
@@ -38,7 +40,7 @@ The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies a
 | spdlog | Structured logging | MIT |
 | prometheus-cpp | Metrics export | MIT |
 | yaml-cpp | Configuration | MIT |
-| googletest | Testing | BSD |
+| googletest | Testing (optional, `tests` feature) | BSD |
 | benchmark | Microbenchmarks (optional, `benchmarks` feature) | Apache 2.0 |
 
 Optional (external profile):

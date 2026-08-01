@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -75,12 +76,19 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   uint64_t ReaperFailures() const { return reaper_failures_.load(std::memory_order_relaxed); }
 
+  // Age of the oldest segment the last sweep found eligible but could not
+  // remove; nullopt once retention reclaims everything it is allowed to.
+  [[nodiscard]] std::optional<core::Duration> OldestEligibleUnreapedAge() const;
+
  private:
+  static constexpr int64_t kNoUnreapedEpochMs = std::numeric_limits<int64_t>::min();
+
   explicit WalQueue(WalConfig config);
   core::Result<void> Initialize();
 
   core::Result<void> ValidateShard(core::ShardId shard) const;
   void RunReaper();
+  void RecordOldestEligibleUnreaped(std::optional<core::WallTime> created_at);
 
   bool IsVolatile(core::ConsumerId consumer) const;
   std::optional<core::SequenceId> GetOffset(core::ConsumerId consumer, core::ShardId shard) const;
@@ -89,6 +97,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   WalConfig config_;
   std::atomic<bool> recovering_{true};
   std::atomic<uint64_t> reaper_failures_{0};
+  std::atomic<int64_t> oldest_eligible_unreaped_epoch_ms_{kNoUnreapedEpochMs};
   std::vector<std::unique_ptr<ShardState>> shards_;
   std::unique_ptr<OffsetStore> offsets_;
   std::unique_ptr<SegmentReaper> reaper_;

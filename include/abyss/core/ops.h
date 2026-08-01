@@ -169,6 +169,11 @@ Result<ReadOp> ParseReadOp(std::string_view name, const RespCommand& cmd);
 uint64_t WallNowMs();
 Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd,
                              uint64_t wall_now_ms = WallNowMs());
+// False means no tier in this build can materialise the command, which is a
+// capability gap; a parser that exists and then rejects is malformed input.
+// The two failures need opposite handling and ParseWriteOp alone cannot
+// distinguish them -- both surface as an error.
+bool HasWriteParser(std::string_view name);
 
 std::string_view PrimaryKey(const ReadOp& op);
 std::string_view PrimaryKey(const WriteOp& op);

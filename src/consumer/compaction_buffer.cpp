@@ -328,6 +328,20 @@ std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeq() const
   return oldest;
 }
 
+std::optional<core::SteadyTime> CompactionBuffer::OldestFirstSeen() const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  if (entries_.empty()) return std::nullopt;
+  // entries_ is unordered and flush_heap_ is keyed on scheduled_time, not
+  // first_seen, so a scan is the only exact answer — same cost profile as
+  // OldestPendingSeq().
+  core::SteadyTime oldest = core::SteadyTime::max();
+  for (const auto& [_, entry] : entries_) {
+    oldest = std::min(oldest, entry.first_seen);
+  }
+  return oldest;
+}
+
 void CompactionBuffer::Clear() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   entries_.clear();

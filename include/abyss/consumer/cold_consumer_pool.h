@@ -37,6 +37,9 @@ class ColdConsumerPool : public CompactionBufferRouter {
     uint64_t retry_attempts = 0;
     uint64_t parse_failures = 0;
     uint32_t shards_in_aggressive_mode = 0;
+    // Max over shards, not a sum: the worst-lagging shard is the one racing the
+    // eviction deadline (ADP-004 lag monitoring).
+    std::chrono::milliseconds oldest_unflushed_age{0};
   };
 
   ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
