@@ -30,29 +30,17 @@ TEST(ColdDurabilityTest, ColdAckedPrefixSurvivesKillWithoutWalReplay) {
 
 #else
 
-#include <signal.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#if defined(__APPLE__)
-#include <crt_externs.h>
-#include <mach-o/dyld.h>
-#endif
-
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -67,6 +55,7 @@ TEST(ColdDurabilityTest, ColdAckedPrefixSurvivesKillWithoutWalReplay) {
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
 #include "abyss/queue/wal_queue.h"
+#include "crash_harness.h"
 
 namespace abyss::cold {
 namespace {
@@ -74,7 +63,7 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr const char* kVictimDirEnv = "ABYSS_COLD_DURABILITY_VICTIM_DIR";
-constexpr const char* kVictimFilter = "--gtest_filter=ColdDurabilityVictim.Run";
+constexpr const char* kVictimFilter = "ColdDurabilityVictim.Run";
 constexpr const char* kReadyFileName = "victim.ready";
 constexpr core::ShardId kShard = 0;
 constexpr uint32_t kShardCount = 1;
@@ -84,7 +73,6 @@ constexpr int kDurableKeys = 24;
 // Checkpoint is stubbed out, i.e. the exact mutant this file exists to catch.
 constexpr int kMutantKeys = 8;
 constexpr auto kReadyDeadline = 90s;
-constexpr auto kReadyPollInterval = 2ms;
 
 // WAL seq range an arm appended, and the offset its cold consumer persisted.
 struct ArmReport {
@@ -206,28 +194,20 @@ void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, 
   out->ack = *ack;
 }
 
-// Published under a rename so the parent can never read a partial record.
-void PublishReport(const std::filesystem::path& dir, const VictimReport& report) {
-  const auto tmp = dir / "victim.ready.tmp";
-  {
-    std::ofstream out(tmp, std::ios::trunc);
-    ASSERT_TRUE(out.good());
-    // Fixed field order: durable {first,last,ack}, then mutant {first,last,ack}.
-    out << report.durable.first << ' ' << report.durable.last << ' ' << report.durable.ack << ' '
-        << report.mutant.first << ' ' << report.mutant.last << ' ' << report.mutant.ack << '\n';
-    ASSERT_TRUE(out.good());
-  }
-  std::error_code ec;
-  std::filesystem::rename(tmp, dir / kReadyFileName, ec);
-  ASSERT_FALSE(ec) << ec.message();
+// Fixed field order: durable {first,last,ack}, then mutant {first,last,ack}.
+std::string SerializeReport(const VictimReport& report) {
+  std::ostringstream out;
+  out << report.durable.first << ' ' << report.durable.last << ' ' << report.durable.ack << ' '
+      << report.mutant.first << ' ' << report.mutant.last << ' ' << report.mutant.ack << '\n';
+  return out.str();
 }
 
 TEST(ColdDurabilityVictim, Run) {
-  const char* dir_env = std::getenv(kVictimDirEnv);
-  if (dir_env == nullptr) {
+  bool is_victim = false;
+  const auto dir = abyss::testing::VictimDirFromEnv(kVictimDirEnv, &is_victim);
+  if (!is_victim) {
     GTEST_SKIP() << "crash victim; driven out-of-process by ColdDurabilityTest";
   }
-  const std::filesystem::path dir{dir_env};
 
   const core::EvictionPolicy eviction{core::EvictionTTL{86400}};
   core::ConsumerRpc rpc;
@@ -249,78 +229,18 @@ TEST(ColdDurabilityVictim, Run) {
   ASSERT_NO_FATAL_FAILURE(
       RunArm(**mutant_queue, stubbed_cold, "b", kMutantKeys, eviction, rpc, &report.mutant));
 
-  ASSERT_NO_FATAL_FAILURE(PublishReport(dir, report));
-
-  // Park with every queue and cold store still open and undestroyed. A clean
+  // Parks with every queue and cold store still open and undestroyed. A clean
   // shutdown would flush RocksDB's WAL buffer and erase the distinction under
   // test; the parent SIGKILLs us here instead.
-  for (;;) {
-    ::pause();
-  }
+  abyss::testing::SignalReadyAndPark(dir, kReadyFileName, SerializeReport(report));
 }
 
 // ---------------------------------------------------------------------------
 // Parent process
 // ---------------------------------------------------------------------------
 
-char** CurrentEnviron() {
-#if defined(__APPLE__)
-  return *_NSGetEnviron();
-#else
-  return environ;
-#endif
-}
-
-std::optional<std::filesystem::path> SelfExecutablePath() {
-  std::filesystem::path raw;
-#if defined(__APPLE__)
-  constexpr size_t kMaxPathBytes = 4096;
-  std::string buf(kMaxPathBytes, '\0');
-  auto size = static_cast<uint32_t>(buf.size());
-  if (_NSGetExecutablePath(buf.data(), &size) != 0) return std::nullopt;
-  buf.resize(std::strlen(buf.c_str()));
-  raw = buf;
-#else
-  std::error_code link_ec;
-  raw = std::filesystem::read_symlink("/proc/self/exe", link_ec);
-  if (link_ec) return std::nullopt;
-#endif
-  std::error_code ec;
-  auto resolved = std::filesystem::weakly_canonical(raw, ec);
-  return ec ? raw : resolved;
-}
-
-// Re-execs this test binary filtered to the victim test. GTEST_* variables are
-// dropped from the child environment so an inherited filter, shard index or
-// output path cannot silently turn the victim into a no-op.
-pid_t SpawnVictim(const std::filesystem::path& exe, const std::filesystem::path& dir) {
-  std::string exe_arg = exe.string();
-  std::string filter_arg = kVictimFilter;
-  std::vector<char*> argv{exe_arg.data(), filter_arg.data(), nullptr};
-
-  std::vector<std::string> env_storage;
-  for (char** e = CurrentEnviron(); e != nullptr && *e != nullptr; ++e) {
-    const std::string_view entry{*e};
-    if (entry.starts_with("GTEST_")) continue;
-    env_storage.emplace_back(entry);
-  }
-  env_storage.emplace_back(std::string(kVictimDirEnv) + "=" + dir.string());
-
-  std::vector<char*> envp;
-  envp.reserve(env_storage.size() + 1);
-  for (auto& entry : env_storage) envp.push_back(entry.data());
-  envp.push_back(nullptr);
-
-  pid_t pid = -1;
-  if (::posix_spawn(&pid, exe_arg.c_str(), nullptr, nullptr, argv.data(), envp.data()) != 0) {
-    return -1;
-  }
-  return pid;
-}
-
-std::optional<VictimReport> ReadReport(const std::filesystem::path& path) {
-  std::ifstream in(path);
-  if (!in) return std::nullopt;
+std::optional<VictimReport> ParseReport(const std::string& payload) {
+  std::istringstream in(payload);
   VictimReport report;
   in >> report.durable.first >> report.durable.last >> report.durable.ack >> report.mutant.first >>
       report.mutant.last >> report.mutant.ack;
@@ -346,37 +266,27 @@ class ColdDurabilityTest : public ::testing::Test {
 
   // Runs the victim to its ready point and kills it there.
   void CrashVictim() {
-    const auto exe = SelfExecutablePath();
-    ASSERT_TRUE(exe.has_value()) << "could not resolve this test binary's path";
-    const pid_t pid = SpawnVictim(*exe, tmp_dir_);
-    ASSERT_GT(pid, 0) << "posix_spawn of the crash victim failed";
+    const auto outcome = abyss::testing::SpawnAndKillVictim(abyss::testing::VictimSpec{
+        .gtest_filter = kVictimFilter,
+        .dir_env_var = kVictimDirEnv,
+        .dir = tmp_dir_,
+        .ready_file_name = kReadyFileName,
+        .ready_deadline = kReadyDeadline,
+    });
 
-    const auto ready_path = tmp_dir_ / kReadyFileName;
-    const auto deadline = std::chrono::steady_clock::now() + kReadyDeadline;
-    bool ready = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (std::filesystem::exists(ready_path)) {
-        ready = true;
-        break;
-      }
-      int early_status = 0;
-      if (::waitpid(pid, &early_status, WNOHANG) == pid) {
-        FAIL() << "crash victim exited before signalling ready (raw status " << early_status << ")";
-      }
-      std::this_thread::sleep_for(kReadyPollInterval);
-    }
-
-    ASSERT_EQ(::kill(pid, SIGKILL), 0);
-    int status = 0;
-    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
-    ASSERT_TRUE(ready) << "crash victim never reached its ready point";
-    ASSERT_NE(WIFSIGNALED(status), 0)
+    ASSERT_TRUE(outcome.error.empty()) << outcome.error;
+    ASSERT_TRUE(outcome.reached_ready) << "crash victim never reached its ready point";
+    ASSERT_TRUE(outcome.died_by_signal)
         << "victim must die by signal: a clean exit flushes RocksDB's WAL buffer and the test "
            "would prove nothing";
-    EXPECT_EQ(WTERMSIG(status), SIGKILL);
+    EXPECT_EQ(outcome.term_signal, SIGKILL);
 
-    auto report = ReadReport(ready_path);
-    ASSERT_TRUE(report.has_value()) << "victim report unreadable";
+    auto report = ParseReport(outcome.ready_payload);
+    ASSERT_TRUE(report.has_value())
+        << "victim report unreadable: '" << outcome.ready_payload << "'";
+    // ASSERT_TRUE above returns from this void function when the optional is
+    // empty; the analyser does not model gtest's macro expansion.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     report_ = *report;
   }
 
@@ -418,6 +328,8 @@ TEST_F(ColdDurabilityTest, ColdAckedPrefixSurvivesKillWithoutWalReplay) {
         << ", but '" << key
         << "' is absent from cold's stable storage after SIGKILL. An acked WAL prefix is reapable, "
            "so this write is recoverable from neither tier.";
+    // Guarded by the ASSERT_TRUE above; see the note at report_ assignment.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     EXPECT_EQ(*value, ValueFor(index));
   }
 }

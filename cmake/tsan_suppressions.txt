@@ -11,4 +11,15 @@
 #
 # Our usage (concurrent Get + Delete, concurrent Get + WriteBatch) is within
 # RocksDB's supported thread-safety contract.
-race:rocksdb::
+#
+# These patterns name RocksDB's lock-free internals specifically. A bare
+# `race:rocksdb::` was previously used and is NOT acceptable: suppressions match
+# ANY frame in the stack, so it silenced genuine races in our own cold-write
+# path the moment the stack passed through a RocksDB frame -- which it always
+# does, since that is how we reach the store. Narrowing restores visibility of
+# abyss-side races while keeping the known-unprovable skiplist noise quiet.
+race:rocksdb::InlineSkipList
+race:rocksdb::SkipList
+race:rocksdb::MemTable
+race:rocksdb::LRUCacheShard
+race:rocksdb::ClockCacheShard
