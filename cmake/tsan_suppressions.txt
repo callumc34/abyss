@@ -23,3 +23,21 @@ race:rocksdb::SkipList
 race:rocksdb::MemTable
 race:rocksdb::LRUCacheShard
 race:rocksdb::ClockCacheShard
+
+# Group-commit write protocol. Concurrent DB::Write from multiple threads is
+# explicitly supported by RocksDB, and it is implemented as a leader/follower
+# handoff: one writer becomes leader for a batch group and drives the others
+# through a state machine of atomics plus a lazily constructed per-writer mutex.
+# TSAN cannot prove the handoff establishes happens-before, so it reports the
+# state transitions as races between whichever threads happen to be writing.
+#
+# Added after narrowing the bare race:rocksdb:: prefix surfaced 18 reports of
+# this shape across two independent call paths -- per-shard Wipe from the cold
+# consumers, and ApplyBatch from the flush path -- with both sides of each race
+# landing inside WriteThread. See abyss#146 for the stacks. Our own frames sit
+# only at the DB::Write call, which is the supported entry point.
+#
+# Narrow on purpose: this names the write-coordination machinery and nothing
+# else, so a genuine race in our cold-store code remains visible even when its
+# stack passes through a RocksDB write.
+race:rocksdb::WriteThread

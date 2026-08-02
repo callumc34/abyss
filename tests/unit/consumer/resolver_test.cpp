@@ -9,6 +9,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -82,17 +83,33 @@ class ResolverTest : public ::testing::Test {
   }
 
   // MockQueue::Append: records the appended entry and returns a synthetic seq.
+  //
+  // ResolverRunTest drives a live Resolver thread, so this runs off that thread
+  // while the test body polls appended_ from the main one. Both sides take
+  // appended_mu_; the threaded tests read through the accessors below rather
+  // than touching the vector directly.
   void StubQueueAppendCapture() {
     EXPECT_CALL(queue_, Append(_, _))
         .WillRepeatedly([this](core::ShardId /*shard*/,
                                core::QueueEntry entry) -> core::Result<queue::AppendResult> {
+          std::promise<core::Result<void>> p;
+          p.set_value(core::Result<void>{});
+          const std::scoped_lock lock(appended_mu_);
           const auto seq = next_appended_seq_++;
           entry.seq = seq;
           appended_.push_back(std::move(entry));
-          std::promise<core::Result<void>> p;
-          p.set_value(core::Result<void>{});
           return queue::AppendResult{.seq = seq, .durable = p.get_future()};
         });
+  }
+
+  size_t AppendedSize() {
+    const std::scoped_lock lock(appended_mu_);
+    return appended_.size();
+  }
+
+  std::vector<core::QueueEntry> AppendedSnapshot() {
+    const std::scoped_lock lock(appended_mu_);
+    return appended_;
   }
 
   void StubQueueAck() {
@@ -167,6 +184,7 @@ class ResolverTest : public ::testing::Test {
   core::ConsumerRpc rpc_;
   core::ApplyNotifier apply_notifier_;
   Resolver::Config config_;
+  std::mutex appended_mu_;
   std::vector<core::QueueEntry> appended_;
   core::SequenceId next_appended_seq_ = 1000;
   // Test-controlled durable watermark for the durability-clamp tests. Default
@@ -366,11 +384,11 @@ TEST_F(ResolverRunTest, StripeLocksReleasedBeforeHotApplyWait) {
   // waiter, confirming the resolver is parked in AwaitApplied (not holding a
   // stripe lock).
   const auto deadline = std::chrono::steady_clock::now() + 3s;
-  while ((appended_.empty() || apply_notifier_.PendingCount() == 0) &&
+  while ((AppendedSize() == 0 || apply_notifier_.PendingCount() == 0) &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(5ms);
   }
-  EXPECT_EQ(appended_.size(), 1U);
+  EXPECT_EQ(AppendedSize(), 1U);
   EXPECT_EQ(apply_notifier_.PendingCount(), 1U);
 
   // Release the parked wait so teardown does not block the full 10s.
@@ -399,14 +417,15 @@ TEST_F(ResolverRunTest, ConditionalStillSerialisesSameKeyInQueueOrder) {
   apply_notifier_.NotifyApplied(0, 4000);  // let both waits resolve
 
   const auto deadline = std::chrono::steady_clock::now() + 3s;
-  while (appended_.size() < 2 && std::chrono::steady_clock::now() < deadline) {
+  while (AppendedSize() < 2 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(5ms);
   }
   resolver.Stop();
 
-  ASSERT_EQ(appended_.size(), 2U);
-  const auto* first = std::get_if<core::entry::Resolved>(&appended_[0].payload);
-  const auto* second = std::get_if<core::entry::Resolved>(&appended_[1].payload);
+  ASSERT_EQ(AppendedSize(), 2U);
+  const auto snapshot = AppendedSnapshot();
+  const auto* first = std::get_if<core::entry::Resolved>(&snapshot[0].payload);
+  const auto* second = std::get_if<core::entry::Resolved>(&snapshot[1].payload);
   ASSERT_NE(first, nullptr);
   ASSERT_NE(second, nullptr);
   EXPECT_EQ(first->ref, 10U);
@@ -440,10 +459,10 @@ TEST_F(ResolverRunTest, AckClampedBehindNonDurableResolved) {
   // Wait until the Resolved has been appended (the resolver has processed the
   // Conditional). The ack must remain clamped below the Conditional's seq.
   const auto deadline = std::chrono::steady_clock::now() + 3s;
-  while (appended_.empty() && std::chrono::steady_clock::now() < deadline) {
+  while (AppendedSize() == 0 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(5ms);
   }
-  ASSERT_EQ(appended_.size(), 1U);
+  ASSERT_EQ(AppendedSize(), 1U);
   // Give the Run loop several ack cycles to (incorrectly) advance, if it would.
   std::this_thread::sleep_for(100ms);
   EXPECT_LT(acked_seq_.load(), 10U) << "ack advanced past Conditional before Resolved durable";
@@ -493,7 +512,7 @@ TEST_F(ResolverRunTest, ConditionalDurabilityTimeoutReturnsError) {
   EXPECT_TRUE(reply.IsError()) << reply.AsString();
   EXPECT_GE(resolver.GetSnapshot().durable_wait_timeouts, 1U);
   // The Resolved was still appended (durable in the WAL, will apply on catch-up).
-  ASSERT_EQ(appended_.size(), 1U);
+  ASSERT_EQ(AppendedSize(), 1U);
 }
 
 TEST_F(ResolverTest, RecoveryRebuildsCacheFromExistingResolved) {
@@ -520,7 +539,7 @@ TEST_F(ResolverTest, RecoveryRebuildsCacheFromExistingResolved) {
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
   ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
 
-  EXPECT_TRUE(appended_.empty());  // no new Resolveds emitted
+  EXPECT_TRUE(AppendedSize() == 0);  // no new Resolveds emitted
   EXPECT_EQ(resolver.GetSnapshot().replayed_resolveds_emitted, 0U);
 }
 
@@ -816,7 +835,7 @@ TEST_F(ResolverTest, RecoveryAckGatedOnReemittedResolvedDurability) {
   EXPECT_LT(acked_seq_.load(), 10U) << "acked past dangling before re-emitted Resolved durable";
   EXPECT_GE(resolver.GetSnapshot().durable_wait_timeouts, 1U);
   // The re-decided Resolved WAS appended (durable in the WAL, just not fsynced).
-  ASSERT_FALSE(appended_.empty());
+  ASSERT_FALSE(AppendedSize() == 0);
 
   // Now the re-emitted Resolved is durable: a retry of the replay advances the
   // terminal ack past the dangling.
