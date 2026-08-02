@@ -568,8 +568,8 @@ TEST_F(ResolverTest, SetWithRelativeExThenSetNxSeesLiveKeyAndSkips) {
 TEST_F(ResolverTest, SetWithRelativeExNotTreatedAsExpiredImmediately) {
   StubQueueReadOnce({
       MakeWriteAt(10, {"SET", "k", "v", "PX", "60000"}, At(2'000'000)),
-      MakeConditionalAt(11, {"SET", "k", "v2", "XX", "KEEPTTL"}, core::PredicateFlags::kXx,
-                        At(2'000'001)),
+      MakeConditionalAt(11, {"SET", "k", "v2", "XX", "KEEPTTL"},
+                        core::PredicateFlags::kXx | core::PredicateFlags::kKeepTtl, At(2'000'001)),
   });
   StubQueueAppendCapture();
   StubQueueAck();

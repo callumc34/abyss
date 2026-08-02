@@ -175,6 +175,14 @@ Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd,
 // distinguish them -- both surface as an error.
 bool HasWriteParser(std::string_view name);
 
+// The one form of `op` that gets written to the WAL: aliases collapsed
+// (SETEX/PSETEX -> SET), relative TTLs already absolute (EX/PX -> PXAT). Its
+// contract is a round trip -- ParseWriteOp on the result reproduces `op` --
+// which is what keeps replies and tier behaviour identical to the client's
+// original spelling. HMSET therefore stays HMSET: it is a distinct WriteOp
+// carrying a distinct reply, not a spelling of HSET.
+RespCommand CanonicalCommand(const WriteOp& op);
+
 std::string_view PrimaryKey(const ReadOp& op);
 std::string_view PrimaryKey(const WriteOp& op);
 

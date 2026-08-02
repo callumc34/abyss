@@ -1,9 +1,11 @@
 #include "abyss/core/ops.h"
 
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #include "abyss/core/types.h"
@@ -426,6 +428,105 @@ Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd, uint
 }
 
 bool HasWriteParser(std::string_view name) { return WriteParsers().contains(name); }
+
+namespace {
+
+// Shortest representation that from_chars reproduces bit-for-bit. std::to_string
+// would round to 6 decimals and silently change scores on the way to the WAL.
+std::string ScoreToString(double score) {
+  std::array<char, 40> buf{};
+  const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), score);
+  if (ec != std::errc{}) return "0";
+  return {buf.data(), ptr};
+}
+
+// Sized up front and filled by emplace: an initializer_list would copy every
+// argument (its elements are const, so they cannot be moved from) and an
+// unreserved vector would then realloc its way up. Both matter here -- this
+// runs once per write, on the client's thread.
+RespCommand Begin(std::string_view name, size_t arg_count) {
+  RespCommand cmd;
+  cmd.args.reserve(arg_count);
+  cmd.args.emplace_back(name);
+  return cmd;
+}
+
+void PushAll(RespCommand& cmd, const std::vector<std::string_view>& values) {
+  for (const auto& v : values) cmd.args.emplace_back(v);
+}
+
+}  // namespace
+
+RespCommand CanonicalCommand(const WriteOp& op) {
+  return std::visit(
+      [](const auto& o) -> RespCommand {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, StringSet>) {
+          auto cmd = Begin("SET", o.abs_ttl_ms > 0 ? 5 : 3);
+          cmd.args.emplace_back(o.key);
+          cmd.args.emplace_back(o.value);
+          if (o.abs_ttl_ms > 0) {
+            cmd.args.emplace_back("PXAT");
+            cmd.args.emplace_back(std::to_string(o.abs_ttl_ms));
+          }
+          return cmd;
+        } else if constexpr (std::is_same_v<T, Del>) {
+          auto cmd = Begin("DEL", 1 + o.keys.size());
+          PushAll(cmd, o.keys);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, SetAdd>) {
+          auto cmd = Begin("SADD", 2 + o.members.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.members);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, SetRem>) {
+          auto cmd = Begin("SREM", 2 + o.members.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.members);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, ZsetAdd>) {
+          auto cmd = Begin("ZADD", 2 + (2 * o.entries.size()));
+          cmd.args.emplace_back(o.key);
+          for (const auto& e : o.entries) {
+            cmd.args.push_back(ScoreToString(e.score));
+            cmd.args.emplace_back(e.member);
+          }
+          return cmd;
+        } else if constexpr (std::is_same_v<T, ZsetRem>) {
+          auto cmd = Begin("ZREM", 2 + o.members.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.members);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, HashSet> || std::is_same_v<T, HashMSet>) {
+          // HMSET acknowledges with OK where HSET returns a count, so they are
+          // distinct ops and must stay distinct commands.
+          constexpr std::string_view kName = std::is_same_v<T, HashSet> ? "HSET" : "HMSET";
+          auto cmd = Begin(kName, 2 + (2 * o.fields.size()));
+          cmd.args.emplace_back(o.key);
+          for (const auto& f : o.fields) {
+            cmd.args.emplace_back(f.field);
+            cmd.args.emplace_back(f.value);
+          }
+          return cmd;
+        } else if constexpr (std::is_same_v<T, HashDel>) {
+          auto cmd = Begin("HDEL", 2 + o.fields.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.fields);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, Expire>) {
+          auto cmd = Begin("PEXPIREAT", 3);
+          cmd.args.emplace_back(o.key);
+          cmd.args.push_back(std::to_string(o.abs_ttl_ms));
+          return cmd;
+        } else {
+          static_assert(std::is_same_v<T, Persist>);
+          auto cmd = Begin("PERSIST", 2);
+          cmd.args.emplace_back(o.key);
+          return cmd;
+        }
+      },
+      op);
+}
 
 std::string_view PrimaryKey(const ReadOp& op) {
   return std::visit(

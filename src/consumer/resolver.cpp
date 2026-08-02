@@ -396,51 +396,37 @@ struct SetParse {
   std::string error;
 };
 
-SetParse ParseSetArgs(const core::RespCommand& cmd, uint64_t now_ms) {
+// The predicate comes from the entry's flags, never from re-reading the command
+// text. Those are two representations of one decision, and re-deriving here is
+// how they drift: the frontend already extracted the flags, validated their
+// combinations, and recorded them in the entry (ADP-011 -- a Conditional is
+// "op + predicate"). Only the operand data -- key, value, absolute TTL -- is
+// read from the command, and that goes through the canonical parser rather than
+// a second hand-rolled one.
+SetParse ParseSetArgs(const core::RespCommand& cmd, core::PredicateFlags flags, uint64_t now_ms) {
   SetParse out;
-  if (cmd.args.size() < 3) {
-    out.error = "wrong number of arguments for 'SET'";
-    return out;
-  }
-  out.key = cmd.args[1];
-  out.value = cmd.args[2];
-  for (size_t i = 3; i < cmd.args.size(); ++i) {
-    const auto opt = AsciiUpper(cmd.args[i]);
-    if (opt == "NX") {
-      out.nx = true;
-    } else if (opt == "XX") {
-      out.xx = true;
-    } else if (opt == "GET") {
-      out.get = true;
-    } else if (opt == "KEEPTTL") {
-      out.keep_ttl = true;
-    } else if (opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") {
-      if (i + 1 >= cmd.args.size()) {
-        out.error = "syntax error after '" + opt + "'";
-        return out;
-      }
-      uint64_t v = 0;
-      if (!ParseUint64(cmd.args[++i], v)) {
-        out.error = "value is not an integer";
-        return out;
-      }
-      if (opt == "EX")
-        out.abs_ttl_ms = now_ms + (v * 1000);
-      else if (opt == "PX")
-        out.abs_ttl_ms = now_ms + v;
-      else if (opt == "EXAT")
-        out.abs_ttl_ms = v * 1000;
-      else
-        out.abs_ttl_ms = v;
-    } else {
-      out.error = "syntax error: unknown SET option '" + opt + "'";
-      return out;
-    }
-  }
+  out.nx = core::HasFlag(flags, core::PredicateFlags::kNx);
+  out.xx = core::HasFlag(flags, core::PredicateFlags::kXx);
+  out.get = core::HasFlag(flags, core::PredicateFlags::kGet);
+  out.keep_ttl = core::HasFlag(flags, core::PredicateFlags::kKeepTtl);
+
   if (out.nx && out.xx) {
     out.error = "syntax error — NX and XX are mutually exclusive";
     return out;
   }
+  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, now_ms);
+  if (!op.has_value()) {
+    out.error = std::string{op.error().message()};
+    return out;
+  }
+  const auto* set = std::get_if<core::ops::StringSet>(&*op);
+  if (set == nullptr) {
+    out.error = "internal: SET did not parse to a string-set op";
+    return out;
+  }
+  out.key = set->key;
+  out.value = set->value;
+  out.abs_ttl_ms = set->abs_ttl_ms;
   out.valid = true;
   return out;
 }
@@ -485,7 +471,7 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
                        .get = false,
                        .valid = cmd.args.size() == 3,
                        .error = cmd.args.size() != 3 ? "wrong number of arguments" : std::string{}}
-            : ParseSetArgs(cmd, now_ms);
+            : ParseSetArgs(cmd, cond.flags, now_ms);
     if (!parsed.valid) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr, parsed.error));
@@ -564,26 +550,17 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
                                                   "wrong number of arguments for 'ZADD'"));
     }
-    bool nx = false;
-    bool xx = false;
-    bool gt = false;
-    bool lt = false;
-    bool ch = false;
+    // Predicate from the entry, not from re-reading the tokens; see ParseSetArgs.
+    const bool nx = core::HasFlag(cond.flags, core::PredicateFlags::kNx);
+    const bool xx = core::HasFlag(cond.flags, core::PredicateFlags::kXx);
+    const bool gt = core::HasFlag(cond.flags, core::PredicateFlags::kZAddGt);
+    const bool lt = core::HasFlag(cond.flags, core::PredicateFlags::kZAddLt);
+    const bool ch = core::HasFlag(cond.flags, core::PredicateFlags::kZAddCh);
+    // The tokens are still skipped to find where the score-member pairs start.
     size_t i = 2;
     for (; i < cmd.args.size(); ++i) {
       const auto opt = AsciiUpper(cmd.args[i]);
-      if (opt == "NX")
-        nx = true;
-      else if (opt == "XX")
-        xx = true;
-      else if (opt == "GT")
-        gt = true;
-      else if (opt == "LT")
-        lt = true;
-      else if (opt == "CH")
-        ch = true;
-      else
-        break;
+      if (opt != "NX" && opt != "XX" && opt != "GT" && opt != "LT" && opt != "CH") break;
     }
     if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -662,26 +639,11 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     else
       requested_abs_ttl = ttl_arg;
 
-    bool nx = false;
-    bool xx = false;
-    bool gt = false;
-    bool lt = false;
-    for (size_t j = 3; j < cmd.args.size(); ++j) {
-      const auto opt = AsciiUpper(cmd.args[j]);
-      if (opt == "NX") {
-        nx = true;
-      } else if (opt == "XX") {
-        xx = true;
-      } else if (opt == "GT") {
-        gt = true;
-      } else if (opt == "LT") {
-        lt = true;
-      } else {
-        parse_failures_.fetch_add(1, std::memory_order_relaxed);
-        return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                    "syntax error: unknown EXPIRE option"));
-      }
-    }
+    // Predicate from the entry, not from re-reading the tokens; see ParseSetArgs.
+    const bool nx = core::HasFlag(cond.flags, core::PredicateFlags::kNx);
+    const bool xx = core::HasFlag(cond.flags, core::PredicateFlags::kXx);
+    const bool gt = core::HasFlag(cond.flags, core::PredicateFlags::kExpireGt);
+    const bool lt = core::HasFlag(cond.flags, core::PredicateFlags::kExpireLt);
     if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,

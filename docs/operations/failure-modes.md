@@ -102,8 +102,13 @@ retention permanently by sending one command the registry advertises but the sto
 not implement, which is a denial of service rather than a safety property.
 
 A rising `abyss_cold_unsupported_op_total` is not a data-loss signal, but it is a real defect
-signal: it means the command registry advertises a surface wider than the storage layer
-implements, and clients are getting apply-time errors for commands the server accepted.
+signal. Live traffic can no longer produce one: the registry only advertises an unconditional
+write when a typed-operation parser backs it, and a unit test asserts that agreement. So a
+non-zero counter on a running node means the log contains entries written by a build whose
+command surface was wider than this one's — a downgrade, a mixed-version rollout, or a data
+directory restored from a newer node. Check the binary version that wrote the affected segments
+before assuming the entries are benign; they were skipped, which is safe for tier agreement but
+means those writes are absent from both tiers.
 
 Instead the cold consumer **quarantines** the poison (fail-closed, invariant 5):
 

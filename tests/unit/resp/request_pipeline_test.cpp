@@ -50,20 +50,26 @@ class StubDispatcher : public core::CommandDispatcher {
  public:
   int flush_calls = 0;
   int write_calls = 0;
+  int conditional_calls = 0;
   core::FlushTarget last_target = core::FlushTarget::kThisDb;
+  core::RespCommand last_write;
+  core::RespCommand last_conditional;
 
   core::Result<core::RespValue> DispatchRead(std::string_view /*name*/,
                                              const core::RespCommand& /*cmd*/) override {
     return core::RespValue::Null();
   }
   core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/,
-                                              core::RespCommand /*cmd*/) override {
+                                              core::RespCommand cmd) override {
     ++write_calls;
+    last_write = std::move(cmd);
     return core::RespValue::SimpleString("OK");
   }
   core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
-                                                    core::RespCommand /*cmd*/,
+                                                    core::RespCommand cmd,
                                                     core::PredicateFlags /*flags*/) override {
+    ++conditional_calls;
+    last_conditional = std::move(cmd);
     return core::RespValue::SimpleString("OK");
   }
   core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
@@ -229,6 +235,55 @@ TEST(RequestPipelineTest, SetWithUnknownOptionIsRejectedBeforeDispatch) {
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
   EXPECT_EQ(dispatcher.write_calls, 0);
+}
+
+// ENGINE-10: the same malformed SET with a leading NX routes down the
+// conditional branch. That branch used to append without ever consulting the
+// parser, so the syntax error surfaced only in the resolver -- after the write
+// was durable. Both branches now validate before dispatch.
+TEST(RequestPipelineTest, SetNxWithUnknownOptionIsRejectedBeforeDispatch) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n$5\r\nBOGUS\r\n"),
+                   output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
+  EXPECT_EQ(dispatcher.conditional_calls, 0);
+  EXPECT_EQ(dispatcher.write_calls, 0);
+}
+
+// A well-formed conditional still reaches the resolver with the client's own
+// spelling: canonicalising it would strip the predicate tokens that Decide
+// reads out of the command text.
+TEST(RequestPipelineTest, SetNxDispatchesConditionallyUncanonicalised) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n"), output);
+  EXPECT_EQ(dispatcher.conditional_calls, 1);
+  EXPECT_EQ(dispatcher.last_conditional.args, (std::vector<std::string>{"SET", "k", "v", "NX"}));
+}
+
+// Unconditional writes reach the queue canonicalised: SETEX and SET..EX are the
+// same op, so the WAL carries one spelling with the TTL already absolute.
+TEST(RequestPipelineTest, UnconditionalWriteIsCanonicalisedBeforeDispatch) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"), output);
+  ASSERT_EQ(dispatcher.write_calls, 1);
+  const auto& args = dispatcher.last_write.args;
+  ASSERT_EQ(args.size(), 5U);
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], "k");
+  EXPECT_EQ(args[2], "v");
+  EXPECT_EQ(args[3], "PXAT");
+  EXPECT_GT(std::stoull(args[4]), 0U);
 }
 
 TEST(RequestPipelineTest, SetWithTtlOptionStillDispatches) {

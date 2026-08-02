@@ -296,5 +296,111 @@ TEST(PrimaryKeyTest, ExtractsFromWriteOps) {
   EXPECT_EQ(PrimaryKey(WriteOp{del}), "x");
 }
 
+// --- CanonicalCommand -------------------------------------------------------
+//
+// The canonical form is what reaches the WAL, so its contract is a round trip:
+// re-parsing it must reproduce the op the client's spelling produced. That is
+// what makes canonicalising invisible to hot, to cold, and to the reply -- all
+// three are pure functions of the WriteOp.
+
+// Every spelling in this table must collapse to the same canonical bytes AND
+// the same op. `now_ms` is fixed so relative TTLs are comparable.
+constexpr uint64_t kNow = 1'700'000'000'000;
+
+void ExpectRoundTrip(const RespCommand& original) {
+  auto op = ParseWriteOp(original.Name(), original, kNow);
+  ASSERT_TRUE(op.has_value()) << original.Name();
+  const auto canonical = CanonicalCommand(*op);
+  auto reparsed = ParseWriteOp(canonical.Name(), canonical, kNow);
+  ASSERT_TRUE(reparsed.has_value()) << "canonical form does not re-parse: " << canonical.Name();
+  EXPECT_EQ(op->index(), reparsed->index()) << "canonical form changed the op variant";
+  EXPECT_EQ(CanonicalCommand(*reparsed).args, canonical.args)
+      << "canonicalisation is not idempotent";
+}
+
+TEST(CanonicalCommandTest, RoundTripsEveryWriteOp) {
+  const std::vector<RespCommand> cases{
+      RespCommand{{"SET", "k", "v"}},
+      RespCommand{{"SET", "k", "v", "EX", "60"}},
+      RespCommand{{"SET", "k", "v", "PXAT", "1700000060000"}},
+      RespCommand{{"SETEX", "k", "60", "v"}},
+      RespCommand{{"PSETEX", "k", "60000", "v"}},
+      RespCommand{{"DEL", "k"}},
+      RespCommand{{"UNLINK", "k"}},
+      RespCommand{{"SADD", "s", "a", "b"}},
+      RespCommand{{"SREM", "s", "a"}},
+      RespCommand{{"ZADD", "z", "1.5", "m", "2", "n"}},
+      RespCommand{{"ZREM", "z", "m"}},
+      RespCommand{{"HSET", "h", "f", "v"}},
+      RespCommand{{"HMSET", "h", "f", "v"}},
+      RespCommand{{"HDEL", "h", "f"}},
+      RespCommand{{"EXPIRE", "k", "60"}},
+      RespCommand{{"PEXPIRE", "k", "60000"}},
+      RespCommand{{"EXPIREAT", "k", "1700000060"}},
+      RespCommand{{"PEXPIREAT", "k", "1700000060000"}},
+      RespCommand{{"PERSIST", "k"}},
+  };
+  for (const auto& c : cases) {
+    ExpectRoundTrip(c);
+  }
+}
+
+// WriteOp holds views into the command it was parsed from, so the canonical
+// command must outlive anything parsed out of it. Named locals, never a
+// temporary threaded straight into ParseWriteOp.
+RespCommand Canonicalise(const RespCommand& original) {
+  auto op = ParseWriteOp(original.Name(), original, kNow);
+  EXPECT_TRUE(op.has_value()) << original.Name();
+  return op.has_value() ? CanonicalCommand(*op) : RespCommand{};
+}
+
+// The four TTL spellings differ only in how they say "when"; canonicalising
+// resolves that to one absolute instant, so the WAL carries one form.
+TEST(CanonicalCommandTest, TtlSpellingsCollapseToPxat) {
+  const RespCommand expected{{"SET", "k", "v", "PXAT", std::to_string(kNow + 60000)}};
+  EXPECT_EQ(Canonicalise(RespCommand{{"SET", "k", "v", "EX", "60"}}).args, expected.args);
+  EXPECT_EQ(Canonicalise(RespCommand{{"SET", "k", "v", "PX", "60000"}}).args, expected.args);
+  EXPECT_EQ(Canonicalise(RespCommand{{"SETEX", "k", "60", "v"}}).args, expected.args);
+}
+
+// HMSET replies +OK where HSET replies with a count, so they are different ops
+// and must stay different commands. Collapsing them would corrupt the reply.
+TEST(CanonicalCommandTest, HmsetIsNotCollapsedToHset) {
+  EXPECT_EQ(Canonicalise(RespCommand{{"HSET", "h", "f", "v"}}).Name(), "HSET");
+  EXPECT_EQ(Canonicalise(RespCommand{{"HMSET", "h", "f", "v"}}).Name(), "HMSET");
+}
+
+// Scores go through double -> text -> double on the way to the WAL. to_string
+// would round to 6 decimals; the shortest-round-trip form must not.
+TEST(CanonicalCommandTest, ZaddScoresSurviveTextRoundTrip) {
+  const RespCommand original{
+      {"ZADD", "z", "3.141592653589793", "pi", "-0.1", "neg", "1e300", "big"}};
+  auto op = ParseWriteOp("ZADD", original, kNow);
+  ASSERT_TRUE(op.has_value());
+  const auto canonical = CanonicalCommand(*op);
+  auto reparsed = ParseWriteOp("ZADD", canonical, kNow);
+  ASSERT_TRUE(reparsed.has_value());
+
+  const auto& before = std::get<ZsetAdd>(*op).entries;
+  const auto& after = std::get<ZsetAdd>(*reparsed).entries;
+  ASSERT_EQ(before.size(), after.size());
+  for (size_t i = 0; i < before.size(); ++i) {
+    EXPECT_DOUBLE_EQ(before[i].score, after[i].score);
+    EXPECT_EQ(before[i].member, after[i].member);
+  }
+}
+
+// Expire{0} means "expire now"; Persist means "clear the TTL". The canonical
+// forms must keep them apart or a PERSIST replays as an immediate deletion.
+TEST(CanonicalCommandTest, ExpireZeroIsDistinctFromPersist) {
+  const auto expire_now = CanonicalCommand(WriteOp{Expire{.key = "k", .abs_ttl_ms = 0}});
+  const auto persist = CanonicalCommand(WriteOp{Persist{.key = "k"}});
+  EXPECT_NE(expire_now.Name(), persist.Name());
+
+  auto reparsed = ParseWriteOp(expire_now.Name(), expire_now, kNow);
+  ASSERT_TRUE(reparsed.has_value());
+  EXPECT_TRUE(std::holds_alternative<Expire>(*reparsed));
+}
+
 }  // namespace
 }  // namespace abyss::core::ops

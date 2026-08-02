@@ -3,12 +3,39 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <string>
 #include <string_view>
+#include <vector>
+
+#include "abyss/core/ops.h"
 
 namespace abyss::resp {
 namespace {
 
 using Status = CommandRegistry::ResolveStatus;
+
+// Advertising a write command that no tier can materialise means accepting it,
+// durably logging it, and only then failing at apply -- and until the registry
+// was trimmed it also meant a WAL entry that no build could ever replay. The
+// registry and the parser table have to agree, so assert it rather than trust
+// two hand-maintained lists to stay in step.
+//
+// Fan-out writes are exempt: the engine decomposes them into per-key commands
+// before anything is queued, so MSET never needs a parser of its own.
+// Conditional writes are exempt: the resolver materialises them into concrete
+// ops, which is the only correct home for read-modify-write commands here.
+TEST(CommandRegistryTest, EveryUnconditionalWriteCommandHasAParser) {
+  CommandRegistry reg;
+  std::vector<std::string> missing;
+  for (const auto& spec : reg.All()) {
+    if (spec.dispatch != Dispatch::kWritePath) continue;
+    if (spec.multi_key_kind != core::MultiKeyKind::kNone) continue;
+    if (!core::ops::HasWriteParser(spec.name)) missing.emplace_back(spec.name);
+  }
+  EXPECT_TRUE(missing.empty())
+      << "registered as an unconditional write but no core::ops parser exists: "
+      << ::testing::PrintToString(missing);
+}
 
 TEST(CommandRegistryTest, FindsKnownCommand) {
   CommandRegistry reg;

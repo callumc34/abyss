@@ -277,9 +277,11 @@ TEST_F(ColdConsumerTest, WriteWithNoParserIsSkippedNotPoisoned) {
   cfg.jitter_fraction = 0.0;
   auto c = MakeConsumer(cfg);
 
-  // INCR is registered as a write command but no tier implements a typed op for
-  // it, so hot could not materialise it either. Quarantining here would let any
-  // client pin this shard's WAL retention forever with one ordinary command.
+  // A WAL entry naming a command this build has no parser for. The frontend can
+  // no longer produce one -- the registry only advertises unconditional writes
+  // that a parser backs -- but replaying a log written by a build with a wider
+  // command surface still can, which is exactly the skew this gate exists for.
+  // Quarantining instead would pin the shard's WAL retention forever.
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"INCR", "counter"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "k", "v"}));

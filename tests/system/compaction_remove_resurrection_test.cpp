@@ -127,6 +127,15 @@ TEST_F(RemoveResurrectionTest, HashFieldDeletedAfterFlushDoesNotResurrect) {
         .value_or(0.0);
   };
 
+  // Load-bearing, not hygiene: the fixture's readiness probe still holds a
+  // buffer entry whose flush lands mid-test. Without draining it first, the
+  // window-1 wait below can be satisfied by the PROBE's flush while `h` is
+  // still buffered -- and then HSET and HDEL compact into a single entry, so
+  // the cross-window delete this test exists to guard is never exercised and
+  // the test passes anyway.
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
+
   // Snapshot the eviction baseline before any write: the key evicts exactly
   // once and may do so before the window-2 flush completes, so snapshotting it
   // later would race the eviction and wait for a second one that never comes.
@@ -183,6 +192,12 @@ TEST_F(RemoveResurrectionTest, DelThenReaddDoesNotResurrectColdSetMembers) {
     return ParseCounter(Scrape(mport), "abyss_cold_flush_total", {{"status", "success"}})
         .value_or(0.0);
   };
+
+  // Same hazard as above: an undrained probe entry lets the window-1 wait pass
+  // on the probe's flush, collapsing DEL + re-add into one buffer entry and
+  // silently skipping the leading-Del path under test.
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
 
   const double before_evicted = ParseCounter(Scrape(mport), "abyss_evicted_total").value_or(0.0);
 

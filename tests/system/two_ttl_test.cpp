@@ -143,6 +143,11 @@ TEST_F(TwoTtlSystemTest, EvictionMovesEveryTypeToCold) {
   // and share the same eviction worker, so a single poll on
   // abyss_evicted_total covers all four removals.
   const uint16_t mport = Server().MetricsPort();
+  // The flush precondition below is "at least one batch since baseline", which
+  // the fixture probe's own flush would satisfy without any of this test's
+  // writes reaching cold -- leaving the reads to be served from the buffer.
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
   const double evicted_before = ParseCounter(Scrape(mport), "abyss_evicted_total").value_or(0.0);
   const double ttl_expired_hot_before =
       ParseCounter(Scrape(mport), "abyss_ttl_expired_total", {{"tier", "hot"}}).value_or(0.0);
@@ -249,6 +254,8 @@ TEST_F(TwoTtlSystemTest, AbsoluteTtlDeletesEveryTypeFromAllTiers) {
 
 TEST_F(TwoTtlSystemTest, EvictionMovesTierThenTtlDeletesAllTypes) {
   const uint16_t mport = Server().MetricsPort();
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
   const double evicted_before = ParseCounter(Scrape(mport), "abyss_evicted_total").value_or(0.0);
   const double ttl_expired_hot_before =
       ParseCounter(Scrape(mport), "abyss_ttl_expired_total", {{"tier", "hot"}}).value_or(0.0);

@@ -117,6 +117,12 @@ class TieredReadTest : public IsolatedDataServerTest {
 TEST_F(TieredReadTest, NaturalFlowHotEvictsThenColdPromotesBackToHot) {
   const uint16_t mport = Server().MetricsPort();
 
+  // Drain the fixture probe: if its flush satisfies the quiet-flush wait below
+  // while `k` is still buffered, the post-eviction read is served from the
+  // buffer and the cold-hit and promotion waits both time out.
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
+
   const double baseline_hot =
       ParseCounter(Scrape(mport), "abyss_hits_total", {{"tier", "hot"}}).value_or(0.0);
   const double baseline_cold =

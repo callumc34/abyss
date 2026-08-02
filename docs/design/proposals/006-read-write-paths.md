@@ -153,6 +153,14 @@ Every read records which tier served the response:
 - `abyss_misses_total` — key not found in any tier
 - `abyss_promotions_total` — cold hits promoted back to hot
 
+### Canonical form on the write path
+
+An unconditional write is parsed once, at the frontend, before anything reaches the queue, and it is the parsed form — re-expressed canonically — that gets appended. Canonical means one spelling per operation: command aliases collapsed (`SETEX` and `SET ... EX` become the same `SET`), and relative TTLs already resolved to the absolute instant they denote. The contract is a round trip: re-parsing the canonical form must reproduce the operation the client's original spelling produced. That is what keeps the change invisible to the reply and to both tiers, since a reply and a tier mutation are each a pure function of the parsed operation. Commands that are distinct operations stay distinct commands even where their arguments coincide — `HMSET` acknowledges with `OK` where `HSET` returns a count, so it is not a spelling of `HSET`.
+
+Two properties follow. Malformed input cannot be made durable, because a command that does not parse never reaches the append; the parse *is* the validation, rather than a separate check that could drift from it. And every reader of the log — hot, cold, the resolver, recovery — sees one spelling with nothing left to re-derive, so there is no opportunity for two readers to derive different meanings from the same entry. Absolute TTLs in particular are fixed at the moment of the write rather than recomputed against each entry's append timestamp, which removes replay's dependence on that timestamp agreeing across tiers.
+
+Conditional writes are validated the same way but are appended in the client's own spelling, because the resolver reads the predicate out of the command text when it decides. Commands with no parser in the build are exempt from validation entirely: that is a capability gap rather than malformed input, and the command registry remains the sole authority for them.
+
 ## Invariants
 
 1. Reads check tiers in order: hot → buffer → cold. No tier is skipped.

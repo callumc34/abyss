@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -183,23 +184,39 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         }
         flags = *extracted;
       }
-      core::Result<RespValue> result;
-      if (flags == core::PredicateFlags::kNone &&
-          resolved.parent->dispatch == Dispatch::kWritePath) {
-        // Arity alone is a weaker check than the parser: `HSET k f v f` and
-        // `SET k v BOGUS` both satisfy the registry and are still malformed.
-        // Queueing them would durably record a command no tier can materialise,
-        // so validate against the canonical parser first and reject here. Only
-        // commands that have a parser are checked -- for the rest the registry
-        // is the sole authority and errors surface at apply time.
-        if (core::ops::HasWriteParser(parent.name)) {
-          auto validated = core::ops::ParseWriteOp(parent.name, cmd);
-          if (!validated.has_value()) {
-            return finish(RespValue::Error(MapErrorCode(validated.error().code()),
-                                           std::string{validated.error().message()}));
-          }
+      // Arity alone is a weaker check than the parser: `HSET k f v f` and
+      // `SET k v BOGUS` both satisfy the registry and are still malformed.
+      // Queueing either would durably record a command no tier can materialise,
+      // so the parser decides before anything reaches the queue. Commands with
+      // no parser are exempt: that is a capability gap, not malformed input, and
+      // the registry stays the sole authority for them.
+      const bool unconditional =
+          flags == core::PredicateFlags::kNone && parent.dispatch == Dispatch::kWritePath;
+      const bool parseable = core::ops::HasWriteParser(parent.name);
+
+      std::optional<RespCommand> canonical;
+      if (parseable) {
+        auto parsed = core::ops::ParseWriteOp(parent.name, cmd);
+        if (!parsed.has_value()) {
+          return finish(RespValue::Error(MapErrorCode(parsed.error().code()),
+                                         std::string{parsed.error().message()}));
         }
-        result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
+        // Unconditional writes are logged in canonical form -- aliases collapsed,
+        // TTLs already absolute -- so hot, cold and recovery all read one
+        // spelling and cannot derive different meanings from it. Conditionals
+        // keep the client's spelling: the resolver reads its predicate from the
+        // command text, not from the entry's flags.
+        if (unconditional) canonical = core::ops::CanonicalCommand(*parsed);
+      }
+
+      core::Result<RespValue> result;
+      if (unconditional) {
+        // parent.name, not the canonical name: it is registry-owned and stable,
+        // and no dispatcher reads it -- passing canonical.Name() here would race
+        // the move below on unspecified argument evaluation order.
+        result = canonical.has_value()
+                     ? deps_.dispatcher->DispatchWrite(parent.name, *std::move(canonical))
+                     : deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
       } else {
         result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
       }
