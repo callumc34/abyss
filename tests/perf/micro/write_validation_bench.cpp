@@ -1,7 +1,12 @@
-// Cost of the frontend write-validation parse, against the work the write path
-// already does either side of it. ENGINE-7 added a canonical-parser check before
-// the queue append; these measure what that check costs and what the two obvious
-// cheaper shapes save, so the trade is a number rather than an argument.
+// What it costs the write path to parse a command once at the frontend and
+// dispatch it in canonical form, measured against the work already happening
+// either side of it -- so that trade is a number rather than an argument.
+//
+// The headline comparison is BM_ValidateAndCanonicalise (current) against
+// BM_ValidateThenDeepCopy (what it replaced: validate, discard the result, then
+// deep-copy the client's command into the dispatcher). Canonicalising replaces
+// that copy rather than adding to it. BM_RespParseCommand is the anchor: the
+// decode that produced the command in the first place, on the same thread.
 
 #include <benchmark/benchmark.h>
 
@@ -103,8 +108,10 @@ void BM_WallNowMsOnly(benchmark::State& state, const RespCommand& cmd) {
   }
 }
 
-// Already on the same path at request_pipeline.cpp:202 -- DispatchWrite takes
-// RespCommand by value, so every argument string is deep-copied.
+// What canonicalising replaced. DispatchWrite takes RespCommand by value, so
+// before the frontend produced a canonical command of its own it deep-copied
+// the client's -- every argument string. Still the cost for a command with no
+// parser, which now means replay-only paths rather than anything from the wire.
 void BM_CommandDeepCopy(benchmark::State& state, const RespCommand& cmd) {
   for (auto _ : state) {
     RespCommand copy(cmd);
