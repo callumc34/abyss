@@ -14,6 +14,8 @@ if(NOT DEFINED ABYSS_BUILD_TESTS OR ABYSS_BUILD_TESTS)
   list(APPEND VCPKG_MANIFEST_FEATURES "tests")
 endif()
 
+include(cmake/abyss_tsan_triplet.cmake)
+
 project(abyss
   VERSION 0.1.0
   LANGUAGES CXX

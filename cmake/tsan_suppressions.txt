@@ -1,43 +1,11 @@
 # ThreadSanitizer suppressions for the abyss test binaries.
 #
-# Entries match any frame in the race's stack. Prefer narrow patterns so that
-# genuine races in our own code remain visible.
-
-# RocksDB's default memtable uses a lock-free skiplist for concurrent reads and
-# writes. The algorithm is correct by construction (release-sequence reasoning
-# on skiplist links) but TSAN cannot prove the invariants and flags the raw
-# memory accesses. This is a long-standing, well-known RocksDB+TSAN issue:
-# https://github.com/facebook/rocksdb/wiki/ThreadSanitizer
+# Entries match any frame in the race's stack, so a broad pattern silences
+# genuine races in our own code whenever the stack passes through the named
+# code. Every entry must name the specific construct TSAN cannot reason about
+# and say why the access is safe.
 #
-# Our usage (concurrent Get + Delete, concurrent Get + WriteBatch) is within
-# RocksDB's supported thread-safety contract.
-#
-# These patterns name RocksDB's lock-free internals specifically. A bare
-# `race:rocksdb::` was previously used and is NOT acceptable: suppressions match
-# ANY frame in the stack, so it silenced genuine races in our own cold-write
-# path the moment the stack passed through a RocksDB frame -- which it always
-# does, since that is how we reach the store. Narrowing restores visibility of
-# abyss-side races while keeping the known-unprovable skiplist noise quiet.
-race:rocksdb::InlineSkipList
-race:rocksdb::SkipList
-race:rocksdb::MemTable
-race:rocksdb::LRUCacheShard
-race:rocksdb::ClockCacheShard
-
-# Group-commit write protocol. Concurrent DB::Write from multiple threads is
-# explicitly supported by RocksDB, and it is implemented as a leader/follower
-# handoff: one writer becomes leader for a batch group and drives the others
-# through a state machine of atomics plus a lazily constructed per-writer mutex.
-# TSAN cannot prove the handoff establishes happens-before, so it reports the
-# state transitions as races between whichever threads happen to be writing.
-#
-# Added after narrowing the bare race:rocksdb:: prefix surfaced 18 reports of
-# this shape across two independent call paths -- per-shard Wipe from the cold
-# consumers, and ApplyBatch from the flush path -- with both sides of each race
-# landing inside WriteThread. See abyss#146 for the stacks. Our own frames sit
-# only at the DB::Write call, which is the supported entry point.
-#
-# Narrow on purpose: this names the write-coordination machinery and nothing
-# else, so a genuine race in our cold-store code remains visible even when its
-# stack passes through a RocksDB write.
-race:rocksdb::WriteThread
+# Dependencies are built instrumented (cmake/triplets/*-linux-tsan.cmake), so a
+# report inside RocksDB or any other dependency is either a real race or needs
+# its own justified entry here. Do not reintroduce library-wide patterns such as
+# race:rocksdb:: -- they existed only to paper over the uninstrumented build.

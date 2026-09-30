@@ -73,7 +73,7 @@ ctest --preset default
 | `default` | Debug | On | Development build |
 | `release` | Release | Off | Optimised build |
 | `asan` | Debug | On | Address sanitizer + undefined behaviour sanitizer |
-| `tsan` | Debug | On | Thread sanitizer |
+| `tsan` | Debug | On | Thread sanitizer, instrumented dependencies (Linux only) |
 | `ubsan` | Debug, `-O1` | On | Standalone undefined behaviour sanitizer |
 | `bench` | Release | Off | Benchmarks enabled (pulls in `benchmark` via vcpkg) |
 | `container` | Release | Off | Static-linked binary for container images (Linux only) |
@@ -103,6 +103,8 @@ Sanitizer wiring is centralised in `cmake/abyss_sanitizers.cmake` and selected v
 | `thread` | ThreadSanitizer |
 | `address+undefined` | AddressSanitizer + default UBSan check group, used by the `asan` preset |
 | `undefined` | Default UBSan check group + `float-divide-by-zero`, used by the `ubsan` preset |
+
+ThreadSanitizer only sees synchronisation performed by instrumented code, so the `tsan` preset builds every vcpkg dependency with `-fsanitize=thread` as well, via the `x64-linux-tsan` / `arm64-linux-tsan` overlay triplets in `cmake/triplets/`. Linking an uninstrumented dependency (the default triplet) turns its internal locking into false race reports, hides genuine races that pass through it, and drops its frames from the reported stacks. `cmake/abyss_tsan_triplet.cmake` selects the triplet for the host architecture and refuses to configure a TSAN build against any other triplet, so reuse of a build directory configured without it fails at configure time rather than producing misleading reports. The triplets build dependencies release-only: the point is to make their synchronisation visible, not to run their debug assertions, and a release RocksDB keeps both the cold dependency build and TSAN runtime tractable. Instrumented triplets exist for Linux only; TSAN is not usable on Apple Silicon macOS regardless. The preset drops the `perf` feature because the `tsan` test preset excludes every perf label. Runtime suppressions live in `cmake/tsan_suppressions.txt`, and every entry must name the specific construct TSAN cannot reason about.
 
 The default `-fsanitize=undefined` check group covers signed-integer-overflow, bounds, null, alignment, shift, vptr, return, unreachable, vla-bound, enum, builtin, pointer-overflow, object-size, and integer-divide-by-zero. The `ubsan` preset adds `float-divide-by-zero` (not in the default group on either compiler).
 
