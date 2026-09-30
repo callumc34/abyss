@@ -4,7 +4,8 @@
 
 - **Language:** C++23
 - **Build system:** CMake 3.25+ with presets, vcpkg for dependency management
-- **Compiler targets:** GCC 13+, Clang 17+, Apple Clang 17+
+- **Compiler targets:** GCC 13+, Clang 17+, Apple Clang from Xcode 26.5+ (the verified minimum)
+- **Standard library:** must provide floating-point `std::from_chars`. Configure checks this and fails fast. libstdc++ from GCC 11+ and the Xcode 26.5 libc++ do; the Xcode 15.4 libc++ does not
 - **Container target:** Distroless
 
 ## Prerequisites
@@ -120,7 +121,7 @@ Third-party headers pulled into our translation units (RocksDB, hiredis, libstdc
 |--------|---------|-------------|
 | `ABYSS_BUILD_TESTS` | `ON` | Build test targets |
 | `ABYSS_BUILD_BENCHMARKS` | `OFF` | Build benchmark targets |
-| `ABYSS_WERROR` | `OFF` | Treat warnings as errors |
+| `ABYSS_WERROR` | `OFF` | Treat warnings as errors. Every preset sets it `ON`, so local, container and CI builds fail on the same warnings |
 | `ABYSS_STRICT_WARNINGS` | `OFF` | Enable additional warning flags beyond -Wall -Wextra -Wpedantic |
 | `ABYSS_SANITIZER` | `none` | Sanitizer to enable (`none`, `address`, `thread`, `undefined`, `address+undefined`) |
 

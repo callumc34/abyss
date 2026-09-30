@@ -29,6 +29,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FeatureSummary)
+include(cmake/abyss_toolchain_checks.cmake)
 include(cmake/abyss_compiler_options.cmake)
 include(cmake/abyss_sanitizers.cmake)
 
