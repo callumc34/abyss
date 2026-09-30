@@ -80,6 +80,8 @@ Resolved   { type = 0x02,
 
 `Predicate` is a bitmask (`PredicateFlags`, uint16_t) over the conditional forms: NX, XX, GET, KEEPTTL, ZADD GT/LT/CH, MSETNX, EXPIRE GT/LT. Flags are combinable (e.g. SET NX GET has both kNx and kGet set). Mutually exclusive flags (NX/XX, GT/LT) are validated at parse time. The bitmask is stored as a uint16_t LE in the WAL entry body — new flags can be added in upper bits without breaking older decoders. See `include/abyss/core/predicate.h` for the current flag set.
 
+**The bitmask is the predicate.** A `Conditional` entry is an operation plus a predicate, and the bitmask is that predicate — not a cached hint alongside a command that also spells it out. The resolver reads its predicate from the flags and never re-derives it by re-reading the option tokens in the command text; it reads only the operand data — key, value, absolute TTL, score-member pairs — from the command, and does so through the canonical parser rather than a private one. The frontend is the single place a predicate is extracted from client syntax, and it is where mutually-exclusive combinations are rejected. Two representations of one decision, both live, is a divergence waiting to happen: whichever one a reader consults silently wins, and nothing forces them to agree.
+
 ### The Resolver
 
 A new in-process consumer thread, peer to hot and cold:

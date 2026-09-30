@@ -31,7 +31,7 @@ class ServerStatsImpl : public resp::ServerStatsProvider {
 
   ServerStatsImpl(core::Queue& queue, core::HotStore& hot, core::ColdStore* cold,
                   std::string version, std::string bind_address, std::string advertise_address,
-                  std::string mode, uint16_t tcp_port);
+                  std::string mode, uint16_t tcp_port, uint32_t shard_count);
 
   void SetTcpPort(uint16_t port) noexcept;
 
@@ -49,6 +49,7 @@ class ServerStatsImpl : public resp::ServerStatsProvider {
   std::string advertise_address_;
   std::string mode_;
   std::atomic<uint16_t> tcp_port_;
+  uint32_t shard_count_;
   ConnectionCountFn connection_count_;
   std::chrono::steady_clock::time_point started_at_;
   uint64_t process_id_;
@@ -83,6 +84,7 @@ class StatusProviderImpl : public admin::StatusProvider {
   using BoolFn = std::function<bool()>;
   using SizeFn = std::function<size_t()>;
   using PortFn = std::function<uint16_t()>;
+  using CountFn = std::function<uint64_t()>;
 
   struct Deps {
     const config::Config* config = nullptr;
@@ -98,6 +100,11 @@ class StatusProviderImpl : public admin::StatusProvider {
     BoolFn loading;
     BoolFn shutting_down;
     SizeFn connection_count;
+    // Segment retention health. Functors rather than a WalQueue* because these
+    // are embedded-WAL concepts with no meaning for an external broker.
+    CountFn reaper_failures;
+    CountFn oldest_eligible_unreaped_age_ms;
+    CountFn read_buffer_high_water_bytes;
     PortFn resp_port;
     PortFn admin_port;
     PortFn metrics_port;

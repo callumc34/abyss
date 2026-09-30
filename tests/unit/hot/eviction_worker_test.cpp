@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/metrics/names.h"
@@ -104,6 +106,63 @@ TEST_F(EvictionWorkerTest, DoubleStartIsNoop) {
   worker.Start();
   EXPECT_TRUE(worker.Running());
   worker.Stop();
+}
+
+TEST(EvictionWorkerMemoryTest, TickEnforcesMemoryBudgetAndPublishesGauges) {
+  abyss::metrics::testing::Reset();
+  abyss::testing::TestClock clock;
+  // Long eviction TTL so the deadline pass never fires; isolate the
+  // memory-pressure pass. Seed a few entries, then size the budget below them.
+  core::EvictionPolicy policy{core::EvictionTTL{86400}};
+
+  // Measure one entry's footprint so the budget can be sized to force eviction.
+  const std::string value(64, 'v');
+  uint64_t per_entry = 0;
+  {
+    ShardedHotStore probe{ShardedHotStoreConfig{.max_memory_bytes = 0,
+                                                .shard_count = 1,
+                                                .eviction_policy = &policy,
+                                                .steady_clock = clock.SteadyFn(),
+                                                .wall_clock = clock.WallFn()}};
+    ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}}, 0)
+                    .has_value());
+    per_entry = probe.Stats()->used_bytes;
+  }
+
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = (per_entry * 2) + (per_entry / 2),  // holds 2, not 4
+      .shard_count = 1,
+      .eviction_policy = &policy,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  for (int i = 0; i < 4; ++i) {
+    // SetReplayMode so the apply-time enforcement does not pre-trim; the tick
+    // is what we are exercising here.
+    store.SetReplayMode(true);
+    ASSERT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k" + std::to_string(i),
+                                                                   .value = value}},
+                           0)
+                    .has_value());
+    store.SetReplayMode(false);
+    clock.Advance(1ms);
+  }
+  ASSERT_GT(store.Stats()->used_bytes, store.Stats()->max_bytes);
+
+  EvictionWorker worker(store, EvictionWorker::Config{.tick = 50ms}, clock.SteadyFn());
+  worker.TickOnce();
+
+  EXPECT_LE(store.Stats()->used_bytes, store.Stats()->max_bytes)
+      << "tick must evict down to the budget";
+  EXPECT_GT(metrics::testing::GetCounterValue(metrics::names::kHotMemoryEvictedTotal).value_or(0.0),
+            0.0);
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kHotMemoryBytes).value_or(-1.0),
+            static_cast<double>(store.Stats()->used_bytes));
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kHotKeys).value_or(-1.0),
+            static_cast<double>(store.Stats()->key_count));
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kHotMaxMemoryBytes).value_or(-1.0),
+            static_cast<double>(store.Stats()->max_bytes));
 }
 
 TEST_F(EvictionWorkerTest, TickReclaimsTombstonesAtOrBelowHorizon) {

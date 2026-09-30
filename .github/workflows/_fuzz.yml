@@ -1,0 +1,123 @@
+name: Fuzz
+
+on:
+  workflow_call:
+    inputs:
+      duration_seconds:
+        description: Wall-clock budget per fuzz target.
+        type: number
+        required: false
+        default: 60
+  # Deep run against the committed corpora. Scheduled runs only fire on the
+  # default branch, so this is the main-branch soak; the PR gate uses the
+  # short workflow_call budget above.
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Wall-clock budget per fuzz target.
+        type: number
+        required: false
+        default: 900
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,readwrite"
+
+jobs:
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Scheduled runs carry no inputs; fall back to the soak budget.
+      FUZZ_SECONDS: ${{ inputs.duration_seconds || 900 }}
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@v7
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_owner: ${{ github.repository_owner }}
+
+      - name: Select Clang toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18
+          echo "CC=/usr/bin/clang-18" >> "${GITHUB_ENV}"
+          echo "CXX=/usr/bin/clang++-18" >> "${GITHUB_ENV}"
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: fuzz
+          max-size: 500M
+
+      # libFuzzer needs Clang, and ASan supplies the sanitizer-coverage runtime
+      # hooks the instrumented libraries reference. RocksDB is not on any fuzz
+      # target's link path, so the cold backend stays off to keep the clang
+      # vcpkg install small.
+      - name: Configure
+        run: >
+          cmake -S . -B build/fuzz -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          -DCMAKE_BUILD_TYPE=Debug
+          -DVCPKG_MANIFEST_FEATURES=tests
+          -DABYSS_BUILD_TESTS=ON
+          -DABYSS_BUILD_PERF=OFF
+          -DABYSS_BUILD_FUZZ=ON
+          -DABYSS_WITH_ROCKSDB=OFF
+          -DABYSS_SANITIZER=address+undefined
+
+      - name: Build fuzz targets
+        run: >
+          cmake --build build/fuzz --parallel --target
+          fuzz_resp_parser fuzz_resp_stream fuzz_wal_decoder fuzz_wal_replay
+          fuzz_net_connection
+
+      - name: Fuzz
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:abort_on_error=1:suppressions=${{ github.workspace }}/cmake/ubsan_suppressions.txt
+        run: |
+          set -euo pipefail
+          BIN=build/fuzz/tests/fuzz
+          mkdir -p fuzz-artifacts
+          run_target() {
+            name="$1"
+            corpus="$2"
+            mkdir -p "fuzz-work/${name}"
+            echo "::group::${name} (${FUZZ_SECONDS}s)"
+            # New units go to the scratch dir; the committed corpus stays a
+            # read-only seed. Any crash, leak, timeout or OOM exits non-zero.
+            "${BIN}/${name}" "fuzz-work/${name}" "tests/fuzz/corpus/${corpus}" \
+              -max_total_time="${FUZZ_SECONDS}" \
+              -timeout=25 \
+              -rss_limit_mb=3072 \
+              -max_len=16384 \
+              -close_fd_mask=3 \
+              -print_final_stats=1 \
+              -artifact_prefix="fuzz-artifacts/${name}-"
+            echo "::endgroup::"
+          }
+          run_target fuzz_resp_parser resp
+          run_target fuzz_resp_stream resp
+          run_target fuzz_net_connection resp
+          run_target fuzz_wal_decoder wal_entry
+          run_target fuzz_wal_replay wal_segment
+
+      - name: Upload reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

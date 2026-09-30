@@ -24,7 +24,9 @@ echo 'export VCPKG_ROOT=$HOME/.local/share/vcpkg' >> ~/.profile
 echo 'export PATH="$VCPKG_ROOT:$PATH"' >> ~/.profile
 ```
 
-The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies are declared in `vcpkg.json` and resolved automatically on configure.
+The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies are declared in `vcpkg.json` and resolved automatically on configure. Every dependency — including the test framework — is pinned by the manifest's `builtin-baseline`, so a configure pulls nothing from an unpinned source.
+
+The `tests` manifest feature (googletest) is requested by `CMakeLists.txt` whenever `ABYSS_BUILD_TESTS` is on, on top of whatever `VCPKG_MANIFEST_FEATURES` the preset selects. Configuring with `-DABYSS_BUILD_TESTS=OFF` (the `release` and `container` presets) leaves it out.
 
 ## Dependencies
 
@@ -32,13 +34,13 @@ The CMake presets pick up the vcpkg toolchain from `$VCPKG_ROOT`. Dependencies a
 |------------|---------|---------|
 | crc32c | WAL entry and segment integrity checksums | BSD-3-Clause |
 | RocksDB | Built-in cold store | Apache 2.0 / GPL 2.0 |
-| xxHash | Key hashing / shard routing | BSD |
+| xxHash | Key hashing for log redaction | BSD |
 | hiredis | RESP parsing, external Redis client | BSD |
 | liburing | io_uring async I/O (Linux) | LGPL / MIT |
 | spdlog | Structured logging | MIT |
 | prometheus-cpp | Metrics export | MIT |
 | yaml-cpp | Configuration | MIT |
-| googletest | Testing | BSD |
+| googletest | Testing (optional, `tests` feature) | BSD |
 | benchmark | Microbenchmarks (optional, `benchmarks` feature) | Apache 2.0 |
 
 Optional (external profile):
@@ -71,7 +73,7 @@ ctest --preset default
 | `default` | Debug | On | Development build |
 | `release` | Release | Off | Optimised build |
 | `asan` | Debug | On | Address sanitizer + undefined behaviour sanitizer |
-| `tsan` | Debug | On | Thread sanitizer |
+| `tsan` | Debug | On | Thread sanitizer, instrumented dependencies (Linux only) |
 | `ubsan` | Debug, `-O1` | On | Standalone undefined behaviour sanitizer |
 | `bench` | Release | Off | Benchmarks enabled (pulls in `benchmark` via vcpkg) |
 | `container` | Release | Off | Static-linked binary for container images (Linux only) |
@@ -101,6 +103,8 @@ Sanitizer wiring is centralised in `cmake/abyss_sanitizers.cmake` and selected v
 | `thread` | ThreadSanitizer |
 | `address+undefined` | AddressSanitizer + default UBSan check group, used by the `asan` preset |
 | `undefined` | Default UBSan check group + `float-divide-by-zero`, used by the `ubsan` preset |
+
+ThreadSanitizer only sees synchronisation performed by instrumented code, so the `tsan` preset builds every vcpkg dependency with `-fsanitize=thread` as well, via the `x64-linux-tsan` / `arm64-linux-tsan` overlay triplets in `cmake/triplets/`. Linking an uninstrumented dependency (the default triplet) turns its internal locking into false race reports, hides genuine races that pass through it, and drops its frames from the reported stacks. `cmake/abyss_tsan_triplet.cmake` selects the triplet for the host architecture and refuses to configure a TSAN build against any other triplet, so reuse of a build directory configured without it fails at configure time rather than producing misleading reports. The triplets build dependencies release-only: the point is to make their synchronisation visible, not to run their debug assertions, and a release RocksDB keeps both the cold dependency build and TSAN runtime tractable. Instrumented triplets exist for Linux only; TSAN is not usable on Apple Silicon macOS regardless. The preset drops the `perf` feature because the `tsan` test preset excludes every perf label. Runtime suppressions live in `cmake/tsan_suppressions.txt`, and every entry must name the specific construct TSAN cannot reason about.
 
 The default `-fsanitize=undefined` check group covers signed-integer-overflow, bounds, null, alignment, shift, vptr, return, unreachable, vla-bound, enum, builtin, pointer-overflow, object-size, and integer-divide-by-zero. The `ubsan` preset adds `float-divide-by-zero` (not in the default group on either compiler).
 

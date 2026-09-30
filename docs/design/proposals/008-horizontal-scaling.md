@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
+> **Refined by [ADP-014](014-slot-routing-and-topology.md).** The xxHash placement hash in this document is superseded. Placement now derives from the Redis wire slot (`CRC16` of the hash-tag content modulo 16384) via contiguous slot ranges: a shard owns a contiguous range of slots, and the key's shard is a pure function of its slot. The shard model, over-provisioning, rebalance-by-ownership, and the routing protocol below are otherwise unchanged. Invariants on consistent placement, deterministic assignment, and `MOVED` correctness become enforceable via slot-unified routing and a persisted topology manifest.
+
 ## Context
 
 Phase 1 runs on a single pod. Phase 2 scales horizontally by partitioning the keyspace across multiple pods. Each key hashes (xxHash) to exactly one pod. Pods share nothing — each has its own queue, hot store, cold store, and compaction buffer. No cross-pod communication is needed for reads or writes.

@@ -45,7 +45,7 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: "${DATA_DIR}/wal"
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
   min_retention_seconds: 3
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000
@@ -127,6 +127,15 @@ TEST_F(RemoveResurrectionTest, HashFieldDeletedAfterFlushDoesNotResurrect) {
         .value_or(0.0);
   };
 
+  // Load-bearing, not hygiene: the fixture's readiness probe still holds a
+  // buffer entry whose flush lands mid-test. Without draining it first, the
+  // window-1 wait below can be satisfied by the PROBE's flush while `h` is
+  // still buffered -- and then HSET and HDEL compact into a single entry, so
+  // the cross-window delete this test exists to guard is never exercised and
+  // the test passes anyway.
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
+
   // Snapshot the eviction baseline before any write: the key evicts exactly
   // once and may do so before the window-2 flush completes, so snapshotting it
   // later would race the eviction and wait for a second one that never comes.
@@ -163,6 +172,56 @@ TEST_F(RemoveResurrectionTest, HashFieldDeletedAfterFlushDoesNotResurrect) {
   auto deleted = Client().Command({"HGET", "h", "f1"});
   EXPECT_TRUE(deleted.IsNil()) << "HGET h f1 resurrected a deleted field from cold: " << deleted;
   EXPECT_EQ(Client().Command({"HGET", "h", "f2"}).String(), "v2");
+}
+
+// COLDC-3: a key DELeted and re-added across flush windows must not resurrect
+// the old set members from cold. Pre-fix Emit never produced a leading Del, so
+// the re-add left the prior members behind on cold; the leading Del now wipes
+// all prior slices before the re-add in the same WriteBatch.
+TEST_F(RemoveResurrectionTest, DelThenReaddDoesNotResurrectColdSetMembers) {
+  const uint16_t mport = Server().MetricsPort();
+  std::string body;
+
+  auto await_flush = [&](double baseline) {
+    ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_cold_flush_total", {{"status", "success"}},
+                                   baseline + 1.0, 6s, &body))
+        << "flush did not land within 6s; last scrape:\n"
+        << body;
+  };
+  auto flushes = [&] {
+    return ParseCounter(Scrape(mport), "abyss_cold_flush_total", {{"status", "success"}})
+        .value_or(0.0);
+  };
+
+  // Same hazard as above: an undrained probe entry lets the window-1 wait pass
+  // on the probe's flush, collapsing DEL + re-add into one buffer entry and
+  // silently skipping the leading-Del path under test.
+  ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
+      << "compaction buffer did not quiesce before baseline";
+
+  const double before_evicted = ParseCounter(Scrape(mport), "abyss_evicted_total").value_or(0.0);
+
+  // Window 1: build a set {a,b,c} and let it flush to cold.
+  double base = flushes();
+  ASSERT_TRUE(Client().Command({"SADD", "s", "a", "b", "c"}).IsInteger());
+  await_flush(base);
+
+  // Window 2: DEL the key, then re-add a single different member.
+  base = flushes();
+  ASSERT_EQ(Client().Command({"DEL", "s"}).Integer(), 1);
+  ASSERT_TRUE(Client().Command({"SADD", "s", "x"}).IsInteger());
+  await_flush(base);
+
+  // Drive the key out of hot so SMEMBERS resolves against cold.
+  ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_evicted_total", {}, before_evicted + 1.0, 8s, &body))
+      << "hot eviction did not occur within 8s; last scrape:\n"
+      << body;
+
+  // Only the re-added member must survive; a/b/c must not resurrect.
+  EXPECT_EQ(Client().Command({"SISMEMBER", "s", "x"}).Integer(), 1);
+  EXPECT_EQ(Client().Command({"SISMEMBER", "s", "a"}).Integer(), 0)
+      << "DEL-then-readd resurrected a stale cold set member";
+  EXPECT_EQ(Client().Command({"SCARD", "s"}).Integer(), 1);
 }
 
 }  // namespace

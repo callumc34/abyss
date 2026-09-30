@@ -2,13 +2,16 @@
 
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <optional>
 #include <regex>
 #include <span>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 #include "abyss/log/log.h"
@@ -61,6 +64,19 @@ std::string FormatShardName(core::ShardId shard) {
   return oss.str();
 }
 
+// Checked, non-throwing decimal parse into T (QUEUE-3): nullopt on overflow or
+// any non-numeric trailing content. Replaces std::stoul/std::stoull, which
+// throw std::out_of_range on 20-digit-plus names and abort recovery.
+template <typename T>
+std::optional<T> ParseUnsignedChecked(std::string_view text) {
+  T value = 0;
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end) return std::nullopt;
+  return value;
+}
+
 }  // namespace
 
 core::Result<std::unique_ptr<FileOffsetStore>> FileOffsetStore::Open(FileOffsetStoreConfig config) {
@@ -101,18 +117,20 @@ std::optional<core::SequenceId> FileOffsetStore::Get(core::ConsumerId consumer,
 
 core::Result<void> FileOffsetStore::Set(core::ConsumerId consumer, core::ShardId shard,
                                         core::SequenceId seq) {
-  // (consumer, shard) has one writer; only the shared cache needs locking.
-  {
-    const std::scoped_lock lock(mu_);
-    offsets_[consumer][shard] = seq;
-  }
+  // Write-through (XERR-2): persist durably FIRST, advance the in-memory cache
+  // only on success. On a failed write the cache stays behind disk, so the
+  // reaper (which reads the cache) never observes an offset not yet durable.
   auto result = WriteShardFile(consumer, shard, seq);
   if (!result.has_value()) {
     ABYSS_LOG_ERROR("offset persist failed", {"consumer", static_cast<uint64_t>(consumer)},
                     {"shard", static_cast<int64_t>(shard)}, {"seq", static_cast<uint64_t>(seq)},
                     {"err", std::string_view{result.error().message()}});
+    return result;
   }
-  return result;
+  // (consumer, shard) has one writer; only the shared cache needs locking.
+  const std::scoped_lock lock(mu_);
+  offsets_[consumer][shard] = seq;
+  return {};
 }
 
 std::string FileOffsetStore::ConsumerDir(core::ConsumerId consumer) const {
@@ -143,7 +161,17 @@ core::Result<void> FileOffsetStore::LoadAll() {
     const auto consumer_name = consumer_entry.path().filename().string();
     if (!std::regex_match(consumer_name, consumer_pattern)) continue;
 
-    const auto consumer_id = static_cast<core::ConsumerId>(std::stoul(consumer_name));
+    auto consumer_id = ParseUnsignedChecked<core::ConsumerId>(consumer_name);
+    if (!consumer_id.has_value()) {
+      // An over-long / overflowing consumer dir name is not one we wrote; skip.
+      ABYSS_LOG_WARN("skipping unparseable consumer dir",
+                     {"name", std::string_view{consumer_name}});
+      continue;
+    }
+
+    // Sweep orphan tmp files from a prior crash before scanning this dir
+    // (QUEUE-7).
+    SweepTempFiles(consumer_entry.path().string());
 
     const std::filesystem::directory_iterator shard_it(consumer_entry.path(), ec);
     if (ec) return std::unexpected(core::Error{core::ErrorCode::kInternal, ec.message()});
@@ -154,7 +182,12 @@ core::Result<void> FileOffsetStore::LoadAll() {
       std::smatch match;
       if (!std::regex_match(shard_name, match, shard_pattern)) continue;
 
-      const auto shard_id = static_cast<core::ShardId>(std::stoull(match[1].str()));
+      auto parsed_shard = ParseUnsignedChecked<core::ShardId>(match[1].str());
+      if (!parsed_shard.has_value()) {
+        ABYSS_LOG_WARN("skipping unparseable offset file", {"name", std::string_view{shard_name}});
+        continue;
+      }
+      const auto shard_id = *parsed_shard;
       auto record = LoadShardFile(shard_entry.path().string());
       if (!record.has_value()) return std::unexpected(record.error());
 
@@ -165,10 +198,27 @@ core::Result<void> FileOffsetStore::LoadAll() {
       }
 
       const std::scoped_lock lock(mu_);
-      offsets_[consumer_id][shard_id] = record->seq;
+      offsets_[*consumer_id][shard_id] = record->seq;
     }
   }
   return {};
+}
+
+void FileOffsetStore::SweepTempFiles(const std::string& dir) {
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  if (ec) return;  // Dir vanished or unreadable; nothing to sweep.
+  for (const auto& entry : it) {
+    if (!entry.is_regular_file()) continue;
+    const auto name = entry.path().filename().string();
+    if (!name.contains(".offset.tmp.")) continue;
+    std::error_code rm_ec;
+    std::filesystem::remove(entry.path(), rm_ec);
+    if (rm_ec) {
+      ABYSS_LOG_WARN("failed to sweep orphan offset tmp", {"path", entry.path().string()},
+                     {"err", std::string_view{rm_ec.message()}});
+    }
+  }
 }
 
 core::Result<FileOffsetStore::Record> FileOffsetStore::LoadShardFile(const std::string& path) {
@@ -223,7 +273,8 @@ core::Result<void> FileOffsetStore::WriteShardFile(core::ConsumerId consumer, co
                                                    core::SequenceId seq) const {
   const auto consumer_dir = ConsumerDir(consumer);
   std::error_code ec;
-  std::filesystem::create_directories(consumer_dir, ec);
+  // create_directories returns true iff it actually created the directory.
+  const bool created_consumer_dir = std::filesystem::create_directories(consumer_dir, ec);
   if (ec) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInternal, "create consumer dir: " + ec.message()});
@@ -268,7 +319,32 @@ core::Result<void> FileOffsetStore::WriteShardFile(core::ConsumerId consumer, co
     return std::unexpected(r.error());
   }
 
-  return pfs::FsyncDir(std::filesystem::path(consumer_dir));
+  // The persisted ack must be durable; a volume that cannot fsync directories
+  // cannot make the rename crash-durable, so a persisted offset could outrun
+  // stable storage (invariants 2/5, G5).
+  auto dir_sync = pfs::FsyncDir(std::filesystem::path(consumer_dir));
+  if (!dir_sync.has_value()) return std::unexpected(dir_sync.error());
+  if (*dir_sync == pfs::DirSyncOutcome::kUnsupported) {
+    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
+                                       "offset directory durability unsupported on volume '" +
+                                           consumer_dir +
+                                           "'; a persisted ack could outrun durable storage"});
+  }
+
+  // The first ack for a new consumer creates a subdir under the offsets root;
+  // that new subdir's directory entry must also be durably linked, or a crash
+  // right after the rename can lose the whole subdir and the offset with it
+  // (QUEUE-5).
+  if (created_consumer_dir) {
+    auto root_sync = pfs::FsyncDir(std::filesystem::path(config_.directory));
+    if (!root_sync.has_value()) return std::unexpected(root_sync.error());
+    if (*root_sync == pfs::DirSyncOutcome::kUnsupported) {
+      return std::unexpected(core::Error{
+          core::ErrorCode::kFailedPrecondition,
+          "offsets-root directory durability unsupported on '" + config_.directory + "'"});
+    }
+  }
+  return {};
 }
 
 }  // namespace abyss::queue

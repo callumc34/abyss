@@ -16,6 +16,9 @@ struct ServerStats {
   uint64_t connected_clients = 0;
   uint64_t process_id = 0;
   uint32_t uptime_seconds = 0;
+  // Owned-shard count, so the cluster handlers can resolve slot ranges by
+  // owning shard (ADP-014). 0 falls back to a single full-range entry.
+  uint32_t shard_count = 0;
   uint16_t tcp_port = 0;
   std::string_view version;
   std::string_view bind_address;

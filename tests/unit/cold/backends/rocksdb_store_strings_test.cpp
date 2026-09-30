@@ -65,7 +65,7 @@ TEST_F(StoreFixture, SetThenGetReturnsValue) {
   std::string key = "k";
   std::string val = "hello";
   core::ops::WriteOp set_op = core::ops::StringSet{.key = key, .value = val};
-  auto set_result = store->ApplyBatch(std::span{&set_op, 1});
+  auto set_result = store->ApplyBatch(std::span{&set_op, 1}, 0);
   ASSERT_TRUE(set_result.has_value()) << set_result.error().message();
 
   auto get_result = store->Exec(GetOp(key));
@@ -88,10 +88,10 @@ TEST_F(StoreFixture, SetOverwritesExistingValue) {
   std::string val1 = "first";
   std::string val2 = "second";
   core::ops::WriteOp op1 = core::ops::StringSet{.key = key, .value = val1};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op1, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op1, 1}, 0).has_value());
 
   core::ops::WriteOp op2 = core::ops::StringSet{.key = key, .value = val2};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op2, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op2, 1}, 0).has_value());
 
   auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
@@ -104,7 +104,7 @@ TEST_F(StoreFixture, SetWithEmptyValueRoundTrips) {
   std::string key = "k";
   std::string val;
   core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
@@ -118,7 +118,7 @@ TEST_F(StoreFixture, SetWithLargeValueRoundTrips) {
   std::string key = "k";
   const std::string payload(64 * 1024, 'x');
   core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = payload};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
@@ -136,7 +136,7 @@ TEST_F(StoreFixture, SetWithFutureTtlRoundTrips) {
   std::string val = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = key, .value = val, .abs_ttl_ms = now_ms + 60'000};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
@@ -152,8 +152,8 @@ TEST_F(StoreFixture, DelReturnsCountOfExistingKeys) {
   std::string vb = "2";
   core::ops::WriteOp op_a = core::ops::StringSet{.key = ka, .value = va};
   core::ops::WriteOp op_b = core::ops::StringSet{.key = kb, .value = vb};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op_a, 1}).has_value());
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op_b, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_a, 1}, 0).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_b, 1}, 0).has_value());
 
   core::ops::Del del_op;
   std::string_view keys[] = {"a", "b", "missing"};
@@ -184,7 +184,7 @@ TEST_F(StoreFixture, PersistenceAcrossReopen) {
   {
     auto store = OpenStore();
     core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
-    ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+    ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
   }
   auto store = OpenStore();
   auto result = store->Exec(GetOp(key));
@@ -198,7 +198,7 @@ TEST_F(StoreFixture, BinaryUnsafeKeyRoundTrips) {
   const std::string key{'a', '\x00', 'b', '\xFF'};
   std::string val = "v";
   core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
   auto result = store->Exec(GetOp(key));
   ASSERT_TRUE(result.has_value());
@@ -216,8 +216,8 @@ TEST_F(StoreFixture, StatsReflectsWrites) {
   std::string vb = "2";
   core::ops::WriteOp op_a = core::ops::StringSet{.key = ka, .value = va};
   core::ops::WriteOp op_b = core::ops::StringSet{.key = kb, .value = vb};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op_a, 1}).has_value());
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op_b, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_a, 1}, 0).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op_b, 1}, 0).has_value());
   ASSERT_TRUE(store->Compact().has_value());
 
   auto after = store->Stats();
@@ -231,7 +231,7 @@ TEST_F(StoreFixture, CompactSucceeds) {
   std::string key = "k";
   std::string val = "v";
   core::ops::WriteOp op = core::ops::StringSet{.key = key, .value = val};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}).has_value());
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
   EXPECT_TRUE(store->Compact().has_value());
 }
 
@@ -246,7 +246,7 @@ TEST_F(StoreFixture, ApplyBatchMultipleOps) {
       core::ops::StringSet{.key = ka, .value = va},
       core::ops::StringSet{.key = kb, .value = vb},
   };
-  auto result = store->ApplyBatch(ops);
+  auto result = store->ApplyBatch(ops, 0);
   ASSERT_TRUE(result.has_value()) << result.error().message();
 
   EXPECT_EQ(store->Exec(GetOp("a"))->AsString(), "1");

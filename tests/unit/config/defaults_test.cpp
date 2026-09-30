@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+
 #include "abyss/config/config.h"
 
 namespace abyss::config {
@@ -37,6 +39,12 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_GE(defaults.cold_consumer.retry_initial_backoff.count(), 0);
   EXPECT_GE(defaults.cold_consumer.retry_max_backoff.count(),
             defaults.cold_consumer.retry_initial_backoff.count());
+  // Must mirror ColdConsumer::Config so an operator who omits these knobs gets
+  // the same cadence the consumer struct-defaults to.
+  EXPECT_EQ(defaults.cold_consumer.checkpoint_max_flushes, 32U);
+  EXPECT_EQ(defaults.cold_consumer.checkpoint_min_interval, std::chrono::milliseconds{50});
+  EXPECT_EQ(defaults.cold_consumer.loop_initial_backoff, std::chrono::milliseconds{1});
+  EXPECT_EQ(defaults.cold_consumer.loop_max_backoff, std::chrono::milliseconds{1000});
 
   EXPECT_GT(defaults.recovery.replay_parallelism, 0U);
   EXPECT_GT(defaults.recovery.hot_replay_batch_size, 0U);

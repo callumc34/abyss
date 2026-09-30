@@ -186,6 +186,41 @@ void AppendEscapedJsonString(std::string& out, std::string_view s) {
   out.push_back('"');
 }
 
+// Text-mode counterpart to AppendEscapedJsonString: every text emitter routes
+// keys and values through this so a control byte can neither split a record nor
+// forge one. Keys additionally escape the ' ' and '=' field separators.
+void AppendEscapedText(std::string& out, std::string_view s, bool escape_separators) {
+  for (char ch : s) {
+    const auto uch = static_cast<unsigned char>(ch);
+    switch (ch) {
+      case '\\':
+        out.append("\\\\");
+        break;
+      case '\n':
+        out.append("\\n");
+        break;
+      case '\r':
+        out.append("\\r");
+        break;
+      case '\t':
+        out.append("\\t");
+        break;
+      default:
+        if (uch < 0x20) {
+          std::array<char, 8> buf{};
+          // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+          std::snprintf(buf.data(), buf.size(), "\\u%04x", uch);
+          out.append(buf.data());
+        } else if (escape_separators && (ch == '=' || ch == ' ')) {
+          out.push_back('\\');
+          out.push_back(ch);
+        } else {
+          out.push_back(ch);
+        }
+    }
+  }
+}
+
 void AppendDouble(std::string& out, double v) {
   std::array<char, 32> buf{};
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
@@ -235,7 +270,7 @@ void AppendTextFieldValue(std::string& out, const LogValue& value) {
       [&](const auto& v) {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, std::string_view> || std::is_same_v<T, std::string>) {
-          out.append(std::string_view(v));
+          AppendEscapedText(out, std::string_view(v), /*escape_separators=*/false);
         } else if constexpr (std::is_same_v<T, bool>) {
           out.append(v ? "true" : "false");
         } else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>) {
@@ -310,7 +345,7 @@ class TextFormatter : public spdlog::formatter {
     std::string fields;
     for (size_t i = 0; i < tls.size; ++i) {
       fields.push_back(' ');
-      fields.append(tls.data[i].key);
+      AppendEscapedText(fields, tls.data[i].key, /*escape_separators=*/true);
       fields.push_back('=');
       AppendTextFieldValue(fields, tls.data[i].value);
     }
@@ -464,7 +499,7 @@ void Logger::Log(Level level, std::string_view msg, std::span<const LogField> fi
     line.append(msg);
     for (const auto& f : fields) {
       line.push_back(' ');
-      line.append(f.key);
+      AppendEscapedText(line, f.key, /*escape_separators=*/true);
       line.push_back('=');
       AppendTextFieldValue(line, f.value);
     }

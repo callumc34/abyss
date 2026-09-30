@@ -22,10 +22,12 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -66,6 +68,10 @@ ErrorCode MapStatusCode(const rocksdb::Status& status) {
   if (status.IsCorruption()) return ErrorCode::kCorruption;
   if (status.IsIOError()) return ErrorCode::kUnavailable;
   if (status.IsInvalidArgument()) return ErrorCode::kInvalidArgument;
+  // A read whose ReadOptions::deadline elapsed surfaces as TimedOut. Map it to
+  // kTimeout so the engine fails the scan closed and bumps the cold-scan
+  // deadline metric rather than treating it as an internal fault (COLD-2).
+  if (status.IsTimedOut()) return ErrorCode::kTimeout;
   return ErrorCode::kInternal;
 }
 
@@ -156,6 +162,42 @@ core::Result<ScoreBound> ParseScoreBound(std::string_view s, bool is_min) {
   return out;
 }
 
+// Parsed ZRANGEBYLEX bound. Redis lex syntax: `[value` (inclusive), `(value`
+// (exclusive), `-` (negative infinity), `+` (positive infinity). A bare value
+// is a syntax error. Total and non-throwing, mirroring ParseScoreBound and the
+// hot-side ParseLexBound so cold and hot agree on validity bit-for-bit.
+struct LexBound {
+  std::string value;
+  bool exclusive = false;
+  bool neg_inf = false;
+  bool pos_inf = false;
+};
+
+core::Result<LexBound> ParseLexBound(std::string_view s) {
+  if (s == "-") return LexBound{.neg_inf = true};
+  if (s == "+") return LexBound{.pos_inf = true};
+  if (!s.empty() && s.front() == '[') {
+    return LexBound{.value = std::string(s.substr(1)), .exclusive = false};
+  }
+  if (!s.empty() && s.front() == '(') {
+    return LexBound{.value = std::string(s.substr(1)), .exclusive = true};
+  }
+  return std::unexpected(
+      Error(ErrorCode::kInvalidArgument, "not a valid lex range bound: '" + std::string(s) + "'"));
+}
+
+bool LexAtOrAboveMin(std::string_view member, const LexBound& min) {
+  if (min.neg_inf) return true;
+  if (min.pos_inf) return false;
+  return min.exclusive ? member > min.value : member >= min.value;
+}
+
+bool LexAtOrBelowMax(std::string_view member, const LexBound& max) {
+  if (max.pos_inf) return true;
+  if (max.neg_inf) return false;
+  return max.exclusive ? member < max.value : member <= max.value;
+}
+
 // Decodes a zset member-indexed value: 8 bytes of native-endian IEEE 754.
 core::Result<double> DecodeZsetMemberScore(std::string_view value) {
   if (value.size() != 8) {
@@ -195,6 +237,12 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   // expiry on read or the active TtlScanner.
   mutable metrics::CounterHandle ttl_expired_total;
 
+  // Per-shard durable frontier recorded by Checkpoint. Guards the recorded
+  // value against concurrent ApplyBatch/Checkpoint from a single consumer; the
+  // cold ack is computed from the value Checkpoint returns, not read here.
+  std::mutex checkpoint_mu;
+  std::unordered_map<core::ShardId, core::SequenceId> checkpointed_seq;
+
   uint64_t NowMs() const { return WallMs(config.wall_clock); }
 
   // TtlScannerBackend.
@@ -204,8 +252,16 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 
   core::Result<RespValue> Exec(const core::ops::ReadOp& op,
                                std::optional<core::Duration> deadline) const;
-  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) const;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                core::SequenceId highest_wal_seq);
+  core::Result<void> Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq);
   core::Result<RespValue> ExecDel(const core::ops::Del& op) const;
+
+  // Writes a fully-built batch and fsyncs the WAL before returning, so the
+  // standalone-command write (ExecDel) is durable on return without relying on
+  // a later cold checkpoint. ApplyBatch deliberately does NOT route through
+  // this — its durability comes from the amortised checkpoint.
+  core::Result<void> WriteDurable(rocksdb::WriteBatch* batch, std::string_view context) const;
 
   // --- Read handlers -------------------------------------------------------
 
@@ -286,6 +342,19 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   core::Result<void> IterateAndDeleteCollection(rocksdb::WriteBatchWithIndex& wb,
                                                 uint8_t inner_type, std::string_view key) const;
 
+  // Enforces one-logical-type-per-key on the cold apply path. When a write
+  // establishes `key` as `kept_type`, this drops every slice the key holds
+  // under any OTHER type (the string record, and the meta/members/score-index
+  // of the other collection types). Without this, an implicit cross-window type
+  // change — e.g. a key flushed as a hash, then SET to a string in a later
+  // compaction window whose CompactedState emits no leading Del — would leave
+  // the stale prior-type slices behind and resurrect them on read (COLDC-6).
+  // Idempotent and cheap: deletes of absent slices are harmless, and the kept
+  // type's own slices are never touched, so this composes with the in-window
+  // delete-before-write and the meta-delta bookkeeping.
+  core::Result<void> ClearOtherTypeSlices(rocksdb::WriteBatchWithIndex& wb, uint8_t kept_type,
+                                          std::string_view key) const;
+
   // CAS-safe expiry. Begins an optimistic transaction with a snapshot, re-reads
   // the record under the snapshot, and commits a delete only if it is still
   // expired. If a concurrent writer modified the record between the caller's
@@ -305,10 +374,22 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 
   core::Result<bool> AnyLiveRecord(std::string_view key) const;
 
-  // Generic prefix scan.
+  // Read-side counterpart to ClearOtherTypeSlices. A collection read for
+  // `expected_type` whose own meta is absent must distinguish "key absent" from
+  // "key is live under a different type": the latter is a WRONGTYPE, not an
+  // empty result, matching the buffer/hot tiers and Redis (COLDC-6 read facet).
+  // Returns kWrongType if `key` is live under any type other than
+  // `expected_type`, otherwise success (so the caller serves its empty result).
+  core::Result<void> CheckNoForeignType(uint8_t expected_type, std::string_view key) const;
+
+  // Generic prefix scan. `deadline` (relative duration from now) is threaded
+  // into rocksdb::ReadOptions::deadline via MakeReadOptions so a scan over a
+  // large collection fails closed with a timeout rather than running unbounded
+  // (COLD-2 / invariant 5). nullopt leaves the scan unbounded (write path).
   template <typename Fn>
   core::Result<void> ScanPrefix(rocksdb::WriteBatchWithIndex* wb, rocksdb::ColumnFamilyHandle* cf,
-                                std::string_view prefix, const Fn& fn) const;
+                                std::string_view prefix, std::optional<core::Duration> deadline,
+                                const Fn& fn) const;
 };
 
 // --- Factory & lifecycle ----------------------------------------------------
@@ -332,6 +413,12 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
   rocksdb::DBOptions db_opts;
   db_opts.create_if_missing = true;
   db_opts.create_missing_column_families = true;
+  // ApplyBatch writes the WAL with sync=false (memtable + RocksDB WAL buffer
+  // only); durability is established by an explicit FlushWAL(sync=true) in
+  // Checkpoint. manual_wal_flush keeps those sync=false writes out of the OS
+  // until the checkpoint, so a checkpoint is the single group-amortised fsync
+  // of the WAL tail rather than one fsync per micro-flush (A6 / XDUR-1).
+  db_opts.manual_wal_flush = true;
 
   const auto cf_opts = MakeCfOptions(config);
   const std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs{
@@ -376,6 +463,12 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
         impl->db->Put(rocksdb::WriteOptions(), impl->default_cf.get(), format_key, format_value);
     if (!status.ok()) {
       return std::unexpected(FromStatus(status, "RocksdbStore::Create: Put format version"));
+    }
+    // manual_wal_flush keeps the Put in the WAL buffer; flush+fsync it now so a
+    // crash before the first cold checkpoint can't lose the format marker.
+    status = impl->db->FlushWAL(/*sync=*/true);
+    if (!status.ok()) {
+      return std::unexpected(FromStatus(status, "RocksdbStore::Create: FlushWAL format version"));
     }
   } else {
     return std::unexpected(FromStatus(status, "RocksdbStore::Create: Get format version"));
@@ -425,8 +518,13 @@ core::Result<RespValue> RocksdbStore::Exec(const core::ops::ReadOp& op,
   return impl_->Exec(op, deadline);
 }
 
-core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops) {
-  return impl_->ApplyBatch(ops);
+core::Result<void> RocksdbStore::ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                            core::SequenceId highest_wal_seq) {
+  return impl_->ApplyBatch(ops, highest_wal_seq);
+}
+
+core::Result<void> RocksdbStore::Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq) {
+  return impl_->Checkpoint(shard, up_to_wal_seq);
 }
 
 core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
@@ -450,12 +548,9 @@ core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
     return std::unexpected(FromStatus(s, "Wipe: DeleteRange zset_score_idx_cf"));
   }
 
-  rocksdb::WriteOptions wo;
-  wo.sync = true;
-  // OptimisticTransactionDB hides DeleteRange/WriteBatch; go through the base DB.
-  auto status = impl_->db->GetBaseDB()->Write(wo, &batch);
-  if (!status.ok()) return std::unexpected(FromStatus(status, "Wipe: Write"));
-  return {};
+  // DeleteRange + synced write: atomic and fsynced so a post-wipe crash can't
+  // resurrect pre-Flush data once the cold consumer's ack is durable (#136).
+  return impl_->WriteDurable(&batch, "Wipe: Write");
 }
 
 core::Result<RespValue> RocksdbStore::ExecDel(const core::ops::Del& op) {
@@ -465,15 +560,14 @@ core::Result<RespValue> RocksdbStore::ExecDel(const core::ops::Del& op) {
 core::Result<core::StorageStats> RocksdbStore::Stats() {
   core::StorageStats out;
 
+  // Default CF only: every score-index record (0x06) duplicates a member record
+  // (0x05) in the default CF, so summing both CFs double-counts zset members.
   uint64_t num_keys = 0;
   if (impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.estimate-num-keys", &num_keys)) {
     out.key_count += num_keys;
   }
-  if (impl_->db->GetIntProperty(impl_->zset_score_idx_cf.get(), "rocksdb.estimate-num-keys",
-                                &num_keys)) {
-    out.key_count += num_keys;
-  }
 
+  // disk_bytes is physical footprint, so it still spans both column families.
   uint64_t live_bytes = 0;
   if (impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.total-sst-files-size",
                                 &live_bytes)) {
@@ -574,7 +668,8 @@ rocksdb::ReadOptions RocksdbStore::Impl::MakeReadOptions(
   return opts;
 }
 
-core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::WriteOp> ops) const {
+core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                                  core::SequenceId /*highest_wal_seq*/) {
   rocksdb::WriteBatchWithIndex wb(rocksdb::BytewiseComparator(), 0, /*overwrite_key=*/true);
 
   for (const auto& op : ops) {
@@ -582,8 +677,40 @@ core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::Wri
     if (!r.has_value()) return r;
   }
 
+  // Default WriteOptions: sync=false. With manual_wal_flush the WAL stays in
+  // RocksDB's buffer; this is a memtable-only write. Durability is established
+  // by a later Checkpoint(FlushWAL sync=true), never per batch (A6). The cold
+  // consumer tracks highest_wal_seq and gates its ack on the checkpointed seq,
+  // so it is not recorded here.
   auto status = db->Write(rocksdb::WriteOptions(), wb.GetWriteBatch());
   if (!status.ok()) return std::unexpected(FromStatus(status, "ApplyBatch"));
+  return {};
+}
+
+core::Result<void> RocksdbStore::Impl::Checkpoint(core::ShardId shard,
+                                                  core::SequenceId up_to_wal_seq) {
+  // FlushWAL flushes RocksDB's WAL buffer to the OS and, with sync=true,
+  // fsyncs it — one group-amortised fsync of the WAL tail for every ApplyBatch
+  // since the last checkpoint. Idempotent: a checkpoint with nothing dirty is
+  // a cheap flush of an empty buffer.
+  auto status = db->FlushWAL(/*sync=*/true);
+  if (!status.ok()) return std::unexpected(FromStatus(status, "Checkpoint: FlushWAL"));
+
+  const std::scoped_lock lock(checkpoint_mu);
+  auto& recorded = checkpointed_seq[shard];
+  recorded = std::max(recorded, up_to_wal_seq);
+  return {};
+}
+
+core::Result<void> RocksdbStore::Impl::WriteDurable(rocksdb::WriteBatch* batch,
+                                                    std::string_view context) const {
+  rocksdb::WriteOptions wo;
+  wo.sync = true;
+  // OptimisticTransactionDB hides plain WriteBatch writes; go through the base
+  // DB. sync=true forces FlushWAL+fsync of this write regardless of
+  // manual_wal_flush, so the standalone command is durable on return.
+  auto status = db->GetBaseDB()->Write(wo, batch);
+  if (!status.ok()) return std::unexpected(FromStatus(status, context));
   return {};
 }
 
@@ -612,7 +739,11 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetIsMember&
                                                    std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Integer(0);
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeSetMember, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Integer(0);
+  }
 
   const auto encoded = fmt::EncodeSetMemberKey(op.key, op.member, config.shard_count);
   std::string raw;
@@ -622,17 +753,21 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetIsMember&
   return RespValue::Integer(1);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::SetMembers& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::SetMembers& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Array({});
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeSetMember, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Array({});
+  }
 
   std::vector<RespValue> members;
   members.reserve((*meta)->cardinality);
   const auto prefix = fmt::SetMemberPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
-      nullptr, default_cf.get(), prefix,
+      nullptr, default_cf.get(), prefix, deadline,
       [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
         members.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
         return true;
@@ -645,7 +780,11 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     const core::ops::SetCard& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeSetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Integer(0);
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeSetMember, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Integer(0);
+  }
   return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
 }
 
@@ -653,7 +792,11 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetScore& o
                                                    std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Null();
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeZsetMember, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Null();
+  }
 
   const auto encoded = fmt::EncodeZsetMemberKey(op.key, op.member, config.shard_count);
   std::string raw;
@@ -670,32 +813,47 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     const core::ops::ZsetCard& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Integer(0);
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeZsetMember, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Integer(0);
+  }
   return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::ZsetRange& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::ZsetRange& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeZsetMember, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Array({});
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeZsetMember, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Array({});
+  }
 
   // Collect (member, score) in the requested order, then apply offset/count.
   std::vector<std::pair<std::string, double>> ordered;
   ordered.reserve((*meta)->cardinality);
 
   if (op.by_lex) {
-    // Lex range on member names, using the member-indexed CF. Bounds: if min
-    // is empty, start at prefix; otherwise begin at the given member. Same
-    // for max.
+    // Lex range on member names, using the member-indexed CF (which iterates in
+    // pure member byte-lex order). The min/max [/(/-/+ bounds are applied per
+    // member so the slice matches the hot tier's ExecZsetRange by_lex branch.
+    auto min_bound = ParseLexBound(op.min);
+    if (!min_bound.has_value()) return std::unexpected(min_bound.error());
+    auto max_bound = ParseLexBound(op.max);
+    if (!max_bound.has_value()) return std::unexpected(max_bound.error());
+
     const auto prefix = fmt::ZsetMemberPrefix(op.key, config.shard_count);
     auto r =
-        ScanPrefix(nullptr, default_cf.get(), prefix,
+        ScanPrefix(nullptr, default_cf.get(), prefix, deadline,
                    [&](std::string_view full_key, std::string_view value) -> core::Result<bool> {
-                     auto m = std::string(full_key.substr(prefix.size()));
+                     auto member = full_key.substr(prefix.size());
+                     if (!LexAtOrAboveMin(member, *min_bound)) return true;
+                     if (!LexAtOrBelowMax(member, *max_bound)) return false;  // past upper, stop
                      auto s = DecodeZsetMemberScore(value);
                      if (!s.has_value()) return std::unexpected(s.error());
-                     ordered.emplace_back(std::move(m), *s);
+                     ordered.emplace_back(std::string(member), *s);
                      return true;
                    });
     if (!r.has_value()) return std::unexpected(r.error());
@@ -711,7 +869,7 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     // Each score-index key is: prefix || 8-byte sortable score || member.
     const auto score_offset = prefix.size();
     auto r = ScanPrefix(
-        nullptr, zset_score_idx_cf.get(), prefix,
+        nullptr, zset_score_idx_cf.get(), prefix, deadline,
         [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
           if (full_key.size() < score_offset + 8) {
             return std::unexpected(Error(ErrorCode::kCorruption, "zset score-index key too short"));
@@ -794,7 +952,11 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGet& op,
                                                    std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Null();
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Null();
+  }
 
   const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field, config.shard_count);
   std::string raw;
@@ -804,17 +966,21 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGet& op,
   return RespValue::BulkString(std::move(raw));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::HashGetAll& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashGetAll& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Array({});
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Array({});
+  }
 
   std::vector<RespValue> pairs;
   pairs.reserve((*meta)->cardinality * 2);
   const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
-      nullptr, default_cf.get(), prefix,
+      nullptr, default_cf.get(), prefix, deadline,
       [&](std::string_view full_key, std::string_view value) -> core::Result<bool> {
         pairs.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
         pairs.push_back(RespValue::BulkString(std::string(value)));
@@ -832,6 +998,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashMultiGet
   std::vector<RespValue> out;
   out.reserve(op.fields.size());
   if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
     for (size_t i = 0; i < op.fields.size(); ++i) out.push_back(RespValue::Null());
     return RespValue::Array(std::move(out));
   }
@@ -856,7 +1024,11 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashFieldExi
                                                    std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Integer(0);
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Integer(0);
+  }
 
   const auto encoded = fmt::EncodeHashFieldKey(op.key, op.field, config.shard_count);
   std::string raw;
@@ -866,17 +1038,21 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashFieldExi
   return RespValue::Integer(1);
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::HashKeys& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashKeys& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Array({});
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Array({});
+  }
 
   std::vector<RespValue> keys;
   keys.reserve((*meta)->cardinality);
   const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r = ScanPrefix(
-      nullptr, default_cf.get(), prefix,
+      nullptr, default_cf.get(), prefix, deadline,
       [&](std::string_view full_key, std::string_view /*value*/) -> core::Result<bool> {
         keys.push_back(RespValue::BulkString(std::string(full_key.substr(prefix.size()))));
         return true;
@@ -885,17 +1061,21 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
   return RespValue::Array(std::move(keys));
 }
 
-core::Result<RespValue> RocksdbStore::Impl::Handle(
-    const core::ops::HashVals& op, std::optional<core::Duration> /*deadline*/) const {
+core::Result<RespValue> RocksdbStore::Impl::Handle(const core::ops::HashVals& op,
+                                                   std::optional<core::Duration> deadline) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Array({});
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Array({});
+  }
 
   std::vector<RespValue> vals;
   vals.reserve((*meta)->cardinality);
   const auto prefix = fmt::HashFieldPrefix(op.key, config.shard_count);
   auto r =
-      ScanPrefix(nullptr, default_cf.get(), prefix,
+      ScanPrefix(nullptr, default_cf.get(), prefix, deadline,
                  [&](std::string_view /*full_key*/, std::string_view value) -> core::Result<bool> {
                    vals.push_back(RespValue::BulkString(std::string(value)));
                    return true;
@@ -908,7 +1088,11 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
     const core::ops::HashLen& op, std::optional<core::Duration> /*deadline*/) const {
   auto meta = ReadMetaIfLive(fmt::kTypeHashField, op.key);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return RespValue::Integer(0);
+  if (!meta->has_value()) {
+    if (auto c = CheckNoForeignType(fmt::kTypeHashField, op.key); !c.has_value())
+      return std::unexpected(c.error());
+    return RespValue::Integer(0);
+  }
   return RespValue::Integer(static_cast<int64_t>((*meta)->cardinality));
 }
 
@@ -927,6 +1111,8 @@ core::Result<RespValue> RocksdbStore::Impl::Handle(
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::StringSet& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
+  if (auto r = ClearOtherTypeSlices(wb, fmt::kTypeString, op.key); !r.has_value()) return r;
+
   const uint8_t flags = (op.abs_ttl_ms == 0) ? 0 : fmt::kFlagHasTtl;
   const auto encoded_key = fmt::EncodeStringKey(op.key, config.shard_count);
   const auto encoded_value = fmt::EncodeStringValue({
@@ -959,6 +1145,8 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Del& op,
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::SetAdd& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
+  if (auto r = ClearOtherTypeSlices(wb, fmt::kTypeSetMember, op.key); !r.has_value()) return r;
+
   auto live = ReadMetaOrPurgeIfExpired(wb, fmt::kTypeSetMember, op.key);
   if (!live.has_value()) return std::unexpected(live.error());
 
@@ -1004,6 +1192,8 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::SetRem& op,
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetAdd& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
+  if (auto r = ClearOtherTypeSlices(wb, fmt::kTypeZsetMember, op.key); !r.has_value()) return r;
+
   auto live = ReadMetaOrPurgeIfExpired(wb, fmt::kTypeZsetMember, op.key);
   if (!live.has_value()) return std::unexpected(live.error());
 
@@ -1082,6 +1272,8 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::ZsetRem& op,
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::HashSet& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
+  if (auto r = ClearOtherTypeSlices(wb, fmt::kTypeHashField, op.key); !r.has_value()) return r;
+
   auto live = ReadMetaOrPurgeIfExpired(wb, fmt::kTypeHashField, op.key);
   if (!live.has_value()) return std::unexpected(live.error());
 
@@ -1237,8 +1429,11 @@ core::Result<RespValue> RocksdbStore::Impl::ExecDel(const core::ops::Del& op) co
     if (counted) ++deleted;
   }
 
-  auto status = db->Write(rocksdb::WriteOptions(), wb.GetWriteBatch());
-  if (!status.ok()) return std::unexpected(FromStatus(status, "DEL"));
+  // Standalone DEL command path (not the cold-flush path): make it durable on
+  // return rather than waiting for a later cold checkpoint (XERR-1 / COLD-1).
+  if (auto r = WriteDurable(wb.GetWriteBatch(), "DEL"); !r.has_value()) {
+    return std::unexpected(r.error());
+  }
   return RespValue::Integer(deleted);
 }
 
@@ -1333,7 +1528,7 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
           Error(ErrorCode::kInternal, "IterateAndDeleteCollection: unknown inner type"));
   }
 
-  auto r = ScanPrefix(&wb, default_cf.get(), member_prefix,
+  auto r = ScanPrefix(&wb, default_cf.get(), member_prefix, std::nullopt,
                       [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
                         auto s = wb.Delete(default_cf.get(), ToSlice(full_key));
                         if (!s.ok())
@@ -1344,7 +1539,7 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
 
   if (inner_type == fmt::kTypeZsetMember) {
     const auto score_prefix = fmt::ZsetScoreIndexPrefix(key, config.shard_count);
-    auto zr = ScanPrefix(&wb, zset_score_idx_cf.get(), score_prefix,
+    auto zr = ScanPrefix(&wb, zset_score_idx_cf.get(), score_prefix, std::nullopt,
                          [&](std::string_view full_key, std::string_view) -> core::Result<bool> {
                            auto s = wb.Delete(zset_score_idx_cf.get(), ToSlice(full_key));
                            if (!s.ok())
@@ -1357,6 +1552,37 @@ core::Result<void> RocksdbStore::Impl::IterateAndDeleteCollection(rocksdb::Write
   const auto meta_key = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   auto s = wb.Delete(default_cf.get(), meta_key);
   if (!s.ok()) return std::unexpected(FromStatus(s, "meta delete"));
+  return {};
+}
+
+core::Result<void> RocksdbStore::Impl::ClearOtherTypeSlices(rocksdb::WriteBatchWithIndex& wb,
+                                                            uint8_t kept_type,
+                                                            std::string_view key) const {
+  // Presence-checked: a key almost never holds a foreign type, so probe first
+  // and only emit deletes when there is something to clear. This keeps the
+  // common type-establish path write-free (no tombstone pollution of the LSM)
+  // and only runs the full collection sweep on the rare cross-window change.
+  if (kept_type != fmt::kTypeString) {
+    const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
+    std::string raw;
+    auto s =
+        wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), string_key, &raw);
+    if (s.ok()) {
+      auto del = wb.Delete(default_cf.get(), string_key);
+      if (!del.ok()) return std::unexpected(FromStatus(del, "clear other-type string slice"));
+    } else if (!s.IsNotFound()) {
+      return std::unexpected(FromStatus(s, "clear other-type string probe"));
+    }
+  }
+
+  for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
+    if (inner_type == kept_type) continue;
+    auto meta = ReadMetaForWrite(wb, inner_type, key);
+    if (!meta.has_value()) return std::unexpected(meta.error());
+    if (!meta->has_value()) continue;
+    auto r = IterateAndDeleteCollection(wb, inner_type, key);
+    if (!r.has_value()) return r;
+  }
   return {};
 }
 
@@ -1687,13 +1913,44 @@ core::Result<bool> RocksdbStore::Impl::AnyLiveRecord(std::string_view key) const
   return false;
 }
 
+core::Result<void> RocksdbStore::Impl::CheckNoForeignType(uint8_t expected_type,
+                                                          std::string_view key) const {
+  static const Error kWrongType(ErrorCode::kWrongType,
+                                "Operation against a key holding the wrong kind of value");
+
+  if (expected_type != fmt::kTypeString) {
+    const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
+    std::string raw;
+    auto s = db->Get(rocksdb::ReadOptions(), default_cf.get(), string_key, &raw);
+    if (s.ok()) {
+      auto decoded = fmt::DecodeStringValue(raw);
+      if (!decoded.has_value()) return std::unexpected(decoded.error());
+      if (!fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, NowMs())) {
+        return std::unexpected(kWrongType);
+      }
+    } else if (!s.IsNotFound()) {
+      return std::unexpected(FromStatus(s, "type check string"));
+    }
+  }
+
+  for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
+    if (inner_type == expected_type) continue;
+    auto meta = ReadMetaIfLive(inner_type, key);
+    if (!meta.has_value()) return std::unexpected(meta.error());
+    if (meta->has_value()) return std::unexpected(kWrongType);
+  }
+  return {};
+}
+
 template <typename Fn>
 core::Result<void> RocksdbStore::Impl::ScanPrefix(rocksdb::WriteBatchWithIndex* wb,
                                                   rocksdb::ColumnFamilyHandle* cf,
-                                                  std::string_view prefix, const Fn& fn) const {
+                                                  std::string_view prefix,
+                                                  std::optional<core::Duration> deadline,
+                                                  const Fn& fn) const {
   std::string upper_storage = LexicographicSuccessor(prefix);
   rocksdb::Slice upper_slice(upper_storage);
-  rocksdb::ReadOptions ro;
+  rocksdb::ReadOptions ro = MakeReadOptions(deadline);
   if (!upper_storage.empty()) {
     ro.iterate_upper_bound = &upper_slice;
   }

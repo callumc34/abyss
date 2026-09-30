@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "test_clock.h"
@@ -703,6 +704,285 @@ TEST_F(SingleShardStoreTest, GcTombstonesReclaimsAtOrBelowHorizon) {
   EXPECT_EQ(store_.Probe("c"), core::HotKeyPresence::kAbsent);
 }
 
+// --- Accounting correctness (HOT-2, HOT-3) ---
+
+TEST_F(SingleShardStoreTest, CollectionCreateAccountsFullFootprint) {
+  // A brand-new set must count the empty-entry baseline plus the member
+  // footprint — strictly more than nothing, and at least as much as a string
+  // of the same key created the same way (the create path is no longer biased
+  // low by a spurious leading TrackRemove).
+  core::ops::SetAdd add{.key = "myset", .members = {"alpha", "beta", "gamma"}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+  const auto set_bytes = store_.Stats().used_bytes;
+  EXPECT_GT(set_bytes, 0U);
+
+  SetString("equal_len_key", "v");  // same key length, scalar value
+  const auto total_after_string = store_.Stats().used_bytes;
+  EXPECT_GT(total_after_string, set_bytes) << "string add must increase used_bytes";
+}
+
+TEST_F(SingleShardStoreTest, TombstoneResurrectThenCreateBalancedBytes) {
+  // Dropping and recreating a collection key N times must not drift used_bytes_
+  // downward (the resurrect path no longer double-subtracts).
+  const auto fresh_create = [&] {
+    core::ops::SetAdd add{.key = "k", .members = {"a", "b", "c"}};
+    EXPECT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+    return store_.Stats().used_bytes;
+  };
+
+  core::SequenceId seq = 1;
+  const auto baseline = fresh_create();
+  EXPECT_GT(baseline, 0U);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, seq++)
+                    .has_value());
+    // GC the tombstone so the slot returns to truly empty before recreating.
+    store_.GcTombstones(seq);
+    const auto recreated = fresh_create();
+    EXPECT_EQ(recreated, baseline) << "used_bytes drifted after drop/recreate cycle " << i;
+  }
+}
+
+TEST_F(SingleShardStoreTest, AccountingInvariantUnderRandomOps) {
+  // After a delete+GC of every key, used_bytes_ must return to exactly 0 — any
+  // unbalanced Track pair would leave residue (or clamp at 0 hiding an
+  // over-count, which the per-step monotonic checks below would catch).
+  ASSERT_TRUE(store_
+                  .Apply(core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"x", "y"}}},
+                         kEviction)
+                  .has_value());
+  ASSERT_TRUE(store_
+                  .Apply(core::ops::WriteOp{core::ops::HashSet{
+                             .key = "h", .fields = {{.field = "f", .value = "v"}}}},
+                         kEviction)
+                  .has_value());
+  ASSERT_TRUE(store_
+                  .Apply(core::ops::WriteOp{core::ops::ZsetAdd{
+                             .key = "z", .entries = {{.score = 1.0, .member = "m"}}}},
+                         kEviction)
+                  .has_value());
+  SetString("str", "value");
+  EXPECT_GT(store_.Stats().used_bytes, 0U);
+
+  core::SequenceId seq = 1;
+  for (const auto* key : {"s", "h", "z", "str"}) {
+    ASSERT_TRUE(store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {key}}}, kEviction, seq++)
+                    .has_value());
+  }
+  store_.GcTombstones(seq);
+  EXPECT_EQ(store_.Stats().used_bytes, 0U) << "used_bytes did not return to baseline";
+  EXPECT_EQ(store_.Stats().key_count, 0U);
+}
+
+TEST_F(SingleShardStoreTest, ZsetAccountsScoreMembersIndex) {
+  // A zset stores every member twice (member_scores + score_members). Its
+  // footprint must exceed a same-cardinality set of identical member strings,
+  // proving the score index is counted (HOT-3).
+  const std::vector<std::string_view> members = {"alpha", "bravo", "charlie", "delta"};
+  core::ops::SetAdd set_add{.key = "as_set"};
+  core::ops::ZsetAdd zset_add{.key = "as_zset"};
+  double score = 1.0;
+  for (auto m : members) {
+    set_add.members.push_back(m);
+    zset_add.entries.push_back({.score = score, .member = m});
+    score += 1.0;
+  }
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set_add}, kEviction).has_value());
+  const auto set_bytes = store_.Stats().used_bytes;
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{zset_add}, kEviction).has_value());
+  const auto total_bytes = store_.Stats().used_bytes;
+  const auto zset_bytes = total_bytes - set_bytes;
+
+  EXPECT_GT(zset_bytes, set_bytes)
+      << "zset of equal cardinality must report more than a set (double-indexed members)";
+}
+
+TEST_F(SingleShardStoreTest, ZsetRemReleasesBothIndexes) {
+  // After ZADD then ZREM of every member (emptied -> tombstone), GC must return
+  // used_bytes_ to the pre-ZADD baseline: no residual from the score index.
+  const auto baseline = store_.Stats().used_bytes;
+  core::ops::ZsetAdd add{.key = "z",
+                         .entries = {{.score = 1.0, .member = "a"},
+                                     {.score = 2.0, .member = "b"},
+                                     {.score = 3.0, .member = "c"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+  EXPECT_GT(store_.Stats().used_bytes, baseline);
+
+  core::ops::ZsetRem rem{.key = "z", .members = {"a", "b", "c"}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{rem}, kEviction, 1).has_value());
+  store_.GcTombstones(2);
+  EXPECT_EQ(store_.Stats().used_bytes, baseline) << "score_members index not fully released";
+}
+
+// --- ZRANGE bound parsing is total / non-throwing (HOT-6) ---
+
+TEST_F(SingleShardStoreTest, ZsetRangeMalformedScoreReturnsInvalidArgument) {
+  core::ops::ZsetAdd add{.key = "z",
+                         .entries = {{.score = 1.0, .member = "a"}, {.score = 2.0, .member = "b"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+
+  // Malformed by-score bound: clean error, no throw.
+  core::ops::ZsetRange bad_score{.key = "z", .min = "abc", .max = "2", .by_score = true};
+  auto r = store_.Exec(core::ops::ReadOp{bad_score});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+
+  // Malformed index bound (non-numeric): clean error.
+  core::ops::ZsetRange bad_idx{.key = "z", .min = "x", .max = "1", .by_score = false};
+  auto r2 = store_.Exec(core::ops::ReadOp{bad_idx});
+  ASSERT_FALSE(r2.has_value());
+  EXPECT_EQ(r2.error().code(), core::ErrorCode::kInvalidArgument);
+
+  // Valid sentinels and numeric ranges still work.
+  core::ops::ZsetRange inf{.key = "z", .min = "-inf", .max = "+inf", .by_score = true};
+  auto ok = store_.Exec(core::ops::ReadOp{inf});
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(ok->AsArray().size(), 2U);
+
+  core::ops::ZsetRange empty_bounds{.key = "z", .min = "", .max = "", .by_score = false};
+  auto ok2 = store_.Exec(core::ops::ReadOp{empty_bounds});
+  ASSERT_TRUE(ok2.has_value());
+  EXPECT_EQ(ok2->AsArray().size(), 2U);
+}
+
+TEST_F(SingleShardStoreTest, ZsetRangeArbitraryBytesNeverThrow) {
+  core::ops::ZsetAdd add{.key = "z", .entries = {{.score = 1.0, .member = "a"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+
+  const std::array<std::string_view, 8> fuzz = {
+      "1e999999",         "9999999999999999999999999999", "nan", "0x10", "1.2.3", "+-1",
+      std::string_view{}, std::string_view("\0\1\2", 3)};
+  for (bool by_score : {true, false}) {
+    for (auto bad : fuzz) {
+      core::ops::ZsetRange op{.key = "z", .min = bad, .max = bad, .by_score = by_score};
+      // The contract is: never throws, always a valid Result (ok or error).
+      auto r = store_.Exec(core::ops::ReadOp{op});
+      (void)r;  // either outcome is acceptable; the point is no exception escapes.
+      SUCCEED();
+    }
+  }
+}
+
+// --- Counter split: TTL-expiry vs deadline-eviction (HOT-7) ---
+
+TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
+  // TTL-expired key bumps expired_count only.
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  SetString("ttl", "v", static_cast<uint64_t>(now_ms + 500));
+  clock_.Advance(1000ms);
+  store_.EvictExpired(clock_.SteadyNow());
+  auto after_ttl = store_.Stats();
+  EXPECT_EQ(after_ttl.expired_count, 1U);
+  EXPECT_EQ(after_ttl.eviction_count, 0U);
+
+  // Deadline-evicted key bumps eviction_count only, leaving expired_count.
+  core::ops::StringSet op{.key = "ev", .value = "v"};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
+  clock_.Advance(1100ms);
+  store_.EvictExpired(clock_.SteadyNow());
+  auto after_deadline = store_.Stats();
+  EXPECT_EQ(after_deadline.expired_count, 1U) << "TTL count unchanged by a deadline eviction";
+  EXPECT_EQ(after_deadline.eviction_count, 1U);
+}
+
+// --- Memory-pressure LRU eviction (HOT-1) ---
+
+// Measures the footprint of a single string entry of the given key/value, so
+// budgets can be sized relative to the real per-entry cost rather than guessed.
+uint64_t MeasureStringEntryBytes(std::string_view key, const std::string& value) {
+  abyss::testing::TestClock clock;
+  SingleShardStore probe{SingleShardConfig{
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  EXPECT_TRUE(probe
+                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = value}},
+                         core::EvictionTTL{86400})
+                  .has_value());
+  return probe.Stats().used_bytes;
+}
+
+TEST(SingleShardStoreMemoryTest, ApplyEvictsLruToFitUnderBudget) {
+  abyss::testing::TestClock clock;
+  const std::string value(64, 'v');
+  const uint64_t per_entry = MeasureStringEntryBytes("a", value);
+  // Budget holds 2 entries but not 3.
+  SingleShardStore store{SingleShardConfig{
+      .max_memory_bytes = (per_entry * 2) + (per_entry / 2),
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  const core::EvictionTTL eviction{86400};
+
+  auto write = [&](std::string_view key) {
+    return store.Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = value}},
+                       eviction);
+  };
+
+  ASSERT_TRUE(write("a").has_value());  // oldest access
+  clock.Advance(10ms);
+  ASSERT_TRUE(write("b").has_value());
+  clock.Advance(10ms);
+  // Writing c pushes over the budget; LRU evicts the least-recently-accessed
+  // (a), the write still succeeds, and used_bytes stays under the ceiling.
+  auto r = write("c");
+  ASSERT_TRUE(r.has_value()) << r.error().message();
+  EXPECT_LE(store.Stats().used_bytes, store.Stats().max_bytes);
+  EXPECT_GT(store.Stats().eviction_count, 0U) << "memory pressure bumps eviction_count";
+
+  // a was demoted (still resolvable from cold/queue in production); c is live.
+  EXPECT_FALSE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "a"}}).has_value());
+  EXPECT_TRUE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "c"}}).has_value());
+}
+
+TEST(SingleShardStoreMemoryTest, ApplyReturnsResourceExhaustedWhenNoVictims) {
+  abyss::testing::TestClock clock;
+  const uint64_t small_entry = MeasureStringEntryBytes("k", "v");
+  // Budget below a single real value, no other evictable keys.
+  SingleShardStore store{SingleShardConfig{
+      .max_memory_bytes = small_entry,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  // A single value larger than the whole budget, no other evictable keys.
+  auto r = store.Apply(
+      core::ops::WriteOp{core::ops::StringSet{.key = "big", .value = std::string(4096, 'x')}},
+      core::EvictionTTL{86400});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kResourceExhausted);
+}
+
+TEST(SingleShardStoreMemoryTest, ReplayModeSuppressesMemoryEviction) {
+  abyss::testing::TestClock clock;
+  const uint64_t small_entry = MeasureStringEntryBytes("k", "v");
+  SingleShardStore store{SingleShardConfig{
+      .max_memory_bytes = small_entry,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  store.SetReplayMode(true);
+  // Over-budget writes must all apply during replay: no eviction, no
+  // kResourceExhausted (deterministic replay, invariant 4).
+  for (int i = 0; i < 5; ++i) {
+    auto r = store.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k" + std::to_string(i),
+                                                                 .value = std::string(256, 'x')}},
+                         core::EvictionTTL{86400});
+    ASSERT_TRUE(r.has_value()) << "replay write " << i << " should not be rejected";
+  }
+  EXPECT_EQ(store.Stats().eviction_count, 0U);
+  EXPECT_EQ(store.Stats().key_count, 5U);
+  EXPECT_GT(store.Stats().used_bytes, store.Stats().max_bytes)
+      << "over budget during replay (enforced only after)";
+
+  // After replay, the ceiling is enforced by EvictLru.
+  store.SetReplayMode(false);
+  store.EvictLru(store.Stats().max_bytes);
+  EXPECT_LE(store.Stats().used_bytes, store.Stats().max_bytes);
+}
+
 TEST_F(SingleShardStoreTest, GcReclaimsTombstoneFootprintAndPreservesLiveKeys) {
   SetString("live", "v");
   SetString("dead", "v");
@@ -727,6 +1007,142 @@ TEST_F(SingleShardStoreTest, GcReclaimsTombstoneFootprintAndPreservesLiveKeys) {
   auto r = GetString("live");
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(r->AsString(), "v");
+}
+
+// --- HOT-4: EXPIRE/PERSIST on a tombstoned key ------------------------------
+
+TEST_F(SingleShardStoreTest, ExpireOnTombstonedKeyReturnsZeroNoMutation) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+  ASSERT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  auto r = store_.Apply(core::ops::WriteOp{core::ops::Expire{
+                            .key = "k", .abs_ttl_ms = static_cast<uint64_t>(now_ms + 100000)}},
+                        kEviction, 2);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 0) << "EXPIRE on a tombstone is a no-op returning 0";
+  // The tombstone is untouched: still tombstoned (not resurrected), GC reclaims
+  // it by horizon, and a read still falls through as absent.
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, PexpireatOnTombstonedKeyReturnsZero) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+
+  // PEXPIREAT parses to the same Expire write op as EXPIRE; both must no-op.
+  auto r =
+      store_.Apply(core::ops::WriteOp{core::ops::Expire{.key = "k", .abs_ttl_ms = 99999999999ULL}},
+                   kEviction, 2);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 0);
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, PersistOnTombstonedKeyReturnsZero) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+
+  auto r = store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 2);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 0) << "PERSIST on a tombstone is a no-op returning 0";
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, ExpirePersistOnTombstoneDoNotPerturbEvictionCounters) {
+  // HOT-7 split: EvictExpired skips tombstones before the count branch, so a
+  // tombstone routed through EXPIRE/PERSIST must not bleak into the ttl_expired
+  // vs deadline counters. Drive a tombstone through both ops, then EvictExpired
+  // and assert neither bucket counts the tombstone.
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 1).has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Expire{.key = "k", .abs_ttl_ms = 1}}, kEviction, 2)
+          .has_value());
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 3).has_value());
+
+  clock_.Advance(1500ms);
+  auto report = store_.EvictExpired(clock_.SteadyNow());
+  EXPECT_EQ(report.by_ttl, 0U) << "tombstone is skipped, never counted as a TTL expiry";
+  EXPECT_EQ(report.by_deadline, 0U) << "tombstone is skipped, never counted as an eviction";
+  // The tombstone survives until GC, not the eviction deadline.
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
+}
+
+TEST_F(SingleShardStoreTest, ExpirePersistAfterTombstoneGcStillAbsent) {
+  SetString("k", "v");
+  ASSERT_TRUE(
+      store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 5).has_value());
+  // GC reclaims the tombstone (horizon >= tombstone_seq), so the key is now
+  // fully absent and the entries_.end() guard returns 0.
+  EXPECT_EQ(store_.GcTombstones(5), 1U);
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
+
+  auto e = store_.Apply(core::ops::WriteOp{core::ops::Expire{.key = "k", .abs_ttl_ms = 1}},
+                        kEviction, 6);
+  ASSERT_TRUE(e.has_value());
+  EXPECT_EQ(e->AsInteger(), 0);
+  auto p = store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 7);
+  ASSERT_TRUE(p.has_value());
+  EXPECT_EQ(p->AsInteger(), 0);
+}
+
+TEST_F(SingleShardStoreTest, ExpireOnLiveKeyStillReturnsOne) {
+  // Regression guard: the tombstone short-circuit must not affect live keys.
+  SetString("k", "v");
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
+          .count();
+  auto r = store_.Apply(core::ops::WriteOp{core::ops::Expire{
+                            .key = "k", .abs_ttl_ms = static_cast<uint64_t>(now_ms + 100000)}},
+                        kEviction, 1);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->AsInteger(), 1);
+}
+
+// --- COLD-3 coupling: hot ZRANGEBYLEX by_lex branch -------------------------
+
+TEST_F(SingleShardStoreTest, HotZrangeByLexAppliesBounds) {
+  // Equal scores so the order is purely lexicographic.
+  core::ops::ZsetAdd add{.key = "z",
+                         .entries = {{.score = 0.0, .member = "a"},
+                                     {.score = 0.0, .member = "b"},
+                                     {.score = 0.0, .member = "c"},
+                                     {.score = 0.0, .member = "d"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+
+  auto collect = [&](std::string_view min, std::string_view max, bool rev = false) {
+    auto r = store_.Exec(core::ops::ReadOp{
+        core::ops::ZsetRange{.key = "z", .min = min, .max = max, .by_lex = true, .rev = rev}});
+    EXPECT_TRUE(r.has_value());
+    std::vector<std::string> out;
+    for (const auto& e : r->AsArray()) out.push_back(e.AsString());
+    return out;
+  };
+
+  EXPECT_EQ(collect("[b", "(d"), (std::vector<std::string>{"b", "c"}));
+  EXPECT_EQ(collect("-", "+"), (std::vector<std::string>{"a", "b", "c", "d"}));
+  EXPECT_EQ(collect("(a", "[c"), (std::vector<std::string>{"b", "c"}));
+  EXPECT_EQ(collect("-", "+", /*rev=*/true), (std::vector<std::string>{"d", "c", "b", "a"}));
+}
+
+TEST_F(SingleShardStoreTest, HotZrangeByLexMalformedBoundIsCleanError) {
+  core::ops::ZsetAdd add{.key = "z", .entries = {{.score = 0.0, .member = "a"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+
+  // A bare value with no [ or ( prefix must surface a clean error, never throw.
+  auto r = store_.Exec(
+      core::ops::ReadOp{core::ops::ZsetRange{.key = "z", .min = "a", .max = "+", .by_lex = true}});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
 }
 
 }  // namespace

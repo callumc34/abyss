@@ -5,6 +5,7 @@ add_executable(abyss_bench
   eviction_policy_bench.cpp
   hot_store_bench.cpp
   compaction_buffer_bench.cpp
+  write_validation_bench.cpp
 )
 
 target_link_libraries(abyss_bench PRIVATE
@@ -14,5 +15,6 @@ target_link_libraries(abyss_bench PRIVATE
   abyss::consumer
   abyss::engine
   abyss::hot
+  abyss::resp
   benchmark::benchmark
 )

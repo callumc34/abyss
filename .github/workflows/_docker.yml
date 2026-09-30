@@ -3,15 +3,23 @@ name: Docker
 on:
   workflow_call:
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   docker:
     name: Docker
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # id-token/attestations cannot be elevated by a called workflow: the calling
+    # job in ci.yml must grant them too, otherwise the run is rejected.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      # Signing and attestation are default-branch pushes only. Cosign keyless
+      # signing depends on the CI OIDC identity and on Sigstore being reachable,
+      # so a Sigstore outage must not be able to fail every pull request.
+      ABYSS_ATTEST: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     steps:
       - name: Checkout commit
         uses: actions/checkout@v7
@@ -44,6 +52,7 @@ jobs:
           echo "baseline=${BASELINE}" >> "${GITHUB_OUTPUT}"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -51,6 +60,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # BuildKit-generated SLSA provenance and SPDX SBOM, attached to the
+          # pushed image as in-toto attestations.
+          provenance: ${{ env.ABYSS_ATTEST == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ env.ABYSS_ATTEST }}
           build-args: |
             CI_REQUIRE_BINARY_CACHE=1
             VCPKG_BASELINE=${{ steps.vcpkg.outputs.baseline }}
@@ -59,3 +72,26 @@ jobs:
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max,ignore-error=true
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        if: env.ABYSS_ATTEST == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image digest
+        if: env.ABYSS_ATTEST == 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest build provenance
+        # Non-blocking: the image already carries BuildKit provenance and is
+        # signed, so a transient Sigstore/attestation-API failure here must not
+        # fail an otherwise good default-branch build.
+        if: env.ABYSS_ATTEST == 'true'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

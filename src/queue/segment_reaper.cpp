@@ -1,5 +1,7 @@
 #include "abyss/queue/segment_reaper.h"
 
+#include <cstdint>
+#include <string_view>
 #include <utility>
 
 #include "abyss/log/log.h"
@@ -12,24 +14,34 @@ SegmentReaper::SegmentReaper(SegmentRegistry& registry, const OffsetStore& offse
                              SegmentReaperConfig config)
     : registry_(registry), offsets_(offsets), config_(std::move(config)) {}
 
-core::Result<size_t> SegmentReaper::RunOnce() {
+core::Result<SegmentReaper::ReapOutcome> SegmentReaper::RunOnce() {
   auto sealed = registry_.ListSealedSegments();
   const auto now = config_.wall_clock();
 
-  size_t deleted = 0;
+  ReapOutcome outcome;
   for (const auto& info : sealed) {
     if (!ShouldDelete(info, now)) continue;
 
     auto removed = registry_.RemoveSegment(info.shard, info.base_seq);
     if (!removed.has_value()) {
-      return std::unexpected(removed.error());
+      ++outcome.failed;
+      if (!outcome.first_error.has_value()) outcome.first_error = removed.error();
+      if (!outcome.oldest_eligible_unreaped.has_value() ||
+          info.created_at < *outcome.oldest_eligible_unreaped) {
+        outcome.oldest_eligible_unreaped = info.created_at;
+      }
+      ABYSS_LOG_WARN("segment removal failed; sweep continues",
+                     {"shard", static_cast<int64_t>(info.shard)},
+                     {"base_seq", static_cast<uint64_t>(info.base_seq)},
+                     {"err", std::string_view{removed.error().message()}});
+      continue;
     }
     ABYSS_LOG_DEBUG("segment removed", {"shard", static_cast<int64_t>(info.shard)},
                     {"base_seq", static_cast<uint64_t>(info.base_seq)},
                     {"last_seq", static_cast<uint64_t>(info.last_seq)});
-    ++deleted;
+    ++outcome.deleted;
   }
-  return deleted;
+  return outcome;
 }
 
 bool SegmentReaper::ShouldDelete(const SegmentRegistry::SealedSegmentInfo& info,

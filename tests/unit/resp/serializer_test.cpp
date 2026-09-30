@@ -18,9 +18,28 @@ std::string Bytes(const std::vector<uint8_t>& v) {
 
 std::span<const uint8_t> AsSpan(const std::vector<uint8_t>& v) { return {v.data(), v.size()}; }
 
+std::span<const uint8_t> StrSpan(const std::string& s) {
+  return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+
 TEST(SerializerTest, Null) {
   auto out = Serializer::Serialize(core::RespValue::Null());
   EXPECT_EQ(Bytes(out), "$-1\r\n");
+}
+
+// RESP-5: Redis distinguishes the array-shaped nil (`*-1`) from the bulk nil
+// (`$-1`); COMMAND INFO of an unknown command uses the former.
+TEST(SerializerTest, NullArrayIsDistinctFromNullBulk) {
+  EXPECT_EQ(Bytes(Serializer::Serialize(core::RespValue::NullArray())), "*-1\r\n");
+  EXPECT_EQ(Bytes(Serializer::Serialize(core::RespValue::Null())), "$-1\r\n");
+}
+
+TEST(SerializerTest, NullArrayNestedInsideArray) {
+  auto out = Serializer::Serialize(core::RespValue::Array({
+      core::RespValue::NullArray(),
+      core::RespValue::Null(),
+  }));
+  EXPECT_EQ(Bytes(out), "*2\r\n*-1\r\n$-1\r\n");
 }
 
 TEST(SerializerTest, SimpleString) {
@@ -142,6 +161,31 @@ TEST(SerializerRoundTripTest, ErrorPreservesPrefixedMessage) {
   ASSERT_TRUE(parsed.has_value());
   EXPECT_TRUE(parsed->value.IsError());
   EXPECT_EQ(parsed->value.AsString(), "MOVED 3999 127.0.0.1:6380");
+}
+
+// RESP-6: a prefix outside ErrorPrefix must survive parse -> serialise intact.
+TEST(SerializerRoundTripTest, UnknownErrorPrefixRoundTrips) {
+  const std::string wire = "-WEIRD something\r\n";
+  auto parsed = Parser::Parse(StrSpan(wire));
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_TRUE(parsed->value.IsError());
+  EXPECT_EQ(parsed->value.AsString(), "WEIRD something");
+  EXPECT_EQ(Bytes(Serializer::Serialize(parsed->value)), wire);
+}
+
+TEST(SerializerRoundTripTest, KnownErrorPrefixesUnchanged) {
+  for (const std::string& wire :
+       {std::string("-WRONGTYPE bad type\r\n"), std::string("-OOM command not allowed\r\n")}) {
+    auto parsed = Parser::Parse(StrSpan(wire));
+    ASSERT_TRUE(parsed.has_value()) << wire;
+    ASSERT_TRUE(parsed->value.IsError());
+    EXPECT_EQ(Bytes(Serializer::Serialize(parsed->value)), wire);
+  }
+  const std::string wrongtype_wire = "-WRONGTYPE bad type\r\n";
+  auto wrongtype = Parser::Parse(StrSpan(wrongtype_wire));
+  ASSERT_TRUE(wrongtype.has_value());
+  EXPECT_EQ(wrongtype->value.ErrorPrefixOf(), core::ErrorPrefix::kWrongType);
+  EXPECT_EQ(wrongtype->value.ErrorMessage(), "bad type");
 }
 
 TEST(SerializerRoundTripTest, ArrayOfCommandArgs) {

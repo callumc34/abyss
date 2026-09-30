@@ -13,6 +13,7 @@
 
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
+#include "abyss/core/varint.h"
 
 namespace abyss::consumer {
 
@@ -68,6 +69,11 @@ class ExistenceCache {
       ABYSS_EXCLUDES(mu_);
   void RemoveField(std::string_view key, std::string_view field) ABYSS_EXCLUDES(mu_);
 
+  // Drops every cached member and field belonging to `key` (not the key entry
+  // itself). Used when a key is deleted or its type changes, so a later
+  // membership conditional can't observe stale members/fields.
+  void RemoveMembersAndFields(std::string_view key) ABYSS_EXCLUDES(mu_);
+
   size_t SweepExpired() ABYSS_EXCLUDES(mu_);
 
   // Drops every cache entry. Used by the FLUSHDB path. Cumulative eviction
@@ -97,11 +103,14 @@ class ExistenceCache {
   using EntryIter = EntryList::iterator;
 
   static std::string KeyKey(std::string_view k) { return std::string(k); }
+  // Length-prefixed so (key,member) is self-delimiting: binary-safe keys and
+  // members may contain any byte (incl. 0x1F), so a varint key length is the
+  // only collision-free composite encoding. Remove/Get/Upsert all share this.
   static std::string MemberKey(std::string_view k, std::string_view m) {
     std::string out;
-    out.reserve(k.size() + 1 + m.size());
+    out.reserve(k.size() + m.size() + 5);
+    core::encoding::AppendVarint(out, k.size());
     out.append(k);
-    out.push_back('\x1F');
     out.append(m);
     return out;
   }

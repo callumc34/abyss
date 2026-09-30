@@ -52,7 +52,17 @@ core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op,
           auto result = shard.store.Exec(op);
           if (result.has_value()) {
             std::scoped_lock access_lock(shard.access_mutex);
-            shard.access_buffer.emplace_back(key);
+            // De-dup within a drain interval and bound the queue: a hot key is
+            // buffered once per tick, and once the cap is hit further refreshes
+            // are dropped (a dropped refresh only shortens a key's deadline,
+            // which is safe — the key is still durable in queue/cold). Drops
+            // are counted so backlog/pressure is observable (XRES-2).
+            const size_t high_water = config_.access_buffer_high_water;
+            if (high_water != 0 && shard.access_buffer.size() >= high_water) {
+              ++shard.access_dropped;
+            } else if (shard.access_seen.insert(std::string(key)).second) {
+              shard.access_buffer.emplace_back(key);
+            }
           }
           return result;
         }
@@ -99,6 +109,13 @@ core::HotKeyPresence ShardedHotStore::Probe(std::string_view key) ABYSS_NO_THREA
   return shard.store.Probe(key);
 }
 
+void ShardedHotStore::SetReplayMode(bool replaying) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  for (auto& shard : shards_) {
+    std::unique_lock lock(shard->mutex);
+    shard->store.SetReplayMode(replaying);
+  }
+}
+
 // Engine fan-out always issues Del{single key}. The vector iteration is
 // preserved so resolver-materialised single-key Dels and any future single-key
 // Del callers share the same path; multi-key Del WAL entries no longer occur.
@@ -133,6 +150,8 @@ core::Result<core::MemoryStats> ShardedHotStore::Stats() ABYSS_NO_THREAD_SAFETY_
     total.used_bytes += stats.used_bytes;
     total.key_count += stats.key_count;
     total.eviction_count += stats.eviction_count;
+    total.expired_count += stats.expired_count;
+    total.max_bytes += stats.max_bytes;
   }
   return total;
 }
@@ -151,6 +170,8 @@ void ShardedHotStore::DrainAccessBuffers(core::SteadyTime now) {
     {
       std::scoped_lock access_lock(shard->access_mutex);
       keys.swap(shard->access_buffer);
+      // Reset the per-tick de-dup set so the next interval starts fresh.
+      shard->access_seen.clear();
     }
     if (keys.empty()) continue;
     std::unique_lock lock(shard->mutex);
@@ -170,6 +191,32 @@ SingleShardStore::EvictExpiredReport ShardedHotStore::EvictExpired(core::SteadyT
     total.by_ttl += r.by_ttl;
   }
   return total;
+}
+
+size_t ShardedHotStore::EvictToMemoryTarget() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  // A budget of 0 means unlimited — never evict for memory pressure. (Guarded
+  // here too because EvictLru(0) would otherwise evict every key.)
+  if (config_.max_memory_bytes == 0) return 0;
+  size_t evicted = 0;
+  // Each shard owns max_memory_bytes / shard_count of the budget (set at
+  // construction). Evict LRU down to that per-shard ceiling; data is safe in
+  // queue/cold (invariant 2).
+  const size_t per_shard = config_.max_memory_bytes / config_.shard_count;
+  for (auto& shard : shards_) {
+    std::unique_lock lock(shard->mutex);
+    evicted += shard->store.EvictLru(per_shard);
+  }
+  return evicted;
+}
+
+ShardedHotStore::AccessBufferStats ShardedHotStore::AccessBufferSnapshot() const {
+  AccessBufferStats stats;
+  for (const auto& shard : shards_) {
+    std::scoped_lock access_lock(shard->access_mutex);
+    stats.depth += shard->access_buffer.size();
+    stats.dropped += shard->access_dropped;
+  }
+  return stats;
 }
 
 size_t ShardedHotStore::GcTombstones(const std::function<core::SequenceId(core::ShardId)>& horizon)

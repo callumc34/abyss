@@ -78,6 +78,7 @@ core::Result<void> ParseQueue(const YamlCursor& cur, QueueConfig& out) {
       .Optional("backend", out.backend)
       .Optional("wal_path", out.wal_path)
       .Optional("segment_size_bytes", out.segment_size_bytes)
+      .Optional("max_value_size_bytes", out.max_value_size_bytes)
       .Optional("min_retention_seconds", out.min_retention)
       .Optional("wal_fsync_policy", out.fsync_policy)
       .Optional("group_commit_interval_us", out.group_commit_interval_us)
@@ -104,6 +105,11 @@ core::Result<void> ParseColdConsumer(const YamlCursor& cur, ColdConsumerConfig& 
       .Optional("queue_read_timeout_ms", out.queue_read_timeout)
       .Optional("retry_initial_backoff_ms", out.retry_initial_backoff)
       .Optional("retry_max_backoff_ms", out.retry_max_backoff)
+      .Optional("checkpoint_max_flushes", out.checkpoint_max_flushes)
+      .Optional("checkpoint_min_interval_ms", out.checkpoint_min_interval)
+      .Optional("loop_initial_backoff_ms", out.loop_initial_backoff)
+      .Optional("loop_max_backoff_ms", out.loop_max_backoff)
+      .Optional("drain_grace_seconds", out.drain_grace)
       .Finish();
 }
 
@@ -152,6 +158,7 @@ core::Result<void> ParseMetrics(const YamlCursor& cur, MetricsConfig& out) {
       .Optional("enabled", out.enabled)
       .Optional("bind", out.bind)
       .Optional("port", out.port)
+      .Optional("snapshot_interval_ms", out.snapshot_interval)
       .Finish();
 }
 
@@ -247,7 +254,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
   Config config = Defaults();
 
   if (!root.IsDefined() || root.IsNull()) {
-    config.ApplyEnvironmentOverrides();
+    if (auto r = config.ApplyEnvironmentOverrides(); !r) return std::unexpected(r.error());
     if (auto r = config.Validate(); !r) return std::unexpected(r.error());
     return config;
   }
@@ -297,7 +304,7 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
     if (auto r = section.parse(child, config); !r) return std::unexpected(r.error());
   }
 
-  config.ApplyEnvironmentOverrides();
+  if (auto r = config.ApplyEnvironmentOverrides(); !r) return std::unexpected(r.error());
   if (auto r = config.Validate(); !r) return std::unexpected(r.error());
   return config;
 }
@@ -345,31 +352,53 @@ bool ParseEnvBool(const char* text, bool& out) {
   return false;
 }
 
+// A present env var whose value cannot be parsed is rejected, not dropped: the
+// operator's intent must never be replaced by a silent default.
+core::Error EnvError(std::string_view name, const char* value, std::string_view reason) {
+  std::string msg(name);
+  msg += "='";
+  msg += value;
+  msg += "' ";
+  msg += reason;
+  return {core::ErrorCode::kInvalidArgument, std::move(msg)};
+}
+
 }  // namespace
 
-void Config::ApplyEnvironmentOverrides() {
+core::Result<void> Config::ApplyEnvironmentOverrides() {
   if (const char* v = GetEnv("ABYSS_PROFILE")) this->profile = v;
 
   if (const char* v = GetEnv("ABYSS_LOG_LEVEL")) {
     log::Level parsed = log::Level::kInfo;
-    if (log::ParseLevel(v, parsed)) this->log.default_level = parsed;
+    if (!log::ParseLevel(v, parsed)) {
+      return std::unexpected(EnvError("ABYSS_LOG_LEVEL", v, "is not a valid log level"));
+    }
+    this->log.default_level = parsed;
   }
+  // format/sink pass through verbatim; the validator's OneOf checks reject any
+  // value these do not name, so re-checking here would duplicate that rule.
   if (const char* v = GetEnv("ABYSS_LOG_FORMAT")) this->log.format = v;
   if (const char* v = GetEnv("ABYSS_LOG_SINK")) this->log.sink = v;
 
   if (const char* v = GetEnv("ABYSS_METRICS_ENABLED")) {
-    bool b = true;
-    if (ParseEnvBool(v, b)) this->metrics.enabled = b;
+    bool enabled = true;
+    if (!ParseEnvBool(v, enabled)) {
+      return std::unexpected(EnvError("ABYSS_METRICS_ENABLED", v,
+                                      "is not a valid boolean (1/0, true/false, yes/no, on/off)"));
+    }
+    this->metrics.enabled = enabled;
   }
   if (const char* v = GetEnv("ABYSS_METRICS_BIND")) this->metrics.bind = v;
   if (const char* v = GetEnv("ABYSS_METRICS_PORT")) {
     char* end = nullptr;
     // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     const long port = std::strtol(v, &end, 10);
-    if (end != v && *end == '\0' && port > 0 && port <= 0xFFFF) {
-      this->metrics.port = static_cast<uint16_t>(port);
+    if (end == v || *end != '\0' || port <= 0 || port > 0xFFFF) {
+      return std::unexpected(EnvError("ABYSS_METRICS_PORT", v, "is not a valid port"));
     }
+    this->metrics.port = static_cast<uint16_t>(port);
   }
+  return {};
 }
 
 core::Result<void> Config::Validate() const { return internal::Validate(*this); }

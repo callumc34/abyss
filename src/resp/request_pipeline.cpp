@@ -2,10 +2,12 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
 #include "abyss/core/ascii.h"
+#include "abyss/core/ops.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
 #include "abyss/resp/admin_handlers.h"
@@ -59,8 +61,10 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
                                        std::string("Protocol error: ") + parsed.error().message());
       auto bytes = Serializer::Serialize(response);
       output.insert(output.end(), bytes.begin(), bytes.end());
-      // Cannot resync on malformed input; consume the lot and let the caller close.
+      // Unframable input: emit the error, consume the lot, and fail-closed so
+      // the connection is torn down once the reply drains.
       consumed = input.size();
+      close_reason_ = ProcessCloseReason::kProtocolError;
       break;
     }
     auto response = Dispatch(parsed->command);
@@ -68,11 +72,11 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
     output.insert(output.end(), bytes.begin(), bytes.end());
     consumed += parsed->bytes_consumed;
 
-    if (close_requested_) {
+    if (close_reason_ != ProcessCloseReason::kNone) {
       break;
     }
   }
-  return {.bytes_consumed = consumed, .close_requested = close_requested_};
+  return {.bytes_consumed = consumed, .close_reason = close_reason_};
 }
 
 RespValue RequestPipeline::Dispatch(const RespCommand& cmd) {
@@ -180,10 +184,39 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         }
         flags = *extracted;
       }
+      // Arity alone is a weaker check than the parser: `HSET k f v f` and
+      // `SET k v BOGUS` both satisfy the registry and are still malformed.
+      // Queueing either would durably record a command no tier can materialise,
+      // so the parser decides before anything reaches the queue. Commands with
+      // no parser are exempt: that is a capability gap, not malformed input, and
+      // the registry stays the sole authority for them.
+      const bool unconditional =
+          flags == core::PredicateFlags::kNone && parent.dispatch == Dispatch::kWritePath;
+      const bool parseable = core::ops::HasWriteParser(parent.name);
+
+      std::optional<RespCommand> canonical;
+      if (parseable) {
+        auto parsed = core::ops::ParseWriteOp(parent.name, cmd);
+        if (!parsed.has_value()) {
+          return finish(RespValue::Error(MapErrorCode(parsed.error().code()),
+                                         std::string{parsed.error().message()}));
+        }
+        // Unconditional writes are logged in canonical form -- aliases collapsed,
+        // TTLs already absolute -- so hot, cold and recovery all read one
+        // spelling and cannot derive different meanings from it. Conditionals
+        // keep the client's spelling: the resolver reads its predicate from the
+        // command text, not from the entry's flags.
+        if (unconditional) canonical = core::ops::CanonicalCommand(*parsed);
+      }
+
       core::Result<RespValue> result;
-      if (flags == core::PredicateFlags::kNone &&
-          resolved.parent->dispatch == Dispatch::kWritePath) {
-        result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
+      if (unconditional) {
+        // parent.name, not the canonical name: it is registry-owned and stable,
+        // and no dispatcher reads it -- passing canonical.Name() here would race
+        // the move below on unspecified argument evaluation order.
+        result = canonical.has_value()
+                     ? deps_.dispatcher->DispatchWrite(parent.name, *std::move(canonical))
+                     : deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
       } else {
         result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
       }
@@ -306,6 +339,10 @@ RequestPipeline::DispatchOutcome RequestPipeline::HandleAdminStateless(
 
 RespValue RequestPipeline::HandlePing(const RespCommand& cmd) {
   if (cmd.ArgCount() == 1) return RespValue::SimpleString("PONG");
+  // Registry arity stays -1; the one-message upper bound is a PING-only rule.
+  if (cmd.ArgCount() > 2) {
+    return RespValue::Error(ErrorPrefix::kErr, "wrong number of arguments for 'ping' command");
+  }
   return RespValue::BulkString(cmd.args[1]);
 }
 
@@ -314,7 +351,7 @@ RespValue RequestPipeline::HandleEcho(const RespCommand& cmd) {
 }
 
 RespValue RequestPipeline::HandleQuit() {
-  close_requested_ = true;
+  close_reason_ = ProcessCloseReason::kClientQuit;
   return RespValue::SimpleString("OK");
 }
 

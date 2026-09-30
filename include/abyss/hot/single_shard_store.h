@@ -16,6 +16,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/hot/memory_governor.h"
 
 namespace abyss::hot {
 
@@ -83,13 +84,28 @@ class SingleShardStore {
   // Extends the eviction deadline using the per-key cached eviction recorded
   // at Apply time. No-op if the key is absent.
   void RefreshAccess(std::string_view key, core::SteadyTime now);
+  // by_deadline is a tier transition (data still in queue/cold) counted as an
+  // eviction; by_ttl is a true deletion counted separately (HOT-7).
   struct EvictExpiredReport {
     size_t by_deadline = 0;
     size_t by_ttl = 0;
     size_t Total() const { return by_deadline + by_ttl; }
   };
   EvictExpiredReport EvictExpired(core::SteadyTime now);
+  // Evicts least-recently-accessed live keys until used_bytes_ <= target_bytes.
+  // Eviction is a tier transition: the key stays durable in queue/cold.
   size_t EvictLru(size_t target_bytes);
+  // Evicts down to the governor's budget, protecting `protect_key` (the entry a
+  // write just created — it must survive so the write is applied, not evicted),
+  // then reports whether the store now fits. Returns false (the caller surfaces
+  // kResourceExhausted) only when, after evicting every other eligible key, the
+  // store still exceeds the budget. A no-op while replaying so recovery stays a
+  // deterministic queue replay (invariant 4).
+  bool EnsureCapacityFor(std::string_view protect_key);
+
+  // Suppresses memory-pressure eviction during replay. Set by the hot consumer
+  // around ReplayUntil so the rebuilt hot view does not depend on memory timing.
+  void SetReplayMode(bool replaying) { replay_mode_ = replaying; }
 
   core::MemoryStats Stats() const;
   void Wipe();
@@ -138,12 +154,20 @@ class SingleShardStore {
   void TombstoneEntry(Entry& entry, std::string_view key, core::SequenceId seq);
   void TrackInsert(const Entry& entry, std::string_view key);
   void TrackRemove(const Entry& entry, std::string_view key);
+  // LRU make-room primitive: evicts least-recently-accessed live keys (never
+  // `protect_key`, empty to protect none) until used_bytes_ <= target_bytes.
+  size_t EvictLru(size_t target_bytes, std::string_view protect_key);
 
   SingleShardConfig config_;
+  MemoryGovernor governor_;
   std::unordered_map<std::string, Entry> entries_;
   uint64_t used_bytes_ = 0;
   uint64_t key_count_ = 0;
+  // Tier transitions: deadline eviction + memory-pressure eviction (HOT-7).
   uint64_t eviction_count_ = 0;
+  // TTL-expiry deletions, distinct from tier evictions (HOT-7).
+  uint64_t expired_count_ = 0;
+  bool replay_mode_ = false;
 };
 
 }  // namespace abyss::hot

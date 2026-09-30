@@ -1,9 +1,11 @@
 #include "abyss/core/ops.h"
 
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #include "abyss/core/types.h"
@@ -27,6 +29,18 @@ Result<double> ParseDouble(std::string_view s) {
 
 Result<uint64_t> ParseUint64(std::string_view s) {
   uint64_t value = 0;
+  const auto* begin = s.data();
+  const auto* end = s.data() + s.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end) {
+    return std::unexpected(
+        Error(ErrorCode::kInvalidArgument, "not a valid integer: '" + std::string(s) + "'"));
+  }
+  return value;
+}
+
+Result<int64_t> ParseInt64(std::string_view s) {
+  int64_t value = 0;
   const auto* begin = s.data();
   const auto* end = s.data() + s.size();
   const auto [ptr, ec] = std::from_chars(begin, end, value);
@@ -109,15 +123,109 @@ Result<ReadOp> ParseHvals(const RespCommand& cmd) { return ReadOp{HashVals{.key 
 
 Result<ReadOp> ParseHlen(const RespCommand& cmd) { return ReadOp{HashLen{.key = cmd.args[1]}}; }
 
+// Parses the trailing `LIMIT offset count` clause starting at args[i]. On
+// success advances `i` past the clause and writes offset/count into `op`.
+Result<void> ParseLimitClause(const RespCommand& cmd, size_t& i, ZsetRange& op) {
+  if (i + 2 >= cmd.args.size()) {
+    return std::unexpected(SyntaxError("syntax error — LIMIT requires offset and count"));
+  }
+  auto offset = ParseInt64(cmd.args[i + 1]);
+  if (!offset.has_value()) return std::unexpected(offset.error());
+  auto count = ParseInt64(cmd.args[i + 2]);
+  if (!count.has_value()) return std::unexpected(count.error());
+  op.offset = *offset;
+  op.count = *count;
+  i += 3;
+  return {};
+}
+
+// ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES].
+// Index, score, and lex modes share one variant; the by_score/by_lex flags pick
+// the bound interpretation downstream (hot ExecZsetRange and cold Handle).
+Result<ReadOp> ParseZrange(const RespCommand& cmd) {
+  ZsetRange op{.key = cmd.args[1], .min = cmd.args[2], .max = cmd.args[3]};
+  for (size_t i = 4; i < cmd.args.size();) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt == "BYSCORE") {
+      op.by_score = true;
+      ++i;
+    } else if (opt == "BYLEX") {
+      op.by_lex = true;
+      ++i;
+    } else if (opt == "REV") {
+      op.rev = true;
+      ++i;
+    } else if (opt == "WITHSCORES") {
+      op.with_scores = true;
+      ++i;
+    } else if (opt == "LIMIT") {
+      auto limit = ParseLimitClause(cmd, i, op);
+      if (!limit.has_value()) return std::unexpected(limit.error());
+    } else {
+      return std::unexpected(SyntaxError("syntax error — unknown ZRANGE option '" + opt + "'"));
+    }
+  }
+  if (op.by_score && op.by_lex) {
+    return std::unexpected(SyntaxError("syntax error — BYSCORE and BYLEX are mutually exclusive"));
+  }
+  return ReadOp{op};
+}
+
+// ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count].
+Result<ReadOp> ParseZrangeByScore(const RespCommand& cmd) {
+  ZsetRange op{.key = cmd.args[1], .min = cmd.args[2], .max = cmd.args[3], .by_score = true};
+  for (size_t i = 4; i < cmd.args.size();) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt == "WITHSCORES") {
+      op.with_scores = true;
+      ++i;
+    } else if (opt == "LIMIT") {
+      auto limit = ParseLimitClause(cmd, i, op);
+      if (!limit.has_value()) return std::unexpected(limit.error());
+    } else {
+      return std::unexpected(
+          SyntaxError("syntax error — unknown ZRANGEBYSCORE option '" + opt + "'"));
+    }
+  }
+  return ReadOp{op};
+}
+
+// ZRANGEBYLEX key min max [LIMIT offset count]. WITHSCORES is not valid for lex.
+Result<ReadOp> ParseZrangeByLex(const RespCommand& cmd) {
+  ZsetRange op{.key = cmd.args[1], .min = cmd.args[2], .max = cmd.args[3], .by_lex = true};
+  for (size_t i = 4; i < cmd.args.size();) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt == "LIMIT") {
+      auto limit = ParseLimitClause(cmd, i, op);
+      if (!limit.has_value()) return std::unexpected(limit.error());
+    } else {
+      return std::unexpected(
+          SyntaxError("syntax error — unknown ZRANGEBYLEX option '" + opt + "'"));
+    }
+  }
+  return ReadOp{op};
+}
+
 const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
   // MGET / EXISTS are intentionally absent: the engine decomposes them in
   // DispatchFanOut and never round-trips through ParseReadOp.
   static const std::unordered_map<std::string_view, ReadParserFn> table{
-      {"GET", ParseGet},         {"SISMEMBER", ParseSismember}, {"SMEMBERS", ParseSmembers},
-      {"SCARD", ParseScard},     {"ZSCORE", ParseZscore},       {"ZCARD", ParseZcard},
-      {"HGET", ParseHget},       {"HGETALL", ParseHgetall},     {"HMGET", ParseHmget},
-      {"HEXISTS", ParseHexists}, {"HKEYS", ParseHkeys},         {"HVALS", ParseHvals},
+      {"GET", ParseGet},
+      {"SISMEMBER", ParseSismember},
+      {"SMEMBERS", ParseSmembers},
+      {"SCARD", ParseScard},
+      {"ZSCORE", ParseZscore},
+      {"ZCARD", ParseZcard},
+      {"HGET", ParseHget},
+      {"HGETALL", ParseHgetall},
+      {"HMGET", ParseHmget},
+      {"HEXISTS", ParseHexists},
+      {"HKEYS", ParseHkeys},
+      {"HVALS", ParseHvals},
       {"HLEN", ParseHlen},
+      {"ZRANGE", ParseZrange},
+      {"ZRANGEBYSCORE", ParseZrangeByScore},
+      {"ZRANGEBYLEX", ParseZrangeByLex},
   };
   return table;
 }
@@ -125,6 +233,13 @@ const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
 // --- Write parsers ----------------------------------------------------------
 
 using WriteParserFn = Result<WriteOp> (*)(const RespCommand&, uint64_t);
+
+// Options the resolver interprets before materialising a plain SET. They carry
+// no meaning here, but must stay legal so both SET parse paths agree on the
+// accepted token set.
+bool IsResolverSetOption(std::string_view opt) {
+  return opt == "NX" || opt == "XX" || opt == "GET" || opt == "KEEPTTL";
+}
 
 Result<WriteOp> ParseSet(const RespCommand& cmd, uint64_t wall_now_ms) {
   uint64_t abs_ttl_ms = 0;
@@ -145,6 +260,8 @@ Result<WriteOp> ParseSet(const RespCommand& cmd, uint64_t wall_now_ms) {
       } else {
         abs_ttl_ms = *ttl_arg;
       }
+    } else if (!IsResolverSetOption(opt)) {
+      return std::unexpected(SyntaxError("syntax error — unknown SET option '" + opt + "'"));
     }
   }
   return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[2], .abs_ttl_ms = abs_ttl_ms}};
@@ -308,6 +425,107 @@ Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd, uint
         Error(ErrorCode::kInvalidArgument, "unknown write command '" + std::string(name) + "'"));
   }
   return it->second(cmd, wall_now_ms);
+}
+
+bool HasWriteParser(std::string_view name) { return WriteParsers().contains(name); }
+
+namespace {
+
+// Shortest representation that from_chars reproduces bit-for-bit. std::to_string
+// would round to 6 decimals and silently change scores on the way to the WAL.
+std::string ScoreToString(double score) {
+  std::array<char, 40> buf{};
+  const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), score);
+  if (ec != std::errc{}) return "0";
+  return {buf.data(), ptr};
+}
+
+// Sized up front and filled by emplace: an initializer_list would copy every
+// argument (its elements are const, so they cannot be moved from) and an
+// unreserved vector would then realloc its way up. Both matter here -- this
+// runs once per write, on the client's thread.
+RespCommand Begin(std::string_view name, size_t arg_count) {
+  RespCommand cmd;
+  cmd.args.reserve(arg_count);
+  cmd.args.emplace_back(name);
+  return cmd;
+}
+
+void PushAll(RespCommand& cmd, const std::vector<std::string_view>& values) {
+  for (const auto& v : values) cmd.args.emplace_back(v);
+}
+
+}  // namespace
+
+RespCommand CanonicalCommand(const WriteOp& op) {
+  return std::visit(
+      [](const auto& o) -> RespCommand {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, StringSet>) {
+          auto cmd = Begin("SET", o.abs_ttl_ms > 0 ? 5 : 3);
+          cmd.args.emplace_back(o.key);
+          cmd.args.emplace_back(o.value);
+          if (o.abs_ttl_ms > 0) {
+            cmd.args.emplace_back("PXAT");
+            cmd.args.emplace_back(std::to_string(o.abs_ttl_ms));
+          }
+          return cmd;
+        } else if constexpr (std::is_same_v<T, Del>) {
+          auto cmd = Begin("DEL", 1 + o.keys.size());
+          PushAll(cmd, o.keys);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, SetAdd>) {
+          auto cmd = Begin("SADD", 2 + o.members.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.members);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, SetRem>) {
+          auto cmd = Begin("SREM", 2 + o.members.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.members);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, ZsetAdd>) {
+          auto cmd = Begin("ZADD", 2 + (2 * o.entries.size()));
+          cmd.args.emplace_back(o.key);
+          for (const auto& e : o.entries) {
+            cmd.args.push_back(ScoreToString(e.score));
+            cmd.args.emplace_back(e.member);
+          }
+          return cmd;
+        } else if constexpr (std::is_same_v<T, ZsetRem>) {
+          auto cmd = Begin("ZREM", 2 + o.members.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.members);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, HashSet> || std::is_same_v<T, HashMSet>) {
+          // HMSET acknowledges with OK where HSET returns a count, so they are
+          // distinct ops and must stay distinct commands.
+          constexpr std::string_view kName = std::is_same_v<T, HashSet> ? "HSET" : "HMSET";
+          auto cmd = Begin(kName, 2 + (2 * o.fields.size()));
+          cmd.args.emplace_back(o.key);
+          for (const auto& f : o.fields) {
+            cmd.args.emplace_back(f.field);
+            cmd.args.emplace_back(f.value);
+          }
+          return cmd;
+        } else if constexpr (std::is_same_v<T, HashDel>) {
+          auto cmd = Begin("HDEL", 2 + o.fields.size());
+          cmd.args.emplace_back(o.key);
+          PushAll(cmd, o.fields);
+          return cmd;
+        } else if constexpr (std::is_same_v<T, Expire>) {
+          auto cmd = Begin("PEXPIREAT", 3);
+          cmd.args.emplace_back(o.key);
+          cmd.args.push_back(std::to_string(o.abs_ttl_ms));
+          return cmd;
+        } else {
+          static_assert(std::is_same_v<T, Persist>);
+          auto cmd = Begin("PERSIST", 2);
+          cmd.args.emplace_back(o.key);
+          return cmd;
+        }
+      },
+      op);
 }
 
 std::string_view PrimaryKey(const ReadOp& op) {

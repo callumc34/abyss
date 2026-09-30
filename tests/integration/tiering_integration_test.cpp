@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -44,7 +45,7 @@ TEST_F(TieringIntegrationTest, HotReadThroughEngine) {
 
 TEST_F(TieringIntegrationTest, ColdReadThroughEngine) {
   core::ops::WriteOp op{core::ops::StringSet{.key = "k1", .value = "cold_value"}};
-  auto apply = harness_.Cold().ApplyBatch(std::span{&op, 1});
+  auto apply = harness_.Cold().ApplyBatch(std::span{&op, 1}, 0);
   ASSERT_TRUE(apply.has_value()) << apply.error().message();
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
@@ -65,7 +66,7 @@ TEST_F(TieringIntegrationTest, HotTakesPriorityOverCold) {
   ASSERT_TRUE(harness_.SeedHot({"SET", "k1", "from_hot"}).has_value());
 
   core::ops::WriteOp cold_op{core::ops::StringSet{.key = "k1", .value = "from_cold"}};
-  auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1});
+  auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1}, 0);
   ASSERT_TRUE(apply_cold.has_value());
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
@@ -75,7 +76,7 @@ TEST_F(TieringIntegrationTest, HotTakesPriorityOverCold) {
 
 TEST_F(TieringIntegrationTest, BufferTombstoneBlocksColdRead) {
   core::ops::WriteOp cold_op{core::ops::StringSet{.key = "k1", .value = "cold_value"}};
-  auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1});
+  auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1}, 0);
   ASSERT_TRUE(apply_cold.has_value());
 
   harness_.BufferFor("k1").Absorb(
@@ -114,7 +115,7 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
   harness_.Clock().Advance(6000ms);
 
   core::ops::WriteOp cold_op{core::ops::StringSet{.key = "k1", .value = "cold_fallback"}};
-  auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1});
+  auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1}, 0);
   ASSERT_TRUE(apply_cold.has_value());
 
   auto after = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
@@ -139,7 +140,7 @@ TEST_F(TieringIntegrationTest, WritePathAwaitsConsumerAck) {
 
 TEST_F(TieringIntegrationTest, ColdHitStringTriggersPromotion) {
   core::ops::WriteOp set_op{core::ops::StringSet{.key = "cold_only", .value = "cv"}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}).has_value());
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0).has_value());
 
   bool promote_appended = false;
   ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_))
@@ -170,7 +171,7 @@ TEST_F(TieringIntegrationTest, ColdHitTtlPreservedInPromotionCommand) {
 
   core::ops::WriteOp set_op{
       core::ops::StringSet{.key = "ttl_key", .value = "v", .abs_ttl_ms = abs_ttl_ms}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}).has_value());
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0).has_value());
 
   std::optional<core::RespCommand> promoted;
   ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_))
@@ -197,11 +198,11 @@ TEST_F(TieringIntegrationTest, ColdHitTtlPreservedInPromotionCommand) {
 
 TEST_F(TieringIntegrationTest, ColdDeleteRemovesKey) {
   core::ops::WriteOp set_op{core::ops::StringSet{.key = "k1", .value = "v1"}};
-  auto apply = harness_.Cold().ApplyBatch(std::span{&set_op, 1});
+  auto apply = harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0);
   ASSERT_TRUE(apply.has_value());
 
   core::ops::WriteOp del_op{core::ops::Del{.keys = {"k1"}}};
-  auto del = harness_.Cold().ApplyBatch(std::span{&del_op, 1});
+  auto del = harness_.Cold().ApplyBatch(std::span{&del_op, 1}, 0);
   ASSERT_TRUE(del.has_value());
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
@@ -294,7 +295,7 @@ TEST_F(TieringIntegrationTest, MultipleKeysTieredAcrossStores) {
   ASSERT_TRUE(harness_.SeedHot({"SET", "hot_key", "hv"}).has_value());
 
   core::ops::WriteOp cold_op{core::ops::StringSet{.key = "cold_key", .value = "cv"}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&cold_op, 1}).has_value());
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&cold_op, 1}, 0).has_value());
 
   harness_.BufferFor("buf_key").Absorb(
       "buf_key", core::ops::WriteOp{core::ops::StringSet{.key = "buf_key", .value = "bv"}},
@@ -316,7 +317,7 @@ TEST_F(TieringIntegrationTest, MultipleKeysTieredAcrossStores) {
 // C6: a failed promotion Append must not silently disappear.
 TEST_F(TieringIntegrationTest, PromotionQueueFailureIncrementsCounter) {
   core::ops::WriteOp set_op{core::ops::StringSet{.key = "cold_only", .value = "cv"}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}).has_value());
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0).has_value());
 
   ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
@@ -403,7 +404,7 @@ TEST_F(TieringIntegrationTest, EmptiedHashReadsEmptyGateFree) {
 // settled seq. Here the consumer catches up mid-wait and the read then succeeds.
 TEST_F(TieringIntegrationTest, HotAbsentCollectionReadWaitsThenSucceeds) {
   core::ops::WriteOp h{core::ops::HashSet{.key = "ch", .fields = {{.field = "a", .value = "1"}}}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&h, 1}).has_value());
+  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&h, 1}, 0).has_value());
 
   const auto shard = core::ComputeShard("ch", testing::IntegrationHarness::kShardCount);
   ASSERT_TRUE(harness_.SeedHot({"SET", SameShardPrimer("ch"), "v"}).has_value());
@@ -443,6 +444,62 @@ TEST(TieringIntegrationTimeoutTest, CollectionReadTimesOutWhenColdConsumerWedged
   ASSERT_TRUE(result->IsError());
   EXPECT_GE(elapsed, kTimeout);
   EXPECT_EQ(harness.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
+}
+
+// COLD-3 coupling: ZRANGEBYLEX must return byte-identical results whether the
+// zset is served from hot or, after eviction, from cold — across a battery of
+// lex bounds. Guards the hot/cold view-equivalence the COLD-3 bundle requires.
+TEST_F(TieringIntegrationTest, ZrangeByLexHotColdEquivalence) {
+  static constexpr const char* kKey = "z";
+  // Equal scores so the order is purely lexicographic.
+  ASSERT_TRUE(harness_.SeedHot({"ZADD", kKey, "0", "a", "0", "b", "0", "c", "0", "d"}).has_value());
+
+  struct Case {
+    const char* min;
+    const char* max;
+  };
+  // ZRANGEBYLEX has no REV option in Redis (REV lives on the unified ZRANGE);
+  // the by_lex rev path is covered by the hot/cold unit tests.
+  const std::vector<Case> cases = {
+      {"[b", "(d"}, {"-", "+"}, {"(a", "[c"}, {"[a", "[d"}, {"[x", "[z"},  // empty slice
+      {"(d", "[a"},                                                        // empty (min > max)
+  };
+
+  // Order-preserving projection of a ZRANGEBYLEX reply to member strings.
+  auto to_members = [](const core::RespValue& v) {
+    std::vector<std::string> out;
+    for (const auto& e : v.AsArray()) out.push_back(e.AsString());
+    return out;
+  };
+  auto run = [&](const Case& c) {
+    return harness_.Engine().DispatchRead(
+        "ZRANGEBYLEX",
+        core::RespCommand{.args = std::vector<std::string>{"ZRANGEBYLEX", kKey, c.min, c.max}});
+  };
+
+  std::vector<std::vector<std::string>> hot_results;
+  hot_results.reserve(cases.size());
+  for (const auto& c : cases) {
+    auto r = run(c);
+    ASSERT_TRUE(r.has_value()) << r.error().message();
+    hot_results.push_back(to_members(*r));
+  }
+
+  // Flush the zset to cold, then evict it from hot so the same reads now route
+  // through the cold tier via the overlay.
+  const auto shard = core::ComputeShard(kKey, testing::IntegrationHarness::kShardCount);
+  auto& cold_consumer = harness_.ColdPool().ConsumerFor(shard);
+  cold_consumer.Drain();
+  cold_consumer.FlushUnscheduled();
+  harness_.Clock().Advance(48h);
+  ASSERT_GE(harness_.ShardedHot().EvictExpired(harness_.Clock().SteadyNow()).Total(), 1U);
+
+  for (size_t i = 0; i < cases.size(); ++i) {
+    auto cold = run(cases[i]);
+    ASSERT_TRUE(cold.has_value()) << cold.error().message();
+    EXPECT_EQ(to_members(*cold), hot_results[i])
+        << "hot/cold ZRANGEBYLEX divergence for [" << cases[i].min << ", " << cases[i].max << "]";
+  }
 }
 
 }  // namespace

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -45,8 +47,15 @@ class IntegrationHarness {
     if (cfg.eviction_policy.has_value()) {
       eviction_policy_ = std::move(*cfg.eviction_policy);
     }
-    tmp_dir_ = std::filesystem::temp_directory_path() /
-               ("abyss_test_" + std::to_string(abyss::platform::fs::ProcessId()));
+    // Unique per harness instance: PID alone collides across sequential tests
+    // in the same binary, leaking cold RocksDB state between them. Add an
+    // atomic counter + steady-clock stamp so every instance gets a private dir.
+    static std::atomic<uint64_t> harness_counter{0};
+    const auto unique = std::to_string(abyss::platform::fs::ProcessId()) + "_" +
+                        std::to_string(harness_counter.fetch_add(1, std::memory_order_relaxed)) +
+                        "_" +
+                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    tmp_dir_ = std::filesystem::temp_directory_path() / ("abyss_test_" + unique);
     std::filesystem::create_directories(tmp_dir_);
 
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
@@ -66,7 +75,9 @@ class IntegrationHarness {
     cold_ = std::move(cold_result).value();
 
     rpc_ = std::make_unique<core::ConsumerRpc>();
-    apply_notifier_ = std::make_unique<core::ApplyNotifier>();
+    apply_notifier_ = std::make_unique<core::AppliedSeqNotifier>(core::AppliedSeqNotifierConfig{
+        .shard_count = kShardCount,
+    });
 
     InstallQueueMocks();
 
@@ -198,7 +209,7 @@ class IntegrationHarness {
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> rpc_;
-  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
+  std::unique_ptr<core::AppliedSeqNotifier> apply_notifier_;
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 };

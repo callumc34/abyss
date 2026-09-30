@@ -17,6 +17,11 @@ enum class ErrorCode : uint8_t {
   kCorruption,
   kIncomplete,
   kWrongType,
+  // A precondition for the operation was not yet met (e.g. acking a retention
+  // offset past the durable WAL tail). Retryable once the precondition holds.
+  kFailedPrecondition,
+  // A value exceeds the configured queue.max_value_size_bytes ceiling.
+  kValueTooLarge,
 };
 
 class Error {

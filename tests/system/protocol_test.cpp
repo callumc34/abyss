@@ -1,3 +1,4 @@
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -22,6 +23,27 @@ TEST_F(ProtocolTest, WrongtypeReturnsError) {
   Client().Command({"SET", "k", "v"});
   auto r = Client().Command({"SADD", "k", "m"});
   EXPECT_TRUE(r.IsError());
+}
+
+// ENGINE-7: a SET carrying an unrecognised option is a syntax error at the
+// frontend; nothing may be appended to the queue, so the key stays absent even
+// after a restart replays the log. Isolated fixture: this writes and restarts.
+using SetOptionValidationTest = IsolatedDataServerTest;
+
+TEST_F(SetOptionValidationTest, SetWithUnknownOptionNotCommittedToWal) {
+  auto rejected = Client().Command({"SET", "eng7", "v", "BOGUS"});
+  ASSERT_TRUE(rejected.IsError()) << rejected;
+  EXPECT_NE(rejected.String().find("syntax error"), std::string::npos) << rejected;
+  EXPECT_TRUE(Client().Command({"GET", "eng7"}).IsNil());
+
+  RestartServer();
+  EXPECT_TRUE(Client().Command({"GET", "eng7"}).IsNil());
+
+  // The legitimate option set still round-trips through the same path.
+  EXPECT_TRUE(Client().Command({"SET", "eng7", "v", "EX", "600"}).IsOk());
+  auto stored = Client().Command({"GET", "eng7"});
+  ASSERT_TRUE(stored.IsBulk());
+  EXPECT_EQ(stored.String(), "v");
 }
 
 class DataProtocolTest : public DataCommandTest {};

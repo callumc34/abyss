@@ -95,6 +95,18 @@ RUN cmake -S . -B build/container -G Ninja \
 RUN ldd build/container/apps/abyss-server/abyss-server || true
 RUN timeout 5 build/container/apps/abyss-server/abyss-server || [[ $? -eq 124 ]]
 
+# tini: a tiny init that owns PID-1 responsibilities (signal forwarding +
+# zombie reaping) so abyss-server runs as a normal child with standard SIGTERM
+# disposition (G7). distroless does not ship tini, so fetch and checksum-pin it
+# here (digest discipline matches the vcpkg/base-image pinning) and COPY into
+# the final stage.
+ARG TINI_VERSION=v0.19.0
+ARG TINI_SHA256=c5b0666b4cb676901f90dfcb37106783c5fe2077b04590973b885950611b30ee
+RUN curl -fsSL "https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static-amd64" \
+      -o /tini && \
+    echo "${TINI_SHA256}  /tini" | sha256sum -c - && \
+    chmod +x /tini
+
 ARG RUNTIME_GLIBC_MAX=2.36
 RUN bin=build/container/apps/abyss-server/abyss-server; \
     max=$(objdump -T "${bin}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
@@ -108,8 +120,12 @@ RUN bin=build/container/apps/abyss-server/abyss-server; \
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985
 
+COPY --from=build /tini /usr/bin/tini
 COPY --from=build /src/build/container/apps/abyss-server/abyss-server /usr/local/bin/abyss-server
 
 EXPOSE 6379 9090 8080
 
-ENTRYPOINT ["abyss-server"]
+# tini (PID 1) forwards signals to abyss-server and reaps zombies; the exec-form
+# wrapping preserves abyss-server's own arg handling. Together with the
+# signal-first bootstrap in main.cpp, a SIGTERM at any instant is honored (G7).
+ENTRYPOINT ["/usr/bin/tini", "--", "abyss-server"]

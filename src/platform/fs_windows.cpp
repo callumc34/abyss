@@ -180,7 +180,10 @@ core::Result<void> Ftruncate(const File& f, std::uint64_t size) {
   return {};
 }
 
-core::Result<void> Fsync(const File& f) {
+core::Result<void> Fsync(const File& f, SyncMode /*mode*/) {
+  // FlushFileBuffers is the strongest durability barrier Windows exposes on a
+  // file handle; it covers both kDurable and kFlushOnly. Rename durability is
+  // handled separately via MOVEFILE_WRITE_THROUGH in Rename.
   if (::FlushFileBuffers(f.get()) == 0) {
     return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "FlushFileBuffers"));
   }
@@ -216,16 +219,19 @@ core::Result<void> Rename(const std::filesystem::path& from, const std::filesyst
   return {};
 }
 
-core::Result<void> FsyncDir(const std::filesystem::path& dir) {
+core::Result<DirSyncOutcome> FsyncDir(const std::filesystem::path& dir) {
   // FILE_FLAG_BACKUP_SEMANTICS is required to open a directory.
   const HANDLE h = ::CreateFileW(dir.c_str(), GENERIC_READ,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (h == INVALID_HANDLE_VALUE) {
-    // NTFS supports directory flush; FAT/exFAT/network shares do not. Treat
-    // as best-effort to mirror POSIX behaviour.
+    // NTFS supports directory flush; FAT/exFAT/network shares do not. Report
+    // that explicitly so durability-critical callers can refuse rather than
+    // silently assume the directory entry is durable.
     const DWORD err = ::GetLastError();
-    if (err == ERROR_ACCESS_DENIED || err == ERROR_NOT_SUPPORTED) return {};
+    if (err == ERROR_ACCESS_DENIED || err == ERROR_NOT_SUPPORTED) {
+      return DirSyncOutcome::kUnsupported;
+    }
     ::SetLastError(err);
     return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "open dir for fsync"));
   }
@@ -233,16 +239,33 @@ core::Result<void> FsyncDir(const std::filesystem::path& dir) {
     const DWORD err = ::GetLastError();
     ::CloseHandle(h);
     if (err == ERROR_NOT_SUPPORTED || err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION) {
-      return {};
+      return DirSyncOutcome::kUnsupported;
     }
     ::SetLastError(err);
     return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "FlushFileBuffers dir"));
   }
   ::CloseHandle(h);
-  return {};
+  return DirSyncOutcome::kSynced;
+}
+
+core::Result<DurabilityCapability> ProbeDurability(const std::filesystem::path& data_dir) {
+  DurabilityCapability cap;
+  cap.backend = FsyncBackend::kFlushFileBuffers;
+  auto dir = FsyncDir(data_dir);
+  if (!dir.has_value()) return std::unexpected(dir.error());
+  cap.dir_sync_supported = (*dir == DirSyncOutcome::kSynced);
+  return cap;
 }
 
 std::uint64_t ProcessId() noexcept { return static_cast<std::uint64_t>(::GetCurrentProcessId()); }
+
+namespace testing {
+
+std::uint64_t DurableFsyncFallbackCount() noexcept { return 0; }
+
+void ResetDurableFsyncFallbackCount() noexcept {}
+
+}  // namespace testing
 
 }  // namespace abyss::platform::fs
 

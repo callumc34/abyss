@@ -163,5 +163,71 @@ TEST(ExistenceCacheTest, ClearOnEmptyIsNoOp) {
   EXPECT_EQ(cache.Size(), 0U);
 }
 
+// HOTC-4: keys/members are binary-safe and may contain 0x1F. The old single
+// 0x1F separator made (key="a", member="b\x1Fc") collide with
+// (key="a\x1Fb", member="c"). Length-prefixed encoding must keep them distinct.
+TEST(ExistenceCacheTest, MemberKeyNoCollisionWithSeparatorInData) {
+  FakeClock clock;
+  ExistenceCache cache(DefaultConfig(), clock.Fn());
+  const std::string member_with_sep = std::string("b\x1F") + "c";
+  const std::string key_with_sep = std::string("a\x1F") + "b";
+
+  cache.UpsertMember("a", member_with_sep,
+                     ExistenceCache::MemberMeta{.score = 1.0, .latest_seq = 1});
+
+  // The colliding-under-old-scheme (key,member) pair must be a miss.
+  EXPECT_FALSE(cache.GetMember(key_with_sep, "c").has_value());
+  // The exact pair we inserted resolves correctly.
+  auto got = cache.GetMember("a", member_with_sep);
+  ASSERT_TRUE(got.has_value());
+  EXPECT_DOUBLE_EQ(got->score, 1.0);
+
+  // Same disambiguation for fields.
+  const std::string field_with_sep = std::string("f\x1F") + "g";
+  const std::string key_with_f = std::string("h\x1F") + "f";
+  cache.UpsertField("h", field_with_sep,
+                    ExistenceCache::FieldMeta{.value = "v", .value_known = true, .latest_seq = 2});
+  EXPECT_FALSE(cache.GetField(key_with_f, "g").has_value());
+  EXPECT_TRUE(cache.GetField("h", field_with_sep).has_value());
+}
+
+// HOTC-3 ⟷ HOTC-4: RemoveMember must address exactly the (key,member) it was
+// given and never the byte-prefix-sharing neighbour.
+TEST(ExistenceCacheTest, RemoveMemberAddressesExactEntryUnderBinarySafeKeys) {
+  FakeClock clock;
+  ExistenceCache cache(DefaultConfig(), clock.Fn());
+  const std::string member_with_sep = std::string("b\x1F") + "c";
+  const std::string key_with_sep = std::string("a\x1F") + "b";
+
+  cache.UpsertMember("a", member_with_sep,
+                     ExistenceCache::MemberMeta{.score = 1.0, .latest_seq = 1});
+  cache.UpsertMember(key_with_sep, "c", ExistenceCache::MemberMeta{.score = 2.0, .latest_seq = 2});
+
+  // Removing the first must leave the second untouched.
+  cache.RemoveMember("a", member_with_sep);
+  EXPECT_FALSE(cache.GetMember("a", member_with_sep).has_value());
+  auto other = cache.GetMember(key_with_sep, "c");
+  ASSERT_TRUE(other.has_value());
+  EXPECT_DOUBLE_EQ(other->score, 2.0);
+}
+
+// HOTC-3: deleting a key purges its members and fields but not its peers'.
+TEST(ExistenceCacheTest, RemoveMembersAndFieldsScopedToKey) {
+  FakeClock clock;
+  ExistenceCache cache(DefaultConfig(), clock.Fn());
+  cache.UpsertMember("s", "m1", ExistenceCache::MemberMeta{.score = 1.0, .latest_seq = 1});
+  cache.UpsertMember("s", "m2", ExistenceCache::MemberMeta{.score = 2.0, .latest_seq = 2});
+  cache.UpsertField("s", "f1",
+                    ExistenceCache::FieldMeta{.value = "v", .value_known = true, .latest_seq = 3});
+  cache.UpsertMember("other", "m1", ExistenceCache::MemberMeta{.score = 9.0, .latest_seq = 4});
+
+  cache.RemoveMembersAndFields("s");
+
+  EXPECT_FALSE(cache.GetMember("s", "m1").has_value());
+  EXPECT_FALSE(cache.GetMember("s", "m2").has_value());
+  EXPECT_FALSE(cache.GetField("s", "f1").has_value());
+  EXPECT_TRUE(cache.GetMember("other", "m1").has_value());
+}
+
 }  // namespace
 }  // namespace abyss::consumer

@@ -25,6 +25,7 @@ add_executable(abyss_system_tests
   compaction_efficiency_test.cpp
   compaction_remove_resurrection_test.cpp
   durability_test.cpp
+  lifecycle_test.cpp
   operational_test.cpp
   health_test.cpp
   two_ttl_test.cpp

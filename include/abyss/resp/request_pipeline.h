@@ -51,9 +51,12 @@ class RequestPipeline {
   RequestPipeline(RequestPipeline&&) = delete;
   RequestPipeline& operator=(RequestPipeline&&) = delete;
 
+  // Why the pipeline wants the connection closed after the reply drains.
+  enum class ProcessCloseReason : uint8_t { kNone, kClientQuit, kProtocolError };
+
   struct ProcessResult {
     size_t bytes_consumed = 0;
-    bool close_requested = false;
+    ProcessCloseReason close_reason = ProcessCloseReason::kNone;
   };
 
   ProcessResult Process(std::span<const uint8_t> input, std::vector<uint8_t>& output);
@@ -94,7 +97,8 @@ class RequestPipeline {
   const CommandRegistry& registry_;
   Dependencies deps_;
   ConnectionState state_;
-  bool close_requested_ = false;
+  // Set by QUIT (via Dispatch) and surfaced through ProcessResult.
+  ProcessCloseReason close_reason_ = ProcessCloseReason::kNone;
 };
 
 }  // namespace abyss::resp

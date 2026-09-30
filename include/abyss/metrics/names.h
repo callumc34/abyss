@@ -59,7 +59,7 @@ constexpr std::string_view ToStringView(FlushStatus s) noexcept {
   return {};
 }
 
-enum class FlushReason : uint8_t { kQuiet, kDeadline, kPressure };
+enum class FlushReason : uint8_t { kQuiet, kDeadline, kPressure, kDrain };
 
 enum class RequestStatus : uint8_t { kOk, kError, kLoading, kUnknown, kArity, kNoProto };
 
@@ -94,6 +94,26 @@ constexpr std::string_view ToStringView(FlushReason r) noexcept {
       return "deadline";
     case FlushReason::kPressure:
       return "pressure";
+    case FlushReason::kDrain:
+      return "drain";
+  }
+  return {};
+}
+
+// Why the cold consumer's drain/flush loop is backing off rather than making
+// progress. kIdle = nothing to drain or flush; kPoisoned = a terminal apply
+// failure pinned the batch; kBackpressure = the cold store is unwritable /
+// the durable gate is not yet satisfied.
+enum class BackoffReason : uint8_t { kIdle, kPoisoned, kBackpressure };
+
+constexpr std::string_view ToStringView(BackoffReason r) noexcept {
+  switch (r) {
+    case BackoffReason::kIdle:
+      return "idle";
+    case BackoffReason::kPoisoned:
+      return "poisoned";
+    case BackoffReason::kBackpressure:
+      return "backpressure";
   }
   return {};
 }
@@ -180,6 +200,10 @@ struct LabelKeyOf<FlushReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<BackoffReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
 struct LabelKeyOf<CloseReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
@@ -213,6 +237,7 @@ struct LabelKeyOf<TtlSubject> {
 inline std::string ToLabelString(Tier t) { return std::string(ToStringView(t)); }
 inline std::string ToLabelString(FlushStatus s) { return std::string(ToStringView(s)); }
 inline std::string ToLabelString(FlushReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(BackoffReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
@@ -248,9 +273,13 @@ struct HistogramDesc {
 
 namespace buckets {
 
-// Six decadal buckets from 100us to 10s. Covers the whole latency spectrum
-// we care about end-to-end without over-binning hot ranges.
-inline constexpr std::array<double, 6> kLatencySeconds{0.0001, 0.001, 0.01, 0.1, 1.0, 10.0};
+// Sub-100us resolution is load-bearing: the hot-read (<100us), hot-write (<50us) and
+// buffer-read (<50us) targets are unresolvable by histogram_quantile without boundaries
+// below them. Upper decades stay coarse so cold (5ms) and queue-append remain resolvable
+// without per-histogram bucket proliferation.
+inline constexpr std::array<double, 14> kLatencySeconds{0.00001, 0.000025, 0.00005, 0.0001, 0.00025,
+                                                        0.0005,  0.001,    0.0025,  0.005,  0.01,
+                                                        0.05,    0.1,      1.0,     10.0};
 
 // Power-of-ten buckets for batch sizes.
 inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
@@ -310,6 +339,13 @@ inline constexpr HistogramDesc<> kColdFlushBatchSize{
     .buckets = buckets::kBatchSize,
 };
 
+inline constexpr GaugeDesc<> kFsDurableDirSupported{
+    .name = "abyss_fs_durable_dir_supported",
+    .help =
+        "1 if the data volume can make directory entries durable (fsync), else 0. A 0 on a "
+        "durability-required deployment is a refuse-to-start condition.",
+};
+
 inline constexpr GaugeDesc<> kHotConsumerLagEntries{
     .name = "abyss_hot_consumer_lag_entries",
     .help = "Entries between hot consumer position and queue head.",
@@ -345,6 +381,16 @@ inline constexpr GaugeDesc<> kHotKeys{
     .help = "Number of keys in the hot store.",
 };
 
+inline constexpr GaugeDesc<> kHotMaxMemoryBytes{
+    .name = "abyss_hot_max_memory_bytes",
+    .help = "Configured hot store memory budget in bytes; 0 means unlimited.",
+};
+
+inline constexpr GaugeDesc<> kHotAccessBufferDepth{
+    .name = "abyss_hot_access_buffer_depth",
+    .help = "Total depth of the per-shard deferred read-access refresh buffers.",
+};
+
 inline constexpr GaugeDesc<> kColdDiskBytes{
     .name = "abyss_cold_disk_bytes",
     .help = "Cold store disk usage in bytes.",
@@ -365,6 +411,16 @@ inline constexpr GaugeDesc<> kQueueDiskBytes{
     .help = "Queue WAL disk usage in bytes.",
 };
 
+inline constexpr CounterDesc<> kQueueReaperFailuresTotal{
+    .name = "abyss_queue_reaper_failures_total",
+    .help = "Segment removals the reaper could not complete; retention reclamation is stalled.",
+};
+
+inline constexpr GaugeDesc<> kQueueOldestEligibleUnreapedAgeSeconds{
+    .name = "abyss_queue_oldest_eligible_unreaped_age_seconds",
+    .help = "Age of the oldest reap-eligible segment still on disk; rises when reaping stalls.",
+};
+
 inline constexpr GaugeDesc<> kColdBufferEntries{
     .name = "abyss_cold_buffer_entries",
     .help = "Number of keys in the compaction buffer.",
@@ -373,6 +429,11 @@ inline constexpr GaugeDesc<> kColdBufferEntries{
 inline constexpr GaugeDesc<> kColdBufferBytes{
     .name = "abyss_cold_buffer_bytes",
     .help = "Estimated memory usage of the compaction buffer.",
+};
+
+inline constexpr GaugeDesc<> kColdFlushHeapDepth{
+    .name = "abyss_cold_flush_heap_depth",
+    .help = "Live entries in the compaction buffer's flush heap; surfaces heap growth.",
 };
 
 inline constexpr CounterDesc<Tier> kHitsTotal{
@@ -390,6 +451,14 @@ inline constexpr CounterDesc<> kQueueAppendedTotal{
     .help = "Total entries appended to the queue.",
 };
 
+inline constexpr CounterDesc<> kWalDecodeCorruptionTotal{
+    .name = "abyss_wal_decode_corruption_total",
+    .help =
+        "CRC-valid WAL entries that failed structural decode during recovery. Genuine corruption "
+        "of durably-acked data; recovery fail-stops (never truncates) so acked data is not "
+        "silently discarded.",
+};
+
 inline constexpr CounterDesc<FlushStatus> kColdFlushTotal{
     .name = "abyss_cold_flush_total",
     .help = "Cold consumer flush operations by outcome.",
@@ -400,6 +469,44 @@ inline constexpr CounterDesc<FlushReason> kColdFlushReasonTotal{
     .help = "Cold consumer flush operations by trigger reason.",
 };
 
+inline constexpr CounterDesc<FlushStatus> kColdCheckpointTotal{
+    .name = "abyss_cold_checkpoint_total",
+    .help = "Cold-store durable checkpoints (FlushWAL sync=true) by outcome.",
+};
+
+inline constexpr HistogramDesc<> kColdCheckpointDurationSeconds{
+    .name = "abyss_cold_checkpoint_duration_seconds",
+    .help = "Cold-store checkpoint (durable WAL fsync) latency.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr GaugeDesc<> kColdCheckpointIntervalSeconds{
+    .name = "abyss_cold_checkpoint_interval_seconds",
+    .help =
+        "Observed wall interval between cold-store checkpoints; surfaces the bounded "
+        "checkpoint cadence so its fsync cost is not a hidden knob.",
+};
+
+inline constexpr CounterDesc<BackoffReason> kColdConsumerBackoffTotal{
+    .name = "abyss_cold_consumer_backoff_total",
+    .help = "Cold consumer loop backoff events by reason (idle, poisoned, backpressure).",
+};
+
+inline constexpr CounterDesc<> kColdUnsupportedOpTotal{
+    .name = "abyss_cold_unsupported_op_total",
+    .help =
+        "WAL writes whose command has no parser in this build. Skipped, not quarantined: no tier "
+        "materialised them, so hot and cold do not diverge. A rising value means the command "
+        "surface advertises more than the storage layer implements.",
+};
+
+inline constexpr CounterDesc<> kColdParsePoisonTotal{
+    .name = "abyss_cold_parse_poison_total",
+    .help =
+        "Structurally-undecodable WAL ops the cold consumer could not materialise. Each pins WAL "
+        "retention below the poison seq for the shard until operator intervention (fail-closed).",
+};
+
 // Tier domain for this metric is limited to {kHot, kCold}; kBuffer is invalid.
 inline constexpr CounterDesc<Tier> kTtlExpiredTotal{
     .name = "abyss_ttl_expired_total",
@@ -408,7 +515,17 @@ inline constexpr CounterDesc<Tier> kTtlExpiredTotal{
 
 inline constexpr CounterDesc<> kEvictedTotal{
     .name = "abyss_evicted_total",
-    .help = "Keys evicted from the hot store.",
+    .help = "Keys evicted from the hot store by eviction deadline (tier transition).",
+};
+
+inline constexpr CounterDesc<> kHotMemoryEvictedTotal{
+    .name = "abyss_hot_memory_evicted_total",
+    .help = "Keys evicted from the hot store under memory pressure (LRU tier transition).",
+};
+
+inline constexpr CounterDesc<> kHotAccessBufferDroppedTotal{
+    .name = "abyss_hot_access_buffer_dropped_total",
+    .help = "Deferred read-access refreshes dropped past the access-buffer high-water cap.",
 };
 
 inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{
@@ -419,6 +536,17 @@ inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{
 inline constexpr CounterDesc<> kPromotionsTotal{
     .name = "abyss_promotions_total",
     .help = "Cold hits promoted back to the hot store.",
+};
+
+// A cold collection scan (SMEMBERS/ZRANGE/HGETALL/HKEYS/HVALS) exceeded the
+// configured cold_scan_deadline and was failed closed with a deadline error
+// rather than returning a silently truncated result. A rising rate means a
+// legitimately large collection is being capped — operators tune
+// cold_scan_deadline. See docs/operations/failure-modes.md (decision 4 /
+// invariant 5).
+inline constexpr CounterDesc<> kColdScanDeadlineExceededTotal{
+    .name = "abyss_cold_scan_deadline_exceeded_total",
+    .help = "Cold collection scans aborted because they exceeded the cold-scan deadline.",
 };
 
 inline constexpr GaugeDesc<> kNetConnectionsActive{
@@ -554,6 +682,19 @@ inline constexpr GaugeDesc<> kRecoveryResolverEntriesTarget{
     .help = "Total entries the resolver must scan during recovery, all shards.",
 };
 
+// Conditional-write durability pressure: the resolver could not confirm a
+// self-emitted Resolved's WAL fsync within its budget before fulfilling the
+// client (steady state) or before advancing the recovery ack past a re-decided
+// dangling. A non-zero rate means conditional acks are stalling/erroring on
+// durable-layer latency, not silently losing writes (the Resolved stays in the
+// WAL and applies on catch-up). Surfaces XDUR-2 / HOTC-5 (no silent degradation).
+inline constexpr CounterDesc<> kResolverDurableWaitTimeoutsTotal{
+    .name = "abyss_resolver_durable_wait_timeouts_total",
+    .help =
+        "Resolver self-emitted Resolved durability waits that timed out before "
+        "the conditional ack (steady-state) or the recovery ack barrier.",
+};
+
 inline constexpr GaugeDesc<> kRecoveryColdEntriesReplayed{
     .name = "abyss_recovery_cold_entries_replayed",
     .help = "Live entries drained by the cold consumer during recovery, all shards.",
@@ -577,6 +718,32 @@ inline constexpr GaugeDesc<> kRecoveryHotEntriesTarget{
 inline constexpr GaugeDesc<> kRecoveryDurationSeconds{
     .name = "abyss_recovery_duration_seconds",
     .help = "Wall-clock elapsed time for the current recovery run.",
+};
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+// Encoded as the underlying value of server::Server::LifecycleState:
+// 0=initializing, 1=recovering, 2=serving, 3=draining, 4=stopped. The
+// client-visible LOADING gate is asserted in every state except serving, so
+// this is the single source of truth for "is the data plane open".
+inline constexpr GaugeDesc<> kServerLifecycleState{
+    .name = "abyss_server_lifecycle_state",
+    .help =
+        "Current server lifecycle state (0=initializing, 1=recovering, "
+        "2=serving, 3=draining, 4=stopped).",
+};
+
+// A graceful shutdown drain that hit its deadline before the cold buffer
+// emptied: the remaining slice is left in the WAL for replay (correctness
+// preserved). A non-zero count means the shutdown_grace budget was too small
+// for the buffered work — surfaced rather than silently truncated.
+inline constexpr CounterDesc<> kColdDrainTruncatedTotal{
+    .name = "abyss_cold_drain_truncated_total",
+    .help =
+        "Cold consumer graceful drains that hit the shutdown deadline before the "
+        "buffer emptied; the remaining slice replays from the WAL on next start.",
 };
 
 }  // namespace names

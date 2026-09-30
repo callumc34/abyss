@@ -4,6 +4,8 @@
 **Created:** 2026-04-09
 **Updated:** 2026-05-31
 
+> **§CLUSTER Commands refined by [ADP-014](014-slot-routing-and-topology.md).** `CLUSTER KEYSLOT` still returns the `CRC16` wire slot unchanged. `CLUSTER SLOTS`/`SHARDS` now advertise slot ranges grouped by their owning shard (resolved through slot-to-shard mapping) rather than a single full-range stub; in single-pod the ranges still cover the whole slot space, partitioned disjointly by shard. The `MOVED` path (gated behind multi-pod) computes its target from slot ownership, so a redirect always names the pod whose shard owns the key. Invariant 8's "only the slot-to-pod mapping differs between phases" is upgraded: that mapping is now explicit, slot-derived, and tested, not coincidental.
+
 ## Context
 
 Abyss exposes a TCP listener implementing the Redis wire protocol (RESP2). Any standard Redis client library connects without modification — no custom SDKs, no protocol extensions. The frontend is responsible for parsing commands, classifying them, and routing them to the appropriate subsystem.
@@ -193,15 +195,7 @@ Both route through the queue as a per-shard `Flush` broadcast and ack only after
 | `SETNX key value` | 3 | Write | Conditional | Integer 0/1 |
 | `SETEX key seconds value` | 4 | Write | Write | `+OK` |
 | `PSETEX key ms value` | 4 | Write | Write | `+OK` |
-| `GETSET key value` | 3 | Write | Write | Bulk or nil |
-| `GETDEL key` | 2 | Write | Write | Bulk or nil |
-| `APPEND key value` | 3 | Write | Write | Integer (new length) |
 | `STRLEN key` | 2 | Read | TieredRead | Integer |
-| `INCR key` | 2 | Write | Write | Integer |
-| `DECR key` | 2 | Write | Write | Integer |
-| `INCRBY key n` | 3 | Write | Write | Integer |
-| `DECRBY key n` | 3 | Write | Write | Integer |
-| `INCRBYFLOAT key n` | 3 | Write | Write | Bulk |
 | `MGET key [key ...]` | -2 | Read | TieredRead (fan-out) | Array of bulk/nil |
 | `MSET k v [k v ...]` | -3 | Write | Write (fan-out) | `+OK` |
 | `MSETNX k v [k v ...]` | -3 | Write | Conditional (atomic) | Integer 0/1 |
@@ -216,7 +210,6 @@ Both route through the queue as a per-shard `Flush` broadcast and ack only after
 | `SISMEMBER key m` | 3 | Read | TieredRead | Integer 0/1 |
 | `SMISMEMBER key m [m ...]` | -3 | Read | TieredRead | Array of 0/1 |
 | `SCARD key` | 2 | Read | TieredRead | Integer |
-| `SPOP key [count]` | -2 | Write | Write | Bulk / array / nil |
 | `SRANDMEMBER key [count]` | -2 | Read | TieredRead | Bulk / array / nil |
 
 **Sorted sets (direct key only):**
@@ -230,7 +223,6 @@ Both route through the queue as a per-shard `Flush` broadcast and ack only after
 | `ZCARD key` | 2 | Read | TieredRead | Integer |
 | `ZRANK key m [WITHSCORE]` | -3 | Read | TieredRead | Integer/array/nil |
 | `ZREVRANK key m [WITHSCORE]` | -3 | Read | TieredRead | Integer/array/nil |
-| `ZINCRBY key n m` | 4 | Write | Write | Bulk |
 | `ZRANGE key start stop [BYSCORE\|BYLEX] [REV] [LIMIT o c] [WITHSCORES]` | -4 | Read | TieredRead | Array |
 | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT o c]` | -4 | Read | TieredRead | Array |
 | `ZRANGEBYLEX key min max [LIMIT o c]` | -4 | Read | TieredRead | Array |
@@ -273,7 +265,6 @@ When the hot store does not hold the key — typical after eviction — multi-fi
 | `EXPIRETIME key` | 2 | Read | TieredRead | Integer |
 | `PEXPIRETIME key` | 2 | Read | TieredRead | Integer |
 | `TYPE key` | 2 | Read | TieredRead | Simple string |
-| `RENAME src dst` | 3 | Write | Write | `+OK` |
 | `RENAMENX src dst` | 3 | Write | Conditional | Integer 0/1 |
 | `COPY src dst [DB n] [REPLACE]` | -3 | Write | Conditional | Integer 0/1 |
 | `OBJECT ENCODING key` | 3 | Read | TieredRead | Bulk |
@@ -290,6 +281,18 @@ When the hot store does not hold the key — typical after eviction — multi-fi
 - Debug — `DEBUG`, `MONITOR`, `LATENCY`, `SLOWLOG`
 - Dump / restore — `DUMP`, `RESTORE`, `MIGRATE`
 - Deferred types — lists (`LPUSH` et al.), bitmaps, hyperloglog, geo. Rejected with `ERR unknown command` in Phase 1; added in Phase 2 when the hot store supports them. Hashes are partially supported (see "Hashes" above); the remaining hash commands listed there are deferred.
+- Read-modify-write — `APPEND`, `DECR`, `DECRBY`, `GETDEL`, `GETSET`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `SPOP`, `ZINCRBY`. See below.
+- Multi-key rename — `RENAME`. `RENAMENX` is supported; the unconditional form is excluded with the read-modify-write group because it shares their resolver dependency and additionally spans two keys, so under [ADP-014](014-slot-routing-and-topology.md) slot routing it needs cross-shard atomicity that does not exist yet.
+
+#### Why read-modify-write commands cannot be plain writes
+
+These were briefly advertised as unconditional writes with no typed op behind them, so the frontend accepted them, durably logged them, and only then failed at apply. The fix is not to add parsers — it is that the unconditional write path is the wrong home for them.
+
+Every one of these commands computes its result from the key's current value. The compaction buffer that feeds the cold tier absorbs and emits *typed ops*, never raw commands, and it holds only what it has seen in the current window — the key may be cold-resident, in which case the buffer cannot know the value at all. A statement-form increment therefore cannot be absorbed: N increments cannot collapse into one op without evaluating them, and cold would have to perform its own read-modify-write to apply what it was given. Two tiers independently re-deriving a value from a statement is precisely the divergence invariant 3 exists to prevent.
+
+This is why Redis can record `INCR` verbatim in its AOF and Abyss cannot: Redis has a single authoritative copy and no compacting secondary view. Systems that do have one resolve atomic operations to concrete values before the log records them.
+
+Abyss already has the mechanism — the resolver, which reads current state and emits a `Resolved` entry carrying materialised ops and a return value ([ADP-011](011-conditional-writes-and-consumer-rpc.md)). The correct implementation routes these commands through it, so the log records the computed result rather than the intent to compute. Hot and cold then apply an ordinary concrete write, compaction collapses it normally, and replay is deterministic because the resolved value is in the log. Until that lands they are excluded rather than advertised, so clients get an honest, feature-detectable `ERR unknown command` instead of an accepted write that fails after a round trip.
 
 ### SET Command Full Specification
 
@@ -331,9 +334,15 @@ Frontend immediately responds `ERR unknown command '<NAME>', with args beginning
 
 This supersedes the prior ambiguous "classify unknown as write" language.
 
-**2. Known command name, store does not support the operation** — e.g. a future Redis module command in the registry but not yet implemented by the Phase 1 built-in hot store.
+**2. Known command name, malformed arguments** — the command has a typed-operation parser and that parser rejects these arguments.
 
-Frontend classifies per the registry and routes. If it is a write, it reaches the queue; the store returns an error at apply time, which is surfaced to the client via Consumer RPC fulfillment with an error value. This preserves the "write bias for safety" intent for known commands whose store support is incomplete.
+Arity is a weaker check than the parser: `SET k v BOGUS` and `HSET k f v f` both satisfy their registry arity and are still malformed. The frontend validates such a command against its canonical parser before routing and rejects it with `ERR` (the prefix table's "malformed args" case). Nothing unparseable reaches the queue. Recording a command in the log that no tier can materialise would durably preserve an intent that can never be applied, and the queue is the single source of truth — it should not accumulate entries that are meaningless to every materialised view.
+
+**3. Known command name, no typed-operation parser exists** — a log entry names a command no tier in this build can materialise.
+
+This is no longer reachable from the wire. The registry advertises an unconditional write only when a typed-operation parser backs it, and that agreement is asserted rather than maintained by hand (`CommandRegistryTest.EveryUnconditionalWriteCommandHasAParser`). Fan-out writes are exempt because the engine decomposes them into per-key commands before anything is queued; conditional writes are exempt because the resolver materialises them into concrete ops.
+
+The case survives for replay: a log written by a build with a wider command surface can still contain such an entry. Consumers must distinguish it from genuine decoder skew. An entry no parser can decode was not applied by any tier, so the materialised views agree it produced nothing and the consumer skips it, counting the occurrence. Quarantining it — refusing to advance past it — would be wrong: it protects nothing, and while the registry could still advertise such a command it let any client suspend log retention indefinitely. Quarantine is reserved for an entry whose parser exists and fails, which is a real skew bug because another tier accepted the same bytes.
 
 **Arity mismatch** — known command with wrong argument count. Frontend rejects with `ERR wrong number of arguments for '<name>' command`, no queue interaction.
 

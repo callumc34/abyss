@@ -9,10 +9,12 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/hot_store.h"
+#include "abyss/core/thread_annotations.h"
 #include "abyss/hot/single_shard_store.h"
 
 namespace abyss::hot {
@@ -20,6 +22,10 @@ namespace abyss::hot {
 struct ShardedHotStoreConfig {
   size_t max_memory_bytes = 4294967296;
   uint32_t shard_count = 64;
+  // Per-shard cap on the deferred read-access refresh buffer (XRES-2). Past the
+  // cap, refreshes are dropped (a dropped refresh only shortens a key's
+  // deadline — safe, the key is still in queue/cold). 0 means unbounded.
+  size_t access_buffer_high_water = 65536;
   // Borrowed from the server's single EvictionPolicy. Must outlive the store.
   // Nullable for tests that don't exercise eviction (DefaultPolicy is used).
   const core::EvictionPolicy* eviction_policy = nullptr;
@@ -42,6 +48,7 @@ class ShardedHotStore : public core::HotStore {
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId seq) override;
   core::HotKeyPresence Probe(std::string_view key) override;
+  void SetReplayMode(bool replaying) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Wipe() override;
 
@@ -50,6 +57,19 @@ class ShardedHotStore : public core::HotStore {
   void DrainAccessBuffers(core::SteadyTime now);
   using EvictExpiredReport = SingleShardStore::EvictExpiredReport;
   EvictExpiredReport EvictExpired(core::SteadyTime now);
+
+  // Evicts each shard down to its per-shard memory budget by LRU. Eviction is a
+  // tier transition (data stays durable in queue/cold). Returns the number of
+  // keys evicted across all shards (HOT-1 memory-pressure pass).
+  size_t EvictToMemoryTarget();
+
+  // Current total depth of the per-shard access buffers and the count of
+  // refreshes dropped past the high-water cap since construction (XRES-2).
+  struct AccessBufferStats {
+    size_t depth = 0;
+    uint64_t dropped = 0;
+  };
+  AccessBufferStats AccessBufferSnapshot() const;
 
   // Reclaims each shard's tombstones at or below that shard's horizon.
   size_t GcTombstones(const std::function<core::SequenceId(core::ShardId)>& horizon);
@@ -61,7 +81,12 @@ class ShardedHotStore : public core::HotStore {
     mutable std::shared_mutex mutex;
     SingleShardStore store;
     mutable std::mutex access_mutex;
-    std::vector<std::string> access_buffer;
+    // Deferred read-access refresh queue, bounded at access_buffer_high_water.
+    // access_seen de-dups within a drain interval so a hot key is buffered
+    // once per tick rather than once per read (XRES-2).
+    std::vector<std::string> access_buffer ABYSS_GUARDED_BY(access_mutex);
+    std::unordered_set<std::string> access_seen ABYSS_GUARDED_BY(access_mutex);
+    uint64_t access_dropped ABYSS_GUARDED_BY(access_mutex) = 0;
 
     explicit Shard(SingleShardConfig config) : store(std::move(config)) {}
   };

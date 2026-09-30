@@ -24,6 +24,8 @@ class FakePoller : public Poller {
 
   std::vector<Call> calls;
   std::vector<Event> next_events;
+  // Opt-in failure injection for the interest-update path.
+  bool fail_modify = false;
 
   core::Result<void> Add(Socket fd, EventKind interest, void* user_data) override {
     calls.push_back({Op::kAdd, fd, interest, user_data});
@@ -31,6 +33,10 @@ class FakePoller : public Poller {
   }
   core::Result<void> Modify(Socket fd, EventKind interest, void* user_data) override {
     calls.push_back({Op::kModify, fd, interest, user_data});
+    if (fail_modify) {
+      return std::unexpected(
+          core::Error{core::ErrorCode::kInternal, "fake poller: injected modify failure"});
+    }
     return {};
   }
   core::Result<void> Remove(Socket fd) override {

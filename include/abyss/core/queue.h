@@ -40,7 +40,18 @@ class Queue {
   virtual Result<std::vector<QueueEntry>> Read(ConsumerId consumer, ShardId shard, size_t max_count,
                                                Duration timeout) = 0;
 
+  // Ack a consumer's processed offset. For a RETENTION consumer this is
+  // fail-closed: it returns kFailedPrecondition if seq > DurableSeq(shard), so
+  // a persisted offset can never outrun the durable WAL tail. Volatile-consumer
+  // Ack is unaffected.
   virtual Result<void> Ack(ConsumerId consumer, ShardId shard, SequenceId seq) = 0;
+
+  // Highest seq on `shard` whose group-commit fsync has completed; 0 = none
+  // durable. Monotonic per shard. The floor every retention Ack is clamped to.
+  virtual Result<SequenceId> DurableSeq(ShardId shard) = 0;
+  // True iff DurableSeq(shard) >= seq within `timeout`.
+  virtual Result<bool> AwaitDurable(ShardId shard, SequenceId seq, Duration timeout) = 0;
+
   virtual Result<SequenceId> OldestRetained(ShardId shard) = 0;
   virtual Result<SequenceId> TailSeq(ShardId shard) = 0;
   // Last ack offset for `consumer` on `shard`; 0 if never acked. Persisted for

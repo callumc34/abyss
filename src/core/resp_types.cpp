@@ -32,6 +32,12 @@ std::string_view ErrorPrefixString(ErrorPrefix prefix) noexcept {
 
 RespValue RespValue::Null() { return {}; }
 
+RespValue RespValue::NullArray() {
+  RespValue v;
+  v.type_ = Type::kNullArray;
+  return v;
+}
+
 RespValue RespValue::SimpleString(std::string value) {
   RespValue v;
   v.type_ = Type::kSimpleString;
@@ -62,6 +68,13 @@ RespValue RespValue::Error(ErrorPrefix prefix, std::string message) {
   v.type_ = Type::kError;
   v.str_ = std::move(message);
   v.error_prefix_ = prefix;
+  return v;
+}
+
+RespValue RespValue::RawError(std::string full_body) {
+  RespValue v;
+  v.type_ = Type::kError;
+  v.str_ = std::move(full_body);
   return v;
 }
 

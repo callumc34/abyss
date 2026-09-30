@@ -23,7 +23,6 @@ struct NetMetrics {
   metrics::CounterHandle connections_accepted;
   metrics::CounterHandle bytes_in;
   metrics::CounterHandle bytes_out;
-  metrics::GaugeHandle read_buffer_high_water;
   metrics::GaugeHandle backpressure_active;
   metrics::CounterHandle backpressure_entered;
   metrics::CounterHandle backpressure_exited;
@@ -77,6 +76,8 @@ class Connection {
 
   bool ReadingPaused() const noexcept { return reading_paused_; }
   size_t WriteBufferBytes() const noexcept { return write_buf_.size() - write_pos_; }
+  // Per-connection peak; the process-wide gauge is the fleet max over these,
+  // published by the server-scoped snapshotter.
   size_t ReadBufferHighWater() const noexcept { return read_buf_high_water_; }
   bool HasPendingWrites() const noexcept { return WriteBufferBytes() > 0; }
 
@@ -93,7 +94,9 @@ class Connection {
   void MaybePauseReading();
   void MaybeResumeReading();
   bool EnforceWriteHardLimit();
-  void DispatchPipelineOutput();
+  // Returns bytes consumed by the pipeline this pass; maps the pipeline's
+  // close signal onto pending_close_.
+  size_t DispatchPipelineOutput();
   void RecordReadBufferHighWater();
   void TouchActivity();
 
@@ -123,7 +126,15 @@ class Connection {
 
   core::SteadyTime last_activity_;
   bool reading_paused_ = false;
-  bool close_after_drain_ = false;
+  // Single source of truth for "this connection currently contributes to
+  // backpressure_active". Set only after a pause transition is committed to the
+  // poller, so a failed Modify can neither leak an increment nor produce a
+  // decrement that was never matched.
+  bool backpressure_counted_ = false;
+  // A close the pipeline/transport requested; fires deterministically once the
+  // pending write buffer drains. Replaces the old close_after_drain_ bool so
+  // the close reason is carried, not just the fact of a close.
+  std::optional<metrics::CloseReason> pending_close_;
   bool closed_ = false;
   std::optional<metrics::CloseReason> close_reason_;
 };

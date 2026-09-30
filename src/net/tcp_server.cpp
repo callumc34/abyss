@@ -116,6 +116,14 @@ void TcpServer::Stop() {
   Join();
 }
 
+size_t TcpServer::MaxReadBufferHighWaterBytes() const noexcept {
+  size_t max_bytes = 0;
+  for (const auto& reactor : reactors_) {
+    max_bytes = std::max(max_bytes, reactor->MaxReadBufferHighWaterBytes());
+  }
+  return max_bytes;
+}
+
 void TcpServer::AcceptAll() {
   while (true) {
     auto accepted = AcceptNonBlocking(listen_fd_.Get());

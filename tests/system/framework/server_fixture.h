@@ -102,6 +102,14 @@ class IsolatedServerTest : public ::testing::Test {
   RedisClient client_;
 };
 
+// Per-test server, with a SET/DEL readiness probe so a half-wired data path
+// fails here rather than inside the test.
+//
+// That probe is a real write: it occupies a compaction-buffer entry that flushes
+// about one quiet window after SetUp returns, i.e. during the test body. Any
+// test that baselines a cold-tier flush counter must first call
+// `AwaitColdQuiescence` (tests/system/framework/prom_scrape.h) or it will
+// attribute the probe's flush to its own writes.
 class IsolatedDataServerTest : public IsolatedServerTest {
  protected:
   void SetUp() override;

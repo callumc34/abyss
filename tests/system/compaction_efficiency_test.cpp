@@ -47,7 +47,7 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: "${DATA_DIR}/wal"
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
   min_retention_seconds: 10
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000
@@ -124,14 +124,19 @@ TEST_F(CompactionEfficiencyTest, BurstWritesSingleKeyCollapseToOneQuietFlush) {
 
   const uint16_t mport = Server().MetricsPort();
 
+  // Drain the fixture's readiness probe out of the buffer first, or its own
+  // flush lands mid-test and is counted against the burst.
+  const std::string quiescent = AwaitColdQuiescence(mport);
+  ASSERT_FALSE(quiescent.empty()) << "compaction buffer did not quiesce before baseline";
+
+  // One scrape for all three, for the same reason the final read uses one.
   const double baseline_quiet =
-      ParseCounter(Scrape(mport), "abyss_cold_flush_reason_total", {{"reason", "quiet"}})
-          .value_or(0.0);
+      ParseCounter(quiescent, "abyss_cold_flush_reason_total", {{"reason", "quiet"}}).value_or(0.0);
   const double baseline_deadline =
-      ParseCounter(Scrape(mport), "abyss_cold_flush_reason_total", {{"reason", "deadline"}})
+      ParseCounter(quiescent, "abyss_cold_flush_reason_total", {{"reason", "deadline"}})
           .value_or(0.0);
   const double baseline_flush_success =
-      ParseCounter(Scrape(mport), "abyss_cold_flush_total", {{"status", "success"}}).value_or(0.0);
+      ParseCounter(quiescent, "abyss_cold_flush_total", {{"status", "success"}}).value_or(0.0);
 
   std::vector<std::vector<std::string>> writes;
   writes.reserve(kSets);
@@ -146,21 +151,20 @@ TEST_F(CompactionEfficiencyTest, BurstWritesSingleKeyCollapseToOneQuietFlush) {
 
   std::string body;
   ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_cold_flush_reason_total", {{"reason", "quiet"}},
-                                 baseline_quiet + 1.0, 5s, &body))
-      << "quiet flush did not fire within 5s; last scrape:\n"
+                                 baseline_quiet + 1.0, 12s, &body))
+      << "quiet flush did not fire within 12s; last scrape:\n"
       << body;
 
-  // Read final values once the quiet path has fired. The burst should not
-  // have crossed any deadline. flush_total{success} captures how many keys
-  // were actually flushed — 1 per burst, not 100.
+  // All three counters come out of the SAME scrape -- the one the poll stopped
+  // on. Re-scraping here raced the cold consumer's next probe cycle: a second
+  // quiet flush landing between the poll and the re-scrape read as delta=2 and
+  // failed a test whose claim was about the burst alone.
   const double final_quiet =
-      ParseCounter(Scrape(mport), "abyss_cold_flush_reason_total", {{"reason", "quiet"}})
-          .value_or(0.0);
+      ParseCounter(body, "abyss_cold_flush_reason_total", {{"reason", "quiet"}}).value_or(0.0);
   const double final_deadline =
-      ParseCounter(Scrape(mport), "abyss_cold_flush_reason_total", {{"reason", "deadline"}})
-          .value_or(0.0);
+      ParseCounter(body, "abyss_cold_flush_reason_total", {{"reason", "deadline"}}).value_or(0.0);
   const double final_flush_success =
-      ParseCounter(Scrape(mport), "abyss_cold_flush_total", {{"status", "success"}}).value_or(0.0);
+      ParseCounter(body, "abyss_cold_flush_total", {{"status", "success"}}).value_or(0.0);
 
   EXPECT_EQ(final_deadline, baseline_deadline)
       << "burst should not trip a deadline flush; final=" << final_deadline

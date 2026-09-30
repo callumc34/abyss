@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Created:** 2026-04-15
 
+> **Refined by [ADP-014](014-slot-routing-and-topology.md).** The 2-byte shard prefix now holds the slot-derived shard (the wire slot mapped to its owning shard range) rather than an xxHash of the raw key; the layout and width are unchanged. The format version is bumped to 3 accordingly. The per-open format-version check described below is retained as defence in depth, but the primary epoch gate is now the persisted topology manifest, which validates the cold-format epoch alongside the shard count and routing scheme before the store opens.
+
 ## Context
 
 [ADP-003](003-cold-store.md) defines the cold store interface and high-level behaviour but does not specify how Redis-level keys and data structures map onto RocksDB key-value pairs. Implementers of the RocksDB integration (#16), batch write (#17), TTL expiry (#18, #19), and the cold-side of compaction (#22-24, #27) need a precise, shared encoding to work against. Without it each will make incompatible ad-hoc decisions about layout, type tagging, TTL storage, and tombstones, and the cost of reconciling later compounds.
@@ -48,7 +50,7 @@ Strings (`0x01`) and the format-version record (`0xFF`) have no field/member tai
 
 ### Shard Slot
 
-The 2-byte big-endian shard slot immediately follows the type byte on every data key. Its value is `ComputeShard(key, shard_count)` — the same xxHash router that the frontend, hot store, and consumers use, so a key's slot is identical across every tier and is a pure function of the Redis key (never of the field/member). It is *not* part of the user key; it is a physical partition tag.
+The 2-byte big-endian shard slot immediately follows the type byte on every data key. Its value is `ComputeShard(key, shard_count)` — the single placement router that the frontend, hot store, and consumers use, so a key's slot is identical across every tier and is a pure function of the Redis key (never of the field/member). It is *not* part of the user key; it is a physical partition tag. (Refined by ADP-014: that router now derives the shard from the Redis wire slot, `CRC16` of the hash-tag content mapped to a contiguous shard range, instead of xxHash; the prefix's role and width are unchanged.)
 
 A single embedded RocksDB instance backs all of a pod's logical shards (Phase 1, single-pod). The slot turns that one physical store into `shard_count` contiguous, non-overlapping key ranges — one per shard — without any per-shard column family or database. The motivating requirement is the broadcast wipe (FLUSHDB): a per-shard `Flush` must clear exactly its own shard's slice and nothing else, so the bytes that identify a shard's slice must be a leading, range-contiguous key prefix. Placing the slot *after* the type byte (rather than first) keeps each type's range globally contiguous, so the TTL sampler, the `EXISTS`/`TYPE` bloom probe, and the format-version record are unaffected by the slot's introduction.
 
@@ -157,7 +159,7 @@ Value:  <version:2 BE> <reserved bytes>
 
 Written once at store initialization. Read on every `open()` to detect mismatched on-disk encoding. A version mismatch fails `open()` with a migration-required error rather than reading data with the wrong decoder.
 
-The current version is `2`. Version `1` predates the shard slot; its keys lack the 2-byte tag, so a v1 store would be misdecoded by a v2 binary and `open()` rejects it. Bumping the version requires a one-shot migration; no migration tooling is in scope for Phase 1 (greenfield: dev/test stores are wiped), but the version byte exists so it is possible.
+The current version is `3` (refined by ADP-014). Version `1` predates the shard slot; version `2` placed the shard prefix by xxHash. Version `3` derives the shard from the wire slot, so a v1 or v2 store would be mis-decoded or mis-placed by a v3 binary and `open()` rejects it. Bumping the version requires a one-shot migration; no migration tooling is in scope (greenfield: dev/test stores are wiped), but the version byte exists so it is possible. The persisted topology manifest (ADP-014) is the primary gate that makes a version change safe across restarts.
 
 ### Tombstones (Deletes)
 

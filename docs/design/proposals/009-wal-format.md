@@ -213,6 +213,9 @@ This gives the Abyss durability guarantee: any entry whose `Append` returned OK 
 7. Sequence IDs are monotonically increasing across entries within a segment and across segments for a given shard.
 8. `base_seq` of segment N+1 equals `last_seq` of segment N plus 1 — there are no gaps at segment boundaries.
 9. (format ≥1.1) After recovery, for every batch appended via `AppendBatch`, either every entry of the batch is present or none is. Recovery never exposes a proper subset of a batch's entries.
+10. Every `Write` entry holds a command that parses. Unconditional writes are canonicalised before the append (see [ADP-006](006-read-write-paths.md) §Canonical form on the write path), so the log carries one spelling per operation with TTLs already absolute; conditional writes retain the client's spelling but are validated before the append. A parse failure on a `Write` entry is therefore a corruption signal, not a report about what the client sent — the only remaining way to get one is a command whose parser is absent from the reading build, which is a capability gap in that build rather than a property of the entry.
+
+This is a constraint on producers, not a layout change: the byte-level encoding of a command is unchanged, and no version bump is implied. It does mean the set of byte sequences a conforming writer can emit is now a strict subset of what the format can express, and readers must not assume otherwise — a reader that encounters a non-canonical `Write` should still process it, since older development logs and the resolver's materialised commands both predate the rule.
 
 ## Trade-offs
 

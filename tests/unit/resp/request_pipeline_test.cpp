@@ -49,19 +49,27 @@ class FakeConfig : public ConfigProvider {
 class StubDispatcher : public core::CommandDispatcher {
  public:
   int flush_calls = 0;
+  int write_calls = 0;
+  int conditional_calls = 0;
   core::FlushTarget last_target = core::FlushTarget::kThisDb;
+  core::RespCommand last_write;
+  core::RespCommand last_conditional;
 
   core::Result<core::RespValue> DispatchRead(std::string_view /*name*/,
                                              const core::RespCommand& /*cmd*/) override {
     return core::RespValue::Null();
   }
   core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/,
-                                              core::RespCommand /*cmd*/) override {
+                                              core::RespCommand cmd) override {
+    ++write_calls;
+    last_write = std::move(cmd);
     return core::RespValue::SimpleString("OK");
   }
   core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
-                                                    core::RespCommand /*cmd*/,
+                                                    core::RespCommand cmd,
                                                     core::PredicateFlags /*flags*/) override {
+    ++conditional_calls;
+    last_conditional = std::move(cmd);
     return core::RespValue::SimpleString("OK");
   }
   core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
@@ -111,7 +119,7 @@ TEST(RequestPipelineTest, RespPing) {
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n"), output);
   EXPECT_GT(result.bytes_consumed, 0U);
-  EXPECT_FALSE(result.close_requested);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kNone);
   EXPECT_EQ(ToStr(output), "+PONG\r\n");
 }
 
@@ -120,6 +128,17 @@ TEST(RequestPipelineTest, PingWithMessageReturnsBulk) {
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"), output);
   EXPECT_EQ(ToStr(output), "$5\r\nhello\r\n");
+}
+
+// RESP-7: PING keeps registry arity -1; the at-most-one-message bound is
+// enforced by the handler, as in real Redis.
+TEST(RequestPipelineTest, PingExtraArgsIsArityError) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_EQ(response.AsString(), "ERR wrong number of arguments for 'ping' command");
 }
 
 TEST(RequestPipelineTest, InlinePing) {
@@ -141,7 +160,7 @@ TEST(RequestPipelineTest, QuitSetsCloseRequested) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   auto result = pipeline.Process(Bytes("*1\r\n$4\r\nQUIT\r\n"), output);
-  EXPECT_TRUE(result.close_requested);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kClientQuit);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
 }
 
@@ -202,6 +221,80 @@ TEST(RequestPipelineTest, FlushdbRejectsUnknownModifier) {
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
   EXPECT_EQ(dispatcher.flush_calls, 0);
+}
+
+// ENGINE-7: an unrecognised SET option must be rejected before the write is
+// handed to the dispatcher, so nothing malformed is ever queued.
+TEST(RequestPipelineTest, SetWithUnknownOptionIsRejectedBeforeDispatch) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$5\r\nBOGUS\r\n"), output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
+  EXPECT_EQ(dispatcher.write_calls, 0);
+}
+
+// ENGINE-10: the same malformed SET with a leading NX routes down the
+// conditional branch. That branch used to append without ever consulting the
+// parser, so the syntax error surfaced only in the resolver -- after the write
+// was durable. Both branches now validate before dispatch.
+TEST(RequestPipelineTest, SetNxWithUnknownOptionIsRejectedBeforeDispatch) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n$5\r\nBOGUS\r\n"),
+                   output);
+  auto response = ParseResponse(output);
+  ASSERT_TRUE(response.IsError());
+  EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
+  EXPECT_EQ(dispatcher.conditional_calls, 0);
+  EXPECT_EQ(dispatcher.write_calls, 0);
+}
+
+// A well-formed conditional still reaches the resolver with the client's own
+// spelling: canonicalising it would strip the predicate tokens that Decide
+// reads out of the command text.
+TEST(RequestPipelineTest, SetNxDispatchesConditionallyUncanonicalised) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n"), output);
+  EXPECT_EQ(dispatcher.conditional_calls, 1);
+  EXPECT_EQ(dispatcher.last_conditional.args, (std::vector<std::string>{"SET", "k", "v", "NX"}));
+}
+
+// Unconditional writes reach the queue canonicalised: SETEX and SET..EX are the
+// same op, so the WAL carries one spelling with the TTL already absolute.
+TEST(RequestPipelineTest, UnconditionalWriteIsCanonicalisedBeforeDispatch) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"), output);
+  ASSERT_EQ(dispatcher.write_calls, 1);
+  const auto& args = dispatcher.last_write.args;
+  ASSERT_EQ(args.size(), 5U);
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], "k");
+  EXPECT_EQ(args[2], "v");
+  EXPECT_EQ(args[3], "PXAT");
+  EXPECT_GT(std::stoull(args[4]), 0U);
+}
+
+TEST(RequestPipelineTest, SetWithTtlOptionStillDispatches) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n"),
+                   output);
+  EXPECT_EQ(ToStr(output), "+OK\r\n");
+  EXPECT_EQ(dispatcher.write_calls, 1);
 }
 
 TEST(RequestPipelineTest, FlushdbWithoutDispatcherReturnsInternalError) {
@@ -371,14 +464,14 @@ TEST(RequestPipelineTest, CommandInfoReportsGetSpec) {
   ASSERT_TRUE(entry.AsArray()[2].IsArray());
 }
 
-TEST(RequestPipelineTest, CommandInfoUnknownIsNull) {
+// RESP-5: Redis answers an unknown COMMAND INFO name with the array-shaped nil
+// `*-1`, not the bulk nil `$-1`. Asserted on the wire bytes because the parser
+// folds both nil forms back onto kNull.
+TEST(RequestPipelineTest, CommandInfoUnknownIsNullArray) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$7\r\nBOGUSCC\r\n"), output);
-  auto response = ParseResponse(output);
-  ASSERT_TRUE(response.IsArray());
-  ASSERT_EQ(response.AsArray().size(), 1U);
-  EXPECT_TRUE(response.AsArray()[0].IsNull());
+  EXPECT_EQ(ToStr(output), "*1\r\n*-1\r\n");
 }
 
 TEST(RequestPipelineTest, CommandDocsReturnsSummary) {
@@ -696,8 +789,8 @@ TEST(RequestPipelineTest, ClusterInfoReportsOk) {
   EXPECT_NE(response.AsString().find("cluster_slots_assigned:16384"), std::string::npos);
 }
 
-TEST(RequestPipelineTest, ClusterCountKeysInSlotUsesTotal) {
-  FakeStats stats(StandardStats());
+TEST(RequestPipelineTest, ClusterCountKeysInSlotIsNotKeyspaceTotal) {
+  FakeStats stats(StandardStats());  // hot_key_count=3, cold_key_count=7
   NodeIdentity identity("33333333-3333-4333-8333-333333333333");
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
@@ -705,7 +798,9 @@ TEST(RequestPipelineTest, ClusterCountKeysInSlotUsesTotal) {
   pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$1\r\n0\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
-  EXPECT_EQ(response.AsInteger(), 10);
+  // Per-slot count for a valid slot must NOT be the whole-keyspace total (10).
+  EXPECT_NE(response.AsInteger(), 10);
+  EXPECT_EQ(response.AsInteger(), 0);
 }
 
 TEST(RequestPipelineTest, ClusterCountKeysOutOfRangeReturnsZero) {
@@ -785,6 +880,40 @@ TEST(RequestPipelineTest, PartialFrameLeftForCaller) {
   auto result = pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$3\r\nhe"), output);
   EXPECT_EQ(result.bytes_consumed, 0U);
   EXPECT_TRUE(output.empty());
+}
+
+// RESP-3: an unframable RESP frame emits a -ERR and asks the caller to close.
+TEST(RequestPipelineTest, ProtocolErrorSetsCloseReason) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  // A negative multibulk count with trailing junk is a fully-delimited bad frame.
+  auto result = pipeline.Process(Bytes("*-5\r\nGARBAGE\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
+}
+
+// RESP-2: an inline command with an unterminated quote is a protocol error
+// (closes), not an indefinite kIncomplete stall. Pre-fix this consumed 0 bytes
+// forever and the connection hung.
+TEST(RequestPipelineTest, UnterminatedQuoteProducesErrorAndConsumesAll) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  const std::string input = "SET key \"oops\r\n";
+  auto result = pipeline.Process(Bytes(input), output);
+  EXPECT_EQ(result.bytes_consumed, input.size());
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
+  EXPECT_NE(ToStr(output).find("unbalanced quotes"), std::string::npos);
+}
+
+// RESP-1: a multibulk declaring a huge element count is rejected as a protocol
+// error before any allocation; no crash/OOM, and the caller is told to close.
+TEST(RequestPipelineTest, HugeArrayCountIsProtocolErrorNotCrash) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  std::vector<uint8_t> output;
+  auto result = pipeline.Process(Bytes("*2000000000\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
 }
 
 TEST(RequestPipelineTest, PipelinedFramesAreAllProcessed) {

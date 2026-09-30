@@ -1,5 +1,6 @@
 #include "abyss/consumer/cold_consumer_pool.h"
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,22 @@ void ColdConsumerPool::Stop() {
   for (auto& consumer : consumers_) {
     consumer->Join();
   }
+}
+
+void ColdConsumerPool::Stop(std::chrono::milliseconds drain_budget) {
+  // One shared deadline so the budget bounds the whole drain, not each shard
+  // serially. Request the drain on every consumer first (they drain in
+  // parallel on their own threads), then join.
+  const auto deadline = std::chrono::steady_clock::now() + drain_budget;
+  ABYSS_LOG_INFO("cold consumers draining", {"count", static_cast<int64_t>(consumers_.size())},
+                 {"budget_ms", static_cast<int64_t>(drain_budget.count())});
+  for (auto& consumer : consumers_) {
+    consumer->RequestStopAndDrain(deadline);
+  }
+  for (auto& consumer : consumers_) {
+    consumer->Join();
+  }
+  ABYSS_LOG_INFO("cold consumers drained", {"count", static_cast<int64_t>(consumers_.size())});
 }
 
 bool ColdConsumerPool::IsRunning() const {
@@ -113,6 +130,7 @@ ColdConsumerPool::AggregateMetrics ColdConsumerPool::Snapshot() const {
     agg.apply_failures += m.apply_failures;
     agg.retry_attempts += m.retry_attempts;
     agg.parse_failures += m.parse_failures;
+    agg.oldest_unflushed_age = std::max(agg.oldest_unflushed_age, m.oldest_unflushed_age);
     if (m.mode == ColdConsumer::Mode::kAggressive) ++agg.shards_in_aggressive_mode;
   }
   return agg;

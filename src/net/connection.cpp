@@ -53,7 +53,6 @@ NetMetrics NetMetrics::Register() {
       .connections_accepted = reg.Counter(metrics::names::kNetConnectionsAcceptedTotal),
       .bytes_in = reg.Counter(metrics::names::kNetBytesInTotal),
       .bytes_out = reg.Counter(metrics::names::kNetBytesOutTotal),
-      .read_buffer_high_water = reg.Gauge(metrics::names::kNetReadBufferHighWaterBytes),
       .backpressure_active = reg.Gauge(metrics::names::kNetBackpressureActive),
       .backpressure_entered = reg.Counter(metrics::names::kNetBackpressureEnteredTotal),
       .backpressure_exited = reg.Counter(metrics::names::kNetBackpressureExitedTotal),
@@ -136,10 +135,13 @@ void Connection::Close(metrics::CloseReason reason) {
   close_reason_ = reason;
   metrics_.Closed(reason).Increment();
   metrics_.connections_active.Decrement();
-  if (reading_paused_) {
+  // Keyed on backpressure_counted_, never on reading_paused_: a pause whose
+  // poller update failed sets the pause flag but never reaches the increment.
+  if (backpressure_counted_) {
     metrics_.backpressure_active.Decrement();
-    reading_paused_ = false;
+    backpressure_counted_ = false;
   }
+  reading_paused_ = false;
 
   // De-register before close: a reused fd number must not deliver to us.
   if (fd_.Valid()) {
@@ -159,43 +161,62 @@ void Connection::Close(metrics::CloseReason reason) {
 void Connection::OnReadable() {
   if (closed_) return;
 
-  while (true) {
-    const size_t old_size = read_buf_.size();
-    if (old_size + kRecvChunkBytes > config_.max_read_buffer_bytes &&
-        old_size >= config_.max_read_buffer_bytes) {
-      ABYSS_LOG_WARN("read buffer would exceed max", {"client_id", client_id_},
+  // Edge-triggered drain: each pass reads the socket until EAGAIN or the read
+  // buffer cap, then feeds the pipeline. If we stopped at the cap (not EAGAIN)
+  // we must make progress in THIS call — an ET backend will not redeliver the
+  // readable edge for bytes still queued in the kernel. If the pipeline freed
+  // buffer space we loop and read more; if it consumed nothing while the buffer
+  // is at the cap the command is unconsumably large and we close deterministically.
+  bool stopped_at_cap = false;
+  do {
+    stopped_at_cap = false;
+    while (true) {
+      const size_t old_size = read_buf_.size();
+      if (old_size >= config_.max_read_buffer_bytes) {
+        stopped_at_cap = true;
+        break;
+      }
+      const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
+      read_buf_.resize(old_size + want);
+
+      const auto n = pnet::Recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
+      if (n > 0) {
+        read_buf_.resize(old_size + static_cast<size_t>(n));
+        metrics_.bytes_in.Increment(static_cast<double>(n));
+        TouchActivity();
+        RecordReadBufferHighWater();
+        continue;
+      }
+      read_buf_.resize(old_size);
+      if (n == 0) {
+        Close(metrics::CloseReason::kClient);
+        return;
+      }
+      const int err = pnet::LastError();
+      if (pnet::IsInterrupted(err)) continue;
+      if (pnet::IsWouldBlock(err)) break;
+      ABYSS_LOG_DEBUG("recv error", {"client_id", client_id_},
+                      {"err", std::string_view{pnet::ErrorString(err)}});
+      Close(metrics::CloseReason::kClient);
+      return;
+    }
+
+    const size_t consumed = DispatchPipelineOutput();
+    if (closed_) return;
+
+    if (stopped_at_cap && consumed == 0) {
+      // A single command fills the entire read buffer yet cannot be framed:
+      // it can never be consumed, so close now rather than wait for an edge
+      // that will never arrive.
+      ABYSS_LOG_WARN("read buffer at cap with unconsumable command", {"client_id", client_id_},
                      {"limit", static_cast<uint64_t>(config_.max_read_buffer_bytes)});
       Close(metrics::CloseReason::kOversize);
       return;
     }
-    const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
-    read_buf_.resize(old_size + want);
-
-    const auto n = pnet::Recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
-    if (n > 0) {
-      read_buf_.resize(old_size + static_cast<size_t>(n));
-      metrics_.bytes_in.Increment(static_cast<double>(n));
-      TouchActivity();
-      RecordReadBufferHighWater();
-      if (read_buf_.size() >= config_.max_read_buffer_bytes) break;
-      continue;
-    }
-    read_buf_.resize(old_size);
-    if (n == 0) {
-      Close(metrics::CloseReason::kClient);
-      return;
-    }
-    const int err = pnet::LastError();
-    if (pnet::IsInterrupted(err)) continue;
-    if (pnet::IsWouldBlock(err)) break;
-    ABYSS_LOG_DEBUG("recv error", {"client_id", client_id_},
-                    {"err", std::string_view{pnet::ErrorString(err)}});
-    Close(metrics::CloseReason::kClient);
-    return;
-  }
-
-  DispatchPipelineOutput();
-  if (closed_) return;
+    // If we stopped at the cap but DID consume bytes, loop: the freed space lets
+    // us drain more of the socket within this call (ET-safe forward progress).
+    // Stop draining once a close is pending — the queued reply must flush first.
+  } while (stopped_at_cap && !pending_close_.has_value());
 
   TryDrainWrite();
   if (closed_) return;
@@ -204,8 +225,8 @@ void Connection::OnReadable() {
   MaybePauseReading();
   if (closed_) return;
 
-  if (close_after_drain_ && !HasPendingWrites()) {
-    Close(metrics::CloseReason::kClient);
+  if (pending_close_.has_value() && !HasPendingWrites()) {
+    Close(*pending_close_);
     return;
   }
 
@@ -221,24 +242,28 @@ void Connection::OnWritable() {
   MaybeResumeReading();
   if (closed_) return;
 
-  if (close_after_drain_ && !HasPendingWrites()) {
-    Close(metrics::CloseReason::kClient);
+  if (pending_close_.has_value() && !HasPendingWrites()) {
+    Close(*pending_close_);
     return;
   }
 
   SyncPollerInterest();
 }
 
-void Connection::DispatchPipelineOutput() {
-  if (read_buf_.empty()) return;
+size_t Connection::DispatchPipelineOutput() {
+  if (read_buf_.empty()) return 0;
   const auto result = pipeline_->Process(read_buf_, write_buf_);
   if (result.bytes_consumed > 0) {
     read_buf_.erase(read_buf_.begin(),
                     read_buf_.begin() + static_cast<ptrdiff_t>(result.bytes_consumed));
   }
-  if (result.close_requested) {
-    close_after_drain_ = true;
+  // Both QUIT and an unframable protocol error close the client connection
+  // after the queued reply (the -ERR or +OK) drains.
+  if (result.close_reason != resp::RequestPipeline::ProcessCloseReason::kNone &&
+      !pending_close_.has_value()) {
+    pending_close_ = metrics::CloseReason::kClient;
   }
+  return result.bytes_consumed;
 }
 
 void Connection::TryDrainWrite() {
@@ -291,8 +316,13 @@ void Connection::MaybePauseReading() {
   if (reading_paused_) return;
   if (WriteBufferBytes() < config_.write_backpressure_bytes) return;
 
+  // reading_paused_ must flip first because SyncPollerInterest derives the
+  // interest mask from it; the gauge moves only once the transition is
+  // committed. A failed Modify closes with backpressure_counted_ still false,
+  // so Close() cannot decrement an increment that never happened.
   reading_paused_ = true;
   if (!SyncPollerInterest()) return;
+  backpressure_counted_ = true;
   metrics_.backpressure_active.Increment();
   metrics_.backpressure_entered.Increment();
   ABYSS_LOG_DEBUG("backpressure paused", {"client_id", client_id_},
@@ -304,18 +334,21 @@ void Connection::MaybeResumeReading() {
   if (WriteBufferBytes() >= config_.write_resume_bytes) return;
 
   reading_paused_ = false;
+  // A failed Modify here leaves backpressure_counted_ set, so the Close() it
+  // triggers drops the gauge exactly once instead of leaking the increment.
   if (!SyncPollerInterest()) return;
+  backpressure_counted_ = false;
   metrics_.backpressure_active.Decrement();
   metrics_.backpressure_exited.Increment();
   ABYSS_LOG_DEBUG("backpressure resumed", {"client_id", client_id_},
                   {"write_bytes", static_cast<uint64_t>(WriteBufferBytes())});
 }
 
+// Deliberately does not touch the process-wide gauge: every connection Setting
+// it makes the value last-writer-wins. The fleet max is folded from these
+// per-connection peaks by the server-scoped snapshotter.
 void Connection::RecordReadBufferHighWater() {
-  if (read_buf_.size() > read_buf_high_water_) {
-    read_buf_high_water_ = read_buf_.size();
-    metrics_.read_buffer_high_water.Set(static_cast<double>(read_buf_high_water_));
-  }
+  read_buf_high_water_ = std::max(read_buf_high_water_, read_buf_.size());
 }
 
 void Connection::TouchActivity() { last_activity_ = clock_(); }

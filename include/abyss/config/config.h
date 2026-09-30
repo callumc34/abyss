@@ -40,7 +40,14 @@ struct ColdConfig {
 struct QueueConfig {
   std::string backend = "builtin_wal";
   std::string wal_path = "/data/wal";
-  size_t segment_size_bytes = 67108864;
+  // 128 MiB: large enough to hold one max-size value plus framing so a max-size
+  // value never needs a variable-size segment (segments stay fixed-size).
+  size_t segment_size_bytes = 134217728;
+  // Largest single value accepted, decoupled from segment_size_bytes. Default
+  // 64 MiB; settable up to Redis's 512 MiB proto-max-bulk-len. The validator
+  // requires segment_size_bytes to hold one max-size entry, so larger values
+  // are rejected with kValueTooLarge rather than tied to the segment knob.
+  size_t max_value_size_bytes = 67108864;
   std::chrono::seconds min_retention{86400};
   std::string fsync_policy = "group_commit";
   uint32_t group_commit_interval_us = 1000;
@@ -63,6 +70,22 @@ struct ColdConsumerConfig {
   std::chrono::milliseconds queue_read_timeout{50};
   std::chrono::milliseconds retry_initial_backoff{50};
   std::chrono::milliseconds retry_max_backoff{30000};
+  // Bounded checkpoint cadence: the cold store is fsynced at most once every
+  // `checkpoint_max_flushes` applied batches or `checkpoint_min_interval`,
+  // whichever comes first. Lowering either tightens the durable frontier at the
+  // cost of more fsyncs; raising either widens the WAL replay window on crash.
+  size_t checkpoint_max_flushes = 32;
+  std::chrono::milliseconds checkpoint_min_interval{50};
+  // Capped exponential backoff applied when a drain/flush iteration makes no
+  // progress (idle, poisoned, or unwritable). Reset on progress.
+  std::chrono::milliseconds loop_initial_backoff{1};
+  std::chrono::milliseconds loop_max_backoff{1000};
+  // Per-shard budget for the graceful SIGTERM drain: each cold consumer
+  // flushes + checkpoints its buffer to durable storage before stopping,
+  // bounded by this deadline (drains run in parallel across shards). On expiry
+  // the remaining slice replays from the WAL. Keep below the K8s
+  // terminationGracePeriodSeconds minus the /ready-flip propagation window.
+  std::chrono::seconds drain_grace{15};
 };
 
 struct RecoveryConfig {
@@ -120,6 +143,10 @@ struct MetricsConfig {
   bool enabled = true;
   std::string bind = "0.0.0.0";
   uint16_t port = 9090;
+  // Cadence for pushing snapshot-style gauges. Deliberately decoupled from the
+  // server's much faster stop-poll: each tick reads store statistics, including
+  // RocksDB property lookups, which are cheap but not free.
+  std::chrono::milliseconds snapshot_interval{1000};
 };
 
 struct ComponentLevel {
@@ -168,10 +195,12 @@ struct Config {
   // Hard-coded defaults. Equivalent to a default-constructed Config.
   static Config Defaults();
 
-  // Apply overrides from environment variables. Currently ABYSS_PROFILE.
-  // Called automatically by LoadFromFile; exposed for callers that need to
-  // apply env overlays to a hand-built Config.
-  void ApplyEnvironmentOverrides();
+  // Apply overrides from ABYSS_* environment variables. Called automatically by
+  // LoadFromFile/ParseFromYaml; exposed for callers that need to apply env
+  // overlays to a hand-built Config. A variable that is present but whose value
+  // cannot be parsed is an error naming the variable — an override is never
+  // silently discarded. An absent variable is not an error.
+  [[nodiscard]] core::Result<void> ApplyEnvironmentOverrides();
 
   // Validate the current config.
   core::Result<void> Validate() const;

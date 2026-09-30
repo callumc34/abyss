@@ -51,6 +51,9 @@ struct StatusQueueInfo {
   uint64_t tail_seq = 0;
   uint64_t total_entries = 0;
   uint64_t total_bytes = 0;
+  uint64_t reaper_failures = 0;
+  // Zero when nothing eligible is stuck; rises while retention reclamation stalls.
+  uint64_t oldest_eligible_unreaped_age_ms = 0;
 };
 
 struct StatusHotInfo {
@@ -62,12 +65,15 @@ struct StatusHotInfo {
 struct StatusColdBufferInfo {
   uint64_t entries = 0;
   uint64_t bytes = 0;
+  // ADP-004 §Lag Monitoring: now - min(first_seen). The cold-gap early warning.
+  uint64_t oldest_entry_age_ms = 0;
 };
 
 struct StatusColdInfo {
   std::string backend;
   uint64_t key_count = 0;
   StatusColdBufferInfo buffer;
+  uint64_t disk_bytes = 0;
 };
 
 struct StatusHotConsumerInfo {
@@ -101,6 +107,8 @@ struct StatusLagInfo {
 
 struct StatusConnectionsInfo {
   uint64_t active = 0;
+  // Fleet-wide max across live connections, not a last-writer-wins sample.
+  uint64_t read_buffer_high_water_bytes = 0;
 };
 
 // Mirrors engine::RecoverySnapshot::Phase but kept in the admin-facing schema

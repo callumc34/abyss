@@ -29,7 +29,7 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
   min_retention_seconds: 86400
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000
@@ -50,6 +50,11 @@ cold_consumer:
   queue_read_timeout_ms: 25
   retry_initial_backoff_ms: 100
   retry_max_backoff_ms: 5000
+  checkpoint_max_flushes: 64
+  checkpoint_min_interval_ms: 75
+  loop_initial_backoff_ms: 2
+  loop_max_backoff_ms: 500
+  drain_grace_seconds: 20
 
 recovery:
   replay_parallelism: 4
@@ -101,7 +106,7 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
 
   EXPECT_EQ(cfg->queue.backend, "builtin_wal");
   EXPECT_EQ(cfg->queue.wal_path, "/data/wal");
-  EXPECT_EQ(cfg->queue.segment_size_bytes, 67108864U);
+  EXPECT_EQ(cfg->queue.segment_size_bytes, 134217728U);
   EXPECT_EQ(cfg->queue.min_retention, std::chrono::seconds{86400});
   EXPECT_EQ(cfg->queue.fsync_policy, "group_commit");
   EXPECT_EQ(cfg->queue.group_commit_interval_us, 1000U);
@@ -120,6 +125,11 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->cold_consumer.queue_read_timeout, std::chrono::milliseconds{25});
   EXPECT_EQ(cfg->cold_consumer.retry_initial_backoff, std::chrono::milliseconds{100});
   EXPECT_EQ(cfg->cold_consumer.retry_max_backoff, std::chrono::milliseconds{5000});
+  EXPECT_EQ(cfg->cold_consumer.checkpoint_max_flushes, 64U);
+  EXPECT_EQ(cfg->cold_consumer.checkpoint_min_interval, std::chrono::milliseconds{75});
+  EXPECT_EQ(cfg->cold_consumer.loop_initial_backoff, std::chrono::milliseconds{2});
+  EXPECT_EQ(cfg->cold_consumer.loop_max_backoff, std::chrono::milliseconds{500});
+  EXPECT_EQ(cfg->cold_consumer.drain_grace, std::chrono::seconds{20});
 
   EXPECT_EQ(cfg->recovery.replay_parallelism, 4U);
   EXPECT_EQ(cfg->recovery.hot_replay_batch_size, 10000U);

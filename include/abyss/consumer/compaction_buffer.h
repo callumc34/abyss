@@ -85,11 +85,18 @@ class CompactionBuffer {
 
   std::optional<core::SequenceId> OldestPendingSeq() const ABYSS_EXCLUDES(mutex_);
 
+  // min(first_seen) over live entries; nullopt when empty. Backs the ADP-004
+  // oldest_unflushed_age lag signal (COLDC-5).
+  std::optional<core::SteadyTime> OldestFirstSeen() const ABYSS_EXCLUDES(mutex_);
+
   // Drops every buffered entry without emitting to cold. Used by FLUSHDB.
   void Clear() ABYSS_EXCLUDES(mutex_);
 
   size_t Size() const ABYSS_EXCLUDES(mutex_);
   size_t BytesEstimate() const ABYSS_EXCLUDES(mutex_);
+  // Live flush-heap depth (after lazy-stale skips are accounted on pop). Surfaces
+  // heap growth as an observable gauge (COLDC-4).
+  size_t HeapDepth() const ABYSS_EXCLUDES(mutex_);
 
  private:
   struct HeapEntry {
@@ -101,6 +108,15 @@ class CompactionBuffer {
     }
   };
 
+  // Per-live-heap-entry overhead charged into BytesEstimate so the flush heap's
+  // own memory drives the high-water/aggressive trigger (COLDC-4); a key whose
+  // quiet deadline keeps sliding can no longer accumulate heap entries silently.
+  static constexpr size_t kHeapEntryOverhead = 64;
+
+  // Pushes a heap entry for `key` scheduled at `scheduled`, charging the heap
+  // overhead. Records the scheduled time on the entry for dedup on re-absorb.
+  void PushHeapEntry(BufferEntry& entry, core::SteadyTime scheduled) ABYSS_REQUIRES(mutex_);
+
   std::chrono::milliseconds ComputeJitter() ABYSS_REQUIRES(mutex_);
 
   const FlushStrategy strategy_;
@@ -111,6 +127,9 @@ class CompactionBuffer {
   std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<>> flush_heap_
       ABYSS_GUARDED_BY(mutex_);
   size_t bytes_estimate_ ABYSS_GUARDED_BY(mutex_) = 0;
+  // Charged on every heap push, decremented on every pop (including stale-skip
+  // pops). Folded into BytesEstimate so heap growth surfaces as backpressure.
+  size_t heap_overhead_bytes_ ABYSS_GUARDED_BY(mutex_) = 0;
   std::mt19937_64 rng_ ABYSS_GUARDED_BY(mutex_);
 };
 

@@ -2,12 +2,17 @@ add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
   core/consumer_rpc_test.cpp
+  core/apply_notifier_test.cpp
   core/fire_and_forget_test.cpp
   core/ops_test.cpp
+  core/ops_set_test.cpp
+  core/varint_test.cpp
   core/eviction_policy_test.cpp
   core/queue_entry_test.cpp
   core/shard_router_test.cpp
   core/slot_test.cpp
+  core/slot_shard_map_test.cpp
+  core/topology_manifest_test.cpp
   core/atomic_file_test.cpp
 )
 
@@ -32,6 +37,7 @@ target_include_directories(abyss_queue_tests PRIVATE
 
 target_link_libraries(abyss_queue_tests PRIVATE
   abyss::queue
+  abyss::metrics
   abyss::test_support
   GTest::gtest_main
 )
@@ -42,6 +48,7 @@ add_executable(abyss_resp_tests
   resp/command_registry_test.cpp
   resp/request_pipeline_test.cpp
   resp/node_identity_test.cpp
+  resp/cluster_test.cpp
 )
 
 target_link_libraries(abyss_resp_tests PRIVATE
@@ -173,10 +180,12 @@ add_executable(abyss_net_tests
   net/connection_idle_test.cpp
   net/connection_lazy_arm_test.cpp
   net/connection_oversize_test.cpp
+  net/reactor_lifecycle_test.cpp
 )
 
 target_include_directories(abyss_net_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/net
+  ${PROJECT_SOURCE_DIR}/src/net
 )
 
 target_link_libraries(abyss_net_tests PRIVATE
@@ -190,6 +199,7 @@ add_executable(abyss_admin_tests
   admin/health_handler_test.cpp
   admin/ready_handler_test.cpp
   admin/metrics_handler_test.cpp
+  admin/metrics_snapshotter_test.cpp
   admin/status_handler_test.cpp
   admin/json_writer_test.cpp
 )
@@ -224,6 +234,16 @@ target_link_libraries(abyss_branding_tests PRIVATE
   GTest::gtest_main
 )
 
+add_executable(abyss_platform_tests
+  platform/fs_test.cpp
+)
+
+target_link_libraries(abyss_platform_tests PRIVATE
+  abyss::platform
+  abyss::test_support
+  GTest::gtest_main
+)
+
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
@@ -238,3 +258,4 @@ abyss_discover_tests(abyss_net_tests      "unit\;unit-net")
 abyss_discover_tests(abyss_admin_tests    "unit\;unit-admin")
 abyss_discover_tests(abyss_engine_tests   "unit\;unit-engine")
 abyss_discover_tests(abyss_branding_tests "unit\;unit-branding")
+abyss_discover_tests(abyss_platform_tests "unit\;unit-platform")

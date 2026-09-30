@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "abyss/core/shard_router.h"
+#include "abyss/core/slot_shard_map.h"
 
 namespace abyss::cold::format {
 namespace {
@@ -205,6 +206,26 @@ TEST(KeyEncoderTest, ShardSlotIsComputeShardBigEndian) {
   EXPECT_EQ(slot, core::ComputeShard(key, kShards));
 }
 
+TEST(KeyEncoderTest, ShardPrefixIsSlotDerivedNotXxHash) {
+  // ADP-014: the 2-byte prefix is the slot-derived shard, i.e.
+  // ShardForSlot(SlotForKey(key), shard_count) — not raw-key xxHash.
+  constexpr uint32_t kShards = 256;
+  const std::string key = "user:42";
+  const auto encoded = EncodeStringKey(key, kShards);
+  const auto prefix = static_cast<uint32_t>((static_cast<uint8_t>(encoded[1]) << 8) |
+                                            static_cast<uint8_t>(encoded[2]));
+  EXPECT_EQ(prefix, core::ShardForSlot(core::SlotForKey(key), kShards));
+}
+
+TEST(KeyEncoderTest, HashtagKeysShareShardPrefix) {
+  // Slot-unified placement makes {hashtag} co-location honest on disk: keys
+  // sharing a tag encode the same 2-byte shard prefix.
+  constexpr uint32_t kShards = 256;
+  const auto a = EncodeStringKey("{user}.name", kShards);
+  const auto b = EncodeStringKey("{user}.email", kShards);
+  EXPECT_EQ(a.substr(1, kShardBytes), b.substr(1, kShardBytes));
+}
+
 TEST(KeyEncoderTest, CollectionSlotDerivesFromKeyNotMember) {
   // The slot must depend only on the Redis key, never on the field/member, so
   // every record for a key lands in the same shard slice (and a per-shard wipe
@@ -298,6 +319,12 @@ TEST(MetaValueCodecTest, RejectsWrongSize) {
   EXPECT_FALSE(DecodeMetaValue(too_short).has_value());
   const std::string too_long(18, '\0');
   EXPECT_FALSE(DecodeMetaValue(too_long).has_value());
+}
+
+TEST(FormatVersionValueCodecTest, CurrentVersionIsThree) {
+  // ADP-014 bumped the cold encoding epoch from 2 (xxHash placement) to 3
+  // (slot-derived placement). Pin it so an accidental revert is caught.
+  EXPECT_EQ(kFormatVersion, 3);
 }
 
 TEST(FormatVersionValueCodecTest, RoundTrip) {

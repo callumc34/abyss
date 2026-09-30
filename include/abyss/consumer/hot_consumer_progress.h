@@ -16,8 +16,10 @@ class HotConsumerProgress {
   HotConsumerProgress(HotConsumerProgress&&) = delete;
   HotConsumerProgress& operator=(HotConsumerProgress&&) = delete;
 
-  // Highest seq the per-shard hot consumer has fully settled (applied AND
-  // any pending Conditional has resolved). 0 if nothing has been settled yet.
+  // The settled floor: the highest seq that is BOTH hot-applied AND not behind
+  // any unresolved pending Conditional, i.e.
+  // min(highest_applied_seq, oldest_pending_conditional_seq - 1). Never advances
+  // past an undecided Conditional. 0 if nothing has been settled yet.
   virtual core::SequenceId HighestSettledSeq(core::ShardId shard) const = 0;
 };
 

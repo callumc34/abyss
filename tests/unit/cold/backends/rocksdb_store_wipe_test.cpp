@@ -96,7 +96,7 @@ class WipeFixture : public ::testing::Test {
         core::ops::SetAdd{.key = keys.set, .members = set_members},
         core::ops::ZsetAdd{.key = keys.zset, .entries = zset_entries},
     };
-    EXPECT_TRUE(store.ApplyBatch(ops).has_value());
+    EXPECT_TRUE(store.ApplyBatch(ops, 0).has_value());
     return keys;
   }
 
@@ -186,7 +186,7 @@ TEST_F(WipeFixture, WipedShardAcceptsFreshWritesAfterward) {
 
   // Post-wipe writes (higher seqno) must not be shadowed by the range tombstone.
   std::vector<core::ops::WriteOp> ops = {core::ops::StringSet{.key = keys.str, .value = "again"}};
-  ASSERT_TRUE(store->ApplyBatch(ops).has_value());
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   auto got = store->Exec(core::ops::StringGet{.key = keys.str});
   ASSERT_TRUE(got.has_value());

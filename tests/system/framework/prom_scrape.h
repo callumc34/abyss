@@ -141,4 +141,34 @@ inline std::optional<double> PollCounterAtLeast(uint16_t metrics_port, std::stri
   return PollCounterAtLeast(metrics_port, name, {}, threshold, timeout, last_body);
 }
 
+// Waits until nothing is left in the compaction buffer, then returns the scrape
+// that observed it. Call this before baselining any cold-tier flush counter.
+//
+// The data-path fixtures probe readiness with a real `SET`/`DEL` pair, and those
+// land in the compaction buffer like any other write. Flush readiness is per
+// entry (`CompactionBuffer::FlushReady`), so the probe's own entry becomes
+// flushable roughly one quiet window after SetUp returns -- inside the test
+// body -- and both `abyss_cold_flush_total{status="success"}` and
+// `abyss_cold_flush_reason_total{reason="quiet"}` count per entry, so it is
+// worth exactly +1 on each. A baseline taken before that lands attributes the
+// probe's flush to whatever the test did next: an exact-delta assertion flakes,
+// and an at-least assertion silently passes without the test's own write ever
+// having been flushed, which is the more dangerous outcome.
+inline std::string AwaitColdQuiescence(
+    uint16_t metrics_port, std::chrono::milliseconds timeout = std::chrono::seconds{15},
+    std::chrono::milliseconds interval = std::chrono::milliseconds{50}) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::string body;
+  while (std::chrono::steady_clock::now() < deadline) {
+    body = Scrape(metrics_port);
+    const auto flushed = ParseCounter(body, "abyss_cold_flush_total", {{"status", "success"}});
+    const auto buffered = ParseCounter(body, "abyss_cold_buffer_entries");
+    // Both conditions matter: an empty buffer alone is also true before the
+    // probe's writes have been drained out of the queue into it.
+    if (flushed.value_or(0.0) >= 1.0 && buffered.value_or(-1.0) == 0.0) return body;
+    std::this_thread::sleep_for(interval);
+  }
+  return {};
+}
+
 }  // namespace abyss::system_test

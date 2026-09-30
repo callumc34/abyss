@@ -1,17 +1,43 @@
 #include "validator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
+#include "abyss/log/log.h"
+
+ABYSS_LOG_COMPONENT("abyss.config.validator")
 
 namespace abyss::config::internal {
 
 namespace {
+
+// WAL framing constants the validator must know to floor segment_size_bytes.
+// Kept local (and asserted against the queue header at the WAL boundary) so the
+// config library does not depend on the queue library's private headers.
+//   kSegmentHeaderSize — fixed 32-byte segment header (queue::kSegmentHeaderSize).
+//   kMaxEntryEnvelope  — generous upper bound on per-entry framing overhead
+//                        (length prefix, type/seq/timestamp, multi-arg command
+//                        framing, batch_last_seq, crc). A value at
+//                        max_value_size_bytes plus this must fit a segment.
+constexpr size_t kSegmentHeaderSize = 32;
+constexpr size_t kMaxEntryEnvelope = 1024;
+// Redis proto-max-bulk-len: the largest single value we ever accept.
+constexpr size_t kMaxAcceptableValueSize = size_t{512} * 1024 * 1024;
+// Upper bound on the cold checkpoint cadence. The cold ack cannot pass data the
+// last checkpoint did not make durable, so this bounds how far the ack — and
+// therefore WAL retention release — can trail the applied frontier.
+constexpr std::chrono::milliseconds kMaxCheckpointMinInterval{60000};
+
+// Snapshot gauges scraped less often than this stop being an alerting signal:
+// Prometheus would sample a value already stale by more than a scrape interval.
+constexpr std::chrono::milliseconds kMaxMetricsSnapshotInterval{60000};
 
 core::Error InvalidArg(std::string path, std::string_view message) {
   std::string msg = std::move(path);
@@ -49,6 +75,12 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
   if (auto r = RequireNonEmpty("hot.backend", hot.backend); !r) return r;
   if (auto r = RequirePositive("hot.max_memory_bytes", hot.max_memory_bytes); !r) return r;
   if (auto r = RequirePositive("hot.shard_count", hot.shard_count); !r) return r;
+  if (hot.shard_count > core::kRpcMaxShardCount) {
+    return std::unexpected(
+        InvalidArg("hot.shard_count", "must be <= " + std::to_string(core::kRpcMaxShardCount) +
+                                          " (RpcId packing reserves bit 63 for the flush tag; "
+                                          "ADP-011 inv 6 / ENGINE-4)"));
+  }
   if (hot.eviction_tick.count() <= 0) {
     return std::unexpected(InvalidArg("hot.eviction_tick_ms", "must be > 0 milliseconds"));
   }
@@ -131,6 +163,36 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
   if (auto r = RequireNonEmpty("queue.backend", q.backend); !r) return r;
   if (auto r = RequireNonEmpty("queue.wal_path", q.wal_path); !r) return r;
   if (auto r = RequirePositive("queue.segment_size_bytes", q.segment_size_bytes); !r) return r;
+
+  // A segment below the header size underflows the capacity subtractions and
+  // wedges the shard in an infinite rotation loop (QUEUE-4). Floor it above the
+  // header plus a minimal entry envelope.
+  const size_t segment_floor = kSegmentHeaderSize + kMaxEntryEnvelope;
+  if (q.segment_size_bytes < segment_floor) {
+    return std::unexpected(InvalidArg(
+        "queue.segment_size_bytes",
+        "must be >= " + std::to_string(segment_floor) + " (segment header + minimum entry)"));
+  }
+
+  // max_value_size_bytes is the single-value ceiling, decoupled from the
+  // segment size (G11 / Decision 2). It must be positive, within Redis's
+  // proto-max-bulk-len, and small enough that one max-size entry plus its
+  // envelope fits a fixed-size segment (no jumbo segments — the reaper,
+  // sealed-segment accounting, recovery base_seq math, and disk gauges all rely
+  // on uniform segment size).
+  if (auto r = RequirePositive("queue.max_value_size_bytes", q.max_value_size_bytes); !r) return r;
+  if (q.max_value_size_bytes > kMaxAcceptableValueSize) {
+    return std::unexpected(InvalidArg(
+        "queue.max_value_size_bytes",
+        "must be <= " + std::to_string(kMaxAcceptableValueSize) + " (Redis proto-max-bulk-len)"));
+  }
+  if (q.segment_size_bytes < q.max_value_size_bytes + kMaxEntryEnvelope) {
+    return std::unexpected(InvalidArg("queue.segment_size_bytes",
+                                      "must be >= queue.max_value_size_bytes + " +
+                                          std::to_string(kMaxEntryEnvelope) +
+                                          " so a max-size value fits one fixed-size segment"));
+  }
+
   if (q.min_retention.count() < 0)
     return std::unexpected(InvalidArg("queue.min_retention_seconds", "must be >= 0 seconds"));
 
@@ -144,6 +206,15 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
       return r;
     if (auto r = RequirePositive("queue.group_commit_max_bytes", q.group_commit_max_bytes); !r)
       return r;
+  }
+
+  // Under fsync_none there is no durability barrier: the WAL durable watermark
+  // tracks the published seq so the retention-Ack gate is a correct no-op, but
+  // a crash can lose acknowledged writes. Surface this loudly (Decision 1).
+  if (q.fsync_policy == "fsync_none") {
+    ABYSS_LOG_CRITICAL(
+        "queue.wal_fsync_policy=fsync_none: WAL durability is DISABLED; acknowledged writes can be "
+        "lost on crash and the retention-ack durability gate is a no-op");
   }
   return {};
 }
@@ -190,6 +261,38 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
   if (c.retry_initial_backoff > c.retry_max_backoff) {
     return std::unexpected(
         InvalidArg("cold_consumer.retry_initial_backoff_ms", "must be <= retry_max_backoff_ms"));
+  }
+  // The checkpoint cadence is the cold durability frontier: a zero cadence
+  // fsyncs per batch, and a zero interval is not a cadence at all. Both bounds
+  // must be positive so the ack can only trail durable data by a bounded amount.
+  if (auto r = RequirePositive("cold_consumer.checkpoint_max_flushes", c.checkpoint_max_flushes);
+      !r) {
+    return r;
+  }
+  if (c.checkpoint_min_interval.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.checkpoint_min_interval_ms", "must be > 0 milliseconds"));
+  }
+  if (c.checkpoint_min_interval > kMaxCheckpointMinInterval) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.checkpoint_min_interval_ms",
+                   "must be <= " + std::to_string(kMaxCheckpointMinInterval.count()) +
+                       " milliseconds (bounds the cold durability lag)"));
+  }
+  if (c.loop_initial_backoff.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.loop_initial_backoff_ms", "must be > 0 milliseconds"));
+  }
+  if (c.loop_max_backoff.count() <= 0) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.loop_max_backoff_ms", "must be > 0 milliseconds"));
+  }
+  if (c.loop_initial_backoff > c.loop_max_backoff) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.loop_initial_backoff_ms", "must be <= loop_max_backoff_ms"));
+  }
+  if (c.drain_grace.count() <= 0) {
+    return std::unexpected(InvalidArg("cold_consumer.drain_grace_seconds", "must be > 0 seconds"));
   }
   return {};
 }
@@ -269,6 +372,14 @@ core::Result<void> ValidateMetrics(const MetricsConfig& m) {
   if (auto r = RequireNonEmpty("metrics.bind", m.bind); !r) return r;
   // port == 0 requests an OS-assigned ephemeral port; the listener reports
   // the bound port via the readiness pipe.
+  if (m.snapshot_interval <= std::chrono::milliseconds::zero()) {
+    return std::unexpected(InvalidArg("metrics.snapshot_interval_ms", "must be > 0"));
+  }
+  if (m.snapshot_interval > kMaxMetricsSnapshotInterval) {
+    return std::unexpected(
+        InvalidArg("metrics.snapshot_interval_ms",
+                   "must be <= " + std::to_string(kMaxMetricsSnapshotInterval.count()) + " ms"));
+  }
   return {};
 }
 

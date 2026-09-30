@@ -75,9 +75,12 @@ class HotConsumer {
   // Test/diagnostic: count of Conditionals awaiting their matching Resolved.
   size_t PendingConditionalCount() const;
 
-  // Test/diagnostic: highest seq the consumer has fully settled.
+  // Highest seq that is BOTH hot-applied AND not behind any unresolved pending
+  // Conditional (the settled floor = min(highest_applied, oldest_pending - 1)).
+  // Never advances past an undecided Conditional, so the tiering engine's
+  // buffer-consistency gate cannot clear ahead of one.
   core::SequenceId HighestSettledSeq() const {
-    return highest_settled_seq_.load(std::memory_order_acquire);
+    return settled_floor_.load(std::memory_order_acquire);
   }
 
  private:
@@ -135,6 +138,9 @@ class HotConsumer {
       ABYSS_GUARDED_BY(pending_mu_);
 
   std::atomic<core::SequenceId> highest_settled_seq_{0};
+  // The settled floor published to HotConsumerProgress: clamped behind the
+  // oldest pending Conditional so it never exceeds an unresolved one.
+  std::atomic<core::SequenceId> settled_floor_{0};
   // Highest seq of an applied `entry::Flush`; no-ops Resolveds whose Conditional was wiped.
   std::atomic<core::SequenceId> latest_flush_seq_{0};
   bool block_and_scan_warning_emitted_ = false;

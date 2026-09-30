@@ -36,7 +36,10 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
+  # Largest single value accepted (default 64 MiB; up to 512 MiB). Must be at
+  # least ~1 KiB below segment_size_bytes so one value fits a fixed-size segment.
+  max_value_size_bytes: 67108864
   min_retention_seconds: 86400
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000
@@ -57,6 +60,17 @@ cold_consumer:
   queue_read_timeout_ms: 50
   retry_initial_backoff_ms: 50
   retry_max_backoff_ms: 30000
+  # Cold-store fsync cadence: at most one checkpoint per N applied batches or
+  # per interval, whichever comes first. Lower = tighter durable frontier and
+  # faster WAL retention release, at the cost of more fsyncs.
+  checkpoint_max_flushes: 32
+  checkpoint_min_interval_ms: 50
+  # Capped exponential backoff for a drain/flush loop making no progress.
+  loop_initial_backoff_ms: 1
+  loop_max_backoff_ms: 1000
+  # Per-shard budget for the graceful drain on SIGTERM. Keep below the K8s
+  # terminationGracePeriodSeconds minus the /ready-flip propagation window.
+  drain_grace_seconds: 15
 
 recovery:
   replay_parallelism: 4
@@ -81,6 +95,7 @@ metrics:
   enabled: true
   bind: 0.0.0.0
   port: 9090
+  snapshot_interval_ms: 1000        # Cadence for pushing snapshot-style gauges
 
 admin:
   enabled: true

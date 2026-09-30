@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -36,6 +37,9 @@ class ColdConsumerPool : public CompactionBufferRouter {
     uint64_t retry_attempts = 0;
     uint64_t parse_failures = 0;
     uint32_t shards_in_aggressive_mode = 0;
+    // Max over shards, not a sum: the worst-lagging shard is the one racing the
+    // eviction deadline (ADP-004 lag monitoring).
+    std::chrono::milliseconds oldest_unflushed_age{0};
   };
 
   ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
@@ -57,7 +61,16 @@ class ColdConsumerPool : public CompactionBufferRouter {
                          std::chrono::milliseconds timeout) override;
 
   void Start();
+  // Abrupt stop: RequestStop + Join on every consumer. The in-memory cold
+  // buffer is dropped (the WAL replays it on next start). Used by the dtor and
+  // tests.
   void Stop();
+  // Graceful stop (G6): request a bounded drain-to-durable on every consumer in
+  // parallel (each flushes + checkpoints + advances its ack within
+  // `drain_budget`), THEN joins them. Drains run concurrently so one slow shard
+  // does not serialise O(N) budgets. Falls back to the abrupt behaviour per
+  // shard on deadline expiry — correctness is preserved by the WAL.
+  void Stop(std::chrono::milliseconds drain_budget);
   bool IsRunning() const;
 
   uint32_t ShardCount() const { return static_cast<uint32_t>(consumers_.size()); }

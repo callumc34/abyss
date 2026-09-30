@@ -1,12 +1,19 @@
 #include "abyss/queue/wal_queue.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iomanip>
+#include <optional>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
+#include "abyss/platform/fs.h"
 #include "abyss/queue/file_offset_store.h"
 #include "shard_state.h"
 
@@ -39,6 +46,30 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
   if (ec) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInternal, "create wal_path: " + ec.message()});
+  }
+
+  // Surface the volume's real durability posture before any ack is given
+  // (invariant 5). A retention-bearing policy on a volume that cannot make
+  // directory renames durable is a refuse-to-start condition: the persisted-ack
+  // <= durable-tail contract A1 relies on cannot hold there.
+  const bool durability_required = config.commit.policy != FsyncPolicy::kNone;
+  if (auto cap = platform::fs::ProbeDurability(config.wal_path); cap.has_value()) {
+    metrics::Registry::Instance()
+        .Gauge(metrics::names::kFsDurableDirSupported)
+        .Set(cap->dir_sync_supported ? 1.0 : 0.0);
+    ABYSS_LOG_INFO("WAL durability probe", {"path", std::string_view{config.wal_path}},
+                   {"dir_sync_supported", cap->dir_sync_supported},
+                   {"fsync_backend", static_cast<int64_t>(cap->backend)});
+    if (durability_required && !cap->dir_sync_supported) {
+      ABYSS_LOG_CRITICAL("data volume cannot make directory entries durable",
+                         {"path", std::string_view{config.wal_path}});
+      return std::unexpected(core::Error{
+          core::ErrorCode::kFailedPrecondition,
+          "data volume does not support durable directory fsync; refusing to start with a "
+          "retention fsync policy (set fsync_policy=none to override at the cost of durability)"});
+    }
+  } else {
+    return std::unexpected(cap.error());
   }
 
   std::unique_ptr<WalQueue> queue(new WalQueue(std::move(config)));
@@ -80,6 +111,7 @@ core::Result<void> WalQueue::Initialize() {
         .shard = shard,
         .directory = shard_dir.string(),
         .segment_size_bytes = config_.segment_size_bytes,
+        .max_value_size_bytes = config_.max_value_size_bytes,
         .commit = config_.commit,
         .on_rotate = [this] { RunReaper(); },
     });
@@ -116,8 +148,44 @@ void WalQueue::RunReaper() {
   auto result = reaper_->RunOnce();
   if (!result.has_value()) {
     reaper_failures_.fetch_add(1, std::memory_order_relaxed);
+    metrics::Registry::Instance().Counter(metrics::names::kQueueReaperFailuresTotal).Increment();
     ABYSS_LOG_WARN("segment reaper failed", {"err", std::string_view{result.error().message()}});
+    return;
   }
+
+  const auto& outcome = *result;
+  if (outcome.failed > 0) {
+    reaper_failures_.fetch_add(outcome.failed, std::memory_order_relaxed);
+    metrics::Registry::Instance()
+        .Counter(metrics::names::kQueueReaperFailuresTotal)
+        .Increment(static_cast<double>(outcome.failed));
+    const std::string_view err = outcome.first_error.has_value()
+                                     ? std::string_view{outcome.first_error->message()}
+                                     : std::string_view{"unknown"};
+    ABYSS_LOG_WARN("segment reaper could not reclaim every eligible segment",
+                   {"failed", static_cast<uint64_t>(outcome.failed)},
+                   {"deleted", static_cast<uint64_t>(outcome.deleted)}, {"err", err});
+  }
+  RecordOldestEligibleUnreaped(outcome.oldest_eligible_unreaped);
+}
+
+void WalQueue::RecordOldestEligibleUnreaped(std::optional<core::WallTime> created_at) {
+  int64_t epoch_ms = kNoUnreapedEpochMs;
+  if (created_at.has_value()) {
+    const auto since_epoch = created_at->time_since_epoch();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(since_epoch);
+    epoch_ms = static_cast<int64_t>(ms.count());
+  }
+  oldest_eligible_unreaped_epoch_ms_.store(epoch_ms, std::memory_order_relaxed);
+}
+
+std::optional<core::Duration> WalQueue::OldestEligibleUnreapedAge() const {
+  const int64_t epoch_ms = oldest_eligible_unreaped_epoch_ms_.load(std::memory_order_relaxed);
+  if (epoch_ms == kNoUnreapedEpochMs) return std::nullopt;
+  const auto created_at = core::WallTime{
+      std::chrono::duration_cast<core::WallClock::duration>(std::chrono::milliseconds{epoch_ms})};
+  const auto age = std::chrono::duration_cast<core::Duration>(core::WallClock::now() - created_at);
+  return std::max(core::Duration::zero(), age);
 }
 
 core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
@@ -166,10 +234,36 @@ core::Result<void> WalQueue::Ack(core::ConsumerId consumer, core::ShardId shard,
     SetVolatileOffset(consumer, shard, seq);
     return {};
   }
+  // Fail-closed durability gate (QUEUE-2/XERR-2/XDUR-1/XDUR-2/HOTC-5): a
+  // retention consumer's persisted offset can never advance past the durable
+  // WAL tail. Consumers (cold/resolver) clamp to DurableSeq or AwaitDurable
+  // before acking; this is the backstop. Under fsync_none durable_seq tracks
+  // the published seq so the gate is a correct no-op (Decision 1). HasDurable
+  // disambiguates the seq-0 edge: a 0 watermark with nothing durable must
+  // reject ack(0), but once seq 0 is durable the same ack is accepted.
+  const bool any_durable = shards_[shard]->HasDurable();
+  const core::SequenceId durable = shards_[shard]->DurableSeq();
+  if (!any_durable || seq > durable) {
+    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
+                                       "ack seq " + std::to_string(seq) +
+                                           " exceeds durable WAL tail " + std::to_string(durable) +
+                                           " for shard " + std::to_string(shard)});
+  }
   auto set = offsets_->Set(consumer, shard, seq);
   if (!set.has_value()) return set;
   RunReaper();
   return {};
+}
+
+core::Result<core::SequenceId> WalQueue::DurableSeq(core::ShardId shard) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->DurableSeq();
+}
+
+core::Result<bool> WalQueue::AwaitDurable(core::ShardId shard, core::SequenceId seq,
+                                          core::Duration timeout) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->AwaitDurable(seq, timeout);
 }
 
 core::Result<core::SequenceId> WalQueue::OldestRetained(core::ShardId shard) {

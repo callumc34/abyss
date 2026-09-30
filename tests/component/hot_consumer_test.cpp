@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/apply_notifier.h"
@@ -16,6 +17,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
@@ -44,7 +46,7 @@ class HotConsumerTest : public ::testing::Test {
                    .interval = std::chrono::microseconds{500},
                    .max_bytes = 1024UL * 1024UL},
         .min_retention = 10s,
-        .retention_consumers = {core::kHotConsumer},
+        .volatile_consumers = {core::kHotConsumer},
     });
     ASSERT_TRUE(queue_result.has_value()) << queue_result.error().message();
     queue_ = std::move(*queue_result);
@@ -92,6 +94,21 @@ class HotConsumerTest : public ::testing::Test {
     e.appended_at = core::WallClock::now();
     e.payload = core::entry::Write{.cmd = core::RespCommand{std::move(args)}};
     return e;
+  }
+
+  // Publishes an arbitrary entry payload and returns its assigned seq.
+  core::SequenceId AppendPayload(std::variant<core::entry::Write, core::entry::Conditional,
+                                              core::entry::Resolved, core::entry::Flush>
+                                     payload) {
+    core::QueueEntry e;
+    e.appended_at = core::WallClock::now();
+    e.payload = std::move(payload);
+    auto pending = queue_->BeginAppend(0, std::move(e));
+    EXPECT_TRUE(pending.has_value());
+    const core::SequenceId seq = pending->seq();
+    pending->Publish();
+    EXPECT_TRUE(pending->durable().get().has_value());
+    return seq;
   }
 
   // BeginAppend → Register → Publish, matching the engine's write path.
@@ -178,6 +195,60 @@ TEST_F(HotConsumerTest, SettledSeqVisibleWhenWriteRpcResolves) {
         << "iter=" << i << " seq=" << seq
         << " — settled-seq must be visible at the moment the RPC future resolves";
   }
+}
+
+// HOTC-7: HighestSettledSeq is the settled FLOOR, not a raw max. With a
+// Conditional pending at seq M and a later Write applied at seq N>M, the floor
+// must clamp to M-1 (never N), because M's outcome is still undecided. Once the
+// matching Resolved for M applies, the floor advances past N.
+TEST_F(HotConsumerTest, HighestSettledSeqClampedBehindPendingConditional) {
+  StartConsumer();
+
+  // Advance settled past seq 0 first so the pending Conditional below lands at a
+  // seq M > 0 — the unsigned-seq-0 clamp guard cannot clamp below seq 0.
+  auto warmup = AppendWithRpcAndSeq({"SET", "warm", "0"});
+  ASSERT_EQ(warmup.future.wait_for(5s), std::future_status::ready);
+  ASSERT_TRUE(warmup.future.get().IsSimpleString());
+
+  // A Conditional that the consumer holds pending (no Resolved emitted by hot;
+  // the resolver would normally emit it).
+  const core::SequenceId m = AppendPayload(core::entry::Conditional{
+      .cmd = core::RespCommand{{"SETNX", "k", "v"}},
+      .flags = core::PredicateFlags::kNx,
+  });
+  ASSERT_GT(m, 0U);
+
+  // A later unconditional Write at seq N > M, fulfilled via its RPC so we know
+  // it has been applied.
+  auto [n, future] = AppendWithRpcAndSeq({"SET", "other", "1"});
+  ASSERT_GT(n, m);
+  ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+  ASSERT_TRUE(future.get().IsSimpleString());
+
+  // Wait for the consumer to observe the pending Conditional, then assert the
+  // floor never exceeds M-1 despite N being applied.
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (consumer_->PendingConditionalCount() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_EQ(consumer_->PendingConditionalCount(), 1U);
+  EXPECT_EQ(consumer_->HighestSettledSeq(), m - 1)
+      << "floor must clamp behind the pending Conditional at " << m;
+
+  // Now the matching Resolved for M applies (kSkip is fine — it just settles M).
+  AppendPayload(core::entry::Resolved{
+      .ref = m,
+      .decision = core::Decision::kSkip,
+      .materialised_ops = {},
+      .return_value = core::RespValue::Integer(0),
+  });
+
+  const auto deadline2 = std::chrono::steady_clock::now() + 2s;
+  while (consumer_->HighestSettledSeq() < n && std::chrono::steady_clock::now() < deadline2) {
+    std::this_thread::sleep_for(2ms);
+  }
+  EXPECT_GE(consumer_->HighestSettledSeq(), n)
+      << "floor must advance past N once the Conditional at M resolves";
 }
 
 TEST_F(HotConsumerTest, WrongTypeFlowsThroughRpcAndAcks) {
@@ -347,6 +418,81 @@ TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {
   auto r_c = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "c"}});
   ASSERT_TRUE(r_c.has_value());
   EXPECT_EQ(r_c->AsString(), "3");
+}
+
+// --- Memory-pressure during/after replay (HOT-1) ---
+
+TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
+  // Size a budget far below the replayed working set. During replay every
+  // entry must apply (no kResourceExhausted, no memory apply_failures) so the
+  // rebuilt state matches the pre-crash state; a subsequent eviction-worker
+  // tick reconverges used_bytes <= budget (deterministic replay, invariant 4).
+  constexpr int kEntries = 20;
+  const std::string value(256, 'v');
+
+  // Probe one entry's footprint to size the per-shard budget below the set.
+  hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
+  ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}}, 0)
+                  .has_value());
+  const uint64_t per_entry = probe.Stats()->used_bytes;
+
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      .max_memory_bytes = per_entry * 4,  // holds ~4, replay writes 20
+      .shard_count = 1,
+  });
+
+  for (int i = 0; i < kEntries; ++i) {
+    auto entry = MakeWrite({"SET", "k" + std::to_string(i), value});
+    ASSERT_TRUE(queue_->Append(0, entry).has_value());
+  }
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+
+  // All entries applied; none rejected for memory.
+  EXPECT_EQ(consumer_->Snapshot().applied, static_cast<uint64_t>(kEntries));
+  EXPECT_EQ(consumer_->Snapshot().apply_failures, 0U);
+  EXPECT_EQ(hot_->Stats()->key_count, static_cast<uint64_t>(kEntries));
+  EXPECT_GT(hot_->Stats()->used_bytes, hot_->Stats()->max_bytes)
+      << "over budget during replay (suppressed); enforced only afterward";
+
+  // After replay, the eviction-worker tick reconverges the ceiling.
+  hot::EvictionWorker worker(*hot_, hot::EvictionWorker::Config{.tick = 50ms});
+  worker.TickOnce();
+  EXPECT_LE(hot_->Stats()->used_bytes, hot_->Stats()->max_bytes);
+}
+
+TEST_F(HotConsumerTest, OverBudgetWriteSurfacesOomButStaysDurable) {
+  // A live steady-state write that cannot be admitted yields -OOM to the client
+  // (MapApplyError path) while the queue entry remains durable and the seq is
+  // acked/NotifyApplied — the consumer does not wedge (invariant 1/2).
+  hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
+  ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "small", .value = "v"}}, 0)
+                  .has_value());
+  const uint64_t small_entry = probe.Stats()->used_bytes;
+
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      // Holds a handful of small entries, but a single 1500-char value is far
+      // larger than the whole budget — so "big" can never be admitted.
+      .max_memory_bytes = small_entry * 4,
+      .shard_count = 1,
+  });
+
+  StartConsumer();
+  // Large enough to dwarf the budget but within the WAL segment size.
+  auto fut = AppendWithRpc({"SET", "big", std::string(1500, 'x')});
+  auto reply = fut.get();
+  // The -OOM reply itself proves the entry was durably queued and applied (the
+  // consumer read it from the WAL and produced an apply result); the write is
+  // not lost — it stays in the queue/cold (invariant 2).
+  ASSERT_TRUE(reply.IsError());
+  EXPECT_EQ(reply.ErrorPrefixOf(), core::ErrorPrefix::kOom);
+
+  // The seq still settled (no wedge); a follow-up write is fulfilled normally.
+  auto ok = AppendWithRpc({"SET", "small", "v"});
+  EXPECT_FALSE(ok.get().IsError());
+  EXPECT_EQ(consumer_->PendingConditionalCount(), 0U);
 }
 
 }  // namespace

@@ -51,7 +51,9 @@ class RocksdbStore : public core::ColdStore {
 
   core::Result<core::RespValue> Exec(
       const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
-  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops) override;
+  core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
+                                core::SequenceId highest_wal_seq) override;
+  core::Result<void> Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq) override;
   core::Result<void> Wipe(core::ShardId shard) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;

@@ -7,14 +7,19 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 #include "abyss/platform/fs.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
+#include "binary_io.h"
+#include "crc32c.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -278,6 +283,96 @@ TEST_F(SegmentTest, TornTail_CrcMismatch) {
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->entries.size(), 1U);
   ExpectWriteArgs(read->entries[0], {"SET", "a", "1"});
+}
+
+// Decision 6: a CRC-VALID frame whose body cannot be structurally decoded is
+// genuine corruption of durably-acked data. Recovery (Segment::Open) must
+// FAIL-STOP with kCorruption, never silently truncate-and-continue (which would
+// discard acked data, breaking invariants 1/2). Contrast the TornTail_* tests,
+// which DO truncate a CRC-invalid/incomplete tail.
+TEST_F(SegmentTest, CrcValidStructuralCorruptionHaltsRecovery) {
+  const auto path = SegPath();
+  size_t good_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+    good_offset = seg->write_offset();
+  }
+
+  // Hand-craft a frame whose body has an unknown entry type (0xFF) but whose
+  // CRC matches the body — so it passes the CRC check yet fails the structural
+  // decode. This is the exact "valid CRC, invalid structure" case.
+  std::vector<std::byte> body;
+  binary::WriteU8(body, 0xFF);  // unknown entry type
+  binary::WriteU64LE(body, 1);  // seq
+  binary::WriteI64LE(body, 0);  // appended_us
+  binary::WriteU32LE(body, 0);  // (read as arg_count for a Write; unreachable)
+  std::vector<std::byte> frame;
+  binary::WriteU32LE(frame, static_cast<uint32_t>(body.size()));
+  frame.insert(frame.end(), body.begin(), body.end());
+  binary::WriteU32LE(frame, Crc32c(std::span<const std::byte>(body)));
+
+  {
+    auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+    ASSERT_TRUE(f.has_value());
+    ASSERT_TRUE(pfs::Pwrite(*f, frame.data(), frame.size(), good_offset).has_value());
+  }
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_FALSE(seg.has_value());
+  EXPECT_EQ(seg.error().code(), core::ErrorCode::kCorruption);
+}
+
+// QUEUE-6 / RESP-1 end-to-end: a CRC-valid Resolved frame whose return_value is
+// RESP-unparseable halts recovery AND bumps abyss_wal_decode_corruption_total,
+// making the corruption observable (never a silent nil or a crash).
+TEST_F(SegmentTest, CorruptResolvedReturnValueBumpsCorruptionCounter) {
+  metrics::testing::Reset();
+  const auto before =
+      metrics::testing::GetCounterValue(metrics::names::kWalDecodeCorruptionTotal).value_or(0.0);
+
+  const auto path = SegPath();
+  size_t good_offset = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+    good_offset = seg->write_offset();
+  }
+
+  // Resolved frame whose return_value bytes ("+unterminated") cannot be framed.
+  const std::string bad_rv = "+unterminated";
+  std::vector<std::byte> body;
+  binary::WriteU8(body, static_cast<uint8_t>(WalEntryType::kResolved));
+  binary::WriteU64LE(body, 1);  // seq
+  binary::WriteI64LE(body, 0);  // appended_us
+  binary::WriteU64LE(body, 0);  // ref
+  binary::WriteU8(body, 0);     // decision
+  binary::WriteU32LE(body, 0);  // materialised_ops count
+  binary::WriteU32LE(body, static_cast<uint32_t>(bad_rv.size()));
+  body.insert(body.end(), reinterpret_cast<const std::byte*>(bad_rv.data()),
+              reinterpret_cast<const std::byte*>(bad_rv.data()) + bad_rv.size());
+  binary::WriteU64LE(body, 1);  // batch_last_seq
+
+  std::vector<std::byte> frame;
+  binary::WriteU32LE(frame, static_cast<uint32_t>(body.size()));
+  frame.insert(frame.end(), body.begin(), body.end());
+  binary::WriteU32LE(frame, Crc32c(std::span<const std::byte>(body)));
+
+  {
+    auto f = pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite});
+    ASSERT_TRUE(f.has_value());
+    ASSERT_TRUE(pfs::Pwrite(*f, frame.data(), frame.size(), good_offset).has_value());
+  }
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_FALSE(seg.has_value());
+  EXPECT_EQ(seg.error().code(), core::ErrorCode::kCorruption);
+
+  const auto after =
+      metrics::testing::GetCounterValue(metrics::names::kWalDecodeCorruptionTotal).value_or(0.0);
+  EXPECT_EQ(after, before + 1.0);
 }
 
 TEST_F(SegmentTest, AppendAfterRecovery) {

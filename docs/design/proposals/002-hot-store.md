@@ -23,7 +23,7 @@ Phase 1 built-in hot store supports: strings, sets, sorted sets, hashes. Lists, 
 
 The Phase 1 hot store is a concurrent hash map with sharded locks.
 
-**Lock striping:** The keyspace is divided into N lock shards (fixed at deployment). Each key hashes (xxHash) to a shard. I/O threads acquire a shared lock on the relevant shard for reads. The hot consumer acquires an exclusive lock for writes.
+**Lock striping:** The keyspace is divided into N lock shards (fixed at deployment). Each key maps to a shard through its CRC16 slot ([ADP-014](014-slot-routing-and-topology.md)). I/O threads acquire a shared lock on the relevant shard for reads. The hot consumer acquires an exclusive lock for writes.
 
 The number of lock shards should equal the planned horizontal shard count. Phase 1's internal sharding boundaries then match Phase 2's pod boundaries, easing migration.
 

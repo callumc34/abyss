@@ -301,5 +301,173 @@ TEST_F(TwoTtlIntegrationTest, S3_SetEvictsThenTtlExpires) {
       << "TTL must remove the set entirely";
 }
 
+// --- COLDC-2: EXPIRE/PERSIST-only window reaches cold ----------------------
+// A TTL set/cleared in a window AFTER the value has already flushed to cold was
+// silently dropped pre-fix (Emit produced nothing). The standalone trailing TTL
+// op must now reach cold's meta record.
+
+TEST_F(TwoTtlIntegrationTest, COLDC2_StandaloneExpireOnAlreadyColdSetReachesCold) {
+  // Window 1: build the set and flush it to cold with NO TTL.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c2set", "a", "b"})).has_value());
+  DrainAndFlushCold("c2set");
+  EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2set"}))->AsInteger(), 2);
+
+  // Window 2 (a fresh compaction window): EXPIRE only — no member-bearing op.
+  const auto ttl_ms = WallMs() + 3000;
+  ASSERT_TRUE(
+      harness_.Engine()
+          .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2set", std::to_string(ttl_ms)}))
+          .has_value());
+  DrainAndFlushCold("c2set");
+
+  // The standalone Expire must have rewritten cold's meta TTL: past the TTL the
+  // cold lazy-expiry strips the set entirely.
+  harness_.Clock().Advance(4s);
+  auto card = harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2set"}));
+  ASSERT_TRUE(card.has_value());
+  EXPECT_EQ(card->AsInteger(), 0)
+      << "standalone EXPIRE window was dropped; cold never saw the TTL (COLDC-2)";
+}
+
+TEST_F(TwoTtlIntegrationTest, COLDC2_StandalonePersistOnAlreadyColdSetClearsTtl) {
+  // Window 1: build a set WITH a TTL and flush to cold.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c2p", "a", "b"})).has_value());
+  const auto ttl_ms = WallMs() + 3000;
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2p", std::to_string(ttl_ms)}))
+                  .has_value());
+  DrainAndFlushCold("c2p");
+
+  // Window 2: PERSIST only — clears the TTL on the already-cold set.
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("PERSIST", MakeCmd({"PERSIST", "c2p"})).has_value());
+  DrainAndFlushCold("c2p");
+
+  // Past the original TTL the set must still be live — the PERSIST window
+  // reached cold and cleared the meta TTL flag.
+  harness_.Clock().Advance(4s);
+  auto card = harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2p"}));
+  ASSERT_TRUE(card.has_value());
+  EXPECT_EQ(card->AsInteger(), 2)
+      << "standalone PERSIST window was dropped; cold kept the stale TTL (COLDC-2)";
+}
+
+// --- COLDC-3: DEL/type-change before re-add wipes prior cold slices --------
+
+TEST_F(TwoTtlIntegrationTest, COLDC3_DelThenReaddDoesNotResurrectColdSetMembers) {
+  // Window 1: set {a,b,c} flushed to cold.
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "a", "b", "c"}))
+                  .has_value());
+  DrainAndFlushCold("c3set");
+  EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 3);
+
+  // Window 2: DEL then re-add a single different member. Emit prepends a Del so
+  // cold wipes a/b/c before the re-add lands.
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("DEL", MakeCmd({"DEL", "c3set"})).has_value());
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "x"})).has_value());
+  DrainAndFlushCold("c3set");
+
+  // Drive the key out of hot so SCARD/SISMEMBER resolve against cold.
+  (void)harness_.ShardedHot().Wipe();
+
+  EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 1)
+      << "DEL-then-readd resurrected stale cold members (COLDC-3)";
+  EXPECT_EQ(harness_.Engine()
+                .DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "c3set", "a"}))
+                ->AsInteger(),
+            0);
+  EXPECT_EQ(harness_.Engine()
+                .DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "c3set", "x"}))
+                ->AsInteger(),
+            1);
+}
+
+TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
+  // A within-window type change (HSET then SET before any flush) is the
+  // COLDC-3 case the leading-Del covers: Emit prepends a Del so cold never
+  // receives the stale hash slices in the first place.
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "c3t", "f1", "v1", "f2", "v2"}))
+                  .has_value());
+  // Same compaction window — no DrainAndFlushCold between the two writes.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c3t", "now-a-string"})).has_value());
+  DrainAndFlushCold("c3t");
+
+  (void)harness_.ShardedHot().Wipe();
+
+  auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}));
+  ASSERT_TRUE(getv.has_value());
+  EXPECT_EQ(getv->AsString(), "now-a-string");
+
+  // The prior hash fields must not survive the type change. The key is now a
+  // string, so HLEN is EITHER WRONGTYPE (an error Result, when a type-aware tier
+  // — the compaction buffer — resolves it) OR integer 0 (when the cold tier,
+  // which has no hash slice, resolves it). Which one wins depends on whether the
+  // buffer has drained to cold yet, so accept both. The ONLY failure is a
+  // positive field count, which would mean the stale hash slices survived.
+  auto hlen = harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c3t"}));
+  if (hlen.has_value()) {
+    EXPECT_TRUE(hlen->IsInteger() && hlen->AsInteger() == 0)
+        << "stale hash fields survived the type change";
+  } else {
+    EXPECT_EQ(hlen.error().code(), core::ErrorCode::kWrongType)
+        << "unexpected HLEN error: " << hlen.error().message();
+  }
+}
+
+// --- COLDC-6: cross-window implicit type change drops prior cold slices -----
+
+TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
+  // The COLDC-6 case the leading-Del does NOT cover: the type change spans two
+  // compaction windows. Window 1 flushes the hash to cold; window 2's
+  // CompactedState starts fresh and emits a SET with no leading Del — it has no
+  // in-window signal that cold already holds a hash for the key. The cold apply
+  // must drop the stale hash slices when it establishes the key as a string, or
+  // the hash resurrects on read.
+
+  // Window 1: hash flushed to cold on its own.
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "c6t", "f1", "v1", "f2", "v2"}))
+                  .has_value());
+  DrainAndFlushCold("c6t");
+  EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c6t"}))->AsInteger(), 2);
+
+  // Window 2 (separate flush): SET the same key to a string.
+  ASSERT_TRUE(
+      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c6t", "now-a-string"})).has_value());
+  DrainAndFlushCold("c6t");
+
+  // Drive the key out of hot so the reads resolve against the buffer/cold tiers.
+  (void)harness_.ShardedHot().Wipe();
+
+  auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c6t"}));
+  ASSERT_TRUE(getv.has_value());
+  EXPECT_EQ(getv->AsString(), "now-a-string");
+
+  // The prior hash fields must not survive the cross-window type change. The key
+  // is now a string, so HLEN is EITHER WRONGTYPE (a type-aware tier resolves it)
+  // OR integer 0 (a tier with no hash slice resolves it). A positive field count
+  // is the failure — it means the stale hash slices survived (the COLDC-6 bug).
+  auto hlen = harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c6t"}));
+  if (hlen.has_value()) {
+    EXPECT_TRUE(hlen->IsInteger() && hlen->AsInteger() == 0)
+        << "stale hash fields survived the cross-window type change (COLDC-6)";
+  } else {
+    EXPECT_EQ(hlen.error().code(), core::ErrorCode::kWrongType)
+        << "unexpected HLEN error: " << hlen.error().message();
+  }
+
+  auto hgetall = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "c6t"}));
+  if (hgetall.has_value()) {
+    EXPECT_TRUE(hgetall->IsArray() && hgetall->AsArray().empty())
+        << "HGETALL resurrected stale hash fields after cross-window type change (COLDC-6)";
+  } else {
+    EXPECT_EQ(hgetall.error().code(), core::ErrorCode::kWrongType);
+  }
+}
+
 }  // namespace
 }  // namespace abyss::engine

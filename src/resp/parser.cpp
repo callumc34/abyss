@@ -24,9 +24,6 @@ using core::Result;
 
 constexpr size_t kNpos = static_cast<size_t>(-1);
 
-// Depth cap for nested RESP arrays.
-constexpr int kMaxParseDepth = 1024;
-
 Error Incomplete(const char* what) { return {ErrorCode::kIncomplete, what}; }
 Error Malformed(std::string what) { return {ErrorCode::kInvalidArgument, std::move(what)}; }
 
@@ -79,7 +76,8 @@ std::optional<ErrorPrefix> LookupErrorPrefix(std::string_view text) {
 }
 
 // Forward declaration for array recursion.
-Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth);
+Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth,
+                             const ParserLimits& limits);
 
 Result<ParseResult> ParseSimpleString(std::span<const uint8_t> buf, size_t pos) {
   const size_t lf = FindLineEnd(buf, pos);
@@ -96,22 +94,17 @@ Result<ParseResult> ParseErrorValue(std::span<const uint8_t> buf, size_t pos) {
     return std::unexpected(Incomplete("incomplete error"));
   }
   const std::string_view body = BufSlice(buf, pos, lf - 1);
-  auto space = body.find(' ');
-  if (space == std::string_view::npos) {
-    return ParseResult{.value = RespValue::Error(ErrorPrefix::kErr, std::string(body)),
-                       .bytes_consumed = lf + 1};
+  const auto space = body.find(' ');
+  std::optional<ErrorPrefix> prefix;
+  if (space != std::string_view::npos) {
+    prefix = LookupErrorPrefix(body.substr(0, space));
   }
-  auto prefix_text = body.substr(0, space);
-  auto prefix = LookupErrorPrefix(prefix_text);
-  std::string message;
-  if (prefix.has_value()) {
-    message = std::string(body.substr(space + 1));
-  } else {
-    // Unknown prefix — preserve entire body under kErr so AsString() round-trips.
-    prefix = ErrorPrefix::kErr;
-    message = std::string(body);
+  if (!prefix.has_value()) {
+    // No enumerated prefix to re-derive the body from: keep it verbatim so
+    // re-serialising reproduces the received bytes exactly.
+    return ParseResult{.value = RespValue::RawError(std::string(body)), .bytes_consumed = lf + 1};
   }
-  return ParseResult{.value = RespValue::Error(*prefix, std::move(message)),
+  return ParseResult{.value = RespValue::Error(*prefix, std::string(body.substr(space + 1))),
                      .bytes_consumed = lf + 1};
 }
 
@@ -127,7 +120,8 @@ Result<ParseResult> ParseInteger(std::span<const uint8_t> buf, size_t pos) {
   return ParseResult{.value = RespValue::Integer(*value), .bytes_consumed = lf + 1};
 }
 
-Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos) {
+Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos,
+                                    const ParserLimits& limits) {
   const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete bulk string length"));
@@ -143,6 +137,10 @@ Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos) {
   if (*len == -1) {
     return ParseResult{.value = RespValue::Null(), .bytes_consumed = body_start};
   }
+  // Bound the declared length BEFORE allocating the payload.
+  if (std::cmp_greater(*len, limits.max_bulk_len)) {
+    return std::unexpected(Malformed("protocol error: bulk length exceeds limit"));
+  }
   const auto length = static_cast<size_t>(*len);
   if (body_start + length + 2 > buf.size()) {
     return std::unexpected(Incomplete("incomplete bulk string body"));
@@ -155,7 +153,8 @@ Result<ParseResult> ParseBulkString(std::span<const uint8_t> buf, size_t pos) {
                      .bytes_consumed = body_start + length + 2};
 }
 
-Result<ParseResult> ParseArray(std::span<const uint8_t> buf, size_t pos, int depth) {
+Result<ParseResult> ParseArray(std::span<const uint8_t> buf, size_t pos, int depth,
+                               const ParserLimits& limits) {
   const size_t lf = FindLineEnd(buf, pos);
   if (lf == kNpos) {
     return std::unexpected(Incomplete("incomplete array length"));
@@ -171,10 +170,14 @@ Result<ParseResult> ParseArray(std::span<const uint8_t> buf, size_t pos, int dep
   if (*count == -1) {
     return ParseResult{.value = RespValue::Null(), .bytes_consumed = next};
   }
+  // Bound the declared element count BEFORE reserving against it.
+  if (std::cmp_greater(*count, limits.max_array_elements)) {
+    return std::unexpected(Malformed("protocol error: array element count exceeds limit"));
+  }
   std::vector<RespValue> elements;
   elements.reserve(static_cast<size_t>(*count));
   for (int64_t i = 0; i < *count; ++i) {
-    auto element = ParseOne(buf, next, depth + 1);
+    auto element = ParseOne(buf, next, depth + 1, limits);
     if (!element.has_value()) {
       return std::unexpected(element.error());
     }
@@ -184,8 +187,9 @@ Result<ParseResult> ParseArray(std::span<const uint8_t> buf, size_t pos, int dep
   return ParseResult{.value = RespValue::Array(std::move(elements)), .bytes_consumed = next};
 }
 
-Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth) {
-  if (depth > kMaxParseDepth) {
+Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth,
+                             const ParserLimits& limits) {
+  if (depth > limits.max_depth) {
     return std::unexpected(Malformed("protocol error: nesting too deep"));
   }
   if (pos >= buf.size()) {
@@ -201,9 +205,9 @@ Result<ParseResult> ParseOne(std::span<const uint8_t> buf, size_t pos, int depth
     case ':':
       return ParseInteger(buf, after_type);
     case '$':
-      return ParseBulkString(buf, after_type);
+      return ParseBulkString(buf, after_type, limits);
     case '*':
-      return ParseArray(buf, after_type, depth);
+      return ParseArray(buf, after_type, depth, limits);
     default:
       return std::unexpected(Malformed("protocol error: unexpected type byte"));
   }
@@ -224,8 +228,14 @@ int HexValue(uint8_t c) {
   return -1;
 }
 
-Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::string* out_token,
-                               size_t* new_pos) {
+// When `line_complete`, the span is a fully-received line: a quote that runs
+// off the end can never be satisfied, so exhaustion is a protocol error
+// (Malformed), not a request for more bytes (Incomplete).
+Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, bool line_complete,
+                               std::string* out_token, size_t* new_pos) {
+  auto exhausted = [line_complete](const char* what) -> Error {
+    return line_complete ? Malformed("unbalanced quotes in request") : Incomplete(what);
+  };
   if (pos >= buf.size() || buf[pos] != '"') {
     return std::unexpected(Malformed("inline: expected double quote"));
   }
@@ -240,7 +250,7 @@ Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
     }
     if (c == '\\') {
       if (i + 1 >= buf.size()) {
-        return std::unexpected(Incomplete("inline: trailing backslash"));
+        return std::unexpected(exhausted("inline: trailing backslash"));
       }
       const uint8_t esc = buf[i + 1];
       switch (esc) {
@@ -274,7 +284,7 @@ Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
           break;
         case 'x': {
           if (i + 3 >= buf.size()) {
-            return std::unexpected(Incomplete("inline: truncated hex escape"));
+            return std::unexpected(exhausted("inline: truncated hex escape"));
           }
           const int hi = HexValue(buf[i + 2]);
           const int lo = HexValue(buf[i + 3]);
@@ -295,11 +305,11 @@ Result<void> ParseDoubleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
       ++i;
     }
   }
-  return std::unexpected(Incomplete("inline: unterminated double quote"));
+  return std::unexpected(exhausted("inline: unterminated double quote"));
 }
 
-Result<void> ParseSingleQuoted(std::span<const uint8_t> buf, size_t pos, std::string* out_token,
-                               size_t* new_pos) {
+Result<void> ParseSingleQuoted(std::span<const uint8_t> buf, size_t pos, bool line_complete,
+                               std::string* out_token, size_t* new_pos) {
   if (pos >= buf.size() || buf[pos] != '\'') {
     return std::unexpected(Malformed("inline: expected single quote"));
   }
@@ -320,7 +330,8 @@ Result<void> ParseSingleQuoted(std::span<const uint8_t> buf, size_t pos, std::st
       ++i;
     }
   }
-  return std::unexpected(Incomplete("inline: unterminated single quote"));
+  return std::unexpected(line_complete ? Malformed("unbalanced quotes in request")
+                                       : Incomplete("inline: unterminated single quote"));
 }
 
 Result<RespCommand> ParseInlineCommand(std::span<const uint8_t> buf, size_t* bytes_consumed) {
@@ -352,13 +363,18 @@ Result<RespCommand> ParseInlineCommand(std::span<const uint8_t> buf, size_t* byt
     std::string token;
     size_t after = 0;
     if (buf[i] == '"') {
-      auto r = ParseDoubleQuoted(buf.subspan(0, content_end), i, &token, &after);
+      // The line terminator is already located, so the quoted token is scanned
+      // over a fully-received span: an unbalanced quote is Malformed, not
+      // Incomplete (otherwise the connection would stall forever).
+      auto r =
+          ParseDoubleQuoted(buf.subspan(0, content_end), i, /*line_complete=*/true, &token, &after);
       if (!r.has_value()) {
         return std::unexpected(r.error());
       }
       i = after;
     } else if (buf[i] == '\'') {
-      auto r = ParseSingleQuoted(buf.subspan(0, content_end), i, &token, &after);
+      auto r =
+          ParseSingleQuoted(buf.subspan(0, content_end), i, /*line_complete=*/true, &token, &after);
       if (!r.has_value()) {
         return std::unexpected(r.error());
       }
@@ -384,14 +400,15 @@ bool IsRespTypeByte(uint8_t b) { return b == '+' || b == '-' || b == ':' || b ==
 
 }  // namespace
 
-Result<ParseResult> Parser::Parse(std::span<const uint8_t> buffer) {
+Result<ParseResult> Parser::Parse(std::span<const uint8_t> buffer, const ParserLimits& limits) {
   if (buffer.empty()) {
     return std::unexpected(Incomplete("empty buffer"));
   }
-  return ParseOne(buffer, 0, 0);
+  return ParseOne(buffer, 0, 0, limits);
 }
 
-Result<ParseCommandResult> Parser::ParseCommand(std::span<const uint8_t> buffer) {
+Result<ParseCommandResult> Parser::ParseCommand(std::span<const uint8_t> buffer,
+                                                const ParserLimits& limits) {
   if (buffer.empty()) {
     return std::unexpected(Incomplete("empty buffer"));
   }
@@ -414,7 +431,7 @@ Result<ParseCommandResult> Parser::ParseCommand(std::span<const uint8_t> buffer)
   }
 
   // RESP path: must be an array of bulk strings.
-  auto parsed = Parse(buffer);
+  auto parsed = Parse(buffer, limits);
   if (!parsed.has_value()) {
     return std::unexpected(parsed.error());
   }

@@ -80,7 +80,7 @@ RespValue HandleInfoSub(const core::RespCommand& cmd, const CommandRegistry& reg
   for (size_t i = 2; i < cmd.ArgCount(); ++i) {
     const auto* spec = registry.Find(cmd.args[i]);
     if (spec == nullptr) {
-      out.push_back(RespValue::Null());
+      out.push_back(RespValue::NullArray());
     } else {
       out.push_back(SpecAsInfo(*spec));
     }

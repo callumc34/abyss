@@ -118,7 +118,7 @@ void BM_RecoveryColdHot(benchmark::State& state) {
         .shard_count = kShardCount,
     });
     core::ConsumerRpc rpc;
-    core::ApplyNotifier notifier;
+    core::AppliedSeqNotifier notifier(core::AppliedSeqNotifierConfig{.shard_count = kShardCount});
     core::EvictionPolicy eviction_policy{86400s};
 
     auto cold_pool = std::make_unique<consumer::ColdConsumerPool>(

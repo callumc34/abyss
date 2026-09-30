@@ -32,10 +32,10 @@ void AppendInt(std::vector<uint8_t>& out, int64_t value) {
 void SerializeInto(const RespValue& value, std::vector<uint8_t>& out) {
   switch (value.type()) {
     case RespValue::Type::kNull:
-      // Redis uses null-bulk (`$-1\r\n`) as the canonical nil wire form in
-      // RESP2. Null arrays (`*-1\r\n`) exist but are rarer; we emit null-bulk
-      // since RespValue::Null does not currently distinguish the two variants.
       AppendStr(out, "$-1\r\n");
+      return;
+    case RespValue::Type::kNullArray:
+      AppendStr(out, "*-1\r\n");
       return;
     case RespValue::Type::kSimpleString:
       out.push_back('+');

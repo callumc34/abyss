@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
 #include "abyss/platform/fs.h"
 #include "abyss/queue/wal_entry.h"
 #include "binary_io.h"
@@ -80,6 +82,15 @@ core::Result<Segment> Segment::Create(const std::string& path, SegmentHeader hea
     return std::unexpected(wr.error());
   }
 
+  // Persist the header bytes before the segment becomes appendable. Combined
+  // with the caller's directory fsync, the header + name are durable before
+  // the first entry's DurabilityFuture can resolve (QUEUE-1/NET-6).
+  if (auto sync = pfs::Fsync(*file); !sync.has_value()) {
+    file->Close();
+    (void)pfs::Unlink(std::filesystem::path(path));  // NOLINT(bugprone-unused-return-value)
+    return std::unexpected(sync.error());
+  }
+
   return Segment(path, header, max_size, std::move(*file), kSegmentHeaderSize, header.base_seq, 0);
 }
 
@@ -122,8 +133,28 @@ core::Result<Segment> Segment::Open(const std::string& path, size_t max_size) {
     size_t pending_entry_count = 0;
 
     while (!view.empty()) {
-      auto decoded = DecodeWalEntry(view, header->format_minor);
-      if (!decoded.has_value()) break;
+      WalDecodeFailure failure = WalDecodeFailure::kNone;
+      auto decoded = DecodeWalEntry(view, header->format_minor, failure);
+      if (!decoded.has_value()) {
+        if (failure == WalDecodeFailure::kCorruptFrame) {
+          // A CRC-valid frame whose structure could not be decoded is genuine
+          // corruption of durably-acked data. Fail-stop: truncating here would
+          // silently discard acked data (invariants 1/2). Decision 6.
+          metrics::Registry::Instance()
+              .Counter(metrics::names::kWalDecodeCorruptionTotal)
+              .Increment();
+          ABYSS_LOG_CRITICAL("WAL decode corruption", {"path", std::string_view{path}},
+                             {"shard", static_cast<int64_t>(header->shard_id)},
+                             {"base_seq", static_cast<uint64_t>(header->base_seq)},
+                             {"offset", static_cast<uint64_t>(kSegmentHeaderSize + cursor_offset)},
+                             {"err", std::string_view{decoded.error().message()}});
+          return std::unexpected(
+              core::Error{core::ErrorCode::kCorruption,
+                          "WAL decode corruption in " + path + ": " + decoded.error().message()});
+        }
+        // Torn tail (incomplete / failed CRC): truncate as today.
+        break;
+      }
       cursor_offset += decoded->bytes_consumed;
       pending_next_seq = decoded->entry.seq + 1;
       ++pending_entry_count;
@@ -199,7 +230,7 @@ core::Result<void> Segment::Fsync() const {
   if (!file_.valid()) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync on closed segment"});
   }
-  return pfs::Fsync(file_);
+  return pfs::Fsync(file_, pfs::SyncMode::kDurable);
 }
 
 core::Result<void> Segment::Seal() {
@@ -209,7 +240,9 @@ core::Result<void> Segment::Seal() {
   }
   const size_t offset = write_offset_.load(std::memory_order_relaxed);
   if (auto r = pfs::Ftruncate(file_, offset); !r.has_value()) return std::unexpected(r.error());
-  if (auto r = pfs::Fsync(file_); !r.has_value()) return std::unexpected(r.error());
+  if (auto r = pfs::Fsync(file_, pfs::SyncMode::kDurable); !r.has_value()) {
+    return std::unexpected(r.error());
+  }
   sealed_ = true;
   return {};
 }

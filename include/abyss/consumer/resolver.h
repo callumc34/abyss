@@ -32,6 +32,14 @@ class Resolver {
     std::chrono::milliseconds cold_lookup_timeout{100};
     uint32_t stripe_count = 64;
     std::chrono::milliseconds hot_apply_wait{1000};
+    // Bound on the wait for a self-emitted Resolved's WAL fsync before the
+    // client conditional ack is fulfilled. Mirrors the write path's
+    // write_timeout so the conditional fulfil path has the same durability
+    // latency budget as DispatchConditional. On timeout the client gets an
+    // error (never the success value); the Resolved stays durable in the WAL
+    // and applies on catch-up. The hot-apply wait that follows uses
+    // hot_apply_wait.
+    std::chrono::milliseconds durable_wait_timeout{5000};
     ExistenceCache::Config cache;
   };
 
@@ -69,6 +77,7 @@ class Resolver {
     uint64_t cold_timeouts = 0;
     uint64_t cold_errors = 0;
     uint64_t apply_wait_timeouts = 0;
+    uint64_t durable_wait_timeouts = 0;
     uint64_t append_failures = 0;
     uint64_t parse_failures = 0;
     uint64_t replayed_resolveds_emitted = 0;
@@ -76,6 +85,7 @@ class Resolver {
     uint64_t flush_skip_resolveds_emitted = 0;
     core::SequenceId latest_drained_seq = 0;
     core::SequenceId last_ack_seq = 0;
+    core::SequenceId resolver_durable_floor = 0;
     core::SequenceId latest_flush_seq = 0;
     size_t cache_entries = 0;
     size_t cache_bytes = 0;
@@ -92,9 +102,22 @@ class Resolver {
   // for replay determinism (ADP-011 §Decision determinism).
   core::entry::Resolved Decide(const core::QueueEntry& entry, const core::entry::Conditional& cond);
 
-  void UpdateCacheFromResolved(core::SequenceId seq, const core::entry::Resolved& resolved);
-  void UpdateCacheFromWrite(core::SequenceId seq, const core::RespCommand& cmd);
-  bool WaitForHotApply(core::SequenceId seq);
+  void UpdateCacheFromResolved(core::SequenceId seq, core::WallTime appended_at,
+                               const core::entry::Resolved& resolved);
+  // The single deterministic cache-apply path (A3). Parses `cmd` through the
+  // canonical core::ops::ParseWriteOp with wall_now = WallMs(appended_at) — the
+  // same clock the hot store uses — so the existence cache is a pure function
+  // of (entry bytes, appended_at) and replay reproduces every decision
+  // bit-for-bit. Never reads WallClock::now().
+  void ApplyToCache(core::SequenceId seq, core::WallTime appended_at, const core::RespCommand& cmd);
+  bool WaitForHotApply(core::SequenceId seq, std::chrono::milliseconds timeout);
+  // Blocks until the self-emitted Resolved at `resolved_seq` is fsynced on this
+  // shard, or `timeout` elapses. Returns true iff durable. The single idiom
+  // shared by the steady-state Fulfill path and the recovery barrier: a
+  // Resolver-emitted Resolved is treated as durable ONLY after its WAL fsync
+  // confirms, never on publish. On timeout/error increments
+  // durable_wait_timeouts_.
+  bool AwaitResolvedDurable(core::SequenceId resolved_seq, std::chrono::milliseconds timeout);
 
   // Sorted ascending; dedupes colliding stripes for deadlock-free multi-key.
   std::vector<uint32_t> StripeIndicesFor(const std::vector<std::string_view>& keys) const;
@@ -115,6 +138,15 @@ class Resolver {
 
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   std::atomic<core::SequenceId> last_ack_seq_{0};
+  // High-watermark (Kafka HW vs LEO): the highest Conditional seq X such that
+  // every Resolved this resolver emitted for Conditionals <= X is confirmed
+  // fsynced. The persisted retention Ack target is clamped to this so a
+  // Conditional is never acked past until its emitted Resolved is durable
+  // (XDUR-2). `highest_emitted_resolved_seq_` is the durability target the
+  // floor advances behind: the max Resolved seq emitted for any drained
+  // Conditional.
+  std::atomic<core::SequenceId> resolver_durable_floor_{0};
+  std::atomic<core::SequenceId> highest_emitted_resolved_seq_{0};
   // Highest seq of an observed `entry::Flush`. During replay, gates the
   // cache-only lookup path for post-Flush danglings (cold replay runs after
   // resolver replay, so cold is still pre-Flush).
@@ -130,6 +162,7 @@ class Resolver {
   std::atomic<uint64_t> cold_timeouts_{0};
   std::atomic<uint64_t> cold_errors_{0};
   std::atomic<uint64_t> apply_wait_timeouts_{0};
+  std::atomic<uint64_t> durable_wait_timeouts_{0};
   std::atomic<uint64_t> append_failures_{0};
   std::atomic<uint64_t> parse_failures_{0};
   std::atomic<uint64_t> replayed_resolveds_emitted_{0};

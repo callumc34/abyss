@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <future>
 #include <thread>
@@ -220,6 +221,35 @@ TEST(ConsumerRpcTest, MakeFlushRpcIdDisjointFromMakeRpcId) {
       EXPECT_NE(cold_flush_id, resolver_flush_id);
     }
   }
+}
+
+// ENGINE-4 / XCONC-6: for every valid shard (< kRpcMaxShardCount = 1<<15) the
+// write RpcId must keep bit 63 clear so the write space [0,2^63) stays disjoint
+// from the flush-tag space [2^63,2^64), and a write id can never alias a flush
+// id. The static_assert in the header covers the compile-time bound.
+TEST(ConsumerRpcTest, WriteRpcIdNeverSetsFlushTagBitForAllValidShards) {
+  static_assert(kRpcMaxShardCount == (1U << 15));
+  const std::array<ShardId, 5> shards{0, 1, 2, kRpcMaxShardCount - 2, kRpcMaxShardCount - 1};
+  const std::array<SequenceId, 4> seqs{SequenceId{0}, SequenceId{1}, SequenceId{1} << 40,
+                                       (SequenceId{1} << 48) - 1};
+  for (ShardId shard : shards) {
+    for (SequenceId seq : seqs) {
+      const auto write_id = MakeRpcId(shard, seq);
+      EXPECT_EQ(write_id & kFlushRpcTagBit, 0U) << "shard=" << shard << " seq=" << seq;
+      // No write id equals any flush id for the same/other shard+seq.
+      for (ConsumerId consumer : {kHotConsumer, kColdConsumer, kResolverConsumer}) {
+        EXPECT_NE(write_id, MakeFlushRpcId(consumer, shard, seq));
+      }
+    }
+  }
+}
+
+// The shard field occupies bits [48,62]; the max valid shard's high bit must
+// land at bit 62, never bit 63.
+TEST(ConsumerRpcTest, MaxValidShardKeepsBit63Clear) {
+  const auto id = MakeRpcId(kRpcMaxShardCount - 1, (SequenceId{1} << 48) - 1);
+  EXPECT_EQ(id & (RpcId{1} << 63), 0U);
+  EXPECT_NE(id & (RpcId{1} << 62), 0U);
 }
 
 TEST(ConsumerRpcTest, MakeFlushRpcIdRoundTripsThroughRegistry) {

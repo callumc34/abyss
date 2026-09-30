@@ -115,6 +115,10 @@ std::string Render(const StatusSnapshot& s) {
     w.UInt(s.queue.total_entries);
     w.Key("total_bytes");
     w.UInt(s.queue.total_bytes);
+    w.Key("reaper_failures");
+    w.UInt(s.queue.reaper_failures);
+    w.Key("oldest_eligible_unreaped_age_ms");
+    w.UInt(s.queue.oldest_eligible_unreaped_age_ms);
     w.EndObject();
   }
 
@@ -137,6 +141,8 @@ std::string Render(const StatusSnapshot& s) {
     w.String(s.cold.backend);
     w.Key("key_count");
     w.UInt(s.cold.key_count);
+    w.Key("disk_bytes");
+    w.UInt(s.cold.disk_bytes);
     w.Key("buffer");
     {
       w.BeginObject();
@@ -144,6 +150,8 @@ std::string Render(const StatusSnapshot& s) {
       w.UInt(s.cold.buffer.entries);
       w.Key("bytes");
       w.UInt(s.cold.buffer.bytes);
+      w.Key("oldest_entry_age_ms");
+      w.UInt(s.cold.buffer.oldest_entry_age_ms);
       w.EndObject();
     }
     w.EndObject();
@@ -203,6 +211,8 @@ std::string Render(const StatusSnapshot& s) {
     w.BeginObject();
     w.Key("active");
     w.UInt(s.connections.active);
+    w.Key("read_buffer_high_water_bytes");
+    w.UInt(s.connections.read_buffer_high_water_bytes);
     w.EndObject();
   }
 

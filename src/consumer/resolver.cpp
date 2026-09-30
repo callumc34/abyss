@@ -31,6 +31,14 @@ std::string AsciiUpper(std::string_view s) {
   return out;
 }
 
+// Monotonic CAS-max advance: raises `target` to `value` iff `value` is larger.
+void AdvanceMaxSeq(std::atomic<core::SequenceId>& target, core::SequenceId value) {
+  auto cur = target.load(std::memory_order_relaxed);
+  while (value > cur && !target.compare_exchange_weak(cur, value, std::memory_order_release,
+                                                      std::memory_order_relaxed)) {
+  }
+}
+
 uint64_t WallMs(core::WallTime t) {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count());
@@ -152,6 +160,7 @@ Resolver::Snapshot Resolver::GetSnapshot() const {
   s.cold_timeouts = cold_timeouts_.load(std::memory_order_relaxed);
   s.cold_errors = cold_errors_.load(std::memory_order_relaxed);
   s.apply_wait_timeouts = apply_wait_timeouts_.load(std::memory_order_relaxed);
+  s.durable_wait_timeouts = durable_wait_timeouts_.load(std::memory_order_relaxed);
   s.append_failures = append_failures_.load(std::memory_order_relaxed);
   s.parse_failures = parse_failures_.load(std::memory_order_relaxed);
   s.replayed_resolveds_emitted = replayed_resolveds_emitted_.load(std::memory_order_relaxed);
@@ -159,6 +168,7 @@ Resolver::Snapshot Resolver::GetSnapshot() const {
   s.flush_skip_resolveds_emitted = flush_skip_resolveds_emitted_.load(std::memory_order_relaxed);
   s.latest_drained_seq = latest_drained_seq_.load(std::memory_order_relaxed);
   s.last_ack_seq = last_ack_seq_.load(std::memory_order_relaxed);
+  s.resolver_durable_floor = resolver_durable_floor_.load(std::memory_order_relaxed);
   s.latest_flush_seq = latest_flush_seq_.load(std::memory_order_relaxed);
   s.cache_entries = cache_.Size();
   s.cache_bytes = cache_.BytesEstimate();
@@ -386,51 +396,37 @@ struct SetParse {
   std::string error;
 };
 
-SetParse ParseSetArgs(const core::RespCommand& cmd, uint64_t now_ms) {
+// The predicate comes from the entry's flags, never from re-reading the command
+// text. Those are two representations of one decision, and re-deriving here is
+// how they drift: the frontend already extracted the flags, validated their
+// combinations, and recorded them in the entry (ADP-011 -- a Conditional is
+// "op + predicate"). Only the operand data -- key, value, absolute TTL -- is
+// read from the command, and that goes through the canonical parser rather than
+// a second hand-rolled one.
+SetParse ParseSetArgs(const core::RespCommand& cmd, core::PredicateFlags flags, uint64_t now_ms) {
   SetParse out;
-  if (cmd.args.size() < 3) {
-    out.error = "wrong number of arguments for 'SET'";
-    return out;
-  }
-  out.key = cmd.args[1];
-  out.value = cmd.args[2];
-  for (size_t i = 3; i < cmd.args.size(); ++i) {
-    const auto opt = AsciiUpper(cmd.args[i]);
-    if (opt == "NX") {
-      out.nx = true;
-    } else if (opt == "XX") {
-      out.xx = true;
-    } else if (opt == "GET") {
-      out.get = true;
-    } else if (opt == "KEEPTTL") {
-      out.keep_ttl = true;
-    } else if (opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") {
-      if (i + 1 >= cmd.args.size()) {
-        out.error = "syntax error after '" + opt + "'";
-        return out;
-      }
-      uint64_t v = 0;
-      if (!ParseUint64(cmd.args[++i], v)) {
-        out.error = "value is not an integer";
-        return out;
-      }
-      if (opt == "EX")
-        out.abs_ttl_ms = now_ms + (v * 1000);
-      else if (opt == "PX")
-        out.abs_ttl_ms = now_ms + v;
-      else if (opt == "EXAT")
-        out.abs_ttl_ms = v * 1000;
-      else
-        out.abs_ttl_ms = v;
-    } else {
-      out.error = "syntax error: unknown SET option '" + opt + "'";
-      return out;
-    }
-  }
+  out.nx = core::HasFlag(flags, core::PredicateFlags::kNx);
+  out.xx = core::HasFlag(flags, core::PredicateFlags::kXx);
+  out.get = core::HasFlag(flags, core::PredicateFlags::kGet);
+  out.keep_ttl = core::HasFlag(flags, core::PredicateFlags::kKeepTtl);
+
   if (out.nx && out.xx) {
     out.error = "syntax error — NX and XX are mutually exclusive";
     return out;
   }
+  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, now_ms);
+  if (!op.has_value()) {
+    out.error = std::string{op.error().message()};
+    return out;
+  }
+  const auto* set = std::get_if<core::ops::StringSet>(&*op);
+  if (set == nullptr) {
+    out.error = "internal: SET did not parse to a string-set op";
+    return out;
+  }
+  out.key = set->key;
+  out.value = set->value;
+  out.abs_ttl_ms = set->abs_ttl_ms;
   out.valid = true;
   return out;
 }
@@ -475,7 +471,7 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
                        .get = false,
                        .valid = cmd.args.size() == 3,
                        .error = cmd.args.size() != 3 ? "wrong number of arguments" : std::string{}}
-            : ParseSetArgs(cmd, now_ms);
+            : ParseSetArgs(cmd, cond.flags, now_ms);
     if (!parsed.valid) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr, parsed.error));
@@ -554,26 +550,17 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
                                                   "wrong number of arguments for 'ZADD'"));
     }
-    bool nx = false;
-    bool xx = false;
-    bool gt = false;
-    bool lt = false;
-    bool ch = false;
+    // Predicate from the entry, not from re-reading the tokens; see ParseSetArgs.
+    const bool nx = core::HasFlag(cond.flags, core::PredicateFlags::kNx);
+    const bool xx = core::HasFlag(cond.flags, core::PredicateFlags::kXx);
+    const bool gt = core::HasFlag(cond.flags, core::PredicateFlags::kZAddGt);
+    const bool lt = core::HasFlag(cond.flags, core::PredicateFlags::kZAddLt);
+    const bool ch = core::HasFlag(cond.flags, core::PredicateFlags::kZAddCh);
+    // The tokens are still skipped to find where the score-member pairs start.
     size_t i = 2;
     for (; i < cmd.args.size(); ++i) {
       const auto opt = AsciiUpper(cmd.args[i]);
-      if (opt == "NX")
-        nx = true;
-      else if (opt == "XX")
-        xx = true;
-      else if (opt == "GT")
-        gt = true;
-      else if (opt == "LT")
-        lt = true;
-      else if (opt == "CH")
-        ch = true;
-      else
-        break;
+      if (opt != "NX" && opt != "XX" && opt != "GT" && opt != "LT" && opt != "CH") break;
     }
     if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -652,26 +639,11 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     else
       requested_abs_ttl = ttl_arg;
 
-    bool nx = false;
-    bool xx = false;
-    bool gt = false;
-    bool lt = false;
-    for (size_t j = 3; j < cmd.args.size(); ++j) {
-      const auto opt = AsciiUpper(cmd.args[j]);
-      if (opt == "NX") {
-        nx = true;
-      } else if (opt == "XX") {
-        xx = true;
-      } else if (opt == "GT") {
-        gt = true;
-      } else if (opt == "LT") {
-        lt = true;
-      } else {
-        parse_failures_.fetch_add(1, std::memory_order_relaxed);
-        return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                    "syntax error: unknown EXPIRE option"));
-      }
-    }
+    // Predicate from the entry, not from re-reading the tokens; see ParseSetArgs.
+    const bool nx = core::HasFlag(cond.flags, core::PredicateFlags::kNx);
+    const bool xx = core::HasFlag(cond.flags, core::PredicateFlags::kXx);
+    const bool gt = core::HasFlag(cond.flags, core::PredicateFlags::kExpireGt);
+    const bool lt = core::HasFlag(cond.flags, core::PredicateFlags::kExpireLt);
     if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
       return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
@@ -834,10 +806,9 @@ void Resolver::HandleFlush(const core::QueueEntry& entry) {
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
   flushes_observed_.fetch_add(1, std::memory_order_relaxed);
 
-  const core::RpcId rpc_id =
-      core::MakeFlushRpcId(core::kResolverConsumer, config_.shard, entry.seq);
-  (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
-  apply_notifier_.NotifyApplied(rpc_id);
+  (void)rpc_.Fulfill(core::MakeFlushRpcId(core::kResolverConsumer, config_.shard, entry.seq),
+                     core::RespValue::SimpleString("OK"));
+  apply_notifier_.NotifyApplied(config_.shard, entry.seq);
 }
 
 void Resolver::ProcessEntry(const core::QueueEntry& entry) {
@@ -845,7 +816,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
       [this, &entry](const auto& payload) {
         using T = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<T, core::entry::Write>) {
-          UpdateCacheFromWrite(entry.seq, payload.cmd);
+          ApplyToCache(entry.seq, entry.appended_at, payload.cmd);
         } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
           HandleFlush(entry);
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
@@ -868,46 +839,86 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
               keys.emplace_back(payload.cmd.args[1]);
             }
           }
-          auto stripe_idxs = StripeIndicesFor(keys);
-          std::vector<std::unique_lock<std::mutex>> locks;
-          locks.reserve(stripe_idxs.size());
-          for (auto idx : stripe_idxs) locks.emplace_back(stripes_[idx]);
-
-          auto resolved = Decide(entry, payload);
-
-          core::QueueEntry out{
-              .seq = 0,
-              .appended_at = core::WallClock::now(),
-              .payload = resolved,
-          };
-          auto append = queue_.Append(config_.shard, std::move(out));
           const core::RpcId client_rpc_id = core::MakeRpcId(config_.shard, entry.seq);
-          if (!append.has_value()) {
-            append_failures_.fetch_add(1, std::memory_order_relaxed);
-            ABYSS_LOG_ERROR("resolver append failed",
-                            {"shard", static_cast<int64_t>(config_.shard)},
-                            {"seq", static_cast<uint64_t>(entry.seq)},
-                            {"err", std::string_view{append.error().message()}});
-            (void)rpc_.Fulfill(client_rpc_id,
-                               core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                      "resolver could not append decision"));
+          core::entry::Resolved resolved;
+          core::SequenceId resolved_seq = 0;
+
+          // The stripe locks serialise per-key Decide+Append+cache-update in
+          // queue order (ADP-011 inv 4). They are released here, before the
+          // latency-bound hot-apply wait and the RPC fulfilment, so a sibling
+          // key sharing a stripe is never blocked behind another op's wait.
+          {
+            auto stripe_idxs = StripeIndicesFor(keys);
+            std::vector<std::unique_lock<std::mutex>> locks;
+            locks.reserve(stripe_idxs.size());
+            for (auto idx : stripe_idxs) locks.emplace_back(stripes_[idx]);
+
+            resolved = Decide(entry, payload);
+
+            core::QueueEntry out{
+                .seq = 0,
+                .appended_at = core::WallClock::now(),
+                .payload = resolved,
+            };
+            auto append = queue_.Append(config_.shard, std::move(out));
+            if (!append.has_value()) {
+              append_failures_.fetch_add(1, std::memory_order_relaxed);
+              ABYSS_LOG_ERROR("resolver append failed",
+                              {"shard", static_cast<int64_t>(config_.shard)},
+                              {"seq", static_cast<uint64_t>(entry.seq)},
+                              {"err", std::string_view{append.error().message()}});
+              (void)rpc_.Fulfill(client_rpc_id,
+                                 core::RespValue::Error(core::ErrorPrefix::kErr,
+                                                        "resolver could not append decision"));
+              return;
+            }
+            resolved_seq = append->seq;
+
+            if (resolved.decision == core::Decision::kApply) {
+              decisions_apply_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              decisions_skip_.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            UpdateCacheFromResolved(entry.seq, entry.appended_at, resolved);
+          }
+
+          // Track the highest Resolved seq this resolver has emitted; the
+          // steady-state ack clamp (Run) holds the persisted offset behind any
+          // Conditional whose Resolved is not yet durable (XDUR-2). Resolveds
+          // are appended monotonically after their Conditionals, so this is the
+          // durability target the durable-floor advances behind.
+          AdvanceMaxSeq(highest_emitted_resolved_seq_, resolved_seq);
+
+          // Two independent waits, durability FIRST (invariant 3). A
+          // durable-layer failure takes precedence over an apply timeout
+          // (mirrors the write path, tiering_engine.cpp). The client conditional
+          // ack must land only after the Resolved is durable AND hot-applied; on
+          // EITHER wait failing the client gets an error, never the success
+          // value — the write stays durable in the WAL and applies on catch-up.
+          if (!AwaitResolvedDurable(resolved_seq, config_.durable_wait_timeout)) {
+            (void)rpc_.Fulfill(
+                client_rpc_id,
+                core::RespValue::Error(core::ErrorPrefix::kErr,
+                                       "conditional write durable wait exceeded timeout; will "
+                                       "apply on consumer catch-up"));
             return;
           }
 
-          if (resolved.decision == core::Decision::kApply) {
-            decisions_apply_.fetch_add(1, std::memory_order_relaxed);
+          // Block until hot applies — required for read-your-write. On timeout
+          // the write stays durable and applies on catch-up, but the client
+          // must NOT see success (mirrors the unconditional write path).
+          if (WaitForHotApply(resolved_seq, config_.hot_apply_wait)) {
+            (void)rpc_.Fulfill(client_rpc_id, std::move(resolved.return_value));
           } else {
-            decisions_skip_.fetch_add(1, std::memory_order_relaxed);
+            (void)rpc_.Fulfill(
+                client_rpc_id,
+                core::RespValue::Error(core::ErrorPrefix::kErr,
+                                       "write durable in queue but consumer did not apply within "
+                                       "timeout"));
           }
-
-          UpdateCacheFromResolved(entry.seq, resolved);
-
-          // Block until hot applies — required for read-your-write.
-          (void)WaitForHotApply(append->seq);
-
-          (void)rpc_.Fulfill(client_rpc_id, std::move(resolved.return_value));
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          UpdateCacheFromResolved(entry.seq, payload);
+          UpdateCacheFromResolved(entry.seq, entry.appended_at, payload);
         }
       },
       entry.payload);
@@ -937,12 +948,39 @@ void Resolver::Run() {
       drained_anything = true;
     }
     if (drained_anything) {
+      // Kafka HW vs LEO: latest_drained_seq_ is read progress (log-end); the
+      // persisted retention ack is the high-watermark and must never outrun the
+      // durable tail. A Conditional at X may have emitted a Resolved at Y > X
+      // that is published+hot-applied+client-OK'd but not yet fsynced; acking
+      // past X then would let a crash lose Y while recovery seeds past X and
+      // never re-decides it (XDUR-2). So we ack a Conditional X only once every
+      // Resolved emitted for Conditionals <= X is durable. The durability
+      // target is max(drained, highest emitted Resolved seq): Resolveds sit at
+      // seqs > their Conditionals, so confirming the highest emitted Resolved
+      // is durable also satisfies the fail-closed Ack gate (seq <= DurableSeq).
       const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
+      const auto durable_target =
+          std::max(drained, highest_emitted_resolved_seq_.load(std::memory_order_acquire));
+      // Confirm (with a bounded wait, never an unbounded block) that every
+      // Resolved emitted for drained Conditionals is durable before advancing
+      // the floor. AwaitDurable returns true iff DurableSeq >= durable_target
+      // within the timeout.
+      auto durable = queue_.AwaitDurable(config_.shard, durable_target, config_.read_timeout);
+      const bool floor_advanced = durable.has_value() && *durable;
+      if (floor_advanced) {
+        AdvanceMaxSeq(resolver_durable_floor_, drained);
+      }
+      // The ack never passes the durable floor (clamped behind any Conditional
+      // whose Resolved is not yet durable). Unsigned seq 0 is ambiguous before
+      // the first confirmed floor, so the first ack is gated on a confirmed
+      // durable advance rather than on target > 0.
+      const auto target = resolver_durable_floor_.load(std::memory_order_acquire);
       const auto last = last_ack_seq_.load(std::memory_order_acquire);
-      if (!first_ack_recorded || drained > last) {
-        auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, drained);
+      const bool can_first_ack = !first_ack_recorded && floor_advanced;
+      if (can_first_ack || (first_ack_recorded && target > last)) {
+        auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, target);
         if (ack.has_value()) {
-          last_ack_seq_.store(drained, std::memory_order_release);
+          last_ack_seq_.store(target, std::memory_order_release);
           first_ack_recorded = true;
         }
       }
@@ -953,10 +991,9 @@ void Resolver::Run() {
   ABYSS_LOG_DEBUG("resolver stopped", {"shard", static_cast<int64_t>(config_.shard)});
 }
 
-bool Resolver::WaitForHotApply(core::SequenceId seq) {
-  const core::RpcId id = core::MakeRpcId(config_.shard, seq);
-  auto fut = apply_notifier_.AwaitApplied(id);
-  if (fut.wait_for(config_.hot_apply_wait) == std::future_status::ready) {
+bool Resolver::WaitForHotApply(core::SequenceId seq, std::chrono::milliseconds timeout) {
+  auto fut = apply_notifier_.AwaitApplied(config_.shard, seq);
+  if (fut.wait_for(timeout) == std::future_status::ready) {
     try {
       fut.get();
       return true;
@@ -965,9 +1002,20 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
     }
   }
   apply_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-  apply_notifier_.Cancel(id);
+  apply_notifier_.Cancel(config_.shard, seq);
   ABYSS_LOG_WARN("resolver hot-apply wait timeout", {"shard", static_cast<int64_t>(config_.shard)},
                  {"seq", static_cast<uint64_t>(seq)});
+  return false;
+}
+
+bool Resolver::AwaitResolvedDurable(core::SequenceId resolved_seq,
+                                    std::chrono::milliseconds timeout) {
+  auto durable = queue_.AwaitDurable(config_.shard, resolved_seq, timeout);
+  if (durable.has_value() && *durable) return true;
+  durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  ABYSS_LOG_WARN("resolver resolved-durable wait timeout",
+                 {"shard", static_cast<int64_t>(config_.shard)},
+                 {"seq", static_cast<uint64_t>(resolved_seq)});
   return false;
 }
 
@@ -975,85 +1023,106 @@ bool Resolver::WaitForHotApply(core::SequenceId seq) {
 // Cache updates from log entries
 // ---------------------------------------------------------------------------
 
-void Resolver::UpdateCacheFromWrite(core::SequenceId seq, const core::RespCommand& cmd) {
-  if (cmd.args.empty()) return;
-  const auto upper = AsciiUpper(cmd.args[0]);
-  if (upper == "SET") {
-    if (cmd.args.size() < 3) return;
-    auto parsed = ParseSetArgs(cmd, /*now_ms=*/0);  // ttl extracted as-is
-    if (!parsed.valid) return;
-    cache_.UpsertKey(parsed.key, ExistenceCache::KeyMeta{
-                                     .exists = true,
-                                     .type = ExistenceCache::KeyType::kString,
-                                     .abs_ttl_ms = parsed.abs_ttl_ms,
-                                     .latest_seq = seq,
-                                     .string_value = std::string(parsed.value),
-                                 });
-  } else if (upper == "SETEX" || upper == "PSETEX") {
-    if (cmd.args.size() < 4) return;
-    cache_.UpsertKey(cmd.args[1], ExistenceCache::KeyMeta{
-                                      .exists = true,
-                                      .type = ExistenceCache::KeyType::kString,
-                                      .abs_ttl_ms = 0,
-                                      .latest_seq = seq,
-                                      .string_value = std::string(cmd.args[3]),
-                                  });
-  } else if (upper == "DEL" || upper == "UNLINK") {
-    for (size_t i = 1; i < cmd.args.size(); ++i) {
-      cache_.TombstoneKey(cmd.args[i], seq);
-    }
-  } else if (upper == "PERSIST") {
-    if (cmd.args.size() < 2) return;
-    auto cur = cache_.GetKey(cmd.args[1]);
-    ExistenceCache::KeyMeta m = cur.has_value() ? *cur : ExistenceCache::KeyMeta{.exists = true};
-    m.abs_ttl_ms = 0;
-    m.latest_seq = seq;
-    cache_.UpsertKey(cmd.args[1], std::move(m));
-  } else if (upper == "EXPIRE" || upper == "PEXPIRE" || upper == "EXPIREAT" ||
-             upper == "PEXPIREAT" || upper == "PEXPIREAT") {
-    if (cmd.args.size() < 3) return;
-    uint64_t v = 0;
-    if (!ParseUint64(cmd.args[2], v)) return;
-    auto cur = cache_.GetKey(cmd.args[1]);
-    if (!cur.has_value()) return;  // don't materialize a key from EXPIRE alone
-    cur->latest_seq = seq;
-    if (upper == "EXPIRE")
-      cur->abs_ttl_ms = WallMs(core::WallClock::now()) + (v * 1000);
-    else if (upper == "PEXPIRE")
-      cur->abs_ttl_ms = WallMs(core::WallClock::now()) + v;
-    else if (upper == "EXPIREAT")
-      cur->abs_ttl_ms = v * 1000;
-    else
-      cur->abs_ttl_ms = v;
-    cache_.UpsertKey(cmd.args[1], *cur);
+namespace {
+
+// Marks `key` present in the cache as a collection of `type`, preserving any
+// existing absolute TTL, and purges stale members/fields if the prior cached
+// type differed (a type change invalidates the old member/field index).
+void UpsertCollectionKey(ExistenceCache& cache, std::string_view key, ExistenceCache::KeyType type,
+                         core::SequenceId seq) {
+  auto cur = cache.GetKey(key);
+  if (cur.has_value() && cur->exists && cur->type != type) {
+    cache.RemoveMembersAndFields(key);
   }
-  // Member-level cache is demand-driven; UpdateCacheFromResolved fills in
-  // affected entries.
+  ExistenceCache::KeyMeta m = cur.has_value() ? *cur : ExistenceCache::KeyMeta{};
+  m.exists = true;
+  m.type = type;
+  m.latest_seq = seq;
+  m.string_value.reset();
+  cache.UpsertKey(key, std::move(m));
 }
 
-void Resolver::UpdateCacheFromResolved(core::SequenceId seq,
+}  // namespace
+
+void Resolver::ApplyToCache(core::SequenceId seq, core::WallTime appended_at,
+                            const core::RespCommand& cmd) {
+  if (cmd.args.empty()) return;
+  const auto name = AsciiUpper(cmd.args[0]);
+  auto op = core::ops::ParseWriteOp(name, cmd, WallMs(appended_at));
+  // The cache is a hint-only layer; an unparseable write is the hot store's
+  // authoritative parse error to report. Skip cache maintenance silently.
+  if (!op.has_value()) return;
+
+  std::visit(
+      [&](const auto& w) {
+        using T = std::decay_t<decltype(w)>;
+        if constexpr (std::is_same_v<T, core::ops::StringSet>) {
+          if (auto cur = cache_.GetKey(w.key);
+              cur.has_value() && cur->exists && cur->type != ExistenceCache::KeyType::kString) {
+            cache_.RemoveMembersAndFields(w.key);
+          }
+          cache_.UpsertKey(w.key, ExistenceCache::KeyMeta{
+                                      .exists = true,
+                                      .type = ExistenceCache::KeyType::kString,
+                                      .abs_ttl_ms = w.abs_ttl_ms,
+                                      .latest_seq = seq,
+                                      .string_value = std::string(w.value),
+                                  });
+        } else if constexpr (std::is_same_v<T, core::ops::Del>) {
+          for (const auto& key : w.keys) {
+            cache_.RemoveMembersAndFields(key);
+            cache_.TombstoneKey(key, seq);
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::Expire>) {
+          // EXPIRE/PERSIST never materialise a key from nothing.
+          auto cur = cache_.GetKey(w.key);
+          if (!cur.has_value() || !cur->exists) return;
+          cur->abs_ttl_ms = w.abs_ttl_ms;
+          cur->latest_seq = seq;
+          cache_.UpsertKey(w.key, std::move(*cur));
+        } else if constexpr (std::is_same_v<T, core::ops::Persist>) {
+          auto cur = cache_.GetKey(w.key);
+          if (!cur.has_value() || !cur->exists) return;
+          cur->abs_ttl_ms = 0;
+          cur->latest_seq = seq;
+          cache_.UpsertKey(w.key, std::move(*cur));
+        } else if constexpr (std::is_same_v<T, core::ops::SetAdd>) {
+          UpsertCollectionKey(cache_, w.key, ExistenceCache::KeyType::kSet, seq);
+          for (const auto& member : w.members) {
+            cache_.UpsertMember(w.key, member,
+                                ExistenceCache::MemberMeta{.score = 0.0, .latest_seq = seq});
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::SetRem>) {
+          for (const auto& member : w.members) cache_.RemoveMember(w.key, member);
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetAdd>) {
+          UpsertCollectionKey(cache_, w.key, ExistenceCache::KeyType::kZset, seq);
+          for (const auto& e : w.entries) {
+            cache_.UpsertMember(w.key, e.member,
+                                ExistenceCache::MemberMeta{.score = e.score, .latest_seq = seq});
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::ZsetRem>) {
+          for (const auto& member : w.members) cache_.RemoveMember(w.key, member);
+        } else if constexpr (std::is_same_v<T, core::ops::HashSet> ||
+                             std::is_same_v<T, core::ops::HashMSet>) {
+          UpsertCollectionKey(cache_, w.key, ExistenceCache::KeyType::kHash, seq);
+          for (const auto& fv : w.fields) {
+            cache_.UpsertField(
+                w.key, fv.field,
+                ExistenceCache::FieldMeta{
+                    .value = std::string(fv.value), .value_known = true, .latest_seq = seq});
+          }
+        } else if constexpr (std::is_same_v<T, core::ops::HashDel>) {
+          for (const auto& field : w.fields) cache_.RemoveField(w.key, field);
+        }
+      },
+      *op);
+}
+
+void Resolver::UpdateCacheFromResolved(core::SequenceId seq, core::WallTime appended_at,
                                        const core::entry::Resolved& resolved) {
   if (resolved.decision != core::Decision::kApply) return;
   for (const auto& cmd : resolved.materialised_ops) {
-    UpdateCacheFromWrite(seq, cmd);
-    if (cmd.args.size() < 2) continue;
-    const auto upper = AsciiUpper(cmd.args[0]);
-    if (upper == "ZADD") {
-      // Update tracked members.
-      for (size_t i = 2; i + 1 < cmd.args.size(); i += 2) {
-        double score = 0.0;
-        if (!ParseDouble(cmd.args[i], score)) continue;
-        cache_.UpsertMember(cmd.args[1], cmd.args[i + 1],
-                            ExistenceCache::MemberMeta{.score = score, .latest_seq = seq});
-      }
-    } else if (upper == "HSET") {
-      for (size_t i = 2; i + 1 < cmd.args.size(); i += 2) {
-        cache_.UpsertField(
-            cmd.args[1], cmd.args[i],
-            ExistenceCache::FieldMeta{
-                .value = std::string(cmd.args[i + 1]), .value_known = true, .latest_seq = seq});
-      }
-    }
+    ApplyToCache(seq, appended_at, cmd);
   }
 }
 
@@ -1080,6 +1149,11 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
 
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
   core::SequenceId highest_seen = 0;
+  // Highest seq of any Resolved this replay re-emits (pre-flush Skips and
+  // terminal dangling re-decisions). The terminal Ack barrier (HOTC-5) awaits
+  // this seq's WAL fsync before advancing the recovery offset past the
+  // danglings, so cold/hot never replay a non-durable re-emitted Resolved.
+  core::SequenceId highest_reemitted_seq = 0;
   while (true) {
     if (cancel.load(std::memory_order_acquire)) {
       ABYSS_LOG_WARN("resolver replay cancelled during scan",
@@ -1103,12 +1177,12 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
           [&](const auto& payload) {
             using T = std::decay_t<decltype(payload)>;
             if constexpr (std::is_same_v<T, core::entry::Write>) {
-              UpdateCacheFromWrite(entry.seq, payload.cmd);
+              ApplyToCache(entry.seq, entry.appended_at, payload.cmd);
             } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
               dangling.emplace(entry.seq, entry);
             } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
               dangling.erase(payload.ref);
-              UpdateCacheFromResolved(entry.seq, payload);
+              UpdateCacheFromResolved(entry.seq, entry.appended_at, payload);
             } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
               HandleFlush(entry);
               // Emit Skip Resolveds for pre-Flush danglings so hot/cold's
@@ -1134,6 +1208,7 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
                                   {"err", std::string_view{append.error().message()}});
                   continue;
                 }
+                highest_reemitted_seq = std::max(highest_reemitted_seq, append->seq);
                 flush_skip_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
                 dangling.erase(d_seq);
               }
@@ -1196,15 +1271,48 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
           {"seq", static_cast<uint64_t>(seq)}, {"err", std::string_view{append.error().message()}});
       return std::unexpected(append.error());
     }
-    UpdateCacheFromResolved(seq, resolved);
+    highest_reemitted_seq = std::max(highest_reemitted_seq, append->seq);
+    UpdateCacheFromResolved(seq, entry.appended_at, resolved);
     replayed_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
   }
 
+  // HOTC-5 recovery barrier: the terminal Ack jumps past the danglings (which
+  // sit at seqs <= drained) to latest_drained_seq_. Before advancing the
+  // persisted offset past a dangling whose Resolved was just re-emitted, that
+  // re-emitted Resolved MUST be durable — otherwise a crash after the offset
+  // fsync but before the Resolved fsync loses both the Conditional (now
+  // acked-past, never re-read) and its Resolved, leaving it permanently
+  // unresolved. AwaitDurable on the highest re-emitted seq is the flush barrier
+  // (subsumes a separate FlushDurable). On barrier timeout we leave the ack at
+  // the already-correct per-scan low-water clamp and return kUnavailable so the
+  // RecoveryCoordinator retries the shard — partial progress is durable and
+  // resumable (the replay-cancel contract). The terminal ack is additionally
+  // clamped to DurableSeq so the fail-closed retention-Ack gate never rejects
+  // it (turns disk back-pressure into a clean retry, not a hard error).
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
   if (drained > 0) {
-    core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, drained),
-                        append_failures_);
-    last_ack_seq_.store(drained, std::memory_order_release);
+    if (highest_reemitted_seq > 0) {
+      auto durable =
+          queue_.AwaitDurable(config_.shard, highest_reemitted_seq, config_.durable_wait_timeout);
+      if (!durable.has_value() || !*durable) {
+        durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        ABYSS_LOG_WARN("resolver recovery durability barrier timed out; offset left clamped",
+                       {"shard", static_cast<int64_t>(config_.shard)},
+                       {"reemitted_seq", static_cast<uint64_t>(highest_reemitted_seq)});
+        return std::unexpected(
+            core::Error{core::ErrorCode::kUnavailable,
+                        "resolver recovery: re-emitted Resolved not yet durable"});
+      }
+    }
+    core::SequenceId ack_to = drained;
+    if (auto durable_seq = queue_.DurableSeq(config_.shard); durable_seq.has_value()) {
+      ack_to = std::min(ack_to, *durable_seq);
+    }
+    if (ack_to > last_ack_seq_.load(std::memory_order_acquire)) {
+      core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, ack_to),
+                          append_failures_);
+      last_ack_seq_.store(ack_to, std::memory_order_release);
+    }
   }
 
   ABYSS_LOG_INFO("resolver replay complete", {"shard", static_cast<int64_t>(config_.shard)},

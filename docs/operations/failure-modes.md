@@ -7,10 +7,40 @@
 | Pod crash (embedded) | Hot store lost. WAL + cold store intact on PVC. | Pod restarts. Queue replay rebuilds hot store. Cold consumer catches up from its last ack point. |
 | Pod crash (external) | In-process orchestrator lost. External stores (Redis, Kafka, KVRocks) retain data. | Pod restarts, resumes queue consumption. |
 | Cold store PVC full | Cold consumer's `apply_batch()` fails. Cold consumer stalls. Queue grows. Eventually queue fills and writes fail. | Provision more cold storage. |
+| Cold store cannot fsync (checkpoint fails) | The cold consumer applies flushes to the memtable but `Checkpoint()` (durable WAL fsync) fails, so it does **not** advance its WAL ack — the WAL is retained, not reaped. No acked write is lost; the queue keeps growing until the fsync path recovers. | Inspect `abyss_cold_checkpoint_total{status="failure"}` and the cold-store volume. Resolve the I/O fault; the ack resumes advancing once a checkpoint succeeds. |
+| Poisoned cold flush batch | A structurally-undecodable op (`kCorruption`/`kInvalidArgument`) cannot be applied. The batch is reinserted and the loop backs off (capped exponential) instead of busy-spinning a core. The shard's WAL stays pinned below the poison. | Inspect `abyss_cold_consumer_backoff_total{reason="poisoned"}` and the `cold apply batch poisoned` CRITICAL log. Operator intervention required to clear the bad entry. |
+| Cold parse poison (undecodable WAL op) | A WAL entry the cold consumer cannot parse into a materialisable op (`ParseWriteOp` failure, empty command, or empty key). The cold view never advances its ack past the un-materialised seq — the WAL retains it for the whole shard — and the loop backs off instead of busy-spinning. No acked write is dropped; cold simply stops making forward progress on that shard until the entry is dealt with. | Inspect `abyss_cold_parse_poison_total` and the `cold parse poison; WAL retention pinned below seq` CRITICAL log (carries the shard + seq). The shard's WAL retention age / disk bytes will rise. See [Cold Parse Poison Quarantine](#cold-parse-poison-quarantine) below for the inspect / quarantine / skip recovery procedure. |
 | Queue WAL PVC full | Queue `Append()` fails. Writes return Redis errors to clients. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). |
 | Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
+| Cold scan exceeds the scan deadline | A large `SMEMBERS`/`ZRANGE`/`HGETALL` served from cold could not complete within `cold_scan_deadline`. The read fails closed with a timeout error to the client rather than returning a silently truncated result. | Inspect `abyss_cold_scan_deadline_exceeded_total`. Raise `cold_scan_deadline` for workloads with large cold-resident collections, or address the cold-volume I/O pressure (compaction, disk) that slowed the scan. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
 | Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
+| Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). With any retention `fsync_policy` this is a **refuse-to-start** condition — a persisted ack could outrun durable storage, violating "no OK for a lost write". | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk). As a deliberate, durability-disabling override, set `fsync_policy: none`. Watch `abyss_fs_durable_dir_supported`. |
+
+## Durability Capability Gate
+
+Durability ("a write that returned OK survives power loss") depends on the data volume's
+`fsync` actually reaching stable media — including the directory entry that links a freshly
+created or renamed file. Not every volume can do this: FAT/exFAT, some network shares, and some
+overlay/tmpfs mounts silently drop directory syncs.
+
+Abyss makes this observable and fail-closed rather than silently degrading (invariant 5):
+
+- At startup the WAL open path probes the data volume and emits
+  `abyss_fs_durable_dir_supported` (1 = durable directory fsync available, 0 = not).
+- The per-OS `fsync` backend is logged at startup (`fsync_backend` on the `WAL durability probe`
+  line): macOS uses `F_FULLFSYNC` (the only Darwin call that pushes the drive cache to platter),
+  Linux uses `fsync`, Windows uses `FlushFileBuffers` (rename durability via
+  `MOVEFILE_WRITE_THROUGH`).
+- If the volume cannot make directory entries durable **and** a retention `fsync_policy`
+  (`per_write` or `group_commit`) is configured, startup fails with a `kFailedPrecondition`
+  error rather than accepting writes it cannot honour.
+- The same check is enforced at the point of every durability-critical atomic write (node
+  identity, consumer offsets): a directory-sync-unsupported volume returns an error instead of
+  reporting a durable commit.
+
+To run on a volume that genuinely cannot provide durable directory fsync, set
+`fsync_policy: none` — this disables durability by design and logs a CRITICAL warning at startup.
 
 ## Backpressure Cascade
 
@@ -54,6 +84,147 @@ If the cold consumer stalls (cold store I/O errors, bugs, resource exhaustion):
 - **Metric to watch:** `abyss_cold_buffer_oldest_entry_age_seconds` and `abyss_cold_consumer_lag_entries`.
 
 The cold consumer stall is the most insidious failure because it has no immediate client-visible impact. Writes succeed, reads work (from hot + buffer). The danger is delayed: if the buffer eventually exceeds its high-water mark, it switches to aggressive flush mode. If the stall persists long enough, the queue fills and writes fail.
+
+## Cold Parse Poison Quarantine
+
+The cold consumer parses every WAL entry it drains with the SAME deterministic `ParseWriteOp`
+the hot consumer uses. If an entry is structurally undecodable from cold's perspective — a parse
+failure, an empty command, or an op with an empty primary key — it is a **poison**: a real
+decoder/format-skew bug, because hot already accepted the same bytes. Silently skipping it would
+let cold diverge from hot forever and would drop a delivered write from the cold view.
+
+**A missing parser is not a poison.** Quarantine applies only when a parser exists and rejects
+bytes hot accepted. If the command has no parser at all in this build, no tier could materialise
+it — hot rejected it too — so hot and cold already agree that the entry produced no state, and
+there is nothing for cold to be missing. Those entries are skipped and counted on
+`abyss_cold_unsupported_op_total`. Conflating the two would let any client pin a shard's WAL
+retention permanently by sending one command the registry advertises but the storage layer does
+not implement, which is a denial of service rather than a safety property.
+
+A rising `abyss_cold_unsupported_op_total` is not a data-loss signal, but it is a real defect
+signal. Live traffic can no longer produce one: the registry only advertises an unconditional
+write when a typed-operation parser backs it, and a unit test asserts that agreement. So a
+non-zero counter on a running node means the log contains entries written by a build whose
+command surface was wider than this one's — a downgrade, a mixed-version rollout, or a data
+directory restored from a newer node. Check the binary version that wrote the affected segments
+before assuming the entries are benign; they were skipped, which is safe for tier agreement but
+means those writes are absent from both tiers.
+
+Instead the cold consumer **quarantines** the poison (fail-closed, invariant 5):
+
+- It does **not** advance its drained frontier or its persisted WAL ack past the poison seq. The
+  ack is pinned at `poison_seq - 1` for the **whole shard** — the WAL (single source of truth)
+  retains the un-materialised entry indefinitely.
+- It increments `abyss_cold_parse_poison_total` and logs a CRITICAL line
+  (`cold parse poison; WAL retention pinned below seq`) carrying the shard and seq.
+- The drain/flush loop backs off on the capped exponential (`abyss_cold_consumer_backoff_total{reason="poisoned"}`)
+  rather than busy-spinning, even though the queue keeps re-delivering the pinned entry.
+- Writes **surrounding** the poison still materialise: a valid write after the poison is still
+  absorbed and flushed to cold. Only the *ack frontier* is quarantined, not the data flow.
+
+This is deliberately a hard stall on the shard's WAL reaping: a single poison entry at the
+retention floor blocks segment cleanup for that shard, so **WAL retention age and disk bytes will
+grow** until an operator intervenes. There is no automatic skip — skipping would silently discard
+a delivered write.
+
+**Observability (this is a fail-closed surface — wire it to alerting):**
+
+- `abyss_cold_parse_poison_total` — a non-zero, rising value is the primary signal. Alert on
+  `rate(abyss_cold_parse_poison_total[5m]) > 0`.
+- The `cold parse poison; WAL retention pinned below seq` CRITICAL log — identifies the exact
+  shard and seq to inspect.
+- The shard's WAL-retention-age / queue-disk-bytes gauges (`abyss_queue_disk_bytes`, and the
+  per-shard oldest-eligible-unreaped age gauge) rise because the ack cannot advance past the
+  poison. This is the disk-fill early warning before the WAL PVC fills.
+
+**Recovery (inspect → quarantine → skip):**
+
+1. **Inspect.** From the CRITICAL log, note the shard and poison seq. Read that WAL entry (offline
+   WAL inspection tooling) and confirm it is genuinely undecodable — it almost always indicates a
+   format/version skew between the writer and this cold build, which is a code bug to fix at the
+   source, not a transient.
+2. **Quarantine / fix forward.** The correct resolution for a decoder-skew poison is to deploy a
+   cold build whose `ParseWriteOp` decodes the entry. On restart the cold consumer re-reads the
+   pinned entry from the WAL, parses it, materialises it, and the ack resumes advancing — cold
+   converges back to hot with no data loss.
+3. **Skip (last resort, lossy).** If the entry is irrecoverably corrupt and cannot be decoded by
+   any build, an operator must explicitly advance the cold ack past it (manual ack-offset
+   override), accepting that the single write the entry carried is dropped from the cold view.
+   This is the only escape and it is intentionally manual and explicit, because it discards a
+   delivered write.
+
+Do not raise the loop backoff ceiling as a "fix" — the backoff only prevents a busy-spin; it does
+not clear the poison. The pin is released only by a successful parse-and-apply (fix forward) or an
+explicit operator ack override (skip).
+
+## WAL Retention Reclamation Stalled
+
+The segment reaper deletes a sealed WAL segment once every consumer has acked past its last seq
+and its age exceeds `min_retention`. A removal can fail for reasons that have nothing to do with
+Abyss — a stale NFS handle, a permissions change, a file still held open by an external process.
+
+The sweep is **skip-and-continue**: a segment that cannot be removed does not abort the pass, so
+one stuck file cannot block reclamation of every later eligible segment. The failure is counted
+rather than swallowed, because an un-reclaimable segment is real disk pressure and invariant 5
+forbids degrading silently.
+
+**Observability:**
+
+- `abyss_queue_reaper_failures_total` — rising means removals are failing. Alert on
+  `rate(abyss_queue_reaper_failures_total[15m]) > 0`.
+- `abyss_queue_oldest_eligible_unreaped_age_seconds` — the leading indicator. Zero when nothing
+  eligible is stuck; a steadily rising value means reclamation is falling behind and the WAL PVC
+  will eventually fill. This is the gauge to page on, since a single stuck segment produces a
+  bounded failure count but an unbounded age.
+- `abyss_queue_disk_bytes` — confirms whether the stall is actually consuming disk.
+
+Note that a rising unreaped age does **not** by itself mean the reaper is broken. A consumer that
+legitimately has not acked yet — a lagging cold consumer, or a shard pinned by the poison
+quarantine above — holds segments back by design. Check `abyss_queue_reaper_failures_total` first:
+non-zero implicates the reaper, zero implicates a consumer that is not acking.
+
+**Recovery:** inspect the first-error message in the reaper's log line for the failing path, and
+resolve the underlying filesystem condition. The next sweep reclaims the segment with no operator
+action beyond that — the reaper retries every eligible segment on each pass.
+
+## Cold Durability Checkpoint
+
+"Cold acked seq N" means **N is on cold's stable storage AND N is past the durable WAL tail** — never merely "handed to RocksDB". The cold consumer makes this true with a two-phase write/checkpoint:
+
+- `ApplyBatch` is a cheap memtable write (`sync=false`); it does not fsync.
+- `Checkpoint` (`FlushWAL(sync=true)`) makes every prior batch durable. It fires on a **bounded cadence** — at most every `checkpoint_max_flushes` applied batches or `checkpoint_min_interval` — so a burst of small flushes amortises into one fsync rather than an fsync-per-batch storm (`F_FULLFSYNC` is expensive on macOS).
+- The cold WAL ack only advances to `min(low_water, last_checkpointed_seq, DurableSeq(shard))`. It can never outrun cold's own durable storage nor the durable WAL tail, so the segment reaper never releases WAL retention for data that is not yet durable on both tiers.
+
+This is fail-closed (invariant 5): a failed or slow checkpoint **pins** the ack (back-pressure), it does not silently advance.
+
+- **Metrics to watch:** `abyss_cold_checkpoint_total{status}` (success/failure), `abyss_cold_checkpoint_duration_seconds` (fsync cost), `abyss_cold_checkpoint_interval_seconds` (observed cadence — confirms the bound is being honoured), and `abyss_cold_consumer_backoff_total{reason}` (idle/poisoned/backpressure loop backoff).
+- A rising checkpoint interval or duration is the early signal that the cold volume's fsync is becoming a throughput bottleneck before the WAL fills.
+
+## Cold Read Deadline (Point Reads and Scans)
+
+Every read served from the cold tier carries a finite deadline, so a cold read can never block a
+reactor thread unboundedly under disk pressure or for a pathologically large key (invariant 5).
+The bound is enforced inside the storage engine (`rocksdb::ReadOptions::deadline`), so it covers
+both point reads and prefix scans — not just an ad-hoc wrapper.
+
+There are two knobs because the two access shapes have different latency budgets:
+
+- `cold_read_deadline` (default **5ms**) bounds cold **point reads** (GET/SISMEMBER/ZSCORE/HGET/
+  HMGET/HEXISTS/SCARD/ZCARD/EXISTS). This is the ADP-003 <5ms p99 cold-read SLA.
+- `cold_scan_deadline` (default **50ms**) bounds cold **collection scans** (SMEMBERS/ZRANGE/
+  HGETALL/HKEYS/HVALS), whose latency scales with cardinality. Set it generously enough to serve
+  your largest cold-resident collection.
+
+This is fail-closed, not best-effort truncation: a scan that overruns its deadline returns a
+timeout **error** to the client and increments `abyss_cold_scan_deadline_exceeded_total` — it
+never returns a partial/silently-capped array that the client would mistake for the full set.
+
+- **Metric to watch:** `abyss_cold_scan_deadline_exceeded_total`. A non-zero, rising rate means a
+  legitimately-large collection is being capped by the deadline.
+- **Tuning:** raise `cold_scan_deadline` for workloads with large cold collections, or relieve
+  the cold-volume I/O pressure (compaction backlog, slow disk) that is slowing the scan. The
+  deadline is best-effort at iterator-step granularity, so a single very large SST block read can
+  overshoot slightly; size the deadline with margin rather than at the exact p99.
 
 ## Hot Consumer Stall
 

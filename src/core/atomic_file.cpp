@@ -72,7 +72,15 @@ Result<void> WriteFileAtomic(const std::filesystem::path& path, std::span<const 
   }
 
   const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
-  return fs::FsyncDir(parent);
+  auto dir_sync = fs::FsyncDir(parent);
+  if (!dir_sync.has_value()) return std::unexpected(dir_sync.error());
+  if (*dir_sync == fs::DirSyncOutcome::kUnsupported) {
+    return std::unexpected(Error{ErrorCode::kFailedPrecondition,
+                                 "directory durability unsupported on volume for '" +
+                                     parent.string() + "'; cannot atomically persist '" +
+                                     path.string() + "'"});
+  }
+  return {};
 }
 
 Result<void> WriteFileAtomic(const std::filesystem::path& path, std::string_view text) {
