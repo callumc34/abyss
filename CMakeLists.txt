@@ -72,7 +72,7 @@ set_package_properties(xxHash PROPERTIES
   TYPE REQUIRED
   DESCRIPTION "Extremely fast hash algorithm"
   URL "https://github.com/Cyan4973/xxHash"
-  PURPOSE "Key hashing for shard routing"
+  PURPOSE "Key hashing for log redaction"
 )
 
 find_package(CLI11 CONFIG REQUIRED)

@@ -52,7 +52,7 @@ The key guarantee: any write the client received OK for is durable. Group commit
 
 ### Lock Discipline
 
-**Hot store:** Sharded lock scheme (lock striping by key hash, using xxHash). I/O threads acquire a shared lock on the relevant shard for reads. The hot consumer acquires an exclusive lock for writes. The number of lock shards is fixed at deployment and should equal the planned horizontal shard count to ease migration to Phase 2.
+**Hot store:** Sharded lock scheme (lock striping by shard, where the shard is derived from the key's CRC16 slot — see [ADP-014](proposals/014-slot-routing-and-topology.md)). I/O threads acquire a shared lock on the relevant shard for reads. The hot consumer acquires an exclusive lock for writes. The number of lock shards is fixed at deployment and should equal the planned horizontal shard count to ease migration to Phase 2.
 
 **Compaction buffer:** `shared_mutex`. I/O threads acquire a shared lock for reads. The cold consumer acquires an exclusive lock when absorbing new entries or removing flushed entries.
 
@@ -122,7 +122,7 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 - NATS JetStream queue backend
 - Hybrid profile configuration
 - Redis Cluster protocol (CLUSTER SLOTS, MOVED redirects)
-- Shard routing with xxHash
+- Slot-range shard ownership across pods (routing by CRC16 slot, [ADP-014](proposals/014-slot-routing-and-topology.md))
 - Multi-pod StatefulSet deployment
 - Resharding via queue replay
 - External profile integration tests

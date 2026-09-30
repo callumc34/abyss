@@ -139,7 +139,7 @@ Phase 1 uses a conventional multithreaded model within a single pod:
 - **Resolver thread** (single, dedicated) — tails queue, resolves conditional writes, emits `Resolved` entries, fulfils Consumer RPC promises for conditional writes. See [ADP-011](proposals/011-conditional-writes-and-consumer-rpc.md).
 - **Background threads** — WAL segment cleanup, cold store compaction, TTL expiry scanning.
 
-Hot store access is protected by a sharded lock scheme (lock striping by key hash, using xxHash) to allow concurrent reads from I/O threads while the hot consumer applies writes. The compaction buffer uses a `shared_mutex` (concurrent reads from I/O threads, exclusive writes from cold consumer).
+Hot store access is protected by a sharded lock scheme (lock striping by shard, where the shard is derived from the key's CRC16 slot — see [ADP-014](proposals/014-slot-routing-and-topology.md)) to allow concurrent reads from I/O threads while the hot consumer applies writes. The compaction buffer uses a `shared_mutex` (concurrent reads from I/O threads, exclusive writes from cold consumer).
 
 The number of lock shards is fixed at deployment and should equal the planned horizontal shard count to ease migration. Phase 1's internal sharding boundaries match Phase 2's pod boundaries.
 

@@ -34,7 +34,7 @@ The `tests` manifest feature (googletest) is requested by `CMakeLists.txt` whene
 |------------|---------|---------|
 | crc32c | WAL entry and segment integrity checksums | BSD-3-Clause |
 | RocksDB | Built-in cold store | Apache 2.0 / GPL 2.0 |
-| xxHash | Key hashing / shard routing | BSD |
+| xxHash | Key hashing for log redaction | BSD |
 | hiredis | RESP parsing, external Redis client | BSD |
 | liburing | io_uring async I/O (Linux) | LGPL / MIT |
 | spdlog | Structured logging | MIT |
