@@ -2,6 +2,7 @@ name: Build & Test (Windows)
 
 on:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,7 +14,7 @@ env:
 jobs:
   build-test-windows:
     name: Build & Test (Windows)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 90
     steps:
       - name: Checkout commit

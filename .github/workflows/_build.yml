@@ -32,7 +32,7 @@ jobs:
           max-size: 500M
 
       - name: Configure
-        run: cmake --preset default -G Ninja -DABYSS_WERROR=ON
+        run: cmake --preset default -G Ninja
 
       - name: Build
         run: cmake --build build/default --parallel

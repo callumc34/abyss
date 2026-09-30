@@ -18,6 +18,8 @@ ctest --preset default -L unit-hot      # one library's unit tests
 ctest --preset default -R '.*Recovery.*' # name regex
 ```
 
+The CI gate builds and tests on Linux only. Windows and macOS runners bill at 2x and 10x Linux minutes, so `Build & Test (Windows)` and `Build & Test (macOS)` run on demand through `workflow_dispatch`; run them when a change touches platform code.
+
 Sanitizers run in CI via dedicated presets (`asan`, `tsan`, `ubsan`) as a build-matrix fan-out. The `asan` and `tsan` jobs use `jobs: 2` to avoid OOM under shadow-memory inflation; `ubsan` runs `jobs: 4`. ASan/TSan are not reliable on Apple Silicon locally; UBSan is, and reproducing findings locally with `cmake --preset ubsan` is supported.
 
 CI sets `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:abort_on_error=1` and points at `cmake/ubsan_suppressions.txt`. The `asan` preset combines AddressSanitizer with the default UBSan check group, so `UBSAN_OPTIONS` is set on that job too — a UBSan hit during an asan run aborts the test, just as an ASan hit does. See `docs/development/building.md` for the full check inventory.

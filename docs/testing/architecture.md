@@ -77,7 +77,7 @@ Test the full `abyss-server` binary over TCP using a real Redis client. The serv
 
 Non-deterministic, long-running tests that explore edge cases automated tests miss.
 
-- **Fuzz:** libFuzzer targets for the RESP parser and WAL decoder. Runs for configurable duration in CI.
+- **Fuzz:** libFuzzer targets for the RESP parser and WAL decoder. Built with `ABYSS_BUILD_FUZZ=ON` and run locally; not part of CI.
 - **Stress:** High-throughput write/read loops, memory pressure, concurrent access under TSAN.
 - **Chaos:** SIGKILL during WAL writes, disk-full simulation, crash-recovery loops.
 
