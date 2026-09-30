@@ -83,7 +83,7 @@ TEST(FsTest, DurableFsyncSelectsFullFsyncOnApple) {
 }
 #endif  // __APPLE__
 
-#ifndef _WIN32
+#ifdef __APPLE__
 namespace {
 int g_seam_calls = 0;
 int FakeEopnotsupp(int /*fd*/) {
@@ -98,7 +98,6 @@ int FakeEio(int /*fd*/) {
 }
 }  // namespace
 
-#ifdef __APPLE__
 // NET-5 (failure injection): when F_FULLFSYNC is unsupported on the volume,
 // kDurable falls back to ::fsync and still succeeds, counting one degraded
 // fallback. A genuine error (EIO) must propagate, never be masked by a fallback
@@ -126,6 +125,5 @@ TEST(FsTest, DurableFsyncFallsBackOnUnsupportedButPropagatesRealError) {
   fst::SetFullFsyncForTesting(nullptr);  // restore the real implementation
 }
 #endif  // __APPLE__
-#endif  // !_WIN32
 
 }  // namespace
