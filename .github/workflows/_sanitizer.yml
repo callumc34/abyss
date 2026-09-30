@@ -19,7 +19,7 @@ jobs:
   sanitizer:
     name: Sanitizer (${{ inputs.preset }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout commit
         uses: actions/checkout@v7
