@@ -38,7 +38,7 @@ jobs:
       FUZZ_SECONDS: ${{ inputs.duration_seconds || 900 }}
     steps:
       - name: Checkout commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up build environment
         uses: ./.github/actions/setup-build
