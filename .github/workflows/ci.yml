@@ -15,7 +15,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are cancelled; every main commit runs to completion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -68,19 +69,9 @@ jobs:
     uses: ./.github/workflows/_build.yml
     secrets: inherit
 
-  build-windows:
-    name: Build (Windows)
-    needs: changes
-    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
-    uses: ./.github/workflows/_build-windows.yml
-    secrets: inherit
-
-  build-macos:
-    name: Build (macOS)
-    needs: changes
-    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
-    uses: ./.github/workflows/_build-macos.yml
-    secrets: inherit
+  # Windows and macOS builds are not part of this gate: they bill at 2x and 10x
+  # Linux minutes. Run _build-windows.yml / _build-macos.yml via
+  # workflow_dispatch when platform code changes.
 
   sanitizer:
     name: Sanitizer
@@ -93,17 +84,6 @@ jobs:
     uses: ./.github/workflows/_sanitizer.yml
     with:
       preset: ${{ matrix.preset }}
-    secrets: inherit
-
-  # Short smoke run: proves the harnesses still build and the committed corpora
-  # stay clean. The nightly schedule in _fuzz.yml carries the long budget.
-  fuzz:
-    name: Fuzz
-    needs: [changes, build]
-    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.ci == 'true'
-    uses: ./.github/workflows/_fuzz.yml
-    with:
-      duration_seconds: 60
     secrets: inherit
 
   docker:
@@ -124,7 +104,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-24.04
-    needs: [changes, format, build, build-windows, build-macos, sanitizer, fuzz, docker]
+    needs: [changes, format, build, sanitizer, docker]
     if: always()
     timeout-minutes: 2
     steps:

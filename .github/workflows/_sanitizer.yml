@@ -37,7 +37,7 @@ jobs:
           max-size: 500M
 
       - name: Configure
-        run: cmake --preset ${{ inputs.preset }} -G Ninja -DABYSS_WERROR=ON
+        run: cmake --preset ${{ inputs.preset }} -G Ninja
 
       - name: Build
         run: cmake --build build/${{ inputs.preset }} --parallel

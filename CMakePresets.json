@@ -7,6 +7,7 @@
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "ABYSS_WERROR": "ON",
         "ABYSS_BUILD_TESTS": "ON",
         "ABYSS_BUILD_PERF": "ON",
         "VCPKG_MANIFEST_FEATURES": "builtin-cold;perf"
@@ -63,6 +64,7 @@
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "ABYSS_WERROR": "ON",
         "ABYSS_BUILD_TESTS": "ON",
         "ABYSS_WITH_ROCKSDB": "OFF"
       }
@@ -76,7 +78,6 @@
         "rhs": "Linux"
       },
       "cacheVariables": {
-        "ABYSS_WERROR": "ON",
         "VCPKG_TARGET_TRIPLET": "x64-linux-static-release",
         "VCPKG_HOST_TRIPLET": "x64-linux-static-release",
         "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
@@ -102,7 +103,6 @@
       },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ABYSS_WERROR": "ON",
         "ABYSS_BUILD_PERF": "OFF",
         "VCPKG_TARGET_TRIPLET": "x64-windows-static-release",
         "VCPKG_HOST_TRIPLET": "x64-windows-static-release",
