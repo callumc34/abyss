@@ -191,7 +191,9 @@ TEST_F(ColdConsumerTest, ParsePoisonDoesNotAdvanceAckPastUnabsorbedSeq) {
   // The drained frontier is pinned below the poison (seq 1 -> floor 0).
   EXPECT_EQ(c->Snapshot().latest_drained_seq, 0U);
   // Either no ack was issued, or it stayed at the floor (never >= poison seq 1).
-  if (acked) EXPECT_EQ(ack_seq, 0U) << "ack advanced past the poison entry";
+  if (acked) {
+    EXPECT_EQ(ack_seq, 0U) << "ack advanced past the poison entry";
+  }
 }
 
 TEST_F(ColdConsumerTest, ParsePoisonEmitsCriticalMetricAndStalls) {
