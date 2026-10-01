@@ -1034,12 +1034,13 @@ void UpsertCollectionKey(ExistenceCache& cache, std::string_view key, ExistenceC
   if (cur.has_value() && cur->exists && cur->type != type) {
     cache.RemoveMembersAndFields(key);
   }
-  ExistenceCache::KeyMeta m = cur.has_value() ? *cur : ExistenceCache::KeyMeta{};
-  m.exists = true;
-  m.type = type;
-  m.latest_seq = seq;
-  m.string_value.reset();
-  cache.UpsertKey(key, std::move(m));
+  cache.UpsertKey(key, ExistenceCache::KeyMeta{
+                           .exists = true,
+                           .type = type,
+                           .abs_ttl_ms = cur.has_value() ? cur->abs_ttl_ms : 0,
+                           .latest_seq = seq,
+                           .string_value = std::nullopt,
+                       });
 }
 
 }  // namespace
