@@ -39,23 +39,33 @@ target_link_libraries(fuzz_resp_stream PRIVATE
 )
 target_compile_options(fuzz_resp_stream PRIVATE -fsanitize=fuzzer)
 
-add_executable(fuzz_wal_decoder wal_decoder_fuzz.cpp)
-target_link_libraries(fuzz_wal_decoder PRIVATE
+# The format 2 frame codec: Inspect with and without CRC verification,
+# then DecodeEntry. Its CRC oracle uses the queue's private CRC32C and
+# byte helpers, hence the source-tree include path.
+add_executable(fuzz_frame_decoder frame_decoder_fuzz.cpp)
+target_include_directories(fuzz_frame_decoder PRIVATE ${PROJECT_SOURCE_DIR}/src/queue)
+target_link_libraries(fuzz_frame_decoder PRIVATE
   abyss::queue
   -fsanitize=fuzzer
 )
-target_compile_options(fuzz_wal_decoder PRIVATE -fsanitize=fuzzer)
+target_compile_options(fuzz_frame_decoder PRIVATE -fsanitize=fuzzer)
 
-# Drives the whole segment recovery scan plus the replay reads, so torn-tail
-# truncation and CRC-valid-but-corrupt fail-stop are both exercised. Segment is
-# an internal queue type, hence the source-tree include path.
-add_executable(fuzz_wal_replay wal_replay_fuzz.cpp)
-target_include_directories(fuzz_wal_replay PRIVATE ${PROJECT_SOURCE_DIR}/src/queue)
-target_link_libraries(fuzz_wal_replay PRIVATE
+# Log::Open over a real segment whose frame space carries the input, so
+# end-of-log, torn-tail and CRC-valid-but-corrupt recovery are all
+# exercised, then a walk of what recovery kept.
+add_executable(fuzz_log_recovery log_recovery_fuzz.cpp)
+target_include_directories(fuzz_log_recovery PRIVATE ${PROJECT_SOURCE_DIR}/src/queue)
+target_link_libraries(fuzz_log_recovery PRIVATE
   abyss::queue
   -fsanitize=fuzzer
 )
-target_compile_options(fuzz_wal_replay PRIVATE -fsanitize=fuzzer)
+target_compile_options(fuzz_log_recovery PRIVATE -fsanitize=fuzzer)
+
+# Regenerates corpus/frame_decoder and corpus/log_recovery with the
+# real encoder: `./fuzz_make_corpus <source dir>/tests/fuzz/corpus`.
+add_executable(fuzz_make_corpus make_corpus.cpp)
+target_include_directories(fuzz_make_corpus PRIVATE ${PROJECT_SOURCE_DIR}/src/queue)
+target_link_libraries(fuzz_make_corpus PRIVATE abyss::queue)
 
 add_executable(fuzz_net_connection net/connection_fuzz.cpp)
 target_link_libraries(fuzz_net_connection PRIVATE

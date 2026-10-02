@@ -24,8 +24,7 @@ target_link_libraries(abyss_core_tests PRIVATE
 )
 
 add_executable(abyss_queue_tests
-  queue/wal_entry_test.cpp
-  queue/segment_header_test.cpp
+  queue/entry_payload_test.cpp
   queue/group_commit_test.cpp
   queue/offset_store_test.cpp
   queue/offset_checkpoint_test.cpp
@@ -225,10 +224,12 @@ target_link_libraries(abyss_admin_tests PRIVATE
 
 add_executable(abyss_engine_tests
   engine/shard_scheduler_test.cpp
+  engine/recovery_coordinator_test.cpp
 )
 
 target_link_libraries(abyss_engine_tests PRIVATE
   abyss::engine
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )

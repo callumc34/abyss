@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -36,6 +37,7 @@
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/platform/fs.h"
+#include "abyss/platform/mapped_file.h"
 #include "abyss/queue/wal_queue.h"
 #include "common.h"
 #include "histogram.h"
@@ -55,6 +57,8 @@ constexpr std::string_view kOpWrite = "write_ack";
 constexpr std::string_view kOpFlush = "device_flush";
 constexpr std::string_view kOpFlushConcurrent = "device_flush_concurrent";
 constexpr size_t kFlushBlockBytes = 4096;
+// The calibration region: one block per sample, at most 16 MiB.
+constexpr uint64_t kFlushRegionBlocks = 4096;
 // W1 (process_crash): write-path overhead; the ack waits for no flush.
 constexpr int64_t kOverheadP99Us = 20;
 // W2 (power_loss): twice the device flush p99 plus this headroom.
@@ -92,27 +96,40 @@ struct FlushCalibration {
   std::chrono::nanoseconds elapsed{0};
 };
 
-// 4 KiB appends flushed with the WAL's primitive; times the flush only.
+// The WAL's flush: a 4 KiB write through a mapping of a region written
+// before use, then a data-only sync; times the write-back and sync. A
+// WAL segment is zero-filled or recycled before it goes live, so an
+// extending file's metadata cost would overstate the flush.
 Result<FlushCalibration> FlushFile(const std::filesystem::path& path, uint64_t samples) {
   auto file =
       pfs::Open(path, {.mode = pfs::OpenMode::kReadWrite, .create = true, .exclusive = true});
   if (!file.has_value()) return std::unexpected(file.error());
+  const uint64_t blocks = std::clamp<uint64_t>(samples, 1, kFlushRegionBlocks);
+  const uint64_t region = blocks * kFlushBlockBytes;
 
-  const std::vector<std::byte> block(kFlushBlockBytes, std::byte{0x5a});
   FlushCalibration out;
-  Result<void> status;
-  const auto start = Clock::now();
-  for (uint64_t i = 0; i < samples; ++i) {
-    status = pfs::Pwrite(*file, block.data(), block.size(), i * kFlushBlockBytes);
-    if (!status.has_value()) break;
-    const auto t0 = Clock::now();
-    status = pfs::Fsync(*file, pfs::SyncMode::kDurableData);
-    const auto t1 = Clock::now();
-    if (!status.has_value()) break;
-    out.histogram.Record(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-    ++out.samples;
+  Result<void> status = pfs::ZeroFill(*file, region);
+  if (status.has_value()) status = pfs::Fsync(*file, pfs::SyncMode::kDurableData);
+  if (status.has_value()) {
+    auto map = pfs::MappedFile::Map(*file, region);
+    if (!map.has_value()) {
+      status = std::unexpected(map.error());
+    } else {
+      const auto start = Clock::now();
+      for (uint64_t i = 0; i < samples; ++i) {
+        const uint64_t offset = (i % blocks) * kFlushBlockBytes;
+        std::memset(map->data() + offset, 0x5a, kFlushBlockBytes);
+        const auto t0 = Clock::now();
+        status = map->WriteBack(offset, kFlushBlockBytes);
+        if (status.has_value()) status = pfs::Fsync(*file, pfs::SyncMode::kDurableData);
+        const auto t1 = Clock::now();
+        if (!status.has_value()) break;
+        out.histogram.Record(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        ++out.samples;
+      }
+      out.elapsed = Clock::now() - start;
+    }
   }
-  out.elapsed = Clock::now() - start;
   file->Close();
   const auto removed = pfs::Unlink(path);
   if (!status.has_value()) return std::unexpected(status.error());
@@ -210,6 +227,8 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       .segment_size_bytes = config.queue.segment_size_bytes,
       .max_value_size_bytes = config.queue.max_value_size_bytes,
       .shard_count = shards,
+      .log_count = config.queue.log_count,
+      .ring_entries = config.queue.ring_entries,
       .durability = config.queue.durability,
       .durability_window_bytes = config.queue.durability_window_bytes,
       .durability_window = config.queue.durability_window,
@@ -259,6 +278,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
                   .checkpoint_min_interval = cc.checkpoint_min_interval,
                   .loop_initial_backoff = cc.loop_initial_backoff,
                   .loop_max_backoff = cc.loop_max_backoff,
+                  .drain_grace = cc.drain_grace,
               },
       },
       *wp->eviction_policy, *wp->consumer_rpc);

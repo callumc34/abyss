@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "abyss/consumer/cold_consumer_pool.h"
@@ -49,7 +50,9 @@ struct RecoverySnapshot {
 // Drives the recovery state machine described in ADP-007: queue self-recovery
 // (already complete by the time WalQueue::Open returns) → resolver replay
 // (re-emits any dangling Resolved entries, deterministic per ADP-011) →
-// cold + hot replay (parallel, drains each shard to the post-resolver tail).
+// cold + hot replay: one queue Scan to the post-resolver tail feeds
+// both, then each shard's ReplayUntil runs as a check that finds
+// nothing.
 //
 // Per-shard work is dispatched through a ShardScheduler; the coordinator
 // itself is runtime-agnostic. Cancellation propagates via the std::atomic<bool>
@@ -81,16 +84,19 @@ class RecoveryCoordinator {
  private:
   core::Result<void> RunResolverPhase(const std::atomic<bool>& cancel);
   core::Result<void> RunColdHotPhase(const std::atomic<bool>& cancel);
+  // Rebuilds cold and hot through one queue Scan up to `end`, from
+  // hot_starting_ and each cold consumer's cursor.
+  core::Result<void> ScanColdHot(const std::vector<core::SequenceId>& end,
+                                 const std::atomic<bool>& cancel);
 
   // Updates phase_ atomic and the phase gauge in lockstep.
   void TransitionPhase(RecoverySnapshot::Phase next);
 
-  // Captures TailSeq per shard. Consumers replay until their progress
+  // Captures TailSeq per shard: the resolver replays until its progress
   // marker reaches the captured tail.
   std::vector<core::SequenceId> CaptureTargets() const;
   // Committed offset per shard; 0 when never committed.
   std::vector<core::SequenceId> CaptureCommittedOffsets(core::ConsumerId consumer) const;
-  std::vector<core::SequenceId> CaptureFirstSeqs() const;
 
   static uint64_t SumDelta(const std::vector<core::SequenceId>& target,
                            const std::vector<core::SequenceId>& starting) noexcept;
@@ -105,8 +111,9 @@ class RecoveryCoordinator {
   std::atomic<RecoverySnapshot::Phase> phase_{RecoverySnapshot::Phase::kQueueOpen};
   std::chrono::steady_clock::time_point started_at_{};
 
-  // Targets and starting offsets for each phase. Set under started_at_ when
-  // the phase opens; immutable thereafter, so reads from Snapshot() race-free.
+  // Run writes these, and started_at_, under progress_mu_ as each phase
+  // opens; Snapshot reads them under it. Run's own reads need no lock.
+  mutable std::mutex progress_mu_;
   std::vector<core::SequenceId> resolver_starting_;
   std::vector<core::SequenceId> resolver_target_;
   std::vector<core::SequenceId> cold_starting_;

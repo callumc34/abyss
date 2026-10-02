@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -1483,6 +1485,119 @@ TEST_F(ColdConsumerTest, DrainDeadlineTruncatesAndReportsWithoutBlocking) {
   EXPECT_LT(elapsed, 400ms) << "drain must be deadline-bounded, not block on the wedged store";
   // The remaining slice was left in the buffer for WAL replay (no silent loss).
   EXPECT_GT(c->Buffer().Size(), 0U) << "truncated drain must leave the rest for replay";
+}
+
+// --- Replay fed by a scan ----------------------------------------------------
+
+core::Result<void> WipeFails(core::ShardId /*shard*/) {
+  return std::unexpected(core::Error{core::ErrorCode::kInternal, "wipe failed (test)"});
+}
+
+TEST_F(ColdConsumerTest, BeginReplayStartsPastTheCommittedOffset) {
+  ON_CALL(queue_, CommittedOffset(core::kColdConsumer, kShard))
+      .WillByDefault(Return(core::Result<std::optional<core::SequenceId>>(4)));
+  auto c = MakeConsumer();
+
+  auto begun = c->BeginReplay();
+  ASSERT_TRUE(begun.has_value());
+  EXPECT_EQ(*begun, 5U);
+  EXPECT_EQ(c->LatestDrainedSeq(), 4U);
+}
+
+TEST_F(ColdConsumerTest, AReplayBatchMustStartAtTheCursor) {
+  auto c = MakeConsumer();
+  ASSERT_EQ(c->BeginReplay().value(), 0U);
+  const std::atomic<bool> cancel{false};
+
+  const std::vector<core::QueueEntry> batch{MakeWriteEntry(3, {"SET", "k", "v"})};
+  auto applied = c->ApplyReplayBatch(batch, cancel);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(applied.error().code(), core::ErrorCode::kInternal);
+  EXPECT_EQ(c->Buffer().Size(), 0U);
+}
+
+// A failed wipe holds the batch at its Flush; the retry resumes there
+// and consumes the rest.
+TEST_F(ColdConsumerTest, AReplayBatchRetriesAFailedWipeThenConsumesTheRest) {
+  ColdConsumer::Config cfg;
+  cfg.loop_max_backoff = 2ms;
+  auto c = MakeConsumer(cfg);
+  ASSERT_EQ(c->BeginReplay().value(), 0U);
+  EXPECT_CALL(cold_, Wipe(kShard))
+      .WillOnce(WipeFails)
+      .WillOnce(WipeFails)
+      .WillOnce(Return(core::Result<void>{}));
+  const std::vector<core::QueueEntry> batch{
+      MakeWriteEntry(0, {"SET", "a", "v"}),
+      MakeFlushEntry(1),
+      MakeWriteEntry(2, {"SET", "b", "v"}),
+  };
+  const std::atomic<bool> cancel{false};
+
+  ASSERT_TRUE(c->ApplyReplayBatch(batch, cancel).has_value());
+  EXPECT_EQ(c->LatestDrainedSeq(), 2U);
+  EXPECT_FALSE(c->Buffer().Read("a").has_value()) << "the wipe left a pre-Flush write";
+  EXPECT_TRUE(c->Buffer().Read("b").has_value());
+}
+
+// A wipe that keeps failing gives up after drain_grace, holding the
+// cursor at the Flush, so recovery fails instead of hanging.
+TEST_F(ColdConsumerTest, AReplayBatchGivesUpOnAWipeThatKeepsFailing) {
+  ColdConsumer::Config cfg;
+  cfg.drain_grace = 20ms;
+  cfg.loop_max_backoff = 5ms;
+  auto c = MakeConsumer(cfg);
+  ASSERT_EQ(c->BeginReplay().value(), 0U);
+  EXPECT_CALL(cold_, Wipe(kShard)).WillRepeatedly(WipeFails);
+  auto fut = rpc_.Register(core::MakeFlushRpcId(core::kColdConsumer, kShard, 1));
+  const std::vector<core::QueueEntry> batch{
+      MakeWriteEntry(0, {"SET", "a", "v"}),
+      MakeFlushEntry(1),
+      MakeWriteEntry(2, {"SET", "b", "v"}),
+  };
+  const std::atomic<bool> cancel{false};
+
+  auto applied = c->ApplyReplayBatch(batch, cancel);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(applied.error().code(), core::ErrorCode::kTimeout);
+  EXPECT_EQ(c->LatestDrainedSeq(), 0U);
+  EXPECT_FALSE(c->Buffer().Read("b").has_value());
+  EXPECT_NE(fut.wait_for(0ms), std::future_status::ready);
+}
+
+TEST_F(ColdConsumerTest, ACancelStopsAWipeRetry) {
+  ColdConsumer::Config cfg;
+  cfg.drain_grace = std::chrono::hours{1};
+  auto c = MakeConsumer(cfg);
+  ASSERT_EQ(c->BeginReplay().value(), 0U);
+  std::atomic<bool> cancel{false};
+  EXPECT_CALL(cold_, Wipe(kShard)).WillRepeatedly([&cancel](core::ShardId shard) {
+    cancel.store(true);
+    return WipeFails(shard);
+  });
+
+  const std::vector<core::QueueEntry> batch{MakeFlushEntry(0)};
+  auto applied = c->ApplyReplayBatch(batch, cancel);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(applied.error().code(), core::ErrorCode::kUnavailable);
+}
+
+TEST_F(ColdConsumerTest, FinishReplayFlushesTheBufferAndCommits) {
+  auto c = MakeConsumer();
+  ASSERT_EQ(c->BeginReplay().value(), 0U);
+  EXPECT_CALL(cold_, ApplyBatch(_, _)).WillOnce(Return(core::Result<void>{}));
+  EXPECT_CALL(queue_, CommitOffset(core::kColdConsumer, kShard, 1))
+      .WillOnce(Return(core::Result<void>{}));
+  const std::vector<core::QueueEntry> batch{
+      MakeWriteEntry(0, {"SET", "a", "v"}),
+      MakeWriteEntry(1, {"SET", "b", "v"}),
+  };
+  const std::atomic<bool> cancel{false};
+  ASSERT_TRUE(c->ApplyReplayBatch(batch, cancel).has_value());
+
+  ASSERT_TRUE(c->FinishReplay(cancel).has_value());
+  EXPECT_EQ(c->Buffer().Size(), 0U);
+  EXPECT_EQ(c->Snapshot().last_commit_seq, 1U);
 }
 
 // --- COLDC-5: oldest_unflushed_age lag signal ---------------------------------

@@ -158,37 +158,50 @@ void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {
   next_read_seq_ = last_seq + 1;
 }
 
-core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
-                                            const std::atomic<bool>& cancel) {
-  ABYSS_LOG_INFO("hot replay starting", {"shard", static_cast<int64_t>(config_.shard)},
-                 {"target_seq", static_cast<uint64_t>(target)});
-
+void HotConsumer::BeginReplay() {
   replay_mode_.store(true, std::memory_order_release);
   // Suppress memory-pressure eviction in the store for the duration of replay:
   // evicting mid-replay would make the rebuilt hot view depend on memory
   // timing, breaking deterministic queue replay (invariant 4). The eviction
   // worker reconverges the ceiling after replay completes.
   store_.SetReplayMode(true);
+}
+
+void HotConsumer::ApplyReplayBatch(std::vector<core::QueueEntry>& batch) {
+  ProcessBatch(batch);
+  CheckBlockAndScanTimeout();
+}
+
+void HotConsumer::SetReplayCursor(core::SequenceId next) { next_read_seq_ = next; }
+
+void HotConsumer::EndReplay() {
+  replay_mode_.store(false, std::memory_order_release);
+  store_.SetReplayMode(false);
+}
+
+core::Result<uint64_t> HotConsumer::ReplayUntil(core::SequenceId target,
+                                                const std::atomic<bool>& cancel) {
+  ABYSS_LOG_INFO("hot replay starting", {"shard", static_cast<int64_t>(config_.shard)},
+                 {"target_seq", static_cast<uint64_t>(target)});
+
+  BeginReplay();
   struct ReplayGuard {
-    std::atomic<bool>& flag;
-    core::HotStore& store;
-    ReplayGuard(std::atomic<bool>& f, core::HotStore& s) : flag(f), store(s) {}
+    HotConsumer& consumer;
+    explicit ReplayGuard(HotConsumer& c) : consumer(c) {}
     ReplayGuard(const ReplayGuard&) = delete;
     ReplayGuard& operator=(const ReplayGuard&) = delete;
     ReplayGuard(ReplayGuard&&) = delete;
     ReplayGuard& operator=(ReplayGuard&&) = delete;
-    ~ReplayGuard() {
-      flag.store(false, std::memory_order_release);
-      store.SetReplayMode(false);
-    }
+    ~ReplayGuard() { consumer.EndReplay(); }
   };
-  ReplayGuard guard(replay_mode_, store_);
+  const ReplayGuard guard(*this);
 
   // Caught up once the cursor passes target. An empty read also means caught
   // up: target was captured below the head, so a read that finds nothing at
   // the cursor proves the cursor is past it (and covers the empty queue,
   // where target 0 names no entry).
   bool caught_up = false;
+  uint64_t replayed = 0;
   while (!cancel.load(std::memory_order_acquire)) {
     if (next_read_seq_ > target) {
       caught_up = true;
@@ -206,8 +219,8 @@ core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
       caught_up = true;
       break;
     }
-    ProcessBatch(*read);
-    CheckBlockAndScanTimeout();
+    replayed += read->size();
+    ApplyReplayBatch(*read);
   }
 
   if (!caught_up) {
@@ -221,7 +234,7 @@ core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
   ABYSS_LOG_INFO("hot replay complete", {"shard", static_cast<int64_t>(config_.shard)},
                  {"highest_settled",
                   static_cast<uint64_t>(highest_settled_seq_.load(std::memory_order_acquire))});
-  return {};
+  return replayed;
 }
 
 void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
@@ -310,7 +323,7 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
     apply_notifier_.NotifyApplied(config_.shard, seq);
   }
 
-  auto wiped = store_.Wipe();
+  auto wiped = store_.Wipe(config_.shard);
   if (!wiped.has_value()) {
     counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
     ABYSS_LOG_ERROR("hot wipe failed", {"shard", static_cast<int64_t>(config_.shard)},

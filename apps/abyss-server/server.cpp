@@ -187,6 +187,7 @@ bool Server::Initialize() {
                   .checkpoint_min_interval = config_.cold_consumer.checkpoint_min_interval,
                   .loop_initial_backoff = config_.cold_consumer.loop_initial_backoff,
                   .loop_max_backoff = config_.cold_consumer.loop_max_backoff,
+                  .drain_grace = config_.cold_consumer.drain_grace,
               },
       },
       *eviction_policy_, *consumer_rpc_);

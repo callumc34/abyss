@@ -31,6 +31,11 @@ core::Result<core::RespCommand> ReadRespCommand(std::span<const std::byte>& curs
   if (!binary::ReadU32LE(cursor, arg_count)) {
     return std::unexpected(Corrupted("missing arg_count"));
   }
+  // Each arg carries at least its length, so a count the bytes cannot
+  // hold is corruption, refused before it sizes an allocation.
+  if (arg_count > cursor.size() / sizeof(uint32_t)) {
+    return std::unexpected(Corrupted("arg_count exceeds the payload"));
+  }
   core::RespCommand cmd;
   cmd.args.reserve(arg_count);
   for (uint32_t i = 0; i < arg_count; ++i) {
@@ -67,6 +72,9 @@ core::Result<Payload> DecodeResolved(std::span<const std::byte>& cursor) {
   uint32_t op_count = 0;
   if (!ReadU32LE(cursor, op_count)) {
     return std::unexpected(Corrupted("missing materialised_ops count"));
+  }
+  if (op_count > cursor.size() / sizeof(uint32_t)) {
+    return std::unexpected(Corrupted("materialised_ops count exceeds the payload"));
   }
   std::vector<core::RespCommand> mat_ops;
   mat_ops.reserve(op_count);
@@ -107,18 +115,18 @@ core::Result<Payload> DecodeResolved(std::span<const std::byte>& cursor) {
 
 }  // namespace
 
-WalEntryType TypeOf(const core::QueueEntry& entry) {
+EntryType TypeOf(const core::QueueEntry& entry) {
   return std::visit(
-      [](const auto& p) -> WalEntryType {
+      [](const auto& p) -> EntryType {
         using T = std::decay_t<decltype(p)>;
         if constexpr (std::is_same_v<T, core::entry::Write>) {
-          return WalEntryType::kWrite;
+          return EntryType::kWrite;
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-          return WalEntryType::kConditional;
+          return EntryType::kConditional;
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          return WalEntryType::kResolved;
+          return EntryType::kResolved;
         } else {
-          return WalEntryType::kFlush;
+          return EntryType::kFlush;
         }
       },
       entry.payload);
@@ -148,14 +156,14 @@ void Encode(const core::QueueEntry& entry, std::vector<std::byte>& out) {
       entry.payload);
 }
 
-core::Result<Payload> Decode(WalEntryType type, std::span<const std::byte>& cursor) {
+core::Result<Payload> Decode(EntryType type, std::span<const std::byte>& cursor) {
   switch (type) {
-    case WalEntryType::kWrite: {
+    case EntryType::kWrite: {
       auto cmd = ReadRespCommand(cursor);
       if (!cmd.has_value()) return std::unexpected(cmd.error());
       return core::entry::Write{.cmd = std::move(*cmd)};
     }
-    case WalEntryType::kConditional: {
+    case EntryType::kConditional: {
       uint16_t flags = 0;
       if (!binary::ReadU16LE(cursor, flags)) {
         return std::unexpected(Corrupted("missing predicate flags"));
@@ -167,9 +175,9 @@ core::Result<Payload> Decode(WalEntryType type, std::span<const std::byte>& curs
           .flags = static_cast<core::PredicateFlags>(flags),
       };
     }
-    case WalEntryType::kResolved:
+    case EntryType::kResolved:
       return DecodeResolved(cursor);
-    case WalEntryType::kFlush:
+    case EntryType::kFlush:
       return core::entry::Flush{};
   }
   return std::unexpected(Corrupted("unknown entry type"));

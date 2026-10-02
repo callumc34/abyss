@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,9 @@ class ColdConsumer {
     // (idle, poisoned, or unwritable). Capped exponential, reset on progress.
     std::chrono::milliseconds loop_initial_backoff{1};
     std::chrono::milliseconds loop_max_backoff{1000};
+    // How long a replay fed through ApplyReplayBatch retries one failing
+    // wipe before it gives up.
+    std::chrono::milliseconds drain_grace{15000};
     std::optional<uint64_t> rng_seed = std::nullopt;
   };
 
@@ -137,9 +141,21 @@ class ColdConsumer {
   // Synchronous replay drive. Drains entries from the queue into the buffer
   // until `target` is reached, then flushes the buffer to the cold store so
   // post-recovery reads do not hit a cold-store-on-disk that lags the WAL.
-  // Returns when caught up, cancelled, or on unrecoverable error. Must NOT
-  // be called while Start() is running on the same instance.
-  core::Result<void> ReplayUntil(core::SequenceId target, const std::atomic<bool>& cancel);
+  // Returns when caught up (with the entries it consumed), cancelled,
+  // or on unrecoverable error. Must NOT be called while Start() is
+  // running on the same instance.
+  core::Result<uint64_t> ReplayUntil(core::SequenceId target, const std::atomic<bool>& cancel);
+
+  // ReplayUntil fed by the caller, e.g. from a queue Scan; not while
+  // Start() runs. BeginReplay seeds the cursor and returns the first seq
+  // it needs; each batch must start at the cursor. A wipe that keeps
+  // failing gives up after drain_grace with an error, so a dead cold
+  // store fails recovery rather than hanging it. FinishReplay flushes
+  // the buffer and checkpoints.
+  core::Result<core::SequenceId> BeginReplay();
+  core::Result<void> ApplyReplayBatch(std::span<const core::QueueEntry> batch,
+                                      const std::atomic<bool>& cancel);
+  core::Result<void> FinishReplay(const std::atomic<bool>& cancel);
 
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
@@ -190,7 +206,7 @@ class ColdConsumer {
   core::Result<void> SeedCursor();
   // Applies `batch`, advancing the cursor and drained frontier past each
   // entry; stops at a Flush whose wipe failed. Returns entries consumed.
-  size_t ConsumeBatch(const std::vector<core::QueueEntry>& batch);
+  size_t ConsumeBatch(std::span<const core::QueueEntry> batch);
   // The reaper deleted entries above this retention consumer's persisted
   // offset: data loss, so fail-stop.
   [[noreturn]] void FailOutOfRange(core::SequenceId requested);

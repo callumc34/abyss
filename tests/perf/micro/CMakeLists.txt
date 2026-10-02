@@ -1,5 +1,5 @@
 add_executable(abyss_bench
-  wal_entry_bench.cpp
+  frame_bench.cpp
   wal_queue_bench.cpp
   recovery_bench.cpp
   eviction_policy_bench.cpp
