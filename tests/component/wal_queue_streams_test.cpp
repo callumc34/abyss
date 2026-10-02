@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -12,11 +12,14 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/consumer_rpc.h"
@@ -26,9 +29,11 @@
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "abyss/queue/append_result.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/offset_checkpoint.h"
 #include "abyss/queue/wal_queue.h"
+#include "latch.h"
 #include "on_exit.h"
 #include "temp_dir.h"
 
@@ -36,6 +41,7 @@ namespace abyss::queue {
 namespace {
 
 using namespace std::chrono_literals;
+using abyss::testing::Latch;
 
 // A few small frames per segment, past its 4 KiB header.
 constexpr size_t kTinySegment = 4096 + 512;
@@ -52,30 +58,6 @@ std::size_t FrameBytes(const core::QueueEntry& entry) {
   std::vector<std::byte> frame;
   return frame::EncodeEntry(entry, 0, frame);
 }
-
-// A latch tests open once. A wait that times out fails the test and
-// goes on, so no thread stays parked behind a failed assertion.
-class Latch {
- public:
-  void Open() {
-    {
-      const std::scoped_lock lock(mu_);
-      open_ = true;
-    }
-    cv_.notify_all();
-  }
-  bool Wait(std::chrono::milliseconds timeout = 10s) {
-    std::unique_lock lock(mu_);
-    if (cv_.wait_for(lock, timeout, [this] { return open_; })) return true;
-    ADD_FAILURE() << "latch wait timed out";
-    return false;
-  }
-
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  bool open_ = false;
-};
 
 class WalQueueStreamsTest : public ::testing::Test {
  protected:
@@ -619,6 +601,42 @@ TEST_F(WalQueueStreamsTest, ANewCommitWordOverAStaleFrameIsACleanTornTail) {
   EXPECT_EQ(Append(0, value), head);
 }
 
+// A rotation is a pointer swap to a prepared spare. With every flush
+// held, appends cross several segment ends and publish while the log
+// runs no sync; the held flushes then sync each segment.
+TEST_F(WalQueueStreamsTest, ARotationAddsNoSyncToTheAppendPath) {
+  auto config = Config(1);
+  // Flushes are held for longer than the default age bound.
+  config.durability_window = 60s;
+  OpenWith(config);
+  auto held = std::make_shared<Latch>();
+  auto entered = std::make_shared<Latch>();
+  const abyss::testing::OnExit release([held] { held->Open(); });
+  queue_->SetFlushHookForTesting([held, entered](uint32_t) -> core::Result<void> {
+    entered->Open();
+    held->Wait();
+    return {};
+  });
+
+  Append(0);
+  ASSERT_TRUE(entered->Wait());
+  const uint64_t syncs = queue_->SyncCountForTesting(0);
+  const uint64_t from = OrdinalOf(queue_->DurableExtentForTesting(0).path);
+  const size_t per_segment = (kTinySegment - 4096) / FrameBytes(MakeWrite("k0"));
+  const core::SequenceId count = (4 * per_segment) + 1;
+  for (core::SequenceId seq = 1; seq < count; ++seq) Append(0);
+  ASSERT_FALSE(HasFatalFailure());
+  EXPECT_EQ(queue_->DurableEnd(0, kAck).value(), count) << "an append did not publish";
+  EXPECT_EQ(queue_->SyncCountForTesting(0), syncs) << "the append path synced";
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
+
+  held->Open();
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, count - 1));
+  const uint64_t to = OrdinalOf(queue_->DurableExtentForTesting(0).path);
+  EXPECT_GE(to - from, 4U);
+  EXPECT_GE(queue_->SyncCountForTesting(0) - syncs, to - from) << "a held segment was not synced";
+}
+
 class WalQueueScanTest : public WalQueueStreamsTest {
  protected:
   static constexpr size_t kShards = 64;
@@ -778,6 +796,301 @@ TEST_F(WalQueueScanTest, ARangeBelowTheFirstRetainedSeqIsOutOfRange) {
       [](core::ShardId, std::vector<core::QueueEntry>&) { return core::Result<void>{}; }, cancel);
   ASSERT_FALSE(scanned.has_value());
   EXPECT_EQ(scanned.error().code(), core::ErrorCode::kOutOfRange);
+}
+
+// 16 appenders over 64 shards on one log, mixing singles and batches,
+// with 64 KiB segments and a ring that wraps many times. Per shard, one
+// reader follows the head at the ack class and one at power_loss; the
+// latter commits what both have read, so retention recycles segments
+// under load. A quarter of the way in, commits are held, and halfway a
+// Scan reads from there to the head. Threads end on counts, bounded by
+// a deadline.
+class WalQueueStressTest : public WalQueueStreamsTest {
+ protected:
+  static constexpr core::ShardId kShards = 64;
+  static constexpr size_t kAppenders = 16;
+  static constexpr uint64_t kOpsPerAppender = 2500;
+  static constexpr uint64_t kMaxBatch = 5;
+  static constexpr auto kAppendFor = 10s;
+  static constexpr auto kCatchUpFor = 4s;
+  static constexpr core::SequenceId kNoCap = std::numeric_limits<core::SequenceId>::max();
+  static constexpr uint64_t kNoId = std::numeric_limits<uint64_t>::max();
+
+  struct Appended {
+    core::ShardId shard = 0;
+    core::SequenceId seq = 0;
+    uint64_t id = 0;
+  };
+
+  // One reader's progress; the shard's other reader reads `next`.
+  struct Follower {
+    std::atomic<core::SequenceId> next{0};
+    std::vector<uint64_t> ids;
+  };
+
+  // A shard's commits, capped while the Scan holds a range.
+  struct CommitGate {
+    std::mutex mu;
+    core::SequenceId committed_end = 0;
+    core::SequenceId cap = kNoCap;
+  };
+
+  static std::string Key(core::ShardId shard) { return "s" + std::to_string(shard); }
+  // Sized by the id, so frames vary in length.
+  static std::string Value(uint64_t id) {
+    return std::to_string(id) + ":" + std::string(id % 97, 'p');
+  }
+
+  // The id an entry of `shard` carries, or nullopt if no appender wrote
+  // it.
+  static std::optional<uint64_t> IdOf(core::ShardId shard, const core::QueueEntry& entry) {
+    const auto* write = std::get_if<core::entry::Write>(&entry.payload);
+    if (write == nullptr || write->cmd.args.size() != 3 || write->cmd.args[1] != Key(shard)) {
+      return std::nullopt;
+    }
+    const std::string& value = write->cmd.args[2];
+    uint64_t id = 0;
+    const auto [end, err] = std::from_chars(value.data(), value.data() + value.size(), id);
+    if (err != std::errc{} || value != Value(id)) return std::nullopt;
+    return id;
+  }
+
+  static double SegmentsGrown() {
+    return metrics::testing::GetCounterValue(metrics::names::kWalSegmentsGrownTotal).value_or(0.0);
+  }
+};
+
+TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
+  auto config = Config(kShards);
+  config.segment_size_bytes = size_t{64} << 10;
+  config.ring_entries = 64;
+  config.retention_consumers = {core::kColdConsumer};
+  config.offset_fsync_interval = 5ms;
+  OpenWith(config);
+  const double grown_before = SegmentsGrown();
+  const auto deadline = std::chrono::steady_clock::now() + kAppendFor;
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> appended_all{false};
+  std::atomic<uint64_t> ops{0};
+  std::atomic<size_t> appending{kAppenders};
+  auto quarter = std::make_shared<Latch>();
+  auto halfway = std::make_shared<Latch>();
+  std::vector<std::vector<Appended>> appended(kAppenders);
+  // Written before appended_all is set.
+  std::vector<core::SequenceId> final_end(kShards, 0);
+  std::vector<Follower> ack(kShards);
+  std::vector<Follower> power(kShards);
+  std::vector<CommitGate> gates(kShards);
+  std::vector<std::thread> appenders;
+  std::vector<std::thread> readers;
+  const abyss::testing::OnExit join([&] {
+    stop.store(true);
+    for (auto& thread : appenders) {
+      if (thread.joinable()) thread.join();
+    }
+    for (auto& thread : readers) {
+      if (thread.joinable()) thread.join();
+    }
+  });
+
+  const auto append = [&](size_t appender) {
+    uint64_t rng = (appender + 1) * 0x9e3779b97f4a7c15ULL;
+    for (uint64_t op = 0; op < kOpsPerAppender && !stop.load(std::memory_order_relaxed) &&
+                          std::chrono::steady_clock::now() < deadline;
+         ++op) {
+      rng ^= rng << 13;
+      rng ^= rng >> 7;
+      rng ^= rng << 17;
+      const auto shard = static_cast<core::ShardId>(rng % kShards);
+      const uint64_t size = (rng >> 8) % 3 == 0 ? 1 + ((rng >> 16) % kMaxBatch) : 1;
+      std::vector<core::QueueEntry> entries;
+      entries.reserve(size);
+      for (uint64_t pos = 0; pos < size; ++pos) {
+        entries.push_back(MakeWrite(Key(shard), Value((appender << 40) | (op << 3) | pos)));
+      }
+      const auto first = [&]() -> core::Result<core::SequenceId> {
+        if (size == 1) {
+          auto appended = queue_->Append(shard, entries.front());
+          if (!appended.has_value()) return std::unexpected(appended.error());
+          return appended->seq;
+        }
+        auto appended = queue_->AppendBatch(shard, entries);
+        if (!appended.has_value()) return std::unexpected(appended.error());
+        return appended->first_seq;
+      }();
+      if (!first.has_value()) {
+        ADD_FAILURE() << "append on shard " << shard << ": " << first.error().message();
+        stop.store(true);
+        break;
+      }
+      for (uint64_t pos = 0; pos < size; ++pos) {
+        appended[appender].push_back(
+            {.shard = shard, .seq = *first + pos, .id = (appender << 40) | (op << 3) | pos});
+      }
+      const uint64_t done = ops.fetch_add(1) + 1;
+      if (done == kAppenders * kOpsPerAppender / 4) quarter->Open();
+      if (done == kAppenders * kOpsPerAppender / 2) halfway->Open();
+    }
+    if (appending.fetch_sub(1) == 1) {
+      quarter->Open();
+      halfway->Open();
+    }
+  };
+
+  const auto commit = [&](core::ShardId shard, core::SequenceId power_next) {
+    const core::SequenceId read_by_both =
+        std::min(power_next, ack[shard].next.load(std::memory_order_acquire));
+    CommitGate& gate = gates[shard];
+    const std::scoped_lock lock(gate.mu);
+    const core::SequenceId end = std::min(read_by_both, gate.cap);
+    if (end <= gate.committed_end) return;
+    if (auto committed = queue_->CommitOffset(core::kColdConsumer, shard, end - 1); !committed) {
+      ADD_FAILURE() << "commit on shard " << shard << ": " << committed.error().message();
+      stop.store(true);
+      return;
+    }
+    gate.committed_end = end;
+  };
+
+  const auto follow = [&](core::ShardId shard, core::Durability visible) {
+    Follower& self = visible == kAck ? ack[shard] : power[shard];
+    core::SequenceId next = 0;
+    const auto give_up = deadline + kCatchUpFor;
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (appended_all.load(std::memory_order_acquire) && next >= final_end[shard]) return;
+      if (std::chrono::steady_clock::now() >= give_up) {
+        ADD_FAILURE() << "shard " << shard << " reader at " << core::DurabilityName(visible)
+                      << " stuck at seq " << next;
+        return;
+      }
+      auto read = queue_->Read(shard, next, 256, 20ms, visible);
+      if (!read.has_value()) {
+        ADD_FAILURE() << "read of shard " << shard << ": " << read.error().message();
+        stop.store(true);
+        return;
+      }
+      if (read->empty()) continue;
+      // A smoke check only: the end only grows, so this catches an
+      // over-read but cannot prove none happened. The power-loss tests
+      // are the proof.
+      if (visible == core::Durability::kPowerLoss &&
+          read->back().seq >= queue_->DurableEnd(shard, visible).value()) {
+        ADD_FAILURE() << "shard " << shard << " read seq " << read->back().seq
+                      << " past its power end";
+        stop.store(true);
+        return;
+      }
+      for (const auto& entry : *read) {
+        const auto id = IdOf(shard, entry);
+        if (entry.seq != next || !id.has_value()) {
+          ADD_FAILURE() << "shard " << shard << " expected seq " << next << ", read seq "
+                        << entry.seq << (id.has_value() ? "" : " with a payload nobody wrote");
+          stop.store(true);
+          return;
+        }
+        self.ids.push_back(*id);
+        ++next;
+      }
+      self.next.store(next, std::memory_order_release);
+      if (visible == core::Durability::kPowerLoss) commit(shard, next);
+    }
+  };
+
+  appenders.reserve(kAppenders);
+  for (size_t a = 0; a < kAppenders; ++a) appenders.emplace_back(append, a);
+  readers.reserve(size_t{2} * kShards);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    readers.emplace_back(follow, shard, kAck);
+    readers.emplace_back(follow, shard, core::Durability::kPowerLoss);
+  }
+
+  // The Scan's range starts at what is committed, and commits stay
+  // below it until the Scan ends, so retention leaves it whole.
+  ASSERT_TRUE(quarter->Wait(kAppendFor + 1s));
+  std::vector<core::SequenceId> from(kShards);
+  std::vector<core::SequenceId> end(kShards);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    const std::scoped_lock lock(gates[shard].mu);
+    from[shard] = gates[shard].committed_end;
+    gates[shard].cap = from[shard];
+  }
+  ASSERT_TRUE(halfway->Wait(kAppendFor + 1s));
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    end[shard] = queue_->DurableEnd(shard, kAck).value();
+  }
+  std::vector<std::vector<uint64_t>> scanned(kShards);
+  const core::Queue::ScanSink sink = [&](core::ShardId shard,
+                                         std::vector<core::QueueEntry>& entries) {
+    for (const auto& entry : entries) {
+      const auto id = IdOf(shard, entry);
+      if (!id.has_value() || entry.seq != from[shard] + scanned[shard].size()) {
+        return core::Result<void>(std::unexpected(core::Error{
+            core::ErrorCode::kInternal, "scan of shard " + std::to_string(shard) +
+                                            " out of order at " + std::to_string(entry.seq)}));
+      }
+      scanned[shard].push_back(*id);
+    }
+    return core::Result<void>{};
+  };
+  const std::atomic<bool> cancel{false};
+  auto scan = queue_->Scan(from, end, 4, sink, cancel);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    const std::scoped_lock lock(gates[shard].mu);
+    gates[shard].cap = kNoCap;
+  }
+  ASSERT_TRUE(scan.has_value()) << scan.error().message();
+
+  for (auto& thread : appenders) thread.join();
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    final_end[shard] = queue_->DurableEnd(shard, kAck).value();
+  }
+  appended_all.store(true, std::memory_order_release);
+  for (auto& thread : readers) thread.join();
+  ASSERT_FALSE(HasFailure());
+
+  std::vector<std::vector<uint64_t>> expected(kShards);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    expected[shard].assign(final_end[shard], kNoId);
+  }
+  for (const auto& records : appended) {
+    for (const auto& record : records) {
+      ASSERT_LT(record.seq, final_end[record.shard]);
+      expected[record.shard][record.seq] = record.id;
+    }
+  }
+  uint64_t scanned_total = 0;
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    ASSERT_EQ(std::ranges::count(expected[shard], kNoId), 0) << "shard " << shard;
+    EXPECT_EQ(ack[shard].ids, expected[shard]) << "shard " << shard;
+    EXPECT_EQ(power[shard].ids, expected[shard]) << "shard " << shard;
+    ASSERT_EQ(scanned[shard].size(), end[shard] - from[shard]) << "shard " << shard;
+    EXPECT_TRUE(std::equal(scanned[shard].begin(), scanned[shard].end(),
+                           expected[shard].begin() + static_cast<std::ptrdiff_t>(from[shard])))
+        << "shard " << shard;
+    scanned_total += scanned[shard].size();
+  }
+  EXPECT_GT(scanned_total, 0U);
+
+  // Every reader at power_loss reached the head, so the log is flushed
+  // to its tail; a log that grew every segment it used recycled none.
+  const uint64_t active = OrdinalOf(queue_->DurableExtentForTesting(0).path);
+  EXPECT_LT(SegmentsGrown() - grown_before, static_cast<double>(active + 1))
+      << "no segment was recycled";
+
+  OpenWith(config);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    SCOPED_TRACE("shard " + std::to_string(shard));
+    EXPECT_EQ(queue_->DurableEnd(shard, core::Durability::kPowerLoss).value(), final_end[shard]);
+    const core::SequenceId first = queue_->FirstSeq(shard).value();
+    EXPECT_LE(first, gates[shard].committed_end) << "reclaimed past what was committed";
+    const auto entries = ReadAll(shard, first);
+    ASSERT_EQ(entries.size(), final_end[shard] - first);
+    for (const auto& entry : entries) {
+      EXPECT_EQ(IdOf(shard, entry), std::optional<uint64_t>{expected[shard][entry.seq]})
+          << "seq " << entry.seq;
+    }
+  }
 }
 
 }  // namespace
