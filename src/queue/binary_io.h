@@ -52,6 +52,20 @@ inline void PatchU32LE(std::vector<std::byte>& out, size_t offset, uint32_t v) {
   std::memcpy(out.data() + offset, &v, sizeof(v));
 }
 
+template <typename T>
+T LoadLE(const std::byte* p) noexcept {
+  T v{};
+  std::memcpy(&v, p, sizeof(v));
+  if constexpr (!kNativeLittleEndian) v = std::byteswap(v);
+  return v;
+}
+
+template <typename T>
+void StoreLE(std::byte* p, T v) noexcept {
+  if constexpr (!kNativeLittleEndian) v = std::byteswap(v);
+  std::memcpy(p, &v, sizeof(v));
+}
+
 inline bool ReadU8(std::span<const std::byte>& bytes, uint8_t& out) {
   if (bytes.empty()) {
     return false;

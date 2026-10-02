@@ -4,7 +4,11 @@ add_library(abyss_queue
   group_commit.cpp
   crc32c.cpp
   wal_entry.cpp
+  entry_payload.cpp
+  frame.cpp
+  log.cpp
   segment_header.cpp
+  segment_header_v2.cpp
   durability_window.cpp
   memory_offset_store.cpp
   offset_checkpoint.cpp

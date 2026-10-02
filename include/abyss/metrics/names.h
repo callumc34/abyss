@@ -354,6 +354,39 @@ inline constexpr CounterDesc<> kWalBackpressureRejectionsTotal{
     .help = "Appends rejected because the WAL durability window stayed full until their deadline.",
 };
 
+inline constexpr HistogramDesc<> kWalFillWaitSeconds{
+    .name = "abyss_wal_fill_wait_seconds",
+    .help =
+        "Time an append waited for earlier WAL reservations to be filled; recorded only "
+        "when it waited.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr GaugeDesc<> kWalSpareSegments{
+    .name = "abyss_wal_spare_segments",
+    .help = "WAL segments prepared ahead of the active one, across logs.",
+};
+
+inline constexpr GaugeDesc<> kWalFreeSegments{
+    .name = "abyss_wal_free_segments",
+    .help = "Reclaimed WAL segments held for reuse, across logs.",
+};
+
+inline constexpr CounterDesc<> kWalSegmentsGrownTotal{
+    .name = "abyss_wal_segments_grown_total",
+    .help = "WAL segments created and zero-filled because no reclaimed segment was free.",
+};
+
+inline constexpr CounterDesc<> kWalSpareWaitsTotal{
+    .name = "abyss_wal_spare_waits_total",
+    .help = "Appends that waited for a spare WAL segment to be prepared.",
+};
+
+inline constexpr CounterDesc<> kWalSegmentPrepareFailuresTotal{
+    .name = "abyss_wal_segment_prepare_failures_total",
+    .help = "WAL spare segment preparations that failed and will be retried.",
+};
+
 inline constexpr HistogramDesc<> kQueueOffsetPersistDurationSeconds{
     .name = "abyss_queue_offset_persist_duration_seconds",
     .help = "Duration of one durable persist of committed offsets (slot write plus fsync).",

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -87,6 +90,17 @@ class Queue {
   // Highest assigned seq on `shard`; 0 when empty.
   virtual Result<SequenceId> TailSeq(ShardId shard) = 0;
   virtual Result<QueueStats> Stats() = 0;
+
+  // Receives one shard's entries in seq order; never called concurrently
+  // for one shard. An error stops the scan and is returned from it.
+  using ScanSink = std::function<Result<void>(ShardId, std::vector<QueueEntry>&)>;
+  // Delivers every shard's entries in [from[s], end[s]) to `sink`, up to
+  // `parallelism` shards at a time; every one of them must be readable.
+  // A log-structured queue reads each log once; this default reads each
+  // shard in turn. kUnavailable once `cancel` is set.
+  virtual Result<void> Scan(std::span<const SequenceId> from, std::span<const SequenceId> end,
+                            uint32_t parallelism, const ScanSink& sink,
+                            const std::atomic<bool>& cancel);
 };
 
 }  // namespace abyss::core
