@@ -24,15 +24,18 @@ target_link_libraries(abyss_core_tests PRIVATE
 )
 
 add_executable(abyss_queue_tests
-  queue/wal_entry_test.cpp
-  queue/segment_header_test.cpp
-  queue/segment_test.cpp
+  queue/entry_payload_test.cpp
   queue/group_commit_test.cpp
   queue/offset_store_test.cpp
   queue/offset_checkpoint_test.cpp
   queue/segment_reaper_test.cpp
   queue/wal_flush_metrics_test.cpp
   queue/durability_window_test.cpp
+  queue/frame_test.cpp
+  queue/log_test.cpp
+  queue/log_stress_test.cpp
+  queue/queue_scan_test.cpp
+  queue/shard_stream_test.cpp
 )
 
 target_include_directories(abyss_queue_tests PRIVATE
@@ -221,10 +224,12 @@ target_link_libraries(abyss_admin_tests PRIVATE
 
 add_executable(abyss_engine_tests
   engine/shard_scheduler_test.cpp
+  engine/recovery_coordinator_test.cpp
 )
 
 target_link_libraries(abyss_engine_tests PRIVATE
   abyss::engine
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )
@@ -241,6 +246,8 @@ target_link_libraries(abyss_branding_tests PRIVATE
 
 add_executable(abyss_platform_tests
   platform/fs_test.cpp
+  platform/mapped_file_test.cpp
+  platform/random_test.cpp
 )
 
 target_link_libraries(abyss_platform_tests PRIVATE

@@ -121,14 +121,23 @@ TEST_F(ShardedHotStoreTest, StatsAggregated) {
 
 // --- Wipe ---
 
-TEST_F(ShardedHotStoreTest, WipeClearsAllShards) {
+TEST_F(ShardedHotStoreTest, WipeClearsOnlyItsShard) {
   for (int i = 0; i < 100; ++i) {
     SetString("key:" + std::to_string(i), "val");
   }
-  ASSERT_TRUE(store_.Wipe().has_value());
+  ASSERT_TRUE(store_.Wipe(0).has_value());
+  const auto after_one = store_.Stats();
+  ASSERT_TRUE(after_one.has_value());
+  EXPECT_LT(after_one->key_count, 100U);
+  EXPECT_GT(after_one->key_count, 0U) << "one shard's wipe cleared the others";
 
-  auto stats = store_.Stats();
-  EXPECT_EQ(stats->key_count, 0U);
+  for (core::ShardId shard = 1; shard < store_.shard_count(); ++shard) {
+    ASSERT_TRUE(store_.Wipe(shard).has_value());
+  }
+  const auto after_all = store_.Stats();
+  ASSERT_TRUE(after_all.has_value());
+  EXPECT_EQ(after_all->key_count, 0U);
+  EXPECT_FALSE(store_.Wipe(store_.shard_count()).has_value());
 }
 
 // --- Eviction ---
@@ -177,13 +186,13 @@ TEST_F(ShardedHotStoreTest, ConcurrentWriteAndRead) {
       auto key = "w:" + std::to_string(i);
       auto value = std::to_string(i);
       core::ops::StringSet op{.key = key, .value = value};
-      (void)store_.Apply(core::ops::WriteOp{op}, /*seq=*/0);
+      EXPECT_TRUE(store_.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
     }
   });
 
   std::thread reader([this]() {
     for (int i = 0; i < 200; ++i) {
-      (void)GetString("w:" + std::to_string(i));
+      [[maybe_unused]] const auto got = GetString("w:" + std::to_string(i));
     }
   });
 
@@ -198,7 +207,7 @@ TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
 
   std::thread reader([this]() {
     for (int i = 0; i < 50; ++i) {
-      (void)GetString("d:" + std::to_string(i));
+      [[maybe_unused]] const auto got = GetString("d:" + std::to_string(i));
     }
   });
 

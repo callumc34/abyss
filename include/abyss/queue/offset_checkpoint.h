@@ -77,6 +77,10 @@ class OffsetCheckpoint final : public OffsetStore {
 
   std::optional<core::SequenceId> Get(core::ConsumerId consumer,
                                       core::ShardId shard) const override;
+  // The lower of the two slots' offsets, nullopt unless both are valid:
+  // a torn or damaged newest slot falls back to the other one.
+  std::optional<core::SequenceId> ReclaimFloor(core::ConsumerId consumer,
+                                               core::ShardId shard) const override;
 
   // Persists `encoded` (one Encode()d value per consumer x shard, indexed
   // consumer-major in config order); on success it becomes what Get returns.
@@ -91,13 +95,16 @@ class OffsetCheckpoint final : public OffsetStore {
  private:
   OffsetCheckpoint(std::vector<core::ConsumerId> consumers, uint32_t shard_count,
                    platform::fs::File file, size_t active_slot, uint64_t epoch,
-                   std::span<const uint64_t> persisted);
+                   std::span<const uint64_t> persisted, std::span<const uint64_t> floor);
 
   const std::vector<core::ConsumerId> consumers_;
   const uint32_t shard_count_;
   const size_t slot_bytes_;
   // Lock-free for the reaper; advanced only after a write is durable.
   std::vector<std::atomic<uint64_t>> persisted_;
+  // Encoded, per entry: the lower of the two slots, 0 unless both hold
+  // a valid write.
+  std::vector<std::atomic<uint64_t>> floor_;
 
   mutable std::mutex write_mu_;
   platform::fs::File file_ ABYSS_GUARDED_BY(write_mu_);

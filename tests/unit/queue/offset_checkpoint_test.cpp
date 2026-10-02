@@ -140,6 +140,40 @@ TEST_F(OffsetCheckpointTest, CorruptNewestSlotFallsBackToThePreviousOne) {
   EXPECT_EQ(slot_bytes, OffsetCheckpoint::kBlockSize);
 }
 
+// Retention may reclaim only what both slots hold: the floor is the
+// lower of the two, and nothing while one slot is not a valid write.
+TEST_F(OffsetCheckpointTest, TheReclaimFloorIsWhatBothSlotsHold) {
+  const auto expect_floor = [](const OffsetCheckpoint& ckpt, const std::vector<uint64_t>& encoded) {
+    for (size_t c = 0; c < kConsumers.size(); ++c) {
+      for (uint32_t s = 0; s < kShards; ++s) {
+        EXPECT_EQ(ckpt.ReclaimFloor(kConsumers.at(c), s),
+                  OffsetCheckpoint::Decode(encoded[(c * kShards) + s]))
+            << "consumer " << kConsumers.at(c) << " shard " << s;
+      }
+    }
+  };
+  const std::vector<uint64_t> none(kConsumers.size() * kShards, 0);
+  {
+    auto ckpt = OpenOrDie();
+    ASSERT_NE(ckpt, nullptr);
+    expect_floor(*ckpt, none);
+    ASSERT_TRUE(ckpt->Write(Pattern(10)).has_value());  // epoch 2, slot 1
+    expect_floor(*ckpt, none);
+    ASSERT_TRUE(ckpt->Write(Pattern(20)).has_value());  // epoch 3, slot 0
+    expect_floor(*ckpt, Pattern(10));
+  }
+  {
+    auto reopened = OpenOrDie();
+    ASSERT_NE(reopened, nullptr);
+    expect_floor(*reopened, Pattern(10));
+  }
+  FlipByte(100);  // inside slot 0's entries
+  auto damaged = OpenOrDie();
+  ASSERT_NE(damaged, nullptr);
+  ExpectMatches(*damaged, Pattern(10));
+  expect_floor(*damaged, none);
+}
+
 TEST_F(OffsetCheckpointTest, CorruptOlderSlotIsIgnored) {
   size_t slot_bytes = 0;
   {

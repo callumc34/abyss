@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,19 +21,23 @@
 #include "abyss/core/thread_annotations.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/queue/durability_window.h"
+#include "abyss/queue/group_commit.h"
 #include "abyss/queue/offset_checkpoint.h"
 #include "abyss/queue/segment_reaper.h"
 #include "abyss/queue/segment_registry.h"
 
 namespace abyss::queue {
 
-class ShardState;
+class ShardStream;
+struct LogUnit;
 
-// Runs before each WAL data sync. May block; an error is a failed sync.
-using FlushHook = std::function<core::Result<void>(core::ShardId)>;
+// Runs in each flush of `log` after its filled-prefix snapshot, before
+// its syncs. May block; an error is a failed sync.
+using FlushHook = std::function<core::Result<void>(uint32_t log)>;
 
-// The active segment and how far into it the last flush reached.
-struct FlushedExtent {
+// Where a log's power-durable prefix ends: its segment file and the
+// file offset of that position.
+struct DurableExtent {
   std::string path;
   uint64_t offset = 0;
 };
@@ -43,10 +48,15 @@ struct WalConfig {
   // Largest single encoded entry accepted; decoupled from segment_size_bytes.
   size_t max_value_size_bytes = 67108864;
   size_t shard_count = 1;
+  // Physical logs, a power of two <= shard_count; shard s is on log
+  // s % log_count.
+  uint32_t log_count = 1;
+  // Per-shard offset ring slots, a power of two.
+  size_t ring_entries = 65536;
   // The class append futures resolve at.
   core::Durability durability = core::Durability::kProcessCrash;
-  // Bounds on published but not yet power-durable entries: bytes across
-  // shards, and the oldest entry's age per shard.
+  // Bounds on filled but not yet power-durable entries: bytes across
+  // logs, and the oldest entry's age per log.
   uint64_t durability_window_bytes = uint64_t{64} * 1024 * 1024;
   std::chrono::milliseconds durability_window{1000};
   // Admission wait for the appends that take no deadline.
@@ -104,8 +114,18 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<core::SequenceId> TailSeq(core::ShardId shard) override;
   core::Result<core::QueueStats> Stats() override;
 
-  std::vector<SegmentRegistry::SealedSegmentInfo> ListSealedSegments() const override;
-  core::Result<void> RemoveSegment(core::ShardId shard, core::SequenceId base_seq) override;
+  // A log-structured scan: one header-only walker per log feeds
+  // shard-affine decode workers. Retention is held off meanwhile.
+  core::Result<void> Scan(std::span<const core::SequenceId> from,
+                          std::span<const core::SequenceId> end, uint32_t parallelism,
+                          const ScanSink& sink, const std::atomic<bool>& cancel) override;
+
+  uint32_t LogCount() const override { return config_.log_count; }
+  std::vector<SegmentRegistry::SealedSegmentInfo> ListSealedSegments(
+      uint32_t log, std::size_t max_count) const override;
+  core::Result<void> RemoveSegment(uint32_t log, uint64_t ordinal) override;
+  // Every log's sealed segments.
+  std::vector<SegmentRegistry::SealedSegmentInfo> ListSealedSegments() const;
 
   // Persists every committed offset now, then sweeps retention. The same
   // round the background persister runs each offset_fsync_interval.
@@ -120,13 +140,14 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   uint64_t ReaperFailures() const { return reaper_failures_.load(std::memory_order_relaxed); }
 
-  // Age of the oldest segment the last sweep found eligible but could not
-  // remove; nullopt once retention reclaims everything it is allowed to.
+  // Time since the oldest segment the last sweep found eligible but
+  // could not remove was sealed; nullopt once retention reclaims
+  // everything it is allowed to.
   [[nodiscard]] std::optional<core::Duration> OldestEligibleUnreapedAge() const;
 
-  // Published bytes not yet power-durable, across shards.
+  // Filled bytes not yet power-durable, across logs.
   uint64_t UnflushedBytes() const { return window_.UnflushedBytes(); }
-  // Age bound of the oldest entry not yet power-durable, across shards.
+  // Age bound of the oldest entry not yet power-durable, across logs.
   core::Duration DurabilityLag() const;
 
   // Test seams. A fault returned here fails persist rounds like an I/O
@@ -135,15 +156,31 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void SkipFinalOffsetPersistForTesting();
   // A blocking hook stalls flushes; an error is a fatal flush failure.
   void SetFlushHookForTesting(const FlushHook& hook);
-  FlushedExtent FlushedExtentForTesting(core::ShardId shard) const;
+  DurableExtent DurableExtentForTesting(uint32_t log) const;
+  // The data syncs `log`'s flushes have run.
+  uint64_t SyncCountForTesting(uint32_t log) const;
   // Close without the final flush, as a power loss at teardown would.
   void SkipFinalFlushForTesting();
+  // Runs inside a batch append after each of its frames but the last is
+  // committed, with the count committed so far. It may block.
+  void SetBatchCommitHookForTesting(const std::function<void(std::size_t committed)>& hook);
+  // While paused, `log` prepares no spare segments.
+  void PauseSegmentPreparerForTesting(uint32_t log, bool paused);
+  // The next removal of a reclaimed segment's file in `log` fails.
+  void InjectSegmentRemoveErrorForTesting(uint32_t log, core::Error error);
+  // For tests that look at how a shard's reads locate frames.
+  const ShardStream& StreamForTesting(core::ShardId shard) const;
 
  private:
   static constexpr int64_t kNoUnreapedEpochMs = std::numeric_limits<int64_t>::min();
 
   explicit WalQueue(WalConfig config);
   core::Result<void> Initialize();
+
+  core::Result<void> OpenLogs();
+  core::Result<void> RecoverOffsets();
+  core::Result<GroupCommitter::Extent> FlushLog(LogUnit& unit);
+  void Flushed(LogUnit& unit);
 
   core::Result<void> ValidateShard(core::ShardId shard) const;
   core::SteadyTime DefaultAdmitBy() const;
@@ -155,15 +192,19 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void StopPersister();
 
   void RunReaper() ABYSS_EXCLUDES(reaper_mu_);
-  void RecordOldestEligibleUnreaped(std::optional<core::WallTime> created_at);
+  void RecordOldestEligibleUnreaped(std::optional<core::WallTime> sealed_at);
 
   WalConfig config_;
   std::atomic<bool> recovering_{true};
   std::atomic<uint64_t> reaper_failures_{0};
   std::atomic<int64_t> oldest_eligible_unreaped_epoch_ms_{kNoUnreapedEpochMs};
-  // Outlives the shards, whose commit threads release into it.
+  const uint64_t frame_space_;
+  // Outlives the logs, whose commit threads release into it.
   DurabilityWindow window_;
-  std::vector<std::unique_ptr<ShardState>> shards_;
+  std::vector<std::unique_ptr<LogUnit>> logs_;
+  std::vector<std::unique_ptr<ShardStream>> streams_;
+  std::atomic<bool> skip_final_flush_{false};
+  metrics::CounterHandle scan_bytes_;
   std::unique_ptr<OffsetCheckpoint> checkpoint_;
 
   // In-memory committed offsets, OffsetCheckpoint::Encode()d, indexed
@@ -174,6 +215,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   std::mutex persist_mu_;
   uint64_t persisted_generation_ ABYSS_GUARDED_BY(persist_mu_) = 0;
+  // The generation written to both checkpoint slots.
+  uint64_t settled_generation_ ABYSS_GUARDED_BY(persist_mu_) = 0;
   std::function<core::Result<void>()> persist_fault_ ABYSS_GUARDED_BY(persist_mu_);
   bool persist_on_close_ ABYSS_GUARDED_BY(persist_mu_) = true;
   metrics::HistogramHandle persist_duration_;
@@ -184,9 +227,11 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   bool persister_stop_ ABYSS_GUARDED_BY(persister_mu_) = false;
   std::thread persister_;
 
-  // Sweeps run from the persister and rotating appenders, one at a time.
+  // Sweeps run from the persister, one at a time, and never during a
+  // Scan.
   std::mutex reaper_mu_;
   std::unique_ptr<SegmentReaper> reaper_ ABYSS_GUARDED_BY(reaper_mu_);
+  uint32_t scans_ ABYSS_GUARDED_BY(reaper_mu_) = 0;
 };
 
 }  // namespace abyss::queue

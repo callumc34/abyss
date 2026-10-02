@@ -27,6 +27,8 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.queue.durability_window_bytes, uint64_t{64} * 1024 * 1024);
   EXPECT_EQ(defaults.queue.durability_window, std::chrono::milliseconds{1000});
   EXPECT_EQ(defaults.queue.offset_fsync_interval, std::chrono::milliseconds{1000});
+  EXPECT_EQ(defaults.queue.log_count, 1U);
+  EXPECT_EQ(defaults.queue.ring_entries, 65536U);
 
   EXPECT_GT(defaults.hot_consumer.read_batch_size, 0U);
   EXPECT_GT(defaults.hot_consumer.read_timeout.count(), 0);

@@ -77,6 +77,8 @@ core::Result<void> ParseQueue(const YamlCursor& cur, QueueConfig& out) {
       .Optional("wal_path", out.wal_path)
       .Optional("segment_size_bytes", out.segment_size_bytes)
       .Optional("max_value_size_bytes", out.max_value_size_bytes)
+      .Optional("log_count", out.log_count)
+      .Optional("ring_entries", out.ring_entries)
       .Optional("min_retention_seconds", out.min_retention)
       .Optional("offset_fsync_interval_ms", out.offset_fsync_interval)
       .Optional("durability", out.durability)

@@ -28,18 +28,21 @@
 #include "abyss/log/testing.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "abyss/queue/frame.h"
 #include "abyss/queue/offset_checkpoint.h"
-#include "abyss/queue/segment_header.h"
 #include "temp_dir.h"
-
-#ifdef _WIN32
-#include "abyss/platform/fs.h"
-#endif
+#include "wal_power_loss.h"
 
 namespace abyss::queue {
 namespace {
 
 using namespace std::chrono_literals;
+
+// Segments past their 4 KiB header: a few small frames, one frame, and
+// a couple of KiB of frames.
+constexpr size_t kTinySegment = 4096 + 512;
+constexpr size_t kOneFrameSegment = 4096 + 160;
+constexpr size_t kSmallSegment = 4096 + 2048;
 
 core::QueueEntry MakeWrite(std::vector<std::string> args) {
   core::QueueEntry e;
@@ -51,6 +54,29 @@ core::QueueEntry MakeWrite(std::vector<std::string> args) {
 std::string ValueOf(const core::QueueEntry& entry) {
   const auto* w = std::get_if<core::entry::Write>(&entry.payload);
   return w != nullptr && w->cmd.args.size() >= 3 ? w->cmd.args[2] : std::string{};
+}
+
+core::SequenceId MaxSeqOf(const SegmentRegistry::SealedSegmentInfo& segment, core::ShardId shard) {
+  for (const auto& range : segment.shards) {
+    if (range.shard == shard) return range.max_seq;
+  }
+  ADD_FAILURE() << "segment " << segment.ordinal << " holds nothing of shard " << shard;
+  return 0;
+}
+
+std::filesystem::path LogDir(const std::filesystem::path& wal_path, uint32_t log = 0) {
+  return wal_path / ("log-000" + std::to_string(log));
+}
+
+std::vector<std::filesystem::path> SegmentFiles(const std::filesystem::path& dir) {
+  std::vector<std::filesystem::path> out;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() == ".seg" && !entry.path().stem().string().starts_with("free-")) {
+      out.push_back(entry.path());
+    }
+  }
+  std::ranges::sort(out);
+  return out;
 }
 
 std::string ReadFileBytes(const std::filesystem::path& path) {
@@ -70,7 +96,7 @@ class FlushStall {
   FlushStall& operator=(FlushStall&&) = delete;
 
   FlushHook Hook() const {
-    return [state = state_](core::ShardId) -> core::Result<void> {
+    return [state = state_](uint32_t) -> core::Result<void> {
       std::unique_lock lock(state->mu);
       ++state->entered;
       state->cv.notify_all();
@@ -114,7 +140,7 @@ class WalQueueTest : public ::testing::Test {
   WalConfig DefaultConfig() const {
     return WalConfig{
         .wal_path = dir_->String(),
-        .segment_size_bytes = 4096,
+        .segment_size_bytes = 8192,
         .shard_count = 2,
         .durability = core::Durability::kPowerLoss,
         .min_retention = 1s,
@@ -137,6 +163,13 @@ class WalQueueTest : public ::testing::Test {
       ASSERT_TRUE(r.has_value()) << r.error().message();
       ASSERT_TRUE(r->durable.get().has_value());
     }
+  }
+
+  // Retention honours an offset once both checkpoint slots hold it: one
+  // round persists it, the next writes it to the other slot.
+  void PersistAndReclaim() {
+    ASSERT_TRUE(queue_->FlushOffsets().has_value());
+    ASSERT_TRUE(queue_->FlushOffsets().has_value());
   }
 
   std::filesystem::path CheckpointPath() const {
@@ -302,15 +335,15 @@ TEST_F(WalQueueTest, ReadRespectsMaxCount) {
 
 TEST_F(WalQueueTest, ReadSpansSealedAndActiveSegments) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   OpenWith(cfg);
-  AppendDurable(10);
+  AppendDurable(20);
   ASSERT_GE(queue_->ListSealedSegments().size(), 2U);
 
-  for (core::SequenceId from = 0; from < 10; ++from) {
+  for (core::SequenceId from = 0; from < 20; ++from) {
     auto read = queue_->Read(0, from, 100, 100ms, core::Durability::kProcessCrash);
     ASSERT_TRUE(read.has_value()) << read.error().message();
-    ASSERT_EQ(read->size(), 10 - from) << "from " << from;
+    ASSERT_EQ(read->size(), 20 - from) << "from " << from;
     for (size_t i = 0; i < read->size(); ++i) EXPECT_EQ((*read)[i].seq, from + i);
   }
 }
@@ -356,14 +389,14 @@ TEST_F(WalQueueTest, ReadReturnsBatchEntriesFromTheMiddle) {
 TEST_F(WalQueueTest, ReadBelowReclaimedFloorIsOutOfRange) {
   metrics::testing::Reset();
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   cfg.min_retention = 0s;
   OpenWith(cfg);
   AppendDurable(20);
 
   ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 19).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
-  ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
   const core::SequenceId first = queue_->FirstSeq(0).value();
   ASSERT_GT(first, 0U) << "nothing was reclaimed";
@@ -385,7 +418,7 @@ TEST_F(WalQueueTest, ReadBelowReclaimedFloorIsOutOfRange) {
 
 TEST_F(WalQueueTest, FirstSeqTracksTheOldestRetainedSegment) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   cfg.min_retention = 0s;
   OpenWith(cfg);
   EXPECT_EQ(queue_->FirstSeq(0).value(), 0U);
@@ -394,7 +427,7 @@ TEST_F(WalQueueTest, FirstSeqTracksTheOldestRetainedSegment) {
 
   ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 19).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
-  ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
   const core::SequenceId first = queue_->FirstSeq(0).value();
   EXPECT_GT(first, 0U);
@@ -435,6 +468,9 @@ void WalQueueTest::RunRandomReadProperty(size_t segment_bytes, size_t max_value_
       reference.push_back(value);
     }
   }
+  // Segments are sealed once the flush passes their end.
+  ASSERT_TRUE(
+      queue_->AwaitDurable(0, reference.size() - 1, core::Durability::kPowerLoss, 5s).value());
   ASSERT_GE(queue_->ListSealedSegments().size(), min_sealed);
 
   auto check_reads = [&](std::string_view phase) {
@@ -459,7 +495,8 @@ void WalQueueTest::RunRandomReadProperty(size_t segment_bytes, size_t max_value_
 }
 
 TEST_F(WalQueueTest, RandomReadsMatchReferenceAcrossManyRotations) {
-  RunRandomReadProperty(/*segment_bytes=*/2048, /*max_value_bytes=*/120, /*min_sealed=*/40);
+  RunRandomReadProperty(/*segment_bytes=*/kSmallSegment, /*max_value_bytes=*/120,
+                        /*min_sealed=*/40);
 }
 
 TEST_F(WalQueueTest, RandomReadsMatchReferenceThroughSparseIndex) {
@@ -471,7 +508,7 @@ TEST_F(WalQueueTest, RandomReadsMatchReferenceThroughSparseIndex) {
 
 TEST_F(WalQueueTest, SegmentRotationPreservesOrder) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   OpenWith(cfg);
   AppendDurable(10);
 
@@ -488,7 +525,7 @@ TEST_F(WalQueueTest, BackToBackRotationsPreserveDurability) {
   // one entry. The committer must be torn down and rebuilt per rotation
   // without losing any durability future.
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 140;
+  cfg.segment_size_bytes = kOneFrameSegment;
   OpenWith(cfg);
 
   constexpr int kWrites = 32;
@@ -560,28 +597,21 @@ TEST_F(WalQueueTest, RecoveryPreservesEntries) {
 }
 
 TEST_F(WalQueueTest, MissingMiddleSegmentRejectedAsCorruption) {
-  // ADP-009 invariant 8: base_seq[i+1] == last_seq[i] + 1. Deleting a middle
-  // segment must surface as corruption on Open rather than silently producing
-  // a gap in the sequence space that consumers would read across.
+  // Segment ordinals are contiguous. Deleting a middle segment must
+  // surface as corruption on Open rather than silently producing a gap
+  // in the log that consumers would read across.
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
 
   {
     OpenWith(cfg);
-    AppendDurable(10);
+    AppendDurable(20);
     queue_.reset();
   }
 
-  // Find and delete a middle (non-first, non-last) segment file.
-  const auto shard_dir = dir_->Path() / "shard-0000";
-  std::vector<std::filesystem::path> seg_paths;
-  for (const auto& entry : std::filesystem::directory_iterator(shard_dir)) {
-    if (entry.path().extension() == ".log") seg_paths.push_back(entry.path());
-  }
-  std::ranges::sort(seg_paths);
-  ASSERT_GE(seg_paths.size(), 3U);
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays)
-  std::filesystem::remove(seg_paths[seg_paths.size() / 2]);
+  const auto segments = SegmentFiles(LogDir(dir_->Path()));
+  ASSERT_GE(segments.size(), 5U);
+  std::filesystem::remove(segments[1]);
 
   auto result = WalQueue::Open(cfg);
   ASSERT_FALSE(result.has_value());
@@ -590,7 +620,7 @@ TEST_F(WalQueueTest, MissingMiddleSegmentRejectedAsCorruption) {
 
 TEST_F(WalQueueTest, RecoveryAcrossRotation) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
 
   {
     OpenWith(cfg);
@@ -635,120 +665,10 @@ TEST_F(WalQueueTest, ReopenSetsBothDurableEndsToHead) {
     EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 2).has_value());
     const auto records = logs.Records();
     EXPECT_TRUE(std::ranges::any_of(records, [](const log::testing::CapturedRecord& r) {
-      return r.msg == "recovered WAL tail synced";
+      return r.msg == "WAL log recovered";
     }));
     queue_.reset();
   }
-}
-
-// A crash between creating the newest segment and syncing its header
-// leaves an empty or short file; reopening redoes the creation.
-TEST_F(WalQueueTest, ReopenRecoversFromAbortedSegmentCreation) {
-  for (const size_t stub_bytes : {size_t{0}, size_t{10}, kSegmentHeaderSize}) {
-    SCOPED_TRACE(stub_bytes);
-    std::filesystem::remove_all(dir_->Path());
-    std::filesystem::create_directories(dir_->Path());
-    OpenWith(DefaultConfig());
-    for (int i = 0; i < 3; ++i) {
-      ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
-    }
-    queue_.reset();
-
-    const auto stub = dir_->Path() / "shard-0000" / "00000000000000000003.log";
-    {
-      std::ofstream out(stub, std::ios::binary);
-      out << std::string(stub_bytes, '\0');
-    }
-    OpenWith(DefaultConfig());
-    EXPECT_EQ(queue_->TailSeq(0).value(), 2U);
-    auto next = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
-    ASSERT_TRUE(next.has_value());
-    EXPECT_EQ(next->seq, 3U);
-    auto read = queue_->Read(0, 0, 10, core::Duration{0}, core::Durability::kProcessCrash);
-    ASSERT_TRUE(read.has_value());
-    EXPECT_EQ(read->size(), 4U);
-    queue_.reset();
-  }
-}
-
-// After a power loss the previous segment's unsynced tail can be gone
-// while the aborted segment's name survives: recreate at the recovered
-// tail, not at the name, since the lost seqs were never durable.
-TEST_F(WalQueueTest, AbortedCreationAfterLostTailResumesAtRecoveredTail) {
-  OpenWith(DefaultConfig());
-  for (int i = 0; i < 3; ++i) {
-    ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
-  }
-  queue_.reset();
-  const auto shard_dir = dir_->Path() / "shard-0000";
-  const auto first = shard_dir / "00000000000000000000.log";
-  std::filesystem::resize_file(first, std::filesystem::file_size(first) - 3);
-  {
-    std::ofstream out(shard_dir / "00000000000000000003.log", std::ios::binary);
-  }
-
-  const log::testing::CapturingSink logs;
-  OpenWith(DefaultConfig());
-  EXPECT_EQ(queue_->TailSeq(0).value(), 1U);
-  auto next = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
-  ASSERT_TRUE(next.has_value());
-  EXPECT_EQ(next->seq, 2U);
-  const auto records = logs.Records();
-  EXPECT_TRUE(std::ranges::any_of(records, [](const log::testing::CapturedRecord& r) {
-    return r.msg == "unsynced WAL tail lost before an aborted segment creation";
-  }));
-}
-
-// If the lost tail empties the previous segment, that segment already
-// starts at the recovered seq and becomes the active one again.
-TEST_F(WalQueueTest, AbortedCreationAfterEmptiedSegmentReopensIt) {
-  OpenWith(DefaultConfig());
-  for (int i = 0; i < 2; ++i) {
-    ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
-  }
-  queue_.reset();
-  const auto shard_dir = dir_->Path() / "shard-0000";
-  std::filesystem::resize_file(shard_dir / "00000000000000000000.log", kSegmentHeaderSize + 3);
-  {
-    std::ofstream out(shard_dir / "00000000000000000002.log", std::ios::binary);
-  }
-
-  OpenWith(DefaultConfig());
-  auto next = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
-  ASSERT_TRUE(next.has_value());
-  EXPECT_EQ(next->seq, 0U);
-  EXPECT_FALSE(std::filesystem::exists(shard_dir / "00000000000000000002.log"));
-}
-
-// With older segments reaped, the stub's name is the only record of the
-// base, so the recreated segment keeps it.
-TEST_F(WalQueueTest, AbortedCreationAsOnlySegmentKeepsItsNamedBase) {
-  const auto shard_dir = dir_->Path() / "shard-0000";
-  std::filesystem::create_directories(shard_dir);
-  {
-    std::ofstream out(shard_dir / "00000000000000000005.log", std::ios::binary);
-  }
-  OpenWith(DefaultConfig());
-  auto next = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
-  ASSERT_TRUE(next.has_value());
-  EXPECT_EQ(next->seq, 5U);
-}
-
-// Only the newest segment can be a torn creation; a short older segment
-// is corruption.
-TEST_F(WalQueueTest, ShortOlderSegmentIsStillCorruption) {
-  OpenWith(DefaultConfig());
-  ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
-  queue_.reset();
-  const auto shard_dir = dir_->Path() / "shard-0000";
-  std::filesystem::resize_file(shard_dir / "00000000000000000000.log", 10);
-  {
-    std::ofstream out(shard_dir / "00000000000000000001.log", std::ios::binary);
-    out << std::string(kSegmentHeaderSize, '\0');
-  }
-  auto reopened = WalQueue::Open(DefaultConfig());
-  ASSERT_FALSE(reopened.has_value());
-  EXPECT_EQ(reopened.error().code(), core::ErrorCode::kCorruption);
 }
 
 // Commits are gated on the power-durable log, so a persisted offset past
@@ -760,9 +680,13 @@ TEST_F(WalQueueTest, OffsetBeyondRecoveredHeadIsCorruption) {
     std::filesystem::create_directories(dir_->Path());
     auto cfg = DefaultConfig();
     cfg.durability = durability;
+    DurableExtent lost_from;
     {
       OpenWith(cfg);
-      for (int i = 0; i < 4; ++i) {
+      AppendDurable(1);
+      ASSERT_TRUE(queue_->AwaitDurable(0, 0, core::Durability::kPowerLoss, 5s).value());
+      lost_from = queue_->DurableExtentForTesting(0);
+      for (int i = 0; i < 3; ++i) {
         ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
       }
       ASSERT_TRUE(queue_->AwaitDurable(0, 3, core::Durability::kPowerLoss, 5s).value());
@@ -770,8 +694,8 @@ TEST_F(WalQueueTest, OffsetBeyondRecoveredHeadIsCorruption) {
       ASSERT_TRUE(queue_->FlushOffsets().has_value());
       queue_.reset();
     }
-    const auto segment = dir_->Path() / "shard-0000" / "00000000000000000000.log";
-    std::filesystem::resize_file(segment, kSegmentHeaderSize);
+    // Damage that takes synced frames with it.
+    testing::SimulatePowerLoss(lost_from);
 
     auto refused = WalQueue::Open(cfg);
     ASSERT_FALSE(refused.has_value());
@@ -796,7 +720,7 @@ TEST_F(WalQueueTest, ReopenedEmptyShardHasNothingDurable) {
 // appends that rotate further keep advancing it.
 TEST_F(WalQueueTest, ReopenWatermarkCoversSealedSegmentsAndTail) {
   auto first = DefaultConfig();
-  first.segment_size_bytes = 200;
+  first.segment_size_bytes = kTinySegment;
   first.durability = core::Durability::kProcessCrash;
   {
     OpenWith(first);
@@ -807,13 +731,14 @@ TEST_F(WalQueueTest, ReopenWatermarkCoversSealedSegmentsAndTail) {
   }
 
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   OpenWith(cfg);
   const auto sealed = queue_->ListSealedSegments();
   ASSERT_FALSE(sealed.empty());
   ASSERT_EQ(queue_->TailSeq(0).value(), 9U);
   EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 10U);
-  EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, sealed.front().last_seq).has_value());
+  EXPECT_TRUE(
+      queue_->CommitOffset(core::kColdConsumer, 0, MaxSeqOf(sealed.front(), 0)).has_value());
   EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 9).has_value());
 
   const size_t sealed_before = sealed.size();
@@ -833,7 +758,8 @@ TEST_F(WalQueueTest, StatsReflectsState) {
   auto stats = queue_->Stats();
   ASSERT_TRUE(stats.has_value());
   EXPECT_EQ(stats->total_entries, 10U);
-  EXPECT_GT(stats->total_bytes, 0U);
+  // The active segment and its two spares, all fixed-size files.
+  EXPECT_EQ(stats->total_bytes, 3U * 8192);
   EXPECT_EQ(stats->head_seq, 5U);
   EXPECT_EQ(stats->first_seq, 0U);
 }
@@ -1000,33 +926,38 @@ TEST_F(WalQueueTest, CrashResumesFromLastPersistedOffset) {
 }
 
 // The reaper reclaims only below PERSISTED offsets. An in-memory commit
-// past a segment must not let a rotation-triggered sweep delete it: a
-// crash would then resume below a deleted segment.
+// past a segment must not let a sweep delete it: a crash would then
+// resume below a deleted segment.
 TEST_F(WalQueueTest, ReaperHonoursPersistedNotCommittedOffsets) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   cfg.min_retention = 0s;
   OpenWith(cfg);
-  AppendDurable(10);
+  AppendDurable(20);
 
   ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 2).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 2).has_value());
-  ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
   ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 9).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 9).has_value());
 
-  // Rotations run the reaper against the persisted offset (2), not 9.
+  // A persist that fails sweeps nothing, whatever was committed.
+  queue_->SetOffsetPersistFaultForTesting([] {
+    return core::Result<void>(std::unexpected(core::Error{core::ErrorCode::kInternal, "EIO"}));
+  });
   AppendDurable(10);
+  EXPECT_FALSE(queue_->FlushOffsets().has_value());
   const auto sealed = queue_->ListSealedSegments();
   for (const auto& s : sealed) {
-    EXPECT_GT(s.last_seq, 2U) << "a segment the persisted offset released was kept";
+    EXPECT_GT(MaxSeqOf(s, 0), 2U) << "a segment the persisted offset released was kept";
   }
-  EXPECT_TRUE(std::ranges::any_of(sealed, [](const auto& s) { return s.last_seq <= 9; }))
+  EXPECT_TRUE(std::ranges::any_of(sealed, [](const auto& s) { return MaxSeqOf(s, 0) <= 9; }))
       << "a segment only the in-memory commit released was reclaimed";
 
-  ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  queue_->SetOffsetPersistFaultForTesting(nullptr);
+  ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
   for (const auto& s : queue_->ListSealedSegments()) {
-    EXPECT_GT(s.last_seq, 9U) << "persisted 9 now releases older segments";
+    EXPECT_GT(MaxSeqOf(s, 0), 9U) << "persisted 9 now releases older segments";
   }
 }
 
@@ -1154,7 +1085,7 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
 // below the reclaimed floor gets kOutOfRange and rejoins at FirstSeq.
 TEST_F(WalQueueTest, ConcurrentReadersSurviveRotationAndReaping) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 2048;
+  cfg.segment_size_bytes = kSmallSegment;
   cfg.shard_count = 1;
   cfg.min_retention = 0s;
   cfg.retention_consumers = {core::kColdConsumer};
@@ -1221,7 +1152,7 @@ TEST_F(WalQueueTest, ConcurrentReadersSurviveRotationAndReaping) {
 
 TEST_F(WalQueueTest, LaggingConsumerKeepsOldSegmentsAlive) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   cfg.min_retention = 0s;  // retention window doesn't interfere.
   OpenWith(cfg);
   AppendDurable(20);
@@ -1243,7 +1174,7 @@ TEST_F(WalQueueTest, LaggingConsumerKeepsOldSegmentsAlive) {
 
 TEST_F(WalQueueTest, PersistedCommitAcrossRotationReclaimsOldSegments) {
   auto cfg = DefaultConfig();
-  cfg.segment_size_bytes = 200;
+  cfg.segment_size_bytes = kTinySegment;
   cfg.min_retention = 0s;
   OpenWith(cfg);
   AppendDurable(20);
@@ -1256,6 +1187,9 @@ TEST_F(WalQueueTest, PersistedCommitAcrossRotationReclaimsOldSegments) {
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
   EXPECT_EQ(queue_->ListSealedSegments().size(), sealed_before.size())
       << "reclaimed before the commit was persisted";
+  ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  EXPECT_EQ(queue_->ListSealedSegments().size(), sealed_before.size())
+      << "reclaimed before both checkpoint slots held the commit";
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
 
   auto sealed_after = queue_->ListSealedSegments();
@@ -1381,48 +1315,50 @@ TEST_F(WalQueueTest, TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace) {
   EXPECT_EQ(rpc.PendingCount(), 0U);
 }
 
+// The closing frame of a batch never reached the disk, though the ones
+// before it did: recovery drops the whole batch.
 TEST_F(WalQueueTest, AppendBatchCrashMidBatchLosesWholeBatch) {
-  OpenWith(DefaultConfig());
+  auto cfg = DefaultConfig();
+  cfg.durability = core::Durability::kProcessCrash;
+  OpenWith(cfg);
+  AppendDurable(2);
 
   std::vector<core::QueueEntry> batch;
   batch.reserve(5);
-  for (int i = 0; i < 5; ++i) {
-    batch.push_back(MakeWrite({"SET", "k", std::to_string(i)}));
-  }
+  for (int i = 0; i < 5; ++i) batch.push_back(MakeWrite({"SET", "k", std::to_string(i)}));
   auto r = queue_->AppendBatch(0, batch);
   ASSERT_TRUE(r.has_value());
-
-  // Truncate the segment mid-batch before reopening. This models the crash:
-  // some of the batch's bytes hit disk, the closing entry did not.
   queue_.reset();
-  const auto shard_dir = dir_->Path() / "shard-0000";
-  std::string segment_path;
-  for (const auto& entry : std::filesystem::directory_iterator(shard_dir)) {
-    if (entry.path().extension() == ".log") {
-      segment_path = entry.path().string();
-      break;
-    }
+
+  // Every frame of this one shard is consecutive from the first
+  // segment's first frame; zero the batch's last commit word.
+  uint64_t offset = 4096;
+  std::vector<core::QueueEntry> written;
+  written.reserve(7);
+  for (int i = 0; i < 2; ++i) written.push_back(MakeWrite({"SET", "key", std::string(20, 'x')}));
+  for (const auto& entry : batch) written.push_back(entry);
+  for (std::size_t i = 0; i + 1 < written.size(); ++i) {
+    std::vector<std::byte> frame;
+    offset += frame::EncodeEntry(written[i], 0, frame);
   }
-  ASSERT_FALSE(segment_path.empty());
+  const auto segments = SegmentFiles(LogDir(dir_->Path()));
+  ASSERT_FALSE(segments.empty());
+  {
+    std::fstream file(segments.front(), std::ios::in | std::ios::out | std::ios::binary);
+    file.seekp(static_cast<std::streamoff>(offset));
+    const std::string zeros(frame::kCommitBytes, '\0');
+    file.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    ASSERT_TRUE(file.good());
+  }
 
-#ifdef _WIN32
-  auto f = abyss::platform::fs::Open(segment_path, {.mode = abyss::platform::fs::OpenMode::kWrite});
-  ASSERT_TRUE(f.has_value());
-  auto size = abyss::platform::fs::FileSize(*f);
-  ASSERT_TRUE(size.has_value());
-  ASSERT_TRUE(abyss::platform::fs::Ftruncate(*f, *size / 3).has_value());
-#else
-  struct stat st{};
-  ASSERT_EQ(::stat(segment_path.c_str(), &st), 0);
-  // Cut the file somewhere inside the mid-batch entries so the closing
-  // entry at seq 4 cannot be recovered.
-  ASSERT_EQ(::truncate(segment_path.c_str(), st.st_size / 3), 0);
-#endif
-
-  OpenWith(DefaultConfig());
+  OpenWith(cfg);
+  EXPECT_EQ(queue_->TailSeq(0).value(), 1U);
   auto read = queue_->Read(0, 0, 100, 50ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
-  EXPECT_TRUE(read->empty());
+  EXPECT_EQ(read->size(), 2U);
+  auto next = queue_->Append(0, MakeWrite({"SET", "k", "after"}));
+  ASSERT_TRUE(next.has_value());
+  EXPECT_EQ(next->seq, 2U);
 }
 
 // A stalled device: what each class shows while the flush cannot finish.
@@ -1566,28 +1502,31 @@ TEST_F(WalQueueTest, ValueLargerThanTheWindowIsAdmittedWhenEmpty) {
   }
 }
 
-TEST_F(WalQueueTest, FlushedExtentTracksTheLastFlush) {
+TEST_F(WalQueueTest, DurableExtentTracksTheLastFlush) {
   auto cfg = DefaultConfig();
   cfg.segment_size_bytes = size_t{1} << 20;
   cfg.durability = core::Durability::kProcessCrash;
   OpenWith(cfg);
   AppendDurable(1);
   ASSERT_TRUE(queue_->AwaitDurable(0, 0, core::Durability::kPowerLoss, 5s).value());
-  const auto flushed = queue_->FlushedExtentForTesting(0);
-  EXPECT_EQ(std::filesystem::file_size(flushed.path), flushed.offset);
+  const auto flushed = queue_->DurableExtentForTesting(0);
+  std::vector<std::byte> frame;
+  const std::size_t size =
+      frame::EncodeEntry(MakeWrite({"SET", "key", std::string(20, 'x')}), 0, frame);
+  EXPECT_EQ(flushed.offset, 4096 + size);
+  EXPECT_TRUE(std::filesystem::exists(flushed.path));
 
   const FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
   AppendDurable(2);
   ASSERT_TRUE(stall.AwaitEntered());
-  const auto stalled = queue_->FlushedExtentForTesting(0);
+  const auto stalled = queue_->DurableExtentForTesting(0);
   EXPECT_EQ(stalled.path, flushed.path);
   EXPECT_EQ(stalled.offset, flushed.offset);
-  EXPECT_GT(std::filesystem::file_size(stalled.path), stalled.offset);
 }
 
-// The commit thread cannot unwind a throwing fatal capture, so these run
-// in a child process.
+// The commit thread cannot unwind a throwing fatal capture, so this
+// runs in a child process.
 TEST_F(WalQueueTest, FlushFailureIsFatal) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   auto cfg = DefaultConfig();
@@ -1595,40 +1534,13 @@ TEST_F(WalQueueTest, FlushFailureIsFatal) {
   EXPECT_DEATH(
       {
         OpenWith(cfg);
-        queue_->SetFlushHookForTesting([](core::ShardId) -> core::Result<void> {
+        queue_->SetFlushHookForTesting([](uint32_t) -> core::Result<void> {
           return std::unexpected(core::Error{core::ErrorCode::kInternal, "injected EIO"});
         });
         ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
         std::this_thread::sleep_for(10s);
       },
       "WAL flush failed: injected EIO");
-}
-
-TEST_F(WalQueueTest, SealFailureDuringRotationIsFatal) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  auto cfg = DefaultConfig();
-  cfg.durability = core::Durability::kProcessCrash;
-  EXPECT_DEATH(
-      {
-        OpenWith(cfg);
-        // The commit thread's flush parks in the first call; every later
-        // call is a rotation's seal, and fails.
-        auto calls = std::make_shared<std::atomic<int>>(0);
-        queue_->SetFlushHookForTesting([calls](core::ShardId) -> core::Result<void> {
-          if (calls->fetch_add(1) == 0) {
-            for (;;) std::this_thread::sleep_for(1s);
-          }
-          return std::unexpected(core::Error{core::ErrorCode::kInternal, "injected EIO"});
-        });
-        ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
-        while (calls->load() == 0) std::this_thread::sleep_for(1ms);
-        for (int i = 0; i < 1000; ++i) {
-          ASSERT_TRUE(
-              queue_->Append(0, MakeWrite({"SET", "k", std::string(100, 'x')})).has_value());
-        }
-        std::this_thread::sleep_for(10s);
-      },
-      "WAL segment seal failed on shard 0: injected EIO");
 }
 
 }  // namespace

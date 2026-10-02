@@ -2,9 +2,9 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-05-03
+**Updated:** 2026-10-02
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Recovery flushes the retained log before replay, so the power-durable watermark is known; step 1 below already describes this. The resolver replay phase is removed, because the log records decided effects that replay applies without re-deciding (Phase 2). Until then the process below is current.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Recovery flushes the retained log before replay, so the power-durable watermark is known. Cold and hot replay through one demultiplexing scan of each log (Phase 1c). Steps 1 and 3 below already describe both. The resolver replay phase is removed, because the log records decided effects that replay applies without re-deciding (Phase 2). Until then the process below is current.
 
 ## Context
 
@@ -20,9 +20,12 @@ Phase 1 has three consumers: the Resolver ([ADP-011](011-conditional-writes-and-
 Pod starts
   │
   ├─ 1. Open the queue (synchronous self-recovery)
-  │     The embedded WAL backend scans segments, validates per-entry CRCs,
-  │     truncates a torn tail, flushes the recovered tail so every retained
-  │     entry is power-durable, and loads the committed-offset checkpoint.
+  │     The embedded WAL backend scans each log once, demultiplexing frames
+  │     into per-shard streams. It CRC-verifies the segments that can hold
+  │     unflushed bytes, ends the log at the first unfilled or torn frame,
+  │     drops an incomplete trailing batch, seals the recovered tail with
+  │     a padding frame, syncs so every retained entry is power-durable,
+  │     and loads the committed-offset checkpoint.
   │     Both durable ends start at the recovered head, so replaying recovered
   │     entries never waits on a flush; only entries replay itself appends
   │     (the resolver's re-emitted Resolveds) wait for their power
@@ -44,12 +47,16 @@ Pod starts
   │     pre-crash decision had the original Resolved fsynced.
   │     Phase surfaces as kResolverReplay.
   │
-  ├─ 3. Recapture targets and run cold + hot replay in parallel
+  ├─ 3. Recapture targets and replay cold + hot in one scan
   │     Resolver replay may have extended the tail with new Resolved entries.
-  │     The coordinator re-captures TailSeq(s) per shard so cold and hot drain
-  │     through every entry, including those just emitted. For each shard,
-  │     ColdConsumer::ReplayUntil(target) and HotConsumer::ReplayUntil(target)
-  │     are submitted concurrently via the scheduler.
+  │     The coordinator captures each shard's end after it, so cold and hot
+  │     drain through every entry, including those just emitted. One
+  │     Queue::Scan per log, from min(FirstSeq, cold commit + 1) to that
+  │     end, delivers each shard's entries in order, never concurrently
+  │     for one shard; the sink hands those at or above FirstSeq to hot
+  │     and those above cold's commit to cold. The retained log is read
+  │     about once. A trailing per-shard ReplayUntil must find nothing
+  │     and warns if it does.
   │     - Cold absorbs entries into its compaction buffer, periodically
   │       flushing if the buffer crosses high-water, then drains the buffer
   │       to disk before declaring its shard done. Block-and-scan handles
@@ -100,14 +107,15 @@ Resolver replay completes before cold and hot. Cold and hot run **in parallel**,
 Rationale:
 
 - **Resolver before cold/hot.** Cold and hot consume `Resolved` entries via block-and-scan; a dangling Conditional whose Resolved hasn't yet been emitted would block them indefinitely. The resolver's replay re-emits any such Resolveds before cold/hot start, eliminating the dependency. Replaying the resolver first also re-warms its existence cache so post-recovery conditional writes do not pay cold-lookup latency on keys the resolver knew about pre-crash.
-- **Cold and hot in parallel.** The LOADING gate prevents client reads during the entire recovery; therefore no consistency hole exists between "hot caught up" and "cold caught up" while the gate is closed. Running them sequentially would roughly double recovery wall time for no observable benefit. The gate flips off only after both pools' per-shard ReplayUntil have completed.
+- **Cold and hot together.** The LOADING gate prevents client reads during the entire recovery; therefore no consistency hole exists between "hot caught up" and "cold caught up" while the gate is closed. Running them sequentially would roughly double recovery wall time for no observable benefit. The gate flips off only after the scan and both consumers' drains have completed.
+- **One scan, not per-shard reads.** In one log carrying every shard, frames are small and interleaved, so every page holds many shards' frames. Per-shard reads would read the whole retained log once per wave of `replay_parallelism` shards. Hot replays from each shard's first retained entry, and cold's commit can trail by up to its buffer's deadline, so both cover most of the log. The scan's walker reads headers only and hands per-shard batches of positions to decode workers, shard `s` always to worker `s mod replay_parallelism`. Hand-off is bounded in batch size and distance behind the walker, so decoding stays inside the walker's page-cache window.
 
 ### Replay Implementation
 
 `engine::RecoveryCoordinator` owns the phase state machine. It depends on:
 
 - `core::Queue` — to capture per-shard `TailSeq`, `FirstSeq` and each retention consumer's `CommittedOffset`.
-- `consumer::ResolverPool` / `ColdConsumerPool` / `HotConsumerPool` — to dispatch per-shard `ReplayForRecovery` / `ReplayUntil`.
+- `consumer::ResolverPool` / `ColdConsumerPool` / `HotConsumerPool` — to dispatch per-shard `ReplayForRecovery`, and to apply the scan's batches.
 - `engine::ShardScheduler` — abstract over per-shard work dispatch. Phase 1 ships `BoundedThreadShardScheduler`; the per-core / Seastar implementation in Phase 4 will plug into the same interface.
 
 Each consumer exposes a synchronous per-shard replay primitive:
@@ -115,10 +123,12 @@ Each consumer exposes a synchronous per-shard replay primitive:
 | Consumer | Method | Termination signal |
 |----------|--------|--------------------|
 | `Resolver` | `ReplayForRecovery(cancel)` | Queue read returns empty AND no dangling conditionals remain |
-| `ColdConsumer` | `ReplayUntil(target, cancel)` | Its read position passes `target`, then the buffer drains to the cold store |
-| `HotConsumer` | `ReplayUntil(target, cancel)` | Its read position passes `target` |
+| `ColdConsumer` | `ApplyReplayBatch` per scan batch, then `FinishReplay(cancel)` | The scan reaches the shard's end, then the buffer drains to the cold store |
+| `HotConsumer` | `ApplyReplayBatch` per scan batch | The scan reaches the shard's end |
 
-Cancellation is observable end-to-end: `Server::Run` passes the SIGTERM-backed `std::atomic<bool>` to `RecoveryCoordinator::Run`, which propagates it to every `ReplayUntil` / `ReplayForRecovery`. A cancel mid-replay returns `kUnavailable`, the server logs it, calls `Shutdown`, and exits non-zero. /ready stays 503 until the process restarts.
+Both keep `ReplayUntil(target, cancel)` for queues without a log, and as the trailing safety net. A cold wipe that keeps failing during the scan gives up after `cold_consumer.drain_grace_seconds` and fails recovery, rather than hanging every shard on its worker.
+
+Cancellation is observable end-to-end: `Server::Run` passes the SIGTERM-backed `std::atomic<bool>` to `RecoveryCoordinator::Run`, which propagates it to the scan and every `ReplayUntil` / `ReplayForRecovery`. A cancel mid-replay returns `kUnavailable`, the server logs it, calls `Shutdown`, and exits non-zero. /ready stays 503 until the process restarts.
 
 ### Configuration
 

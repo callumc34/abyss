@@ -50,7 +50,7 @@ class ShardedHotStore : public core::HotStore {
   core::HotKeyPresence Probe(std::string_view key) override;
   void SetReplayMode(bool replaying) override;
   core::Result<core::MemoryStats> Stats() override;
-  core::Result<void> Wipe() override;
+  core::Result<void> Wipe(core::ShardId shard) override;
 
   // Refreshes the deadline for every buffered access, using the per-key
   // eviction cached on each Entry at Apply time. See ADP-002 §Eviction.

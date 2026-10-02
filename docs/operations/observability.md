@@ -8,9 +8,10 @@
 - `abyss_cold_op_duration_seconds{cmd="..."}` — cold store operation latency per command
 - `abyss_buffer_op_duration_seconds{cmd="..."}` — compaction buffer read latency per command
 - `abyss_resp_request_duration_seconds{cmd="..."}` — end-to-end request latency per command
-- `abyss_wal_flush_duration_seconds` — duration of one WAL group-commit flush (fdatasync on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This is the device floor that `power_loss` acknowledgements and cold persistence wait on. Segment create and seal flushes and offset persists are not included. Flushes per write is `rate(abyss_wal_flush_duration_seconds_count[1m]) / rate(abyss_queue_appended_total[1m])`. Near 1.0 under concurrent load, flushes are not batching.
+- `abyss_wal_flush_duration_seconds` — duration of one WAL group-commit flush (fdatasync on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This is the device floor that `power_loss` acknowledgements and cold persistence wait on. It includes the walk that advances each shard's durable end after the sync. Segment preparation and offset persists are not included. Flushes per write is `rate(abyss_wal_flush_duration_seconds_count[1m]) / rate(abyss_queue_appended_total[1m])`. Near 1.0 under concurrent load, flushes are not batching.
 - `abyss_queue_offset_persist_duration_seconds` — duration of one durable persist of committed consumer offsets. The rate of persists (`_count`) shows how much flush capacity offset bookkeeping consumes.
 - `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. A failed flush terminates the process, so both histograms record successful flushes only.
+- `abyss_wal_fill_wait_seconds` — time an append waited for earlier reservations in its log to be filled before it could be acknowledged. Recorded only when the wait outlasted a short spin (about 2 µs), so it counts the waits behind a large value or a preempted filler (the head-of-line effect the blob lane, #162, removes), not a neighbour mid-copy.
 
 ### RESP Frontend
 
@@ -35,6 +36,10 @@
 - `abyss_wal_backpressure_rejections_total` — appends rejected after waiting `engine.write_timeout` for the durability window
 - `abyss_queue_offset_persist_failures_total` — committed-offset checkpoint writes that failed; retried on the next round
 - `abyss_queue_read_out_of_range_total` — queue reads below the first retained entry
+- `abyss_wal_spare_waits_total` — appends that found no prepared segment ready and waited for one (a full disk, or the preparer behind)
+- `abyss_wal_segment_prepare_failures_total` — attempts to prepare a spare segment that failed and will be retried. A rising rate is the direct signal of a full or failing WAL volume, ahead of appends waiting.
+- `abyss_wal_segments_grown_total` — segments created by zero-filling rather than recycled. It rises during warm-up and whenever retention pins more segments than the free pool holds.
+- `abyss_wal_scan_bytes_total` — log bytes walked by recovery scans. A hot and cold rebuild should read about the retained log once.
 - `abyss_cold_flush_total{status="success|failure"}` — cold consumer flush operations
 - `abyss_cold_flush_reason_total{reason="quiet|deadline|pressure"}` — flush trigger reason
 - `abyss_cold_flush_batch_size` (histogram) — number of keys per flush batch
@@ -71,10 +76,14 @@ Gauges:
 - `abyss_cold_disk_bytes` — cold store disk usage
 - `abyss_cold_keys` — number of keys in cold store
 - `abyss_queue_depth` — number of entries in queue
-- `abyss_queue_disk_bytes` — queue WAL disk usage
+- `abyss_queue_disk_bytes` — queue WAL disk usage: retained, active, spare and free-pool segments
 - `abyss_wal_unflushed_bytes` — WAL bytes published but not yet power-durable, across shards. Bounded by `queue.durability_window_bytes`; under `process_crash` this is what a power loss would lose.
-- `abyss_wal_durability_lag_seconds` — age of the oldest WAL entry not yet power-durable, worst shard. Bounded by `queue.durability_window_ms`.
+- `abyss_wal_durability_lag_seconds` — age bound of the oldest WAL entry not yet power-durable, worst log. Bounded by `queue.durability_window_ms`.
 - Both are set each snapshot interval by the metrics snapshotter, from the current time on its own thread, so they keep rising while a flush is stalled. They read 0 until recovery has finished.
+- `abyss_wal_spare_segments` — prepared segments ready for the next rotation, summed over logs. Two per log is healthy; zero means appends will wait at the next rotation.
+- `abyss_wal_free_segments` — reclaimed segments waiting to be recycled, summed over logs (at most two per log).
+- `abyss_wal_index_bytes` — memory held by the per-shard sparse indexes (about 0.025% of the retained WAL).
+- `abyss_wal_ring_bytes` — memory held by the per-shard offset rings, allocated at start: 16 bytes × `queue.ring_entries` × shard count. The `WAL opened` log line states the same figure.
 - `abyss_cold_buffer_entries` — number of keys in compaction buffer
 - `abyss_cold_buffer_bytes` — estimated memory usage of compaction buffer
 
@@ -296,6 +305,7 @@ class FlushEngine {
 - `increase(abyss_wal_backpressure_rejections_total[5m]) > 0` — writes are failing because the WAL device cannot flush fast enough to keep acknowledged-but-not-power-durable data inside the durability window. Check `abyss_wal_flush_duration_seconds` and the volume's IOPS limit.
 
 ### Warning
+- `abyss_wal_spare_segments == 0` for more than a minute, or `increase(abyss_wal_spare_waits_total[5m]) > 0` — appends are waiting for a WAL segment. Check free space on the WAL volume and, during warm-up, whether the write rate exceeds about half the volume's bandwidth (`abyss_wal_segments_grown_total` rising).
 
 - `abyss_cold_buffer_oldest_entry_age_seconds > (default_eviction * 0.8)` — cold consumer is approaching the danger zone.
 - `abyss_wal_durability_lag_seconds > 0.5 * durability_window_ms / 1000` — the WAL is flushing slower than it should. Under `process_crash` the power-loss exposure is growing, and writes will start to wait when the lag reaches the window.
@@ -306,5 +316,5 @@ class FlushEngine {
 - `increase(abyss_queue_offset_persist_failures_total[5m]) > 0` — the committed-offset checkpoint could not be written. Persisted offsets stay where they were, so the next restart replays further and retention cannot advance; nothing acknowledged is lost. Check the WAL volume for space and I/O errors.
 - A pod restarting repeatedly (Kubernetes `CrashLoopBackOff`) after a CRITICAL `fatal invariant breach; terminating` log line means an unrecoverable invariant breach. The process aborts deliberately, so no metric survives to be scraped; the log line names the cause. A retention consumer reading below the first retained WAL entry is one such breach: entries above its persisted offset were reclaimed, so the process stops instead of skipping data, and the line names the consumer, shard and positions. `abyss_queue_read_out_of_range_total` counts the out-of-range reads a live process survives, which are hot-consumer resets to the oldest entry, expected after a restart.
 - `increase(abyss_queue_reaper_failures_total[15m]) > 0` — the segment reaper could not delete a sealed segment it was entitled to reclaim. One failure is usually a transient filesystem error and the reaper retries; a sustained rate means WAL disk will grow without bound even though every retention consumer's persisted committed offset is past those segments. Check filesystem permissions and free inodes on the WAL volume. Pair this with the age gauge below — failures alone do not say how much reclamation is being lost.
-- `abyss_queue_oldest_eligible_unreaped_age_seconds > 3 * min_retention_seconds` — a segment has been eligible for reclamation for far longer than the retention floor and is still on disk. This is the symptom that matters for disk exhaustion; the failure counter above is the cause. If this climbs while the failure counter is flat, the reaper is not running at all rather than failing.
+- `abyss_queue_oldest_eligible_unreaped_age_seconds > 3 * min_retention_seconds` — a segment has been eligible for reclamation for far longer than the retention floor and is still on disk. This is the symptom that matters for disk exhaustion; the failure counter above is one cause. Reclamation is oldest-first per log, so if this climbs while the failure counter is flat, an earlier segment is pinned: some shard on that log has a retention consumer (cold or the resolver) whose persisted offset is not moving. Find it from per-shard consumer lag and the poison counters before restarting anything; a restart does not unpin it.
 - `increase(abyss_cold_unsupported_op_total[1h]) > 0` — the log contains write entries this build has no parser for. Live traffic cannot produce these (see [failure-modes.md](failure-modes.md) §poison quarantine), so a non-zero value means the data directory carries entries from a binary with a wider command surface: a downgrade, a mixed-version rollout, or a restore from a newer node. Those writes are absent from both tiers. Treat as a correctness investigation, not a capacity one.

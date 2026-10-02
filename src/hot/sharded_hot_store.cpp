@@ -1,5 +1,6 @@
 #include "abyss/hot/sharded_hot_store.h"
 
+#include <string>
 #include <utility>
 
 #include "abyss/core/ops.h"
@@ -156,11 +157,14 @@ core::Result<core::MemoryStats> ShardedHotStore::Stats() ABYSS_NO_THREAD_SAFETY_
   return total;
 }
 
-core::Result<void> ShardedHotStore::Wipe() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  for (auto& shard : shards_) {
-    std::unique_lock lock(shard->mutex);
-    shard->store.Wipe();
+core::Result<void> ShardedHotStore::Wipe(core::ShardId shard) {
+  if (shard >= shards_.size()) {
+    return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument,
+                                       "hot shard " + std::to_string(shard) + " out of range"});
   }
+  Shard& target = *shards_[shard];
+  const std::unique_lock lock(target.mutex);
+  target.store.Wipe();
   return {};
 }
 

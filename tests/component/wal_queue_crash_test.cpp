@@ -25,14 +25,30 @@
 
 #ifndef _WIN32
 
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <fstream>
+#include <future>
+#include <span>
 #include <sstream>
+#include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/platform/fs.h"
+#include "abyss/platform/mapped_file.h"
+#include "abyss/queue/append_result.h"
 #include "abyss/queue/wal_queue.h"
 #include "crash_harness.h"
 #include "durability_printer.h"
@@ -45,6 +61,10 @@ namespace {
 #ifdef _WIN32
 
 TEST(WalCrashTest, ConfirmedWritesSurviveKillNine) {
+  GTEST_SKIP() << "out-of-process crash simulation is POSIX-only";
+}
+
+TEST(WalCrashTest, AcknowledgedWritesOnEveryShardSurviveKillNine) {
   GTEST_SKIP() << "out-of-process crash simulation is POSIX-only";
 }
 
@@ -78,7 +98,7 @@ core::QueueEntry MakeWrite(std::vector<std::string> args) {
 WalConfig VictimConfig(const std::filesystem::path& dir, core::Durability durability) {
   return WalConfig{
       .wal_path = dir.string(),
-      .segment_size_bytes = 4096,
+      .segment_size_bytes = 8192,
       .shard_count = 1,
       .durability = durability,
       .min_retention = 1s,
@@ -143,6 +163,158 @@ void RunVictim(core::Durability durability) {
 
 TEST(WalCrashVictim, ProcessCrash) { RunVictim(core::Durability::kProcessCrash); }
 TEST(WalCrashVictim, PowerLoss) { RunVictim(core::Durability::kPowerLoss); }
+
+// 64 shards on one log, 64 KiB segments so the kill lands among
+// rotations and rolls, and 8 appenders each spreading singles and
+// batches over every shard. Each appender records the highest seq it
+// was acknowledged on each shard in a MAP_SHARED file, whose dirty
+// pages outlive the SIGKILL in the page cache. Acknowledged is the
+// append returning at process_crash, its future resolving at
+// power_loss.
+constexpr core::ShardId kShards = 64;
+constexpr size_t kAppenders = 8;
+constexpr size_t kMaxBatch = 5;
+constexpr const char* kAckedFile = "acked.slots";
+constexpr size_t kAckedSlots = kAppenders * kShards;
+// Some 40 segments in; the kill lands soon after.
+constexpr uint64_t kReadyAfterOps = 20000;
+// Bounds a victim whose kill is late.
+constexpr uint64_t kMaxOpsPerAppender = 250000;
+// Unresolved power_loss futures an appender holds before it waits.
+constexpr size_t kAwaitWindow = 32;
+constexpr auto kAwaitTimeout = 10s;
+
+const char* ShardsVictimFilter(core::Durability durability) {
+  return durability == core::Durability::kPowerLoss ? "WalCrashVictim.ShardsPowerLoss"
+                                                    : "WalCrashVictim.ShardsProcessCrash";
+}
+
+WalConfig ShardsConfig(const std::filesystem::path& dir, core::Durability durability) {
+  return WalConfig{
+      .wal_path = dir.string(),
+      .segment_size_bytes = size_t{64} << 10,
+      .shard_count = kShards,
+      .ring_entries = 4096,
+      .durability = durability,
+      .min_retention = 1s,
+      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+  };
+}
+
+// Slot appender * kShards + shard: that appender's highest acknowledged
+// seq on the shard plus one, or zero.
+class AckedSlots {
+ public:
+  explicit AckedSlots(const std::filesystem::path& path) {
+    auto file = platform::fs::Open(
+        path, {.mode = platform::fs::OpenMode::kReadWrite, .create = true, .truncate = true});
+    if (!file.has_value()) return;
+    if (!platform::fs::Ftruncate(*file, kAckedSlots * sizeof(uint64_t)).has_value()) return;
+    auto map = platform::fs::MappedFile::Map(*file, kAckedSlots * sizeof(uint64_t));
+    if (!map.has_value()) return;
+    map_ = std::move(*map);
+    slots_ = {reinterpret_cast<uint64_t*>(map_.data()), kAckedSlots};
+  }
+
+  bool ok() const { return !slots_.empty(); }
+
+  void Record(size_t appender, core::ShardId shard, core::SequenceId seq) {
+    std::atomic_ref<uint64_t>(slots_[(appender * kShards) + shard])
+        .store(seq + 1, std::memory_order_relaxed);
+  }
+
+ private:
+  platform::fs::MappedFile map_;
+  std::span<uint64_t> slots_;
+};
+
+// Batch members carry {appender, op} in the key and pos/size in the
+// value, so the parent can tell a whole batch from part of one.
+std::vector<core::QueueEntry> MakeOp(size_t appender, uint64_t op, size_t size) {
+  std::vector<core::QueueEntry> entries;
+  entries.reserve(size);
+  const std::string key = "a" + std::to_string(appender) + "_" + std::to_string(op);
+  for (size_t pos = 0; pos < size; ++pos) {
+    entries.push_back(MakeWrite({"SET", key, std::to_string(pos) + "/" + std::to_string(size)}));
+  }
+  return entries;
+}
+
+struct Unsettled {
+  core::ShardId shard = 0;
+  core::SequenceId last = 0;
+  DurabilityFuture durable;
+};
+
+// Returns when its ops run out, an append fails, or a future stays
+// unresolved for kAwaitTimeout; the parent kills it long before.
+void RunShardsAppender(WalQueue& queue, size_t appender, AckedSlots& acked,
+                       std::atomic<uint64_t>& ops, const std::filesystem::path& dir) {
+  uint64_t rng = (appender + 1) * 0x9e3779b97f4a7c15ULL;
+  std::deque<Unsettled> unsettled;
+  const auto settle = [&](bool wait) {
+    while (!unsettled.empty()) {
+      Unsettled& front = unsettled.front();
+      if (front.durable.wait_for(wait ? kAwaitTimeout : 0s) != std::future_status::ready) {
+        return !wait;
+      }
+      if (!front.durable.get().has_value()) return false;
+      acked.Record(appender, front.shard, front.last);
+      unsettled.pop_front();
+      wait = false;
+    }
+    return true;
+  };
+  for (uint64_t op = 0; op < kMaxOpsPerAppender; ++op) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    const auto shard = static_cast<core::ShardId>(rng % kShards);
+    const size_t size = (rng >> 8) % 3 == 0 ? 1 + ((rng >> 16) % kMaxBatch) : 1;
+    const auto entries = MakeOp(appender, op, size);
+    if (size == 1) {
+      auto appended = queue.Append(shard, entries.front());
+      if (!appended.has_value()) return;
+      unsettled.push_back({shard, appended->seq, std::move(appended->durable)});
+    } else {
+      auto appended = queue.AppendBatch(shard, entries);
+      if (!appended.has_value()) return;
+      unsettled.push_back({shard, appended->last_seq, std::move(appended->durable)});
+    }
+    if (!settle(unsettled.size() > kAwaitWindow)) return;
+    if (ops.fetch_add(1, std::memory_order_relaxed) + 1 == kReadyAfterOps) {
+      testing::SignalReady(dir, kReadyFile, "");
+    }
+  }
+}
+
+void RunShardsVictim(core::Durability durability) {
+  bool is_victim = false;
+  const auto dir = testing::VictimDirFromEnv(kVictimDirEnv, &is_victim);
+  if (!is_victim) {
+    GTEST_SKIP() << "crash victim; driven out-of-process by WalCrashTest";
+  }
+  AckedSlots acked(dir / kAckedFile);
+  ASSERT_TRUE(acked.ok());
+  auto queue = WalQueue::Open(ShardsConfig(dir, durability));
+  ASSERT_TRUE(queue.has_value()) << queue.error().message();
+
+  std::atomic<uint64_t> ops{0};
+  std::vector<std::thread> appenders;
+  appenders.reserve(kAppenders);
+  for (size_t a = 0; a < kAppenders; ++a) {
+    appenders.emplace_back([&, a] { RunShardsAppender(**queue, a, acked, ops, dir); });
+  }
+  for (auto& appender : appenders) appender.join();
+  // Exiting before the ready marker fails the parent at once.
+  ASSERT_GE(ops.load(), kReadyAfterOps) << "the appenders stopped early";
+  for (;;) {
+    ::pause();
+  }
+}
+
+TEST(WalCrashVictim, ShardsProcessCrash) { RunShardsVictim(core::Durability::kProcessCrash); }
+TEST(WalCrashVictim, ShardsPowerLoss) { RunShardsVictim(core::Durability::kPowerLoss); }
 
 class WalCrashTest : public ::testing::TestWithParam<core::Durability> {
  protected:
@@ -221,6 +393,85 @@ TEST_P(WalCrashTest, ConfirmedWritesSurviveKillNine) {
   EXPECT_EQ(batch_entries % kBatchSize, 0U)
       << "recovery exposed a partial AppendBatch (" << batch_entries
       << " batch entries is not a multiple of " << kBatchSize << ")";
+}
+
+// Every append acknowledged before the kill survives on its shard; each
+// shard's log is contiguous from FirstSeq and holds only whole batches.
+TEST_P(WalCrashTest, AcknowledgedWritesOnEveryShardSurviveKillNine) {
+  const auto outcome = testing::SpawnAndKillVictim(testing::VictimSpec{
+      .gtest_filter = ShardsVictimFilter(GetParam()),
+      .dir_env_var = kVictimDirEnv,
+      .dir = tmp_dir_,
+      .ready_file_name = kReadyFile,
+      .ready_deadline = 20s,
+  });
+  ASSERT_TRUE(outcome.error.empty()) << outcome.error;
+  ASSERT_TRUE(outcome.reached_ready) << "crash victim never reached its ready point";
+  ASSERT_TRUE(outcome.died_by_signal);
+  EXPECT_EQ(outcome.term_signal, SIGKILL);
+
+  std::vector<uint64_t> slots(kAckedSlots, 0);
+  {
+    std::ifstream in(tmp_dir_ / kAckedFile, std::ios::binary);
+    in.read(reinterpret_cast<char*>(slots.data()),
+            static_cast<std::streamsize>(slots.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(in.good()) << "the acknowledged slots are unreadable";
+  }
+  std::vector<core::SequenceId> acked_end(kShards, 0);
+  uint64_t acked_shards = 0;
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    for (size_t a = 0; a < kAppenders; ++a) {
+      acked_end[shard] = std::max(acked_end[shard], slots[(a * kShards) + shard]);
+    }
+    if (acked_end[shard] > 0) ++acked_shards;
+  }
+  ASSERT_EQ(acked_shards, kShards) << "the victim was killed before every shard was acknowledged";
+
+  auto queue = WalQueue::Open(ShardsConfig(tmp_dir_, GetParam()));
+  ASSERT_TRUE(queue.has_value()) << queue.error().message();
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    SCOPED_TRACE("shard " + std::to_string(shard));
+    const core::SequenceId first = (*queue)->FirstSeq(shard).value();
+    ASSERT_EQ(first, 0U) << "nothing was committed, so nothing may be reclaimed";
+    const core::SequenceId end = (*queue)->DurableEnd(shard, core::Durability::kPowerLoss).value();
+    // Open synced the recovered log, so it is all power-durable.
+    ASSERT_EQ(end, (*queue)->TailSeq(shard).value() + 1);
+    EXPECT_GE(end, acked_end[shard]) << "recovery lost an acknowledged write";
+
+    core::SequenceId next = first;
+    std::string open_batch;
+    size_t batch_size = 0;
+    size_t batch_pos = 0;
+    while (next < end) {
+      auto read = (*queue)->Read(shard, next, 4096, 0ms, core::Durability::kPowerLoss);
+      ASSERT_TRUE(read.has_value()) << read.error().message();
+      ASSERT_FALSE(read->empty()) << "seq " << next << " is below the end but unreadable";
+      for (const auto& entry : *read) {
+        ASSERT_EQ(entry.seq, next) << "a gap or duplicate in the recovered log";
+        ++next;
+        const auto* write = std::get_if<core::entry::Write>(&entry.payload);
+        ASSERT_NE(write, nullptr);
+        ASSERT_EQ(write->cmd.args.size(), 3U);
+        const std::string& key = write->cmd.args[1];
+        const std::string& value = write->cmd.args[2];
+        const size_t slash = value.find('/');
+        ASSERT_NE(slash, std::string::npos) << value;
+        const size_t pos = std::stoul(value.substr(0, slash));
+        const size_t size = std::stoul(value.substr(slash + 1));
+        if (batch_pos == batch_size) {
+          ASSERT_EQ(pos, 0U) << "seq " << entry.seq << " starts inside a batch";
+          open_batch = key;
+          batch_size = size;
+          batch_pos = 0;
+        }
+        ASSERT_EQ(key, open_batch) << "seq " << entry.seq << " interleaves two batches";
+        ASSERT_EQ(pos, batch_pos);
+        ASSERT_EQ(size, batch_size);
+        ++batch_pos;
+      }
+    }
+    EXPECT_EQ(batch_pos, batch_size) << "recovery exposed part of batch " << open_batch;
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(Durability, WalCrashTest,
