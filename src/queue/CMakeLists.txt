@@ -7,7 +7,7 @@ add_library(abyss_queue
   segment_header.cpp
   fsync_policy.cpp
   memory_offset_store.cpp
-  file_offset_store.cpp
+  offset_checkpoint.cpp
   segment_reaper.cpp
   shard_state.cpp
   pending_append.cpp

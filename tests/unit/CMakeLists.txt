@@ -14,6 +14,7 @@ add_executable(abyss_core_tests
   core/slot_shard_map_test.cpp
   core/topology_manifest_test.cpp
   core/atomic_file_test.cpp
+  core/fatal_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
@@ -27,6 +28,7 @@ add_executable(abyss_queue_tests
   queue/segment_test.cpp
   queue/group_commit_test.cpp
   queue/offset_store_test.cpp
+  queue/offset_checkpoint_test.cpp
   queue/segment_reaper_test.cpp
   queue/wal_flush_metrics_test.cpp
 )

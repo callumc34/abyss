@@ -149,7 +149,7 @@ class HttpTestClient {
 #ifdef _WIN32
         if (WSAGetLastError() == WSAEINTR) continue;
 #else
-        if (errno == EINTR) continue;
+        if (n < 0 && errno == EINTR) continue;
 #endif
         return false;
       }

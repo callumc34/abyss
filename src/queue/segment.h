@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -13,6 +15,37 @@
 #include "abyss/queue/segment_header.h"
 
 namespace abyss::queue {
+
+// Sparse (seq, file offset) points, one per kIntervalBytes of entry bytes.
+// Fixed capacity, one writer (the appender, under the append lock);
+// readers acquire the published count and search without a lock.
+class SegmentIndex {
+ public:
+  static constexpr size_t kIntervalBytes = size_t{64} * 1024;
+
+  struct Point {
+    core::SequenceId seq = 0;
+    size_t offset = 0;
+  };
+
+  // Enough points for `max_bytes` of segment at one per interval.
+  explicit SegmentIndex(size_t max_bytes);
+
+  // Writer only. Records `seq` at `offset` once an interval has passed.
+  void MaybeRecord(core::SequenceId seq, size_t offset);
+  // Before publication only. Drops points at or past `end_offset`.
+  void TrimTo(size_t end_offset);
+
+  // Largest point with seq <= `seq`; nullopt if none.
+  std::optional<Point> Floor(core::SequenceId seq) const;
+  size_t size() const { return count_.load(std::memory_order_acquire); }
+
+ private:
+  // Sized once; never reallocated, so readers may index below count_.
+  std::vector<Point> points_;
+  std::atomic<size_t> count_{0};
+  size_t last_offset_ = kSegmentHeaderSize;
+};
 
 // Single WAL segment file on disk.
 class Segment {
@@ -57,6 +90,7 @@ class Segment {
   size_t write_offset() const { return write_offset_.load(std::memory_order_acquire); }
   size_t max_size() const { return max_size_; }
   size_t entry_count() const { return entry_count_; }
+  size_t index_size() const { return index_->size(); }
   size_t SpaceRemaining() const {
     const size_t offset = write_offset_.load(std::memory_order_acquire);
     return max_size_ > offset ? max_size_ - offset : 0;
@@ -64,7 +98,8 @@ class Segment {
 
  private:
   Segment(std::string path, SegmentHeader header, size_t max_size, platform::fs::File file,
-          size_t write_offset, core::SequenceId next_seq, size_t entry_count);
+          size_t write_offset, core::SequenceId next_seq, size_t entry_count,
+          std::unique_ptr<SegmentIndex> index);
 
   std::string path_;
   SegmentHeader header_;
@@ -77,6 +112,7 @@ class Segment {
   std::atomic<core::SequenceId> next_seq_{0};
   size_t entry_count_ = 0;
   bool sealed_ = false;
+  std::unique_ptr<SegmentIndex> index_;
 };
 
 }  // namespace abyss::queue

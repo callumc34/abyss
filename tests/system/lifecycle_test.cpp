@@ -65,7 +65,7 @@ TEST_F(LifecycleTest, LifecycleGaugeReportsServing) {
 
 // G6: a graceful SIGTERM shutdown drains the in-memory cold compaction buffer
 // to durable storage before stopping, so the data survives a graceful restart
-// (and the cold ack advanced, bounding replay). The fixture's RestartServer()
+// (and the cold commit advanced, bounding replay). The fixture's RestartServer()
 // delivers SIGTERM, which exercises the full drain path end-to-end.
 TEST_F(LifecycleDataTest, ColdBufferSurvivesGracefulRestart) {
   constexpr int kKeys = 300;

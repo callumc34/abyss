@@ -23,6 +23,7 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.queue.backend, "builtin_wal");
   EXPECT_EQ(defaults.queue.fsync_policy, "group_commit");
   EXPECT_GT(defaults.queue.group_commit_interval_us, 0U);
+  EXPECT_EQ(defaults.queue.offset_fsync_interval, std::chrono::milliseconds{1000});
 
   EXPECT_GT(defaults.hot_consumer.read_batch_size, 0U);
   EXPECT_GT(defaults.hot_consumer.read_timeout.count(), 0);

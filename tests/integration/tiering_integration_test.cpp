@@ -188,12 +188,14 @@ TEST_F(TieringIntegrationTest, ColdHitTtlPreservedInPromotionCommand) {
   auto read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ttl_key"}));
   ASSERT_TRUE(read.has_value());
   ASSERT_TRUE(promoted.has_value());
+  // NOLINTBEGIN(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
   ASSERT_GE(promoted->args.size(), 5U);
   EXPECT_EQ(promoted->args[0], "SET");
   EXPECT_EQ(promoted->args[1], "ttl_key");
   EXPECT_EQ(promoted->args[2], "v");
   EXPECT_EQ(promoted->args[3], "PXAT");
   EXPECT_EQ(promoted->args[4], std::to_string(abs_ttl_ms));
+  // NOLINTEND(bugprone-unchecked-optional-access)
 }
 
 TEST_F(TieringIntegrationTest, ColdDeleteRemovesKey) {
@@ -230,7 +232,7 @@ TEST_F(TieringIntegrationTest, DrainFlushPersistsWriteToColdStoreAfterQuietWindo
           },
   });
 
-  EXPECT_CALL(harness_.Queue(), Read(core::kColdConsumer, ::testing::_, ::testing::_, ::testing::_))
+  EXPECT_CALL(harness_.Queue(), Read(kShard, ::testing::_, ::testing::_, ::testing::_))
       .WillOnce(::testing::Return(entries))
       .WillRepeatedly(::testing::Return(std::vector<core::QueueEntry>{}));
 
@@ -270,7 +272,7 @@ TEST_F(TieringIntegrationTest, TenThousandWritesToSameKeyProduceOneColdWrite) {
     });
   }
 
-  EXPECT_CALL(harness_.Queue(), Read(core::kColdConsumer, ::testing::_, ::testing::_, ::testing::_))
+  EXPECT_CALL(harness_.Queue(), Read(kShard, ::testing::_, ::testing::_, ::testing::_))
       .WillOnce(::testing::Return(entries))
       .WillRepeatedly(::testing::Return(std::vector<core::QueueEntry>{}));
 

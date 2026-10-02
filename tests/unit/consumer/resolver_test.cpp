@@ -19,6 +19,7 @@
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
+#include "fatal_capture.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"
 
@@ -72,8 +73,8 @@ class ResolverTest : public ::testing::Test {
   // calls return empty (terminating the replay scan).
   void StubQueueReadOnce(std::vector<core::QueueEntry> entries) {
     auto remaining = std::make_shared<std::vector<core::QueueEntry>>(std::move(entries));
-    EXPECT_CALL(queue_, Read(core::kResolverConsumer, 0, _, _))
-        .WillRepeatedly([remaining](core::ConsumerId, core::ShardId, size_t,
+    EXPECT_CALL(queue_, Read(0, _, _, _))
+        .WillRepeatedly([remaining](core::ShardId, core::SequenceId, size_t,
                                     core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
           if (remaining->empty()) return std::vector<core::QueueEntry>{};
           auto out = std::move(*remaining);
@@ -112,27 +113,34 @@ class ResolverTest : public ::testing::Test {
     return appended_;
   }
 
-  void StubQueueAck() {
-    EXPECT_CALL(queue_, Ack(_, _, _)).WillRepeatedly(Return(core::Result<void>{}));
+  void StubQueueCommit() {
+    EXPECT_CALL(queue_, CommitOffset(_, _, _)).WillRepeatedly(Return(core::Result<void>{}));
   }
 
-  // Captures the highest acked seq for kResolverConsumer. Fail-closed: an Ack
-  // past durable_seq_ returns kFailedPrecondition (mirrors the real WAL gate),
-  // so a clamp bug surfaces as a rejected ack rather than silent success.
-  void StubQueueAckCapture() {
-    EXPECT_CALL(queue_, Ack(core::kResolverConsumer, 0, _))
+  // Captures the highest committed seq for kResolverConsumer and serves it
+  // back from CommittedOffset. Fail-closed: a commit past durable_seq_
+  // returns kFailedPrecondition (mirrors the real WAL gate), so a clamp bug
+  // surfaces as a rejected commit rather than silent success.
+  void StubQueueCommitCapture() {
+    EXPECT_CALL(queue_, CommitOffset(core::kResolverConsumer, 0, _))
         .WillRepeatedly(
             [this](core::ConsumerId, core::ShardId, core::SequenceId seq) -> core::Result<void> {
               if (seq > durable_seq_.load()) {
-                return std::unexpected(
-                    core::Error(core::ErrorCode::kFailedPrecondition, "ack past durable (test)"));
+                return std::unexpected(core::Error(core::ErrorCode::kFailedPrecondition,
+                                                   "commit past durable (test)"));
               }
-              auto cur = acked_seq_.load();
-              while (seq > cur && !acked_seq_.compare_exchange_weak(cur, seq)) {
+              auto cur = committed_seq_.load();
+              while (seq > cur && !committed_seq_.compare_exchange_weak(cur, seq)) {
               }
-              ack_called_.store(true);
+              commit_called_.store(true);
               return core::Result<void>{};
             });
+    EXPECT_CALL(queue_, CommittedOffset(core::kResolverConsumer, 0))
+        .WillRepeatedly([this](core::ConsumerId,
+                               core::ShardId) -> core::Result<std::optional<core::SequenceId>> {
+          if (!commit_called_.load()) return std::nullopt;
+          return committed_seq_.load();
+        });
   }
 
   // Drives DurableSeq/AwaitDurable off the test-controlled durable_seq_ so a
@@ -191,8 +199,8 @@ class ResolverTest : public ::testing::Test {
   // max() = "everything durable" so tests not exercising durability are
   // unaffected (matches MockQueue's permissive default).
   std::atomic<core::SequenceId> durable_seq_{std::numeric_limits<core::SequenceId>::max()};
-  std::atomic<core::SequenceId> acked_seq_{0};
-  std::atomic<bool> ack_called_{false};
+  std::atomic<core::SequenceId> committed_seq_{0};
+  std::atomic<bool> commit_called_{false};
   // Tests never cancel — pass to ReplayForRecovery to satisfy the API.
   std::atomic<bool> cancel_{false};
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -201,7 +209,7 @@ class ResolverTest : public ::testing::Test {
 TEST_F(ResolverTest, SetnxOnAbsentKeyDecidesApply) {
   StubQueueReadOnce({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // Cold returns "key absent": Exists=0, StringGet=Null.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
@@ -222,7 +230,7 @@ TEST_F(ResolverTest, SetnxOnAbsentKeyDecidesApply) {
 TEST_F(ResolverTest, SetnxOnPresentKeyDecidesSkip) {
   StubQueueReadOnce({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // Cold says key exists.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(1)));
 
@@ -240,7 +248,7 @@ TEST_F(ResolverTest, SetnxOnPresentKeyDecidesSkip) {
 TEST_F(ResolverTest, SetXxOnAbsentKeyDecidesSkipReturnsNull) {
   StubQueueReadOnce({MakeConditional(20, {"SET", "k", "v", "XX"}, core::PredicateFlags::kXx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -257,7 +265,7 @@ TEST_F(ResolverTest, MsetnxAtomicSkipsAllIfAnyExist) {
   StubQueueReadOnce(
       {MakeConditional(30, {"MSETNX", "a", "1", "b", "2"}, core::PredicateFlags::kMsetNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // Cold says key 'b' exists by returning Integer(1) for any Exists call —
   // MSETNX requires all-absent, so any present key triggers Skip.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(1)));
@@ -274,7 +282,7 @@ TEST_F(ResolverTest, MsetnxAtomicSkipsAllIfAnyExist) {
 TEST_F(ResolverTest, ColdTimeoutDecidesSkipWithError) {
   StubQueueReadOnce({MakeConditional(40, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _))
       .WillRepeatedly(
           Return(std::unexpected(core::Error{core::ErrorCode::kTimeout, "cold deadline elapsed"})));
@@ -297,8 +305,8 @@ class ResolverRunTest : public ResolverTest {
  protected:
   void StubQueueReadRepeating(std::vector<core::QueueEntry> entries) {
     auto remaining = std::make_shared<std::vector<core::QueueEntry>>(std::move(entries));
-    EXPECT_CALL(queue_, Read(core::kResolverConsumer, 0, _, _))
-        .WillRepeatedly([remaining](core::ConsumerId, core::ShardId, size_t,
+    EXPECT_CALL(queue_, Read(0, _, _, _))
+        .WillRepeatedly([remaining](core::ShardId, core::SequenceId, size_t,
                                     core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
           if (remaining->empty()) return std::vector<core::QueueEntry>{};
           auto out = std::move(*remaining);
@@ -315,7 +323,7 @@ TEST_F(ResolverRunTest, ConditionalApplyTimeoutReturnsError) {
   config_.hot_apply_wait = std::chrono::milliseconds{30};
   StubQueueReadRepeating({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
   // Register the client RPC the engine would have registered for the write.
@@ -339,7 +347,7 @@ TEST_F(ResolverRunTest, ConditionalAppliesThenSucceedsHappyPath) {
   config_.hot_apply_wait = std::chrono::milliseconds{1000};
   StubQueueReadRepeating({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
   auto client = rpc_.Register(core::MakeRpcId(0, 10));
@@ -372,7 +380,7 @@ TEST_F(ResolverRunTest, StripeLocksReleasedBeforeHotApplyWait) {
   config_.hot_apply_wait = 10s;  // never notified; the resolver parks here
   StubQueueReadRepeating({MakeConditional(10, {"SETNX", "a", "1"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -408,7 +416,7 @@ TEST_F(ResolverRunTest, ConditionalStillSerialisesSameKeyInQueueOrder) {
       MakeConditional(11, {"SETNX", "k", "v2"}, core::PredicateFlags::kNx),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // Cold reports absent; the first op's cache update must make the second skip.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
@@ -434,19 +442,19 @@ TEST_F(ResolverRunTest, ConditionalStillSerialisesSameKeyInQueueOrder) {
   EXPECT_EQ(second->decision, core::Decision::kSkip);
 }
 
-// XDUR-2: the resolver's persisted retention ack must never outrun the durable
+// XDUR-2: the resolver's persisted retention commit must never outrun the durable
 // tail. With the group committer "paused" (durable_seq_ held below the emitted
 // Resolved's seq), the resolver appends the Resolved for Conditional 10 but its
-// persisted ack stays clamped below 10 — a crash here would re-read and
-// re-decide the Conditional. Once the Resolved becomes durable the ack advances
-// to 10. Pre-fix the resolver acked the Conditional's seq on drain progress,
+// persisted commit stays clamped below 10 — a crash here would re-read and
+// re-decide the Conditional. Once the Resolved becomes durable the commit advances
+// to 10. Pre-fix the resolver committed the Conditional's seq on drain progress,
 // losing the Resolved across a crash in the fsync-coalescing window.
-TEST_F(ResolverRunTest, AckClampedBehindNonDurableResolved) {
+TEST_F(ResolverRunTest, CommitClampedBehindNonDurableResolved) {
   config_.hot_apply_wait = std::chrono::milliseconds{30};
   config_.durable_wait_timeout = std::chrono::milliseconds{30};
   StubQueueReadRepeating({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();  // Resolved is appended at seq 1000.
-  StubQueueAckCapture();
+  StubQueueCommitCapture();
   StubControllableDurability();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
@@ -457,27 +465,28 @@ TEST_F(ResolverRunTest, AckClampedBehindNonDurableResolved) {
   resolver.Start();
 
   // Wait until the Resolved has been appended (the resolver has processed the
-  // Conditional). The ack must remain clamped below the Conditional's seq.
+  // Conditional). The commit must remain clamped below the Conditional's seq.
   const auto deadline = std::chrono::steady_clock::now() + 3s;
   while (AppendedSize() == 0 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(5ms);
   }
   ASSERT_EQ(AppendedSize(), 1U);
-  // Give the Run loop several ack cycles to (incorrectly) advance, if it would.
+  // Give the Run loop several commit cycles to (incorrectly) advance, if it would.
   std::this_thread::sleep_for(100ms);
-  EXPECT_LT(acked_seq_.load(), 10U) << "ack advanced past Conditional before Resolved durable";
+  EXPECT_LT(committed_seq_.load(), 10U)
+      << "commit advanced past Conditional before Resolved durable";
 
   // Release durability for the Resolved (seq 1000).
   durable_seq_.store(2000);
   apply_notifier_.NotifyApplied(0, 2000);
 
-  const auto ack_deadline = std::chrono::steady_clock::now() + 3s;
-  while (acked_seq_.load() < 10U && std::chrono::steady_clock::now() < ack_deadline) {
+  const auto commit_deadline = std::chrono::steady_clock::now() + 3s;
+  while (committed_seq_.load() < 10U && std::chrono::steady_clock::now() < commit_deadline) {
     std::this_thread::sleep_for(5ms);
   }
   resolver.Stop();
 
-  EXPECT_GE(acked_seq_.load(), 10U) << "ack did not advance after Resolved became durable";
+  EXPECT_GE(committed_seq_.load(), 10U) << "commit did not advance after Resolved became durable";
   EXPECT_GE(resolver.GetSnapshot().resolver_durable_floor, 10U);
 }
 
@@ -490,7 +499,7 @@ TEST_F(ResolverRunTest, ConditionalDurabilityTimeoutReturnsError) {
   config_.durable_wait_timeout = std::chrono::milliseconds{30};
   StubQueueReadRepeating({MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)});
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   StubControllableDurability();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
@@ -533,7 +542,7 @@ TEST_F(ResolverTest, RecoveryRebuildsCacheFromExistingResolved) {
   });
   StubQueueReadOnce(std::move(entries));
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -565,7 +574,7 @@ TEST_F(ResolverTest, SetWithRelativeExThenSetNxSeesLiveKeyAndSkips) {
       MakeConditionalAt(11, {"SET", "k", "v2", "NX"}, core::PredicateFlags::kNx, At(1'050'000)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // Cache hit short-circuits cold; stub permissively anyway.
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
@@ -579,6 +588,7 @@ TEST_F(ResolverTest, SetWithRelativeExThenSetNxSeesLiveKeyAndSkips) {
 
   auto cached = resolver.Cache().GetKey("k");
   ASSERT_TRUE(cached.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
   EXPECT_EQ(cached->abs_ttl_ms, 1'000'000U + 100'000U);  // appended_at + 100s, not ~1970
 }
 
@@ -591,7 +601,7 @@ TEST_F(ResolverTest, SetWithRelativeExNotTreatedAsExpiredImmediately) {
                         core::PredicateFlags::kXx | core::PredicateFlags::kKeepTtl, At(2'000'001)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -616,7 +626,7 @@ TEST_F(ResolverTest, SetexThenSetNxSeesLiveKeyAndSkips) {
       MakeConditionalAt(11, {"SET", "k", "v2", "NX"}, core::PredicateFlags::kNx, At(3'050'000)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -627,6 +637,7 @@ TEST_F(ResolverTest, SetexThenSetNxSeesLiveKeyAndSkips) {
   EXPECT_EQ(resolved->decision, core::Decision::kSkip);
   auto cached = resolver.Cache().GetKey("k");
   ASSERT_TRUE(cached.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
   EXPECT_EQ(cached->abs_ttl_ms, 3'000'000U + 100'000U);
 }
 
@@ -638,7 +649,7 @@ TEST_F(ResolverTest, SetexKeyExpiresInCacheAfterTtl) {
       MakeConditionalAt(11, {"SET", "k", "v2", "NX"}, core::PredicateFlags::kNx, At(4'002'000)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // After cache expiry the lookup falls through; cold reports absent.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
@@ -659,7 +670,7 @@ TEST_F(ResolverTest, ExpireCacheTtlEqualsAppendedAtNotWallNow) {
       MakeWriteAt(11, {"EXPIRE", "k", "100"}, At(5'000'000)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -667,6 +678,7 @@ TEST_F(ResolverTest, ExpireCacheTtlEqualsAppendedAtNotWallNow) {
 
   auto cached = resolver.Cache().GetKey("k");
   ASSERT_TRUE(cached.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
   EXPECT_EQ(cached->abs_ttl_ms, 5'000'000U + 100'000U);
 }
 
@@ -684,7 +696,7 @@ TEST_F(ResolverTest, ExpireReplayDeterministicAcrossRecovery) {
                           At(6'001'000)),
     });
     StubQueueAppendCapture();
-    StubQueueAck();
+    StubQueueCommit();
     EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
     Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
     EXPECT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
@@ -715,7 +727,7 @@ TEST_F(ResolverTest, ExpireFamilyAllVariantsUpdateCache) {
       MakeWriteAt(17, {"PEXPIREAT", "d", "10400000"}, At(10'000'000)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).Times(::testing::AnyNumber());
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -743,7 +755,7 @@ TEST_F(ResolverTest, HdelThenHsetnxAppliesOnRemovedField) {
       MakeConditionalAt(12, {"HSETNX", "h", field, "v2"}, core::PredicateFlags::kNx, At(7'000'200)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   // After RemoveField the field is absent in cache; cold reports field absent.
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Null()));
 
@@ -764,7 +776,7 @@ TEST_F(ResolverTest, ZremThenZaddNxAppliesOnRemovedMember) {
                         At(8'000'200)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Null()));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -784,7 +796,7 @@ TEST_F(ResolverTest, DelPurgesFieldsThenHsetnxApplies) {
       MakeConditionalAt(12, {"HSETNX", "h", "f", "v2"}, core::PredicateFlags::kNx, At(9'000'200)),
   });
   StubQueueAppendCapture();
-  StubQueueAck();
+  StubQueueCommit();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Null()));
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
@@ -798,51 +810,274 @@ TEST_F(ResolverTest, DelPurgesFieldsThenHsetnxApplies) {
 }
 
 // HOTC-5: ReplayForRecovery re-decides a dangling Conditional and appends a
-// fresh Resolved. The terminal recovery ack must NOT advance past the dangling
+// fresh Resolved. The terminal recovery commit must NOT advance past the dangling
 // until that re-emitted Resolved is durable — otherwise a crash after the
 // offset fsync but before the Resolved fsync loses both, leaving the conditional
 // permanently unresolved. While the re-emitted Resolved is non-durable the
-// terminal Ack is refused (replay returns kUnavailable, offset clamped to the
-// per-scan low-water); once AwaitDurable confirms, replay succeeds and acks past
-// the dangling.
-TEST_F(ResolverTest, RecoveryAckGatedOnReemittedResolvedDurability) {
-  // A dangling Conditional at seq 10 with no matching Resolved. Re-served from
-  // the persisted offset on each replay until the ack advances past it (the
-  // real WAL behaviour: Read starts at ack_offset + 1). Within a single replay,
-  // the resolver's highest_seen dedup stops re-processing.
-  EXPECT_CALL(queue_, Read(core::kResolverConsumer, 0, _, _))
-      .WillRepeatedly([this](core::ConsumerId, core::ShardId, size_t,
+// terminal commit is refused (replay returns kUnavailable, offset clamped
+// to the per-scan low-water); once AwaitDurable confirms, a retried replay
+// rescans from the committed offset, re-finds the dangling and commits.
+TEST_F(ResolverTest, RecoveryCommitGatedOnReemittedResolvedDurability) {
+  // A dangling Conditional at seq 10 with no matching Resolved.
+  const std::vector<core::QueueEntry> log{
+      MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
+  EXPECT_CALL(queue_, Read(0, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max,
                              core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
-        if (acked_seq_.load() >= 10U) return std::vector<core::QueueEntry>{};
-        return std::vector<core::QueueEntry>{
-            MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
+        return testing::ReadFromLog(log, from, max);
       });
   StubQueueAppendCapture();  // re-emitted Resolved is appended at seq 1000.
-  StubQueueAckCapture();
+  StubQueueCommitCapture();
   StubControllableDurability();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
-  // The per-scan low-water clamp acks behind the dangling (seq 9); allow that,
+  // The per-scan low-water clamp commits behind the dangling (seq 9); allow that,
   // but the re-emitted Resolved (seq 1000) is NOT yet durable.
   durable_seq_.store(9);
 
   Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
   auto r1 = resolver.ReplayForRecovery(cancel_);
 
-  // Barrier refuses to advance the terminal ack past the dangling.
+  // Barrier refuses to advance the terminal commit past the dangling.
   ASSERT_FALSE(r1.has_value());
   EXPECT_EQ(r1.error().code(), core::ErrorCode::kUnavailable);
-  EXPECT_LT(acked_seq_.load(), 10U) << "acked past dangling before re-emitted Resolved durable";
+  EXPECT_LT(committed_seq_.load(), 10U)
+      << "committed past dangling before re-emitted Resolved durable";
   EXPECT_GE(resolver.GetSnapshot().durable_wait_timeouts, 1U);
   // The re-decided Resolved WAS appended (durable in the WAL, just not fsynced).
   ASSERT_FALSE(AppendedSize() == 0);
 
   // Now the re-emitted Resolved is durable: a retry of the replay advances the
-  // terminal ack past the dangling.
+  // terminal commit past the dangling.
   durable_seq_.store(2000);
   auto r2 = resolver.ReplayForRecovery(cancel_);
   ASSERT_TRUE(r2.has_value()) << r2.error().message();
-  EXPECT_GE(acked_seq_.load(), 10U) << "ack did not advance after re-emitted Resolved durable";
+  EXPECT_GE(committed_seq_.load(), 10U)
+      << "commit did not advance after re-emitted Resolved durable";
+}
+
+// A pre-flush Skip erases its dangling mid-scan, so the per-scan commit
+// must not pass that Conditional before the Skip is durable.
+TEST_F(ResolverTest, RecoveryScanCommitGatedOnPreFlushSkipDurability) {
+  const std::vector<core::QueueEntry> log{
+      MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx),
+      core::QueueEntry{
+          .seq = 11, .appended_at = core::WallClock::now(), .payload = core::entry::Flush{}},
+  };
+  EXPECT_CALL(queue_, Read(0, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max,
+                             core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+        return testing::ReadFromLog(log, from, max);
+      });
+  StubQueueAppendCapture();  // the pre-flush Skip lands at seq 1000.
+  StubQueueCommitCapture();
+  StubControllableDurability();
+  durable_seq_.store(11);  // the scanned log is durable; the Skip is not.
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  auto r1 = resolver.ReplayForRecovery(cancel_);
+  ASSERT_FALSE(r1.has_value());
+  EXPECT_EQ(r1.error().code(), core::ErrorCode::kUnavailable);
+  EXPECT_FALSE(commit_called_.load()) << "committed past X before its pre-flush Skip was durable";
+  EXPECT_EQ(resolver.GetSnapshot().flush_skip_resolveds_emitted, 1U);
+
+  durable_seq_.store(2000);
+  auto r2 = resolver.ReplayForRecovery(cancel_);
+  ASSERT_TRUE(r2.has_value()) << r2.error().message();
+  EXPECT_EQ(committed_seq_.load(), 11U);
+}
+
+TEST_F(ResolverTest, RejectedCommitCountsAsCommitFailure) {
+  StubQueueReadOnce({MakeWriteAt(5, {"SET", "k", "v"}, core::WallClock::now())});
+  StubQueueAppendCapture();
+  EXPECT_CALL(queue_, CommitOffset(core::kResolverConsumer, 0, _))
+      .WillRepeatedly(Return(core::Result<void>{
+          std::unexpected(core::Error(core::ErrorCode::kFailedPrecondition, "rejected (test)"))}));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  ASSERT_TRUE(resolver.ReplayForRecovery(cancel_).has_value());
+
+  const auto snap = resolver.GetSnapshot();
+  EXPECT_GE(snap.commit_failures, 1U);
+  EXPECT_EQ(snap.append_failures, 0U);
+  EXPECT_EQ(snap.last_commit_seq, 0U);
+}
+
+// A3: when the end-of-batch durability wait times out the commit does not
+// advance. The steady-state loop must still read forward from its cursor
+// and never re-decide the Conditional, or it appends a second Resolved for
+// it (ADP-001 invariant 7).
+TEST_F(ResolverRunTest, DurabilityTimeoutNeverRedecidesConditional) {
+  config_.read_timeout = core::Duration{7};
+  config_.hot_apply_wait = std::chrono::milliseconds{1};
+  const std::vector<core::QueueEntry> log{
+      MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
+  std::atomic<int> reads{0};
+  EXPECT_CALL(queue_, Read(0, _, _, _))
+      .WillRepeatedly(
+          [&log, &reads](core::ShardId, core::SequenceId from, size_t max,
+                         core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+            reads.fetch_add(1);
+            return testing::ReadFromLog(log, from, max);
+          });
+  // Only the end-of-batch wait uses read_timeout; the first one times out.
+  std::atomic<bool> first_batch_wait{true};
+  EXPECT_CALL(queue_, AwaitDurable(0, _, _))
+      .WillRepeatedly([this, &first_batch_wait](core::ShardId, core::SequenceId,
+                                                core::Duration timeout) -> core::Result<bool> {
+        return timeout != config_.read_timeout || !first_batch_wait.exchange(false);
+      });
+  StubQueueAppendCapture();
+  StubQueueCommitCapture();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  resolver.Start();
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while ((reads.load() < 10 || committed_seq_.load() < 10U) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  resolver.Stop();
+
+  EXPECT_FALSE(first_batch_wait.load()) << "the end-of-batch durability wait never ran";
+  size_t resolveds_for_ref = 0;
+  for (const auto& e : AppendedSnapshot()) {
+    if (const auto* r = std::get_if<core::entry::Resolved>(&e.payload); r && r->ref == 10) {
+      ++resolveds_for_ref;
+    }
+  }
+  EXPECT_EQ(resolveds_for_ref, 1U) << "the Conditional was decided more than once";
+  EXPECT_EQ(committed_seq_.load(), 10U) << "the commit never advanced once durable";
+}
+
+// A failed Resolved append holds the cursor at X: X is retried and
+// decided once, and the entry after X is processed only after it.
+TEST_F(ResolverRunTest, FailedResolvedAppendRetriesConditionalInOrder) {
+  const std::vector<core::QueueEntry> log{
+      MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx),
+      MakeConditional(11, {"SETNX", "k2", "v"}, core::PredicateFlags::kNx),
+  };
+  const auto x_resolved = [this] { return FindResolvedFor(AppendedSnapshot(), 10) != nullptr; };
+  std::atomic<bool> read_past_x{false};
+  EXPECT_CALL(queue_, Read(0, _, _, _))
+      .WillRepeatedly([&](core::ShardId, core::SequenceId from, size_t max,
+                          core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+        if (from > 10 && !x_resolved()) read_past_x.store(true);
+        return testing::ReadFromLog(log, from, max);
+      });
+  std::atomic<bool> committed_past_x{false};
+  EXPECT_CALL(queue_, CommitOffset(core::kResolverConsumer, 0, _))
+      .WillRepeatedly([&](core::ConsumerId, core::ShardId, core::SequenceId seq) {
+        if (seq >= 10 && !x_resolved()) committed_past_x.store(true);
+        return core::Result<void>{};
+      });
+  std::atomic<int> append_calls{0};
+  EXPECT_CALL(queue_, Append(_, _))
+      .WillRepeatedly([this, &append_calls](
+                          core::ShardId,
+                          core::QueueEntry entry) -> core::Result<queue::AppendResult> {
+        if (append_calls.fetch_add(1) == 0) {
+          return std::unexpected(core::Error(core::ErrorCode::kInternal, "append failed (test)"));
+        }
+        std::promise<core::Result<void>> p;
+        p.set_value(core::Result<void>{});
+        const std::scoped_lock lock(appended_mu_);
+        entry.seq = next_appended_seq_++;
+        appended_.push_back(entry);
+        return queue::AppendResult{.seq = entry.seq, .durable = p.get_future()};
+      });
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+  auto x_client = rpc_.Register(core::MakeRpcId(0, 10));
+  apply_notifier_.NotifyApplied(0, 2000);
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  resolver.Start();
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (AppendedSize() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  resolver.Stop();
+
+  const auto appended = AppendedSnapshot();
+  ASSERT_EQ(appended.size(), 2U);
+  EXPECT_EQ(std::get<core::entry::Resolved>(appended[0].payload).ref, 10U);
+  EXPECT_EQ(std::get<core::entry::Resolved>(appended[1].payload).ref, 11U);
+  EXPECT_EQ(append_calls.load(), 3);
+  EXPECT_FALSE(read_past_x.load()) << "the cursor passed X while it was unresolved";
+  EXPECT_FALSE(committed_past_x.load()) << "committed past X while it was unresolved";
+  const auto snap = resolver.GetSnapshot();
+  EXPECT_EQ(snap.append_failures, 1U);
+  EXPECT_EQ(snap.conditionals_resolved, 2U);
+  // The client sees the decision the retry made, never a failure: a
+  // SETNX lock reported as failed would leak once the retry applies.
+  ASSERT_EQ(x_client.wait_for(0ms), std::future_status::ready);
+  const auto reply = x_client.get();
+  ASSERT_FALSE(reply.IsError()) << "the client was told an applied conditional failed";
+  EXPECT_EQ(reply.AsInteger(), 1);
+}
+
+// A persistent append failure backs off (no busy spin) and the backoff
+// wakes promptly on Stop.
+TEST_F(ResolverRunTest, PersistentAppendFailureBacksOffAndStopsPromptly) {
+  const std::vector<core::QueueEntry> log{
+      MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
+  EXPECT_CALL(queue_, Read(0, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max,
+                             core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+        return testing::ReadFromLog(log, from, max);
+      });
+  std::atomic<int> append_calls{0};
+  EXPECT_CALL(queue_, Append(_, _))
+      .WillRepeatedly(
+          [&append_calls](core::ShardId,
+                          const core::QueueEntry&) -> core::Result<queue::AppendResult> {
+            append_calls.fetch_add(1);
+            return std::unexpected(core::Error(core::ErrorCode::kInternal, "append failed (test)"));
+          });
+  StubQueueCommitCapture();
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  const auto start = std::chrono::steady_clock::now();
+  resolver.Start();
+  // Backoffs of 1+2+...+256 ms precede the 10th attempt, which then
+  // waits ~512 ms more.
+  const auto deadline = start + 5s;
+  while (append_calls.load() < 10 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  const auto stop_start = std::chrono::steady_clock::now();
+  resolver.Stop();
+  const auto stop_took = std::chrono::steady_clock::now() - stop_start;
+
+  ASSERT_GE(append_calls.load(), 10);
+  EXPECT_GE(stop_start - start, 500ms) << "append retries busy-spun instead of backing off";
+  EXPECT_LT(stop_took, 250ms) << "Stop waited out the append-retry backoff";
+  EXPECT_LT(committed_seq_.load(), 10U) << "committed past the unresolved Conditional";
+  EXPECT_TRUE(AppendedSnapshot().empty());
+}
+
+TEST_F(ResolverTest, ReadBelowFirstRetainedSeqIsFatal) {
+  const testing::ScopedFatalCapture capture;
+  EXPECT_CALL(queue_, CommittedOffset(core::kResolverConsumer, 0))
+      .WillRepeatedly(Return(core::Result<std::optional<core::SequenceId>>(6)));
+  EXPECT_CALL(queue_, Read(0, 7, _, _))
+      .WillRepeatedly(Return(core::Result<std::vector<core::QueueEntry>>(
+          std::unexpected(core::Error{core::ErrorCode::kOutOfRange, "below first retained seq"}))));
+  EXPECT_CALL(queue_, FirstSeq(0)).WillRepeatedly(Return(core::Result<core::SequenceId>(50)));
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  try {
+    const auto replayed = resolver.ReplayForRecovery(cancel_);
+    FAIL() << "a read below the first retained seq must be fatal; replay returned "
+           << (replayed.has_value() ? "ok" : replayed.error().message());
+  } catch (const testing::FatalCalled& fatal) {
+    EXPECT_NE(fatal.reason.find("resolver"), std::string::npos) << fatal.reason;
+    EXPECT_NE(fatal.reason.find("shard 0"), std::string::npos) << fatal.reason;
+    EXPECT_NE(fatal.reason.find("read seq 7"), std::string::npos) << fatal.reason;
+    EXPECT_NE(fatal.reason.find("first retained seq 50"), std::string::npos) << fatal.reason;
+  }
 }
 
 }  // namespace

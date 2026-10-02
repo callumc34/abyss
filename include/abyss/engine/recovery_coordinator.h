@@ -88,7 +88,9 @@ class RecoveryCoordinator {
   // Captures TailSeq per shard. Consumers replay until their progress
   // marker reaches the captured tail.
   std::vector<core::SequenceId> CaptureTargets() const;
-  std::vector<core::SequenceId> CaptureAckOffsets(core::ConsumerId consumer) const;
+  // Committed offset per shard; 0 when never committed.
+  std::vector<core::SequenceId> CaptureCommittedOffsets(core::ConsumerId consumer) const;
+  std::vector<core::SequenceId> CaptureFirstSeqs() const;
 
   static uint64_t SumDelta(const std::vector<core::SequenceId>& target,
                            const std::vector<core::SequenceId>& starting) noexcept;
@@ -103,7 +105,7 @@ class RecoveryCoordinator {
   std::atomic<RecoverySnapshot::Phase> phase_{RecoverySnapshot::Phase::kQueueOpen};
   std::chrono::steady_clock::time_point started_at_{};
 
-  // Targets and starting acks for each phase. Set under started_at_ when
+  // Targets and starting offsets for each phase. Set under started_at_ when
   // the phase opens; immutable thereafter, so reads from Snapshot() race-free.
   std::vector<core::SequenceId> resolver_starting_;
   std::vector<core::SequenceId> resolver_target_;

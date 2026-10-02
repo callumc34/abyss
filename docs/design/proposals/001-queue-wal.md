@@ -4,7 +4,7 @@
 **Created:** 2026-04-09
 **Updated:** 2026-04-18
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Read takes an explicit consumer-owned position, and acknowledgements become committed offsets that are persisted lazily in one dual-slot checkpoint. Volatile consumers go away (Phase 1a). Group commit becomes natural batching with named durability classes, `process_crash` by default and `power_loss` opt-in, on preallocated mapped segments in one physical log per volume (Phase 1b). The entry taxonomy loses `Conditional` and `Resolved` (Phase 2). The sections below describe current behaviour until each phase lands.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Read takes an explicit consumer-owned position, and acknowledgements are committed offsets persisted lazily in one dual-slot checkpoint; §Interface and §Offset persistence already describe this. Group commit becomes natural batching with named durability classes, `process_crash` by default and `power_loss` opt-in, on preallocated mapped segments in one physical log per volume (Phase 1b). The entry taxonomy loses `Conditional` and `Resolved` (Phase 2). Those sections describe current behaviour until each phase lands.
 
 ## Context
 
@@ -38,7 +38,12 @@ The queue interface offers two append flavours:
 
 Callers that await consumer apply (the tiering engine's write path) MUST use the two-phase primitive. Publishing before the producer has registered its RPC promise would race with the consumer's Fulfill — the producer could miss the response. Two-phase closes this structurally by letting the producer register under the same lock that gates visibility.
 
-A `Read` method returns entries for a given consumer and shard. `Ack` marks entries as processed. `OldestRetained` reports the earliest unacknowledged entry for GC.
+**Read position and committed offset are separate**, as a Kafka fetch position and committed offset are.
+- **Read.** A consumer owns its read position and passes it to `Read`, which returns the contiguous published entries at or after that sequence. A position below the oldest retained entry is an explicit out-of-range error, never silently moved forward.
+- **Commit.** `CommitOffset` records how far a retention consumer has processed. It takes effect in memory at once, never passes the durable WAL tail, and is persisted lazily (see "Offset persistence" below).
+- **Retention.** Committed offsets govern retention and where a consumer resumes after a restart. They never govern where a running consumer reads.
+- **Hot.** The hot consumer keeps its position in memory and commits nothing. After a restart it rebuilds from the oldest retained entry.
+- **Accessors.** `FirstSeq` reports the lowest readable sequence on a shard. `CommittedOffset` reports a consumer's committed offset, or none if it has never committed.
 
 The frontend creates Write and Conditional entries. The Resolver creates Resolved entries. Hot and cold consumers are read-only against the queue.
 
@@ -56,8 +61,8 @@ The built-in queue implementation is an append-only WAL on the PVC.
 ```
 
 - Segment size: configurable, default 64 MiB.
-- Segment cleanup is triggered synchronously after every `Ack` and after every rotation — the only two events that can change eligibility. Tick-based reaping is not used. Segments whose `last_seq` is below the minimum consumer offset AND whose age exceeds `min_retention` are deleted. The active segment is never eligible. See [ADP-009](009-wal-format.md) for file format details.
-- Consumer offsets are persisted to per-consumer binary files under `{wal_path}/offsets/`. Each `Set` rewrites the file atomically (tmp + fsync + rename + directory fsync) before returning, so every `Ack` is durable the instant its caller sees `OK`. See "Offset persistence" below.
+- Segment cleanup runs after each round that persists committed offsets, and after every rotation. A segment is deleted when its `last_seq` is below the minimum *persisted* committed offset across retention consumers AND its age exceeds `min_retention`. The active segment is never eligible. Reclamation uses persisted offsets, never in-memory ones, so a restart never resumes a consumer below a deleted segment. See [ADP-009](009-wal-format.md) for file format details.
+- Committed offsets are persisted lazily to one checkpoint file under `{wal_path}/offsets/`. See "Offset persistence" below.
 
 **Retention:** The queue retains entries until all consumers have acknowledged. Minimum retention is:
 
@@ -71,23 +76,33 @@ This must fit on the WAL PVC.
 
 ### Offset persistence
 
-Each (consumer, shard) pair has its own file at `{wal_path}/offsets/{consumer_id}/{shard_id:020d}.offset` containing a single `(shard, seq)` record. Format:
+Committed offsets for every retention consumer and shard are persisted together in one checkpoint file, `{wal_path}/offsets/offsets.ckpt`.
 
-```
-magic        8 bytes  "ABYSSOFF"
-format_major 1 byte   2
-format_minor 1 byte   0
-reserved     2 bytes  0
-shard_id     u32
-seq          u64
-crc          u32      CRC32C over all preceding bytes
-```
+**Cadence.** Committing an offset is an in-memory operation. A background persister writes the checkpoint every `offset_fsync_interval_ms`, but only when something has been committed since the last write. It writes again on shutdown, after the consumers have stopped.
 
-Total file size is 28 bytes. The per-(consumer, shard) layout is load-bearing for the shard-per-core execution model: each shard is owned by a single thread, and that thread is the only writer of its own offset file. No cross-shard thread ever touches another shard's file, so there is no shared write point, no need for cross-shard serialisation on the ack path, and no lost-update race between shards acking for the same consumer.
+**Two slots.** The file holds two fixed-size slots. Each slot is a whole number of 4 KiB blocks and starts on a block boundary, so a torn write to one slot can never touch the other. A slot records:
 
-`Ack(consumer, shard, seq)` updates the in-memory cache, then rewrites that one 28-byte file via tmp + fsync + rename + directory fsync — no background flusher, no batched flush. Ack cost is therefore O(1) in active shards, not O(total shards for the consumer), which matters once Phase 2 lands with many shards per pod.
+| Field | Meaning |
+|-------|---------|
+| magic, format version, slot size | Identify the layout |
+| epoch | Monotonic counter; the valid slot with the highest epoch is current |
+| shard count, consumer ids | Must match the configuration on open |
+| per consumer and shard | The committed sequence, and whether one exists |
+| checksum | CRC32C over the slot |
 
-Offsets missing on Open mean the consumer starts from the tail of the oldest retained segment.
+A persist overwrites the slot that does not hold the highest epoch, with the next epoch, and then makes it durable with one flush. There is no temporary file, no rename and no directory sync, as with LMDB meta pages. The file is created once, with one valid empty slot, and its directory is synced at that point only.
+
+**Opening.**
+- A missing file is a fresh store.
+- A file with no valid slot, or with two valid slots of equal epoch, is corruption.
+- A shard-count or consumer mismatch refuses to start.
+- An older per-consumer, per-shard offset layout refuses to start and names the layout, rather than silently starting from nothing.
+
+**Crash semantics.** After a crash, a consumer resumes from its last persisted offset. Entries after it are delivered again, at most one persist interval's worth; cold absorption and resolver replay are idempotent. A consumer with no committed offset starts at the first retained entry.
+
+**Recovered tail.** On open, each shard flushes the tail it recovered, so entries a crashed process left only in the page cache become durable before any consumer commits past them. One residual risk is accepted, the same one PostgreSQL accepts. Linux reports a write-back error that happened before the crash to the first flush on a new file descriptor only if the file's inode stayed cached in between. Nothing at the application level can close that gap. Under `fsync_policy: none`, a power loss can drop entries the checkpoint already named. That policy accepts the loss, so such an offset is clamped to the recovered tail, with a warning, rather than refusing to start.
+
+**Failures.** A failed persist is logged and counted, and retried on the next round. Persisted offsets stay where they were, so retention waits, visibly. Nothing is lost.
 
 ### Batch atomicity
 
@@ -139,7 +154,7 @@ queue:
   wal_path: /data/wal
   segment_size_bytes: 67108864        # 64 MiB
   min_retention_seconds: 86400        # 24 hours
-  offset_fsync_interval_ms: 1000
+  offset_fsync_interval_ms: 1000      # committed-offset checkpoint cadence, 10–60000
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000      # 1ms batch window
   group_commit_max_bytes: 1048576     # Or flush at 1 MiB, whichever first
@@ -149,11 +164,12 @@ queue:
 
 1. Any `Append` operation returning OK means the entry is durable (for group commit: the batch containing this entry has been fsynced).
 2. `Read` returns entries in sequence order. No gaps, no reordering.
-3. The queue retains all entries until every registered consumer has acknowledged them.
-4. Each consumer's cursor is independent. No consumer's progress affects another consumer's read position.
+3. The queue retains every entry above the minimum persisted committed offset across retention consumers.
+4. Each consumer owns its read position. No consumer's progress, and no committed offset, affects where another consumer reads.
 5. Sequence IDs are monotonically increasing per shard.
 6. Entry type tags are immutable once appended. A `Conditional` never transforms into a `Write`; the Resolver produces a separate `Resolved` entry.
 7. For every `Conditional` entry at seq X, exactly one `Resolved` entry with `ref = X` follows it in the log. The queue itself does not enforce this — it is an invariant of the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) that the queue must preserve bit-for-bit.
+8. A read below the first retained entry is an explicit out-of-range error. For a retention consumer it signals reclaimed, uncommitted data and is fatal.
 
 ## Trade-offs
 

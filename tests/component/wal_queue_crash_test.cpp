@@ -184,7 +184,7 @@ TEST_F(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
   auto queue = WalQueue::Open(VictimConfig(tmp_dir_));
   ASSERT_TRUE(queue.has_value()) << queue.error().message();
 
-  auto read = (*queue)->Read(core::kHotConsumer, 0, 10000, 100ms);
+  auto read = (*queue)->Read(0, 0, 10000, 100ms);
   ASSERT_TRUE(read.has_value()) << read.error().message();
   const auto& entries = *read;
 

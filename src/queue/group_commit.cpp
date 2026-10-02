@@ -40,8 +40,8 @@ DurabilityFuture GroupCommitter::Submit(size_t bytes, size_t entries,
   switch (config_.policy) {
     case FsyncPolicy::kNone:
       // No durability barrier, but advance the watermark to the published seq
-      // so the retention-Ack gate is a correct no-op (Decision 1). The operator
-      // is warned at startup that durability is disabled.
+      // so the retention-commit gate is a correct no-op (Decision 1). The
+      // operator is warned at startup that durability is disabled.
       PublishDurable(batch_last_seq);
       return MakeReadyFuture({});
 

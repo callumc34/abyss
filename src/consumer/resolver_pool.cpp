@@ -57,6 +57,7 @@ ResolverPool::AggregateMetrics ResolverPool::Snapshot() const {
     agg.apply_wait_timeouts += s.apply_wait_timeouts;
     agg.durable_wait_timeouts += s.durable_wait_timeouts;
     agg.append_failures += s.append_failures;
+    agg.commit_failures += s.commit_failures;
     agg.parse_failures += s.parse_failures;
     agg.replayed_resolveds_emitted += s.replayed_resolveds_emitted;
     agg.cache_entries_total += s.cache_entries;

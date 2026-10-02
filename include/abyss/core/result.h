@@ -17,11 +17,14 @@ enum class ErrorCode : uint8_t {
   kCorruption,
   kIncomplete,
   kWrongType,
-  // A precondition for the operation was not yet met (e.g. acking a retention
-  // offset past the durable WAL tail). Retryable once the precondition holds.
+  // A precondition for the operation was not yet met (e.g. committing a
+  // retention offset past the durable WAL tail). Retryable once it holds.
   kFailedPrecondition,
   // A value exceeds the configured queue.max_value_size_bytes ceiling.
   kValueTooLarge,
+  // A requested position lies outside the retained range (e.g. a queue read
+  // below the first seq still on disk). Never clamped silently.
+  kOutOfRange,
 };
 
 class Error {
