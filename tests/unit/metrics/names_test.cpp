@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
 #include <string_view>
 
 namespace abyss::metrics {
@@ -47,7 +48,9 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kColdOpDurationSeconds.name,
       names::kBufferOpDurationSeconds.name,
       names::kRespRequestDurationSeconds.name,
-      names::kQueueAppendDurationSeconds.name,
+      names::kWalFlushDurationSeconds.name,
+      names::kWalFlushBatchEntries.name,
+      names::kQueueOffsetPersistDurationSeconds.name,
       names::kColdFlushBatchSize.name,
       names::kHotConsumerLagEntries.name,
       names::kColdConsumerLagEntries.name,
@@ -71,10 +74,9 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kEvictedTotal.name,
       names::kPromotionsTotal.name,
   };
-  for (size_t i = 0; i < kAllNames.size(); ++i) {
-    for (size_t j = i + 1; j < kAllNames.size(); ++j) {
-      EXPECT_NE(kAllNames[i], kAllNames[j]) << "duplicate metric name: " << kAllNames[i];
-    }
+  std::set<std::string_view> seen;
+  for (const auto name : kAllNames) {
+    EXPECT_TRUE(seen.insert(name).second) << "duplicate metric name: " << name;
   }
 }
 

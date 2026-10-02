@@ -12,6 +12,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/metrics.h"
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/fsync_policy.h"
 
@@ -39,7 +40,8 @@ class GroupCommitter {
   // Enqueue `bytes` for the next fsync. `batch_last_seq` is the highest seq the
   // submitted bytes materialise; durable_seq advances to it once the fsync that
   // covers it completes (the Kafka log-end-offset vs high-watermark split).
-  DurabilityFuture Submit(size_t bytes, core::SequenceId batch_last_seq);
+  // `entries` is the number of WAL entries in those bytes.
+  DurabilityFuture Submit(size_t bytes, size_t entries, core::SequenceId batch_last_seq);
 
   // Force an immediate fsync and wait for its completion. No-op for kNone.
   core::Result<void> Drain();
@@ -73,6 +75,9 @@ class GroupCommitter {
   // not hold mu_.
   void PublishDurable(core::SequenceId seq);
 
+  // Records one fsync_fn call and the WAL entries it covers.
+  void RecordFlush(std::chrono::steady_clock::duration elapsed, size_t entries) noexcept;
+
   struct Pending {
     std::promise<core::Result<void>> promise;
     size_t bytes = 0;
@@ -81,11 +86,15 @@ class GroupCommitter {
 
   GroupCommitConfig config_;
   FsyncFn fsync_fn_;
+  metrics::HistogramHandle flush_duration_;
+  metrics::HistogramHandle flush_batch_entries_;
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::vector<Pending> pending_ ABYSS_GUARDED_BY(mu_);
   size_t pending_bytes_ ABYSS_GUARDED_BY(mu_) = 0;
+  // WAL entries in pending_; Drain's sentinel adds none.
+  size_t pending_entries_ ABYSS_GUARDED_BY(mu_) = 0;
   // Highest seq submitted into the current (not-yet-flushed) batch.
   core::SequenceId batch_high_seq_ ABYSS_GUARDED_BY(mu_) = 0;
   bool flush_requested_ ABYSS_GUARDED_BY(mu_) = false;

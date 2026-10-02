@@ -4,6 +4,8 @@
 **Created:** 2026-04-15
 **Updated:** 2026-04-18
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Reads use a sparse in-memory sequence-to-offset index rebuilt at open (Phase 1a). Segments become preallocated and zero-filled, with a zero body length marking the end of the log, and are organised as one physical log per volume carrying per-shard streams (Phase 1b). Entries carry decided effects (Phase 2). The format below is current until each phase lands.
+
 ## Context
 
 ADP-001 defines the Queue interface and describes the embedded WAL as per-shard fixed-size segment files. This document specifies the concrete on-disk format: how segment headers are laid out, how entries are encoded, how the format evolves, and how readers detect corruption.

@@ -32,6 +32,10 @@ struct PreloadConfig {
   uint64_t value_size_bytes = 64;
 };
 
+// How open-loop requests arrive: one per slot, or a pipeline-depth
+// burst per slot at the same request rate.
+enum class Arrival : uint8_t { kSteady, kBurst };
+
 struct WorkloadConfig {
   std::string name;
   std::string description;
@@ -39,6 +43,9 @@ struct WorkloadConfig {
   std::chrono::seconds warmup{0};
   int workers = 1;
   int connections_per_worker = 1;
+  // Requests each connection keeps in flight.
+  int pipeline_depth = 1;
+  Arrival arrival = Arrival::kSteady;
   uint64_t target_rate_ops = 0;
   uint64_t key_count = 0;
   KeyDistConfig key_distribution;

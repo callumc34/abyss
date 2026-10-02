@@ -131,6 +131,8 @@ Mix of embedded and external. For example: embedded hot store + NATS queue + ext
 
 ### Phase 1: Single-Pod, Multithreaded
 
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Writes move to a per-shard sequencer that decides, logs and applies each write under the shard lock on the calling thread. The hot consumer and resolver threads go away, reactors stop waiting on durability, and cold consumers become a pool sized to cores. The model below describes current behaviour until those phases land.
+
 Phase 1 uses a conventional multithreaded model within a single pod:
 
 - **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands, route to tiering engine.

@@ -11,6 +11,8 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 #include "abyss/platform/fs.h"
 #include "abyss/queue/file_offset_store.h"
 #include "abyss/queue/memory_offset_store.h"
@@ -53,7 +55,7 @@ TEST_P(OffsetStoreTest, SetGetRoundTrip) {
   ASSERT_TRUE(store_->Set(0, 3, 42).has_value());
   auto got = store_->Get(0, 3);
   ASSERT_TRUE(got.has_value());
-  EXPECT_EQ(*got, 42U);
+  EXPECT_EQ(got, 42U);
 }
 
 TEST_P(OffsetStoreTest, MultipleConsumersIndependent) {
@@ -61,8 +63,8 @@ TEST_P(OffsetStoreTest, MultipleConsumersIndependent) {
   ASSERT_TRUE(store_->Set(0, 0, 100).has_value());
   ASSERT_TRUE(store_->Set(1, 0, 200).has_value());
 
-  EXPECT_EQ(*store_->Get(0, 0), 100U);
-  EXPECT_EQ(*store_->Get(1, 0), 200U);
+  EXPECT_EQ(store_->Get(0, 0), 100U);
+  EXPECT_EQ(store_->Get(1, 0), 200U);
 }
 
 TEST_P(OffsetStoreTest, MultipleShardsIndependent) {
@@ -71,16 +73,16 @@ TEST_P(OffsetStoreTest, MultipleShardsIndependent) {
   ASSERT_TRUE(store_->Set(0, 1, 20).has_value());
   ASSERT_TRUE(store_->Set(0, 2, 30).has_value());
 
-  EXPECT_EQ(*store_->Get(0, 0), 10U);
-  EXPECT_EQ(*store_->Get(0, 1), 20U);
-  EXPECT_EQ(*store_->Get(0, 2), 30U);
+  EXPECT_EQ(store_->Get(0, 0), 10U);
+  EXPECT_EQ(store_->Get(0, 1), 20U);
+  EXPECT_EQ(store_->Get(0, 2), 30U);
 }
 
 TEST_P(OffsetStoreTest, SetOverwritesPrevious) {
   store_ = MakeStore();
   ASSERT_TRUE(store_->Set(0, 0, 100).has_value());
   ASSERT_TRUE(store_->Set(0, 0, 200).has_value());
-  EXPECT_EQ(*store_->Get(0, 0), 200U);
+  EXPECT_EQ(store_->Get(0, 0), 200U);
 }
 
 INSTANTIATE_TEST_SUITE_P(Impls, OffsetStoreTest, ::testing::Values("memory", "file"));
@@ -113,6 +115,21 @@ TEST_F(FileOffsetStoreTest, SetPersistsSynchronouslyToPerShardFile) {
   EXPECT_TRUE(std::filesystem::exists(ShardFilePath(0, 0)));
 }
 
+TEST_F(FileOffsetStoreTest, EachDurablePersistIsTimed) {
+  metrics::testing::Reset();
+  {
+    auto store = FileOffsetStore::Open({.directory = TmpDir()});
+    ASSERT_TRUE(store.has_value());
+    for (core::SequenceId seq = 1; seq <= 3; ++seq) {
+      ASSERT_TRUE((*store)->Set(0, 0, seq).has_value());
+    }
+    EXPECT_EQ(
+        metrics::testing::GetHistogramCount(metrics::names::kQueueOffsetPersistDurationSeconds),
+        3U);
+  }
+  metrics::testing::Reset();
+}
+
 TEST_F(FileOffsetStoreTest, SetsDifferentShardsCreateSeparateFiles) {
   auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
@@ -135,8 +152,8 @@ TEST_F(FileOffsetStoreTest, PersistsAcrossReopen) {
 
   auto store = FileOffsetStore::Open({.directory = TmpDir()});
   ASSERT_TRUE(store.has_value());
-  EXPECT_EQ(*(*store)->Get(0, 5), 123U);
-  EXPECT_EQ(*(*store)->Get(1, 2), 456U);
+  EXPECT_EQ((*store)->Get(0, 5), 123U);
+  EXPECT_EQ((*store)->Get(1, 2), 456U);
 }
 
 TEST_F(FileOffsetStoreTest, CorruptedRecordDetected) {
@@ -203,7 +220,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossShardsSameConsumerAllPersist) {
   for (int s = 0; s < kShards; ++s) {
     auto got = (*store)->Get(0, s);
     ASSERT_TRUE(got.has_value()) << "shard " << s;
-    EXPECT_EQ(*got, static_cast<core::SequenceId>(kSetsPerShard)) << "shard " << s;
+    EXPECT_EQ(got, static_cast<core::SequenceId>(kSetsPerShard)) << "shard " << s;
   }
 
   // And the per-shard values must survive reopen.
@@ -213,7 +230,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossShardsSameConsumerAllPersist) {
   for (int s = 0; s < kShards; ++s) {
     auto got = (*reopened)->Get(0, s);
     ASSERT_TRUE(got.has_value()) << "shard " << s;
-    EXPECT_EQ(*got, static_cast<core::SequenceId>(kSetsPerShard)) << "shard " << s;
+    EXPECT_EQ(got, static_cast<core::SequenceId>(kSetsPerShard)) << "shard " << s;
   }
 }
 
@@ -241,7 +258,7 @@ TEST_F(FileOffsetStoreTest, ConcurrentSetsAcrossConsumersSameShardAllPersist) {
   for (int c = 0; c < kConsumers; ++c) {
     auto got = (*reopened)->Get(c, 0);
     ASSERT_TRUE(got.has_value()) << "consumer " << c;
-    EXPECT_EQ(*got, static_cast<core::SequenceId>(kSetsPerConsumer)) << "consumer " << c;
+    EXPECT_EQ(got, static_cast<core::SequenceId>(kSetsPerConsumer)) << "consumer " << c;
   }
 }
 

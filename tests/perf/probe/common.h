@@ -54,8 +54,11 @@ WorkloadConfig MakeWorkloadConfig(const ProbeArgs& args, const OperationMix& mix
 RunReport BuildReport(const ProbeArgs& args, const WorkloadConfig& workload,
                       const RunLoopResult& result);
 
-// Emit JSON to args.output_path (or stdout if empty). Returns false on I/O
-// failure.
+// Emit JSON to args.output_path (or stdout if empty) and a summary line
+// to stderr. Returns false on I/O failure.
 bool WriteOutputs(const RunReport& report, const ProbeArgs& args, const RunLoopResult& result);
+
+// Exit status when any measured op failed; errors are never timed.
+inline constexpr int kExitOpErrors = 4;
 
 }  // namespace abyss::perf::probe

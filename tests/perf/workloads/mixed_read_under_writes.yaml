@@ -1,0 +1,29 @@
+# Reference workload for authoritative runs on perf-grade hardware.
+# Open-loop: set target_rate_ops to at most half the saturation
+# throughput measured on the host, or the tail reflects queueing rather
+# than service.
+# No static targets; compare runs and servers on the same host.
+# See docs/development/performance.md §Conditions of measurement.
+name: mixed-read-under-writes
+description: |
+  90/10 GET/SET against a zipfian hot set, open-loop, 64 connections at
+  pipeline depth 1. Read latency while writes flow through the WAL.
+duration_seconds: 60
+warmup_seconds: 10
+workers: 8
+connections_per_worker: 8
+pipeline_depth: 1
+target_rate_ops: 50000
+key_count: 100000
+key_distribution:
+  kind: zipfian
+  theta: 0.99
+  seed: 21
+value_size_bytes: 64
+mix:
+  GET: 0.9
+  SET: 0.1
+preload:
+  enabled: true
+  key_count: 100000
+  value_size_bytes: 64

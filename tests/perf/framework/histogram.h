@@ -28,11 +28,6 @@ class Histogram {
 
   void Record(int64_t value_ns);
 
-  // Records value_ns and, when value_ns > expected_interval_ns, additional
-  // synthetic samples spaced by expected_interval_ns to compensate for
-  // coordinated omission. See ADP-013 §Coordinated omission.
-  void RecordCorrected(int64_t value_ns, int64_t expected_interval_ns);
-
   int64_t PercentileNs(double percentile) const;
   int64_t Count() const;
   int64_t MinNs() const;

@@ -18,7 +18,7 @@ TEST(RunLoopTest, ClosedLoopExercisesAllOpsAcrossWorkers) {
   cfg.workers = 2;
   cfg.duration = std::chrono::seconds{1};
   cfg.warmup = std::chrono::seconds{0};
-  cfg.target_rate_ops_per_worker = 0;
+  cfg.target_rate_ops = 0;
   cfg.key_count = 100;
   cfg.value_size_bytes = 16;
   cfg.mix.weights["A"] = 0.5;
@@ -32,6 +32,7 @@ TEST(RunLoopTest, ClosedLoopExercisesAllOpsAcrossWorkers) {
     } else if (name == "B") {
       worker_seen_b.fetch_add(1, std::memory_order_relaxed);
     }
+    return true;
   };
 
   const auto result = RunLoop(cfg, op);
@@ -41,20 +42,11 @@ TEST(RunLoopTest, ClosedLoopExercisesAllOpsAcrossWorkers) {
   EXPECT_GT(result.per_op_histograms.at("B").Count(), 0);
 }
 
-// Pins the wiring between the open-loop scheduler and the coordinated-omission
-// corrector: RunLoop must measure from the INTENDED send time and must feed the
-// scheduler's expected interval to Histogram::RecordCorrected. (The corrector
-// itself is pinned by CoordinatedOmissionTest.StallInjectsSyntheticTailSamples;
-// this test owns the wiring, per ADP-013 §Coordinated omission.)
-//
-// Every assertion below is a LOWER bound on a quantity that a stall can only
-// increase, so machine load cannot make the test fail — only a regression in
-// the harness can. An upper bound on a wall-clock p99 cannot have that
-// property: under parallel-test load the scheduler overshoot is unbounded, and
-// the corrector faithfully amplifies it. A no-stall p99 bound was also blind to
-// the thing this test is named for, since with no missed slot RecordCorrected
-// and Record are identical.
-TEST(RunLoopTest, OpenLoopRecordsCorrectedLatency) {
+// Pins coordinated-omission accounting (ADP-013): open loop issues
+// every scheduled op, late if necessary, and measures each from its own
+// intended send time, so one stall is charged once to every op it
+// delayed. The lower bounds can only loosen under machine load.
+TEST(CoordinatedOmissionTest, StallIsChargedToEveryDelayedOp) {
   constexpr int64_t kIntervalNs = 1'000'000;  // 1000 ops/s/worker → 1ms schedule
   constexpr int kStallIntervals = 50;
   constexpr auto kStall = std::chrono::milliseconds{kStallIntervals};
@@ -63,7 +55,7 @@ TEST(RunLoopTest, OpenLoopRecordsCorrectedLatency) {
   RunLoopConfig cfg;
   cfg.workers = 1;
   cfg.duration = std::chrono::seconds{1};
-  cfg.target_rate_ops_per_worker = 1000;
+  cfg.target_rate_ops = 1000;
   cfg.key_count = 10;
   cfg.mix.weights["X"] = 1.0;
 
@@ -73,27 +65,28 @@ TEST(RunLoopTest, OpenLoopRecordsCorrectedLatency) {
     if (!stalled.exchange(true, std::memory_order_relaxed)) {
       std::this_thread::sleep_for(kStall);
     }
+    return true;
   };
   const auto result = RunLoop(cfg, op);
 
   const uint64_t ops = result.per_op_counts.at("X");
   const auto& hist = result.per_op_histograms.at("X");
-  EXPECT_GT(ops, 100U);
 
-  // The stalled op alone must contribute kStallIntervals-1 synthetic samples
-  // (one per send slot it missed). Record() would leave Count() == ops exactly,
-  // so this fires if the open-loop path stops correcting or is handed an
-  // interval other than the scheduler's.
-  EXPECT_GE(hist.Count(), static_cast<int64_t>(ops) + kStallIntervals - 1)
-      << "count = " << hist.Count() << " for " << ops
-      << " ops; coordinated-omission correction is missing or mis-parameterised";
-
-  // Measuring from the intended send time preserves the full stall; measuring
-  // from the actual send time would clip it to the ops that were in flight.
+  // Every slot of the second is issued, and sampled once.
+  EXPECT_EQ(ops, 1000U);
+  EXPECT_EQ(hist.Count(), static_cast<int64_t>(ops));
+  EXPECT_EQ(result.send_lag.Count(), static_cast<int64_t>(ops));
   EXPECT_GE(hist.MaxNs(), kStallNs);
 
-  // ADP-013: the reported tail must reflect the stall.
-  EXPECT_GT(hist.PercentileNs(99.0), kIntervalNs);
+  // The ~49 ops behind the stall drain the backlog with waits falling
+  // from ~49ms to ~1ms. Measured from the actual send, only the stalled
+  // op would exceed an interval.
+  EXPECT_GE(hist.PercentileNs(99.0), kStallNs * 3 / 5);
+  EXPECT_GE(hist.PercentileNs(97.0), kStallNs / 5);
+  EXPECT_LT(hist.PercentileNs(97.0), hist.PercentileNs(99.0));
+
+  // The rest of the schedule keeps its unstalled latency.
+  EXPECT_LT(hist.PercentileNs(50.0), kIntervalNs);
 }
 
 TEST(RunLoopTest, ResultExposesMeasuredDuration) {
@@ -101,16 +94,75 @@ TEST(RunLoopTest, ResultExposesMeasuredDuration) {
   cfg.workers = 1;
   cfg.duration = std::chrono::seconds{1};
   cfg.warmup = std::chrono::seconds{1};
-  cfg.target_rate_ops_per_worker = 0;
+  cfg.target_rate_ops = 0;
   cfg.key_count = 10;
   cfg.mix.weights["GET"] = 1.0;
 
-  OpFn op = [&](int, std::string_view, uint64_t) {};
+  OpFn op = [&](int, std::string_view, uint64_t) { return true; };
   const auto result = RunLoop(cfg, op);
   EXPECT_NEAR(result.measured_duration.count(), 1'000'000'000, 200'000'000);
+  EXPECT_FALSE(result.open_loop);
+  EXPECT_EQ(result.send_lag.Count(), 0);
 }
 
-TEST(RunLoopConfigFromWorkloadTest, DividesTargetRateAcrossWorkers) {
+TEST(RunLoopTest, FailedOpsAreCountedNotTimed) {
+  RunLoopConfig cfg;
+  cfg.workers = 1;
+  cfg.duration = std::chrono::seconds{1};
+  cfg.key_count = 10;
+  cfg.mix.weights["fail"] = 0.5;
+  cfg.mix.weights["ok"] = 0.5;
+
+  OpFn op = [&](int, std::string_view name, uint64_t) { return name == "ok"; };
+  const auto result = RunLoop(cfg, op);
+
+  EXPECT_GT(result.per_op_errors.at("fail"), 0U);
+  EXPECT_EQ(result.per_op_counts.at("fail"), 0U);
+  EXPECT_EQ(result.per_op_histograms.at("fail").Count(), 0);
+  EXPECT_EQ(result.per_op_errors.at("ok"), 0U);
+  EXPECT_EQ(result.per_op_histograms.at("ok").Count(),
+            static_cast<int64_t>(result.per_op_counts.at("ok")));
+}
+
+// An op scheduled inside the warmup stays out of the measurement even
+// when a stall makes it complete after the warmup ends.
+TEST(RunLoopTest, WarmupClassifiesByIntendedSendTime) {
+  RunLoopConfig cfg;
+  cfg.workers = 1;
+  cfg.warmup = std::chrono::seconds{1};
+  cfg.duration = std::chrono::seconds{1};
+  cfg.target_rate_ops = 1000;
+  cfg.key_count = 10;
+  cfg.mix.weights["X"] = 1.0;
+
+  // Slot 995 is 5ms before the warmup ends; it stalls 50ms past it.
+  std::atomic<int> calls{0};
+  OpFn op = [&](int, std::string_view, uint64_t) {
+    if (calls.fetch_add(1, std::memory_order_relaxed) == 995) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    return true;
+  };
+  const auto result = RunLoop(cfg, op);
+
+  EXPECT_EQ(result.per_op_counts.at("X"), 1000U);
+  EXPECT_EQ(result.per_op_histograms.at("X").Count(), 1000);
+}
+
+// 120 req/s over 80 connections: 40 take 2/s and 40 take 1/s.
+TEST(WorkerRateTest, SplitsTheTotalExactly) {
+  uint64_t total = 0;
+  for (size_t w = 0; w < 80; ++w) {
+    EXPECT_EQ(WorkerRate(120, 80, w), w < 40 ? 2U : 1U);
+    total += WorkerRate(120, 80, w);
+  }
+  EXPECT_EQ(total, 120U);
+  EXPECT_EQ(WorkerRate(100'000, 80, 79), 1250U);
+  EXPECT_EQ(WorkerRate(3, 80, 2), 1U);
+  EXPECT_EQ(WorkerRate(3, 80, 3), 0U);
+}
+
+TEST(RunLoopConfigFromWorkloadTest, CarriesTheTotalTargetRate) {
   WorkloadConfig wl;
   wl.workers = 4;
   wl.duration = std::chrono::seconds{30};
@@ -122,7 +174,7 @@ TEST(RunLoopConfigFromWorkloadTest, DividesTargetRateAcrossWorkers) {
 
   const auto rl = RunLoopConfigFromWorkload(wl);
   EXPECT_EQ(rl.workers, 4);
-  EXPECT_EQ(rl.target_rate_ops_per_worker, 25'000U);
+  EXPECT_EQ(rl.target_rate_ops, 100'000U);
   EXPECT_EQ(rl.duration.count(), 30);
   EXPECT_EQ(rl.warmup.count(), 5);
 }

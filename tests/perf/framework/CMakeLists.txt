@@ -6,6 +6,8 @@ add_library(abyss_perf_framework
   reporter.cpp
   metrics_scraper.cpp
   run_loop.cpp
+  server_identity.cpp
+  sweep.cpp
 )
 add_library(abyss::perf_framework ALIAS abyss_perf_framework)
 

@@ -1,0 +1,26 @@
+# Reference workload for authoritative runs on perf-grade hardware.
+# Open-loop bursts: each slot sends pipeline_depth requests together at
+# target_rate_ops requests/s. The rate is a placeholder; tune it per
+# host to at most half the saturation throughput.
+# No static target: the loopback write is judged against Valkey in the
+# same run (provisional 250us p99 ceiling). Run the server at the
+# durability class under test.
+# See docs/development/performance.md §Conditions of measurement.
+name: write-loopback-pipelined
+description: 100% SET over loopback, open-loop bursts, 64 connections at pipeline depth 16.
+duration_seconds: 60
+warmup_seconds: 10
+workers: 8
+connections_per_worker: 8
+pipeline_depth: 16
+arrival: burst
+target_rate_ops: 102400
+key_count: 1000000
+key_distribution:
+  kind: uniform
+  seed: 3
+value_size_bytes: 64
+mix:
+  SET: 1.0
+preload:
+  enabled: false

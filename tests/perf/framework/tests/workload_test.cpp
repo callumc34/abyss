@@ -52,10 +52,95 @@ TEST(WorkloadTest, ParsesValidYaml) {
   EXPECT_EQ(result->mix.weights.at("GET"), 0.95);
   EXPECT_EQ(result->mix.weights.at("SET"), 0.05);
   EXPECT_TRUE(result->preload.enabled);
-  EXPECT_TRUE(result->targets.throughput_ops.has_value());
-  EXPECT_EQ(*result->targets.throughput_ops, 100'000);
+  EXPECT_EQ(result->targets.throughput_ops, 100'000);
   ASSERT_TRUE(result->targets.per_op.contains("GET"));
-  EXPECT_EQ(*result->targets.per_op.at("GET").p99_us, 100);
+  EXPECT_EQ(result->targets.per_op.at("GET").p99_us, 100);
+  EXPECT_EQ(result->pipeline_depth, 1);
+}
+
+TEST(WorkloadTest, ParsesPipelineDepth) {
+  constexpr const char* kPipelined = R"(
+name: x
+duration_seconds: 1
+connections_per_worker: 64
+pipeline_depth: 16
+key_count: 1
+key_distribution:
+  kind: uniform
+mix:
+  SET: 1.0
+)";
+  auto result = ParseWorkloadYaml(kPipelined);
+  ASSERT_TRUE(result.has_value()) << "parse failed: " << result.error().message();
+  EXPECT_EQ(result->pipeline_depth, 16);
+}
+
+TEST(WorkloadTest, ParsesBurstArrival) {
+  constexpr const char* kBurst = R"(
+name: x
+duration_seconds: 1
+pipeline_depth: 16
+arrival: burst
+target_rate_ops: 1600
+key_count: 1
+key_distribution:
+  kind: uniform
+mix:
+  SET: 1.0
+)";
+  auto result = ParseWorkloadYaml(kBurst);
+  ASSERT_TRUE(result.has_value()) << "parse failed: " << result.error().message();
+  EXPECT_EQ(result->arrival, Arrival::kBurst);
+}
+
+TEST(WorkloadTest, RejectsClosedLoopBurst) {
+  constexpr const char* kClosedBurst = R"(
+name: x
+duration_seconds: 1
+pipeline_depth: 16
+arrival: burst
+key_count: 1
+key_distribution:
+  kind: uniform
+mix:
+  SET: 1.0
+)";
+  auto result = ParseWorkloadYaml(kClosedBurst);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message().find("open loop"), std::string::npos);
+}
+
+TEST(WorkloadTest, RejectsOversizedPipelineWindow) {
+  constexpr const char* kWide = R"(
+name: x
+duration_seconds: 1
+pipeline_depth: 16
+value_size_bytes: 131072
+key_count: 1
+key_distribution:
+  kind: uniform
+mix:
+  SET: 1.0
+)";
+  auto result = ParseWorkloadYaml(kWide);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message().find("backpressure"), std::string::npos);
+}
+
+TEST(WorkloadTest, RejectsZeroPipelineDepth) {
+  constexpr const char* kZeroDepth = R"(
+name: x
+duration_seconds: 1
+pipeline_depth: 0
+key_count: 1
+key_distribution:
+  kind: uniform
+mix:
+  SET: 1.0
+)";
+  auto result = ParseWorkloadYaml(kZeroDepth);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message().find("pipeline_depth"), std::string::npos);
 }
 
 TEST(WorkloadTest, RejectsMixWithBadWeightSum) {
