@@ -251,6 +251,57 @@ TEST(ConfigValidate, DurabilityWindowMsBounds) {
   }
 }
 
+TEST(ConfigValidate, LogCountIsAPowerOfTwoAtMostTheShardCount) {
+  for (const char* bad : {"0", "3", "6"}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  log_count: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value()) << bad;
+    EXPECT_NE(cfg.error().message().find("queue.log_count"), std::string::npos)
+        << cfg.error().message();
+  }
+  auto over = Config::ParseFromYaml("hot:\n  shard_count: 4\nqueue:\n  log_count: 8\n");
+  ASSERT_FALSE(over.has_value());
+  EXPECT_NE(over.error().message().find("queue.log_count"), std::string::npos)
+      << over.error().message();
+  EXPECT_NE(over.error().message().find("hot.shard_count"), std::string::npos)
+      << over.error().message();
+  for (const char* good : {"1", "2", "64"}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  log_count: ") + good + "\n");
+    ASSERT_TRUE(cfg.has_value()) << good << ": " << cfg.error().message();
+  }
+}
+
+TEST(ConfigValidate, RingEntriesIsAPowerOfTwoInRange) {
+  for (const char* bad : {"2048", "4095", "5000", "33554432"}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  ring_entries: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value()) << bad;
+    EXPECT_NE(cfg.error().message().find("queue.ring_entries"), std::string::npos)
+        << cfg.error().message();
+  }
+  for (const char* good : {"4096", "65536", "16777216"}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  ring_entries: ") + good + "\n");
+    ASSERT_TRUE(cfg.has_value()) << good << ": " << cfg.error().message();
+  }
+}
+
+// A segment is its 4 KiB header plus 8-byte aligned frames, and must
+// hold one max-size frame.
+TEST(ConfigValidate, SegmentSizeHoldsTheHeaderAndOneMaxSizeFrame) {
+  const auto parse = [](const std::string& segment, const std::string& value) {
+    return Config::ParseFromYaml("queue:\n  segment_size_bytes: " + segment +
+                                 "\n  max_value_size_bytes: " + value + "\n");
+  };
+  auto unaligned = parse("1048580", "1024");
+  ASSERT_FALSE(unaligned.has_value());
+  EXPECT_NE(unaligned.error().message().find("multiple of 8"), std::string::npos)
+      << unaligned.error().message();
+  auto no_header_room = parse("1049600", "1048576");
+  ASSERT_FALSE(no_header_room.has_value());
+  EXPECT_NE(no_header_room.error().message().find("queue.segment_size_bytes"), std::string::npos)
+      << no_header_room.error().message();
+  auto fits = parse("1053696", "1048576");
+  EXPECT_TRUE(fits.has_value()) << fits.error().message();
+}
+
 // Cold's pause for power durability freezes the frontier that buffer
 // consistency waits on, so it must end well before that wait does.
 TEST(ConfigValidate, ColdReadTimeoutIsAtMostHalfTheConsistencyWait) {

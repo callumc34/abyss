@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -41,12 +43,13 @@ constexpr std::size_t kBodyAt = frame::kCommitBytes + frame::kCrcBytes;
 constexpr std::size_t kWriteFrameOverhead = 64;
 
 // One closed frame of exactly `size` bytes (a multiple of 8, >= 64).
-std::vector<std::byte> Frame(core::ShardId shard, core::SequenceId seq, std::size_t size) {
+std::vector<std::byte> Frame(core::ShardId shard, core::SequenceId seq, std::size_t size,
+                             core::WallTime appended_at = core::WallClock::now()) {
   std::vector<std::byte> out;
   frame::EncodeEntry(
       core::QueueEntry{
           .seq = seq,
-          .appended_at = core::WallClock::now(),
+          .appended_at = appended_at,
           .payload =
               core::entry::Write{
                   .cmd = core::RespCommand{{"SET", "k",
@@ -162,8 +165,9 @@ class LogTest : public ::testing::Test {
 
   // Reserves and commits one frame, waiting for a spare if need be.
   static Log::Reservation Append(Log& log, core::ShardId shard, core::SequenceId seq,
-                                 std::size_t size) {
-    const auto bytes = Frame(shard, seq, size);
+                                 std::size_t size,
+                                 core::WallTime appended_at = core::WallClock::now()) {
+    const auto bytes = Frame(shard, seq, size, appended_at);
     auto reservation = log.Reserve(static_cast<uint32_t>(size));
     if (!reservation.has_value() && reservation.error().code() == core::ErrorCode::kUnavailable) {
       EXPECT_TRUE(log.WaitForSpare(std::chrono::steady_clock::now() + 5s));
@@ -509,6 +513,68 @@ TEST_F(LogTest, SealedSegmentsCarryTheirShardRanges) {
   EXPECT_EQ(sealed[0].shards[0].max_seq, 6U);
   EXPECT_EQ(sealed[0].shards[1].shard, 2U);
   EXPECT_EQ(sealed[0].shards[1].min_seq, 9U);
+}
+
+// Retention ages a segment from its seal: a spare prepared long before
+// it took frames is stamped when the flush passes its end, and stamps
+// never go back with the clock.
+TEST_F(LogTest, ASegmentIsStampedWhenSealedNotWhenPrepared) {
+  auto seconds = std::make_shared<std::atomic<int64_t>>(1000);
+  auto config = Config();
+  config.wall_clock = [seconds] { return core::WallTime(std::chrono::seconds(seconds->load())); };
+  auto opened = Log::Open(config, nullptr);
+  ASSERT_TRUE(opened.has_value()) << opened.error().message();
+  Log& log = **opened;
+  const auto at = [](int64_t s) { return core::WallTime(std::chrono::seconds(s)); };
+
+  // Idle for ten days with segments 0, 1 and 2 already prepared.
+  constexpr int64_t kDay = 86400;
+  seconds->store(1000 + (10 * kDay));
+  // Three frames fill a segment; the next one rolls and lets it seal.
+  core::SequenceId seq = 0;
+  const auto append_and_flush = [&](int frames) {
+    for (int i = 0; i < frames; ++i) Append(log, 0, seq++, 20000);
+    ASSERT_TRUE(log.Flush({}).has_value());
+  };
+  append_and_flush(4);
+  seconds->store(1000 + (11 * kDay));
+  append_and_flush(3);
+  seconds->store(1000);
+  append_and_flush(3);
+
+  const auto sealed = log.SealedSegments(kAll);
+  ASSERT_GE(sealed.size(), 3U);
+  EXPECT_EQ(sealed[0].sealed_at, at(1000 + (10 * kDay)));
+  EXPECT_EQ(sealed[1].sealed_at, at(1000 + (11 * kDay)));
+  EXPECT_EQ(sealed[2].sealed_at, at(1000 + (11 * kDay))) << "a seal stamp went back";
+}
+
+// A reopened segment is stamped with its newest entry's append time,
+// wherever in the segment that entry sits.
+TEST_F(LogTest, ARecoveredSegmentIsStampedWithItsNewestEntry) {
+  const auto at = [](int64_t s) { return core::WallTime(std::chrono::seconds(s)); };
+  std::map<uint64_t, core::WallTime> newest;
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    const std::vector<int64_t> times = {5000, 8000, 6000, 7000, 9000, 6500, 9500};
+    for (std::size_t i = 0; i < times.size(); ++i) {
+      const auto reserved = Append(*log, 0, i, 20000, at(times[i]));
+      auto& stamp = newest[reserved.pos / kSpace];
+      stamp = std::max(stamp, at(times[i]));
+    }
+    log->AwaitFilled(log->ReservedTail());
+  }
+  ASSERT_GE(newest.size(), 3U);
+  EXPECT_EQ(newest[0], at(8000));
+
+  auto log = OpenLog();
+  ASSERT_NE(log, nullptr);
+  const auto sealed = log->SealedSegments(kAll);
+  ASSERT_EQ(sealed.size(), newest.size());
+  for (const auto& segment : sealed) {
+    EXPECT_EQ(segment.sealed_at, newest[segment.ordinal]) << "segment " << segment.ordinal;
+  }
 }
 
 TEST_F(LogTest, ReclaimWaitsForReadersBeforeRecycling) {

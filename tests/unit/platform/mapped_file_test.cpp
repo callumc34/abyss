@@ -13,6 +13,11 @@
 #include "abyss/platform/fs.h"
 #include "temp_dir.h"
 
+#ifdef __APPLE__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace abyss::platform::fs {
 namespace {
 
@@ -131,6 +136,32 @@ TEST(MappedFileTest, MoveTransfersTheMapping) {
   EXPECT_FALSE(assigned.valid());
   EXPECT_EQ(assigned.size(), 0U);
 }
+
+#ifdef __APPLE__
+bool Dirty(const std::byte* page) {
+  char vec = 0;
+  EXPECT_EQ(mincore(page, static_cast<std::size_t>(getpagesize()), &vec), 0);
+  return (vec & MINCORE_MODIFIED) != 0;
+}
+
+// The WAL's flush relies on F_FULLFSYNC writing back pages dirtied
+// through a MAP_SHARED mapping, which APFS does but does not document.
+TEST(MappedFileTest, ADurableSyncWritesBackPagesDirtiedThroughTheMapping) {
+  const TempDir dir("mapped");
+  const File file = OpenNew(dir, "seg");
+  ASSERT_TRUE(ZeroFill(file, kMiB).has_value());
+  ASSERT_TRUE(Fsync(file, SyncMode::kDurableData).has_value());
+  auto map = MappedFile::Map(file, kMiB);
+  ASSERT_TRUE(map.has_value()) << map.error().message();
+
+  std::byte* const page = map->data() + getpagesize();
+  *page = std::byte{1};
+  ASSERT_TRUE(Dirty(page));
+  ASSERT_TRUE(map->WriteBack(0, kMiB).has_value());
+  ASSERT_TRUE(Fsync(file, SyncMode::kDurableData).has_value());
+  EXPECT_FALSE(Dirty(page)) << "F_FULLFSYNC left a mapped page dirty";
+}
+#endif
 
 }  // namespace
 }  // namespace abyss::platform::fs

@@ -31,6 +31,8 @@ queue:
   backend: builtin_wal
   wal_path: /data/wal
   segment_size_bytes: 134217728
+  log_count: 2
+  ring_entries: 8192
   min_retention_seconds: 86400
   offset_fsync_interval_ms: 250
   durability: power_loss
@@ -109,6 +111,8 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->queue.backend, "builtin_wal");
   EXPECT_EQ(cfg->queue.wal_path, "/data/wal");
   EXPECT_EQ(cfg->queue.segment_size_bytes, 134217728U);
+  EXPECT_EQ(cfg->queue.log_count, 2U);
+  EXPECT_EQ(cfg->queue.ring_entries, 8192U);
   EXPECT_EQ(cfg->queue.min_retention, std::chrono::seconds{86400});
   EXPECT_EQ(cfg->queue.offset_fsync_interval, std::chrono::milliseconds{250});
   EXPECT_EQ(cfg->queue.durability, core::Durability::kPowerLoss);

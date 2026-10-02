@@ -44,6 +44,8 @@ struct Header {
   core::ShardId shard = 0;
   core::SequenceId seq = 0;
   uint64_t batch_rest = 0;
+  // Zero for padding.
+  int64_t appended_at_us = 0;
 };
 
 inline uint64_t CommitWord(uint32_t len, uint32_t gen) noexcept {

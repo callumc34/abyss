@@ -78,7 +78,7 @@ core::QueueEntry MakeWrite(std::vector<std::string> args) {
 WalConfig VictimConfig(const std::filesystem::path& dir, core::Durability durability) {
   return WalConfig{
       .wal_path = dir.string(),
-      .segment_size_bytes = 4096,
+      .segment_size_bytes = 8192,
       .shard_count = 1,
       .durability = durability,
       .min_retention = 1s,

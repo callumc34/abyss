@@ -137,6 +137,7 @@ View Inspect(uint64_t commit_word, std::span<const std::byte> bytes, uint32_t ge
       .shard = LoadLE<uint16_t>(body.data() + kShardAt),
       .seq = LoadLE<uint64_t>(body.data() + kSeqAt),
       .batch_rest = LoadLE<uint64_t>(body.data() + kBatchRestAt),
+      .appended_at_us = LoadLE<int64_t>(body.data() + kAppendedAt),
   };
   view.size = size;
   view.body = body;

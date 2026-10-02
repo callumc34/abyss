@@ -44,7 +44,7 @@ class HotConsumerTest : public ::testing::Test {
 
     auto queue_result = queue::WalQueue::Open(queue::WalConfig{
         .wal_path = dir_->String(),
-        .segment_size_bytes = 4096,
+        .segment_size_bytes = 8192,
         .shard_count = 1,
         .durability = core::Durability::kPowerLoss,
         .min_retention = 10s,
@@ -188,7 +188,7 @@ TEST_F(HotConsumerTest, PowerLossAppliesOnlyFlushedWrites) {
     bool released = false;
   };
   auto stall = std::make_shared<Stall>();
-  queue_->SetFlushHookForTesting([stall](core::ShardId) -> core::Result<void> {
+  queue_->SetFlushHookForTesting([stall](uint32_t) -> core::Result<void> {
     std::unique_lock lock(stall->mu);
     stall->cv.wait(lock, [&stall] { return stall->released; });
     return {};
@@ -598,7 +598,7 @@ TEST_F(HotConsumerTest, RebuildsFromFirstRetainedSeqAfterReclaim) {
   const testing::TempDir dir("hot_consumer_reaped");
   auto opened = queue::WalQueue::Open(queue::WalConfig{
       .wal_path = dir.String(),
-      .segment_size_bytes = 256,
+      .segment_size_bytes = 4096 + 512,
       .shard_count = 1,
       .durability = core::Durability::kPowerLoss,
       .min_retention = 0s,
@@ -614,6 +614,8 @@ TEST_F(HotConsumerTest, RebuildsFromFirstRetainedSeqAfterReclaim) {
   }
   const core::SequenceId tail = queue_->TailSeq(0).value();
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, tail).has_value());
+  // Reclaimed once both checkpoint slots hold the commit.
+  ASSERT_TRUE(queue_->FlushOffsets().has_value());
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
   const core::SequenceId first = queue_->FirstSeq(0).value();
   ASSERT_GT(first, 0U) << "the reaper reclaimed nothing";
