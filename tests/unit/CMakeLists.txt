@@ -241,6 +241,7 @@ target_link_libraries(abyss_branding_tests PRIVATE
 
 add_executable(abyss_platform_tests
   platform/fs_test.cpp
+  platform/mapped_file_test.cpp
 )
 
 target_link_libraries(abyss_platform_tests PRIVATE
