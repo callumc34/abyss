@@ -167,6 +167,39 @@ class HotConsumerTest : public ::testing::Test {
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
+// A Flush reaches every shard's stream and each consumer wipes only its
+// own shard, so it never drops another shard's writes.
+TEST_F(HotConsumerTest, AFlushWipesOnlyItsOwnShard) {
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      .max_memory_bytes = 16UL * 1024UL * 1024UL,
+      .shard_count = 2,
+  });
+  HotConsumer writer(*queue_, *hot_, rpc_, apply_notifier_, HotConsumer::Config{.shard = 0},
+                     policy_);
+  HotConsumer flusher(*queue_, *hot_, rpc_, apply_notifier_, HotConsumer::Config{.shard = 1},
+                      policy_);
+  constexpr int kKeys = 64;
+  std::vector<core::QueueEntry> writes;
+  for (int i = 0; i < kKeys; ++i) {
+    writes.push_back(MakeWrite({"SET", "key:" + std::to_string(i), "v"}));
+    writes.back().seq = static_cast<core::SequenceId>(i);
+  }
+  writer.BeginReplay();
+  writer.ApplyReplayBatch(writes);
+  writer.EndReplay();
+  ASSERT_EQ(hot_->Stats()->key_count, static_cast<uint64_t>(kKeys));
+
+  std::vector<core::QueueEntry> flush(1);
+  flush[0].appended_at = core::WallClock::now();
+  flush[0].payload = core::entry::Flush{};
+  flusher.BeginReplay();
+  flusher.ApplyReplayBatch(flush);
+  flusher.EndReplay();
+  const uint64_t left = hot_->Stats()->key_count;
+  EXPECT_GT(left, 0U) << "shard 1's Flush wiped shard 0";
+  EXPECT_LT(left, static_cast<uint64_t>(kKeys)) << "shard 1's Flush wiped nothing";
+}
+
 TEST_F(HotConsumerTest, AppliesWriteAndFulfillsOk) {
   StartConsumer();
   auto future = AppendWithRpc({"SET", "key", "value"});

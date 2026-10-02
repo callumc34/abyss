@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -25,11 +26,11 @@ namespace abyss::consumer {
 // a volatile view: it commits no offset and rebuilds from the first
 // retained seq on restart.
 //
-// During recovery the consumer is driven synchronously through ReplayUntil()
-// instead of Start()/Run(). Replay sets replay_mode_, which gates the
-// skip-stale checks (ADP-007 invariants 3-4) so they don't fire on fresh
-// steady-state writes. Both share one read cursor, so Run resumes where
-// replay stopped.
+// During recovery the consumer is driven synchronously, by a queue Scan
+// or through ReplayUntil(), instead of Start()/Run(). Replay sets
+// replay_mode_, which gates the skip-stale checks (ADP-007 invariants
+// 3-4) so they don't fire on fresh steady-state writes. Both share one
+// read cursor, so Run resumes where replay stopped.
 class HotConsumer {
  public:
   struct Config {
@@ -65,10 +66,20 @@ class HotConsumer {
   void Stop();
 
   // Synchronous replay drive: drain entries to `target` (inclusive) using
-  // replay_batch_size, applying skip-stale rules. Returns when caught up,
-  // cancelled, or on unrecoverable queue error. Must NOT be called while
-  // Start() is running on the same instance.
-  core::Result<void> ReplayUntil(core::SequenceId target, const std::atomic<bool>& cancel);
+  // replay_batch_size, applying skip-stale rules. Returns when caught up
+  // (with the entries it replayed), cancelled, or on unrecoverable queue
+  // error. Must NOT be called while Start() is running on the same
+  // instance.
+  core::Result<uint64_t> ReplayUntil(core::SequenceId target, const std::atomic<bool>& cancel);
+
+  // Replay fed by the caller, e.g. from a queue Scan: BeginReplay, each
+  // batch in seq order, then EndReplay. The same rules as ReplayUntil;
+  // not while Start() runs. Each batch moves the cursor past it.
+  void BeginReplay();
+  void ApplyReplayBatch(std::vector<core::QueueEntry>& batch);
+  void EndReplay();
+  // Where Run, or a later ReplayUntil, reads next.
+  void SetReplayCursor(core::SequenceId next);
 
   bool Running() const { return running_.load(std::memory_order_acquire); }
   core::ShardId shard() const { return config_.shard; }
@@ -129,8 +140,8 @@ class HotConsumer {
 
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> running_{false};
-  // True only while ReplayUntil() is executing on this consumer. Gates the
-  // skip-stale checks so steady-state writes through Run() apply normally.
+  // True only while this consumer replays. Gates the skip-stale checks
+  // so steady-state writes through Run() apply normally.
   std::atomic<bool> replay_mode_{false};
   std::thread thread_;
 
@@ -144,7 +155,7 @@ class HotConsumer {
   std::unordered_map<core::SequenceId, PendingConditional> pending_conditionals_
       ABYSS_GUARDED_BY(pending_mu_);
 
-  // Next seq to read. Touched by ReplayUntil or the Run thread, never both.
+  // Next seq to read. Touched by replay or the Run thread, never both.
   core::SequenceId next_read_seq_ = 0;
 
   std::atomic<core::SequenceId> highest_settled_seq_{0};

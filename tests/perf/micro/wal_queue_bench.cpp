@@ -204,5 +204,102 @@ BENCHMARK(BM_ReadAtSegmentPosition)
     ->Unit(benchmark::kMicrosecond)
     ->Complexity();
 
+// Each thread appends to a shard of its own, all on one log, so they
+// contend on the log's reservation tail rather than on a shard lock.
+constexpr size_t kContentionShards = 64;
+
+void OpenContention(const benchmark::State& /*state*/) {
+  auto& shared = Shared();
+  shared.dir = std::make_unique<TempDir>();
+  auto result = WalQueue::Open({
+      .wal_path = shared.dir->path(),
+      .segment_size_bytes = size_t{16} * 1024 * 1024,
+      .shard_count = kContentionShards,
+      .log_count = 1,
+      .durability = core::Durability::kProcessCrash,
+      .min_retention = 1s,
+  });
+  if (!result.has_value()) std::abort();
+  shared.queue = std::move(*result);
+}
+
+void BM_ReserveContention(benchmark::State& state) {
+  WalQueue& queue = *Shared().queue;
+  const auto shard = static_cast<core::ShardId>(state.thread_index() % kContentionShards);
+  const core::QueueEntry entry = MakeEntry(64);
+  for ([[maybe_unused]] auto _ : state) {
+    auto appended = queue.Append(shard, entry);
+    if (!appended.has_value()) {
+      state.SkipWithError("append failed");
+      break;
+    }
+    benchmark::DoNotOptimize(appended->seq);
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+}
+BENCHMARK(BM_ReserveContention)
+    ->Setup(OpenContention)
+    ->Teardown(CloseShared)
+    ->Threads(1)
+    ->Threads(8)
+    ->Threads(64)
+    ->UseRealTime();
+
+// 64 shards interleaved on one log. A seq inside its shard's ring is
+// found at once; one behind it starts from the sparse index and steps
+// over every other shard's frames in between.
+constexpr size_t kInterleavedShards = 64;
+constexpr size_t kInterleavedRing = 4096;
+constexpr core::SequenceId kInterleavedPerShard = 4 * kInterleavedRing;
+constexpr size_t kInterleavedBatch = 8;
+constexpr core::SequenceId kRingMargin = 256;
+
+void BM_ReadInterleaved(benchmark::State& state) {
+  const bool from_index = state.range(0) != 0;
+  TempDir tmp;
+  auto opened = WalQueue::Open({
+      .wal_path = tmp.path(),
+      .segment_size_bytes = size_t{64} * 1024 * 1024,
+      .shard_count = kInterleavedShards,
+      .log_count = 1,
+      .ring_entries = kInterleavedRing,
+      .durability = core::Durability::kProcessCrash,
+      .min_retention = 1s,
+  });
+  if (!opened.has_value()) {
+    state.SkipWithError("open failed");
+    return;
+  }
+  auto& queue = **opened;
+  const std::vector<core::QueueEntry> batch(kInterleavedBatch, MakeEntry(kPositionValueBytes));
+  for (core::SequenceId filled = 0; filled < kInterleavedPerShard; filled += kInterleavedBatch) {
+    for (core::ShardId shard = 0; shard < kInterleavedShards; ++shard) {
+      if (!queue.AppendBatch(shard, batch).has_value()) {
+        state.SkipWithError("fill failed");
+        return;
+      }
+    }
+  }
+
+  // Seqs stride across the range, so no read reuses a position hint.
+  const core::SequenceId lo =
+      from_index ? 0 : kInterleavedPerShard - kInterleavedRing + kRingMargin;
+  const core::SequenceId span = from_index ? kInterleavedPerShard - kInterleavedRing - kRingMargin
+                                           : kInterleavedRing - kRingMargin;
+  uint64_t i = 0;
+  for ([[maybe_unused]] auto _ : state) {
+    const auto shard = static_cast<core::ShardId>(i % kInterleavedShards);
+    const core::SequenceId seq = lo + ((i * 7919) % span);
+    ++i;
+    auto read = queue.Read(shard, seq, 1, core::Duration{0}, core::Durability::kProcessCrash);
+    if (!read.has_value() || read->size() != 1 || read->front().seq != seq) {
+      state.SkipWithError("read failed");
+      return;
+    }
+    benchmark::DoNotOptimize(read);
+  }
+}
+BENCHMARK(BM_ReadInterleaved)->ArgName("from_index")->Arg(0)->Arg(1)->Unit(benchmark::kMicrosecond);
+
 }  // namespace
 }  // namespace abyss::queue

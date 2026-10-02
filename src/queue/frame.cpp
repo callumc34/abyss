@@ -7,7 +7,6 @@
 #include <string>
 #include <utility>
 
-#include "abyss/queue/wal_entry.h"
 #include "binary_io.h"
 #include "crc32c.h"
 #include "entry_payload.h"
@@ -149,7 +148,7 @@ core::Result<core::QueueEntry> DecodeEntry(const View& view) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInvalidArgument, "WAL frame is not a filled entry"});
   }
-  const auto type = static_cast<WalEntryType>(view.body[kTypeAt]);
+  const auto type = static_cast<entry_payload::EntryType>(view.body[kTypeAt]);
   const auto appended_us = LoadLE<int64_t>(view.body.data() + kAppendedAt);
   std::span<const std::byte> cursor = view.body.subspan(kHeaderBytes);
   auto payload = entry_payload::Decode(type, cursor);
