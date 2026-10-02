@@ -34,6 +34,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -52,10 +53,18 @@ constexpr std::size_t kSegment = std::size_t{64} << 10;
 constexpr std::size_t kFrameSpace = kSegment - 4096;
 constexpr std::string_view kMissed = "replay after the recovery scan found entries it missed";
 
-// Keys name their WAL shard, "s<shard>:...", so a wipe can drop one
-// shard's keys as the real store does.
-std::string Key(core::ShardId shard, const std::string& name) {
-  return "s" + std::to_string(shard) + ":" + name;
+std::string Prefix(core::ShardId shard) { return "s" + std::to_string(shard) + ":"; }
+
+// Keys name their WAL shard, "s<shard>:...", and route to it as the
+// engine routes keys, so a Flush on one shard wipes exactly that
+// shard's keys from hot and from this cold store.
+std::string Key(core::ShardId shard, const std::string& name, uint32_t shards) {
+  for (uint32_t salt = 0; salt < (uint32_t{1} << 20); ++salt) {
+    std::string key = Prefix(shard) + name + "#" + std::to_string(salt);
+    if (core::ComputeShard(key, shards) == shard) return key;
+  }
+  ADD_FAILURE() << "no key routes to shard " << shard;
+  return Prefix(shard) + name;
 }
 
 // A cold store in memory: per key, the last op applied and, for a
@@ -109,7 +118,7 @@ class MemoryColdStore : public core::ColdStore {
       return std::unexpected(core::Error{core::ErrorCode::kInternal, "cold store unwritable"});
     }
     const std::scoped_lock lock(mu_);
-    const std::string prefix = Key(shard, "");
+    const std::string prefix = Prefix(shard);
     std::erase_if(state_, [&](const auto& kv) { return kv.first.starts_with(prefix); });
     return {};
   }
@@ -289,7 +298,7 @@ TEST_F(RecoveryCoordinatorScanTest, OneScanRebuildsWhatShardByShardReplayDid) {
     auto& queue = **opened;
     for (std::size_t i = 0; i < 3000; ++i) {
       const core::ShardId shard = shard_of(i);
-      const std::string key = Key(shard, "k" + std::to_string(i % 40));
+      const std::string key = Key(shard, "k" + std::to_string(i % 40), kShards);
       keys_.insert(key);
       Append(queue, shard, WriteEntry(key, "old" + std::to_string(i)));
     }
@@ -305,19 +314,19 @@ TEST_F(RecoveryCoordinatorScanTest, OneScanRebuildsWhatShardByShardReplayDid) {
 
     for (std::size_t i = 0; i < 15000; ++i) {
       const core::ShardId shard = shard_of(i);
-      const std::string key = Key(shard, "k" + std::to_string(i % 40));
+      const std::string key = Key(shard, "k" + std::to_string(i % 40), kShards);
       keys_.insert(key);
       Append(queue, shard, WriteEntry(key, std::string(i % 97, 'v') + std::to_string(i)));
       if (i % 25 == 0) {
-        const std::string cond = Key(shard, "c" + std::to_string(i));
+        const std::string cond = Key(shard, "c" + std::to_string(i), kShards);
         keys_.insert(cond);
         const core::SequenceId ref = Append(queue, shard, ConditionalEntry(cond));
         Append(queue, shard, ResolvedEntry(ref, cond, i % 50 == 0));
       }
       if (i == 7500) Append(queue, 0, FlushEntry());
     }
-    keys_.insert(Key(9, "dangling"));
-    Append(queue, 9, ConditionalEntry(Key(9, "dangling")));
+    keys_.insert(Key(9, "dangling", kShards));
+    Append(queue, 9, ConditionalEntry(Key(9, "dangling", kShards)));
   }
   const auto wal_b = dir_.Sub("b");
   std::filesystem::copy(wal_a, wal_b, std::filesystem::copy_options::recursive);
@@ -373,8 +382,8 @@ TEST_F(RecoveryCoordinatorScanTest, OneScanRebuildsWhatShardByShardReplayDid) {
     in_hot += got.has_value() ? 1 : 0;
   }
   EXPECT_GT(in_hot, keys_.size() / 2);
-  EXPECT_EQ(scan.HotGet(Key(9, "dangling")), "v");
-  EXPECT_TRUE(cold_state.contains(Key(9, "dangling")));
+  EXPECT_EQ(scan.HotGet(Key(9, "dangling", kShards)), "v");
+  EXPECT_TRUE(cold_state.contains(Key(9, "dangling", kShards)));
 }
 
 // The resolver re-emits a Resolved for a dangling Conditional. The
@@ -387,8 +396,8 @@ TEST_F(RecoveryCoordinatorScanTest, AResolvedTheResolverReEmitsIsReplayedByTheSc
   {
     auto opened = queue::WalQueue::Open(WalConfigFor(wal, kShards));
     ASSERT_TRUE(opened.has_value()) << opened.error().message();
-    Append(**opened, 2, WriteEntry(Key(2, "k"), "v"));
-    before = Append(**opened, 2, ConditionalEntry(Key(2, "c")));
+    Append(**opened, 2, WriteEntry(Key(2, "k", kShards), "v"));
+    before = Append(**opened, 2, ConditionalEntry(Key(2, "c", kShards)));
   }
 
   Node node(wal, kShards);
@@ -398,8 +407,8 @@ TEST_F(RecoveryCoordinatorScanTest, AResolvedTheResolverReEmitsIsReplayedByTheSc
   ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
 
   EXPECT_EQ(node.queue->TailSeq(2).value(), before + 1) << "no Resolved was re-emitted";
-  EXPECT_EQ(node.HotGet(Key(2, "c")), "v");
-  EXPECT_TRUE(node.cold.State().contains(Key(2, "c")));
+  EXPECT_EQ(node.HotGet(Key(2, "c", kShards)), "v");
+  EXPECT_TRUE(node.cold.State().contains(Key(2, "c", kShards)));
   for (const auto& record : logs.Records()) EXPECT_NE(record.msg, kMissed);
 }
 
@@ -410,9 +419,10 @@ TEST_F(RecoveryCoordinatorScanTest, AColdWipeThatAlwaysFailsFailsRecoveryWithinI
   {
     auto opened = queue::WalQueue::Open(WalConfigFor(wal, kShards));
     ASSERT_TRUE(opened.has_value()) << opened.error().message();
-    for (core::ShardId s = 0; s < kShards; ++s) Append(**opened, s, WriteEntry(Key(s, "k"), "v"));
+    for (core::ShardId s = 0; s < kShards; ++s)
+      Append(**opened, s, WriteEntry(Key(s, "k", kShards), "v"));
     Append(**opened, 3, FlushEntry());
-    Append(**opened, 3, WriteEntry(Key(3, "after"), "v"));
+    Append(**opened, 3, WriteEntry(Key(3, "after", kShards), "v"));
   }
 
   consumer::ColdConsumer::Config cold_config;

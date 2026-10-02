@@ -36,7 +36,8 @@ struct QueueStats {
 // safe to resume and, for retention, how far the WAL may be reclaimed.
 //
 // Durable ends are exclusive: seqs below DurableEnd(shard, d) are durable
-// at d; 0 means none is.
+// at d; 0 means none is. DurableEnd(kPowerLoss) never passes
+// DurableEnd(kProcessCrash): nothing is visible before it is published.
 class Queue {
  public:
   Queue() = default;

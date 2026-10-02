@@ -95,10 +95,11 @@ class ShardStream {
                     core::Duration timeout) const;
 
   // Commit thread, in the flush walk, before the log's durable prefix
-  // moves. True iff the frame closed its batch, moving the power end.
+  // moves. True iff the frame closed its batch and that moved the power
+  // end, which never passes the published end.
   bool Durable(const frame::Header& header, uint32_t size) noexcept;
-  // Commit thread, after the flush: resolves append futures below the
-  // power end and wakes its waiters.
+  // After the power end moved: resolves append futures below it and
+  // wakes its waiters.
   void PowerAdvanced();
 
   // Retention, under the unit's reclaim_mu: a segment of this log was
@@ -158,6 +159,8 @@ class ShardStream {
   void Published(LogPosition end_pos) noexcept;
   bool WaitForEnd(core::SequenceId seq, core::Durability durability, core::Duration timeout) const;
 
+  // True iff it moved the power end.
+  bool RaisePowerEnd() noexcept;
   std::optional<LogPosition> RingAt(core::SequenceId seq) const noexcept;
   std::optional<IndexPoint> Floor(Log::Cursor& cursor, core::SequenceId seq) const;
   core::Result<LogPosition> SkipTo(Log::Cursor& cursor, LogPosition pos,
@@ -191,6 +194,8 @@ class ShardStream {
 
   std::atomic<core::SequenceId> first_seq_{0};
   std::atomic<core::SequenceId> published_end_{0};
+  // Batch ends the flush walk has found durable, published or not.
+  std::atomic<core::SequenceId> flushed_end_{0};
   std::atomic<core::SequenceId> power_end_{0};
 
   // Readers of published_end_, Dekker-counted so a publish notifies

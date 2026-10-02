@@ -11,7 +11,7 @@
 - `abyss_wal_flush_duration_seconds` — duration of one WAL group-commit flush (fdatasync on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This is the device floor that `power_loss` acknowledgements and cold persistence wait on. It includes the walk that advances each shard's durable end after the sync. Segment preparation and offset persists are not included. Flushes per write is `rate(abyss_wal_flush_duration_seconds_count[1m]) / rate(abyss_queue_appended_total[1m])`. Near 1.0 under concurrent load, flushes are not batching.
 - `abyss_queue_offset_persist_duration_seconds` — duration of one durable persist of committed consumer offsets. The rate of persists (`_count`) shows how much flush capacity offset bookkeeping consumes.
 - `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. A failed flush terminates the process, so both histograms record successful flushes only.
-- `abyss_wal_fill_wait_seconds` — time an append waited for earlier reservations in its log to be filled before it could be acknowledged. Recorded only when it waited. It is microseconds unless large values are being copied (the head-of-line effect the blob lane, #162, removes).
+- `abyss_wal_fill_wait_seconds` — time an append waited for earlier reservations in its log to be filled before it could be acknowledged. Recorded only when the wait outlasted a short spin (about 2 µs), so it counts the waits behind a large value or a preempted filler (the head-of-line effect the blob lane, #162, removes), not a neighbour mid-copy.
 
 ### RESP Frontend
 

@@ -194,6 +194,9 @@ admin:
 - **Offset ring:** `ring_entries` slots of 16 bytes per shard, allocated at start. That is 1 MiB per shard at the default, 64 MiB at 64 shards, outside `hot.max_memory_bytes`. `abyss_wal_ring_bytes` and the `WAL opened` log line report it. The ring must cover how far consumers normally trail the head; reads further back fall back to the sparse index.
 
 **Log count.** All logs live under `wal_path`, on one volume. The default of one log gives one sequential write stream and one flush per batch. Raise `log_count` only if measurements show a single flusher is the limit.
+- On macOS a second log makes things worse. `F_FULLFSYNC` flushes the whole drive cache, so two logs' flushes serialise and each write waits for both.
+- Measured on an Apple SSD at `power_loss`: one log held p99 under 10 ms to 30K writes/s. Two logs went over 13 ms at every rate.
+- On Linux, concurrent `fdatasync` calls on separate files can be merged by the block layer, so more logs may help. That is unmeasured until an authoritative run on Linux hardware.
 
 ### External Profile
 

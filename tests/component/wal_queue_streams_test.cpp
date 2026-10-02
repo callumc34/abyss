@@ -392,6 +392,35 @@ TEST_F(WalQueueStreamsTest, ABatchStraddlingAFlushIsHiddenUntilItsLastFrameIsDur
 // Must-fix 5: with the preparer stopped, appends that need a new
 // segment wait for one, are rejected cleanly at their deadline, and go
 // through once a spare is ready.
+// A frame is filled, and can be flushed, before its PendingAppend is
+// published; the caller registers per-seq state in between, so nothing
+// may see it at power_loss until the publish.
+TEST_F(WalQueueStreamsTest, AnUnpublishedAppendIsHiddenAtPowerLossEvenOnceFlushed) {
+  auto config = Config(2);
+  config.durability = core::Durability::kPowerLoss;
+  OpenWith(config);
+  auto held = queue_->BeginAppend(0, MakeWrite("held"));
+  ASSERT_TRUE(held.has_value()) << held.error().message();
+
+  // Shard 1's frame lies after the held one, so its flush covers both.
+  auto later = queue_->Append(1, MakeWrite("later"));
+  ASSERT_TRUE(later.has_value()) << later.error().message();
+  ASSERT_EQ(later->durable.wait_for(5s), std::future_status::ready);
+  ASSERT_TRUE(later->durable.get().has_value());
+
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
+  EXPECT_EQ(held->durable().wait_for(0s), std::future_status::timeout);
+  auto hidden = queue_->Read(0, 0, 8, 0ms, core::Durability::kPowerLoss);
+  ASSERT_TRUE(hidden.has_value()) << hidden.error().message();
+  EXPECT_TRUE(hidden->empty());
+
+  held->Publish();
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 1U)
+      << "a publish after the flush raises the power end itself";
+  ASSERT_EQ(held->durable().wait_for(5s), std::future_status::ready);
+  EXPECT_TRUE(held->durable().get().has_value());
+}
+
 TEST_F(WalQueueStreamsTest, NoSpareSegmentWaitsThenRejectsCleanly) {
   OpenWith(Config(1));
   std::future<core::Result<AppendResult>> waiting;
@@ -974,6 +1003,12 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
       // A smoke check only: the end only grows, so this catches an
       // over-read but cannot prove none happened. The power-loss tests
       // are the proof.
+      if (queue_->DurableEnd(shard, core::Durability::kPowerLoss).value() >
+          queue_->DurableEnd(shard, core::Durability::kProcessCrash).value()) {
+        ADD_FAILURE() << "shard " << shard << " power end passed its published end";
+        stop.store(true);
+        return;
+      }
       if (visible == core::Durability::kPowerLoss &&
           read->back().seq >= queue_->DurableEnd(shard, visible).value()) {
         ADD_FAILURE() << "shard " << shard << " read seq " << read->back().seq
