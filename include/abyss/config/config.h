@@ -10,6 +10,7 @@
 
 #include "abyss/cold/ttl_scanner.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/durability.h"
 #include "abyss/core/result.h"
 #include "abyss/log/log.h"
 
@@ -52,9 +53,12 @@ struct QueueConfig {
   // Cadence of the committed-offset checkpoint. A crash replays at most this
   // much past the last checkpoint; WAL reclamation trails commits by it.
   std::chrono::milliseconds offset_fsync_interval{1000};
-  std::string fsync_policy = "group_commit";
-  uint32_t group_commit_interval_us = 1000;
-  size_t group_commit_max_bytes = 1048576;
+  // What an acknowledged write survives.
+  core::Durability durability = core::Durability::kProcessCrash;
+  // Bounds on written but not yet power-durable data: bytes across shards,
+  // and the oldest entry's age per shard. Appends wait, then fail, past it.
+  uint64_t durability_window_bytes = 67108864;
+  std::chrono::milliseconds durability_window{1000};
 };
 
 struct HotConsumerConfig {

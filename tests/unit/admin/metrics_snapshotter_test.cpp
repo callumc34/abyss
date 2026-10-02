@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
 
@@ -60,15 +62,27 @@ TEST_F(MetricsSnapshotterTest, PublishesTierKeyCountsAndFootprints) {
 TEST_F(MetricsSnapshotterTest, ConvertsAgeMillisToSeconds) {
   provider_.snapshot.cold.buffer.oldest_entry_age_ms = 5500;
   provider_.snapshot.queue.oldest_eligible_unreaped_age_ms = 2000;
+  provider_.snapshot.queue.durability_lag_ms = 250;
 
   MetricsSnapshotter snapshotter(provider_);
   snapshotter.Observe();
 
-  EXPECT_DOUBLE_EQ(
-      *metrics::testing::GetGaugeValue(metrics::names::kColdBufferOldestEntryAgeSeconds), 5.5);
-  EXPECT_DOUBLE_EQ(
-      *metrics::testing::GetGaugeValue(metrics::names::kQueueOldestEligibleUnreapedAgeSeconds),
-      2.0);
+  // Each value is exact in binary, so equality is safe.
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kColdBufferOldestEntryAgeSeconds),
+            std::optional<double>{5.5});
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kQueueOldestEligibleUnreapedAgeSeconds),
+            std::optional<double>{2.0});
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kWalDurabilityLagSeconds),
+            std::optional<double>{0.25});
+}
+
+TEST_F(MetricsSnapshotterTest, PublishesWalUnflushedBytes) {
+  provider_.snapshot.queue.unflushed_bytes = 4096;
+
+  MetricsSnapshotter snapshotter(provider_);
+  snapshotter.Observe();
+
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kWalUnflushedBytes), 4096.0);
 }
 
 TEST_F(MetricsSnapshotterTest, PublishesFleetReadBufferHighWater) {

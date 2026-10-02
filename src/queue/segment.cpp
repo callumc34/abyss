@@ -400,11 +400,51 @@ core::Result<size_t> Segment::AppendEncoded(std::span<const std::byte> bytes,
   return bytes.size();
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
+core::Result<size_t> Segment::AppendEncodedBatch(std::span<const std::byte> bytes,
+                                                 std::span<const size_t> sizes,
+                                                 core::SequenceId first_seq) {
+  size_t sized = 0;
+  for (const size_t size : sizes) sized += size;
+  if (sizes.empty() || sized != bytes.size()) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "batch sizes do not cover its bytes"});
+  }
+  if (sealed_) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "append on sealed segment"});
+  }
+  const core::SequenceId current_next_seq = next_seq_.load(std::memory_order_relaxed);
+  if (first_seq != current_next_seq) {
+    return std::unexpected(core::Error{
+        core::ErrorCode::kInvalidArgument,
+        "expected seq " + std::to_string(current_next_seq) + ", got " + std::to_string(first_seq)});
+  }
+  const size_t start = write_offset_.load(std::memory_order_relaxed);
+  if (start + bytes.size() > max_size_) {
+    return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "segment full"});
+  }
+
+  if (auto r = pfs::Pwrite(file_, bytes.data(), bytes.size(), start); !r.has_value()) {
+    return std::unexpected(r.error());
+  }
+
+  size_t offset = start;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    index_->MaybeRecord(first_seq + i, offset);
+    offset += sizes[i];
+  }
+  write_offset_.store(start + bytes.size(), std::memory_order_release);
+  next_seq_.store(first_seq + sizes.size(), std::memory_order_release);
+  entry_count_ += sizes.size();
+  return bytes.size();
+}
+
 core::Result<void> Segment::Fsync() const {
   if (!file_.valid()) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync on closed segment"});
   }
-  return pfs::Fsync(file_, pfs::SyncMode::kDurable);
+  return pfs::Fsync(file_, pfs::SyncMode::kDurableData);
 }
 
 core::Result<void> Segment::Seal() {
@@ -414,7 +454,7 @@ core::Result<void> Segment::Seal() {
   }
   const size_t offset = write_offset_.load(std::memory_order_relaxed);
   if (auto r = pfs::Ftruncate(file_, offset); !r.has_value()) return std::unexpected(r.error());
-  if (auto r = pfs::Fsync(file_, pfs::SyncMode::kDurable); !r.has_value()) {
+  if (auto r = pfs::Fsync(file_, pfs::SyncMode::kDurableData); !r.has_value()) {
     return std::unexpected(r.error());
   }
   sealed_ = true;

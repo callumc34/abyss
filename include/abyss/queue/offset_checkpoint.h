@@ -25,8 +25,6 @@ struct OffsetCheckpointConfig {
   std::filesystem::path dir;
   uint32_t shard_count = 1;
   std::vector<core::ConsumerId> consumers;
-  // When false, a volume that cannot fsync directories only warns.
-  bool require_durable_dir = true;
 };
 
 // Every retention consumer's committed offset on every shard, persisted as

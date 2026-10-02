@@ -44,9 +44,12 @@ queue:
   # Committed-offset checkpoint cadence, 10..60000 ms. A crash replays at most
   # this much past the last checkpoint.
   offset_fsync_interval_ms: 1000
-  wal_fsync_policy: group_commit
-  group_commit_interval_us: 1000
-  group_commit_max_bytes: 1048576
+  # What an acknowledged write survives: process_crash or power_loss.
+  durability: process_crash
+  # Unflushed bytes across shards before appends wait, 1 MiB..4 GiB.
+  durability_window_bytes: 67108864
+  # Oldest unflushed entry's age per shard before appends wait, 10..60000 ms.
+  durability_window_ms: 1000
 
 hot_consumer:
   read_batch_size: 256

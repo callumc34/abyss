@@ -135,10 +135,29 @@ core::Result<std::chrono::microseconds> DecodeMicroseconds(const YamlCursor& cur
   return std::chrono::microseconds{*raw};
 }
 
+core::Result<core::Durability> DecodeDurability(const YamlCursor& cur) {
+  auto name = DecodeString(cur);
+  if (!name.has_value()) return std::unexpected(name.error());
+  const auto durability = core::ParseDurability(*name);
+  if (!durability.has_value()) {
+    return std::unexpected(cur.MakeError("must be one of: process_crash, power_loss"));
+  }
+  return *durability;
+}
+
 SectionDecoder::SectionDecoder(YamlCursor cur) : cur_(std::move(cur)) {
   if (auto r = cur_.RequireMap(); !r.has_value()) {
     state_ = std::unexpected(r.error());
   }
+}
+
+SectionDecoder& SectionDecoder::Removed(std::string_view key, std::string_view hint) {
+  Register(key);
+  if (!state_.has_value()) return *this;
+  if (auto child = cur_.Child(key); child.node().IsDefined()) {
+    state_ = std::unexpected(child.MakeError(hint));
+  }
+  return *this;
 }
 
 core::Result<void> SectionDecoder::Finish() {

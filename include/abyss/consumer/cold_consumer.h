@@ -39,6 +39,7 @@ class ColdConsumer {
     // Used by ReplayUntil(); larger than queue_read_max_count to amortise
     // queue reads while draining a long catch-up backlog.
     size_t replay_batch_size = 50000;
+    // Also bounds each wait for a flush or wipe to become power-durable.
     std::chrono::milliseconds queue_read_timeout{50};
     std::chrono::milliseconds retry_initial_backoff{50};
     std::chrono::milliseconds retry_max_backoff{30000};
@@ -59,8 +60,15 @@ class ColdConsumer {
   enum class Mode : uint8_t { kNormal = 0, kAggressive = 1 };
 
   // Outcome of one drain+flush iteration; drives the RunLoop's backoff state
-  // machine. kProgress resets the backoff; the others grow it (capped).
-  enum class FlushOutcome : uint8_t { kProgress, kIdle, kPoisoned, kBackpressure };
+  // machine. kProgress resets the backoff; so does kDurabilityPending, whose
+  // durability wait already paced the pass. The others grow it (capped).
+  enum class FlushOutcome : uint8_t {
+    kProgress,
+    kIdle,
+    kPoisoned,
+    kBackpressure,
+    kDurabilityPending,
+  };
 
   struct Metrics {
     size_t buffer_entries = 0;
@@ -71,10 +79,13 @@ class ColdConsumer {
     uint64_t flushes_deadline = 0;
     uint64_t flushes_aggressive = 0;
     uint64_t ops_flushed = 0;
-    uint64_t entries_dropped_abs_ttl = 0;
+    // Buffered entries whose absolute TTL lapsed, flushed as deletes.
+    uint64_t entries_expired_abs_ttl = 0;
     uint64_t apply_failures = 0;
     uint64_t apply_poisoned = 0;
     uint64_t retry_attempts = 0;
+    // Flushes and wipes held because their entries were not yet power-durable.
+    uint64_t durability_waits_timed_out = 0;
     uint64_t parse_failures = 0;
     // Structurally-undecodable ops that pinned the WAL retention floor below
     // their seq (XERR-5). Distinct from parse_failures (the legacy counter,
@@ -193,8 +204,13 @@ class ColdConsumer {
   bool HandleFlush(const core::QueueEntry& entry);
 
   // `wall_now_ms` must be the entry's appended_at so hot and cold materialise
-  // identical absolute TTLs from PX/EX args.
-  void AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t wall_now_ms);
+  // identical absolute TTLs from PX/EX args. See CompactionBuffer::Absorb for
+  // `position` and `carrier`.
+  void AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId position,
+                        core::SequenceId carrier, uint64_t wall_now_ms);
+
+  // True once `seq` is power-durable, waiting up to queue_read_timeout.
+  bool AwaitPowerDurable(core::SequenceId seq);
 
   // Records `seq` as poison: increments the metric, logs CRITICAL, and lowers
   // oldest_poison_seq_ so TryAdvanceCommit pins the commit below it.
@@ -203,25 +219,25 @@ class ColdConsumer {
   std::optional<core::SequenceId> OldestPendingConditional() const ABYSS_EXCLUDES(pending_mu_);
   void CheckBlockAndScanTimeout();
 
-  // Reinserts entries on shutdown-during-retry so the next run replays them.
-  // kProgress on apply success, kPoisoned on a terminal error (the batch is
-  // reinserted), kBackpressure if a retriable error persisted through stop.
-  FlushOutcome ApplyBatchWithRetry(std::vector<BufferEntry> entries,
-                                   core::SequenceId highest_wal_seq);
+  // Erases the batch on success; otherwise reschedules it, and the RunLoop
+  // retries after a backoff. kProgress on success, kPoisoned on a terminal
+  // error, kBackpressure on a retriable one.
+  FlushOutcome ApplyBatchWithRetry(const FlushBatch& entries, core::SequenceId highest_wal_seq,
+                                   core::WallTime wall_now);
 
   // Shared implementation between Flush() and FlushUnscheduled() — once a
-  // batch has been popped from the buffer, the apply path is identical.
+  // batch has been selected from the buffer, the apply path is identical.
   // `aggressive_reason` attributes a bypass-the-strategy flush (replay or
   // graceful drain) to its FlushReason; scheduled flushes pass nullopt and are
   // attributed quiet/deadline per entry trigger.
-  FlushOutcome ApplyFlushBatch(std::vector<BufferEntry> to_flush,
+  FlushOutcome ApplyFlushBatch(const FlushBatch& to_flush,
                                std::optional<metrics::FlushReason> aggressive_reason,
                                std::chrono::steady_clock::time_point flush_start);
 
   // Highest first-seen WAL seq among `entries`; passed to ApplyBatch as the
   // batch's highest_wal_seq. The commit frontier is derived from the live
   // buffer state, not from this.
-  static core::SequenceId HighestSeqOf(const std::vector<BufferEntry>& entries);
+  static core::SequenceId HighestSeqOf(const FlushBatch& entries);
 
   // Runs Checkpoint(shard, up_to) when the bounded cadence
   // (checkpoint_max_flushes / checkpoint_min_interval) is due, or when `force`
@@ -230,8 +246,9 @@ class ColdConsumer {
   // pinned).
   bool MaybeCheckpoint(core::SequenceId up_to, bool force);
 
-  std::vector<core::ops::WriteOp> BuildBatchOps(const std::vector<BufferEntry>& entries,
-                                                std::vector<core::ops::Del>& del_storage) const;
+  std::vector<core::ops::WriteOp> BuildBatchOps(const FlushBatch& entries,
+                                                std::vector<core::ops::Del>& del_storage,
+                                                core::WallTime wall_now) const;
 
   bool AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const;
   size_t LowWaterBytes() const;
@@ -276,6 +293,11 @@ class ColdConsumer {
   bool cursor_seeded_ = false;
   // A Flush whose wipe failed holds the cursor until a retry succeeds.
   bool wipe_pending_ = false;
+  // The held Flush is waiting for power durability, not for a failed wipe;
+  // the wait paces the retry, so it skips the backoff ladder.
+  bool wipe_awaits_durability_ = false;
+  // Set by the first timed-out durability wait of a run of them.
+  bool durability_wait_logged_ = false;
   core::SequenceId next_read_seq_ = 0;
   std::optional<core::SequenceId> committed_;
 
@@ -317,6 +339,7 @@ class ColdConsumer {
 
   metrics::ConsumerCounters counters_;
   std::atomic<uint64_t> retry_attempts_{0};
+  std::atomic<uint64_t> durability_waits_timed_out_{0};
   std::atomic<uint64_t> apply_poisoned_{0};
   std::atomic<uint64_t> parse_poison_{0};
   std::atomic<uint64_t> unsupported_ops_{0};
@@ -324,7 +347,7 @@ class ColdConsumer {
   std::atomic<uint64_t> flushes_deadline_{0};
   std::atomic<uint64_t> flushes_aggressive_{0};
   std::atomic<uint64_t> ops_flushed_{0};
-  std::atomic<uint64_t> entries_dropped_abs_ttl_{0};
+  std::atomic<uint64_t> entries_expired_abs_ttl_{0};
   std::atomic<uint32_t> mode_transitions_{0};
   std::atomic<Mode> mode_{Mode::kNormal};
 

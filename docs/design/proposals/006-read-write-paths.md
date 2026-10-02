@@ -25,10 +25,10 @@ Client ──▶ RESP Frontend ──▶ Queue.Append() ──▶ Hot Consumer �
 
 1. The RESP frontend receives a write command, wraps it in a `QueueEntry` (Write or Conditional variant), and appends it to the queue for the appropriate shard.
 2. The write handler registers a promise in the `ConsumerRpc` registry, keyed by the returned sequence ID.
-3. The queue append blocks until the write is durable (for group commit: the batch containing this write has been fsynced).
-4. Concurrently, the hot consumer reads the entry from the queue's in-memory buffer and applies the typed operation to the hot store.
+3. The write handler waits until the append reaches the configured durability class ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
+4. The hot consumer reads the entry once it is durable at that class and applies the typed operation to the hot store. Under `power_loss` it therefore applies only fdatasynced entries, so no reply reflects a write a power loss could drop.
 5. After applying, the hot consumer fulfils the promise with the response value.
-6. The write handler awaits both the queue fsync and the promise fulfillment. When both are complete, it returns the response to the client.
+6. The write handler awaits both the durability future (at the configured class) and the promise fulfillment, within one deadline that also bounds admission to the WAL durability window. When both are complete, it returns the response to the client.
 
 The queue is the sole write path. There is no dual write. The hot consumer ACK is an in-process synchronisation — this is why the hot consumer is always an in-process thread, even when the queue and hot store are external.
 

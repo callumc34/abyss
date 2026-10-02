@@ -69,8 +69,8 @@ int main(int argc, char** argv) {
         .abs_ttl_ms = 0,
     };
     abyss::core::ops::WriteOp op = set_op;
-    buffer.Absorb(key, op, abyss::core::EvictionTTL{86400},
-                  static_cast<abyss::core::SequenceId>(i));
+    const auto seq = static_cast<abyss::core::SequenceId>(i);
+    buffer.Absorb(key, op, abyss::core::EvictionTTL{86400}, seq, seq);
   }
 
   auto cfg = abyss::perf::probe::MakeRunLoopConfig(args, mix);

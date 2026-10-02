@@ -90,9 +90,9 @@ core::Result<File> Open(const std::filesystem::path& path, OpenOptions opts) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
   const int fd = ::open(path.c_str(), flags, 0644);
   if (fd < 0) {
-    const auto code = (errno == ENOENT)   ? core::ErrorCode::kNotFound
-                      : (errno == EEXIST) ? core::ErrorCode::kAlreadyExists
-                                          : core::ErrorCode::kInternal;
+    core::ErrorCode code = core::ErrorCode::kInternal;
+    if (errno == ENOENT) code = core::ErrorCode::kNotFound;
+    if (errno == EEXIST) code = core::ErrorCode::kAlreadyExists;
     return std::unexpected(MakeErrno(code, "open"));
   }
   return File{fd};
@@ -165,7 +165,7 @@ core::Result<void> Ftruncate(const File& f, std::uint64_t size) {
 
 core::Result<void> Fsync(const File& f, SyncMode mode) {
 #ifdef __APPLE__
-  if (mode == SyncMode::kDurable) {
+  if (mode == SyncMode::kDurable || mode == SyncMode::kDurableData) {
     g_full_fsync_calls.fetch_add(1, std::memory_order_relaxed);
     const auto full_fsync = g_full_fsync_fn.load(std::memory_order_acquire);
     if (full_fsync(f.get()) == 0) return {};
@@ -178,7 +178,12 @@ core::Result<void> Fsync(const File& f, SyncMode mode) {
     g_durable_fallbacks.fetch_add(1, std::memory_order_relaxed);
   }
 #else
-  (void)mode;
+  if (mode == SyncMode::kDurableData) {
+    if (::fdatasync(f.get()) < 0) {
+      return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "fdatasync"));
+    }
+    return {};
+  }
 #endif
   if (::fsync(f.get()) < 0) {
     return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "fsync"));

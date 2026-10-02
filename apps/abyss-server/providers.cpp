@@ -13,6 +13,7 @@
 #include <unistd.h>
 #endif
 
+#include "abyss/core/durability.h"
 #include "abyss/version.h"
 
 namespace abyss::server {
@@ -118,7 +119,8 @@ ConfigProviderImpl::ConfigProviderImpl(const config::Config& cfg) {
   AppendNumericEntry(entries_, values_, "default-eviction-seconds",
                      static_cast<uint64_t>(cfg.hot.default_eviction.count()));
   AppendStringEntry(entries_, values_, "wal-path", cfg.queue.wal_path);
-  AppendStringEntry(entries_, values_, "wal-fsync-policy", cfg.queue.fsync_policy);
+  AppendStringEntry(entries_, values_, "wal-durability",
+                    std::string{core::DurabilityName(cfg.queue.durability)});
   AppendNumericEntry(entries_, values_, "wal-segment-size-bytes", cfg.queue.segment_size_bytes);
   AppendStringEntry(entries_, values_, "cold-data-path", cfg.cold.data_path);
   AppendBoolEntry(entries_, values_, "metrics-enabled", cfg.metrics.enabled);
@@ -156,7 +158,7 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
   if (deps_.config != nullptr) {
     s.config.profile = deps_.config->profile;
     s.config.shard_count = deps_.config->hot.shard_count;
-    s.config.fsync_policy = deps_.config->queue.fsync_policy;
+    s.config.durability = std::string{core::DurabilityName(deps_.config->queue.durability)};
     s.config.default_eviction_seconds =
         static_cast<uint64_t>(deps_.config->hot.default_eviction.count());
 
@@ -192,6 +194,8 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
   if (deps_.oldest_eligible_unreaped_age_ms) {
     s.queue.oldest_eligible_unreaped_age_ms = deps_.oldest_eligible_unreaped_age_ms();
   }
+  if (deps_.unflushed_bytes) s.queue.unflushed_bytes = deps_.unflushed_bytes();
+  if (deps_.durability_lag_ms) s.queue.durability_lag_ms = deps_.durability_lag_ms();
   if (deps_.read_buffer_high_water_bytes) {
     s.connections.read_buffer_high_water_bytes = deps_.read_buffer_high_water_bytes();
   }

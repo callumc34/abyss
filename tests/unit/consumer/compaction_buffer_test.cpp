@@ -44,11 +44,11 @@ class CompactionBufferTest : public ::testing::Test {
 
   void AbsorbString(const std::string& key, const std::string& value,
                     core::EvictionTTL eviction = core::EvictionTTL{3600}) {
-    buffer_.Absorb(key, WriteOp{StringSet{.key = key, .value = value}}, eviction);
+    buffer_.Absorb(key, WriteOp{StringSet{.key = key, .value = value}}, eviction, 0, 0);
   }
 
   void AbsorbDel(const std::string& key, core::EvictionTTL eviction = core::EvictionTTL{3600}) {
-    buffer_.Absorb(key, WriteOp{Del{.keys = {key}}}, eviction);
+    buffer_.Absorb(key, WriteOp{Del{.keys = {key}}}, eviction, 0, 0);
   }
 };
 
@@ -74,7 +74,7 @@ TEST_F(CompactionBufferTest, AbsorbDelThenReadReturnsNull) {
 
 TEST_F(CompactionBufferTest, AbsorbCollectionReadReturnsNotFound) {
   auto eviction = core::EvictionTTL{3600};
-  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"a"}}}, eviction);
+  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"a"}}}, eviction, 0, 0);
   auto result = buffer_.Read("ka");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kNotFound);
@@ -136,17 +136,18 @@ TEST_F(CompactionBufferTest, BytesEstimateDecreasesAfterFlush) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
+  buffer_.EraseFlushed(flushed);
 
   EXPECT_EQ(buffer_.BytesEstimate(), 0);
 }
 
 TEST_F(CompactionBufferTest, BytesEstimateReflectsCollectionSize) {
   auto eviction = core::EvictionTTL{3600};
-  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"member1"}}}, eviction);
+  buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"member1"}}}, eviction, 0, 0);
   auto after_one = buffer_.BytesEstimate();
 
   buffer_.Absorb("ka", WriteOp{SetAdd{.key = "ka", .members = {"member2", "member3", "member4"}}},
-                 eviction);
+                 eviction, 0, 0);
   auto after_four = buffer_.BytesEstimate();
 
   EXPECT_GT(after_four, after_one);
@@ -180,11 +181,11 @@ TEST_F(CompactionBufferTest, FlushReadyReturnsEntryAfterQuietWindow) {
   CompactionBuffer buf{no_jitter, clock_.SteadyFn(), kTestSeed};
 
   auto key = MakeKey();
-  buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, core::EvictionTTL{3600});
+  buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, core::EvictionTTL{3600}, 0, 0);
   clock_.Advance(31s);
   auto flushed = buf.FlushReady(clock_.SteadyNow());
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, key);
+  EXPECT_EQ(flushed[0].get().key, key);
 }
 
 TEST_F(CompactionBufferTest, FlushReadyReturnsAllWhenAllDue) {
@@ -206,9 +207,9 @@ TEST_F(CompactionBufferTest, FlushReadyReturnsSubsetWhenSomeDue) {
 
   auto early = MakeKey();
   auto late = MakeKey();
-  buf.Absorb(early, WriteOp{StringSet{.key = early, .value = "v1"}}, core::EvictionTTL{3600});
+  buf.Absorb(early, WriteOp{StringSet{.key = early, .value = "v1"}}, core::EvictionTTL{3600}, 0, 0);
   clock_.Advance(20s);
-  buf.Absorb(late, WriteOp{StringSet{.key = late, .value = "v2"}}, core::EvictionTTL{3600});
+  buf.Absorb(late, WriteOp{StringSet{.key = late, .value = "v2"}}, core::EvictionTTL{3600}, 0, 0);
 
   // Advance past early's quiet deadline but before late's.
   // early: absorbed at t0, quiet deadline = t0 + 30s. Now at t0 + 20s + 15s = t0 + 35s.
@@ -217,7 +218,8 @@ TEST_F(CompactionBufferTest, FlushReadyReturnsSubsetWhenSomeDue) {
   auto flushed = buf.FlushReady(clock_.SteadyNow());
 
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, early);
+  EXPECT_EQ(flushed[0].get().key, early);
+  buf.EraseFlushed(flushed);
   EXPECT_EQ(buf.Size(), 1);
 }
 
@@ -237,9 +239,9 @@ TEST_F(CompactionBufferTest, FlushReadyEarliestScheduledFirst) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 3);
-  EXPECT_EQ(flushed[0].key, "first");
-  EXPECT_EQ(flushed[1].key, "second");
-  EXPECT_EQ(flushed[2].key, "third");
+  EXPECT_EQ(flushed[0].get().key, "first");
+  EXPECT_EQ(flushed[1].get().key, "second");
+  EXPECT_EQ(flushed[2].get().key, "third");
 }
 
 TEST_F(CompactionBufferTest, EvictionDeadlineForcesEarlyFlush) {
@@ -247,13 +249,13 @@ TEST_F(CompactionBufferTest, EvictionDeadlineForcesEarlyFlush) {
   CompactionBuffer buf{strategy, clock_.SteadyFn(), kTestSeed};
 
   auto key = MakeKey();
-  buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, core::EvictionTTL{310});
+  buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, core::EvictionTTL{310}, 0, 0);
   // Eviction deadline = first_seen + 310 - 300 = first_seen + 10s.
   // With quiet_threshold=30s, eviction dominates.
   clock_.Advance(15s);
   auto flushed = buf.FlushReady(clock_.SteadyNow());
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, key);
+  EXPECT_EQ(flushed[0].get().key, key);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +279,7 @@ TEST_F(CompactionBufferTest, ReAbsorbSlidesQuietDeadline) {
   clock_.Advance(25s);
   flushed = buffer_.FlushReady(clock_.SteadyNow());
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, "k");
+  EXPECT_EQ(flushed[0].get().key, "k");
 }
 
 TEST_F(CompactionBufferTest, MultipleReAbsorbsOnlyLatestMatters) {
@@ -296,7 +298,7 @@ TEST_F(CompactionBufferTest, MultipleReAbsorbsOnlyLatestMatters) {
   clock_.Advance(20s);
   flushed = buffer_.FlushReady(clock_.SteadyNow());
   EXPECT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].state.StringValue(), "v3");
+  EXPECT_EQ(flushed[0].get().state.StringValue(), "v3");
 }
 
 TEST_F(CompactionBufferTest, FlushedEntryCarriesLatestState) {
@@ -307,8 +309,8 @@ TEST_F(CompactionBufferTest, FlushedEntryCarriesLatestState) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].state.StringValue(), "v3");
-  EXPECT_EQ(flushed[0].write_count, 3);
+  EXPECT_EQ(flushed[0].get().state.StringValue(), "v3");
+  EXPECT_EQ(flushed[0].get().write_count, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,8 +321,8 @@ TEST_F(CompactionBufferTest, DeterministicJitterWithFixedSeed) {
   CompactionBuffer buf1{strategy_, clock_.SteadyFn(), kTestSeed};
   CompactionBuffer buf2{strategy_, clock_.SteadyFn(), kTestSeed};
 
-  buf1.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction);
-  buf2.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction);
+  buf1.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 0, 0);
+  buf2.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 0, 0);
 
   clock_.Advance(60s);
   auto f1 = buf1.FlushReady(clock_.SteadyNow());
@@ -328,7 +330,7 @@ TEST_F(CompactionBufferTest, DeterministicJitterWithFixedSeed) {
 
   ASSERT_EQ(f1.size(), 1);
   ASSERT_EQ(f2.size(), 1);
-  EXPECT_EQ(f1[0].jitter_offset, f2[0].jitter_offset);
+  EXPECT_EQ(f1[0].get().jitter_offset, f2[0].get().jitter_offset);
 }
 
 TEST_F(CompactionBufferTest, JitterWithinExpectedRange) {
@@ -338,14 +340,14 @@ TEST_F(CompactionBufferTest, JitterWithinExpectedRange) {
   for (int i = 0; i < 100; ++i) {
     CompactionBuffer buf{strategy_, clock_.SteadyFn(), static_cast<uint64_t>(i)};
     auto key = "k" + std::to_string(i);
-    buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, kDefaultEviction);
+    buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, kDefaultEviction, 0, 0);
 
     clock_.Advance(60s);
     auto flushed = buf.FlushReady(clock_.SteadyNow());
     ASSERT_EQ(flushed.size(), 1);
 
-    EXPECT_GE(flushed[0].jitter_offset.count(), 0);
-    EXPECT_LE(flushed[0].jitter_offset, max_jitter);
+    EXPECT_GE(flushed[0].get().jitter_offset.count(), 0);
+    EXPECT_LE(flushed[0].get().jitter_offset, max_jitter);
 
     clock_.Set(core::SteadyTime{std::chrono::seconds{1000000}});
   }
@@ -357,7 +359,7 @@ TEST_F(CompactionBufferTest, JitterDelaysFlushBeyondBaseDeadline) {
   FlushStrategy no_jitter_strategy{30s, 300s, 0.0};
   CompactionBuffer no_jitter_buf{no_jitter_strategy, clock_.SteadyFn(), kTestSeed};
 
-  no_jitter_buf.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction);
+  no_jitter_buf.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 0, 0);
   clock_.Advance(31s);
 
   auto flushed_no_jitter = no_jitter_buf.FlushReady(clock_.SteadyNow());
@@ -381,11 +383,11 @@ TEST_F(CompactionBufferTest, ZeroJitterFractionMeansNoJitter) {
   FlushStrategy zero_jitter{30s, 300s, 0.0};
   CompactionBuffer buf{zero_jitter, clock_.SteadyFn(), kTestSeed};
 
-  buf.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction);
+  buf.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 0, 0);
   clock_.Advance(60s);
   auto flushed = buf.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].jitter_offset.count(), 0);
+  EXPECT_EQ(flushed[0].get().jitter_offset.count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +399,7 @@ TEST_F(CompactionBufferTest, ReadAfterFlushReturnsNotFound) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
+  buffer_.EraseFlushed(flushed);
 
   auto result = buffer_.Read("k");
   ASSERT_FALSE(result.has_value());
@@ -409,7 +412,7 @@ TEST_F(CompactionBufferTest, SizeDecreasesAfterFlush) {
   EXPECT_EQ(buffer_.Size(), 2);
 
   clock_.Advance(60s);
-  buffer_.FlushReady(clock_.SteadyNow());
+  buffer_.EraseFlushed(buffer_.FlushReady(clock_.SteadyNow()));
   EXPECT_EQ(buffer_.Size(), 0);
 }
 
@@ -424,7 +427,7 @@ TEST_F(CompactionBufferTest, TombstoneFlushedLikeAnyEntry) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_TRUE(flushed[0].state.IsTombstone());
+  EXPECT_TRUE(flushed[0].get().state.IsTombstone());
 }
 
 TEST_F(CompactionBufferTest, TombstoneEmitsEmptyVector) {
@@ -434,7 +437,7 @@ TEST_F(CompactionBufferTest, TombstoneEmitsEmptyVector) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  auto ops = flushed[0].state.Emit();
+  auto ops = flushed[0].get().state.Emit();
   EXPECT_TRUE(ops.empty());
 }
 
@@ -452,19 +455,19 @@ TEST_F(CompactionBufferTest, FlushedEntryHasCorrectTimestamps) {
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].first_seen, t0);
-  EXPECT_EQ(flushed[0].last_modified, t0 + 5s);
-  EXPECT_EQ(flushed[0].write_count, 2);
+  EXPECT_EQ(flushed[0].get().first_seen, t0);
+  EXPECT_EQ(flushed[0].get().last_modified, t0 + 5s);
+  EXPECT_EQ(flushed[0].get().write_count, 2);
 }
 
 TEST_F(CompactionBufferTest, FlushedEntryCarriesEviction) {
   auto eviction = core::EvictionTTL{7200};
-  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, eviction);
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, eviction, 0, 0);
 
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].eviction, eviction);
+  EXPECT_EQ(flushed[0].get().eviction, eviction);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,21 +475,21 @@ TEST_F(CompactionBufferTest, FlushedEntryCarriesEviction) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CompactionBufferTest, AbsorbRecordsFirstSeenSeq) {
-  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 42);
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, kDefaultEviction, 42, 42);
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].first_seen_seq, 42U);
+  EXPECT_EQ(flushed[0].get().first_seen_seq, 42U);
 }
 
 TEST_F(CompactionBufferTest, ReAbsorbKeepsFirstSeenSeq) {
-  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v1"}}, kDefaultEviction, 10);
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v1"}}, kDefaultEviction, 10, 10);
   clock_.Advance(5s);
-  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v2"}}, kDefaultEviction, 11);
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v2"}}, kDefaultEviction, 11, 11);
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].first_seen_seq, 10U);
+  EXPECT_EQ(flushed[0].get().first_seen_seq, 10U);
 }
 
 TEST_F(CompactionBufferTest, OldestPendingSeqEmptyReturnsNullopt) {
@@ -494,20 +497,21 @@ TEST_F(CompactionBufferTest, OldestPendingSeqEmptyReturnsNullopt) {
 }
 
 TEST_F(CompactionBufferTest, OldestPendingSeqReturnsMinimum) {
-  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 7);
-  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 3);
-  buffer_.Absorb("c", WriteOp{StringSet{.key = "c", .value = "v"}}, kDefaultEviction, 11);
+  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 7, 7);
+  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 3, 3);
+  buffer_.Absorb("c", WriteOp{StringSet{.key = "c", .value = "v"}}, kDefaultEviction, 11, 11);
   auto oldest = buffer_.OldestPendingSeq();
   EXPECT_EQ(oldest, std::optional{3U});
 }
 
 TEST_F(CompactionBufferTest, OldestPendingSeqAdvancesAfterFlush) {
-  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 5);
-  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 8);
+  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 5, 5);
+  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 8, 8);
 
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 2);
+  buffer_.EraseFlushed(flushed);
   EXPECT_FALSE(buffer_.OldestPendingSeq().has_value());
 }
 
@@ -550,7 +554,8 @@ TEST_F(CompactionBufferTest, OldestFirstSeenAdvancesToNextOldestAfterFlush) {
   // FlushOldest pops in scheduled order; "a" is scheduled 10s ahead of "b".
   auto flushed = buffer_.FlushOldest(/*target_bytes=*/0, /*max_count=*/1);
   ASSERT_EQ(flushed.size(), 1U);
-  EXPECT_EQ(flushed[0].key, "a");
+  EXPECT_EQ(flushed[0].get().key, "a");
+  buffer_.EraseFlushed(flushed);
 
   auto oldest = buffer_.OldestFirstSeen();
   EXPECT_EQ(oldest, std::optional{t1});
@@ -575,6 +580,7 @@ TEST_F(CompactionBufferTest, FlushOldestStopsWhenBelowTargetBytes) {
   auto flushed = buffer_.FlushOldest(all_bytes / 2, 100);
   EXPECT_GT(flushed.size(), 0);
   EXPECT_LT(flushed.size(), 3);
+  buffer_.EraseFlushed(flushed);
   EXPECT_LE(buffer_.BytesEstimate(), (all_bytes / 2) + 1);  // +1 for rounding
 }
 
@@ -595,7 +601,7 @@ TEST_F(CompactionBufferTest, FlushOldestPopsOldestFirst) {
 
   auto flushed = buffer_.FlushOldest(0, 1);
   ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(flushed[0].key, "first");
+  EXPECT_EQ(flushed[0].get().key, "first");
 }
 
 TEST_F(CompactionBufferTest, FlushOldestBypassesQuietWindow) {
@@ -609,43 +615,142 @@ TEST_F(CompactionBufferTest, FlushOldestBypassesQuietWindow) {
 }
 
 // ---------------------------------------------------------------------------
-// Reinsert (retry path)
+// In-flight batches: selection keeps entries until erase or reschedule
 // ---------------------------------------------------------------------------
 
-TEST_F(CompactionBufferTest, ReinsertRestoresEntries) {
+TEST_F(CompactionBufferTest, SelectedEntriesStayReadable) {
+  buffer_.Absorb("s", WriteOp{StringSet{.key = "s", .value = "v"}}, kDefaultEviction, 4, 4);
+  buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "f", .value = "1"}}}},
+                 kDefaultEviction, 2, 2);
+  clock_.Advance(60s);
+
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 2U);
+
+  EXPECT_EQ(buffer_.Size(), 2U);
+  auto read = buffer_.Read("s");
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->AsString(), "v");
+  const auto overlay = buffer_.HashOverlayFor("h");
+  ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
+  EXPECT_EQ(overlay.fields.at("f"), "1");
+  EXPECT_EQ(buffer_.Probe("s"), BufferKeyPresence::kPresent);
+  EXPECT_EQ(buffer_.OldestPendingSeq(), std::optional<core::SequenceId>{2});
+  EXPECT_GT(buffer_.BytesEstimate(), 0U);
+}
+
+TEST_F(CompactionBufferTest, EraseFlushedRemovesExactlyTheBatch) {
+  AbsorbString("k0", "v");
+  clock_.Advance(5s);
+  AbsorbString("k1", "v");
+  clock_.Advance(5s);
+  AbsorbString("k2", "v");
+  const auto all_bytes = buffer_.BytesEstimate();
+
+  auto flushed = buffer_.FlushOldest(/*target_bytes=*/0, /*max_count=*/2);
+  ASSERT_EQ(flushed.size(), 2U);
+  EXPECT_EQ(flushed[0].get().key, "k0");
+  EXPECT_EQ(flushed[1].get().key, "k1");
+  buffer_.EraseFlushed(flushed);
+
+  EXPECT_EQ(buffer_.Size(), 1U);
+  EXPECT_TRUE(buffer_.Read("k2").has_value());
+  EXPECT_EQ(buffer_.Read("k0").error().code(), core::ErrorCode::kNotFound);
+  EXPECT_EQ(buffer_.Read("k1").error().code(), core::ErrorCode::kNotFound);
+  EXPECT_LT(buffer_.BytesEstimate(), all_bytes);
+  EXPECT_GT(buffer_.BytesEstimate(), 0U);
+}
+
+TEST_F(CompactionBufferTest, RescheduleMakesTheBatchDueAgain) {
   AbsorbString("k", "v");
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
-  ASSERT_EQ(flushed.size(), 1);
-  EXPECT_EQ(buffer_.Size(), 0);
+  ASSERT_EQ(flushed.size(), 1U);
+  EXPECT_EQ(buffer_.HeapDepth(), 0U);
+  EXPECT_TRUE(buffer_.FlushReady(clock_.SteadyNow()).empty()) << "an in-flight key was reselected";
+  EXPECT_TRUE(buffer_.FlushOldest(0, 10).empty()) << "an in-flight key was reselected";
 
-  buffer_.Reinsert(std::move(flushed));
-  EXPECT_EQ(buffer_.Size(), 1);
-  EXPECT_GT(buffer_.BytesEstimate(), 0);
+  buffer_.Reschedule(flushed);
+  EXPECT_EQ(buffer_.HeapDepth(), 1U);
+  EXPECT_EQ(buffer_.Size(), 1U);
 
   auto again = buffer_.FlushReady(clock_.SteadyNow());
-  EXPECT_EQ(again.size(), 1);
+  ASSERT_EQ(again.size(), 1U);
+  EXPECT_EQ(again[0].get().key, "k");
+  EXPECT_EQ(again[0].get().state.StringValue(), "v");
 }
 
-TEST_F(CompactionBufferTest, ReinsertOverwritesNewerAbsorbForSameKey) {
-  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "old"}}, kDefaultEviction, 1);
+TEST_F(CompactionBufferTest, LastSeqIsTheMaxCarrierAndFirstSeenKeepsThePosition) {
+  // A Resolved's ops absorb at its Conditional's position and its own carrier.
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "a"}}, kDefaultEviction, 5, 9);
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "b"}}, kDefaultEviction, 6, 7);
+  EXPECT_EQ(buffer_.OldestPendingSeq(), std::optional<core::SequenceId>{5});
+  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "c"}}, kDefaultEviction, 12, 12);
+
   clock_.Advance(60s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
-  ASSERT_EQ(flushed.size(), 1);
+  ASSERT_EQ(flushed.size(), 1U);
+  EXPECT_EQ(flushed[0].get().first_seen_seq, 5U);
+  EXPECT_EQ(flushed[0].get().last_seq, 12U);
 
-  // A newer write comes in while the old snapshot is "in flight".
-  buffer_.Absorb("k", WriteOp{StringSet{.key = "k", .value = "new"}}, kDefaultEviction, 2);
-  EXPECT_EQ(buffer_.Size(), 1);
+  buffer_.Reschedule(flushed);
+  auto again = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(again.size(), 1U);
+  EXPECT_EQ(again[0].get().last_seq, 12U) << "a reschedule lost last_seq";
+}
 
-  // Reinserting the old snapshot overwrites the newer one. This is acceptable
-  // because the cold consumer only uses Reinsert on transient retry failures
-  // that it then retries immediately — the "new" write would be re-drained
-  // from the queue on the next loop iteration and re-absorbed.
-  buffer_.Reinsert(std::move(flushed));
-  EXPECT_EQ(buffer_.Size(), 1);
-  auto read = buffer_.Read("k");
-  ASSERT_TRUE(read.has_value());
-  EXPECT_EQ(read->AsString(), "old");
+TEST_F(CompactionBufferTest, OldestPendingSeqUnchangedByInFlightBatch) {
+  buffer_.Absorb("a", WriteOp{StringSet{.key = "a", .value = "v"}}, kDefaultEviction, 3, 3);
+  buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 8, 8);
+  clock_.Advance(60s);
+
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 2U);
+  EXPECT_EQ(buffer_.OldestPendingSeq(), std::optional<core::SequenceId>{3});
+  buffer_.Reschedule(flushed);
+  EXPECT_EQ(buffer_.OldestPendingSeq(), std::optional<core::SequenceId>{3});
+
+  buffer_.EraseFlushed(buffer_.FlushReady(clock_.SteadyNow()));
+  EXPECT_FALSE(buffer_.OldestPendingSeq().has_value());
+}
+
+using CompactionBufferDeathTest = CompactionBufferTest;
+
+// A batch is applied by reference, so the buffer must not change under it.
+TEST_F(CompactionBufferDeathTest, MutatingDuringAnInFlightFlushIsFatal) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  AbsorbString("a", "v");
+  clock_.Advance(60s);
+  auto flushed = buffer_.FlushReady(clock_.SteadyNow());
+  ASSERT_EQ(flushed.size(), 1U);
+
+  EXPECT_DEATH(AbsorbString("a", "w"), "absorbed during an in-flight flush");
+  EXPECT_DEATH(buffer_.Clear(), "cleared during an in-flight flush");
+
+  buffer_.Reschedule(flushed);
+  AbsorbString("a", "w");
+  buffer_.Clear();
+}
+
+TEST_F(CompactionBufferTest, KeyWithTwoLiveHeapEntriesIsSelectedOnce) {
+  FlushStrategy no_jitter{30s, 300s, 0.0};
+  CompactionBuffer buf{no_jitter, clock_.SteadyFn(), kTestSeed};
+  const auto absorb = [&buf](core::EvictionTTL eviction) {
+    buf.Absorb("k", WriteOp{StringSet{.key = "k", .value = "v"}}, eviction, 0, 0);
+  };
+  // Deadline t0+10s, then quiet t0+31s, then the t0+10s deadline again.
+  absorb(core::EvictionTTL{310});
+  clock_.Advance(1s);
+  absorb(core::EvictionTTL{3600});
+  clock_.Advance(1s);
+  absorb(core::EvictionTTL{310});
+  ASSERT_EQ(buf.HeapDepth(), 3U);
+
+  clock_.Advance(15s);
+  auto flushed = buf.FlushReady(clock_.SteadyNow());
+  EXPECT_EQ(flushed.size(), 1U);
+  buf.EraseFlushed(flushed);
+  EXPECT_EQ(buf.Size(), 0U);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +766,7 @@ TEST_F(CompactionBufferTest, HashOverlayReturnsHashStateAfterHashSet) {
       "h",
       WriteOp{HashSet{.key = "h",
                       .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}}},
-      kDefaultEviction);
+      kDefaultEviction, 0, 0);
   const auto overlay = buffer_.HashOverlayFor("h");
   ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
   EXPECT_EQ(overlay.fields.size(), 2);
@@ -675,8 +780,8 @@ TEST_F(CompactionBufferTest, HashOverlayTracksRemovedFields) {
                  WriteOp{HashSet{
                      .key = "h",
                      .fields = {{.field = "keep", .value = "v"}, {.field = "gone", .value = "v"}}}},
-                 kDefaultEviction);
-  buffer_.Absorb("h", WriteOp{HashDel{.key = "h", .fields = {"gone"}}}, kDefaultEviction);
+                 kDefaultEviction, 0, 0);
+  buffer_.Absorb("h", WriteOp{HashDel{.key = "h", .fields = {"gone"}}}, kDefaultEviction, 0, 0);
 
   const auto overlay = buffer_.HashOverlayFor("h");
   ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
@@ -689,7 +794,7 @@ TEST_F(CompactionBufferTest, HashOverlayTracksRemovedFields) {
 
 TEST_F(CompactionBufferTest, HashOverlayTombstoneAfterDel) {
   buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "a", .value = "1"}}}},
-                 kDefaultEviction);
+                 kDefaultEviction, 0, 0);
   AbsorbDel("h");
   EXPECT_EQ(buffer_.HashOverlayFor("h").kind, HashOverlay::Kind::kTombstone);
 }
@@ -701,7 +806,7 @@ TEST_F(CompactionBufferTest, HashOverlayWrongTypeWhenKeyIsString) {
 
 TEST_F(CompactionBufferTest, MultiFieldHashReadsDeferToEngine) {
   buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "a", .value = "1"}}}},
-                 kDefaultEviction);
+                 kDefaultEviction, 0, 0);
   const std::array<core::ops::ReadOp, 6> ops{
       core::ops::ReadOp{core::ops::HashGetAll{.key = "h"}},
       core::ops::ReadOp{core::ops::HashKeys{.key = "h"}},
@@ -719,15 +824,15 @@ TEST_F(CompactionBufferTest, MultiFieldHashReadsDeferToEngine) {
 
 TEST_F(CompactionBufferTest, ClearDropsEntriesAndHeap) {
   const auto eviction = core::EvictionTTL{3600};
-  buffer_.Absorb("s", WriteOp{StringSet{.key = "s", .value = "v"}}, eviction);
-  buffer_.Absorb("set_k", WriteOp{SetAdd{.key = "set_k", .members = {"a", "b"}}}, eviction);
+  buffer_.Absorb("s", WriteOp{StringSet{.key = "s", .value = "v"}}, eviction, 0, 0);
+  buffer_.Absorb("set_k", WriteOp{SetAdd{.key = "set_k", .members = {"a", "b"}}}, eviction, 0, 0);
   buffer_.Absorb("hash_k",
                  WriteOp{HashSet{.key = "hash_k", .fields = {{.field = "f", .value = "v"}}}},
-                 eviction);
+                 eviction, 0, 0);
   buffer_.Absorb(
       "zset_k",
       WriteOp{core::ops::ZsetAdd{.key = "zset_k", .entries = {{.score = 1.0, .member = "m"}}}},
-      eviction);
+      eviction, 0, 0);
   ASSERT_EQ(buffer_.Size(), 4U);
   ASSERT_GT(buffer_.BytesEstimate(), 0U);
 
@@ -739,7 +844,7 @@ TEST_F(CompactionBufferTest, ClearDropsEntriesAndHeap) {
   EXPECT_EQ(buffer_.Read("s").error().code(), core::ErrorCode::kNotFound);
 
   // A subsequent Absorb works on the empty buffer; the heap is sane.
-  buffer_.Absorb("post", WriteOp{StringSet{.key = "post", .value = "v"}}, eviction);
+  buffer_.Absorb("post", WriteOp{StringSet{.key = "post", .value = "v"}}, eviction, 0, 0);
   EXPECT_EQ(buffer_.Size(), 1U);
   auto r = buffer_.Read("post");
   ASSERT_TRUE(r.has_value());
@@ -800,6 +905,7 @@ TEST_F(CompactionBufferTest, HeapOverheadReleasedAfterFlush) {
   clock_.Advance(120s);
   auto flushed = buffer_.FlushReady(clock_.SteadyNow());
   ASSERT_EQ(flushed.size(), 1U);
+  buffer_.EraseFlushed(flushed);
   EXPECT_EQ(buffer_.HeapDepth(), 0U);
   EXPECT_EQ(buffer_.BytesEstimate(), 0U);
 }

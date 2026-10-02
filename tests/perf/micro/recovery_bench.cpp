@@ -14,13 +14,12 @@
 #include "abyss/consumer/resolver_pool.h"
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/engine/recovery_coordinator.h"
 #include "abyss/hot/sharded_hot_store.h"
-#include "abyss/queue/fsync_policy.h"
-#include "abyss/queue/group_commit.h"
 #include "abyss/queue/wal_queue.h"
 
 namespace abyss::engine {
@@ -36,6 +35,8 @@ class BenchTempDir {
     if (::mkdtemp(s.data()) == nullptr) std::abort();
     path_ = s;
   }
+  // remove_all reports through `ec`; only allocation can throw.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
   ~BenchTempDir() {
     std::error_code ec;
     std::filesystem::remove_all(path_, ec);
@@ -51,6 +52,7 @@ class BenchTempDir {
 };
 
 constexpr uint32_t kShardCount = 4;
+constexpr size_t kMiB = size_t{1024} * 1024;
 
 core::QueueEntry MakeEntry(int64_t i) {
   core::QueueEntry e;
@@ -64,17 +66,15 @@ core::QueueEntry MakeEntry(int64_t i) {
 void PreloadQueue(const std::string& wal_path, int64_t n_entries) {
   auto queue = queue::WalQueue::Open({
       .wal_path = wal_path,
-      .segment_size_bytes = 64 * 1024 * 1024,
+      .segment_size_bytes = 64 * kMiB,
       .shard_count = kShardCount,
-      .commit = {.policy = queue::FsyncPolicy::kGroupCommit,
-                 .interval = 1ms,
-                 .max_bytes = 1024 * 1024},
+      .durability = core::Durability::kProcessCrash,
       .min_retention = 24h,
       .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
   });
   if (!queue.has_value()) std::abort();
   for (int64_t i = 0; i < n_entries; ++i) {
-    const core::ShardId shard = static_cast<core::ShardId>(i % kShardCount);
+    const auto shard = static_cast<core::ShardId>(i % kShardCount);
     auto r = (*queue)->Append(shard, MakeEntry(i));
     if (!r.has_value()) std::abort();
     if (!r->durable.get().has_value()) std::abort();
@@ -83,7 +83,7 @@ void PreloadQueue(const std::string& wal_path, int64_t n_entries) {
 
 void BM_RecoveryColdHot(benchmark::State& state) {
   const int64_t n = state.range(0);
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     state.PauseTiming();
     BenchTempDir dir;
     PreloadQueue(dir.path() + "/wal", n);
@@ -94,11 +94,9 @@ void BM_RecoveryColdHot(benchmark::State& state) {
     // `n` entries.
     auto queue = queue::WalQueue::Open({
         .wal_path = dir.path() + "/wal",
-        .segment_size_bytes = 64 * 1024 * 1024,
+        .segment_size_bytes = 64 * kMiB,
         .shard_count = kShardCount,
-        .commit = {.policy = queue::FsyncPolicy::kGroupCommit,
-                   .interval = 1ms,
-                   .max_bytes = 1024 * 1024},
+        .durability = core::Durability::kProcessCrash,
         .min_retention = 24h,
         .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
     });
@@ -107,12 +105,12 @@ void BM_RecoveryColdHot(benchmark::State& state) {
     auto cold = cold::backends::RocksdbStore::Create({
         .data_path = dir.path() + "/cold",
         .shard_count = kShardCount,
-        .write_buffer_size_bytes = 64 * 1024 * 1024,
+        .write_buffer_size_bytes = 64 * kMiB,
     });
     if (!cold.has_value()) state.SkipWithError("cold open");
 
     auto hot = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
-        .max_memory_bytes = 256 * 1024 * 1024,
+        .max_memory_bytes = 256 * kMiB,
         .shard_count = kShardCount,
     });
     core::ConsumerRpc rpc;

@@ -997,5 +997,71 @@ TEST_F(SegmentTest, AppendEncodedRejectsOutOfOrderSeq) {
   EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
 }
 
+// Encodes `count` writes from `first` as one batch closing at the last.
+std::vector<std::byte> EncodeBatch(core::SequenceId first, size_t count, size_t value_bytes,
+                                   std::vector<size_t>& sizes) {
+  std::vector<std::byte> bytes;
+  const core::SequenceId last = first + count - 1;
+  for (size_t i = 0; i < count; ++i) {
+    core::QueueEntry e;
+    e.seq = first + i;
+    e.appended_at = core::WallClock::now();
+    e.payload = core::entry::Write{
+        .cmd = core::RespCommand{{"SET", "k" + std::to_string(i), std::string(value_bytes, 'v')}}};
+    sizes.push_back(EncodeWalEntry(e, last, bytes));
+  }
+  return bytes;
+}
+
+TEST_F(SegmentTest, AppendEncodedBatchWritesAndIndexesEveryEntry) {
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+
+  std::vector<size_t> sizes;
+  const auto bytes = EncodeBatch(0, 400, 1024, sizes);
+  auto wrote = seg->AppendEncodedBatch(bytes, sizes, 0);
+  ASSERT_TRUE(wrote.has_value()) << wrote.error().message();
+  EXPECT_EQ(*wrote, bytes.size());
+  EXPECT_EQ(seg->next_seq(), 400U);
+  EXPECT_EQ(seg->entry_count(), 400U);
+  EXPECT_EQ(seg->write_offset(), kSegmentHeaderSize + bytes.size());
+  EXPECT_GT(seg->index_size(), 0U);
+  ExpectEveryStartMatchesLinearDecode(*seg, 3);
+
+  auto reopened = Segment::Open(SegPath(), kDefaultMaxSize);
+  ASSERT_TRUE(reopened.has_value());
+  EXPECT_EQ(reopened->next_seq(), 400U);
+}
+
+TEST_F(SegmentTest, AppendEncodedBatchThatDoesNotFitAppendsNothing) {
+  constexpr size_t kSmall = 8192;
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kSmall);
+  ASSERT_TRUE(seg.has_value());
+  ASSERT_TRUE(AppendSingle(*seg, MakeWrite(0, {"SET", "a", "1"})).has_value());
+  const size_t offset = seg->write_offset();
+
+  std::vector<size_t> sizes;
+  const auto bytes = EncodeBatch(1, 16, 1024, sizes);
+  auto wrote = seg->AppendEncodedBatch(bytes, sizes, 1);
+  ASSERT_FALSE(wrote.has_value());
+  EXPECT_EQ(wrote.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_EQ(seg->write_offset(), offset);
+  EXPECT_EQ(seg->next_seq(), 1U);
+  EXPECT_EQ(seg->entry_count(), 1U);
+
+  EXPECT_TRUE(AppendSingle(*seg, MakeWrite(1, {"SET", "b", "2"})).has_value());
+}
+
+TEST_F(SegmentTest, AppendEncodedBatchRejectsOutOfOrderSeq) {
+  auto seg = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value());
+  std::vector<size_t> sizes;
+  const auto bytes = EncodeBatch(5, 2, 8, sizes);
+  auto wrote = seg->AppendEncodedBatch(bytes, sizes, 5);
+  ASSERT_FALSE(wrote.has_value());
+  EXPECT_EQ(wrote.error().code(), core::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(seg->next_seq(), 0U);
+}
+
 }  // namespace
 }  // namespace abyss::queue

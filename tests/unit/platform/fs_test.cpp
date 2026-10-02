@@ -80,6 +80,11 @@ TEST(FsTest, DurableFsyncSelectsFullFsyncOnApple) {
   fst::ResetFullFsyncCallCount();
   ASSERT_TRUE(fs::Fsync(*file, fs::SyncMode::kFlushOnly).has_value());
   EXPECT_EQ(fst::FullFsyncCallCount(), 0U);
+
+  // fdatasync does not push the drive cache on macOS either.
+  fst::ResetFullFsyncCallCount();
+  ASSERT_TRUE(fs::Fsync(*file, fs::SyncMode::kDurableData).has_value());
+  EXPECT_GT(fst::FullFsyncCallCount(), 0U);
 }
 #endif  // __APPLE__
 

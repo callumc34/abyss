@@ -873,7 +873,7 @@ bool Resolver::ProcessEntry(const core::QueueEntry& entry) {
                 .appended_at = core::WallClock::now(),
                 .payload = resolved,
             };
-            auto append = queue_.Append(config_.shard, std::move(out));
+            auto append = queue_.Append(config_.shard, std::move(out), AdmitBy());
             if (!append.has_value()) {
               append_failures_.fetch_add(1, std::memory_order_relaxed);
               ABYSS_LOG_ERROR("resolver append failed",
@@ -961,6 +961,35 @@ void Resolver::Commit(core::SequenceId seq) {
   last_commit_seq_.store(seq, std::memory_order_release);
 }
 
+void Resolver::QueueFloor(core::SequenceId drained, core::SequenceId durable_target) {
+  constexpr size_t kMaxPendingFloors = 64;
+  if (!pending_floors_.empty() &&
+      (pending_floors_.back().drained >= drained || pending_floors_.size() == kMaxPendingFloors)) {
+    // Coalescing only delays the floor: the later target covers both.
+    auto& back = pending_floors_.back();
+    back.drained = std::max(back.drained, drained);
+    back.durable_target = std::max(back.durable_target, durable_target);
+    return;
+  }
+  pending_floors_.push_back({.drained = drained, .durable_target = durable_target});
+}
+
+void Resolver::AdvanceFloor() {
+  if (pending_floors_.empty()) return;
+  const auto end = queue_.DurableEnd(config_.shard, core::Durability::kPowerLoss);
+  if (!end.has_value()) return;
+  bool advanced = false;
+  while (!pending_floors_.empty() && pending_floors_.front().durable_target < *end) {
+    AdvanceMaxSeq(resolver_durable_floor_, pending_floors_.front().drained);
+    pending_floors_.pop_front();
+    advanced = true;
+  }
+  // The commit never passes the durable floor. The floor's 0 is ambiguous
+  // until one advance is confirmed, so the first commit waits for that.
+  const auto target = resolver_durable_floor_.load(std::memory_order_acquire);
+  if (committed_.has_value() ? target > *committed_ : advanced) Commit(target);
+}
+
 void Resolver::FailOutOfRange(core::SequenceId requested) {
   const auto first = queue_.FirstSeq(config_.shard);
   const std::string first_text = first.has_value() ? std::to_string(*first) : "unknown";
@@ -988,8 +1017,8 @@ void Resolver::Run() {
 
   auto append_backoff = kAppendRetryInitialBackoff;
   while (!stop_requested_.load(std::memory_order_acquire)) {
-    auto read =
-        queue_.Read(config_.shard, next_read_seq_, config_.read_batch_size, config_.read_timeout);
+    auto read = queue_.Read(config_.shard, next_read_seq_, config_.read_batch_size,
+                            config_.read_timeout, queue_.AckDurability());
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
         ABYSS_LOG_WARN("resolver stopping: queue unavailable",
@@ -1023,23 +1052,13 @@ void Resolver::Run() {
       // target is max(drained, highest emitted Resolved seq): Resolveds sit at
       // seqs > their Conditionals, so confirming the highest emitted Resolved
       // is durable also satisfies the fail-closed CommitOffset gate.
+      // The check is pipelined: decisions never wait on a device flush,
+      // and the floor trails the drained position by about one flush.
       const auto drained = next_read_seq_ - 1;
-      const auto durable_target =
-          std::max(drained, highest_emitted_resolved_seq_.load(std::memory_order_acquire));
-      // Bounded wait, never an unbounded block: AwaitDurable returns true iff
-      // DurableSeq >= durable_target within the timeout. Only a fresh batch
-      // waits; an idle pass just checks, so it never delays the next Read.
-      const core::Duration wait = read->empty() ? core::Duration::zero() : config_.read_timeout;
-      auto durable = queue_.AwaitDurable(config_.shard, durable_target, wait);
-      const bool floor_advanced = durable.has_value() && *durable;
-      if (floor_advanced) {
-        AdvanceMaxSeq(resolver_durable_floor_, drained);
-      }
-      // The commit never passes the durable floor. The floor's 0 is ambiguous
-      // until one advance is confirmed, so the first commit waits for that.
-      const auto target = resolver_durable_floor_.load(std::memory_order_acquire);
-      if (committed_.has_value() ? target > *committed_ : floor_advanced) Commit(target);
+      QueueFloor(drained,
+                 std::max(drained, highest_emitted_resolved_seq_.load(std::memory_order_acquire)));
     }
+    AdvanceFloor();
     cache_.SweepExpired();
 
     if (!retry || next_read_seq_ != batch_start) append_backoff = kAppendRetryInitialBackoff;
@@ -1073,7 +1092,7 @@ bool Resolver::WaitForHotApply(core::SequenceId seq, std::chrono::milliseconds t
 
 bool Resolver::AwaitResolvedDurable(core::SequenceId resolved_seq,
                                     std::chrono::milliseconds timeout) {
-  auto durable = queue_.AwaitDurable(config_.shard, resolved_seq, timeout);
+  auto durable = queue_.AwaitDurable(config_.shard, resolved_seq, queue_.AckDurability(), timeout);
   if (durable.has_value() && *durable) return true;
   durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
   ABYSS_LOG_WARN("resolver resolved-durable wait timeout",
@@ -1225,7 +1244,8 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
   core::SequenceId awaited_reemitted_seq = 0;
   // On timeout the offset stays put and kUnavailable retries the shard.
   const auto await_durable = [this](core::SequenceId barrier) -> core::Result<void> {
-    auto durable = queue_.AwaitDurable(config_.shard, barrier, config_.durable_wait_timeout);
+    auto durable = queue_.AwaitDurable(config_.shard, barrier, core::Durability::kPowerLoss,
+                                       config_.durable_wait_timeout);
     if (durable.has_value() && *durable) return {};
     durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
     ABYSS_LOG_WARN("resolver recovery durability barrier timed out; offset left clamped",
@@ -1241,8 +1261,8 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
       return std::unexpected(
           core::Error{core::ErrorCode::kUnavailable, "resolver replay cancelled"});
     }
-    auto batch =
-        queue_.Read(config_.shard, next_read_seq_, config_.replay_batch_size, core::Duration{50});
+    auto batch = queue_.Read(config_.shard, next_read_seq_, config_.replay_batch_size,
+                             core::Duration{50}, queue_.AckDurability());
     if (!batch.has_value()) {
       if (batch.error().code() == core::ErrorCode::kOutOfRange) FailOutOfRange(next_read_seq_);
       break;
@@ -1277,7 +1297,7 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
                     .appended_at = d_entry.appended_at,
                     .payload = MakeSkip(d_seq, core::RespValue::Null()),
                 };
-                auto append = queue_.Append(config_.shard, std::move(out));
+                auto append = queue_.Append(config_.shard, std::move(out), AdmitBy());
                 if (!append.has_value()) {
                   append_failures_.fetch_add(1, std::memory_order_relaxed);
                   ABYSS_LOG_ERROR("resolver pre-flush skip append failed",
@@ -1343,7 +1363,7 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
         .appended_at = entry.appended_at,
         .payload = resolved,
     };
-    auto append = queue_.Append(config_.shard, std::move(out));
+    auto append = queue_.Append(config_.shard, std::move(out), AdmitBy());
     if (!append.has_value()) {
       ABYSS_LOG_ERROR(
           "resolver replay append failed", {"shard", static_cast<int64_t>(config_.shard)},
