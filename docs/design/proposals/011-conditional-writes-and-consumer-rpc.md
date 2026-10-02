@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Created:** 2026-04-15
 
-> **Superseded in part by [ADP-015](015-write-path-and-durability.md).** The resolver, the `Conditional`/`Resolved` entry pair and block-and-scan are replaced by decide-then-log on the per-shard sequencer, and Consumer RPC is reduced to admin and flush use (Phase 2). This document describes current behaviour until then.
+> **Superseded in part by [ADP-015](015-write-path-and-durability.md).** The resolver, the `Conditional`/`Resolved` entry pair and block-and-scan are replaced by decide-then-log on the per-shard sequencer, and Consumer RPC is reduced to admin and flush use (Phase 2). This document describes current behaviour until then, with one change already made. The resolver now reads only entries durable at the acknowledgement class. Under `power_loss` a conditional therefore waits for its Conditional's flush and then its Resolved's, and §Parallel Execution with Fsync describes the earlier fixed commit window ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
 
 ## Context
 

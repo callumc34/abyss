@@ -4,6 +4,7 @@
 #include <string>
 
 #include "abyss/config/config.h"
+#include "abyss/core/durability.h"
 
 namespace abyss::config {
 namespace {
@@ -32,9 +33,9 @@ queue:
   segment_size_bytes: 134217728
   min_retention_seconds: 86400
   offset_fsync_interval_ms: 250
-  wal_fsync_policy: group_commit
-  group_commit_interval_us: 1000
-  group_commit_max_bytes: 1048576
+  durability: power_loss
+  durability_window_bytes: 2097152
+  durability_window_ms: 500
 
 hot_consumer:
   read_batch_size: 128
@@ -110,9 +111,9 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->queue.segment_size_bytes, 134217728U);
   EXPECT_EQ(cfg->queue.min_retention, std::chrono::seconds{86400});
   EXPECT_EQ(cfg->queue.offset_fsync_interval, std::chrono::milliseconds{250});
-  EXPECT_EQ(cfg->queue.fsync_policy, "group_commit");
-  EXPECT_EQ(cfg->queue.group_commit_interval_us, 1000U);
-  EXPECT_EQ(cfg->queue.group_commit_max_bytes, 1048576U);
+  EXPECT_EQ(cfg->queue.durability, core::Durability::kPowerLoss);
+  EXPECT_EQ(cfg->queue.durability_window_bytes, 2097152U);
+  EXPECT_EQ(cfg->queue.durability_window, std::chrono::milliseconds{500});
 
   EXPECT_EQ(cfg->hot_consumer.read_batch_size, 128U);
   EXPECT_EQ(cfg->hot_consumer.read_timeout, std::chrono::milliseconds{50});
@@ -162,7 +163,7 @@ TEST(ConfigParse, MissingSectionsUseDefaults) {
   ASSERT_TRUE(cfg.has_value()) << cfg.error().message();
   const Config defaults = Config::Defaults();
   EXPECT_EQ(cfg->hot.max_memory_bytes, defaults.hot.max_memory_bytes);
-  EXPECT_EQ(cfg->queue.fsync_policy, defaults.queue.fsync_policy);
+  EXPECT_EQ(cfg->queue.durability, defaults.queue.durability);
   EXPECT_EQ(cfg->recovery.replay_parallelism, defaults.recovery.replay_parallelism);
 }
 

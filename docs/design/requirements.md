@@ -37,17 +37,17 @@ A durable write cannot be acknowledged faster than the device's flush, so write 
 
 ## Durability Guarantees
 
-> **Superseded by [ADP-015](proposals/015-write-path-and-durability.md) §Durability classes.** Abyss acknowledges at a named durability class: `process_crash` (the default, acknowledged once the entry is in the operating system's page cache, with continuous background flushing) or `power_loss` (acknowledged after fdatasync). The fsync policies below describe current behaviour until the durability pipeline lands.
+Abyss acknowledges a write when it reaches the durability class set by `queue.durability` ([ADP-015](proposals/015-write-path-and-durability.md) §Durability classes):
 
-**Group commit (default):** Writes are batched within a configurable window and fsynced together. The client blocks until its batch is fsynced. Maximum data loss on crash is limited to writes in the current unfsynced batch — but those writes were never acknowledged to the client.
+| Class | Acknowledged when | A failure loses |
+|-------|-------------------|-----------------|
+| `process_crash` (default) | The entry is in the operating system's page cache | Nothing on a process crash, OOM kill or container restart. A node power loss loses at most the durability window. |
+| `power_loss` | The fdatasync covering the entry has completed | Nothing on power loss |
 
-| Fsync Policy | Throughput | Max Data Loss on Crash | Use Case |
-|-------------|-----------|----------------------|----------|
-| `fsync_per_write` | ~1K ops/s | 0 | Safety-critical |
-| `group_commit` (default) | ~50-100K ops/s | Up to `group_commit_interval` of un-ACKed writes | Most workloads |
-| `fsync_none` | ~500K+ ops/s | All un-flushed WAL data | Ephemeral data |
-
-The key guarantee: any write the client received OK for is durable. Group commit only risks losing writes that were in the batch buffer at crash time and hadn't been fsynced or ACKed to the client yet. The client never saw OK for those, so it can retry.
+- **Continuous flushing.** The log flushes continuously by natural batching, with no commit timer.
+- **A bounded window.** Acknowledged but not yet power-durable data is bounded by `queue.durability_window_bytes` and `queue.durability_window_ms`. When the device cannot keep up, writes wait and then fail with an error, and metrics report the lag. The window never grows silently.
+- **What replies can show.** No reply, to a read or a write, reflects a write that a failure in the configured class can lose.
+- **What gets persisted.** No persisted derived state (the cold store, committed offsets) ever runs ahead of the power-durable log, whatever the class.
 
 ## Concurrency Model
 
@@ -114,7 +114,7 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 
 - Queue, HotStore, ColdStore interfaces (shard-aware)
 - Built-in append-only WAL with segment rotation and offset persistence
-- Group commit fsync with configurable policy
+- Durability classes (`process_crash`, `power_loss`) with natural-batching group commit
 - Built-in hash map hot store with LRU eviction, eviction refresh on read, absolute TTL
 - Built-in RocksDB cold store with dual TTL expiry (lazy + active)
 - Hot consumer (eager, real-time, promise-based write ACK)

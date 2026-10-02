@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <limits>
 #include <memory>
@@ -73,14 +74,15 @@ class ResolverTest : public ::testing::Test {
   // calls return empty (terminating the replay scan).
   void StubQueueReadOnce(std::vector<core::QueueEntry> entries) {
     auto remaining = std::make_shared<std::vector<core::QueueEntry>>(std::move(entries));
-    EXPECT_CALL(queue_, Read(0, _, _, _))
-        .WillRepeatedly([remaining](core::ShardId, core::SequenceId, size_t,
-                                    core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
-          if (remaining->empty()) return std::vector<core::QueueEntry>{};
-          auto out = std::move(*remaining);
-          remaining->clear();
-          return out;
-        });
+    EXPECT_CALL(queue_, Read(0, _, _, _, _))
+        .WillRepeatedly(
+            [remaining](core::ShardId, core::SequenceId, size_t, core::Duration,
+                        core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
+              if (remaining->empty()) return std::vector<core::QueueEntry>{};
+              auto out = std::move(*remaining);
+              remaining->clear();
+              return out;
+            });
   }
 
   // MockQueue::Append: records the appended entry and returns a synthetic seq.
@@ -90,9 +92,9 @@ class ResolverTest : public ::testing::Test {
   // appended_mu_; the threaded tests read through the accessors below rather
   // than touching the vector directly.
   void StubQueueAppendCapture() {
-    EXPECT_CALL(queue_, Append(_, _))
-        .WillRepeatedly([this](core::ShardId /*shard*/,
-                               core::QueueEntry entry) -> core::Result<queue::AppendResult> {
+    EXPECT_CALL(queue_, Append(_, _, _))
+        .WillRepeatedly([this](core::ShardId /*shard*/, core::QueueEntry entry,
+                               core::SteadyTime) -> core::Result<queue::AppendResult> {
           std::promise<core::Result<void>> p;
           p.set_value(core::Result<void>{});
           const std::scoped_lock lock(appended_mu_);
@@ -143,18 +145,19 @@ class ResolverTest : public ::testing::Test {
         });
   }
 
-  // Drives DurableSeq/AwaitDurable off the test-controlled durable_seq_ so a
-  // test can hold a Resolved non-durable then release it.
+  // Drives DurableEnd/AwaitDurable off the test-controlled durable_seq_
+  // (the highest durable seq) so a test can hold a Resolved non-durable
+  // then release it.
   void StubControllableDurability() {
-    EXPECT_CALL(queue_, DurableSeq(0))
-        .WillRepeatedly([this](core::ShardId) -> core::Result<core::SequenceId> {
-          return durable_seq_.load();
+    EXPECT_CALL(queue_, DurableEnd(0, _))
+        .WillRepeatedly([this](core::ShardId, core::Durability) -> core::Result<core::SequenceId> {
+          const auto highest = durable_seq_.load();
+          return highest == std::numeric_limits<core::SequenceId>::max() ? highest : highest + 1;
         });
-    EXPECT_CALL(queue_, AwaitDurable(0, _, _))
+    EXPECT_CALL(queue_, AwaitDurable(0, _, _, _))
         .WillRepeatedly(
-            [this](core::ShardId, core::SequenceId seq, core::Duration) -> core::Result<bool> {
-              return durable_seq_.load() >= seq;
-            });
+            [this](core::ShardId, core::SequenceId seq, core::Durability,
+                   core::Duration) -> core::Result<bool> { return durable_seq_.load() >= seq; });
   }
 
   core::QueueEntry MakeConditional(core::SequenceId seq, std::vector<std::string> args,
@@ -305,14 +308,15 @@ class ResolverRunTest : public ResolverTest {
  protected:
   void StubQueueReadRepeating(std::vector<core::QueueEntry> entries) {
     auto remaining = std::make_shared<std::vector<core::QueueEntry>>(std::move(entries));
-    EXPECT_CALL(queue_, Read(0, _, _, _))
-        .WillRepeatedly([remaining](core::ShardId, core::SequenceId, size_t,
-                                    core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
-          if (remaining->empty()) return std::vector<core::QueueEntry>{};
-          auto out = std::move(*remaining);
-          remaining->clear();
-          return out;
-        });
+    EXPECT_CALL(queue_, Read(0, _, _, _, _))
+        .WillRepeatedly(
+            [remaining](core::ShardId, core::SequenceId, size_t, core::Duration,
+                        core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
+              if (remaining->empty()) return std::vector<core::QueueEntry>{};
+              auto out = std::move(*remaining);
+              remaining->clear();
+              return out;
+            });
   }
 };
 
@@ -488,6 +492,55 @@ TEST_F(ResolverRunTest, CommitClampedBehindNonDurableResolved) {
 
   EXPECT_GE(committed_seq_.load(), 10U) << "commit did not advance after Resolved became durable";
   EXPECT_GE(resolver.GetSnapshot().resolver_durable_floor, 10U);
+}
+
+// The commit floor is pipelined: with the power-durable end stalled, the
+// next conditional is still decided at once, and the commit catches up
+// when the end moves. A per-batch durability wait would pace decisions.
+TEST_F(ResolverRunTest, DecisionsNeverWaitForTheCommitFloor) {
+  config_.hot_apply_wait = std::chrono::milliseconds{5};
+  auto batches = std::make_shared<std::deque<std::vector<core::QueueEntry>>>();
+  auto batches_mu = std::make_shared<std::mutex>();
+  batches->push_back({MakeConditional(10, {"SETNX", "a", "v"}, core::PredicateFlags::kNx)});
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
+      .WillRepeatedly(
+          [batches, batches_mu](core::ShardId, core::SequenceId, size_t, core::Duration,
+                                core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
+            const std::scoped_lock lock(*batches_mu);
+            if (batches->empty()) return std::vector<core::QueueEntry>{};
+            auto out = std::move(batches->front());
+            batches->pop_front();
+            return out;
+          });
+  StubQueueAppendCapture();
+  StubQueueCommitCapture();
+  StubControllableDurability();
+  EXPECT_CALL(queue_, AwaitDurable(0, _, core::Durability::kPowerLoss, _)).Times(0);
+  EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
+  durable_seq_.store(0);
+
+  Resolver resolver(queue_, cold_, buffer_router_, rpc_, apply_notifier_, config_);
+  resolver.Start();
+  const auto wait_for = [](const auto& done) {
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(1ms);
+    }
+    return done();
+  };
+  ASSERT_TRUE(wait_for([this] { return AppendedSize() == 1; }));
+  {
+    const std::scoped_lock lock(*batches_mu);
+    batches->push_back({MakeConditional(11, {"SETNX", "b", "v"}, core::PredicateFlags::kNx)});
+  }
+  ASSERT_TRUE(wait_for([this] { return AppendedSize() == 2; }))
+      << "the second conditional waited on the first batch's durability";
+  EXPECT_LT(committed_seq_.load(), 10U) << "committed past a seq that is not power-durable";
+
+  durable_seq_.store(5000);
+  EXPECT_TRUE(wait_for([this] { return committed_seq_.load() >= 11U; }))
+      << "commit did not catch up once the power-durable end moved";
+  resolver.Stop();
 }
 
 // XDUR-2 / XERR-3 client path (mirror-assert): the conditional client ack is
@@ -821,9 +874,9 @@ TEST_F(ResolverTest, RecoveryCommitGatedOnReemittedResolvedDurability) {
   // A dangling Conditional at seq 10 with no matching Resolved.
   const std::vector<core::QueueEntry> log{
       MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
-  EXPECT_CALL(queue_, Read(0, _, _, _))
-      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max,
-                             core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
         return testing::ReadFromLog(log, from, max);
       });
   StubQueueAppendCapture();  // re-emitted Resolved is appended at seq 1000.
@@ -864,9 +917,9 @@ TEST_F(ResolverTest, RecoveryScanCommitGatedOnPreFlushSkipDurability) {
       core::QueueEntry{
           .seq = 11, .appended_at = core::WallClock::now(), .payload = core::entry::Flush{}},
   };
-  EXPECT_CALL(queue_, Read(0, _, _, _))
-      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max,
-                             core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
         return testing::ReadFromLog(log, from, max);
       });
   StubQueueAppendCapture();  // the pre-flush Skip lands at seq 1000.
@@ -903,30 +956,34 @@ TEST_F(ResolverTest, RejectedCommitCountsAsCommitFailure) {
   EXPECT_EQ(snap.last_commit_seq, 0U);
 }
 
-// A3: when the end-of-batch durability wait times out the commit does not
-// advance. The steady-state loop must still read forward from its cursor
-// and never re-decide the Conditional, or it appends a second Resolved for
-// it (ADP-001 invariant 7).
+// A3: while the power-durable end lags, the commit does not advance. The
+// steady-state loop must still read forward from its cursor and never
+// re-decide the Conditional, or it appends a second Resolved for it
+// (ADP-001 invariant 7).
 TEST_F(ResolverRunTest, DurabilityTimeoutNeverRedecidesConditional) {
   config_.read_timeout = core::Duration{7};
   config_.hot_apply_wait = std::chrono::milliseconds{1};
   const std::vector<core::QueueEntry> log{
       MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
   std::atomic<int> reads{0};
-  EXPECT_CALL(queue_, Read(0, _, _, _))
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
       .WillRepeatedly(
-          [&log, &reads](core::ShardId, core::SequenceId from, size_t max,
-                         core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+          [&log, &reads](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                         core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
             reads.fetch_add(1);
             return testing::ReadFromLog(log, from, max);
           });
-  // Only the end-of-batch wait uses read_timeout; the first one times out.
-  std::atomic<bool> first_batch_wait{true};
-  EXPECT_CALL(queue_, AwaitDurable(0, _, _))
-      .WillRepeatedly([this, &first_batch_wait](core::ShardId, core::SequenceId,
-                                                core::Duration timeout) -> core::Result<bool> {
-        return timeout != config_.read_timeout || !first_batch_wait.exchange(false);
-      });
+  // Nothing is power durable for the first few passes.
+  std::atomic<bool> lagged{false};
+  EXPECT_CALL(queue_, DurableEnd(0, core::Durability::kPowerLoss))
+      .WillRepeatedly(
+          [&reads, &lagged](core::ShardId, core::Durability) -> core::Result<core::SequenceId> {
+            if (reads.load() < 5) {
+              lagged.store(true);
+              return core::SequenceId{0};
+            }
+            return std::numeric_limits<core::SequenceId>::max();
+          });
   StubQueueAppendCapture();
   StubQueueCommitCapture();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
@@ -940,7 +997,7 @@ TEST_F(ResolverRunTest, DurabilityTimeoutNeverRedecidesConditional) {
   }
   resolver.Stop();
 
-  EXPECT_FALSE(first_batch_wait.load()) << "the end-of-batch durability wait never ran";
+  EXPECT_TRUE(lagged.load()) << "the power-durable end never lagged the drained position";
   size_t resolveds_for_ref = 0;
   for (const auto& e : AppendedSnapshot()) {
     if (const auto* r = std::get_if<core::entry::Resolved>(&e.payload); r && r->ref == 10) {
@@ -960,9 +1017,9 @@ TEST_F(ResolverRunTest, FailedResolvedAppendRetriesConditionalInOrder) {
   };
   const auto x_resolved = [this] { return FindResolvedFor(AppendedSnapshot(), 10) != nullptr; };
   std::atomic<bool> read_past_x{false};
-  EXPECT_CALL(queue_, Read(0, _, _, _))
-      .WillRepeatedly([&](core::ShardId, core::SequenceId from, size_t max,
-                          core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
+      .WillRepeatedly([&](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                          core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
         if (from > 10 && !x_resolved()) read_past_x.store(true);
         return testing::ReadFromLog(log, from, max);
       });
@@ -973,10 +1030,9 @@ TEST_F(ResolverRunTest, FailedResolvedAppendRetriesConditionalInOrder) {
         return core::Result<void>{};
       });
   std::atomic<int> append_calls{0};
-  EXPECT_CALL(queue_, Append(_, _))
-      .WillRepeatedly([this, &append_calls](
-                          core::ShardId,
-                          core::QueueEntry entry) -> core::Result<queue::AppendResult> {
+  EXPECT_CALL(queue_, Append(_, _, _))
+      .WillRepeatedly([this, &append_calls](core::ShardId, core::QueueEntry entry,
+                                            core::SteadyTime) -> core::Result<queue::AppendResult> {
         if (append_calls.fetch_add(1) == 0) {
           return std::unexpected(core::Error(core::ErrorCode::kInternal, "append failed (test)"));
         }
@@ -1022,19 +1078,18 @@ TEST_F(ResolverRunTest, FailedResolvedAppendRetriesConditionalInOrder) {
 TEST_F(ResolverRunTest, PersistentAppendFailureBacksOffAndStopsPromptly) {
   const std::vector<core::QueueEntry> log{
       MakeConditional(10, {"SETNX", "k", "v"}, core::PredicateFlags::kNx)};
-  EXPECT_CALL(queue_, Read(0, _, _, _))
-      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max,
-                             core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
         return testing::ReadFromLog(log, from, max);
       });
   std::atomic<int> append_calls{0};
-  EXPECT_CALL(queue_, Append(_, _))
-      .WillRepeatedly(
-          [&append_calls](core::ShardId,
-                          const core::QueueEntry&) -> core::Result<queue::AppendResult> {
-            append_calls.fetch_add(1);
-            return std::unexpected(core::Error(core::ErrorCode::kInternal, "append failed (test)"));
-          });
+  EXPECT_CALL(queue_, Append(_, _, _))
+      .WillRepeatedly([&append_calls](core::ShardId, const core::QueueEntry&,
+                                      core::SteadyTime) -> core::Result<queue::AppendResult> {
+        append_calls.fetch_add(1);
+        return std::unexpected(core::Error(core::ErrorCode::kInternal, "append failed (test)"));
+      });
   StubQueueCommitCapture();
   EXPECT_CALL(cold_, Exec(_, _)).WillRepeatedly(Return(core::RespValue::Integer(0)));
 
@@ -1062,7 +1117,7 @@ TEST_F(ResolverTest, ReadBelowFirstRetainedSeqIsFatal) {
   const testing::ScopedFatalCapture capture;
   EXPECT_CALL(queue_, CommittedOffset(core::kResolverConsumer, 0))
       .WillRepeatedly(Return(core::Result<std::optional<core::SequenceId>>(6)));
-  EXPECT_CALL(queue_, Read(0, 7, _, _))
+  EXPECT_CALL(queue_, Read(0, 7, _, _, _))
       .WillRepeatedly(Return(core::Result<std::vector<core::QueueEntry>>(
           std::unexpected(core::Error{core::ErrorCode::kOutOfRange, "below first retained seq"}))));
   EXPECT_CALL(queue_, FirstSeq(0)).WillRepeatedly(Return(core::Result<core::SequenceId>(50)));

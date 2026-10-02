@@ -31,7 +31,8 @@ struct BufferFixture {
       const auto key = KeyFor(i);
       const core::ops::StringSet set_op{.key = key, .value = value, .abs_ttl_ms = 0};
       const core::ops::WriteOp op = set_op;
-      buffer.Absorb(key, op, core::EvictionTTL{86400}, static_cast<core::SequenceId>(i));
+      const auto seq = static_cast<core::SequenceId>(i);
+      buffer.Absorb(key, op, core::EvictionTTL{86400}, seq, seq);
     }
   }
 };
@@ -41,7 +42,7 @@ void BM_BufferRead(benchmark::State& state) {
   const auto value_size = static_cast<size_t>(state.range(1));
   BufferFixture fixture{key_count, value_size};
   int64_t i = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     const auto key = KeyFor(i % key_count);
     benchmark::DoNotOptimize(fixture.buffer.Read(key));
     ++i;

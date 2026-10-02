@@ -12,12 +12,12 @@
 #include <utility>
 #include <vector>
 
+#include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
-#include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/memory_offset_store.h"
 #include "abyss/queue/segment_registry.h"
 #include "abyss/queue/wal_queue.h"
@@ -283,7 +283,6 @@ TEST(WalQueueReaperTest, ReaperFailureSurfacedAsMetric) {
       .wal_path = dir.String(),
       .segment_size_bytes = 4096,
       .shard_count = 1,
-      .commit = {.policy = FsyncPolicy::kNone},
       .min_retention = 0s,
       .retention_consumers = {0},
   });
@@ -305,9 +304,11 @@ TEST(WalQueueReaperTest, ReaperFailureSurfacedAsMetric) {
   ASSERT_TRUE(std::filesystem::create_directory(stuck_path));
   ASSERT_TRUE(std::filesystem::create_directory(stuck_path / "blocker"));
 
-  auto durable = queue->DurableSeq(0);
-  ASSERT_TRUE(durable.has_value()) << durable.error().message();
-  auto committed = queue->CommitOffset(0, 0, *durable);
+  const auto tail = queue->TailSeq(0);
+  ASSERT_TRUE(tail.has_value()) << tail.error().message();
+  auto durable = queue->AwaitDurable(0, *tail, core::Durability::kPowerLoss, 5s);
+  ASSERT_TRUE(durable.has_value() && *durable);
+  auto committed = queue->CommitOffset(0, 0, *tail);
   ASSERT_TRUE(committed.has_value()) << committed.error().message();
   // Sweeps follow the persisted offset, so persist to trigger one.
   auto flushed = queue->FlushOffsets();

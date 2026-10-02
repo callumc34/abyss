@@ -126,9 +126,10 @@ ColdConsumerPool::AggregateMetrics ColdConsumerPool::Snapshot() const {
     agg.flushes_deadline += m.flushes_deadline;
     agg.flushes_aggressive += m.flushes_aggressive;
     agg.ops_flushed += m.ops_flushed;
-    agg.entries_dropped_abs_ttl += m.entries_dropped_abs_ttl;
+    agg.entries_expired_abs_ttl += m.entries_expired_abs_ttl;
     agg.apply_failures += m.apply_failures;
     agg.retry_attempts += m.retry_attempts;
+    agg.durability_waits_timed_out += m.durability_waits_timed_out;
     agg.parse_failures += m.parse_failures;
     agg.oldest_unflushed_age = std::max(agg.oldest_unflushed_age, m.oldest_unflushed_age);
     if (m.mode == ColdConsumer::Mode::kAggressive) ++agg.shards_in_aggressive_mode;

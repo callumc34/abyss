@@ -20,11 +20,15 @@ struct BufferEntry {
   core::EvictionTTL eviction{0};
   std::chrono::milliseconds jitter_offset{0};
   core::SequenceId first_seen_seq = 0;
+  // Highest seq of an entry carrying an absorbed effect.
+  core::SequenceId last_seq = 0;
   FlushTrigger last_trigger = FlushTrigger::kQuiet;
   // Scheduled time of this key's currently-live flush-heap entry. Absorb skips
   // pushing a duplicate HeapEntry when the recomputed schedule is unchanged,
   // bounding heap growth per key in the hot-key case (COLDC-4).
   core::SteadyTime scheduled_in_heap_{};
+  // Selected for a flush that has neither landed nor been rescheduled.
+  bool in_flight_ = false;
 };
 
 }  // namespace abyss::consumer

@@ -194,7 +194,7 @@ TEST(ReporterTest, UnevaluatedTargetsNeverPass) {
 
 TEST(ReporterTest, SweepStepsAndSummaryAreReported) {
   auto report = MakeFixtureReport();
-  report.config["wal-fsync-policy"] = "group_commit";
+  report.config["wal-durability"] = "process_crash";
   report.sweep = {{.offered_ops = 1000,
                    .achieved_ops = 999,
                    .p99_ns = 500'000,
@@ -212,7 +212,7 @@ TEST(ReporterTest, SweepStepsAndSummaryAreReported) {
 
   std::ostringstream summary;
   WriteSummary(report, summary);
-  EXPECT_NE(summary.str().find("wal-fsync-policy=group_commit"), std::string::npos);
+  EXPECT_NE(summary.str().find("wal-durability=process_crash"), std::string::npos);
   EXPECT_NE(summary.str().find("sweep result: 1000"), std::string::npos);
 }
 

@@ -134,12 +134,12 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 67108864
+  segment_size_bytes: 134217728
   min_retention_seconds: 86400
   offset_fsync_interval_ms: 1000      # committed-offset checkpoint cadence (10-60000)
-  wal_fsync_policy: group_commit
-  group_commit_interval_us: 1000
-  group_commit_max_bytes: 1048576
+  durability: process_crash           # process_crash | power_loss
+  durability_window_bytes: 67108864   # unflushed WAL bytes across shards (1 MiB-4 GiB)
+  durability_window_ms: 1000          # oldest unflushed entry per shard (10-60000)
 
 hot_consumer:
   read_batch_size: 256

@@ -5,6 +5,7 @@
 #include <mutex>
 #include <utility>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/resp_format.h"
 #include "abyss/core/thread_annotations.h"
 
@@ -32,9 +33,12 @@ CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock, core::WallClockFn 
     : CompactionBuffer(FlushStrategy{}, std::move(clock), std::nullopt, std::move(wall_clock)) {}
 
 void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op,
-                              core::EvictionTTL eviction,
-                              core::SequenceId seq) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+                              core::EvictionTTL eviction, core::SequenceId position,
+                              core::SequenceId carrier) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
+  // A selected batch is applied by reference; changing it would let
+  // EraseFlushed drop state that never reached cold.
+  if (in_flight_ != 0) core::Fatal("compaction buffer absorbed during an in-flight flush");
   auto& entry = entries_[key];
   bool is_new = entry.key.empty();
 
@@ -44,9 +48,10 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
     entry.key = key;
     entry.first_seen = clock_();
     entry.jitter_offset = ComputeJitter();
-    entry.first_seen_seq = seq;
+    entry.first_seen_seq = position;
   }
 
+  entry.last_seq = std::max(entry.last_seq, carrier);
   entry.eviction = eviction;
   entry.state.Absorb(op);
   entry.last_modified = clock_();
@@ -242,10 +247,10 @@ HashOverlay CompactionBuffer::HashOverlayFor(std::string_view key) const
   };
 }
 
-std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size_t max_count)
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+FlushBatch CompactionBuffer::FlushReady(core::SteadyTime now,
+                                        size_t max_count) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
-  std::vector<BufferEntry> result;
+  FlushBatch result;
 
   while (!flush_heap_.empty() && flush_heap_.top().scheduled_time <= now &&
          result.size() < max_count) {
@@ -256,64 +261,74 @@ std::vector<BufferEntry> CompactionBuffer::FlushReady(core::SteadyTime now, size
     // accepted below — every push had a matching charge (COLDC-4).
     heap_overhead_bytes_ -= kHeapEntryOverhead + heap_key.size();
 
-    auto it = entries_.find(heap_key);
-    if (it == entries_.end()) continue;
-
-    auto& entry = it->second;
-    const auto next = strategy_.NextFlushTime(entry, entry.eviction);
-    const auto expected = next.time + entry.jitter_offset;
-    if (expected != heap_time) continue;
-    entry.last_trigger = next.trigger;
-
-    bytes_estimate_ -= EntryBytes(entry);
-    result.push_back(std::move(entry));
-    entries_.erase(it);
+    BufferEntry* entry = SelectLocked(heap_key, heap_time);
+    if (entry != nullptr) result.emplace_back(*entry);
   }
 
   return result;
 }
 
-std::vector<BufferEntry> CompactionBuffer::FlushOldest(size_t target_bytes, size_t max_count)
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+FlushBatch CompactionBuffer::FlushOldest(size_t target_bytes,
+                                         size_t max_count) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
-  std::vector<BufferEntry> result;
+  FlushBatch result;
+  // Selected entries stay buffered, so count them off the estimate here.
+  size_t selected_bytes = 0;
 
   // Compare the combined estimate (entry bytes + heap overhead) against the
   // target so heap-driven pressure actually drains, mirroring BytesEstimate().
   while (!flush_heap_.empty() && result.size() < max_count &&
-         bytes_estimate_ + heap_overhead_bytes_ > target_bytes) {
+         bytes_estimate_ - selected_bytes + heap_overhead_bytes_ > target_bytes) {
     auto heap_time = flush_heap_.top().scheduled_time;
     auto heap_key = flush_heap_.top().key;
     flush_heap_.pop();
     heap_overhead_bytes_ -= kHeapEntryOverhead + heap_key.size();
 
-    auto it = entries_.find(heap_key);
-    if (it == entries_.end()) continue;
-
-    auto& entry = it->second;
-    const auto next = strategy_.NextFlushTime(entry, entry.eviction);
-    const auto expected = next.time + entry.jitter_offset;
-    if (expected != heap_time) continue;
-    entry.last_trigger = next.trigger;
-
-    bytes_estimate_ -= EntryBytes(entry);
-    result.push_back(std::move(entry));
-    entries_.erase(it);
+    BufferEntry* entry = SelectLocked(heap_key, heap_time);
+    if (entry == nullptr) continue;
+    selected_bytes += EntryBytes(*entry);
+    result.emplace_back(*entry);
   }
 
   return result;
 }
 
-void CompactionBuffer::Reinsert(std::vector<BufferEntry> entries) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+BufferEntry* CompactionBuffer::SelectLocked(const std::string& key, core::SteadyTime heap_time) {
+  auto it = entries_.find(key);
+  if (it == entries_.end()) return nullptr;
+
+  auto& entry = it->second;
+  // A key can hold two heap entries for one time; select it only once.
+  if (entry.in_flight_) return nullptr;
+  const auto next = strategy_.NextFlushTime(entry, entry.eviction);
+  const auto expected = next.time + entry.jitter_offset;
+  if (expected != heap_time) return nullptr;
+  entry.last_trigger = next.trigger;
+  entry.in_flight_ = true;
+  ++in_flight_;
+  return &entry;
+}
+
+void CompactionBuffer::EraseFlushed(const FlushBatch& batch) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
-  for (auto& entry : entries) {
-    const std::string key = entry.key;
-    bytes_estimate_ += EntryBytes(entry);
+  for (const BufferEntry& entry : batch) {
+    // Erase by iterator: the key argument would alias the erased node.
+    const auto it = entries_.find(entry.key);
+    bytes_estimate_ -= EntryBytes(it->second);
+    entries_.erase(it);
+    --in_flight_;
+  }
+}
+
+void CompactionBuffer::Reschedule(const FlushBatch& batch) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::unique_lock lock(mutex_);
+  for (const BufferEntry& selected : batch) {
+    auto& entry = entries_.find(selected.key)->second;
+    entry.in_flight_ = false;
+    --in_flight_;
     const auto next = strategy_.NextFlushTime(entry, entry.eviction);
     entry.last_trigger = next.trigger;
-    const auto scheduled = next.time + entry.jitter_offset;
-    auto [it, _] = entries_.insert_or_assign(key, std::move(entry));
-    PushHeapEntry(it->second, scheduled);
+    PushHeapEntry(entry, next.time + entry.jitter_offset);
   }
 }
 
@@ -344,6 +359,7 @@ std::optional<core::SteadyTime> CompactionBuffer::OldestFirstSeen() const
 
 void CompactionBuffer::Clear() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
+  if (in_flight_ != 0) core::Fatal("compaction buffer cleared during an in-flight flush");
   entries_.clear();
   // std::priority_queue has no clear(); swap with an empty instance.
   decltype(flush_heap_) empty;

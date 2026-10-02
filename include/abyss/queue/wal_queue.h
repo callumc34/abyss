@@ -14,11 +14,12 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/core/durability.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/result.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/metrics/metrics.h"
-#include "abyss/queue/group_commit.h"
+#include "abyss/queue/durability_window.h"
 #include "abyss/queue/offset_checkpoint.h"
 #include "abyss/queue/segment_reaper.h"
 #include "abyss/queue/segment_registry.h"
@@ -27,13 +28,29 @@ namespace abyss::queue {
 
 class ShardState;
 
+// Runs before each WAL data sync. May block; an error is a failed sync.
+using FlushHook = std::function<core::Result<void>(core::ShardId)>;
+
+// The active segment and how far into it the last flush reached.
+struct FlushedExtent {
+  std::string path;
+  uint64_t offset = 0;
+};
+
 struct WalConfig {
   std::string wal_path;
   size_t segment_size_bytes = 134217728;
   // Largest single encoded entry accepted; decoupled from segment_size_bytes.
   size_t max_value_size_bytes = 67108864;
   size_t shard_count = 1;
-  GroupCommitConfig commit;
+  // The class append futures resolve at.
+  core::Durability durability = core::Durability::kProcessCrash;
+  // Bounds on published but not yet power-durable entries: bytes across
+  // shards, and the oldest entry's age per shard.
+  uint64_t durability_window_bytes = uint64_t{64} * 1024 * 1024;
+  std::chrono::milliseconds durability_window{1000};
+  // Admission wait for the appends that take no deadline.
+  std::chrono::milliseconds admission_timeout{5000};
   std::chrono::seconds min_retention{86400};
   // Consumers that commit offsets; their persisted offsets gate retention.
   std::vector<core::ConsumerId> retention_consumers;
@@ -52,23 +69,36 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   WalQueue(WalQueue&&) = delete;
   WalQueue& operator=(WalQueue&&) = delete;
 
-  core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry) override;
-  core::Result<PendingBatchAppend> BeginAppendBatch(
-      core::ShardId shard, std::span<const core::QueueEntry> entries) override;
-
-  core::Result<AppendResult> Append(core::ShardId shard, core::QueueEntry entry) override;
+  core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry,
+                                          core::SteadyTime admit_by) override;
+  core::Result<PendingBatchAppend> BeginAppendBatch(core::ShardId shard,
+                                                    std::span<const core::QueueEntry> entries,
+                                                    core::SteadyTime admit_by) override;
+  core::Result<AppendResult> Append(core::ShardId shard, core::QueueEntry entry,
+                                    core::SteadyTime admit_by) override;
   core::Result<AppendBatchResult> AppendBatch(core::ShardId shard,
-                                              std::span<const core::QueueEntry> entries) override;
+                                              std::span<const core::QueueEntry> entries,
+                                              core::SteadyTime admit_by) override;
+
+  // As above, admitting within WalConfig::admission_timeout.
+  core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry);
+  core::Result<PendingBatchAppend> BeginAppendBatch(core::ShardId shard,
+                                                    std::span<const core::QueueEntry> entries);
+  core::Result<AppendResult> Append(core::ShardId shard, core::QueueEntry entry);
+  core::Result<AppendBatchResult> AppendBatch(core::ShardId shard,
+                                              std::span<const core::QueueEntry> entries);
   core::Result<std::vector<core::QueueEntry>> Read(core::ShardId shard, core::SequenceId from_seq,
-                                                   size_t max_count,
-                                                   core::Duration timeout) override;
+                                                   size_t max_count, core::Duration timeout,
+                                                   core::Durability visible) override;
   core::Result<void> CommitOffset(core::ConsumerId consumer, core::ShardId shard,
                                   core::SequenceId seq) override;
   core::Result<std::optional<core::SequenceId>> CommittedOffset(core::ConsumerId consumer,
                                                                 core::ShardId shard) override;
-  core::Result<core::SequenceId> DurableSeq(core::ShardId shard) override;
+  core::Durability AckDurability() const override { return config_.durability; }
+  core::Result<core::SequenceId> DurableEnd(core::ShardId shard,
+                                            core::Durability durability) override;
   core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
-                                  core::Duration timeout) override;
+                                  core::Durability durability, core::Duration timeout) override;
   core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override;
   core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override;
   core::Result<core::SequenceId> TailSeq(core::ShardId shard) override;
@@ -94,10 +124,20 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   // remove; nullopt once retention reclaims everything it is allowed to.
   [[nodiscard]] std::optional<core::Duration> OldestEligibleUnreapedAge() const;
 
+  // Published bytes not yet power-durable, across shards.
+  uint64_t UnflushedBytes() const { return window_.UnflushedBytes(); }
+  // Age bound of the oldest entry not yet power-durable, across shards.
+  core::Duration DurabilityLag() const;
+
   // Test seams. A fault returned here fails persist rounds like an I/O
   // error would; skipping the final persist models a crash at teardown.
   void SetOffsetPersistFaultForTesting(std::function<core::Result<void>()> fault);
   void SkipFinalOffsetPersistForTesting();
+  // A blocking hook stalls flushes; an error is a fatal flush failure.
+  void SetFlushHookForTesting(const FlushHook& hook);
+  FlushedExtent FlushedExtentForTesting(core::ShardId shard) const;
+  // Close without the final flush, as a power loss at teardown would.
+  void SkipFinalFlushForTesting();
 
  private:
   static constexpr int64_t kNoUnreapedEpochMs = std::numeric_limits<int64_t>::min();
@@ -106,6 +146,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<void> Initialize();
 
   core::Result<void> ValidateShard(core::ShardId shard) const;
+  core::SteadyTime DefaultAdmitBy() const;
   // Index into committed_ for a retention consumer, or nullopt.
   std::optional<size_t> OffsetIndex(core::ConsumerId consumer, core::ShardId shard) const;
 
@@ -120,6 +161,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   std::atomic<bool> recovering_{true};
   std::atomic<uint64_t> reaper_failures_{0};
   std::atomic<int64_t> oldest_eligible_unreaped_epoch_ms_{kNoUnreapedEpochMs};
+  // Outlives the shards, whose commit threads release into it.
+  DurabilityWindow window_;
   std::vector<std::unique_ptr<ShardState>> shards_;
   std::unique_ptr<OffsetCheckpoint> checkpoint_;
 

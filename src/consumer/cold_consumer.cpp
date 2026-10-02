@@ -118,9 +118,11 @@ void ColdConsumer::RunLoop() {
     CheckBlockAndScanTimeout();
 
     // Backoff state machine (XRES-5): re-iterate immediately on progress (the
-    // cursor moved or a flush wrote), otherwise sleep on a capped exponential
-    // backoff so a poisoned/unwritable/idle shard never busy-spins.
-    if (drained > 0 || outcome == FlushOutcome::kProgress) {
+    // cursor moved or a flush wrote) or after a durability wait (which paced
+    // the pass), otherwise sleep on a capped exponential backoff so a
+    // poisoned/unwritable/idle shard never busy-spins.
+    if (drained > 0 || outcome == FlushOutcome::kProgress ||
+        outcome == FlushOutcome::kDurabilityPending || wipe_awaits_durability_) {
       backoff = config_.loop_initial_backoff;
       continue;
     }
@@ -136,6 +138,7 @@ void ColdConsumer::RunLoop() {
           break;
         case FlushOutcome::kIdle:
         case FlushOutcome::kProgress:
+        case FlushOutcome::kDurabilityPending:
           backoff_idle_.Increment();
           break;
       }
@@ -188,8 +191,11 @@ void ColdConsumer::DrainAndFlush() {
       truncated = true;
       break;
     }
-    if (FlushUnscheduled(metrics::FlushReason::kDrain) != FlushOutcome::kProgress) {
-      // No forward progress (poisoned/unwritable batch reinserted): do not
+    const FlushOutcome outcome = FlushUnscheduled(metrics::FlushReason::kDrain);
+    // The WAL flushers outlive this drain, so the power-durable end catches up.
+    if (outcome == FlushOutcome::kDurabilityPending) continue;
+    if (outcome != FlushOutcome::kProgress) {
+      // No forward progress (poisoned/unwritable batch rescheduled): do not
       // busy-spin to the deadline — the queue still has the data. Bail and let
       // replay handle it.
       truncated = true;
@@ -222,7 +228,8 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
     counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
-  auto result = queue_.Read(shard_, next_read_seq_, max_count, config_.queue_read_timeout);
+  auto result = queue_.Read(shard_, next_read_seq_, max_count, config_.queue_read_timeout,
+                            queue_.AckDurability());
   if (!result.has_value()) {
     if (result.error().code() == core::ErrorCode::kUnavailable) {
       // Queue has shut down; signal loop exit rather than spinning on the same error.
@@ -333,8 +340,8 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
       caught_up = true;
       break;
     }
-    auto read =
-        queue_.Read(shard_, next_read_seq_, config_.replay_batch_size, config_.queue_read_timeout);
+    auto read = queue_.Read(shard_, next_read_seq_, config_.replay_batch_size,
+                            config_.queue_read_timeout, queue_.AckDurability());
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
         return std::unexpected(read.error());
@@ -377,11 +384,13 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
   // right semantic for "make this buffer empty before declaring recovery
   // done." Bounded by max_flush_batch_size per call; loop until empty.
   while (!cancel.load(std::memory_order_acquire) && buffer_.Size() > 0) {
-    if (FlushUnscheduled() != FlushOutcome::kProgress) {
+    const FlushOutcome outcome = FlushUnscheduled();
+    if (outcome == FlushOutcome::kDurabilityPending) continue;
+    if (outcome != FlushOutcome::kProgress) {
       // No progress: either the buffer reported entries but FlushOldest
       // returned none (shouldn't happen for non-empty buffer with target=0),
-      // or ApplyBatchWithRetry hit a poisoned batch and reinserted them. The
-      // latter is unrecoverable here — operator intervention required.
+      // or ApplyBatchWithRetry hit a failed batch and rescheduled it. That is
+      // unrecoverable here — operator intervention required.
       ABYSS_LOG_ERROR("cold replay flush stalled", {"shard", static_cast<int64_t>(shard_)},
                       {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
       return std::unexpected(core::Error{core::ErrorCode::kInternal, "cold replay flush stalled"});
@@ -414,7 +423,7 @@ void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry:
   const uint64_t wall_now_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
           .count());
-  AbsorbResolvedOp(write.cmd, entry.seq, wall_now_ms);
+  AbsorbResolvedOp(write.cmd, entry.seq, entry.seq, wall_now_ms);
 }
 
 void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
@@ -445,8 +454,9 @@ void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
       RecordPoison(resolved.ref, "empty resolved materialised op");
       continue;
     }
-    // Non-poison ops in the same Resolved still absorb.
-    AbsorbResolvedOp(cmd, resolved.ref, wall_now_ms);
+    // Non-poison ops in the same Resolved still absorb. Replay resumes at the
+    // Conditional, but the effect is only as durable as this Resolved.
+    AbsorbResolvedOp(cmd, resolved.ref, entry.seq, wall_now_ms);
   }
 }
 
@@ -467,6 +477,13 @@ bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
     }
   }
 
+  // The wipe is persisted state: it must not outrun the power-durable log.
+  if (!AwaitPowerDurable(entry.seq)) {
+    wipe_pending_ = true;
+    wipe_awaits_durability_ = true;
+    return false;
+  }
+  wipe_awaits_durability_ = false;
   const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
   auto wiped = cold_store_.Wipe(shard_);
   if (!wiped.has_value()) {
@@ -509,17 +526,17 @@ bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   latest_drained_seq_.store(entry.seq, std::memory_order_release);
   NotifyDrained();
 
-  // OK needs only the synced Wipe: the engine already awaited the Flush
-  // entry's WAL durability, a replayed Flush re-wipes this shard, and
-  // retention follows the persisted offset, so post-Flush writes stay
-  // replayable whether or not this commit lands now (ADP-006).
+  // OK needs only the synced Wipe: the Flush entry is power-durable, a
+  // replayed Flush re-wipes this shard, and retention follows the persisted
+  // offset, so post-Flush writes stay replayable whether or not this commit
+  // lands now (ADP-006).
   TryAdvanceCommit();
   (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
   return true;
 }
 
-void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq,
-                                    uint64_t wall_now_ms) {
+void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId position,
+                                    core::SequenceId carrier, uint64_t wall_now_ms) {
   // A command with no parser at all cannot be materialised by ANY tier in this
   // build, so hot rejected it too and there is no state for cold to be missing:
   // both views agree the entry produced nothing. Poisoning here would pin WAL
@@ -530,28 +547,28 @@ void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::Sequence
     unsupported_ops_.fetch_add(1, std::memory_order_relaxed);
     unsupported_op_total_.Increment();
     ABYSS_LOG_WARN("cold skipping write with no parser in this build",
-                   {"shard", static_cast<int64_t>(shard_)}, {"seq", static_cast<uint64_t>(seq)},
-                   {"cmd", std::string(cmd.Name())});
+                   {"shard", static_cast<int64_t>(shard_)},
+                   {"seq", static_cast<uint64_t>(position)}, {"cmd", std::string(cmd.Name())});
     return;
   }
 
   auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, wall_now_ms);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    RecordPoison(seq, "ParseWriteOp failed");
+    RecordPoison(position, "ParseWriteOp failed");
     return;
   }
 
   auto key = core::ops::PrimaryKey(*op);
   if (key.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    RecordPoison(seq, "empty primary key");
+    RecordPoison(position, "empty primary key");
     return;
   }
 
   const std::string key_str(key);
   auto eviction = eviction_policy_.Resolve(key_str);
-  buffer_.Absorb(key_str, *op, eviction, seq);
+  buffer_.Absorb(key_str, *op, eviction, position, carrier);
 }
 
 void ColdConsumer::RecordPoison(core::SequenceId seq, std::string_view reason) {
@@ -617,12 +634,12 @@ ColdConsumer::FlushOutcome ColdConsumer::Flush() {
 
   if (to_flush.empty()) {
     // Nothing due to flush. Still try to advance the commit: a checkpoint
-    // may now be due, or DurableSeq may have caught up to checkpointed data.
+    // may now be due, or the power-durable end may have caught up.
     TryAdvanceCommit();
     return FlushOutcome::kIdle;
   }
 
-  return ApplyFlushBatch(std::move(to_flush),
+  return ApplyFlushBatch(to_flush,
                          aggressive
                              ? std::optional<metrics::FlushReason>{metrics::FlushReason::kPressure}
                              : std::nullopt,
@@ -638,56 +655,58 @@ ColdConsumer::FlushOutcome ColdConsumer::FlushUnscheduled(metrics::FlushReason r
   }
   // Bypass-the-strategy flushes (replay or graceful drain) are attributed by
   // the caller's reason rather than the quiet/deadline per-entry trigger.
-  return ApplyFlushBatch(std::move(to_flush), reason, flush_start);
+  return ApplyFlushBatch(to_flush, reason, flush_start);
 }
 
 ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
-    std::vector<BufferEntry> to_flush, std::optional<metrics::FlushReason> aggressive_reason,
+    const FlushBatch& to_flush, std::optional<metrics::FlushReason> aggressive_reason,
     std::chrono::steady_clock::time_point flush_start) {
   const bool aggressive = aggressive_reason.has_value();
   const auto wall_now = wall_clock_();
-  std::vector<BufferEntry> surviving;
-  surviving.reserve(to_flush.size());
-  uint64_t dropped = 0;
   uint64_t quiet_count = 0;
   uint64_t deadline_count = 0;
+  core::SequenceId max_last_seq = 0;
   // Highest WAL seq this flush materialises (informational; passed to
   // ApplyBatch). TryAdvanceCommit derives the commit frontier from the live
-  // buffer state, not from this, so a reinserted failed batch re-pins it.
+  // buffer state, not from this, so a rescheduled batch still pins it.
   const core::SequenceId batch_highest_seq = HighestSeqOf(to_flush);
-  for (auto& entry : to_flush) {
-    if (AbsTtlExpired(entry, wall_now)) {
-      ++dropped;
-      continue;
-    }
+  uint64_t expired = 0;
+  for (const BufferEntry& entry : to_flush) {
+    // An expired entry still flushes, as a delete: cold may hold an
+    // older value of the key that would otherwise resurface.
+    if (AbsTtlExpired(entry, wall_now)) ++expired;
     if (entry.last_trigger == FlushTrigger::kQuiet) {
       ++quiet_count;
     } else {
       ++deadline_count;
     }
-    surviving.push_back(std::move(entry));
+    max_last_seq = std::max(max_last_seq, entry.last_seq);
   }
 
-  if (dropped > 0) {
-    entries_dropped_abs_ttl_.fetch_add(dropped, std::memory_order_relaxed);
-  }
-
-  const size_t surviving_count = surviving.size();
+  const size_t batch_count = to_flush.size();
   FlushOutcome outcome = FlushOutcome::kProgress;
-  if (!surviving.empty()) {
-    outcome = ApplyBatchWithRetry(std::move(surviving), batch_highest_seq);
+  if (!to_flush.empty()) {
+    if (AwaitPowerDurable(max_last_seq)) {
+      outcome = ApplyBatchWithRetry(to_flush, batch_highest_seq, wall_now);
+    } else {
+      buffer_.Reschedule(to_flush);
+      outcome = FlushOutcome::kDurabilityPending;
+    }
   }
   const bool applied = outcome == FlushOutcome::kProgress;
+  if (applied && expired > 0) {
+    entries_expired_abs_ttl_.fetch_add(expired, std::memory_order_relaxed);
+  }
 
-  if (surviving_count > 0) {
+  if (batch_count > 0 && outcome != FlushOutcome::kDurabilityPending) {
     if (applied) {
-      flush_total_success_.Increment(static_cast<double>(surviving_count));
+      flush_total_success_.Increment(static_cast<double>(batch_count));
       if (aggressive) {
-        flushes_aggressive_.fetch_add(surviving_count, std::memory_order_relaxed);
+        flushes_aggressive_.fetch_add(batch_count, std::memory_order_relaxed);
         auto& reason_counter = *aggressive_reason == metrics::FlushReason::kDrain
                                    ? flush_reason_drain_
                                    : flush_reason_pressure_;
-        reason_counter.Increment(static_cast<double>(surviving_count));
+        reason_counter.Increment(static_cast<double>(batch_count));
       } else {
         if (quiet_count > 0) {
           flushes_quiet_.fetch_add(quiet_count, std::memory_order_relaxed);
@@ -699,7 +718,7 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
         }
       }
     } else {
-      flush_total_failure_.Increment(static_cast<double>(surviving_count));
+      flush_total_failure_.Increment(static_cast<double>(batch_count));
     }
 
     if (applied) {
@@ -707,10 +726,10 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
                                   std::chrono::steady_clock::now() - flush_start)
                                   .count();
       ABYSS_LOG_DEBUG("cold flush", {"shard", static_cast<int64_t>(shard_)},
-                      {"entries", static_cast<uint64_t>(surviving_count)},
+                      {"entries", static_cast<uint64_t>(batch_count)},
                       {"quiet", static_cast<uint64_t>(quiet_count)},
                       {"deadline", static_cast<uint64_t>(deadline_count)},
-                      {"aggressive", aggressive}, {"dropped_ttl", static_cast<uint64_t>(dropped)},
+                      {"aggressive", aggressive}, {"expired_ttl", static_cast<uint64_t>(expired)},
                       {"duration_ms", static_cast<int64_t>(elapsed_ms)});
     }
   }
@@ -720,13 +739,14 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
 }
 
 std::vector<core::ops::WriteOp> ColdConsumer::BuildBatchOps(
-    const std::vector<BufferEntry>& entries, std::vector<core::ops::Del>& del_storage) const {
+    const FlushBatch& entries, std::vector<core::ops::Del>& del_storage,
+    core::WallTime wall_now) const {
   std::vector<core::ops::WriteOp> ops;
   ops.reserve(entries.size());
   del_storage.reserve(entries.size());
 
-  for (const auto& entry : entries) {
-    if (entry.state.IsTombstone()) {
+  for (const BufferEntry& entry : entries) {
+    if (entry.state.IsTombstone() || AbsTtlExpired(entry, wall_now)) {
       del_storage.push_back(core::ops::Del{.keys = {entry.key}});
       ops.emplace_back(del_storage.back());
       continue;
@@ -750,22 +770,24 @@ std::vector<core::ops::WriteOp> ColdConsumer::BuildBatchOps(
   return ops;
 }
 
-core::SequenceId ColdConsumer::HighestSeqOf(const std::vector<BufferEntry>& entries) {
+core::SequenceId ColdConsumer::HighestSeqOf(const FlushBatch& entries) {
   core::SequenceId highest = 0;
-  for (const auto& entry : entries) {
+  for (const BufferEntry& entry : entries) {
     highest = std::max(highest, entry.first_seen_seq);
   }
   return highest;
 }
 
-ColdConsumer::FlushOutcome ColdConsumer::ApplyBatchWithRetry(std::vector<BufferEntry> entries,
-                                                             core::SequenceId highest_wal_seq) {
+ColdConsumer::FlushOutcome ColdConsumer::ApplyBatchWithRetry(const FlushBatch& entries,
+                                                             core::SequenceId highest_wal_seq,
+                                                             core::WallTime wall_now) {
   std::vector<core::ops::Del> del_storage;
-  auto ops = BuildBatchOps(entries, del_storage);
+  auto ops = BuildBatchOps(entries, del_storage, wall_now);
 
   auto result = cold_store_.ApplyBatch(std::span<const core::ops::WriteOp>(ops), highest_wal_seq);
   if (result.has_value()) {
     ops_flushed_.fetch_add(ops.size(), std::memory_order_relaxed);
+    buffer_.EraseFlushed(entries);
     return FlushOutcome::kProgress;
   }
 
@@ -773,10 +795,10 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyBatchWithRetry(std::vector<BufferE
   const bool terminal =
       code == core::ErrorCode::kCorruption || code == core::ErrorCode::kInvalidArgument;
   counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-  // Reinsert so the entries are replayed on the next iteration. The RunLoop
+  // Reschedule so the entries are retried on the next iteration. The RunLoop
   // (not a blocking sleep here) applies bounded backoff between attempts so a
   // poisoned or unwritable shard never busy-spins (XRES-5).
-  buffer_.Reinsert(std::move(entries));
+  buffer_.Reschedule(entries);
   if (terminal) {
     apply_poisoned_.fetch_add(1, std::memory_order_relaxed);
     ABYSS_LOG_CRITICAL("cold apply batch poisoned", {"shard", static_cast<int64_t>(shard_)},
@@ -789,6 +811,30 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyBatchWithRetry(std::vector<BufferE
                   {"batch", static_cast<uint64_t>(ops.size())},
                   {"err", std::string_view{result.error().message()}});
   return FlushOutcome::kBackpressure;
+}
+
+bool ColdConsumer::AwaitPowerDurable(core::SequenceId seq) {
+  const auto end = queue_.DurableEnd(shard_, core::Durability::kPowerLoss);
+  if (end.has_value() && seq < *end) {
+    durability_wait_logged_ = false;
+    return true;
+  }
+  const auto durable =
+      queue_.AwaitDurable(shard_, seq, core::Durability::kPowerLoss, config_.queue_read_timeout);
+  if (durable.value_or(false)) {
+    durability_wait_logged_ = false;
+    return true;
+  }
+  // Not a failure: a slow device shows up as WAL durability lag.
+  durability_waits_timed_out_.fetch_add(1, std::memory_order_relaxed);
+  if (!durability_wait_logged_) {
+    durability_wait_logged_ = true;
+    ABYSS_LOG_DEBUG("cold persistence waiting for WAL power durability",
+                    {"shard", static_cast<int64_t>(shard_)}, {"seq", static_cast<uint64_t>(seq)},
+                    {"err", durable.has_value() ? std::string_view{"timeout"}
+                                                : std::string_view{durable.error().message()}});
+  }
+  return false;
 }
 
 bool ColdConsumer::AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const {
@@ -916,15 +962,16 @@ void ColdConsumer::TryAdvanceCommit(bool force_checkpoint) {
   // cold's stable storage (the FlushWAL checkpoint frontier), XDUR-1.
   target = std::min(target, last_checkpointed_seq_.load(std::memory_order_acquire));
 
-  // (3) WAL-durability clamp (A1): the commit can never pass the durable
-  // WAL tail. Clamping to DurableSeq means the fail-closed CommitOffset
+  // (3) WAL-durability clamp (A1): the commit can never pass the
+  // power-durable log. Clamping to it means the fail-closed CommitOffset
   // gate never rejects us, turning WAL lag into clean back-pressure.
-  if (auto durable = queue_.DurableSeq(shard_); durable.has_value()) {
-    target = std::min(target, *durable);
-  } else {
+  auto durable_end = queue_.DurableEnd(shard_, core::Durability::kPowerLoss);
+  if (!durable_end.has_value()) {
     counters_.commit_failures.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  if (*durable_end == 0) return;
+  target = std::min(target, *durable_end - 1);
 
   if (committed_.has_value() && target <= *committed_) return;
   // The checkpoint frontier's 0 is ambiguous ("seq 0" or "nothing yet").
@@ -987,10 +1034,11 @@ ColdConsumer::Metrics ColdConsumer::Snapshot() const {
   out.flushes_deadline = flushes_deadline_.load(std::memory_order_relaxed);
   out.flushes_aggressive = flushes_aggressive_.load(std::memory_order_relaxed);
   out.ops_flushed = ops_flushed_.load(std::memory_order_relaxed);
-  out.entries_dropped_abs_ttl = entries_dropped_abs_ttl_.load(std::memory_order_relaxed);
+  out.entries_expired_abs_ttl = entries_expired_abs_ttl_.load(std::memory_order_relaxed);
   out.apply_failures = common.apply_failures;
   out.apply_poisoned = apply_poisoned_.load(std::memory_order_relaxed);
   out.retry_attempts = retry_attempts_.load(std::memory_order_relaxed);
+  out.durability_waits_timed_out = durability_waits_timed_out_.load(std::memory_order_relaxed);
   out.parse_failures = common.parse_failures;
   out.parse_poison = parse_poison_.load(std::memory_order_relaxed);
   out.unsupported_ops = unsupported_ops_.load(std::memory_order_relaxed);

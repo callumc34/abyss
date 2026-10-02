@@ -104,6 +104,8 @@ class StatusProviderImpl : public admin::StatusProvider {
     // are embedded-WAL concepts with no meaning for an external broker.
     CountFn reaper_failures;
     CountFn oldest_eligible_unreaped_age_ms;
+    CountFn unflushed_bytes;
+    CountFn durability_lag_ms;
     CountFn read_buffer_high_water_bytes;
     PortFn resp_port;
     PortFn admin_port;

@@ -167,7 +167,7 @@ Each minor-version bump ships with a round-trip compatibility test asserting bot
 
 ### Write semantics
 
-Entries are serialized into an in-memory buffer and appended to the active segment's file descriptor. The group-commit mechanism (ADP-001) batches multiple appends into a single `fsync` boundary. An entry is durable once the `fsync` covering its bytes returns.
+Entries are serialized into an in-memory buffer and appended to the active segment's file descriptor. Once written, an entry is in the page cache, which is durable at `process_crash`. Group commit (ADP-001 §Durability classes and group commit) batches entries into one fdatasync. An entry is `power_loss` durable once the fdatasync covering its bytes returns.
 
 Segment rotation:
 
