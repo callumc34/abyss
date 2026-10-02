@@ -266,16 +266,20 @@ size_t ColdConsumer::ConsumeBatch(const std::vector<core::QueueEntry>& batch) {
     const bool applied = std::visit(
         [this, &entry](const auto& payload) {
           using T = std::decay_t<decltype(payload)>;
-          if constexpr (std::is_same_v<T, core::entry::Write>) {
-            HandleWrite(entry, payload);
-          } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-            HandleConditional(entry, payload);
-          } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-            HandleResolved(entry, payload);
-          } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
+          // Only a Flush can fail to apply; the else keeps MSVC from
+          // flagging the shared return as unreachable for it (C4702).
+          if constexpr (std::is_same_v<T, core::entry::Flush>) {
             return HandleFlush(entry);
+          } else {
+            if constexpr (std::is_same_v<T, core::entry::Write>) {
+              HandleWrite(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
+              HandleConditional(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
+              HandleResolved(entry, payload);
+            }
+            return true;
           }
-          return true;
         },
         entry.payload);
     // A failed wipe holds the cursor and frontier below the Flush, so
