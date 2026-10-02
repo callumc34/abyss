@@ -10,14 +10,17 @@
 | Cold store cannot fsync (checkpoint fails) | The cold consumer applies flushes to the memtable but `Checkpoint()` (durable WAL fsync) fails, so it does **not** advance its WAL ack — the WAL is retained, not reaped. No acked write is lost; the queue keeps growing until the fsync path recovers. | Inspect `abyss_cold_checkpoint_total{status="failure"}` and the cold-store volume. Resolve the I/O fault; the ack resumes advancing once a checkpoint succeeds. |
 | Poisoned cold flush batch | A structurally-undecodable op (`kCorruption`/`kInvalidArgument`) cannot be applied. The batch is reinserted and the loop backs off (capped exponential) instead of busy-spinning a core. The shard's WAL stays pinned below the poison. | Inspect `abyss_cold_consumer_backoff_total{reason="poisoned"}` and the `cold apply batch poisoned` CRITICAL log. Operator intervention required to clear the bad entry. |
 | Cold parse poison (undecodable WAL op) | A WAL entry the cold consumer cannot parse into a materialisable op (`ParseWriteOp` failure, empty command, or empty key). The cold view never advances its ack past the un-materialised seq — the WAL retains it for the whole shard — and the loop backs off instead of busy-spinning. No acked write is dropped; cold simply stops making forward progress on that shard until the entry is dealt with. | Inspect `abyss_cold_parse_poison_total` and the `cold parse poison; WAL retention pinned below seq` CRITICAL log (carries the shard + seq). The shard's WAL retention age / disk bytes will rise. See [Cold Parse Poison Quarantine](#cold-parse-poison-quarantine) below for the inspect / quarantine / skip recovery procedure. |
-| Queue WAL PVC full | Queue `Append()` fails. Writes return Redis errors to clients. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). |
+| Queue WAL PVC full | The segment preparer cannot create a spare, so the next rotation finds none. Appends wait for a spare until their deadline, then fail with "no spare WAL segment ready". Nothing is applied or acknowledged for a rejected write. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). `abyss_wal_segment_prepare_failures_total` rises first, then `abyss_wal_spare_segments` falls to 0 and `abyss_wal_spare_waits_total` rises. |
+| Spares exhausted during warm-up | Before retention first reclaims a segment, every new segment is zero-filled. A sustained write rate above about half the volume's bandwidth can outrun the preparer, with the same symptoms as a full PVC. | Lower the write rate, or provision more volume bandwidth. `abyss_wal_segments_grown_total` rising with spares at zero confirms it. It clears once recycling starts. |
 | Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
 | Cold scan exceeds the scan deadline | A large `SMEMBERS`/`ZRANGE`/`HGETALL` served from cold could not complete within `cold_scan_deadline`. The read fails closed with a timeout error to the client rather than returning a silently truncated result. | Inspect `abyss_cold_scan_deadline_exceeded_total`. Raise `cold_scan_deadline` for workloads with large cold-resident collections, or address the cold-volume I/O pressure (compaction, disk) that slowed the scan. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
 | Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
 | Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). This is a **refuse-to-start** condition under both durability classes: a power loss could drop whole segments, far beyond the durability window. | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk; Docker Desktop bind mounts often do not, so use a named volume). Watch `abyss_fs_durable_dir_supported`. |
 | WAL flush cannot keep up | The device flushes slower than writes arrive, so acknowledged-but-not-power-durable data grows until it hits `queue.durability_window_bytes` or `queue.durability_window_ms`. Writes then wait for a flush, and after `engine.write_timeout` fail with "WAL durability window full". Acknowledged data is untouched. | Inspect `abyss_wal_durability_lag_seconds`, `abyss_wal_unflushed_bytes`, `abyss_wal_flush_duration_seconds` and `abyss_wal_backpressure_*`. Provision a faster or higher-IOPS volume; widening the window trades a larger power-loss exposure for headroom. |
-| WAL flush or segment seal fails | An fdatasync of published WAL data returns an error. The kernel may already have dropped the dirty pages, so the process terminates rather than let a later flush mark lost data durable. The pod restarts (CrashLoopBackOff if the fault persists) and recovery replays the log. | Look for the CRITICAL `fatal invariant breach; terminating` log naming the WAL flush. Check the volume for I/O errors before restarting. |
+| WAL flush fails, or a mapped segment faults | An fdatasync of published WAL data returns an error, or a write into a mapped segment raises `SIGBUS`. The kernel may already have dropped the dirty pages, so the process terminates rather than let a later flush mark lost data durable. The pod restarts (CrashLoopBackOff if the fault persists) and recovery replays the log. | Look for the CRITICAL `fatal invariant breach; terminating` log naming the WAL flush. Check the volume for I/O errors before restarting. |
+| WAL media corruption | A reader finds a CRC failure below the range recovery verifies, in bytes that were synced long ago. This is media corruption, not a torn write, so the process terminates, naming the log, segment ordinal and offset. It is never skipped as a poison entry. | Check the volume for I/O errors. The entry is lost from the log, so restore the volume from backup, or truncate the log at the reported position and accept the loss. |
+| WAL from another format or layout | The WAL directory holds the format 1 layout (`shard-NNNN/`), a segment of another major version, or a frame of a kind this build does not know. Abyss refuses to start and names which. | There is no migration. Start with an empty WAL directory, or run the build that wrote it. |
 
 ## Durability Capability Gate
 
@@ -78,7 +81,8 @@ See [ADP-007](../design/proposals/007-recovery.md) for the full recovery design.
 1. Recovery is pure queue replay. No external coordination.
 2. During recovery, the RESP port returns `LOADING` errors.
 3. The readiness probe (`/ready`) returns 503 until recovery is complete.
-4. Recovery time is bounded by queue depth and replay batch sizes.
+4. Recovery time is bounded by the retained log. Open scans each log once (CRC-verifying only the range that can hold unflushed bytes), and the hot and cold rebuild reads it about once more through one demultiplexing scan.
+5. A torn write at a power loss, including a sector that persisted a new commit word over a recycled segment's old frame, ends the log cleanly at the tear. Writes acknowledged at `power_loss` are below it.
 
 ## Cold Consumer Stall
 
@@ -140,9 +144,10 @@ a delivered write.
   `rate(abyss_cold_parse_poison_total[5m]) > 0`.
 - The `cold parse poison; WAL retention pinned below seq` CRITICAL log — identifies the exact
   shard and seq to inspect.
-- The shard's WAL-retention-age / queue-disk-bytes gauges (`abyss_queue_disk_bytes`, and the
-  per-shard oldest-eligible-unreaped age gauge) rise because the ack cannot advance past the
-  poison. This is the disk-fill early warning before the WAL PVC fills.
+- The WAL's retention gauges (`abyss_queue_disk_bytes`, and the oldest-eligible-unreaped age)
+  rise because the ack cannot advance past the poison, and reclamation is oldest-first per log,
+  so the poisoned shard holds back every later segment of its log. This is the disk-fill early
+  warning before the WAL PVC fills.
 
 **Recovery (inspect → quarantine → skip):**
 
@@ -166,14 +171,17 @@ explicit operator ack override (skip).
 
 ## WAL Retention Reclamation Stalled
 
-The segment reaper deletes a sealed WAL segment once every consumer has acked past its last seq
-and its age exceeds `min_retention`. A removal can fail for reasons that have nothing to do with
-Abyss — a stale NFS handle, a permissions change, a file still held open by an external process.
+The segment reaper reclaims a sealed WAL segment once, for every shard with frames in it, every
+retention consumer's persisted offset has passed those frames, and its age exceeds
+`min_retention`. Reclaimed segments are recycled for reuse, or unlinked when two already wait.
+A removal can fail for reasons that have nothing to do with Abyss: a stale NFS handle, a
+permissions change, a file still held open by an external process.
 
-The sweep is **skip-and-continue**: a segment that cannot be removed does not abort the pass, so
-one stuck file cannot block reclamation of every later eligible segment. The failure is counted
-rather than swallowed, because an un-reclaimable segment is real disk pressure and invariant 5
-forbids degrading silently.
+The sweep is **oldest-first per log**, and it stops at the first segment it cannot reclaim.
+Reclaiming past it would leave a gap in some shard's retained entries, and hot's rebuild from
+the first retained entry would replay an older write across the gap. A failing removal therefore
+pins every later segment of that log. The failure is counted rather than swallowed, because an
+un-reclaimable segment is real disk pressure and invariant 5 forbids degrading silently.
 
 **Observability:**
 
@@ -187,12 +195,14 @@ forbids degrading silently.
 
 Note that a rising unreaped age does **not** by itself mean the reaper is broken. A consumer that
 legitimately has not acked yet — a lagging cold consumer, or a shard pinned by the poison
-quarantine above — holds segments back by design. Check `abyss_queue_reaper_failures_total` first:
+quarantine above — holds segments back by design. One such shard holds back every later segment
+of its log, because a segment carries frames of every shard on the log. Check `abyss_queue_reaper_failures_total` first:
 non-zero implicates the reaper, zero implicates a consumer that is not acking.
 
 **Recovery:** inspect the first-error message in the reaper's log line for the failing path, and
 resolve the underlying filesystem condition. The next sweep reclaims the segment with no operator
-action beyond that — the reaper retries every eligible segment on each pass.
+action beyond that: the log retries the stuck removal on every pass, and the sweep resumes from
+the oldest segment once it succeeds.
 
 ## Cold Durability Checkpoint
 

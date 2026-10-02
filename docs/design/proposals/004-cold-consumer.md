@@ -7,7 +7,9 @@
 > - **§Consumer Thread Loop:** the loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain.
 > - **§Persisting at the power-durable log:** writes to the cold store never run ahead of the power-durable log.
 >
-> Still to land: consumers run as a pool sized to cores (Phase 1c, #175). Until then each shard has its own thread.
+> Also amended: replay at recovery is driven by the demultiplexing scan of each log (Phase 1c), which hands this consumer its shard's entries in batches.
+>
+> Still to land: consumers run as a pool sized to cores, shard-affine, after Phase 2 (#177). Until then each shard has its own thread.
 
 ## Context
 
