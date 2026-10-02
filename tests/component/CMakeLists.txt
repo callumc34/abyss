@@ -4,6 +4,7 @@ add_executable(abyss_component_tests
   wal_queue_crash_test.cpp
   hot_consumer_test.cpp
   cold_durability_test.cpp
+  cold_persistence_gate_test.cpp
   resolver_recovery_test.cpp
 )
 

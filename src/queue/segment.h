@@ -66,6 +66,11 @@ class Segment {
 
   // Write pre-encoded entry bytes. Does NOT fsync.
   core::Result<size_t> AppendEncoded(std::span<const std::byte> bytes, core::SequenceId entry_seq);
+  // Writes consecutive entries from `first_seq` in one write, so a failure
+  // leaves none of them appended. `sizes` holds each entry's length.
+  core::Result<size_t> AppendEncodedBatch(std::span<const std::byte> bytes,
+                                          std::span<const size_t> sizes,
+                                          core::SequenceId first_seq);
 
   // Flush the fd's in-kernel dirty pages. Blocks until storage acknowledges.
   core::Result<void> Fsync() const;

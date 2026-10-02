@@ -8,9 +8,9 @@
 - `abyss_cold_op_duration_seconds{cmd="..."}` — cold store operation latency per command
 - `abyss_buffer_op_duration_seconds{cmd="..."}` — compaction buffer read latency per command
 - `abyss_resp_request_duration_seconds{cmd="..."}` — end-to-end request latency per command
-- `abyss_wal_flush_duration_seconds` — duration of one group-commit or per-write WAL durability flush (fsync, fdatasync or `F_FULLFSYNC`). This is the device floor that durable acknowledgements wait on. Segment create and seal flushes and offset persists are not included.
+- `abyss_wal_flush_duration_seconds` — duration of one WAL group-commit flush (fdatasync on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This is the device floor that `power_loss` acknowledgements and cold persistence wait on. Segment create and seal flushes and offset persists are not included. Flushes per write is `rate(abyss_wal_flush_duration_seconds_count[1m]) / rate(abyss_queue_appended_total[1m])`. Near 1.0 under concurrent load, flushes are not batching.
 - `abyss_queue_offset_persist_duration_seconds` — duration of one durable persist of committed consumer offsets. The rate of persists (`_count`) shows how much flush capacity offset bookkeeping consumes.
-- `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. Both flush histograms include failed flushes, and stay empty under `fsync_none`.
+- `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. A failed flush terminates the process, so both histograms record successful flushes only.
 
 ### RESP Frontend
 
@@ -31,6 +31,8 @@
 - `abyss_hits_total{tier="hot|buffer|cold"}` — read hits by tier
 - `abyss_misses_total` — read misses (key not found in any tier)
 - `abyss_queue_appended_total` — total entries appended to queue
+- `abyss_wal_backpressure_waits_total` — appends that waited for a WAL flush because the durability window was full
+- `abyss_wal_backpressure_rejections_total` — appends rejected after waiting `engine.write_timeout` for the durability window
 - `abyss_queue_offset_persist_failures_total` — committed-offset checkpoint writes that failed; retried on the next round
 - `abyss_queue_read_out_of_range_total` — queue reads below the first retained entry
 - `abyss_cold_flush_total{status="success|failure"}` — cold consumer flush operations
@@ -70,6 +72,9 @@ Gauges:
 - `abyss_cold_keys` — number of keys in cold store
 - `abyss_queue_depth` — number of entries in queue
 - `abyss_queue_disk_bytes` — queue WAL disk usage
+- `abyss_wal_unflushed_bytes` — WAL bytes published but not yet power-durable, across shards. Bounded by `queue.durability_window_bytes`; under `process_crash` this is what a power loss would lose.
+- `abyss_wal_durability_lag_seconds` — age of the oldest WAL entry not yet power-durable, worst shard. Bounded by `queue.durability_window_ms`.
+- Both are set each snapshot interval by the metrics snapshotter, from the current time on its own thread, so they keep rising while a flush is stalled. They read 0 until recovery has finished.
 - `abyss_cold_buffer_entries` — number of keys in compaction buffer
 - `abyss_cold_buffer_bytes` — estimated memory usage of compaction buffer
 
@@ -129,21 +134,22 @@ Returns a JSON document with the live operational state of the process. Content-
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "abyss":   { "version": "0.1.0", "build": { "commit": "abc1234", "date": "2026-05-03T12:34:56Z" } },
   "server":  { "node_id": "...", "started_at_unix_ms": 1714742400000,
                "uptime_seconds": 3600, "process_id": 12345,
                "ready": true, "loading": false, "shutting_down": false,
                "mode": "standalone", "role": "master" },
   "config":  { "profile": "embedded", "shard_count": 64,
-               "fsync_policy": "group_commit", "default_eviction_seconds": 86400 },
+               "durability": "process_crash", "default_eviction_seconds": 86400 },
   "endpoints": {
     "resp":    { "bind": "0.0.0.0", "port": 6379 },
     "admin":   { "bind": "0.0.0.0", "port": 8080, "enabled": true },
     "metrics": { "bind": "0.0.0.0", "port": 9090, "enabled": true }
   },
   "queue": { "backend": "builtin_wal", "head_seq": 0, "first_seq": 0,
-             "total_entries": 0, "total_bytes": 0 },
+             "total_entries": 0, "total_bytes": 0,
+             "unflushed_bytes": 0, "durability_lag_ms": 0 },
   "hot":   { "backend": "builtin_hashmap", "key_count": 0, "memory_bytes": 0 },
   "cold":  { "backend": "builtin_rocksdb", "key_count": 0,
              "buffer": { "entries": 0, "bytes": 0 } },
@@ -172,7 +178,10 @@ These invariants govern any change to the `/status` payload across releases. Bum
 
 #### Field semantics
 
-- `schema_version` — bumps only when an invariant above is broken. Today: `2`. Version 2 renamed `queue.tail_seq` to `queue.first_seq`, which now reports the lowest readable sequence across shards. It also renamed `consumers.{cold,resolver}.last_ack_seq_{min,max}` to `last_commit_seq_{min,max}`, following the queue's move from acknowledgements to committed offsets.
+- `schema_version` — bumps only when an invariant above is broken. Today: `3`.
+  - Version 3 replaced `config.fsync_policy` with `config.durability` (`process_crash` or `power_loss`).
+  - Version 2 renamed `queue.tail_seq` to `queue.first_seq`, which now reports the lowest readable sequence across shards. It also renamed `consumers.{cold,resolver}.last_ack_seq_{min,max}` to `last_commit_seq_{min,max}`, following the queue's move from acknowledgements to committed offsets.
+- `queue.unflushed_bytes` / `queue.durability_lag_ms` — the same values as `abyss_wal_unflushed_bytes` and `abyss_wal_durability_lag_seconds`, at snapshot time.
 - `abyss.build.commit` / `abyss.build.date` — captured at configure time. `unknown` outside a git checkout.
 - `server.mode` — `"standalone"` or `"cluster"`. Phase 1 always emits `"standalone"`.
 - `server.role` — `"master"` or `"replica"`. Phase 1 always emits `"master"`.
@@ -284,10 +293,12 @@ class FlushEngine {
 - `abyss_cold_buffer_oldest_entry_age_seconds > default_eviction` — the cold consumer has fallen behind the eviction window. Data may be inaccessible between hot eviction and cold flush.
 - Cold store disk usage > 95% — cold consumer will stall soon, cascading to queue growth and write failures.
 - Queue WAL disk usage > 90% — writes will fail when the WAL fills.
+- `increase(abyss_wal_backpressure_rejections_total[5m]) > 0` — writes are failing because the WAL device cannot flush fast enough to keep acknowledged-but-not-power-durable data inside the durability window. Check `abyss_wal_flush_duration_seconds` and the volume's IOPS limit.
 
 ### Warning
 
 - `abyss_cold_buffer_oldest_entry_age_seconds > (default_eviction * 0.8)` — cold consumer is approaching the danger zone.
+- `abyss_wal_durability_lag_seconds > 0.5 * durability_window_ms / 1000` — the WAL is flushing slower than it should. Under `process_crash` the power-loss exposure is growing, and writes will start to wait when the lag reaches the window.
 - `abyss_cold_flush_reason_total{reason="pressure"}` increasing — buffer memory pressure is forcing early flushes, reducing compaction efficiency.
 - `abyss_cold_flush_reason_total{reason="deadline"}` dominating over `{reason="quiet"}` — keys are being written continuously without quiet windows. This may be normal for the workload, or it may indicate the quiet threshold needs tuning.
 - `abyss_cold_ttl_disk_pressure_active == 1` — the cold-store filesystem has crossed `disk_pressure_threshold` and the TTL scanner has switched to maximum aggression. Sustained pressure means provisioning is underspec'd or the cold consumer is producing more than active expiry can reclaim.

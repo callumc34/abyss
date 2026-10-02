@@ -5,7 +5,7 @@ add_library(abyss_queue
   crc32c.cpp
   wal_entry.cpp
   segment_header.cpp
-  fsync_policy.cpp
+  durability_window.cpp
   memory_offset_store.cpp
   offset_checkpoint.cpp
   segment_reaper.cpp
