@@ -431,6 +431,10 @@ DurableExtent WalQueue::DurableExtentForTesting(uint32_t log) const {
                        .offset = kLogSegmentHeaderBytes + (durable - (ordinal * frame_space_))};
 }
 
+uint64_t WalQueue::SyncCountForTesting(uint32_t log) const {
+  return logs_.at(log)->log->SyncCountForTesting();
+}
+
 void WalQueue::SkipFinalFlushForTesting() {
   skip_final_flush_.store(true, std::memory_order_release);
 }

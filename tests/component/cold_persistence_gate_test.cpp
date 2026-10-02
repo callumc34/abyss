@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -18,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
@@ -34,8 +37,14 @@
 #include "abyss/core/types.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
+#include "abyss/queue/append_result.h"
+#include "abyss/queue/frame.h"
 #include "abyss/queue/wal_queue.h"
 #include "durability_printer.h"
+#include "latch.h"
+#include "on_exit.h"
 #include "temp_dir.h"
 #include "wal_power_loss.h"
 
@@ -46,13 +55,16 @@ using namespace std::chrono_literals;
 
 constexpr auto kWait = 5s;
 
-// Holds every WAL flush until released.
+// Holds every WAL flush until released, but for those allowed through.
 class FlushStall {
  public:
   queue::FlushHook Hook() const {
     return [state = state_](uint32_t) -> core::Result<void> {
       std::unique_lock lock(state->mu);
-      state->cv.wait(lock, [&state] { return state->released; });
+      ++state->entered;
+      state->cv.notify_all();
+      state->cv.wait(lock, [&state] { return state->released || state->allowed > 0; });
+      if (!state->released) --state->allowed;
       return {};
     };
   }
@@ -65,11 +77,27 @@ class FlushStall {
     state_->cv.notify_all();
   }
 
+  // The next `flushes` to reach the hook pass it.
+  void Allow(int flushes) const {
+    {
+      const std::scoped_lock lock(state_->mu);
+      state_->allowed += flushes;
+    }
+    state_->cv.notify_all();
+  }
+
+  bool AwaitEntered(int flushes) const {
+    std::unique_lock lock(state_->mu);
+    return state_->cv.wait_for(lock, kWait, [this, flushes] { return state_->entered >= flushes; });
+  }
+
  private:
   struct State {
     std::mutex mu;
     std::condition_variable cv;
     bool released = false;
+    int allowed = 0;
+    int entered = 0;
   };
   std::shared_ptr<State> state_ = std::make_shared<State>();
 };
@@ -177,7 +205,11 @@ class ColdPersistenceGateTest : public ::testing::Test {
   }
 
   void OpenWal(core::Durability durability, size_t shards = 1) {
-    auto opened = queue::WalQueue::Open(WalConfigFor(durability, shards));
+    OpenWalWith(WalConfigFor(durability, shards));
+  }
+
+  void OpenWalWith(const queue::WalConfig& config) {
+    auto opened = queue::WalQueue::Open(config);
     ASSERT_TRUE(opened.has_value()) << opened.error().message();
     queue_ = std::move(*opened);
   }
@@ -508,6 +540,232 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
     const auto committed = ColdCommit(shard);
     EXPECT_TRUE(committed.has_value() && *committed < durable_end[shard])
         << "persisted offset missing or past the recovered log";
+  }
+}
+
+double SegmentsGrown() {
+  return metrics::testing::GetCounterValue(metrics::names::kWalSegmentsGrownTotal).value_or(0.0);
+}
+
+uint64_t OrdinalOf(const queue::DurableExtent& extent) {
+  return std::stoull(std::filesystem::path(extent.path).stem().string());
+}
+
+uint64_t WordAt(const std::string& bytes, uint64_t offset) {
+  uint64_t word = 0;
+  std::memcpy(&word, bytes.data() + offset, sizeof(word));
+  return word;
+}
+
+// A power loss on a device that still holds what the unflushed writes
+// replaced, which in a recycled segment is frames of an earlier
+// generation. D sits inside a batch. Recovery ends exactly at D's last
+// whole batch with every entry as written, and cold, run to completion,
+// holds nothing above that end.
+TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
+  constexpr size_t kShards = 4;
+  constexpr core::SequenceId kKeys = 8;
+  constexpr size_t kFrameSpace = 8192;
+  auto config = WalConfigFor(GetParam(), kShards);
+  config.segment_size_bytes = 4096 + kFrameSpace;
+  config.min_retention = 0s;
+  // Flushes are held below for longer than the default age bound.
+  config.durability_window = 60s;
+  config.offset_fsync_interval = std::chrono::hours{1};
+  ASSERT_NO_FATAL_FAILURE(OpenWalWith(config));
+  ASSERT_NO_FATAL_FAILURE(OpenCold(kShards));
+  for (core::ShardId shard = 0; shard < kShards; ++shard) AddConsumer(shard, AggressiveConfig());
+
+  // Values are one width, so every frame is one size and a frame of an
+  // earlier generation starts exactly where a new one does.
+  std::vector<std::vector<std::string>> written(kShards);
+  uint64_t values = 0;
+  const auto key = [](core::ShardId shard, core::SequenceId seq) {
+    return "k" + std::to_string(shard) + "_" + std::to_string(seq % kKeys);
+  };
+  const auto next_entry = [&](core::ShardId shard, char tag) {
+    const core::SequenceId seq = written[shard].size();
+    const std::string digits = std::to_string(values++);
+    std::string value = tag + std::string(8 - digits.size(), '0') + digits;
+    written[shard].push_back(value);
+    return WriteEntry({"SET", key(shard, seq), std::move(value)});
+  };
+  const auto append_rows = [&](size_t rows) {
+    for (size_t r = 0; r < rows; ++r) {
+      for (core::ShardId shard = 0; shard < kShards; ++shard) {
+        const core::SequenceId seq = written[shard].size();
+        ASSERT_EQ(Append(shard, next_entry(shard, 'w')), seq);
+      }
+    }
+    for (core::ShardId shard = 0; shard < kShards; ++shard) {
+      ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, written[shard].size() - 1));
+    }
+  };
+  // Cold takes in and commits everything durable; retention then
+  // reclaims every sealed segment, the oldest two into the free pool.
+  const auto absorb_and_reclaim = [&] {
+    for (auto& consumer : consumers_) {
+      consumer->Drain();
+      EXPECT_EQ(consumer->Flush(), ColdConsumer::FlushOutcome::kProgress);
+      ASSERT_EQ(ColdCommit(consumer->Shard()), written[consumer->Shard()].size() - 1);
+    }
+    ASSERT_TRUE(queue_->FlushOffsets().has_value());
+    ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  };
+  const size_t frame_bytes = [&] {
+    std::vector<std::byte> frame;
+    return queue::frame::EncodeEntry(WriteEntry({"SET", key(0, 0), std::string(9, 'w')}), 0, frame);
+  }();
+  // Half a segment, so a step crosses one segment end at most.
+  const size_t step = kFrameSpace / frame_bytes / kShards / 2;
+  ASSERT_GT(step, 2U);
+
+  for (int i = 0; i < 100 && OrdinalOf(queue_->DurableExtentForTesting(0)) < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(append_rows(step));
+  }
+  ASSERT_NO_FATAL_FAILURE(absorb_and_reclaim());
+  ASSERT_GT(queue_->FirstSeq(0).value(), 0U) << "retention reclaimed nothing";
+
+  // Each segment end crossed from here is reclaimed at once, so the
+  // pool never runs dry and every spare prepared is a recycled file.
+  // The spares published now end two past the active segment, so the
+  // third one on is prepared after this count.
+  const double grown = SegmentsGrown();
+  const uint64_t from = OrdinalOf(queue_->DurableExtentForTesting(0));
+  uint64_t active = from;
+  for (int i = 0; i < 100 && active < from + 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(append_rows(step));
+    if (const uint64_t now = OrdinalOf(queue_->DurableExtentForTesting(0)); now != active) {
+      ASSERT_NO_FATAL_FAILURE(absorb_and_reclaim());
+      active = now;
+    }
+  }
+  ASSERT_EQ(active, from + 3);
+  ASSERT_EQ(SegmentsGrown(), grown) << "a spare was grown rather than recycled";
+
+  // D moves inside a batch: flush 1 holds a snapshot of X alone, Y
+  // makes the committer flush again, and that flush finds the batch on
+  // shard 0 filled up to its first frame.
+  const queue::DurableExtent before = queue_->DurableExtentForTesting(0);
+  queue_->SetFlushHookForTesting(stall_.Hook());
+  const core::SequenceId x = Append(1, next_entry(1, 'w'));
+  ASSERT_TRUE(stall_.AwaitEntered(1));
+  const core::SequenceId y = Append(2, next_entry(2, 'w'));
+  const core::SequenceId batch_first = written[0].size();
+  std::vector<core::QueueEntry> batch_entries;
+  batch_entries.reserve(5);
+  for (int i = 0; i < 5; ++i) batch_entries.push_back(next_entry(0, 'w'));
+  auto in_batch = std::make_shared<testing::Latch>();
+  auto finish_batch = std::make_shared<testing::Latch>();
+  // Released before the batch's future is waited on.
+  std::future<core::Result<queue::AppendBatchResult>> batch;
+  const testing::OnExit release_batch([finish_batch] { finish_batch->Open(); });
+  queue_->SetBatchCommitHookForTesting([in_batch, finish_batch](std::size_t committed) {
+    if (committed != 1) return;
+    in_batch->Open();
+    finish_batch->Wait();
+  });
+  batch = std::async(std::launch::async,
+                     [this, &batch_entries] { return queue_->AppendBatch(0, batch_entries); });
+  ASSERT_TRUE(in_batch->Wait());
+  stall_.Allow(2);
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(1, x));
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(2, y));
+  EXPECT_EQ(PowerEnd(0), batch_first) << "part of a batch is visible at power_loss";
+  const queue::DurableExtent extent = queue_->DurableExtentForTesting(0);
+  ASSERT_EQ(extent.path, before.path);
+  ASSERT_EQ(extent.offset, before.offset + (3 * frame_bytes)) << "D is not inside the batch";
+  std::vector<core::SequenceId> durable_end(kShards);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    durable_end[shard] = shard == 0 ? batch_first : written[shard].size();
+  }
+
+  // Everything past D is a frame of an earlier generation, lined up
+  // with the frames being written now.
+  const auto snapshot = testing::CaptureLog(std::filesystem::path(extent.path).parent_path());
+  {
+    const auto it = snapshot.find(std::filesystem::path(extent.path).filename().string());
+    ASSERT_NE(it, snapshot.end());
+    const uint64_t stale = WordAt(it->second, extent.offset);
+    const uint64_t last = WordAt(it->second, extent.offset - frame_bytes);
+    ASSERT_NE(stale, 0U) << "nothing was written past D in an earlier life";
+    EXPECT_NE(queue::frame::CommitGen(stale), static_cast<uint32_t>(active));
+    EXPECT_EQ(queue::frame::CommitLen(stale), queue::frame::CommitLen(last));
+  }
+
+  // No flush passes from here, so D stays put while the batch finishes
+  // and more appends land past it, singles and batches on every shard.
+  finish_batch->Open();
+  ASSERT_EQ(batch.wait_for(kWait), std::future_status::ready);
+  auto batched = batch.get();
+  ASSERT_TRUE(batched.has_value()) << batched.error().message();
+  ASSERT_EQ(batched->first_seq, batch_first);
+  std::vector<queue::DurabilityFuture> unflushed;
+  unflushed.push_back(std::move(batched->durable));
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    for (int i = 0; i < 6; ++i) {
+      auto appended = queue_->Append(shard, next_entry(shard, 'L'));
+      ASSERT_TRUE(appended.has_value()) << appended.error().message();
+      unflushed.push_back(std::move(appended->durable));
+    }
+    std::vector<core::QueueEntry> entries;
+    entries.reserve(3);
+    for (int i = 0; i < 3; ++i) entries.push_back(next_entry(shard, 'L'));
+    auto appended = queue_->AppendBatch(shard, entries);
+    ASSERT_TRUE(appended.has_value()) << appended.error().message();
+    unflushed.push_back(std::move(appended->durable));
+  }
+  // At process_crash cold takes these in, and must not persist them.
+  for (auto& consumer : consumers_) {
+    consumer->Drain();
+    consumer->Flush();
+  }
+  ASSERT_EQ(queue_->DurableExtentForTesting(0).offset, extent.offset);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    EXPECT_EQ(PowerEnd(shard), durable_end[shard]) << "shard " << shard;
+  }
+  if (GetParam() == core::Durability::kPowerLoss) {
+    for (auto& future : unflushed) {
+      EXPECT_EQ(future.wait_for(0ms), std::future_status::timeout) << "acknowledged past D";
+    }
+  }
+
+  consumers_.clear();
+  queue_->SkipFinalFlushForTesting();
+  stall_.Release();
+  queue_.reset();
+  cold_.reset();
+  testing::SimulatePowerLossRestoring(extent, snapshot);
+
+  ASSERT_NO_FATAL_FAILURE(OpenWalWith(config));
+  ASSERT_NO_FATAL_FAILURE(OpenCold(kShards));
+  const std::atomic<bool> cancel{false};
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    SCOPED_TRACE("shard " + std::to_string(shard));
+    const core::SequenceId end = durable_end[shard];
+    EXPECT_EQ(PowerEnd(shard), end) << "an acknowledged write was lost, or D was passed";
+    EXPECT_EQ(queue_->TailSeq(shard).value() + 1, end);
+    const core::SequenceId first = queue_->FirstSeq(shard).value();
+    auto recovered = queue_->Read(shard, first, 100000, 0ms, core::Durability::kPowerLoss);
+    ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+    ASSERT_EQ(recovered->size(), end - first);
+    for (const auto& entry : *recovered) {
+      const auto* write = std::get_if<core::entry::Write>(&entry.payload);
+      ASSERT_NE(write, nullptr) << "seq " << entry.seq;
+      const std::vector<std::string> want{"SET", key(shard, entry.seq), written[shard][entry.seq]};
+      EXPECT_EQ(write->cmd.args, want) << "seq " << entry.seq;
+    }
+
+    auto& consumer = AddConsumer(shard, AggressiveConfig());
+    auto replayed = consumer.ReplayUntil(end - 1, cancel);
+    ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+    for (core::SequenceId k = 0; k < kKeys; ++k) {
+      std::optional<std::string> want;
+      for (core::SequenceId seq = k; seq < end; seq += kKeys) want = written[shard][seq];
+      EXPECT_EQ(ReadCold(*cold_, key(shard, k)), want) << key(shard, k);
+    }
+    const auto committed = ColdCommit(shard);
+    EXPECT_TRUE(committed.has_value() && *committed < end);
   }
 }
 
