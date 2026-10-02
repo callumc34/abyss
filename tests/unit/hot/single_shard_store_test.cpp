@@ -438,11 +438,11 @@ TEST_F(SingleShardStoreTest, EvictExpiredRemovesOldKeys) {
   auto short_eviction = core::EvictionTTL{1};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
-  auto before = store_.EvictExpired(clock_.SteadyNow());
+  auto before = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(before.Total(), 0U);
 
   clock_.Advance(1100ms);
-  auto after = store_.EvictExpired(clock_.SteadyNow());
+  auto after = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(after.Total(), 1U);
   EXPECT_EQ(after.by_deadline, 1U);
   EXPECT_EQ(after.by_ttl, 0U);
@@ -460,7 +460,7 @@ TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
   store_.RefreshAccess("k", clock_.SteadyNow());
 
   clock_.Advance(700ms);
-  auto evicted = store_.EvictExpired(clock_.SteadyNow());
+  auto evicted = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(evicted.Total(), 0U);
 }
 
@@ -472,12 +472,12 @@ TEST_F(SingleShardStoreTest, EvictExpiredAttributesTtlReason) {
           .count();
   SetString("k", "v", static_cast<uint64_t>(now_ms + 1000));
 
-  auto before = store_.EvictExpired(clock_.SteadyNow());
+  auto before = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(before.by_ttl, 0U);
   EXPECT_EQ(before.by_deadline, 0U);
 
   clock_.Advance(1500ms);
-  auto after = store_.EvictExpired(clock_.SteadyNow());
+  auto after = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(after.by_ttl, 1U) << "abs TTL drove removal";
   EXPECT_EQ(after.by_deadline, 0U) << "eviction deadline is far in the future";
 }
@@ -495,7 +495,7 @@ TEST_F(SingleShardStoreTest, EvictExpiredTtlWinsWhenBothApply) {
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
 
   clock_.Advance(1500ms);
-  auto report = store_.EvictExpired(clock_.SteadyNow());
+  auto report = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(report.by_ttl, 1U);
   EXPECT_EQ(report.by_deadline, 0U);
 }
@@ -507,7 +507,7 @@ TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {
   SetString("new", std::string(512, 'y'));
 
   auto target = store_.Stats().used_bytes * 3 / 4;
-  auto evicted = store_.EvictLru(target);
+  auto evicted = store_.EvictLru(target, kAllDrained);
   EXPECT_GE(evicted, 1U);
 
   auto old_result = GetString("old");
@@ -569,7 +569,7 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
 TEST_F(SingleShardStoreTest, WipeClearsAll) {
   SetString("a", "1");
   SetString("b", "2");
-  store_.Wipe();
+  store_.Wipe(0);
 
   EXPECT_EQ(store_.Stats().key_count, 0U);
   auto result = GetString("a");
@@ -873,7 +873,7 @@ TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
           .count();
   SetString("ttl", "v", static_cast<uint64_t>(now_ms + 500));
   clock_.Advance(1000ms);
-  store_.EvictExpired(clock_.SteadyNow());
+  store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   auto after_ttl = store_.Stats();
   EXPECT_EQ(after_ttl.expired_count, 1U);
   EXPECT_EQ(after_ttl.eviction_count, 0U);
@@ -882,7 +882,7 @@ TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
   core::ops::StringSet op{.key = "ev", .value = "v"};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
   clock_.Advance(1100ms);
-  store_.EvictExpired(clock_.SteadyNow());
+  store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   auto after_deadline = store_.Stats();
   EXPECT_EQ(after_deadline.expired_count, 1U) << "TTL count unchanged by a deadline eviction";
   EXPECT_EQ(after_deadline.eviction_count, 1U);
@@ -979,7 +979,7 @@ TEST(SingleShardStoreMemoryTest, ReplayModeSuppressesMemoryEviction) {
 
   // After replay, the ceiling is enforced by EvictLru.
   store.SetReplayMode(false);
-  store.EvictLru(store.Stats().max_bytes);
+  store.EvictLru(store.Stats().max_bytes, kAllDrained);
   EXPECT_LE(store.Stats().used_bytes, store.Stats().max_bytes);
 }
 
@@ -1070,7 +1070,7 @@ TEST_F(SingleShardStoreTest, ExpirePersistOnTombstoneDoNotPerturbEvictionCounter
       store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 3).has_value());
 
   clock_.Advance(1500ms);
-  auto report = store_.EvictExpired(clock_.SteadyNow());
+  auto report = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(report.by_ttl, 0U) << "tombstone is skipped, never counted as a TTL expiry";
   EXPECT_EQ(report.by_deadline, 0U) << "tombstone is skipped, never counted as an eviction";
   // The tombstone survives until GC, not the eviction deadline.
@@ -1081,7 +1081,7 @@ TEST_F(SingleShardStoreTest, ExpirePersistAfterTombstoneGcStillAbsent) {
   SetString("k", "v");
   ASSERT_TRUE(
       store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 5).has_value());
-  // GC reclaims the tombstone (horizon >= tombstone_seq), so the key is now
+  // GC reclaims the tombstone (horizon >= latest_seq), so the key is now
   // fully absent and the entries_.end() guard returns 0.
   EXPECT_EQ(store_.GcTombstones(5), 1U);
   EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);

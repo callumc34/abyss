@@ -218,6 +218,12 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   wp->hot_store = std::make_unique<abyss::hot::ShardedHotStore>(abyss::hot::ShardedHotStoreConfig{
       .max_memory_bytes = config.hot.max_memory_bytes,
       .shard_count = config.hot.shard_count,
+      .stub_memory_fraction = config.hot.stub_memory_fraction,
+      .backpressure_ratio = config.hot.backpressure_ratio,
+      // The cold pool is built later; until then nothing has drained.
+      .drained = [path = wp.get()](abyss::core::ShardId shard) -> abyss::core::SequenceId {
+        return path->cold_pool ? path->cold_pool->ConsumerFor(shard).LatestDrainedSeq() : 0;
+      },
       .eviction_policy = wp->eviction_policy.get(),
   });
   const uint32_t shards = wp->hot_store->shard_count();
@@ -306,13 +312,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       });
 
   wp->hot_eviction_worker = std::make_unique<abyss::hot::EvictionWorker>(
-      *wp->hot_store, abyss::hot::EvictionWorker::Config{
-                          .tick = config.hot.eviction_tick,
-                          .tombstone_horizon =
-                              [pool = wp->cold_pool.get()](abyss::core::ShardId shard) {
-                                return pool->ConsumerFor(shard).LatestDrainedSeq();
-                              },
-                      });
+      *wp->hot_store, abyss::hot::EvictionWorker::Config{.tick = config.hot.eviction_tick});
 
   wp->resolver_pool = std::make_unique<consumer::ResolverPool>(
       *wp->queue, *wp->cold_store, *wp->cold_pool, *wp->consumer_rpc, *wp->apply_notifier,

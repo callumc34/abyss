@@ -23,6 +23,15 @@ struct MemoryStats {
   // Configured memory budget; 0 means unlimited. Lets the exporter publish the
   // ceiling alongside usage (HOT-1 observability).
   uint64_t max_bytes = 0;
+  // Stub bytes are part of used_bytes.
+  uint64_t stub_entries = 0;
+  uint64_t stub_bytes = 0;
+  uint64_t stub_drops = 0;
+  uint64_t load_discards = 0;
+  // Live bytes cold had not drained, as of the last full eviction pass.
+  uint64_t unevictable_bytes = 0;
+  // Over the backpressure ratio of max_bytes after an eviction pass.
+  bool backpressured = false;
 };
 
 // Existence verdict for a key in the hot tier. kTombstoned is an authoritative
@@ -60,10 +69,10 @@ class HotStore : public Reader {
   virtual void SetReplayMode(bool /*replaying*/) {}
 
   virtual Result<MemoryStats> Stats() = 0;
-  // Clears one shard. A Flush reaches every shard's stream, and each
-  // shard's consumer wipes only its own, so one shard's Flush never
-  // drops another's later writes.
-  virtual Result<void> Wipe(ShardId shard) = 0;
+  // Clears one shard for a Flush at `seq`. A Flush reaches every shard's
+  // stream, and each shard's consumer wipes only its own, so one shard's
+  // Flush never drops another's later writes.
+  virtual Result<void> Wipe(ShardId shard, SequenceId seq) = 0;
 };
 
 }  // namespace abyss::core

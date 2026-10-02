@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <string_view>
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
@@ -20,9 +21,11 @@ class EvictionWorkerTest : public ::testing::Test {
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::TestClock clock_;
   core::EvictionPolicy policy_{core::EvictionTTL{1}};
+  core::SequenceId horizon_ = kAllDrained;
   ShardedHotStore store_{ShardedHotStoreConfig{
       .max_memory_bytes = 8UL * 1024 * 1024,
       .shard_count = 1,
+      .drained = [this](core::ShardId) { return horizon_; },
       .eviction_policy = &policy_,
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
@@ -176,12 +179,8 @@ TEST_F(EvictionWorkerTest, TickReclaimsTombstonesAtOrBelowHorizon) {
       store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, /*seq=*/5).has_value());
   ASSERT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
 
-  core::SequenceId horizon = 4;
-  EvictionWorker worker(
-      store_,
-      EvictionWorker::Config{.tick = 50ms,
-                             .tombstone_horizon = [&](core::ShardId) { return horizon; }},
-      clock_.SteadyFn());
+  horizon_ = 4;
+  EvictionWorker worker(store_, EvictionWorker::Config{.tick = 50ms}, clock_.SteadyFn());
 
   // Horizon below the delete seq: cold has not caught up, tombstone is kept.
   worker.TickOnce();
@@ -191,12 +190,58 @@ TEST_F(EvictionWorkerTest, TickReclaimsTombstonesAtOrBelowHorizon) {
       0.0);
 
   // Horizon reaches the delete seq: cold has absorbed it, tombstone reclaimed.
-  horizon = 5;
+  horizon_ = 5;
   worker.TickOnce();
   EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
   EXPECT_EQ(
       metrics::testing::GetCounterValue(metrics::names::kHotTombstonesReclaimedTotal).value_or(0.0),
       1.0);
+}
+
+TEST(EvictionWorkerResidencyTest, TickPublishesStubAndLoadMetrics) {
+  abyss::metrics::testing::Reset();
+  abyss::testing::TestClock clock;
+  core::EvictionPolicy policy{core::EvictionTTL{1}};
+  core::SequenceId horizon = 0;
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = kStubBytes * 100,
+      .shard_count = 1,
+      // Room for one stub.
+      .stub_memory_fraction = 0.01,
+      .drained = [&horizon](core::ShardId) { return horizon; },
+      .eviction_policy = &policy,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  const auto set = [&](std::string_view key, core::SequenceId seq) {
+    ASSERT_TRUE(store.Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}}, seq)
+                    .has_value());
+  };
+  set("a", 1);
+  set("b", 2);
+  const LoadToken token = store.BeginLoad("c").value_or(LoadToken{});
+  ASSERT_NE(token.id, 0U) << "no load token";
+  set("c", 3);
+  ASSERT_FALSE(store.CompleteLoad("c", token, LoadedState{}));
+
+  clock.Advance(2s);
+  horizon = 2;
+  EvictionWorker worker(store, EvictionWorker::Config{.tick = 50ms}, clock.SteadyFn());
+  worker.TickOnce();
+  worker.TickOnce();
+
+  const auto stats = store.Stats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->stub_entries, 1U);
+  EXPECT_GT(stats->unevictable_bytes, 0U) << "c is not drained";
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kHotStubEntries).value_or(-1.0), 1.0);
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kHotUnevictableBytes).value_or(-1.0),
+            static_cast<double>(stats->unevictable_bytes));
+  EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kHotStubDropsTotal).value_or(0.0),
+            1.0)
+      << "counted once across two ticks";
+  EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kHotLoadDiscardsTotal).value_or(0.0),
+            1.0);
 }
 
 }  // namespace

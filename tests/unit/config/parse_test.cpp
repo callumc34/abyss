@@ -16,6 +16,8 @@ hot:
   backend: builtin_hashmap
   max_memory_bytes: 4294967296
   default_eviction_seconds: 86400
+  stub_memory_fraction: 0.05
+  backpressure_ratio: 1.5
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
@@ -98,6 +100,8 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->hot.backend, "builtin_hashmap");
   EXPECT_EQ(cfg->hot.max_memory_bytes, 4294967296U);
   EXPECT_EQ(cfg->hot.default_eviction, std::chrono::seconds{86400});
+  EXPECT_DOUBLE_EQ(cfg->hot.stub_memory_fraction, 0.05);
+  EXPECT_DOUBLE_EQ(cfg->hot.backpressure_ratio, 1.5);
   ASSERT_EQ(cfg->hot.eviction_overrides.size(), 2U);
   EXPECT_EQ(cfg->hot.eviction_overrides[0].prefix, "session:");
   EXPECT_EQ(cfg->hot.eviction_overrides[0].eviction, std::chrono::seconds{3600});

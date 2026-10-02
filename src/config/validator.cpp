@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -99,6 +100,14 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
   }
   if (hot.eviction_tick.count() <= 0) {
     return std::unexpected(InvalidArg("hot.eviction_tick_ms", "must be > 0 milliseconds"));
+  }
+  if (std::isnan(hot.stub_memory_fraction) || hot.stub_memory_fraction < 0.0 ||
+      hot.stub_memory_fraction > 0.5) {
+    return std::unexpected(InvalidArg("hot.stub_memory_fraction", "must be in [0.0, 0.5]"));
+  }
+  if (std::isnan(hot.backpressure_ratio) || hot.backpressure_ratio < 1.0 ||
+      hot.backpressure_ratio > 10.0) {
+    return std::unexpected(InvalidArg("hot.backpressure_ratio", "must be in [1.0, 10.0]"));
   }
 
   std::vector<core::EvictionRule> rules;

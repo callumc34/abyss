@@ -466,6 +466,16 @@ inline constexpr GaugeDesc<> kHotAccessBufferDepth{
     .help = "Total depth of the per-shard deferred read-access refresh buffers.",
 };
 
+inline constexpr GaugeDesc<> kHotStubEntries{
+    .name = "abyss_hot_stub_entries",
+    .help = "Stubs the hot store holds for evicted keys.",
+};
+
+inline constexpr GaugeDesc<> kHotUnevictableBytes{
+    .name = "abyss_hot_unevictable_bytes",
+    .help = "Hot store bytes held because cold has not drained their latest write.",
+};
+
 inline constexpr GaugeDesc<> kColdDiskBytes{
     .name = "abyss_cold_disk_bytes",
     .help = "Cold store disk usage in bytes.",
@@ -620,6 +630,16 @@ inline constexpr CounterDesc<> kHotAccessBufferDroppedTotal{
 inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{
     .name = "abyss_hot_tombstones_reclaimed_total",
     .help = "Delete tombstones reclaimed from the hot store after the cold consumer caught up.",
+};
+
+inline constexpr CounterDesc<> kHotStubDropsTotal{
+    .name = "abyss_hot_stub_drops_total",
+    .help = "Stubs dropped, least recently written first, past the stub cap.",
+};
+
+inline constexpr CounterDesc<> kHotLoadDiscardsTotal{
+    .name = "abyss_hot_load_discards_total",
+    .help = "Key loads discarded because a write or flush superseded them.",
 };
 
 inline constexpr CounterDesc<> kPromotionsTotal{

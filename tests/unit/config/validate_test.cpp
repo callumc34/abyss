@@ -57,6 +57,32 @@ TEST(ConfigValidate, RejectsNonPositiveHotEvictionTick) {
   EXPECT_NE(cfg.error().message().find("hot.eviction_tick_ms"), std::string::npos);
 }
 
+TEST(ConfigValidate, HotStubMemoryFractionRange) {
+  for (const char* bad : {"-0.01", "0.6", ".nan"}) {
+    SCOPED_TRACE(bad);
+    auto cfg = Config::ParseFromYaml(std::string("hot:\n  stub_memory_fraction: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value());
+    EXPECT_NE(cfg.error().message().find("hot.stub_memory_fraction"), std::string::npos);
+  }
+  for (const char* good : {"0", "0.5"}) {
+    SCOPED_TRACE(good);
+    EXPECT_TRUE(Config::ParseFromYaml(std::string("hot:\n  stub_memory_fraction: ") + good + "\n"));
+  }
+}
+
+TEST(ConfigValidate, HotBackpressureRatioRange) {
+  for (const char* bad : {"0.99", "10.5", ".nan"}) {
+    SCOPED_TRACE(bad);
+    auto cfg = Config::ParseFromYaml(std::string("hot:\n  backpressure_ratio: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value());
+    EXPECT_NE(cfg.error().message().find("hot.backpressure_ratio"), std::string::npos);
+  }
+  for (const char* good : {"1", "10"}) {
+    SCOPED_TRACE(good);
+    EXPECT_TRUE(Config::ParseFromYaml(std::string("hot:\n  backpressure_ratio: ") + good + "\n"));
+  }
+}
+
 TEST(ConfigValidate, RejectsNegativeJitterRatio) {
   auto cfg = Config::ParseFromYaml("cold_consumer:\n  jitter_fraction: -0.1\n");
   ASSERT_FALSE(cfg.has_value());

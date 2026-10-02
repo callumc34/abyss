@@ -69,6 +69,7 @@ add_executable(abyss_hot_tests
   hot/single_shard_store_test.cpp
   hot/sharded_hot_store_test.cpp
   hot/eviction_worker_test.cpp
+  hot/residency_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE
