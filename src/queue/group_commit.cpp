@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/names.h"
 
 ABYSS_LOG_COMPONENT("abyss.queue.group_commit")
 
@@ -24,6 +25,9 @@ DurabilityFuture MakeReadyFuture(core::Result<void> value) {
 
 GroupCommitter::GroupCommitter(GroupCommitConfig config, FsyncFn fsync_fn)
     : config_(config), fsync_fn_(std::move(fsync_fn)) {
+  auto& reg = metrics::Registry::Instance();
+  flush_duration_ = reg.Histogram(metrics::names::kWalFlushDurationSeconds);
+  flush_batch_entries_ = reg.Histogram(metrics::names::kWalFlushBatchEntries);
   if (config_.policy == FsyncPolicy::kGroupCommit) {
     thread_ = std::thread([this] { Run(); });
   }
@@ -31,7 +35,8 @@ GroupCommitter::GroupCommitter(GroupCommitConfig config, FsyncFn fsync_fn)
 
 GroupCommitter::~GroupCommitter() { Stop(); }
 
-DurabilityFuture GroupCommitter::Submit(size_t bytes, core::SequenceId batch_last_seq) {
+DurabilityFuture GroupCommitter::Submit(size_t bytes, size_t entries,
+                                        core::SequenceId batch_last_seq) {
   switch (config_.policy) {
     case FsyncPolicy::kNone:
       // No durability barrier, but advance the watermark to the published seq
@@ -41,7 +46,9 @@ DurabilityFuture GroupCommitter::Submit(size_t bytes, core::SequenceId batch_las
       return MakeReadyFuture({});
 
     case FsyncPolicy::kPerWrite: {
+      const auto start = std::chrono::steady_clock::now();
       auto result = fsync_fn_();
+      RecordFlush(std::chrono::steady_clock::now() - start, entries);
       if (result.has_value()) {
         PublishDurable(batch_last_seq);
       }
@@ -52,7 +59,7 @@ DurabilityFuture GroupCommitter::Submit(size_t bytes, core::SequenceId batch_las
       std::promise<core::Result<void>> promise;
       auto future = promise.get_future();
       {
-        std::lock_guard lock(mu_);
+        const std::scoped_lock lock(mu_);
         if (stopped_) {
           return MakeReadyFuture(std::unexpected(
               core::Error{core::ErrorCode::kUnavailable, "group committer stopped"}));
@@ -60,6 +67,7 @@ DurabilityFuture GroupCommitter::Submit(size_t bytes, core::SequenceId batch_las
         pending_.push_back(
             {.promise = std::move(promise), .bytes = bytes, .batch_last_seq = batch_last_seq});
         pending_bytes_ += bytes;
+        pending_entries_ += entries;
         batch_high_seq_ = std::max(batch_high_seq_, batch_last_seq);
         if (pending_bytes_ >= config_.max_bytes) {
           flush_requested_ = true;
@@ -99,18 +107,28 @@ void GroupCommitter::PublishDurable(core::SequenceId seq) {
   durable_cv_.notify_all();
 }
 
+void GroupCommitter::RecordFlush(std::chrono::steady_clock::duration elapsed,
+                                 size_t entries) noexcept {
+  flush_duration_.Observe(std::chrono::duration<double>(elapsed).count());
+  // A Drain-only flush covers no entries; 0 would blur the le=1 bucket.
+  if (entries > 0) flush_batch_entries_.Observe(static_cast<double>(entries));
+}
+
 core::Result<void> GroupCommitter::Drain() {
   if (config_.policy == FsyncPolicy::kNone) {
     return {};
   }
   if (config_.policy == FsyncPolicy::kPerWrite) {
-    return fsync_fn_();
+    const auto start = std::chrono::steady_clock::now();
+    auto result = fsync_fn_();
+    RecordFlush(std::chrono::steady_clock::now() - start, 0);
+    return result;
   }
 
   std::promise<core::Result<void>> promise;
   auto future = promise.get_future();
   {
-    std::lock_guard lock(mu_);
+    const std::scoped_lock lock(mu_);
     if (stopped_) {
       return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "group committer stopped"});
     }
@@ -123,7 +141,7 @@ core::Result<void> GroupCommitter::Drain() {
 
 void GroupCommitter::Stop() {
   {
-    std::lock_guard lock(mu_);
+    const std::scoped_lock lock(mu_);
     if (stopped_) return;
     stopped_ = true;
     flush_requested_ = true;
@@ -155,6 +173,7 @@ void GroupCommitter::Run() {
 
     auto batch = std::exchange(pending_, {});
     const size_t batch_bytes = pending_bytes_;
+    const size_t batch_entries = std::exchange(pending_entries_, 0);
     const core::SequenceId flushed_high_seq = batch_high_seq_;
     pending_bytes_ = 0;
     batch_high_seq_ = 0;
@@ -165,6 +184,8 @@ void GroupCommitter::Run() {
     const auto start = std::chrono::steady_clock::now();
     core::Result<void> result = fsync_fn();
     const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Before the promises resolve, so a woken writer sees this flush.
+    RecordFlush(elapsed, batch_entries);
 
     if (!result.has_value()) {
       ABYSS_LOG_ERROR("fsync failed", {"batch", static_cast<uint64_t>(batch.size())},

@@ -35,14 +35,14 @@ TEST_F(ScrapeTest, IncludesCounterWithHelpAndType) {
 TEST_F(ScrapeTest, IncludesGaugeAndHistogram) {
   auto& reg = Registry::Instance();
   reg.Gauge(names::kHotKeys).Set(7.0);
-  reg.Histogram(names::kQueueAppendDurationSeconds).Observe(0.001);
+  reg.Histogram(names::kWalFlushDurationSeconds).Observe(0.001);
 
   const std::string out = reg.Scrape();
   EXPECT_TRUE(out.contains("# TYPE abyss_hot_keys gauge"));
-  EXPECT_TRUE(out.contains("# TYPE abyss_queue_append_duration_seconds histogram"));
-  EXPECT_TRUE(out.contains("abyss_queue_append_duration_seconds_count"));
-  EXPECT_TRUE(out.contains("abyss_queue_append_duration_seconds_sum"));
-  EXPECT_TRUE(out.contains("abyss_queue_append_duration_seconds_bucket{"));
+  EXPECT_TRUE(out.contains("# TYPE abyss_wal_flush_duration_seconds histogram"));
+  EXPECT_TRUE(out.contains("abyss_wal_flush_duration_seconds_count"));
+  EXPECT_TRUE(out.contains("abyss_wal_flush_duration_seconds_sum"));
+  EXPECT_TRUE(out.contains("abyss_wal_flush_duration_seconds_bucket{"));
 }
 
 }  // namespace

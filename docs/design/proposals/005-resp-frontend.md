@@ -4,6 +4,8 @@
 **Created:** 2026-04-09
 **Updated:** 2026-05-31
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Dispatch becomes asynchronous: reactors never wait on durability or cold reads, each command is sequenced before the next on its connection, and replies keep command order (Phase 3). Conditional writes become ordinary sequenced writes that log their decided effects (Phase 2). §TCP server implementation's head-of-line trade-off and §Write Acknowledgement describe current behaviour until then.
+
 > **§CLUSTER Commands refined by [ADP-014](014-slot-routing-and-topology.md).** `CLUSTER KEYSLOT` still returns the `CRC16` wire slot unchanged. `CLUSTER SLOTS`/`SHARDS` now advertise slot ranges grouped by their owning shard (resolved through slot-to-shard mapping) rather than a single full-range stub; in single-pod the ranges still cover the whole slot space, partitioned disjointly by shard. The `MOVED` path (gated behind multi-pod) computes its target from slot ownership, so a redirect always names the pod whose shard owns the key. Invariant 8's "only the slot-to-pod mapping differs between phases" is upgraded: that mapping is now explicit, slot-derived, and tested, not coincidental.
 
 ## Context

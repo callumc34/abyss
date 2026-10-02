@@ -4,6 +4,8 @@
 **Created:** 2026-04-09
 **Updated:** 2026-04-18
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Read takes an explicit consumer-owned position, and acknowledgements become committed offsets that are persisted lazily in one dual-slot checkpoint. Volatile consumers go away (Phase 1a). Group commit becomes natural batching with named durability classes, `process_crash` by default and `power_loss` opt-in, on preallocated mapped segments in one physical log per volume (Phase 1b). The entry taxonomy loses `Conditional` and `Resolved` (Phase 2). The sections below describe current behaviour until each phase lands.
+
 ## Context
 
 The queue is the single source of truth in Abyss. Every write is committed to the queue before it is applied to any store. All consumers (hot, cold, resolver) read from the queue independently and rebuild their state from it on recovery. The queue's durability and ordering guarantees are the foundation of Abyss's correctness.

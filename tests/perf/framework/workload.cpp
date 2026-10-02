@@ -17,6 +17,9 @@ using core::ErrorCode;
 using core::Result;
 
 constexpr double kMixWeightSumEpsilon = 1e-6;
+// Bytes one connection may have in flight. The driver writes blocking,
+// so a window near the server's read backpressure pause could stall it.
+constexpr uint64_t kMaxPipelineWindowBytes = uint64_t{1} << 20;
 
 [[nodiscard]] Error Invalid(std::string message) {
   return {ErrorCode::kInvalidArgument, std::move(message)};
@@ -175,6 +178,18 @@ Result<WorkloadConfig> ParseWorkloadYaml(const std::string& yaml) {
     return std::unexpected(Invalid("connections_per_worker must be >= 1"));
   }
 
+  if (root["pipeline_depth"]) cfg.pipeline_depth = root["pipeline_depth"].as<int>();
+  if (cfg.pipeline_depth < 1) return std::unexpected(Invalid("pipeline_depth must be >= 1"));
+
+  if (root["arrival"]) {
+    const auto arrival = root["arrival"].as<std::string>();
+    if (arrival == "burst") {
+      cfg.arrival = Arrival::kBurst;
+    } else if (arrival != "steady") {
+      return std::unexpected(Invalid("arrival must be steady or burst, got " + arrival));
+    }
+  }
+
   if (root["target_rate_ops"]) {
     cfg.target_rate_ops = root["target_rate_ops"].as<uint64_t>();
   }
@@ -192,6 +207,15 @@ Result<WorkloadConfig> ParseWorkloadYaml(const std::string& yaml) {
   }
   if (cfg.value_size_bytes == 0) {
     return std::unexpected(Invalid("value_size_bytes must be > 0"));
+  }
+  if (static_cast<uint64_t>(cfg.pipeline_depth) * cfg.value_size_bytes > kMaxPipelineWindowBytes) {
+    return std::unexpected(Invalid(
+        "pipeline_depth x value_size_bytes must be <= " + std::to_string(kMaxPipelineWindowBytes) +
+        ": the load generator writes each window blocking, so a window approaching the "
+        "server's read backpressure pause can stall the connection"));
+  }
+  if (cfg.arrival == Arrival::kBurst && cfg.target_rate_ops == 0) {
+    return std::unexpected(Invalid("arrival: burst needs target_rate_ops > 0 (open loop)"));
   }
 
   auto mix = ParseMix(root["mix"]);

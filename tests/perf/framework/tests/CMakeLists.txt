@@ -6,6 +6,9 @@ add_executable(abyss_perf_framework_tests
   reporter_test.cpp
   metrics_scraper_test.cpp
   run_loop_test.cpp
+  pipelined_run_loop_test.cpp
+  server_identity_test.cpp
+  sweep_test.cpp
 )
 
 target_link_libraries(abyss_perf_framework_tests PRIVATE

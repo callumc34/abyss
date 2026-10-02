@@ -9,7 +9,7 @@ Three substrates that share infrastructure but answer different questions:
 | Substrate | Question | Runs |
 |---|---|---|
 | `tests/perf/micro/` | What is the lower-bound cost of one operation in isolation? | Google Benchmark targets via `abyss_bench`. |
-| `tests/perf/probe/` | What does the engine deliver to the layer above it? | In-process binaries (`abyss_hot_probe`, `abyss_buffer_probe`, `abyss_cold_probe`) that construct real components and exercise them directly. |
+| `tests/perf/probe/` | What does the engine deliver to the layer above it? | In-process binaries (`abyss_hot_probe`, `abyss_buffer_probe`, `abyss_cold_probe`, `abyss_write_probe`) that construct real components and exercise them directly. |
 | `tests/perf/load/` | What does a real client see? | `abyss_loadgen` — multi-threaded TCP driver against the full `abyss-server` binary using hiredis. |
 
 A shared library — `abyss::perf_framework` under `tests/perf/framework/` — wraps HdrHistogram, parses workload YAML, schedules requests under the wrk2 coordinated-omission discipline, scrapes `/metrics`, and emits the versioned JSON report + `.hgrm` histogram logs.
@@ -22,7 +22,7 @@ Performance binaries are gated by `ABYSS_BUILD_PERF`. The `default` and `bench` 
 cmake --preset default          # debug build, framework tests run in default ctest
 cmake --preset bench            # release build, perf binaries optimised
 
-cmake --build build/bench --target abyss_hot_probe abyss_buffer_probe abyss_cold_probe abyss_loadgen
+cmake --build build/bench --target abyss_hot_probe abyss_buffer_probe abyss_cold_probe abyss_write_probe abyss_loadgen
 ```
 
 For meaningful numbers use the `bench` preset (Release, `-O2`, no sanitizers). Debug builds are useful only for verifying the harness itself works, not for measuring system performance.
@@ -54,7 +54,7 @@ build/bench/tests/perf/probe/abyss_hot_probe \
     --duration 30 --warmup 5 --workers 4 \
     --key-count 100000 --value-size-bytes 64 \
     --distribution zipfian --zipf-theta 0.99 \
-    --mix "hot_get=0.95,hot_set=0.05" \
+    --mix "hot_get=0.95,hot_apply=0.05" \
     --output /tmp/hot.json --hgrm-dir /tmp/hot-hgrm
 ```
 
@@ -78,9 +78,58 @@ Common flags across all probes:
 
 ### Probe-specific operation names
 
-- `abyss_hot_probe` — `hot_get`, `hot_set`. Default targets: GET p99 < 100µs, SET p99 < 50µs.
+- `abyss_hot_probe` — `hot_get`, `hot_apply`. Default targets: `hot_get` p99 ≤ 100µs (R1), `hot_apply` p99 ≤ 5µs (H1). Unknown operation names in `--mix` are rejected.
 - `abyss_buffer_probe` — `buffer_read`. Default target: p99 < 50µs.
 - `abyss_cold_probe` — `cold_get`, optionally `cold_set`. Default target: GET p99 < 5ms. Also accepts `--data-path` to reuse a pre-populated RocksDB directory; otherwise creates a temporary one.
+- `abyss_write_probe` — `write_ack`, plus the calibration operation `device_flush`. See below.
+
+### The write probe
+
+`abyss_write_probe` drives the real in-process write path: the engine's write dispatch, the WAL, and all three consumer pools, built exactly as the server builds them, minus RESP and TCP. Each `write_ack` is a `SET` parsed and canonicalised the way the RESP pipeline does it. Its latency runs until the write is acknowledged.
+
+Before measuring, the probe calibrates the device. It runs `--flush-samples` iterations of a 4 KiB write followed by the WAL's own durable flush primitive on a scratch file in the WAL directory, timing the flush only. The result is reported as the `device_flush` operation, and the write target is derived from it:
+
+| Fsync policy | Target evaluated on `write_ack` |
+|---|---|
+| `none` | p99 ≤ 20µs (W1, write-path overhead without a device flush) |
+| `group_commit`, `per_write` | p99 ≤ 2 × measured `device_flush` p99 + 50µs (W2) |
+
+Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-path` and `--cold-path` must be empty or absent, because the probe does not run recovery; a temporary directory is used when either is omitted.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--wal-path` | temporary | WAL directory on the volume under test |
+| `--cold-path` | temporary | Cold store directory |
+| `--fsync-policy` | `group_commit` | `group_commit`, `per_write` or `none` |
+| `--group-commit-interval-us` | server default | Group-commit window |
+| `--shards` | 64 | Shard count |
+| `--segment-size-bytes` | server default | WAL segment size; must hold one maximum-size value |
+| `--flush-samples` | 1000 | Device flush calibration samples |
+| `--flush-concurrency` | `--shards` | Files flushed in parallel for the `device_flush_concurrent` calibration |
+| `--prefill-entries` | 0 | Entries appended before measuring, so the run starts deep in a segment |
+| `--quiet-threshold-s` | server default | Cold consumer quiet window |
+| `--workers` | min(hardware threads, 16) | Concurrent writers. Each one blocks in the engine's write dispatch, as a reactor thread does, so this models reactors, not connections. |
+
+**Calibration.** The concurrent calibration flushes `--flush-concurrency` files in parallel and is reported as `device_flush_concurrent`. Comparing it with `device_flush` separates the device's own floor from contention that parallel flushes create. W2 is always derived from the single-file `device_flush` p99.
+
+**Prefill.** Prefill appends canonical `SET` entries directly to the queue in batches, routed to their owning shards, then waits for every consumer to drain them before measuring. Through the real write path on a slow device, prefill would take hours.
+
+**Evaluating targets.**
+- W1 and W2 are defined at ≤ 50% of saturation, so they are evaluated only on open-loop runs (`--target-rate-ops` > 0).
+- A closed-loop run reports its targets as not evaluated and never claims a pass.
+- `--gate` without a rate is a usage error.
+
+**Run length.** The cold consumer starts flushing, checkpointing and acknowledging only after its quiet window (30 s by default). An authoritative run therefore lasts at least 60 s after warmup, or records a shorter `--quiet-threshold-s`. Prefill at least one deep-position run, because queue read cost depends on how far into a segment the consumers are reading.
+
+**Report contents.**
+- `config` records the effective settings: fsync policy, group-commit interval, shard count, segment size, quiet window, value size, workers and prefill.
+- `server_metrics` holds registry snapshots at `start` and `end`, so WAL flush and offset persist counts, durations and batch sizes for the run are in the same JSON.
+- The server's metrics snapshotter is not started; it takes shard locks once a second and is otherwise absent from this measurement.
+
+**Exit codes.**
+- 2: a usage error, a non-empty directory, or `--gate` without a rate.
+- 3: a failed gate.
+- 4: any operation errored. The report is still written, and errors are never recorded as latency.
 
 ## Running the load generator
 
@@ -126,7 +175,15 @@ build/bench/tests/perf/load/abyss_loadgen \
     --output /tmp/local-report.json
 ```
 
-The bundled workloads (`hot_read_heavy.yaml`, `write_throughput.yaml`, `mixed_50_50.yaml`, `cold_read_aged.yaml`) are reference shapes for authoritative runs. Treat them as templates: scale `workers × connections_per_worker`, `target_rate_ops`, and `duration` down before running on a developer machine.
+The bundled workloads are reference shapes for authoritative runs:
+- `hot_read_heavy.yaml`
+- `write_throughput.yaml`: W3, with 256 requests in flight (8 workers × 8 connections × pipeline depth 4)
+- `write_loopback_pipelined.yaml`: W1-L, SET-only, 64 connections, pipeline depth 16
+- `mixed_read_under_writes.yaml`: R1-L, 90/10 GET/SET, 64 connections, open loop
+- `mixed_50_50.yaml`
+- `cold_read_aged.yaml`
+
+Write targets are not written into workloads, because they depend on the durability class and are relative to the device or to a comparison server in the same run. Treat them as templates: scale `workers × connections_per_worker`, `target_rate_ops`, and `duration` down before running on a developer machine.
 
 ### Loadgen flags
 
@@ -134,14 +191,49 @@ The bundled workloads (`hot_read_heavy.yaml`, `write_throughput.yaml`, `mixed_50
 |---|---|---|
 | `--workload` | yes | Path to a workload YAML file. |
 | `--server` | no | `host:port` of the abyss-server RESP listener (default `127.0.0.1:6379`). |
-| `--metrics-url` | no | Base URL for `/metrics` scraping. Pass empty to disable. Three snapshots are recorded — start, mid, end. |
+| `--metrics-url` | no | Base URL for `/metrics` scraping. Pass empty to disable. Snapshots are recorded at start, mid and end; a failed scrape records none for that phase. |
 | `--output` | no | JSON report path (defaults to stdout). |
 | `--hgrm-dir` | no | Directory for per-operation `.hgrm` files. |
 | `--gate` | no | Exit code 3 if any target fails. |
 | `--skip-preload` | no | Skip the workload's preload phase (useful when re-running against a server that already has the keyspace populated). |
 | `--run-id` | no | Override the auto-generated run id. |
+| `--sweep` | no | Find the highest sustained open-loop rate (W3); see below. |
+| `--sweep-p99-bound-us` | with `--sweep` | Latency bound each sweep step must meet, normally the W2 bound from a write-probe calibration on the same volume. |
+| `--sweep-step-seconds` | no | Override the workload's duration for each sweep step. |
 
-Loadgen v1 supports `GET` and `SET` operations. Other RESP commands (`HGET`, `HSET`, `SADD`, …) are recognised in the mix but produce errors that count against the run; expanding command coverage is tracked separately.
+**Server identity.** The load generator identifies the server it measured. It reads `HELLO` and, where needed, `INFO server`, so Abyss, Valkey, Redis and Dragonfly are told apart. It records the result as `server: {kind, version}`, and the server's durability settings as `config` (best effort via `CONFIG GET`). The same binary can therefore produce the comparative baselines in ADP-013 §Comparative baselines. Pass `--metrics-url ""` for servers without a `/metrics` endpoint. A failed scrape is reported on stderr and records no snapshot.
+
+**Pipelining and arrivals.**
+- Each connection keeps up to the workload's `pipeline_depth` requests in flight (default 1).
+- With `arrival: steady`, open-loop requests are scheduled individually.
+- With `arrival: burst`, each slot sends `pipeline_depth` requests together, the way a pipelining client behaves. `target_rate_ops` stays in requests per second, so bursts are spaced `pipeline_depth / rate` apart.
+- Every request is measured from its slot's intended send time, so waiting for a full window or a slow earlier reply is charged to it.
+
+**Errors.** Error replies are counted per operation and never recorded as latency. Any error makes the load generator exit 4, after writing the report.
+
+**Sweeping W3.**
+- `--sweep` starts at the workload's rate and doubles it until a step fails, then bisects until the bracket is within 5%.
+- A step passes when it has no errors, its p99 is within `--sweep-p99-bound-us`, and the achieved rate is at least 95% of offered.
+- The highest passing rate is reported as `sweep_result_ops`, with every step in `sweep[]`.
+- If the starting rate already fails, the sweep halves the rate until a step passes, down to a floor of max(start / 1024, one request/s per connection).
+- Only if the floor also fails is there no result, and the run exits 3.
+- Steps are not independent. WAL length, hot-set size and compaction-buffer state carry over from one step to the next, and each step records the server's queue position (`queue_entries`, `queue_bytes` from `/metrics`, up to 1 s stale). For a baseline taken before the queue-read fix (#158), use a fresh server per step or a fixed prefill, because read cost there grows with queue position.
+
+**Driver lag and load.** Open-loop runs record a send-lag histogram (actual send minus intended send).
+- If send-lag p99 exceeds 50 µs, or 10% of any per-op target, the run is flagged `lagging` and a warning is printed. Treat its latencies as including driver delay.
+- Driver CPU is the sum of the worker or connection threads' CPU time over the measured window. In the write probe those threads also execute the engine work inline, as reactor threads do.
+- If driver CPU per wall-second exceeds max(1 core, 10% of hardware threads), the run is flagged `overloaded`. The driver is then competing with the server for cores: pin it to separate cores or run it on another host. The driver's CPU affinity is recorded on Linux.
+
+**Waiting for a scheduled send.** Open-loop waits sleep, then spin briefly before each scheduled send.
+- On Linux the sleep is an absolute monotonic `clock_nanosleep` with 1 ns timer slack, and the spin is at most 20 µs.
+- On macOS, timer coalescing stretches a long sleep by up to about a quarter of its length (capped at 5 ms). The sleep there is taken in steps that each cover half the remaining time, and the spin is at most 200 µs.
+- On every platform the spin is at most 1/20 of a thread's slot interval, and is capped so that all driver threads together spin less than half a core.
+- Each thread's schedule is offset by its share of a slot, so threads interleave rather than firing in synchronised bursts.
+- A pipelining transport must poll without blocking when asked to wait for a deadline that has already passed.
+
+Offered rates are split across connections exactly: the remainder goes one request/s at a time to the first connections, and a connection whose share is zero stays idle. The load generator does not wait for server readiness: start it against a server whose `/ready` already returns 200.
+
+Loadgen supports `GET` and `SET` operations, and rejects a workload whose mix names anything else; expanding command coverage is tracked separately.
 
 ## Workload YAML
 
@@ -154,6 +246,9 @@ duration_seconds: 60          # required, > 0
 warmup_seconds: 10            # optional, default 0
 workers: 4                    # required, >= 1
 connections_per_worker: 4     # loadgen only; probes ignore
+pipeline_depth: 1             # loadgen only; requests in flight per connection
+arrival: steady               # steady | burst; burst requires target_rate_ops > 0
+                              # pipeline_depth × value_size_bytes ≤ 1 MiB
 target_rate_ops: 0            # 0 = closed-loop
 key_count: 100000             # required, > 0
 key_distribution:
@@ -175,8 +270,6 @@ targets:
       p50_us: 50
       p99_us: 100
       p999_us: 250
-    SET:
-      p99_us: 50
 ```
 
 Op names in `mix` and `targets.per_op` must match. For the load generator they are RESP command names (`GET`, `SET`, …); for probes they are component-API names (`hot_get`, `buffer_read`, `cold_get`, …).
@@ -196,12 +289,26 @@ Single file, machine-consumable, schema-versioned (`schema_version: 1`). Contain
 - `run_id`, `started_at`, `duration_seconds`
 - `classification` — `indicative` or `authoritative` (see below)
 - `build` — commit, preset, compiler, build_type, sanitizer
+- `server` — `{kind, version}` of the server measured (load generator only)
 - `host` — os, kernel, cpu_model, hostname
-- `workload` — the parsed workload config inlined
-- `operations.<name>` — `count`, `throughput_ops`, `latency_us.{p50,p99,p999,max}`, `noise_floor_cv`, `saturated`, `histogram_b64` (base64-encoded HdrHistogram log)
+- `workload` — the parsed workload config inlined, including `pipeline_depth` and `arrival`
+- `operations.<name>` — `count`, `errors`, `throughput_ops`, `latency_us.{p50,p99,p999,max}`, `noise_floor_cv`, `saturated`, `histogram_b64` (base64-encoded HdrHistogram log)
+- `config` — effective probe settings, or the measured server's reported durability settings
+- `driver` — `open_loop`, `send_lag_us{count,p50,p99,max}`, `lagging`, `cpu_seconds`, `cpu_per_wall_second`, `overload_threshold_cores`, `overloaded`, `cpu_affinity{available,count,cpus}`
+- `sweep[]`, `sweep_result_ops` — W3 sweep steps `{offered_ops, effective_offered_ops, achieved_ops, p99_us, errors, pass, queue_entries, queue_bytes}` and the highest passing rate (load generator `--sweep` only)
 - `server_metrics` — start / mid / end snapshots from the abyss-server `/metrics` endpoint (loadgen only)
-- `targets[]` — per-target `{metric, target, actual, pass}` evaluations
-- `pass` — top-level boolean: true iff every target passed
+- `targets[]` — per-target `{metric, target, actual, pass, evaluated}`; `targets_evaluated` and `targets_note` say when targets were not evaluated (closed-loop write probe)
+- `pass` — top-level boolean: true iff every evaluated target passed
+
+A one-line summary of the measured server or the in-process setup, its durability setting, and per-operation counts, errors and percentiles is also printed to stderr.
+
+**Comparing across versions.** Compare runs only within the same durability class: the current `fsync_none` against `process_crash`, and `group_commit` against `power_loss`. A default-against-default comparison across the change in acknowledgement point is meaningless.
+
+`abyss_queue_offset_persist_duration_seconds` changes meaning across versions:
+- before lazy offset persistence, one observation is one per-acknowledgement file rewrite;
+- after it, one observation is one checkpoint persist.
+
+Compare persists per second (the `_count` rate), not durations.
 
 `noise_floor_cv` is the coefficient of variation (`stddev / mean`) of the operation's latency distribution. Use it to judge how much weight to give the percentile numbers — a CV above ~0.3 means the run was noisy and the percentiles are less trustworthy.
 
@@ -235,12 +342,19 @@ The targets in `requirements.md` are assigned to substrates by ADP-013:
 
 | Target | Authoritative substrate | Cross-check |
 |---|---|---|
-| Hot read p99 < 100µs | hot probe (`hot_get`) | loadgen (`GET` after hot preload) |
-| Hot write+ACK p99 < 50µs | hot probe (`hot_set`) | loadgen (`SET`) |
-| Buffer read p99 < 50µs | buffer probe (`buffer_read`) | — |
-| Cold read p99 < 5ms | cold probe (`cold_get`) | loadgen (`GET` after aging out hot) |
-| Write throughput > 100 000 ops/s | loadgen (`write_throughput.yaml`) | — |
-| Recovery < 60s for 24h / 1M | micro (`recovery_bench`) | — |
+| H1 hot apply ≤ 5µs | hot probe (`hot_apply`) | micro (`hot_store_bench`) |
+| R1 hot read ≤ 100µs | hot probe (`hot_get`) | loadgen (`GET` after hot preload) |
+| R1-L read under writes | loadgen (`mixed_read_under_writes.yaml`, vs Valkey in the same run) | memtier |
+| W1 write overhead ≤ 20µs | write probe (`write_ack`, `--fsync-policy none`) | — |
+| W1-L write over loopback | loadgen (`write_loopback_pipelined.yaml`, vs Valkey in the same run) | memtier |
+| W2 durable write | write probe (`write_ack` vs calibrated `device_flush`) | loadgen |
+| W3 durable write throughput > 100 000 ops/s | loadgen (`write_throughput.yaml`) | — |
+| X1 comparative | loadgen against each server (ADP-013 matrix) | memtier |
+| B1 buffer read < 50µs | buffer probe (`buffer_read`) | — |
+| C1 cold read < 5ms | cold probe (`cold_get`) | loadgen (`GET` after aging out hot) |
+| RC1 recovery < 60s for 24h / 1M | micro (`recovery_bench`) | — |
+
+The definitions behind each ID are in [requirements.md](../design/requirements.md) §Performance Targets.
 
 When the probe and loadgen numbers disagree for the same target, the gap is the cost of the RESP+TCP path plus client-side scheduling — both real and worth knowing.
 

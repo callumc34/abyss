@@ -56,16 +56,6 @@ void Histogram::Record(int64_t value_ns) {
   hdr_record_value(hdr_, value_ns);
 }
 
-void Histogram::RecordCorrected(int64_t value_ns, int64_t expected_interval_ns) {
-  if (value_ns > highest_ns_) {
-    saturated_ = true;
-    value_ns = highest_ns_;
-  } else if (value_ns < 0) {
-    value_ns = 0;
-  }
-  hdr_record_corrected_value(hdr_, value_ns, expected_interval_ns);
-}
-
 int64_t Histogram::PercentileNs(double percentile) const {
   return hdr_value_at_percentile(hdr_, percentile);
 }

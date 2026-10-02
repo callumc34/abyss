@@ -354,7 +354,7 @@ core::Result<PendingAppend> ShardState::BeginAppend(core::QueueEntry entry) {
   next_seq_ = entry.seq + 1;
 
   const core::SequenceId seq = entry.seq;
-  DurabilityFuture future = committer_->Submit(*written, seq);
+  DurabilityFuture future = committer_->Submit(*written, 1, seq);
 
   auto publisher =
       std::make_unique<ShardStatePublisher>(read_cv_, std::move(lock), config_.on_rotate, rotated);
@@ -419,7 +419,7 @@ core::Result<PendingBatchAppend> ShardState::BeginAppendBatch(
     next_seq_ = owned[i].seq + 1;
   }
 
-  DurabilityFuture future = committer_->Submit(written_bytes, last_seq);
+  DurabilityFuture future = committer_->Submit(written_bytes, owned.size(), last_seq);
 
   auto publisher =
       std::make_unique<ShardStatePublisher>(read_cv_, std::move(lock), config_.on_rotate, rotated);

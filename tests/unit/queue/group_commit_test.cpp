@@ -5,10 +5,13 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <thread>
 #include <vector>
 
 #include "abyss/core/result.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 #include "abyss/queue/fsync_policy.h"
 
 namespace abyss::queue {
@@ -27,7 +30,7 @@ TEST(GroupCommitterTest, NonePolicyNeverFsyncs) {
   std::atomic<int> fsync_count{0};
   GroupCommitter committer({.policy = FsyncPolicy::kNone}, MakeCounter(fsync_count));
 
-  auto future = committer.Submit(100, 1);
+  auto future = committer.Submit(100, 1, 1);
   EXPECT_EQ(future.wait_for(0ms), std::future_status::ready);
   EXPECT_TRUE(future.get().has_value());
   EXPECT_EQ(fsync_count.load(), 0);
@@ -38,7 +41,7 @@ TEST(GroupCommitterTest, PerWritePolicyFsyncsEveryCall) {
   GroupCommitter committer({.policy = FsyncPolicy::kPerWrite}, MakeCounter(fsync_count));
 
   for (int i = 0; i < 5; ++i) {
-    auto future = committer.Submit(100, 1);
+    auto future = committer.Submit(100, 1, 1);
     EXPECT_TRUE(future.get().has_value());
   }
 
@@ -56,7 +59,7 @@ TEST(GroupCommitterTest, GroupCommitCoalescesConcurrentSubmits) {
   futures.reserve(kWriters);
 
   for (int i = 0; i < kWriters; ++i) {
-    futures.push_back(committer.Submit(100, 1));
+    futures.push_back(committer.Submit(100, 1, 1));
   }
 
   for (auto& f : futures) {
@@ -80,8 +83,8 @@ TEST(GroupCommitterTest, GroupCommitTripsOnByteThreshold) {
       MakeCounter(fsync_count));
 
   auto start = std::chrono::steady_clock::now();
-  auto f1 = committer.Submit(512, 1);
-  auto f2 = committer.Submit(512, 1);
+  auto f1 = committer.Submit(512, 1, 1);
+  auto f2 = committer.Submit(512, 1, 1);
 
   EXPECT_TRUE(f1.get().has_value());
   EXPECT_TRUE(f2.get().has_value());
@@ -97,7 +100,7 @@ TEST(GroupCommitterTest, GroupCommitFlushesAfterInterval) {
       {.policy = FsyncPolicy::kGroupCommit, .interval = 30ms, .max_bytes = 1 << 30},
       MakeCounter(fsync_count));
 
-  auto future = committer.Submit(100, 1);
+  auto future = committer.Submit(100, 1, 1);
   auto start = std::chrono::steady_clock::now();
   EXPECT_TRUE(future.get().has_value());
   auto elapsed = std::chrono::steady_clock::now() - start;
@@ -112,7 +115,7 @@ TEST(GroupCommitterTest, DrainFlushesPending) {
       {.policy = FsyncPolicy::kGroupCommit, .interval = 10s, .max_bytes = 1 << 30},
       MakeCounter(fsync_count));
 
-  auto f = committer.Submit(100, 1);
+  auto f = committer.Submit(100, 1, 1);
   auto drain = committer.Drain();
 
   EXPECT_TRUE(drain.has_value());
@@ -132,7 +135,7 @@ TEST(GroupCommitterTest, StopResolvesPending) {
       {.policy = FsyncPolicy::kGroupCommit, .interval = 10s, .max_bytes = 1 << 30},
       MakeCounter(fsync_count));
 
-  auto f = committer.Submit(100, 1);
+  auto f = committer.Submit(100, 1, 1);
   committer.Stop();
 
   EXPECT_TRUE(f.get().has_value());
@@ -143,7 +146,7 @@ TEST(GroupCommitterTest, SubmitAfterStopResolvesWithUnavailable) {
   GroupCommitter committer({.policy = FsyncPolicy::kGroupCommit}, MakeCounter(fsync_count));
   committer.Stop();
 
-  auto f = committer.Submit(100, 1);
+  auto f = committer.Submit(100, 1, 1);
   auto result = f.get();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
@@ -154,8 +157,8 @@ TEST(GroupCommitterTest, FsyncFailurePropagates) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "simulated failure"});
   });
 
-  auto f1 = committer.Submit(100, 1);
-  auto f2 = committer.Submit(100, 1);
+  auto f1 = committer.Submit(100, 1, 1);
+  auto f2 = committer.Submit(100, 1, 1);
 
   auto r1 = f1.get();
   auto r2 = f2.get();
@@ -170,7 +173,7 @@ TEST(GroupCommitterTest, PerWriteFsyncFailurePropagates) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "boom"});
   });
 
-  auto f = committer.Submit(100, 1);
+  auto f = committer.Submit(100, 1, 1);
   auto result = f.get();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
@@ -190,7 +193,7 @@ TEST(GroupCommitterTest, HighConcurrencyCoalescesIntoMuchFewerFsyncs) {
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&committer] {
       for (int i = 0; i < kOpsPerThread; ++i) {
-        auto f = committer.Submit(64, 1);
+        auto f = committer.Submit(64, 1, 1);
         EXPECT_TRUE(f.get().has_value());
       }
     });
@@ -224,7 +227,7 @@ TEST(GroupCommitterTest, DurableSeqAdvancesOnlyAfterFsync) {
       });
 
   EXPECT_EQ(committer.DurableSeq(), 0U);
-  auto f = committer.Submit(100, 42);
+  auto f = committer.Submit(100, 1, 42);
   // The fsync is blocked, so the watermark must stay at 0.
   EXPECT_FALSE(committer.AwaitDurable(42, 20ms));
   EXPECT_EQ(committer.DurableSeq(), 0U);
@@ -242,14 +245,14 @@ TEST(GroupCommitterTest, DurableSeqMonotonicToHighestBatchSeq) {
       {.policy = FsyncPolicy::kGroupCommit, .interval = 5ms, .max_bytes = 1 << 30},
       MakeCounter(fsync_count));
 
-  auto f1 = committer.Submit(100, 10);
-  auto f2 = committer.Submit(100, 25);
+  auto f1 = committer.Submit(100, 1, 10);
+  auto f2 = committer.Submit(100, 1, 25);
   ASSERT_TRUE(f1.get().has_value());
   ASSERT_TRUE(f2.get().has_value());
   EXPECT_EQ(committer.DurableSeq(), 25U);
 
   // A later, smaller seq must never regress the watermark.
-  auto f3 = committer.Submit(100, 5);
+  auto f3 = committer.Submit(100, 1, 5);
   ASSERT_TRUE(f3.get().has_value());
   EXPECT_GE(committer.DurableSeq(), 25U);
 }
@@ -260,7 +263,7 @@ TEST(GroupCommitterTest, NonePolicyTracksPublishedSeq) {
   std::atomic<int> fsync_count{0};
   GroupCommitter committer({.policy = FsyncPolicy::kNone}, MakeCounter(fsync_count));
 
-  auto f = committer.Submit(100, 7);
+  auto f = committer.Submit(100, 1, 7);
   EXPECT_TRUE(f.get().has_value());
   EXPECT_EQ(committer.DurableSeq(), 7U);
   EXPECT_TRUE(committer.AwaitDurable(7, 0ms));
@@ -272,7 +275,7 @@ TEST(GroupCommitterTest, PerWritePolicyAdvancesDurableSeqSynchronously) {
   std::atomic<int> fsync_count{0};
   GroupCommitter committer({.policy = FsyncPolicy::kPerWrite}, MakeCounter(fsync_count));
 
-  auto f = committer.Submit(100, 3);
+  auto f = committer.Submit(100, 1, 3);
   EXPECT_TRUE(f.get().has_value());
   EXPECT_EQ(committer.DurableSeq(), 3U);
 }
@@ -284,10 +287,112 @@ TEST(GroupCommitterTest, FailedFsyncDoesNotAdvanceDurableSeq) {
     return std::unexpected(core::Error{core::ErrorCode::kInternal, "boom"});
   });
 
-  auto f = committer.Submit(100, 9);
+  auto f = committer.Submit(100, 1, 9);
   ASSERT_FALSE(f.get().has_value());
   EXPECT_EQ(committer.DurableSeq(), 0U);
   EXPECT_FALSE(committer.AwaitDurable(9, 10ms));
+}
+
+class GroupCommitterMetricsTest : public ::testing::Test {
+ protected:
+  void SetUp() override { metrics::testing::Reset(); }
+  void TearDown() override { metrics::testing::Reset(); }
+
+  static std::optional<uint64_t> FlushCount() {
+    return metrics::testing::GetHistogramCount(metrics::names::kWalFlushDurationSeconds);
+  }
+  static std::optional<uint64_t> BatchCount() {
+    return metrics::testing::GetHistogramCount(metrics::names::kWalFlushBatchEntries);
+  }
+  static std::optional<double> BatchSum() {
+    return metrics::testing::GetHistogramSum(metrics::names::kWalFlushBatchEntries);
+  }
+};
+
+// The interval never elapses, so each Drain closes exactly one batch.
+TEST_F(GroupCommitterMetricsTest, GroupCommitRecordsOneSamplePerFlush) {
+  std::atomic<int> fsync_count{0};
+  GroupCommitter committer(
+      {.policy = FsyncPolicy::kGroupCommit, .interval = 10s, .max_bytes = 1 << 30},
+      MakeCounter(fsync_count));
+
+  std::vector<DurabilityFuture> futures;
+  futures.reserve(5);
+  for (core::SequenceId seq = 0; seq < 3; ++seq) futures.push_back(committer.Submit(100, 1, seq));
+  ASSERT_TRUE(committer.Drain().has_value());
+  for (core::SequenceId seq = 3; seq < 5; ++seq) futures.push_back(committer.Submit(100, 1, seq));
+  ASSERT_TRUE(committer.Drain().has_value());
+  ASSERT_TRUE(committer.Drain().has_value());
+  for (auto& f : futures) ASSERT_TRUE(f.get().has_value());
+
+  EXPECT_EQ(fsync_count.load(), 3);
+  EXPECT_EQ(FlushCount(), 3U);
+  // The third flush covered only the Drain sentinel.
+  EXPECT_EQ(BatchCount(), 2U);
+  EXPECT_EQ(BatchSum(), 5.0);
+}
+
+TEST_F(GroupCommitterMetricsTest, PerWriteRecordsEveryFsync) {
+  std::atomic<int> fsync_count{0};
+  GroupCommitter committer({.policy = FsyncPolicy::kPerWrite}, MakeCounter(fsync_count));
+
+  for (core::SequenceId seq = 0; seq < 4; ++seq) {
+    ASSERT_TRUE(committer.Submit(100, 1, seq).get().has_value());
+  }
+  ASSERT_TRUE(committer.Drain().has_value());
+
+  EXPECT_EQ(fsync_count.load(), 5);
+  EXPECT_EQ(FlushCount(), 5U);
+  EXPECT_EQ(BatchCount(), 4U);
+  EXPECT_EQ(BatchSum(), 4.0);
+}
+
+TEST_F(GroupCommitterMetricsTest, NonePolicyRecordsNothing) {
+  std::atomic<int> fsync_count{0};
+  GroupCommitter committer({.policy = FsyncPolicy::kNone}, MakeCounter(fsync_count));
+
+  for (core::SequenceId seq = 0; seq < 3; ++seq) {
+    ASSERT_TRUE(committer.Submit(100, 1, seq).get().has_value());
+  }
+  ASSERT_TRUE(committer.Drain().has_value());
+
+  EXPECT_EQ(fsync_count.load(), 0);
+  EXPECT_EQ(FlushCount(), 0U);
+  EXPECT_EQ(BatchCount(), 0U);
+}
+
+TEST_F(GroupCommitterMetricsTest, FailedFlushIsStillRecorded) {
+  GroupCommitter committer(
+      {.policy = FsyncPolicy::kGroupCommit, .interval = 10s, .max_bytes = 1 << 30},
+      [] { return std::unexpected(core::Error{core::ErrorCode::kInternal, "boom"}); });
+
+  auto f1 = committer.Submit(100, 1, 1);
+  auto f2 = committer.Submit(100, 1, 2);
+  ASSERT_FALSE(committer.Drain().has_value());
+  ASSERT_FALSE(f1.get().has_value());
+  ASSERT_FALSE(f2.get().has_value());
+
+  EXPECT_EQ(FlushCount(), 1U);
+  EXPECT_EQ(BatchSum(), 2.0);
+}
+
+// A batch Submit is one submission covering many WAL entries.
+TEST_F(GroupCommitterMetricsTest, BatchSubmitCountsEveryEntry) {
+  std::atomic<int> fsync_count{0};
+  GroupCommitter group({.policy = FsyncPolicy::kGroupCommit, .interval = 10s, .max_bytes = 1 << 30},
+                       MakeCounter(fsync_count));
+  auto batch = group.Submit(700, 7, 6);
+  auto single = group.Submit(100, 1, 7);
+  ASSERT_TRUE(group.Drain().has_value());
+  ASSERT_TRUE(batch.get().has_value());
+  ASSERT_TRUE(single.get().has_value());
+  EXPECT_EQ(BatchCount(), 1U);
+  EXPECT_EQ(BatchSum(), 8.0);
+
+  GroupCommitter per_write({.policy = FsyncPolicy::kPerWrite}, MakeCounter(fsync_count));
+  ASSERT_TRUE(per_write.Submit(500, 5, 4).get().has_value());
+  EXPECT_EQ(BatchCount(), 2U);
+  EXPECT_EQ(BatchSum(), 13.0);
 }
 
 }  // namespace

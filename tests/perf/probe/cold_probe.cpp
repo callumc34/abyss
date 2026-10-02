@@ -45,6 +45,7 @@ abyss::perf::WorkloadTargets DefaultTargets() {
 
 }  // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape)
 int main(int argc, char** argv) {
   CLI::App app{"In-process cold store probe (ADP-013)"};
   abyss::perf::probe::ProbeArgs args;
@@ -123,23 +124,19 @@ int main(int argc, char** argv) {
 
   auto cfg = abyss::perf::probe::MakeRunLoopConfig(args, mix);
 
-  std::atomic<uint64_t> error_count{0};
   abyss::perf::OpFn op_fn = [&](int /*worker_id*/, std::string_view op_name, uint64_t key_index) {
     const auto key = KeyFor(key_index);
     if (op_name == kOpGet) {
       abyss::core::ops::StringGet read{.key = key};
-      auto rc = cold.Exec(read);
-      if (!rc.has_value()) error_count.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      abyss::core::ops::StringSet set_op{
-          .key = key,
-          .value = value_str,
-          .abs_ttl_ms = 0,
-      };
-      std::array<abyss::core::ops::WriteOp, 1> ops{set_op};
-      auto rc = cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{ops}, 0);
-      if (!rc.has_value()) error_count.fetch_add(1, std::memory_order_relaxed);
+      return cold.Exec(read).has_value();
     }
+    abyss::core::ops::StringSet set_op{
+        .key = key,
+        .value = value_str,
+        .abs_ttl_ms = 0,
+    };
+    std::array<abyss::core::ops::WriteOp, 1> ops{set_op};
+    return cold.ApplyBatch(std::span<const abyss::core::ops::WriteOp>{ops}, 0).has_value();
   };
 
   const auto result = abyss::perf::RunLoop(cfg, op_fn);
@@ -157,11 +154,12 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (error_count.load() > 0) {
-    std::cerr << "cold_probe: " << error_count.load() << " op errors during run\n";
-  }
   if (auto rc = cold.Stop(); !rc.has_value()) {
     std::cerr << "cold_probe: stop failed: " << rc.error().message() << '\n';
+  }
+  if (const auto errors = abyss::perf::TotalErrors(result); errors > 0) {
+    std::cerr << "cold_probe: " << errors << " op errors during run\n";
+    return abyss::perf::probe::kExitOpErrors;
   }
   if (args.gate && !report.pass) {
     std::cerr << "cold_probe: one or more targets failed\n";

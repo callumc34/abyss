@@ -24,7 +24,7 @@ The cold consumer is the most interesting component. Rather than writing every u
 ## Key Properties
 
 - **Redis compatible** — RESP2 protocol. Any Redis client works.
-- **Durable** — writes are not acknowledged until they are committed to the queue. A crash never loses an acknowledged write.
+- **Durable** — writes are not acknowledged until they reach the configured durability class: surviving a process crash by default, or a power loss when configured. A failure within that class never loses an acknowledged write.
 - **Efficient** — the compaction buffer collapses intermediate writes. The cold store sees a fraction of the total write volume.
 - **Recoverable** — pod restart rebuilds state from the queue. No external coordination needed.
 - **Pluggable** — each component (queue, hot store, cold store) is behind an abstract interface. The embedded profile runs everything in-process with zero dependencies. The external profile delegates to Kafka, Redis, KVRocks, or similar systems.
@@ -37,6 +37,7 @@ The cold consumer is the most interesting component. Rather than writing every u
 - [Architecture](design/architecture.md) — system design, component model, deployment profiles, TTL model
 - [Requirements](design/requirements.md) — performance targets, durability guarantees, design principles, milestones
 - [ADP-013: Performance Harness](design/proposals/013-performance-harness.md) — how Abyss measures itself against its targets
+- [ADP-015: Write Path, Durability Classes and Execution Model](design/proposals/015-write-path-and-durability.md) — how a write is sequenced, made durable and acknowledged
 
 ### Operations
 

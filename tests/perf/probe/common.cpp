@@ -86,8 +86,7 @@ RunLoopConfig MakeRunLoopConfig(const ProbeArgs& args, const OperationMix& defau
   cfg.workers = args.workers;
   cfg.duration = args.duration;
   cfg.warmup = args.warmup;
-  cfg.target_rate_ops_per_worker =
-      args.workers > 0 ? args.target_rate_ops / static_cast<uint64_t>(args.workers) : 0;
+  cfg.target_rate_ops = args.target_rate_ops;
   cfg.key_count = args.key_count;
   cfg.value_size_bytes = args.value_size_bytes;
   cfg.key_distribution.kind = ParseDistKind(args.distribution);
@@ -141,7 +140,10 @@ RunReport BuildReport(const ProbeArgs& args, const WorkloadConfig& workload,
   for (const auto& [name, hist] : result.per_op_histograms) {
     const auto count = result.per_op_counts.at(name);
     report.operations[name] = StatsFromHistogram(hist, count, result.measured_duration);
+    report.operations[name].errors = result.per_op_errors.at(name);
   }
+  report.driver = MakeDriverStats(result.send_lag, result.open_loop, result.driver_cpu,
+                                  result.measured_duration, workload.targets);
   EvaluateTargets(report);
   return report;
 }
@@ -177,6 +179,7 @@ bool WriteOutputs(const RunReport& report, const ProbeArgs& args, const RunLoopR
     }
   }
 
+  WriteSummary(report, std::cerr);
   return true;
 }
 

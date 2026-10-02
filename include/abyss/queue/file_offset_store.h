@@ -9,6 +9,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/metrics.h"
 #include "abyss/queue/offset_store.h"
 
 namespace abyss::queue {
@@ -59,6 +60,7 @@ class FileOffsetStore : public OffsetStore {
   std::string ShardTempPath(core::ConsumerId consumer, core::ShardId shard) const;
 
   FileOffsetStoreConfig config_;
+  metrics::HistogramHandle persist_duration_;
 
   mutable std::mutex mu_;
   std::unordered_map<core::ConsumerId, ConsumerMap> offsets_ ABYSS_GUARDED_BY(mu_);

@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/names.h"
 #include "abyss/platform/fs.h"
 #include "binary_io.h"
 #include "crc32c.h"
@@ -103,7 +105,10 @@ core::Result<std::unique_ptr<FileOffsetStore>> FileOffsetStore::Open(FileOffsetS
   return store;
 }
 
-FileOffsetStore::FileOffsetStore(FileOffsetStoreConfig config) : config_(std::move(config)) {}
+FileOffsetStore::FileOffsetStore(FileOffsetStoreConfig config)
+    : config_(std::move(config)),
+      persist_duration_(metrics::Registry::Instance().Histogram(
+          metrics::names::kQueueOffsetPersistDurationSeconds)) {}
 
 std::optional<core::SequenceId> FileOffsetStore::Get(core::ConsumerId consumer,
                                                      core::ShardId shard) const {
@@ -120,7 +125,10 @@ core::Result<void> FileOffsetStore::Set(core::ConsumerId consumer, core::ShardId
   // Write-through (XERR-2): persist durably FIRST, advance the in-memory cache
   // only on success. On a failed write the cache stays behind disk, so the
   // reaper (which reads the cache) never observes an offset not yet durable.
+  const auto start = std::chrono::steady_clock::now();
   auto result = WriteShardFile(consumer, shard, seq);
+  persist_duration_.Observe(
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
   if (!result.has_value()) {
     ABYSS_LOG_ERROR("offset persist failed", {"consumer", static_cast<uint64_t>(consumer)},
                     {"shard", static_cast<int64_t>(shard)}, {"seq", static_cast<uint64_t>(seq)},

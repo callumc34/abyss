@@ -28,6 +28,7 @@ add_executable(abyss_queue_tests
   queue/group_commit_test.cpp
   queue/offset_store_test.cpp
   queue/segment_reaper_test.cpp
+  queue/wal_flush_metrics_test.cpp
 )
 
 target_include_directories(abyss_queue_tests PRIVATE
