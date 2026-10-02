@@ -17,6 +17,8 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_GT(defaults.hot.max_memory_bytes, 0U);
   EXPECT_GT(defaults.hot.default_eviction.count(), 0);
   EXPECT_GT(defaults.hot.eviction_tick.count(), 0);
+  EXPECT_DOUBLE_EQ(defaults.hot.stub_memory_fraction, 0.02);
+  EXPECT_DOUBLE_EQ(defaults.hot.backpressure_ratio, 1.25);
   EXPECT_TRUE(defaults.hot.eviction_overrides.empty());
 
   EXPECT_EQ(defaults.cold.backend, "builtin_rocksdb");

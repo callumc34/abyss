@@ -4,7 +4,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -21,7 +20,6 @@ class EvictionWorker {
  public:
   struct Config {
     std::chrono::milliseconds tick{1000};
-    std::function<core::SequenceId(core::ShardId)> tombstone_horizon;
   };
 
   EvictionWorker(ShardedHotStore& store, Config config,
@@ -58,13 +56,19 @@ class EvictionWorker {
   metrics::CounterHandle tombstones_reclaimed_total_;
   metrics::CounterHandle memory_evicted_total_;
   metrics::CounterHandle access_buffer_dropped_total_;
+  metrics::CounterHandle stub_drops_total_;
+  metrics::CounterHandle load_discards_total_;
   metrics::GaugeHandle hot_memory_bytes_;
   metrics::GaugeHandle hot_keys_;
   metrics::GaugeHandle hot_max_memory_bytes_;
   metrics::GaugeHandle hot_access_buffer_depth_;
+  metrics::GaugeHandle hot_stub_entries_;
+  metrics::GaugeHandle hot_unevictable_bytes_;
   // Last cumulative access-buffer drop count published, so each tick increments
   // the monotonic counter by only the new drops since the previous tick.
   uint64_t reported_access_dropped_ = 0;
+  uint64_t reported_stub_drops_ = 0;
+  uint64_t reported_load_discards_ = 0;
 };
 
 }  // namespace abyss::hot

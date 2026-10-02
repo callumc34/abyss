@@ -125,19 +125,19 @@ TEST_F(ShardedHotStoreTest, WipeClearsOnlyItsShard) {
   for (int i = 0; i < 100; ++i) {
     SetString("key:" + std::to_string(i), "val");
   }
-  ASSERT_TRUE(store_.Wipe(0).has_value());
+  ASSERT_TRUE(store_.Wipe(0, 0).has_value());
   const auto after_one = store_.Stats();
   ASSERT_TRUE(after_one.has_value());
   EXPECT_LT(after_one->key_count, 100U);
   EXPECT_GT(after_one->key_count, 0U) << "one shard's wipe cleared the others";
 
   for (core::ShardId shard = 1; shard < store_.shard_count(); ++shard) {
-    ASSERT_TRUE(store_.Wipe(shard).has_value());
+    ASSERT_TRUE(store_.Wipe(shard, 0).has_value());
   }
   const auto after_all = store_.Stats();
   ASSERT_TRUE(after_all.has_value());
   EXPECT_EQ(after_all->key_count, 0U);
-  EXPECT_FALSE(store_.Wipe(store_.shard_count()).has_value());
+  EXPECT_FALSE(store_.Wipe(store_.shard_count(), 0).has_value());
 }
 
 // --- Eviction ---

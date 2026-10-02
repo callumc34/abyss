@@ -371,7 +371,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_DelThenReaddDoesNotResurrectColdSetMembers)
 
   // Drive the key out of hot so SCARD/SISMEMBER resolve against cold.
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, 0).has_value());
   }
 
   EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 1)
@@ -399,7 +399,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
   DrainAndFlushCold("c3t");
 
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, 0).has_value());
   }
 
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}));
@@ -436,7 +436,7 @@ TEST_F(TwoTtlIntegrationTest, ExpiredBufferedWriteDeletesTheOlderColdValue) {
   harness_.Clock().Advance(2s);
   DrainAndFlushCold("rk");
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, 0).has_value());
   }
 
   auto got = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "rk"}));
@@ -468,7 +468,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
 
   // Drive the key out of hot so the reads resolve against the buffer/cold tiers.
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, 0).has_value());
   }
 
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c6t"}));

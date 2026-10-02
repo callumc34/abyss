@@ -16,7 +16,7 @@ class MockHotStore : public core::HotStore {
               (std::span<const core::ops::WriteOp> ops, core::SequenceId seq), (override));
   MOCK_METHOD(core::HotKeyPresence, Probe, (std::string_view key), (override));
   MOCK_METHOD(core::Result<core::MemoryStats>, Stats, (), (override));
-  MOCK_METHOD(core::Result<void>, Wipe, (core::ShardId shard), (override));
+  MOCK_METHOD(core::Result<void>, Wipe, (core::ShardId shard, core::SequenceId seq), (override));
 };
 
 }  // namespace abyss::testing

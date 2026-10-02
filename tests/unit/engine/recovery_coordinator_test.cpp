@@ -154,7 +154,7 @@ class RecoveryCoordinatorTest : public ::testing::Test {
           hot_applied_.Add(core::ops::PrimaryKey(op));
           return core::Result<core::RespValue>(core::RespValue::SimpleString("OK"));
         });
-    ON_CALL(hot_, Wipe(_)).WillByDefault(Return(core::Result<void>{}));
+    ON_CALL(hot_, Wipe(_, _)).WillByDefault(Return(core::Result<void>{}));
     ON_CALL(cold_, ApplyBatch(_, _))
         .WillByDefault([this](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
           for (const auto& op : ops) cold_applied_.Add(core::ops::PrimaryKey(op));

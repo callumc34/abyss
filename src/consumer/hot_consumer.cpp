@@ -323,7 +323,7 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
     apply_notifier_.NotifyApplied(config_.shard, seq);
   }
 
-  auto wiped = store_.Wipe(config_.shard);
+  auto wiped = store_.Wipe(config_.shard, entry.seq);
   if (!wiped.has_value()) {
     counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
     ABYSS_LOG_ERROR("hot wipe failed", {"shard", static_cast<int64_t>(config_.shard)},

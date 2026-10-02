@@ -21,6 +21,7 @@
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -198,6 +199,35 @@ TEST_F(HotConsumerTest, AFlushWipesOnlyItsOwnShard) {
   const uint64_t left = hot_->Stats()->key_count;
   EXPECT_GT(left, 0U) << "shard 1's Flush wiped shard 0";
   EXPECT_LT(left, static_cast<uint64_t>(kKeys)) << "shard 1's Flush wiped nothing";
+}
+
+// The wipe records the Flush's seq as the shard's flush floor.
+TEST_F(HotConsumerTest, AFlushSetsItsShardsFlushFloor) {
+  core::SequenceId drained = 6;
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      .max_memory_bytes = 16UL * 1024UL * 1024UL,
+      .shard_count = 2,
+      .drained = [&drained](core::ShardId) { return drained; },
+  });
+  HotConsumer flusher(*queue_, *hot_, rpc_, apply_notifier_, HotConsumer::Config{.shard = 1},
+                      policy_);
+  std::string on_flushed = "k";
+  while (core::ComputeShard(on_flushed, 2) != 1) on_flushed += "k";
+  std::string on_other = "o";
+  while (core::ComputeShard(on_other, 2) != 0) on_other += "o";
+
+  std::vector<core::QueueEntry> flush(1);
+  flush[0].seq = 7;
+  flush[0].appended_at = core::WallClock::now();
+  flush[0].payload = core::entry::Flush{};
+  flusher.BeginReplay();
+  flusher.ApplyReplayBatch(flush);
+  flusher.EndReplay();
+
+  EXPECT_TRUE(hot_->KnownAbsentAfterFlush(on_flushed));
+  EXPECT_FALSE(hot_->KnownAbsentAfterFlush(on_other));
+  drained = 7;
+  EXPECT_FALSE(hot_->KnownAbsentAfterFlush(on_flushed));
 }
 
 TEST_F(HotConsumerTest, AppliesWriteAndFulfillsOk) {

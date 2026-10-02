@@ -112,6 +112,13 @@ bool Server::Initialize() {
   hot_store_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = config_.hot.max_memory_bytes,
       .shard_count = config_.hot.shard_count,
+      .stub_memory_fraction = config_.hot.stub_memory_fraction,
+      .backpressure_ratio = config_.hot.backpressure_ratio,
+      // Eviction and tombstone GC wait for the shard's cold consumer to
+      // drain a key. The pool is built below; until then nothing has.
+      .drained = [this](core::ShardId shard) -> core::SequenceId {
+        return cold_pool_ ? cold_pool_->ConsumerFor(shard).LatestDrainedSeq() : 0;
+      },
       .eviction_policy = eviction_policy_.get(),
   });
 
@@ -215,14 +222,7 @@ bool Server::Initialize() {
       });
 
   hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
-      *hot_store_, hot::EvictionWorker::Config{
-                       .tick = config_.hot.eviction_tick,
-                       // GC tombstones once the shard's cold consumer drains past them.
-                       .tombstone_horizon =
-                           [pool = cold_pool_.get()](core::ShardId shard) {
-                             return pool->ConsumerFor(shard).LatestDrainedSeq();
-                           },
-                   });
+      *hot_store_, hot::EvictionWorker::Config{.tick = config_.hot.eviction_tick});
   resolver_pool_ = std::make_unique<consumer::ResolverPool>(
       *queue_, *cold_store_, *cold_pool_, *consumer_rpc_, *apply_notifier_,
       consumer::ResolverPool::Config{

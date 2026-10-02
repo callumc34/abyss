@@ -1,10 +1,12 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -26,6 +28,13 @@ struct ShardedHotStoreConfig {
   // cap, refreshes are dropped (a dropped refresh only shortens a key's
   // deadline — safe, the key is still in queue/cold). 0 means unbounded.
   size_t access_buffer_high_water = 65536;
+  // Share of max_memory_bytes for stubs, at kStubBytes each.
+  double stub_memory_fraction = 0.02;
+  // Over max_memory_bytes times this, the store reports backpressure.
+  double backpressure_ratio = 1.25;
+  // A shard's cold drained seq: nothing above it is removed from hot.
+  // Null means everything has drained.
+  std::function<core::SequenceId(core::ShardId)> drained;
   // Borrowed from the server's single EvictionPolicy. Must outlive the store.
   // Nullable for tests that don't exercise eviction (DefaultPolicy is used).
   const core::EvictionPolicy* eviction_policy = nullptr;
@@ -50,7 +59,20 @@ class ShardedHotStore : public core::HotStore {
   core::HotKeyPresence Probe(std::string_view key) override;
   void SetReplayMode(bool replaying) override;
   core::Result<core::MemoryStats> Stats() override;
-  core::Result<void> Wipe(core::ShardId shard) override;
+  core::Result<void> Wipe(core::ShardId shard, core::SequenceId seq) override;
+
+  std::optional<LoadToken> BeginLoad(std::string_view key);
+  bool CompleteLoad(std::string_view key, LoadToken token, LoadedState state);
+  void AbortLoad(std::string_view key, LoadToken token);
+  // Waits until `key` has no load in flight; false at the deadline.
+  bool AwaitLoad(std::string_view key, core::SteadyTime deadline);
+
+  std::optional<Stub> FindStub(std::string_view key);
+  bool DropStub(std::string_view key);
+
+  // True while cold has not drained the key's shard's last Flush. Ask
+  // only after seeing the miss, so the drain read is no older than it.
+  bool KnownAbsentAfterFlush(std::string_view key);
 
   // Refreshes the deadline for every buffered access, using the per-key
   // eviction cached on each Entry at Apply time. See ADP-002 §Eviction.
@@ -71,8 +93,8 @@ class ShardedHotStore : public core::HotStore {
   };
   AccessBufferStats AccessBufferSnapshot() const;
 
-  // Reclaims each shard's tombstones at or below that shard's horizon.
-  size_t GcTombstones(const std::function<core::SequenceId(core::ShardId)>& horizon);
+  // Reclaims each shard's tombstones cold has drained.
+  size_t GcTombstones();
 
   uint32_t shard_count() const { return config_.shard_count; }
 
@@ -87,12 +109,18 @@ class ShardedHotStore : public core::HotStore {
     std::vector<std::string> access_buffer ABYSS_GUARDED_BY(access_mutex);
     std::unordered_set<std::string> access_seen ABYSS_GUARDED_BY(access_mutex);
     uint64_t access_dropped ABYSS_GUARDED_BY(access_mutex) = 0;
+    // Signalled when a load placeholder may have gone.
+    std::condition_variable_any load_cv;
 
     explicit Shard(SingleShardConfig config) : store(std::move(config)) {}
   };
 
+  core::ShardId ShardIndex(std::string_view key) const;
   Shard& ShardFor(std::string_view key);
+  core::SequenceId Horizon(core::ShardId shard) const;
   core::EvictionTTL ResolveEviction(std::string_view key) const;
+  core::Result<core::RespValue> ApplyToShard(core::ShardId index, const core::ops::WriteOp& op,
+                                             core::EvictionTTL eviction, core::SequenceId seq);
 
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
