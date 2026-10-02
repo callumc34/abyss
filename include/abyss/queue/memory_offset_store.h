@@ -19,6 +19,11 @@ class MemoryOffsetStore : public OffsetStore {
 
   std::optional<core::SequenceId> Get(core::ConsumerId consumer,
                                       core::ShardId shard) const override;
+  // One copy, so the floor is the offset itself.
+  std::optional<core::SequenceId> ReclaimFloor(core::ConsumerId consumer,
+                                               core::ShardId shard) const override {
+    return Get(consumer, shard);
+  }
   core::Result<void> Set(core::ConsumerId consumer, core::ShardId shard, core::SequenceId seq);
 
  private:

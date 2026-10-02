@@ -30,6 +30,9 @@ set(ABYSS_MSVC_WARNINGS
   /D_CRT_NONSTDC_NO_DEPRECATION
   # Suppress windows.h's min/max macros so std::min/std::max parse correctly.
   /DNOMINMAX
+  # C4324 reports padding an alignas asked for; cache-line alignment of
+  # contended atomics is deliberate.
+  /wd4324
 )
 
 target_compile_options(abyss_compiler_options INTERFACE

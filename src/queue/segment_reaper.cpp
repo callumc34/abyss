@@ -10,52 +10,80 @@ ABYSS_LOG_COMPONENT("abyss.queue.reaper")
 
 namespace abyss::queue {
 
+namespace {
+
+constexpr std::size_t kSweepBatch = 64;
+
+void NoteUnreaped(SegmentReaper::ReapOutcome& outcome, core::WallTime sealed_at) {
+  if (!outcome.oldest_eligible_unreaped.has_value() ||
+      sealed_at < *outcome.oldest_eligible_unreaped) {
+    outcome.oldest_eligible_unreaped = sealed_at;
+  }
+}
+
+}  // namespace
+
 SegmentReaper::SegmentReaper(SegmentRegistry& registry, const OffsetStore& offsets,
                              SegmentReaperConfig config)
     : registry_(registry), offsets_(offsets), config_(std::move(config)) {}
 
 core::Result<SegmentReaper::ReapOutcome> SegmentReaper::RunOnce() {
-  auto sealed = registry_.ListSealedSegments();
-  const auto now = config_.wall_clock();
-
   ReapOutcome outcome;
-  for (const auto& info : sealed) {
-    if (!ShouldDelete(info, now)) continue;
-
-    auto removed = registry_.RemoveSegment(info.shard, info.base_seq);
-    if (!removed.has_value()) {
-      ++outcome.failed;
-      if (!outcome.first_error.has_value()) outcome.first_error = removed.error();
-      if (!outcome.oldest_eligible_unreaped.has_value() ||
-          info.created_at < *outcome.oldest_eligible_unreaped) {
-        outcome.oldest_eligible_unreaped = info.created_at;
-      }
-      ABYSS_LOG_WARN("segment removal failed; sweep continues",
-                     {"shard", static_cast<int64_t>(info.shard)},
-                     {"base_seq", static_cast<uint64_t>(info.base_seq)},
-                     {"err", std::string_view{removed.error().message()}});
-      continue;
-    }
-    ABYSS_LOG_DEBUG("segment removed", {"shard", static_cast<int64_t>(info.shard)},
-                    {"base_seq", static_cast<uint64_t>(info.base_seq)},
-                    {"last_seq", static_cast<uint64_t>(info.last_seq)});
-    ++outcome.deleted;
-  }
+  if (config_.consumers.empty()) return outcome;
+  const auto now = config_.wall_clock();
+  for (uint32_t log = 0; log < registry_.LogCount(); ++log) SweepLog(log, now, outcome);
   return outcome;
 }
 
-bool SegmentReaper::ShouldDelete(const SegmentRegistry::SealedSegmentInfo& info,
-                                 core::WallTime now) const {
-  if (config_.consumers.empty()) return false;
-
-  for (auto consumer : config_.consumers) {
-    auto persisted = offsets_.Get(consumer, info.shard);
-    if (!persisted.has_value()) return false;
-    if (*persisted < info.last_seq) return false;
+// Reclaiming past a pinned segment would let a rebuild from FirstSeq
+// replay a shard's older write across the hole, so a sweep stops at
+// the first segment it cannot reclaim. It looks on through that batch
+// only to report the oldest segment held back.
+void SegmentReaper::SweepLog(uint32_t log, core::WallTime now, ReapOutcome& outcome) {
+  bool held = false;
+  for (;;) {
+    const auto batch = registry_.ListSealedSegments(log, kSweepBatch);
+    for (const auto& info : batch) {
+      // Later segments were sealed later still.
+      if (now - info.sealed_at < config_.min_retention) return;
+      const bool released = Released(info);
+      if (held) {
+        if (released) {
+          NoteUnreaped(outcome, info.sealed_at);
+          return;
+        }
+        continue;
+      }
+      if (!released) {
+        held = true;
+        continue;
+      }
+      auto removed = registry_.RemoveSegment(log, info.ordinal);
+      if (!removed.has_value()) {
+        ++outcome.failed;
+        if (!outcome.first_error.has_value()) outcome.first_error = removed.error();
+        NoteUnreaped(outcome, info.sealed_at);
+        ABYSS_LOG_WARN("segment reclaim failed; the sweep of this log stops",
+                       {"log", static_cast<int64_t>(log)}, {"ordinal", info.ordinal},
+                       {"err", std::string_view{removed.error().message()}});
+        return;
+      }
+      ABYSS_LOG_DEBUG("segment reclaimed", {"log", static_cast<int64_t>(log)},
+                      {"ordinal", info.ordinal});
+      ++outcome.deleted;
+    }
+    if (held || batch.size() < kSweepBatch) return;
   }
+}
 
-  const auto age = now - info.created_at;
-  return age >= config_.min_retention;
+bool SegmentReaper::Released(const SegmentRegistry::SealedSegmentInfo& info) const {
+  for (const auto& range : info.shards) {
+    for (auto consumer : config_.consumers) {
+      const auto floor = offsets_.ReclaimFloor(consumer, range.shard);
+      if (!floor.has_value() || *floor < range.max_seq) return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace abyss::queue

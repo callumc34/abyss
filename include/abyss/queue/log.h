@@ -28,6 +28,8 @@ struct LogConfig {
   // Recorded in every header. Recovery CRC-verifies the last
   // max(this, recorded) bytes before the recovered end, plus a segment.
   uint64_t durability_window_bytes = uint64_t{64} << 20;
+  // Stamps segment headers and seals.
+  core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
 // One frame recovered at Open, in log order.
@@ -47,7 +49,10 @@ struct SegmentShardRange {
 
 struct SegmentInfo {
   uint64_t ordinal = 0;
-  core::WallTime created_at;
+  // When the flush passed its end; for a recovered segment, its newest
+  // entry's append time, else its header's. Retention ages from it. It
+  // never decreases from one ordinal to the next.
+  core::WallTime sealed_at;
   std::vector<SegmentShardRange> shards;
 };
 
@@ -162,7 +167,7 @@ class Log {
   // an earlier reclaim's file could not be removed yet.
   core::Result<void> Reclaim(uint64_t ordinal);
 
-  uint64_t log_id() const noexcept { return config_.log_id; }
+  uint32_t log_id() const noexcept { return config_.log_id; }
   std::size_t spare_count() const noexcept;
   std::size_t free_count() const noexcept;
 
@@ -175,6 +180,9 @@ class Log {
   uint64_t SyncCountForTesting() const noexcept;
   // The next flush sync fails with `error`.
   void InjectSyncErrorForTesting(core::Error error);
+  // Runs in each flush after its filled-prefix snapshot, before its
+  // syncs. It may block; an error fails the flush.
+  void SetFlushHookForTesting(std::function<core::Result<void>()> hook);
   // While paused no completion reaches the filled prefix: commits fill
   // the completion ring, then wait, and drain it themselves on resume.
   void PauseCombinerForTesting();

@@ -2,6 +2,7 @@ add_executable(abyss_component_tests
   tiering_engine_test.cpp
   wal_queue_test.cpp
   wal_queue_crash_test.cpp
+  wal_queue_streams_test.cpp
   hot_consumer_test.cpp
   cold_durability_test.cpp
   cold_persistence_gate_test.cpp

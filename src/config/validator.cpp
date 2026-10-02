@@ -1,6 +1,7 @@
 #include "validator.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -16,16 +17,22 @@ namespace abyss::config::internal {
 
 namespace {
 
-// WAL framing constants the validator must know to floor segment_size_bytes.
-// Kept local (and asserted against the queue header at the WAL boundary) so the
-// config library does not depend on the queue library's private headers.
-//   kSegmentHeaderSize — fixed 32-byte segment header (queue::kSegmentHeaderSize).
-//   kMaxEntryEnvelope  — generous upper bound on per-entry framing overhead
-//                        (length prefix, type/seq/timestamp, multi-arg command
-//                        framing, batch_last_seq, crc). A value at
-//                        max_value_size_bytes plus this must fit a segment.
-constexpr size_t kSegmentHeaderSize = 32;
+// WAL framing constants the validator needs to floor
+// segment_size_bytes, kept local so the config library does not depend
+// on the queue library's private headers.
+//   kSegmentHeaderSize: the 4 KiB header block, so frames start
+//     page-aligned (kLogSegmentHeaderBytes).
+//   kMaxEntryEnvelope: a generous bound on a frame's overhead (commit
+//     word, CRC, frame header, command framing, padding). A segment
+//     holds its header plus one max-size frame.
+//   kFrameAlign: frames are 8-byte aligned, and so is a segment.
+//   kMaxFrameSpace: frame offsets within a segment are 32-bit.
+constexpr size_t kSegmentHeaderSize = 4096;
 constexpr size_t kMaxEntryEnvelope = 1024;
+constexpr size_t kFrameAlign = 8;
+constexpr uint64_t kMaxFrameSpace = 0xFFFFFFFFULL;
+constexpr uint32_t kMinRingEntries = uint32_t{1} << 12;
+constexpr uint32_t kMaxRingEntries = uint32_t{1} << 24;
 // Redis proto-max-bulk-len: the largest single value we ever accept.
 constexpr size_t kMaxAcceptableValueSize = size_t{512} * 1024 * 1024;
 // Upper bound on the cold checkpoint cadence. The cold commit cannot pass data the
@@ -182,6 +189,11 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
         "queue.segment_size_bytes",
         "must be >= " + std::to_string(segment_floor) + " (segment header + minimum entry)"));
   }
+  if (q.segment_size_bytes % kFrameAlign != 0 ||
+      q.segment_size_bytes - kSegmentHeaderSize > kMaxFrameSpace) {
+    return std::unexpected(InvalidArg("queue.segment_size_bytes",
+                                      "must be a multiple of 8 below 4 GiB plus its 4 KiB header"));
+  }
 
   // max_value_size_bytes is the single-value ceiling, decoupled from the
   // segment size (G11 / Decision 2). It must be positive, within Redis's
@@ -195,11 +207,21 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
         "queue.max_value_size_bytes",
         "must be <= " + std::to_string(kMaxAcceptableValueSize) + " (Redis proto-max-bulk-len)"));
   }
-  if (q.segment_size_bytes < q.max_value_size_bytes + kMaxEntryEnvelope) {
+  if (q.segment_size_bytes < kSegmentHeaderSize + q.max_value_size_bytes + kMaxEntryEnvelope) {
     return std::unexpected(InvalidArg("queue.segment_size_bytes",
                                       "must be >= queue.max_value_size_bytes + " +
-                                          std::to_string(kMaxEntryEnvelope) +
+                                          std::to_string(kSegmentHeaderSize + kMaxEntryEnvelope) +
                                           " so a max-size value fits one fixed-size segment"));
+  }
+
+  if (q.log_count == 0 || !std::has_single_bit(q.log_count)) {
+    return std::unexpected(InvalidArg("queue.log_count", "must be a power of two"));
+  }
+  if (q.ring_entries < kMinRingEntries || q.ring_entries > kMaxRingEntries ||
+      !std::has_single_bit(q.ring_entries)) {
+    return std::unexpected(InvalidArg(
+        "queue.ring_entries", "must be a power of two in [" + std::to_string(kMinRingEntries) +
+                                  ", " + std::to_string(kMaxRingEntries) + "]"));
   }
 
   if (q.min_retention.count() < 0)
@@ -454,6 +476,16 @@ core::Result<void> ValidateColdReadVsConsistencyWait(const Config& c) {
   return {};
 }
 
+// Every log carries at least one shard's stream.
+core::Result<void> ValidateLogCountVsShards(const Config& c) {
+  if (c.queue.log_count > c.hot.shard_count) {
+    return std::unexpected(
+        InvalidArg("queue.log_count",
+                   "must be <= hot.shard_count (" + std::to_string(c.hot.shard_count) + ")"));
+  }
+  return {};
+}
+
 // NOLINTNEXTLINE(misc-unused-parameters)
 core::Result<void> ValidatePortCollisions(const Config& c) {
   const std::vector<std::pair<uint16_t, std::string_view>> ports = {
@@ -496,6 +528,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidatePortCollisions(config); !r) return r;
   if (auto r = ValidateRetentionVsEviction(config); !r) return r;
   if (auto r = ValidateColdReadVsConsistencyWait(config); !r) return r;
+  if (auto r = ValidateLogCountVsShards(config); !r) return r;
   return {};
 }
 

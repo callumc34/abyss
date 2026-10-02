@@ -49,14 +49,21 @@ struct QueueConfig {
   // requires segment_size_bytes to hold one max-size entry, so larger values
   // are rejected with kValueTooLarge rather than tied to the segment knob.
   size_t max_value_size_bytes = 67108864;
+  // Physical logs on the data volume, a power of two <=
+  // hot.shard_count; shard s writes to log s % log_count.
+  uint32_t log_count = 1;
+  // Per-shard offset ring slots, a power of two in [2^12, 2^24]. Reads
+  // further back than the ring locate frames through the sparse index.
+  uint32_t ring_entries = 65536;
   std::chrono::seconds min_retention{86400};
   // Cadence of the committed-offset checkpoint. A crash replays at most this
   // much past the last checkpoint; WAL reclamation trails commits by it.
   std::chrono::milliseconds offset_fsync_interval{1000};
   // What an acknowledged write survives.
   core::Durability durability = core::Durability::kProcessCrash;
-  // Bounds on written but not yet power-durable data: bytes across shards,
-  // and the oldest entry's age per shard. Appends wait, then fail, past it.
+  // Bounds on written but not yet power-durable data: bytes across
+  // logs, and the oldest entry's age per log. Appends wait, then fail,
+  // past it.
   uint64_t durability_window_bytes = 67108864;
   std::chrono::milliseconds durability_window{1000};
 };

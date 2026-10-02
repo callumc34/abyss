@@ -18,21 +18,27 @@ int64_t ToMillis(DurabilityWindow::Clock::duration d) {
 
 }  // namespace
 
-void DurabilityWindow::ShardAge::Start(Clock::time_point now) noexcept {
-  if (since_ns_.load(std::memory_order_relaxed) == kClear) {
-    since_ns_.store(ToNanos(now), std::memory_order_seq_cst);
+void DurabilityWindow::LogAge::Start(Clock::time_point now) noexcept {
+  if (since_ns_.load(std::memory_order_seq_cst) != kClear) return;
+  int64_t clear = kClear;
+  since_ns_.compare_exchange_strong(clear, ToNanos(now), std::memory_order_seq_cst);
+}
+
+// An appender reserves, then starts the clock; this clears, then reads
+// the tail. In the total order one of them sees the other, so a frame
+// reserved past `flushed_to` never leaves the age clear.
+void DurabilityWindow::LogAge::Flushed(Clock::time_point snapshot_at, uint64_t flushed_to,
+                                       const std::function<uint64_t()>& reserved_tail) {
+  const int64_t since = ToNanos(snapshot_at);
+  if (reserved_tail() > flushed_to) {
+    since_ns_.store(since, std::memory_order_seq_cst);
+    return;
   }
-}
-
-void DurabilityWindow::ShardAge::Set(Clock::time_point since) noexcept {
-  since_ns_.store(ToNanos(since), std::memory_order_seq_cst);
-}
-
-void DurabilityWindow::ShardAge::Clear() noexcept {
   since_ns_.store(kClear, std::memory_order_seq_cst);
+  if (reserved_tail() > flushed_to) since_ns_.store(since, std::memory_order_seq_cst);
 }
 
-DurabilityWindow::Clock::duration DurabilityWindow::ShardAge::Age(
+DurabilityWindow::Clock::duration DurabilityWindow::LogAge::Age(
     Clock::time_point now) const noexcept {
   const int64_t since = since_ns_.load(std::memory_order_seq_cst);
   if (since == kClear) return Clock::duration::zero();
@@ -48,14 +54,14 @@ DurabilityWindow::DurabilityWindow(uint64_t max_bytes, Clock::duration max_age)
       rejections_(
           metrics::Registry::Instance().Counter(metrics::names::kWalBackpressureRejectionsTotal)) {}
 
-bool DurabilityWindow::Admissible(const ShardAge& shard) const noexcept {
+bool DurabilityWindow::Admissible(const LogAge& age) const noexcept {
   const uint64_t bytes = unflushed_bytes_.load(std::memory_order_seq_cst);
   if (bytes == 0) return true;
-  return bytes < max_bytes_ && shard.Age(Clock::now()) < max_age_;
+  return bytes < max_bytes_ && age.Age(Clock::now()) < max_age_;
 }
 
-core::Result<void> DurabilityWindow::Admit(const ShardAge& shard, Clock::time_point deadline) {
-  if (Admissible(shard)) return {};
+core::Result<void> DurabilityWindow::Admit(const LogAge& age, Clock::time_point deadline) {
+  if (Admissible(age)) return {};
   // A caller that cannot wait (a best-effort append) is not backpressure.
   if (deadline <= Clock::now()) {
     return std::unexpected(
@@ -66,7 +72,7 @@ core::Result<void> DurabilityWindow::Admit(const ShardAge& shard, Clock::time_po
   std::unique_lock lock(mu_);
   waiters_.fetch_add(1, std::memory_order_seq_cst);
   const bool admitted = cv_.wait_until(
-      lock, deadline, [this, &shard] ABYSS_REQUIRES(mu_) { return stopped_ || Admissible(shard); });
+      lock, deadline, [this, &age] ABYSS_REQUIRES(mu_) { return stopped_ || Admissible(age); });
   waiters_.fetch_sub(1, std::memory_order_relaxed);
   if (stopped_) {
     return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
@@ -78,7 +84,7 @@ core::Result<void> DurabilityWindow::Admit(const ShardAge& shard, Clock::time_po
       core::ErrorCode::kResourceExhausted,
       "WAL durability window full: the device is not keeping up with writes (unflushed " +
           std::to_string(UnflushedBytes()) + " of " + std::to_string(max_bytes_) +
-          " bytes, oldest " + std::to_string(ToMillis(shard.Age(Clock::now()))) + " of " +
+          " bytes, oldest " + std::to_string(ToMillis(age.Age(Clock::now()))) + " of " +
           std::to_string(ToMillis(max_age_)) + " ms)"});
 }
 

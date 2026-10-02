@@ -37,6 +37,7 @@
 #include "abyss/queue/wal_queue.h"
 #include "durability_printer.h"
 #include "temp_dir.h"
+#include "wal_power_loss.h"
 
 namespace abyss::consumer {
 namespace {
@@ -49,7 +50,7 @@ constexpr auto kWait = 5s;
 class FlushStall {
  public:
   queue::FlushHook Hook() const {
-    return [state = state_](core::ShardId) -> core::Result<void> {
+    return [state = state_](uint32_t) -> core::Result<void> {
       std::unique_lock lock(state->mu);
       state->cv.wait(lock, [&state] { return state->released; });
       return {};
@@ -311,7 +312,7 @@ TEST_F(ColdPersistenceGateTest, RewrittenKeyNeverPersistsAboveThePowerDurableEnd
   ASSERT_TRUE(Eventually([this, last] { return ReadCold(*cold_, "hot") == std::to_string(last); }));
 
   // Each value names its own seq; a slow device keeps the end lagging.
-  queue_->SetFlushHookForTesting([](core::ShardId) -> core::Result<void> {
+  queue_->SetFlushHookForTesting([](uint32_t) -> core::Result<void> {
     std::this_thread::sleep_for(3ms);
     return {};
   });
@@ -425,7 +426,7 @@ TEST_F(ColdPersistenceGateTest, GracefulDrainWaitsForPowerDurabilityWithoutTimin
   cfg.buffer_high_water_bytes = ColdConsumer::Config{}.buffer_high_water_bytes;
   cfg.queue_read_timeout = 200ms;
   auto& consumer = AddConsumer(0, cfg);
-  queue_->SetFlushHookForTesting([](core::ShardId) -> core::Result<void> {
+  queue_->SetFlushHookForTesting([](uint32_t) -> core::Result<void> {
     std::this_thread::sleep_for(10ms);
     return {};
   });
@@ -443,9 +444,9 @@ TEST_F(ColdPersistenceGateTest, GracefulDrainWaitsForPowerDurabilityWithoutTimin
   EXPECT_EQ(ColdCommit(0), last);
 }
 
-// A power loss: the active segments keep only what their last flush
-// covered. Writes acknowledged at power_loss survive; the later ones, and
-// any cold state or committed offset derived from them, do not.
+// A power loss: the log keeps only what its last flush covered. Writes
+// acknowledged at power_loss survive; the later ones, and any cold
+// state or committed offset derived from them, do not.
 class ColdPowerLossTest : public ColdPersistenceGateTest,
                           public ::testing::WithParamInterface<core::Durability> {};
 
@@ -470,7 +471,6 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
   }
 
   queue_->SetFlushHookForTesting(stall_.Hook());
-  std::vector<queue::FlushedExtent> extents;
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     Append(shard, WriteEntry({"SET", key("b", shard), "b"}));
     const core::SequenceId x = Append(shard, ConditionalEntry({"SET", key("c", shard), "c"}));
@@ -484,15 +484,15 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
     } else {
       EXPECT_EQ(outcome, ColdConsumer::FlushOutcome::kIdle) << "absorbed an unflushed entry";
     }
-    extents.push_back(queue_->FlushedExtentForTesting(shard));
   }
+  const queue::DurableExtent extent = queue_->DurableExtentForTesting(0);
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
   consumers_.clear();
   queue_->SkipFinalFlushForTesting();
   stall_.Release();
   queue_.reset();
   cold_.reset();
-  for (const auto& extent : extents) std::filesystem::resize_file(extent.path, extent.offset);
+  testing::SimulatePowerLoss(extent);
 
   ASSERT_NO_FATAL_FAILURE(OpenWal(GetParam(), kShards));
   ASSERT_NO_FATAL_FAILURE(OpenCold(kShards));

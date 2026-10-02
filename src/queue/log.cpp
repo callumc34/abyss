@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -229,12 +230,12 @@ struct PoolEntry {
 
 struct LogSegment {
   uint64_t ordinal = 0;
-  core::WallTime created_at;
   std::filesystem::path path;
   pfs::File file;
   pfs::MappedFile map;
   uint64_t salt = 0;
   // Set when sealed, under Log::Impl::mu.
+  core::WallTime sealed_at;
   std::vector<SegmentShardRange> shards;
 
   std::byte* frames() const noexcept { return map.data() + kLogSegmentHeaderBytes; }
@@ -321,6 +322,8 @@ struct Replayed {
   uint64_t verify_from = 0;
   uint64_t reported = 0;
   std::map<uint64_t, ShardSpans> spans;
+  // Newest appended_at_us among each segment's reported entries.
+  std::map<uint64_t, int64_t> newest;
 };
 
 // Recovery's second pass over each filled frame: the semantic checks,
@@ -382,6 +385,7 @@ class Replayer {
   LogPosition End(LogPosition stop) const { return batch_.empty() ? stop : batch_.front().pos; }
   uint64_t reported() const noexcept { return reported_; }
   std::map<uint64_t, ShardSpans>& spans() noexcept { return spans_; }
+  std::map<uint64_t, int64_t>& newest() noexcept { return newest_; }
 
  private:
   std::unexpected<core::Error> Corrupt(uint64_t ordinal, uint64_t off,
@@ -395,6 +399,9 @@ class Replayer {
     auto& spans = spans_[recovered.ordinal];
     if (spans.empty()) spans.resize(shard_count_);
     Note(spans, recovered.header);
+    const auto [newest, first] =
+        newest_.try_emplace(recovered.ordinal, recovered.header.appended_at_us);
+    if (!first) newest->second = std::max(newest->second, recovered.header.appended_at_us);
     ++reported_;
   }
 
@@ -407,6 +414,7 @@ class Replayer {
   LogPosition batch_end_ = 0;
   uint64_t reported_ = 0;
   std::map<uint64_t, ShardSpans> spans_;
+  std::map<uint64_t, int64_t> newest_;
 };
 
 std::atomic<Log::OpenStep> g_crash_after{Log::OpenStep::kNone};
@@ -425,7 +433,9 @@ std::size_t RingSlots(const LogConfig& config) {
 
 }  // namespace
 
-struct Log::Impl {
+// The completion ring's cache-line alignment rounds this up; the fields
+// stay grouped by use.
+struct Log::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding)
   explicit Impl(Log& owner)
       : log(owner),
         frame_space(owner.config_.segment_size_bytes - kLogSegmentHeaderBytes),
@@ -498,6 +508,7 @@ struct Log::Impl {
   std::map<uint64_t, std::shared_ptr<LogSegment>> segments ABYSS_GUARDED_BY(mu);
   // Ordinals below this are sealed.
   uint64_t sealed_end ABYSS_GUARDED_BY(mu) = 0;
+  core::WallTime last_sealed_at ABYSS_GUARDED_BY(mu);
   // Reclaimed, oldest first, waiting for readers to let go.
   std::deque<std::shared_ptr<LogSegment>> deferred ABYSS_GUARDED_BY(mu);
   // Reclaimed files that could not be removed yet, oldest first. They
@@ -520,9 +531,11 @@ struct Log::Impl {
   std::atomic<uint64_t> syncs{0};
   std::atomic<bool> has_sync_error{false};
   std::atomic<bool> has_remove_error{false};
+  std::atomic<bool> has_flush_hook{false};
   std::mutex seam_mu;
   std::optional<core::Error> sync_error ABYSS_GUARDED_BY(seam_mu);
   std::optional<core::Error> remove_error ABYSS_GUARDED_BY(seam_mu);
+  std::function<core::Result<void>()> flush_hook ABYSS_GUARDED_BY(seam_mu);
 
   metrics::GaugeHandle spare_gauge;
   metrics::GaugeHandle free_gauge;
@@ -631,13 +644,17 @@ core::Result<void> Log::Impl::Sync(const LogSegment& segment) {
 
 void Log::Impl::SealBelow(LogPosition durable) {
   const uint64_t end = durable / frame_space;
+  const core::WallTime now = log.config_.wall_clock();
   {
     const std::scoped_lock lock(mu);
     for (uint64_t ordinal = sealed_end; ordinal < end; ++ordinal) {
       ring[ordinal & ring_mask].store(nullptr, std::memory_order_seq_cst);
       auto spans = open_spans.extract(ordinal);
       const auto it = segments.find(ordinal);
-      if (it != segments.end() && !spans.empty()) it->second->shards = Ranges(spans.mapped());
+      if (it == segments.end()) continue;
+      last_sealed_at = std::max(last_sealed_at, now);
+      it->second->sealed_at = last_sealed_at;
+      if (!spans.empty()) it->second->shards = Ranges(spans.mapped());
     }
     sealed_end = std::max(sealed_end, end);
   }
@@ -719,7 +736,7 @@ core::Result<std::shared_ptr<LogSegment>> Log::Impl::Prepare(uint64_t ordinal,
     return fail(tmp, drawn.error());
   }
   const auto salt = binary::LoadLE<uint64_t>(random.data());
-  const core::WallTime created_at = core::WallClock::now();
+  const core::WallTime created_at = config.wall_clock();
   std::vector<std::byte> header(kLogSegmentHeaderBytes);
   EncodeLogSegmentHeader(LogSegmentHeader{.log_id = config.log_id,
                                           .ordinal = ordinal,
@@ -743,7 +760,6 @@ core::Result<std::shared_ptr<LogSegment>> Log::Impl::Prepare(uint64_t ordinal,
 
   auto segment = std::make_shared<LogSegment>();
   segment->ordinal = ordinal;
-  segment->created_at = created_at;
   segment->path = path;
   segment->file = std::move(file);
   segment->map = std::move(*map);
@@ -1035,6 +1051,7 @@ core::Result<Replayed> Log::Impl::Replay(const OnDisk& disk, const FrameFn& on_f
   replayed.end = replayer.End(second->end);
   replayed.reported = replayer.reported();
   replayed.spans = std::move(replayer.spans());
+  replayed.newest = std::move(replayer.newest());
   return replayed;
 }
 
@@ -1110,11 +1127,17 @@ core::Result<void> Log::Impl::Adopt(OnDisk& disk, Replayed& replayed) {
     }
     auto segment = std::make_shared<LogSegment>();
     segment->ordinal = ordinal;
-    segment->created_at = seg.header->created_at;
     segment->path = seg.path;
     segment->file = std::move(seg.file);
     segment->map = std::move(seg.map);
     segment->salt = seg.salt;
+    // Its newest entry was appended about when it was last written to.
+    core::WallTime sealed_at = seg.header->created_at;
+    if (auto it = replayed.newest.find(ordinal); it != replayed.newest.end()) {
+      sealed_at = core::WallTime(std::chrono::microseconds(it->second));
+    }
+    last_sealed_at = std::max(last_sealed_at, sealed_at);
+    segment->sealed_at = last_sealed_at;
     if (auto it = replayed.spans.find(ordinal); it != replayed.spans.end()) {
       segment->shards = Ranges(it->second);
     }
@@ -1283,6 +1306,16 @@ core::Result<Log::Flushed> Log::Flush(const DurableFn& on_frame) {
   const LogPosition from = durable_.load(std::memory_order_relaxed);
   Flushed flushed{.from = from, .to = to};
   if (to <= from) return flushed;
+  if (impl.has_flush_hook.load(std::memory_order_acquire)) {
+    std::function<core::Result<void>()> hook;
+    {
+      const std::scoped_lock lock(impl.seam_mu);
+      hook = impl.flush_hook;
+    }
+    if (hook) {
+      if (auto hooked = hook(); !hooked.has_value()) return std::unexpected(hooked.error());
+    }
+  }
 
   const auto segment_at = [&impl](uint64_t ordinal) -> core::Result<LogSegment*> {
     LogSegment* segment = impl.RingSegment(ordinal);
@@ -1418,7 +1451,7 @@ std::vector<SegmentInfo> Log::SealedSegments(std::size_t max_count) const {
   for (const auto& [ordinal, segment] : impl.segments) {
     if (ordinal >= impl.sealed_end || out.size() >= max_count) break;
     out.push_back(SegmentInfo{
-        .ordinal = ordinal, .created_at = segment->created_at, .shards = segment->shards});
+        .ordinal = ordinal, .sealed_at = segment->sealed_at, .shards = segment->shards});
   }
   return out;
 }
@@ -1511,6 +1544,12 @@ void Log::InjectRemoveErrorForTesting(core::Error error) {
   const std::scoped_lock lock(impl_->seam_mu);
   impl_->remove_error = std::move(error);
   impl_->has_remove_error.store(true, std::memory_order_release);
+}
+
+void Log::SetFlushHookForTesting(std::function<core::Result<void>()> hook) {
+  const std::scoped_lock lock(impl_->seam_mu);
+  impl_->flush_hook = std::move(hook);
+  impl_->has_flush_hook.store(true, std::memory_order_release);
 }
 
 void Log::InjectSyncErrorForTesting(core::Error error) {

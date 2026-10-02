@@ -120,6 +120,8 @@ bool Server::Initialize() {
       .segment_size_bytes = config_.queue.segment_size_bytes,
       .max_value_size_bytes = config_.queue.max_value_size_bytes,
       .shard_count = hot_store_->shard_count(),
+      .log_count = config_.queue.log_count,
+      .ring_entries = config_.queue.ring_entries,
       .durability = config_.queue.durability,
       .durability_window_bytes = config_.queue.durability_window_bytes,
       .durability_window = config_.queue.durability_window,

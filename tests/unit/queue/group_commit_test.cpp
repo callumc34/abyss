@@ -8,7 +8,6 @@
 #include <condition_variable>
 #include <future>
 #include <mutex>
-#include <optional>
 #include <thread>
 #include <vector>
 
@@ -23,25 +22,25 @@ using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 using Extent = GroupCommitter::Extent;
 
-// Stands in for a shard: the published end it snapshots, and a gate that
-// holds each flush until the test releases it.
+// Stands in for a log: the filled end each flush snapshots, and a gate
+// that holds each flush until the test releases it.
 class FakeLog {
  public:
-  void Publish(core::SequenceId end) {
+  void Publish(LogPosition end) {
     const std::scoped_lock lock(mu_);
     published_ = end;
   }
 
   // Each flush snapshots the published end, then waits at the gate while
-  // the gate is closed. Returns the snapshot.
+  // the gate is closed. Returns the snapshot, one entry per position.
   core::Result<Extent> Flush() {
     std::unique_lock lock(mu_);
     starts_.push_back(Clock::now());
-    const Extent snapshot{.end = published_, .bytes = published_ * 10};
+    const Extent snapshot{.end = published_, .entries = published_ - flushed_};
+    flushed_ = published_;
     cv_.notify_all();
     cv_.wait(lock, [this] { return open_ || releases_ > 0; });
     if (releases_ > 0) --releases_;
-    ++completed_;
     cv_.notify_all();
     return snapshot;
   }
@@ -70,10 +69,6 @@ class FakeLog {
     std::unique_lock lock(mu_);
     return cv_.wait_for(lock, timeout, [this, n] { return starts_.size() >= n; });
   }
-  bool AwaitCompleted(size_t n, std::chrono::milliseconds timeout = 5s) {
-    std::unique_lock lock(mu_);
-    return cv_.wait_for(lock, timeout, [this, n] { return completed_ >= n; });
-  }
 
   size_t starts() {
     const std::scoped_lock lock(mu_);
@@ -91,14 +86,22 @@ class FakeLog {
  private:
   std::mutex mu_;
   std::condition_variable cv_;
-  core::SequenceId published_ = 0;
+  LogPosition published_ = 0;
+  LogPosition flushed_ = 0;
   bool open_ = true;
   int releases_ = 0;
-  size_t completed_ = 0;
   std::vector<Clock::time_point> starts_;
 };
 
-bool Ready(DurabilityFuture& f) { return f.wait_for(0ms) == std::future_status::ready; }
+bool AwaitDurableEnd(const GroupCommitter& committer, LogPosition end,
+                     std::chrono::milliseconds timeout = 5s) {
+  const auto deadline = Clock::now() + timeout;
+  while (committer.DurableEnd() < end) {
+    if (Clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(100us);
+  }
+  return true;
+}
 
 class GroupCommitterTest : public ::testing::Test {
  protected:
@@ -110,19 +113,19 @@ class GroupCommitterTest : public ::testing::Test {
 };
 
 TEST_F(GroupCommitterTest, LoneWriteFlushesWithoutDelay) {
-  GroupCommitter committer({}, log_.Fn(), nullptr);
+  GroupCommitter committer(0, log_.Fn(), nullptr);
   // An idle committer never flushes on its own: there is no timer.
   std::this_thread::sleep_for(20ms);
   EXPECT_EQ(log_.starts(), 0U);
 
   Clock::duration best = Clock::duration::max();
-  for (core::SequenceId end = 1; end <= 20; ++end) {
+  for (LogPosition end = 1; end <= 20; ++end) {
     log_.Publish(end);
     const auto published_at = Clock::now();
     committer.Published(end);
     ASSERT_TRUE(log_.AwaitStarts(end));
     best = std::min(best, log_.start(end - 1) - published_at);
-    ASSERT_TRUE(committer.AwaitDurable(end - 1, 5s));
+    ASSERT_TRUE(AwaitDurableEnd(committer, end));
   }
   // A 1 ms interval timer would put every start at or past 1 ms.
   EXPECT_LT(best, 500us) << "best start latency "
@@ -131,20 +134,20 @@ TEST_F(GroupCommitterTest, LoneWriteFlushesWithoutDelay) {
 }
 
 TEST_F(GroupCommitterTest, PublishesDuringASlowFlushFormOneNextFlush) {
-  GroupCommitter committer({}, log_.Fn(), nullptr);
+  GroupCommitter committer(0, log_.Fn(), nullptr);
   log_.Close();
   log_.Publish(1);
   committer.Published(1);
   ASSERT_TRUE(log_.AwaitStarts(1));
 
-  constexpr core::SequenceId kLast = 50;
-  for (core::SequenceId end = 2; end <= kLast; ++end) {
+  constexpr LogPosition kLast = 50;
+  for (LogPosition end = 2; end <= kLast; ++end) {
     log_.Publish(end);
     committer.Published(end);
   }
   log_.Open();
 
-  ASSERT_TRUE(committer.AwaitDurable(kLast - 1, 5s));
+  ASSERT_TRUE(AwaitDurableEnd(committer, kLast));
   std::this_thread::sleep_for(20ms);
   EXPECT_EQ(log_.starts(), 2U);
   EXPECT_EQ(committer.DurableEnd(), kLast);
@@ -154,112 +157,63 @@ TEST_F(GroupCommitterTest, PublishesDuringASlowFlushFormOneNextFlush) {
             static_cast<double>(kLast));
 }
 
-TEST_F(GroupCommitterTest, WaitersResolveInSeqOrderAndNeverEarly) {
-  std::vector<std::pair<Extent, Extent>> flushed;
-  GroupCommitter committer({}, log_.Fn(), [&flushed](Extent previous, Extent now) {
-    flushed.emplace_back(previous, now);
+TEST_F(GroupCommitterTest, FlushedRunsBeforeTheEndIsVisibleAndNeverEarly) {
+  struct Seen {
+    LogPosition previous;
+    LogPosition end;
+    LogPosition visible;
+  };
+  std::vector<Seen> seen;
+  GroupCommitter* self = nullptr;
+  GroupCommitter committer(0, log_.Fn(), [&](LogPosition previous, Extent flushed) {
+    seen.push_back({previous, flushed.end, self->DurableEnd()});
   });
+  self = &committer;
   log_.Close();
 
-  std::vector<DurabilityFuture> futures;
-  futures.reserve(3);
   log_.Publish(3);
-  for (core::SequenceId seq = 0; seq < 3; ++seq) futures.push_back(committer.WhenDurable(seq));
   committer.Published(3);
   ASSERT_TRUE(log_.AwaitStarts(1));
-
   // Published while the first flush is held: not covered by it.
   log_.Publish(7);
-  for (core::SequenceId seq = 3; seq < 7; ++seq) futures.push_back(committer.WhenDurable(seq));
   committer.Published(7);
-  for (auto& f : futures) EXPECT_FALSE(Ready(f));
+  EXPECT_EQ(committer.DurableEnd(), 0U);
 
   log_.ReleaseOne();
   ASSERT_TRUE(log_.AwaitStarts(2));
-  for (core::SequenceId seq = 0; seq < 3; ++seq) {
-    ASSERT_EQ(futures[seq].wait_for(5s), std::future_status::ready) << seq;
-  }
-  for (core::SequenceId seq = 3; seq < 7; ++seq) EXPECT_FALSE(Ready(futures[seq])) << seq;
+  ASSERT_TRUE(AwaitDurableEnd(committer, 3));
   EXPECT_EQ(committer.DurableEnd(), 3U);
 
   log_.ReleaseOne();
-  for (auto& f : futures) {
-    ASSERT_EQ(f.wait_for(5s), std::future_status::ready);
-    EXPECT_TRUE(f.get().has_value());
-  }
-  EXPECT_EQ(committer.DurableEnd(), 7U);
+  ASSERT_TRUE(AwaitDurableEnd(committer, 7));
   log_.Open();
   committer.Stop(/*final_flush=*/true);
-  ASSERT_EQ(flushed.size(), 2U);
-  EXPECT_EQ(flushed[0].first.end, 0U);
-  EXPECT_EQ(flushed[0].second.end, 3U);
-  EXPECT_EQ(flushed[1].first.end, 3U);
-  EXPECT_EQ(flushed[1].second.end, 7U);
-  EXPECT_EQ(flushed[1].second.bytes, 70U);
+  ASSERT_EQ(seen.size(), 2U);
+  EXPECT_EQ(seen[0].previous, 0U);
+  EXPECT_EQ(seen[0].end, 3U);
+  EXPECT_EQ(seen[0].visible, 0U);
+  EXPECT_EQ(seen[1].previous, 3U);
+  EXPECT_EQ(seen[1].end, 7U);
+  EXPECT_EQ(seen[1].visible, 3U);
 }
 
-TEST_F(GroupCommitterTest, AlreadyDurableSeqResolvesAtOnce) {
-  GroupCommitter committer({.end = 5, .bytes = 0}, log_.Fn(), nullptr);
-  auto f = committer.WhenDurable(4);
-  EXPECT_TRUE(Ready(f));
-  EXPECT_TRUE(committer.AwaitDurable(4, 0ms));
-  EXPECT_FALSE(committer.AwaitDurable(5, 0ms));
-}
-
-TEST_F(GroupCommitterTest, AwaitDurableTimesOut) {
-  GroupCommitter committer({}, log_.Fn(), nullptr);
-  log_.Close();
-  log_.Publish(1);
-  committer.Published(1);
-  ASSERT_TRUE(log_.AwaitStarts(1));
-
-  const auto start = Clock::now();
-  EXPECT_FALSE(committer.AwaitDurable(0, 30ms));
-  EXPECT_GE(Clock::now() - start, 30ms);
-
-  log_.Open();
-  EXPECT_TRUE(committer.AwaitDurable(0, 5s));
-}
-
-TEST_F(GroupCommitterTest, StopResolvesOutstandingWaitersUnavailable) {
-  GroupCommitter committer({}, log_.Fn(), nullptr);
-  auto pending = committer.WhenDurable(0);
-  committer.Stop(/*final_flush=*/false);
-
-  ASSERT_TRUE(Ready(pending));
-  auto result = pending.get();
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
-
-  auto late = committer.WhenDurable(0);
-  ASSERT_TRUE(Ready(late));
-  EXPECT_FALSE(late.get().has_value());
-  EXPECT_FALSE(committer.AwaitDurable(0, 1s));
-  committer.Stop(/*final_flush=*/false);
-}
-
-TEST_F(GroupCommitterTest, StopWakesAwaiters) {
-  GroupCommitter committer({}, log_.Fn(), nullptr);
-  auto awaiting = std::async(std::launch::async, [&] { return committer.AwaitDurable(0, 10s); });
+TEST_F(GroupCommitterTest, StartsAtTheRecoveredEnd) {
+  GroupCommitter committer(5, log_.Fn(), nullptr);
+  EXPECT_EQ(committer.DurableEnd(), 5U);
+  // Nothing past the recovered end is published, so nothing flushes.
+  committer.Published(5);
   std::this_thread::sleep_for(10ms);
-  const auto start = Clock::now();
-  committer.Stop(/*final_flush=*/false);
-  ASSERT_EQ(awaiting.wait_for(5s), std::future_status::ready);
-  EXPECT_FALSE(awaiting.get());
-  EXPECT_LT(Clock::now() - start, 5s);
+  EXPECT_EQ(log_.starts(), 0U);
 }
 
 TEST_F(GroupCommitterTest, FinalFlushCoversTheRemainder) {
-  GroupCommitter committer({}, log_.Fn(), nullptr);
+  GroupCommitter committer(0, log_.Fn(), nullptr);
   log_.Close();
   log_.Publish(1);
   committer.Published(1);
   ASSERT_TRUE(log_.AwaitStarts(1));
 
   log_.Publish(4);
-  std::vector<DurabilityFuture> futures;
-  futures.reserve(4);
-  for (core::SequenceId seq = 0; seq < 4; ++seq) futures.push_back(committer.WhenDurable(seq));
   committer.Published(4);
 
   auto stopped = std::async(std::launch::async, [&] { committer.Stop(/*final_flush=*/true); });
@@ -267,10 +221,6 @@ TEST_F(GroupCommitterTest, FinalFlushCoversTheRemainder) {
   ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
   EXPECT_EQ(committer.DurableEnd(), 4U);
   EXPECT_EQ(log_.starts(), 2U);
-  for (auto& f : futures) {
-    ASSERT_TRUE(Ready(f));
-    EXPECT_TRUE(f.get().has_value());
-  }
 }
 
 // The commit thread cannot unwind a throwing fatal capture, so the
@@ -280,7 +230,7 @@ TEST(GroupCommitterDeathTest, FlushFailureIsFatal) {
   EXPECT_DEATH(
       {
         GroupCommitter committer(
-            {},
+            0,
             [] {
               return core::Result<Extent>(std::unexpected(
                   core::Error{core::ErrorCode::kInternal, "injected device failure"}));
