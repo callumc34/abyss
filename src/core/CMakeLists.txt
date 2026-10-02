@@ -12,6 +12,7 @@ add_library(abyss_core
   atomic_file.cpp
   fatal.cpp
   durability.cpp
+  queue.cpp
 )
 add_library(abyss::core ALIAS abyss_core)
 

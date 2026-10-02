@@ -2,12 +2,11 @@
 
 #include <chrono>
 #include <string>
-#include <variant>
+#include <utility>
 
-#include "abyss/resp/parser.h"
-#include "abyss/resp/serializer.h"
 #include "binary_io.h"
 #include "crc32c.h"
+#include "entry_payload.h"
 
 namespace abyss::queue {
 
@@ -21,59 +20,6 @@ core::Error Corrupted(const char* what) {
   return {core::ErrorCode::kCorruption, std::string("WAL entry corruption: ") + what};
 }
 
-void WriteRespCommand(std::vector<std::byte>& out, const core::RespCommand& cmd) {
-  binary::WriteU32LE(out, static_cast<uint32_t>(cmd.args.size()));
-  for (const auto& arg : cmd.args) {
-    binary::WriteU32LE(out, static_cast<uint32_t>(arg.size()));
-    binary::AppendBytes(out, arg.data(), arg.size());
-  }
-}
-
-core::Result<core::RespCommand> ReadRespCommand(std::span<const std::byte>& cursor) {
-  uint32_t arg_count = 0;
-  if (!binary::ReadU32LE(cursor, arg_count)) {
-    return std::unexpected(Corrupted("missing arg_count"));
-  }
-  core::RespCommand cmd;
-  cmd.args.reserve(arg_count);
-  for (uint32_t i = 0; i < arg_count; ++i) {
-    uint32_t arg_len = 0;
-    if (!binary::ReadU32LE(cursor, arg_len)) {
-      return std::unexpected(Corrupted("missing arg length"));
-    }
-    if (cursor.size() < arg_len) {
-      return std::unexpected(Corrupted("missing arg bytes"));
-    }
-    const auto* data = reinterpret_cast<const char*>(cursor.data());
-    cmd.args.emplace_back(data, arg_len);
-    cursor = cursor.subspan(arg_len);
-  }
-  return cmd;
-}
-
-void WriteRespValue(std::vector<std::byte>& out, const core::RespValue& val) {
-  auto serialized = resp::Serializer::Serialize(val);
-  binary::WriteU32LE(out, static_cast<uint32_t>(serialized.size()));
-  binary::AppendBytes(out, reinterpret_cast<const char*>(serialized.data()), serialized.size());
-}
-
-WalEntryType EntryType(const core::QueueEntry& entry) {
-  return std::visit(
-      [](const auto& p) -> WalEntryType {
-        using T = std::decay_t<decltype(p)>;
-        if constexpr (std::is_same_v<T, core::entry::Write>) {
-          return WalEntryType::kWrite;
-        } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-          return WalEntryType::kConditional;
-        } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          return WalEntryType::kResolved;
-        } else {
-          return WalEntryType::kFlush;
-        }
-      },
-      entry.payload);
-}
-
 }  // namespace
 
 size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last_seq,
@@ -84,7 +30,7 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last
   WriteU32LE(out, 0);
   const size_t body_start = out.size();
 
-  WriteU8(out, static_cast<uint8_t>(EntryType(entry)));
+  WriteU8(out, static_cast<uint8_t>(entry_payload::TypeOf(entry)));
   WriteU64LE(out, entry.seq);
 
   const auto appended_us =
@@ -92,27 +38,7 @@ size_t EncodeWalEntry(const core::QueueEntry& entry, core::SequenceId batch_last
           .count();
   WriteI64LE(out, appended_us);
 
-  std::visit(
-      [&out](const auto& p) {
-        using T = std::decay_t<decltype(p)>;
-        if constexpr (std::is_same_v<T, core::entry::Write>) {
-          WriteRespCommand(out, p.cmd);
-        } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-          binary::WriteU16LE(out, static_cast<uint16_t>(p.flags));
-          WriteRespCommand(out, p.cmd);
-        } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          binary::WriteU64LE(out, p.ref);
-          binary::WriteU8(out, static_cast<uint8_t>(p.decision));
-          binary::WriteU32LE(out, static_cast<uint32_t>(p.materialised_ops.size()));
-          for (const auto& op : p.materialised_ops) {
-            WriteRespCommand(out, op);
-          }
-          WriteRespValue(out, p.return_value);
-        } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
-          // No payload.
-        }
-      },
-      entry.payload);
+  entry_payload::Encode(entry, out);
 
   WriteU64LE(out, batch_last_seq);
 
@@ -184,82 +110,9 @@ core::Result<DecodedWalEntry> DecodeWalEntry(std::span<const std::byte> bytes, u
   }
   qe.appended_at = core::WallTime(std::chrono::microseconds(appended_us));
 
-  switch (static_cast<WalEntryType>(type_byte)) {
-    case WalEntryType::kWrite: {
-      auto cmd = ReadRespCommand(cursor);
-      if (!cmd.has_value()) return std::unexpected(cmd.error());
-      qe.payload = core::entry::Write{.cmd = std::move(*cmd)};
-      break;
-    }
-    case WalEntryType::kConditional: {
-      uint16_t flags = 0;
-      if (!ReadU16LE(cursor, flags)) {
-        return std::unexpected(Corrupted("missing predicate flags"));
-      }
-      auto cmd = ReadRespCommand(cursor);
-      if (!cmd.has_value()) return std::unexpected(cmd.error());
-      qe.payload = core::entry::Conditional{
-          .cmd = std::move(*cmd),
-          .flags = static_cast<core::PredicateFlags>(flags),
-      };
-      break;
-    }
-    case WalEntryType::kResolved: {
-      uint64_t ref = 0;
-      if (!ReadU64LE(cursor, ref)) {
-        return std::unexpected(Corrupted("missing ref"));
-      }
-      uint8_t decision = 0;
-      if (!ReadU8(cursor, decision)) {
-        return std::unexpected(Corrupted("missing decision"));
-      }
-      uint32_t op_count = 0;
-      if (!ReadU32LE(cursor, op_count)) {
-        return std::unexpected(Corrupted("missing materialised_ops count"));
-      }
-      std::vector<core::RespCommand> mat_ops;
-      mat_ops.reserve(op_count);
-      for (uint32_t i = 0; i < op_count; ++i) {
-        auto cmd = ReadRespCommand(cursor);
-        if (!cmd.has_value()) return std::unexpected(cmd.error());
-        mat_ops.push_back(std::move(*cmd));
-      }
-      uint32_t resp_len = 0;
-      if (!ReadU32LE(cursor, resp_len)) {
-        return std::unexpected(Corrupted("missing return_value length"));
-      }
-      if (cursor.size() < resp_len) {
-        return std::unexpected(Corrupted("truncated return_value"));
-      }
-      auto resp_bytes = cursor.first(resp_len);
-      // Bound the parse with the replay envelope: a crafted inner array/bulk
-      // count cannot abort recovery via length_error/bad_alloc (RESP-1). A
-      // parse failure on a CRC-valid frame is genuine corruption — surface it
-      // (kCorruptFrame is already set above) instead of silently substituting
-      // nil, so recovery fails-stop and the corruption counter is bumped
-      // (QUEUE-6). It is never left as a default-constructed kNull.
-      auto parsed_resp =
-          resp::Parser::Parse({reinterpret_cast<const uint8_t*>(resp_bytes.data()), resp_len},
-                              resp::ParserLimits::ForWalReplay());
-      if (!parsed_resp.has_value()) {
-        return std::unexpected(Corrupted("return_value parse failed"));
-      }
-      cursor = cursor.subspan(resp_len);
-
-      qe.payload = core::entry::Resolved{
-          .ref = ref,
-          .decision = static_cast<core::Decision>(decision),
-          .materialised_ops = std::move(mat_ops),
-          .return_value = std::move(parsed_resp->value),
-      };
-      break;
-    }
-    case WalEntryType::kFlush:
-      qe.payload = core::entry::Flush{};
-      break;
-    default:
-      return std::unexpected(Corrupted("unknown entry type"));
-  }
+  auto payload = entry_payload::Decode(static_cast<WalEntryType>(type_byte), cursor);
+  if (!payload.has_value()) return std::unexpected(payload.error());
+  qe.payload = std::move(*payload);
 
   core::SequenceId batch_last_seq = qe.seq;
   if (format_minor >= 1) {
