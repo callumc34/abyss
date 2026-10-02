@@ -39,11 +39,16 @@ class ShardStream::Publisher final : public AppendPublisher {
             LogPosition end_pos) noexcept
       : stream_(stream), lock_(std::move(lock)), end_(end), end_pos_(end_pos) {}
 
+  // Only allocation can throw here, and an OOM while publishing may
+  // terminate.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
   void Publish() noexcept override {
     if (!lock_.owns_lock()) return;
     // Under the lock, so published ends never regress.
     stream_.published_end_.store(end_, std::memory_order_seq_cst);
     lock_.unlock();
+    // A flush may have covered these frames before they were published.
+    if (stream_.RaisePowerEnd()) stream_.PowerAdvanced();
     stream_.Published(end_pos_);
   }
 
@@ -93,6 +98,7 @@ void ShardStream::FinishRecovery(core::SequenceId next) {
   next_seq_ = next;
   first_seq_.store(recovered_first_.value_or(next), std::memory_order_release);
   published_end_.store(next, std::memory_order_release);
+  flushed_end_.store(next, std::memory_order_release);
   power_end_.store(next, std::memory_order_release);
 }
 
@@ -293,8 +299,26 @@ bool ShardStream::Durable(const frame::Header& header, uint32_t size) noexcept {
   // A batch is visible at power_loss only once its last frame is
   // durable.
   if (header.batch_rest != size) return false;
-  power_end_.store(header.seq + 1, std::memory_order_release);
-  return true;
+  flushed_end_.store(header.seq + 1, std::memory_order_seq_cst);
+  return RaisePowerEnd();
+}
+
+// The power end is the flushed end, but never past the published one:
+// a frame is filled, and may be flushed, before its PendingAppend is
+// published, and nothing may see it until then. The flusher stores the
+// flushed end and the publisher the published end, each then reading
+// the other, all seq_cst, so the later of the two raises it.
+bool ShardStream::RaisePowerEnd() noexcept {
+  const core::SequenceId target = std::min(flushed_end_.load(std::memory_order_seq_cst),
+                                           published_end_.load(std::memory_order_seq_cst));
+  core::SequenceId current = power_end_.load(std::memory_order_relaxed);
+  while (target > current) {
+    if (power_end_.compare_exchange_weak(current, target, std::memory_order_release,
+                                         std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void ShardStream::PowerAdvanced() {

@@ -437,6 +437,7 @@ int main(int argc, char** argv) {
                  "process_crash (evaluates W1) | power_loss (evaluates W2)");
   app.add_option("--shards", config.hot.shard_count, "Shard count");
   app.add_option("--segment-size-bytes", config.queue.segment_size_bytes, "WAL segment size");
+  app.add_option("--log-count", config.queue.log_count, "Physical WAL logs, a power of two");
   app.add_option("--quiet-threshold-s", quiet_threshold_s, "Cold consumer quiet threshold");
   app.add_option("--prefill-entries", prefill_entries,
                  "WAL entries appended and drained before measuring");
@@ -549,6 +550,7 @@ int main(int argc, char** argv) {
       {"durability", std::string{abyss::core::DurabilityName(config.queue.durability)}},
       {"shard_count", std::to_string(config.hot.shard_count)},
       {"segment_size_bytes", std::to_string(config.queue.segment_size_bytes)},
+      {"log_count", std::to_string(config.queue.log_count)},
       {"cold_quiet_threshold_s", std::to_string(quiet_threshold_s)},
       {"value_size_bytes", std::to_string(args.value_size_bytes)},
       {"prefill_entries", std::to_string(prefill_entries)},

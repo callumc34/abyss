@@ -35,6 +35,10 @@
 #include "commit_word.h"
 #include "segment_header_v2.h"
 
+#if defined(_M_X64) || defined(_M_IX86)
+#include <intrin.h>
+#endif
+
 ABYSS_LOG_COMPONENT("abyss.queue.log")
 
 namespace abyss::queue {
@@ -64,6 +68,16 @@ constexpr std::string_view kTmpSuffix = ".seg.tmp";
 constexpr std::string_view kFreePrefix = "free-";
 
 uint32_t Gen(uint64_t ordinal) noexcept { return static_cast<uint32_t>(ordinal); }
+
+void CpuRelax() noexcept {
+#if defined(_M_X64) || defined(_M_IX86)
+  _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elifdef __aarch64__
+  __asm__ __volatile__("yield");
+#endif
+}
 
 std::string Padded(uint64_t ordinal) {
   const std::string digits = std::to_string(ordinal);
@@ -562,12 +576,16 @@ void Log::Impl::Complete(Completion done) {
 }
 
 // The flag exchange acquires what the last holder left, and its release
-// hands it on. A pusher publishes, then exchanges; a holder releases,
-// then re-checks the ring; all four are seq_cst. So a pusher that finds
-// the flag held has its completion seen by that holder's re-check.
+// hands it on. A pusher publishes, then tests or exchanges the flag; a
+// holder releases, then re-checks the ring; all are seq_cst. So a
+// pusher that finds the flag held has its completion seen by that
+// holder's re-check. Testing first keeps waiters off the flag's line.
 void Log::Impl::Combine() {
   do {
-    if (combining.exchange(true, std::memory_order_seq_cst)) return;
+    if (combining.load(std::memory_order_seq_cst) ||
+        combining.exchange(true, std::memory_order_seq_cst)) {
+      return;
+    }
     Fold(nullptr);
     combining.store(false, std::memory_order_seq_cst);
   } while (completions.Ready());
@@ -1287,12 +1305,22 @@ void Log::AwaitFilled(LogPosition end) const {
   const auto start = std::chrono::steady_clock::now();
   bool spinning = true;
   while (filled_.load(std::memory_order_acquire) < end) {
-    if (impl_->completions.Ready()) impl_->Combine();
+    if (!impl_->combining.load(std::memory_order_relaxed) && impl_->completions.Ready()) {
+      impl_->Combine();
+    }
     if (spinning && std::chrono::steady_clock::now() - start >= kSpinFor) spinning = false;
-    if (!spinning) std::this_thread::yield();
+    if (spinning) {
+      CpuRelax();
+    } else {
+      std::this_thread::yield();
+    }
   }
-  impl_->fill_wait.Observe(
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  // A wait inside the spin is a neighbour mid-copy; only longer ones,
+  // behind a large value or a preempted filler, are worth recording.
+  if (!spinning) {
+    impl_->fill_wait.Observe(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  }
 }
 
 LogPosition Log::ReservedTail() const noexcept {

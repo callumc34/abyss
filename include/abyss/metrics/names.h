@@ -358,7 +358,7 @@ inline constexpr HistogramDesc<> kWalFillWaitSeconds{
     .name = "abyss_wal_fill_wait_seconds",
     .help =
         "Time an append waited for earlier WAL reservations to be filled; recorded only "
-        "when it waited.",
+        "when the wait outlasted a short spin.",
     .buckets = buckets::kLatencySeconds,
 };
 
