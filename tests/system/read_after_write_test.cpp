@@ -15,9 +15,8 @@ namespace {
 //
 // Per-test isolated server (the durability-test pattern for write-heavy
 // acceptance tests): a fresh empty server per test gives true isolation and
-// avoids the shared fixture's FLUSHDB cleanup, whose read floor stalls behind a
-// burst of unflushed writes to a hot key (cold_consumer.cpp read-offset FIXME),
-// which is orthogonal to read-after-write.
+// keeps the shared fixture's FLUSHDB cleanup, which is orthogonal to
+// read-after-write, out of these tests.
 using ReadAfterWriteFixture = IsolatedDataServerTest;
 
 TEST_F(ReadAfterWriteFixture, OverwriteSameKeyNeverStale) {

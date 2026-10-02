@@ -2,13 +2,20 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
+#include <random>
 #include <span>
 #include <string>
+#include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/queue_entry.h"
@@ -809,6 +816,172 @@ TEST_F(SegmentTest, AppendEncodedAcceptsPreEncodedBytes) {
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->entries.size(), 1U);
   ExpectWriteArgs(read->entries[0], {"SET", "key", "value"});
+}
+
+// --- Sparse index ---------------------------------------------------------------
+
+std::string ValueOf(const core::QueueEntry& entry) {
+  const auto* w = std::get_if<core::entry::Write>(&entry.payload);
+  return w != nullptr && w->cmd.args.size() >= 3 ? w->cmd.args[2] : std::string{};
+}
+
+// ReadEntriesFrom(seq) at every seq must equal the matching slice of one
+// linear decode from the segment start.
+void ExpectEveryStartMatchesLinearDecode(const Segment& seg, size_t window) {
+  auto linear = seg.ReadEntries(kSegmentHeaderSize, std::numeric_limits<size_t>::max());
+  ASSERT_TRUE(linear.has_value()) << linear.error().message();
+  ASSERT_EQ(linear->entries.size(), seg.next_seq() - seg.base_seq());
+  for (size_t i = 0; i < linear->entries.size(); ++i) {
+    const core::SequenceId seq = seg.base_seq() + i;
+    auto read = seg.ReadEntriesFrom(seq, window);
+    ASSERT_TRUE(read.has_value()) << "seq " << seq << ": " << read.error().message();
+    const size_t expected = std::min(window, linear->entries.size() - i);
+    ASSERT_EQ(read->entries.size(), expected) << "seq " << seq;
+    for (size_t j = 0; j < expected; ++j) {
+      ASSERT_EQ(read->entries[j].seq, linear->entries[i + j].seq);
+      ASSERT_EQ(ValueOf(read->entries[j]), ValueOf(linear->entries[i + j])) << "seq " << seq;
+    }
+  }
+}
+
+TEST_F(SegmentTest, ReadFromEverySeqMatchesLinearDecodeLiveAndReopened) {
+  const auto path = SegPath();
+  constexpr core::SequenceId kBase = 1000;
+  std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): deterministic by design
+  size_t live_index_size = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(kBase), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    core::SequenceId seq = kBase;
+    while (seg->write_offset() < size_t{512} * 1024) {
+      // Mix single entries and batches so frames carry both kinds of tail.
+      const size_t n = rng() % 4 == 0 ? 1 + (rng() % 5) : 1;
+      for (size_t i = 0; i < n; ++i) {
+        const auto value = std::to_string(seq + i) + std::string(50 + (rng() % 550), 'v');
+        ASSERT_TRUE(seg->Append(MakeWrite(seq + i, {"SET", "k", value}), seq + n - 1).has_value());
+      }
+      seq += n;
+    }
+    live_index_size = seg->index_size();
+    ASSERT_GE(live_index_size, 6U);
+    ExpectEveryStartMatchesLinearDecode(*seg, 4);
+  }
+
+  auto reopened = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  EXPECT_EQ(reopened->index_size(), live_index_size) << "Open rebuilt a different index";
+  ExpectEveryStartMatchesLinearDecode(*reopened, 4);
+}
+
+TEST_F(SegmentTest, EntriesLargerThanTheIndexIntervalAndReadChunk) {
+  const auto path = SegPath();
+  // Around the 64 KiB index interval and past the 256 KiB read chunk.
+  const std::vector<size_t> sizes{size_t{100} * 1024, 10, size_t{300} * 1024, size_t{70} * 1024, 5,
+                                  size_t{64} * 1024,  1,  size_t{257} * 1024};
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      const std::string value(sizes[i], static_cast<char>('a' + i));
+      ASSERT_TRUE(AppendSingle(*seg, MakeWrite(i, {"SET", "k", value})).has_value());
+    }
+    EXPECT_GE(seg->index_size(), 3U);
+    ExpectEveryStartMatchesLinearDecode(*seg, 3);
+  }
+  auto reopened = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  ExpectEveryStartMatchesLinearDecode(*reopened, 3);
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    auto read = reopened->ReadEntriesFrom(i, 1);
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(read->entries.size(), 1U);
+    EXPECT_EQ(ValueOf(read->entries[0]).size(), sizes[i]);
+  }
+}
+
+TEST_F(SegmentTest, IndexIsTrimmedToTheRecoveredTail) {
+  const auto path = SegPath();
+  // Replays the index rule to know where the last point sits.
+  std::vector<std::pair<core::SequenceId, size_t>> points;
+  size_t last_point = kSegmentHeaderSize;
+  core::SequenceId next = 0;
+  {
+    auto seg = Segment::Create(path, MakeHeader(0), kDefaultMaxSize);
+    ASSERT_TRUE(seg.has_value());
+    while (seg->write_offset() < size_t{400} * 1024) {
+      const size_t start = seg->write_offset();
+      if (start >= last_point + SegmentIndex::kIntervalBytes) {
+        points.emplace_back(next, start);
+        last_point = start;
+      }
+      ASSERT_TRUE(
+          AppendSingle(*seg, MakeWrite(next, {"SET", "k", std::string(300, 'x')})).has_value());
+      ++next;
+    }
+    ASSERT_EQ(seg->index_size(), points.size());
+  }
+  ASSERT_GE(points.size(), 3U);
+
+  // Tear the entry the last index point names.
+  const auto [torn_seq, torn_offset] = points.back();
+  TruncateTo(path, torn_offset + 5);
+
+  auto seg = Segment::Open(path, kDefaultMaxSize);
+  ASSERT_TRUE(seg.has_value()) << seg.error().message();
+  EXPECT_EQ(seg->next_seq(), torn_seq);
+  EXPECT_EQ(seg->write_offset(), torn_offset);
+  EXPECT_EQ(seg->index_size(), points.size() - 1) << "a point past the recovered tail survived";
+  for (core::SequenceId seq = torn_seq - 30; seq < torn_seq; ++seq) {
+    auto read = seg->ReadEntriesFrom(seq, 100);
+    ASSERT_TRUE(read.has_value()) << read.error().message();
+    ASSERT_EQ(read->entries.size(), torn_seq - seq);
+    EXPECT_EQ(read->entries.front().seq, seq);
+  }
+  auto past = seg->ReadEntriesFrom(torn_seq, 10);
+  ASSERT_TRUE(past.has_value());
+  EXPECT_TRUE(past->entries.empty());
+
+  // Appending past the trimmed tail keeps indexing correctly.
+  for (core::SequenceId seq = torn_seq; seq < torn_seq + 400; ++seq) {
+    ASSERT_TRUE(
+        AppendSingle(*seg, MakeWrite(seq, {"SET", "k", std::string(300, 'y')})).has_value());
+  }
+  EXPECT_GE(seg->index_size(), points.size());
+  ExpectEveryStartMatchesLinearDecode(*seg, 2);
+}
+
+// Readers search the active segment's index without the append lock while
+// the single writer publishes new points.
+TEST_F(SegmentTest, ConcurrentReadersSeePublishedIndexPoints) {
+  auto created = Segment::Create(SegPath(), MakeHeader(0), kDefaultMaxSize);
+  ASSERT_TRUE(created.has_value());
+  const Segment& seg = *created;
+  std::atomic<bool> done{false};
+
+  auto reader = [&seg, &done](uint32_t seed) {
+    std::mt19937 rng(seed);
+    while (!done.load(std::memory_order_acquire)) {
+      const core::SequenceId end = seg.next_seq();
+      if (end == 0) continue;
+      const core::SequenceId seq = rng() % end;
+      auto read = seg.ReadEntriesFrom(seq, 8);
+      ASSERT_TRUE(read.has_value()) << read.error().message();
+      ASSERT_FALSE(read->entries.empty());
+      for (size_t i = 0; i < read->entries.size(); ++i) {
+        ASSERT_EQ(read->entries[i].seq, seq + i);
+      }
+    }
+  };
+  std::thread r1(reader, 1);
+  std::thread r2(reader, 2);
+  for (core::SequenceId seq = 0; seq < 3000; ++seq) {
+    ASSERT_TRUE(
+        AppendSingle(*created, MakeWrite(seq, {"SET", "k", std::string(200, 'c')})).has_value());
+  }
+  done.store(true, std::memory_order_release);
+  r1.join();
+  r2.join();
+  EXPECT_GE(seg.index_size(), 8U);
 }
 
 TEST_F(SegmentTest, AppendEncodedRejectsOutOfOrderSeq) {

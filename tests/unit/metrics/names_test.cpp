@@ -73,6 +73,8 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kTtlExpiredTotal.name,
       names::kEvictedTotal.name,
       names::kPromotionsTotal.name,
+      names::kQueueOffsetPersistFailuresTotal.name,
+      names::kQueueReadOutOfRangeTotal.name,
   };
   std::set<std::string_view> seen;
   for (const auto name : kAllNames) {

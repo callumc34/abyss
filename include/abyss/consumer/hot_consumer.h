@@ -19,14 +19,17 @@
 
 namespace abyss::consumer {
 
-// One thread per shard in steady state. Conditional entries are held without
-// ack until the matching Resolved arrives (block-and-scan, ADP-011); ack is
-// clamped behind the oldest pending Conditional.
+// One thread per shard in steady state. Conditional entries are parked
+// until the matching Resolved arrives (block-and-scan, ADP-011); the
+// settled floor is clamped behind the oldest pending Conditional. Hot is
+// a volatile view: it commits no offset and rebuilds from the first
+// retained seq on restart.
 //
 // During recovery the consumer is driven synchronously through ReplayUntil()
 // instead of Start()/Run(). Replay sets replay_mode_, which gates the
 // skip-stale checks (ADP-007 invariants 3-4) so they don't fire on fresh
-// steady-state writes.
+// steady-state writes. Both share one read cursor, so Run resumes where
+// replay stopped.
 class HotConsumer {
  public:
   struct Config {
@@ -85,6 +88,10 @@ class HotConsumer {
 
  private:
   void Run();
+  // Reads from next_read_seq_, moving it to the first retained seq when the
+  // entries it points at were reclaimed.
+  core::Result<std::vector<core::QueueEntry>> ReadFromCursor(size_t max_count);
+  // Processes `batch` and advances next_read_seq_ past it.
   void ProcessBatch(std::vector<core::QueueEntry>& batch);
 
   void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
@@ -106,8 +113,8 @@ class HotConsumer {
                                     core::WallTime wall_now) const;
   static bool ShouldSkipForAbsTtlElapsed(uint64_t abs_ttl_ms, core::WallTime wall_now);
 
-  // Acks min(highest_settled, oldest_pending_conditional - 1).
-  void MarkSettledAndMaybeAck(core::SequenceId seq);
+  // Publishes min(highest_settled, oldest_pending_conditional - 1).
+  void MarkSettled(core::SequenceId seq);
 
   void CheckBlockAndScanTimeout();
 
@@ -136,6 +143,9 @@ class HotConsumer {
   mutable std::mutex pending_mu_;
   std::unordered_map<core::SequenceId, PendingConditional> pending_conditionals_
       ABYSS_GUARDED_BY(pending_mu_);
+
+  // Next seq to read. Touched by ReplayUntil or the Run thread, never both.
+  core::SequenceId next_read_seq_ = 0;
 
   std::atomic<core::SequenceId> highest_settled_seq_{0};
   // The settled floor published to HotConsumerProgress: clamped behind the

@@ -12,14 +12,14 @@
 
 namespace abyss::queue {
 
+// In-memory OffsetStore whose Set is the persist; drives reaper tests.
 class MemoryOffsetStore : public OffsetStore {
  public:
   MemoryOffsetStore() = default;
 
   std::optional<core::SequenceId> Get(core::ConsumerId consumer,
                                       core::ShardId shard) const override;
-  core::Result<void> Set(core::ConsumerId consumer, core::ShardId shard,
-                         core::SequenceId seq) override;
+  core::Result<void> Set(core::ConsumerId consumer, core::ShardId shard, core::SequenceId seq);
 
  private:
   static uint64_t Key(core::ConsumerId consumer, core::ShardId shard) {

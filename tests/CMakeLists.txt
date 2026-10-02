@@ -8,8 +8,6 @@ if(ABYSS_BUILD_TESTS)
   add_subdirectory(system)
 
   # Concurrent file-I/O tests that exceed the 30s default on Windows runners.
-  abyss_mark_slow_tests(unit "${CMAKE_CURRENT_SOURCE_DIR}/unit"
-    FileOffsetStoreTest.ConcurrentSetsAcrossShardsSameConsumerAllPersist)
   abyss_mark_slow_tests(component "${CMAKE_CURRENT_SOURCE_DIR}/component"
     WalQueueTest.TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace
     HotConsumerTest.ConcurrentWritersAlwaysSeeRegisteredEntries)

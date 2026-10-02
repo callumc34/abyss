@@ -171,6 +171,20 @@ cold_consumer:
   EXPECT_NE(cfg.error().message().find("loop_initial_backoff_ms"), std::string::npos);
 }
 
+TEST(ConfigValidate, OffsetFsyncIntervalBounds) {
+  for (const char* bad : {"9", "60001"}) {
+    auto cfg =
+        Config::ParseFromYaml(std::string("queue:\n  offset_fsync_interval_ms: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value()) << bad;
+    EXPECT_NE(cfg.error().message().find("queue.offset_fsync_interval_ms"), std::string::npos);
+  }
+  for (const char* good : {"10", "60000"}) {
+    auto cfg =
+        Config::ParseFromYaml(std::string("queue:\n  offset_fsync_interval_ms: ") + good + "\n");
+    EXPECT_TRUE(cfg.has_value()) << good << ": " << cfg.error().message();
+  }
+}
+
 TEST(ConfigValidate, RejectsUnknownFsyncPolicy) {
   auto cfg = Config::ParseFromYaml("queue:\n  wal_fsync_policy: fsync_sometimes\n");
   ASSERT_FALSE(cfg.has_value());

@@ -1,13 +1,14 @@
 #include "abyss/consumer/hot_consumer.h"
 
+#include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
 
 #include "abyss/core/consumer_rpc.h"
-#include "abyss/core/fire_and_forget.h"
 #include "abyss/core/ops.h"
 #include "abyss/log/log.h"
 
@@ -92,8 +93,7 @@ void HotConsumer::Run() {
   ABYSS_LOG_DEBUG("hot consumer started", {"shard", static_cast<int64_t>(config_.shard)});
 
   while (!stop_requested_.load(std::memory_order_acquire)) {
-    auto read = queue_.Read(core::kHotConsumer, config_.shard, config_.read_batch_size,
-                            config_.read_timeout);
+    auto read = ReadFromCursor(config_.read_batch_size);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
         ABYSS_LOG_WARN("hot consumer stopping: queue unavailable",
@@ -112,7 +112,31 @@ void HotConsumer::Run() {
   ABYSS_LOG_DEBUG("hot consumer stopped", {"shard", static_cast<int64_t>(config_.shard)});
 }
 
+core::Result<std::vector<core::QueueEntry>> HotConsumer::ReadFromCursor(size_t max_count) {
+  auto read = queue_.Read(config_.shard, next_read_seq_, max_count, config_.read_timeout);
+  if (read.has_value() || read.error().code() != core::ErrorCode::kOutOfRange) return read;
+
+  auto first = queue_.FirstSeq(config_.shard);
+  if (!first.has_value()) return std::unexpected(first.error());
+  // From a fresh cursor this is the normal restart path; mid-stream it means
+  // the reaper overtook hot and entries it never applied are gone.
+  if (next_read_seq_ == 0) {
+    ABYSS_LOG_DEBUG("hot consumer rebuilding from first retained seq",
+                    {"shard", static_cast<int64_t>(config_.shard)},
+                    {"first_seq", static_cast<uint64_t>(*first)});
+  } else {
+    ABYSS_LOG_WARN("hot consumer read below retained WAL; skipping to first retained seq",
+                   {"shard", static_cast<int64_t>(config_.shard)},
+                   {"requested_seq", static_cast<uint64_t>(next_read_seq_)},
+                   {"first_seq", static_cast<uint64_t>(*first)});
+  }
+  next_read_seq_ = *first;
+  return queue_.Read(config_.shard, next_read_seq_, max_count, config_.read_timeout);
+}
+
 void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {
+  if (batch.empty()) return;
+  const core::SequenceId last_seq = batch.back().seq;
   for (auto& entry : batch) {
     std::visit(
         [this, &entry](auto& payload) {
@@ -129,6 +153,7 @@ void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {
         },
         entry.payload);
   }
+  next_read_seq_ = last_seq + 1;
 }
 
 core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
@@ -157,14 +182,17 @@ core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
   };
   ReplayGuard guard(replay_mode_, store_);
 
-  // The progress signal is "highest_settled_seq has reached target", but
-  // both start at 0. To distinguish "target=0 means one entry at seq=0 to
-  // process" from "target=0 means queue empty", read once before checking.
-  // An empty read with progress reached → caught up; empty read with progress
-  // behind → genuinely waiting on the queue, retry.
+  // Caught up once the cursor passes target. An empty read also means caught
+  // up: target was captured below the head, so a read that finds nothing at
+  // the cursor proves the cursor is past it (and covers the empty queue,
+  // where target 0 names no entry).
+  bool caught_up = false;
   while (!cancel.load(std::memory_order_acquire)) {
-    auto read = queue_.Read(core::kHotConsumer, config_.shard, config_.replay_batch_size,
-                            config_.read_timeout);
+    if (next_read_seq_ > target) {
+      caught_up = true;
+      break;
+    }
+    auto read = ReadFromCursor(config_.replay_batch_size);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
         return std::unexpected(read.error());
@@ -172,25 +200,19 @@ core::Result<void> HotConsumer::ReplayUntil(core::SequenceId target,
       counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-
     if (read->empty()) {
-      if (highest_settled_seq_.load(std::memory_order_acquire) >= target) break;
-      CheckBlockAndScanTimeout();
-      continue;
+      caught_up = true;
+      break;
     }
-
     ProcessBatch(*read);
     CheckBlockAndScanTimeout();
-    if (highest_settled_seq_.load(std::memory_order_acquire) >= target) break;
   }
 
-  if (cancel.load(std::memory_order_acquire) &&
-      highest_settled_seq_.load(std::memory_order_acquire) < target) {
+  if (!caught_up) {
     ABYSS_LOG_WARN("hot replay cancelled before reaching target",
                    {"shard", static_cast<int64_t>(config_.shard)},
                    {"target_seq", static_cast<uint64_t>(target)},
-                   {"highest_settled",
-                    static_cast<uint64_t>(highest_settled_seq_.load(std::memory_order_acquire))});
+                   {"next_read_seq", static_cast<uint64_t>(next_read_seq_)});
     return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "hot replay cancelled"});
   }
 
@@ -245,7 +267,7 @@ void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::
   }
 
   // Publish settled-seq BEFORE fulfilling the RPC to avoid preempt issues.
-  MarkSettledAndMaybeAck(entry.seq);
+  MarkSettled(entry.seq);
   (void)rpc_.Fulfill(core::MakeRpcId(config_.shard, entry.seq), std::move(result));
   apply_notifier_.NotifyApplied(config_.shard, entry.seq);
 }
@@ -297,15 +319,14 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
                  core::RespValue::Error(core::ErrorPrefix::kErr,
                                         "hot store wipe failed: " + wiped.error().message()));
     apply_notifier_.NotifyApplied(config_.shard, entry.seq);
-    MarkSettledAndMaybeAck(entry.seq);
+    MarkSettled(entry.seq);
     return;
   }
 
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
 
-  // Persist the Flush ack BEFORE fulfilling the RPC. See the equivalent comment
-  // in ColdConsumer::HandleFlush.
-  MarkSettledAndMaybeAck(entry.seq);
+  // Settle before fulfilling, as HandleWrite does, for the engine's gate.
+  MarkSettled(entry.seq);
 
   (void)rpc_.Fulfill(core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq),
                      core::RespValue::SimpleString("OK"));
@@ -330,7 +351,7 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
     }
   }
   // If we never saw the Conditional (cold replay re-entered after a partial
-  // recovery, or the Conditional landed before our ack point), fall back to
+  // recovery, or the Conditional landed before our resume point), fall back to
   // the Resolved's own appended_at. Less precise but a safe approximation:
   // the Resolved was emitted shortly after the Conditional in steady state,
   // and during recovery re-emission they share the original appended_at
@@ -353,8 +374,8 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
     }
   }
 
-  if (had_pending) MarkSettledAndMaybeAck(resolved.ref);
-  MarkSettledAndMaybeAck(entry.seq);
+  if (had_pending) MarkSettled(resolved.ref);
+  MarkSettled(entry.seq);
 
   // The resolver awaits NotifyApplied on the Resolved entry's own seq (the
   // appended decision) before fulfilling the client RPC. Notify both the
@@ -419,7 +440,7 @@ bool HotConsumer::ShouldSkipForAbsTtlElapsed(uint64_t abs_ttl_ms, core::WallTime
   return WallMs(wall_now) >= abs_ttl_ms;
 }
 
-void HotConsumer::MarkSettledAndMaybeAck(core::SequenceId seq) {
+void HotConsumer::MarkSettled(core::SequenceId seq) {
   auto prev = highest_settled_seq_.load(std::memory_order_acquire);
   while (seq > prev) {
     if (highest_settled_seq_.compare_exchange_weak(prev, seq, std::memory_order_acq_rel)) {
@@ -427,9 +448,8 @@ void HotConsumer::MarkSettledAndMaybeAck(core::SequenceId seq) {
     }
   }
 
-  // Clamp ack behind any pending Conditional so its Resolved isn't acked-past.
-  // The same clamped value is the published settled floor (HighestSettledSeq):
-  // it never exceeds an unresolved pending Conditional.
+  // The published floor never passes an unresolved Conditional. One pending
+  // at seq 0 has nothing settled before it, so the floor cannot move at all.
   core::SequenceId target = seq;
   std::optional<core::SequenceId> oldest_pending;
   {
@@ -438,20 +458,15 @@ void HotConsumer::MarkSettledAndMaybeAck(core::SequenceId seq) {
       if (!oldest_pending.has_value() || pseq < *oldest_pending) oldest_pending = pseq;
     }
   }
-  if (oldest_pending.has_value() && *oldest_pending > 0 && *oldest_pending - 1 < target) {
-    target = *oldest_pending - 1;
+  if (oldest_pending.has_value()) {
+    if (*oldest_pending == 0) return;
+    target = std::min(target, *oldest_pending - 1);
   }
 
-  // Publish the floor monotonically. Reuse the cold consumer's unsigned-seq-0
-  // guard: a clamp to *oldest_pending - 1 when oldest_pending == 0 underflows,
-  // already excluded above, so target here is a real settled seq.
   auto floor = settled_floor_.load(std::memory_order_acquire);
   while (target > floor) {
     if (settled_floor_.compare_exchange_weak(floor, target, std::memory_order_acq_rel)) break;
   }
-
-  core::FireAndForget(queue_.Ack(core::kHotConsumer, config_.shard, target),
-                      counters_.ack_failures);
 }
 
 void HotConsumer::CheckBlockAndScanTimeout() {

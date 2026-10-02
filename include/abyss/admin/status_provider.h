@@ -48,7 +48,7 @@ struct StatusEndpointsInfo {
 struct StatusQueueInfo {
   std::string backend;
   uint64_t head_seq = 0;
-  uint64_t tail_seq = 0;
+  uint64_t first_seq = 0;
   uint64_t total_entries = 0;
   uint64_t total_bytes = 0;
   uint64_t reaper_failures = 0;
@@ -82,13 +82,13 @@ struct StatusHotConsumerInfo {
 };
 
 struct StatusColdConsumerInfo {
-  uint64_t last_ack_seq_min = 0;
-  uint64_t last_ack_seq_max = 0;
+  uint64_t last_commit_seq_min = 0;
+  uint64_t last_commit_seq_max = 0;
 };
 
 struct StatusResolverInfo {
-  uint64_t last_ack_seq_min = 0;
-  uint64_t last_ack_seq_max = 0;
+  uint64_t last_commit_seq_min = 0;
+  uint64_t last_commit_seq_max = 0;
   uint64_t cache_entries = 0;
   uint64_t cache_bytes = 0;
 };
@@ -137,7 +137,7 @@ struct StatusRecoveryInfo {
 // schema_version bump. Unset/inapplicable fields render as JSON null or as
 // the type's neutral value (0, "", false), never as missing keys.
 struct StatusSnapshot {
-  uint32_t schema_version = 1;
+  uint32_t schema_version = 2;
   StatusBuildInfo build;
   StatusServerInfo server;
   StatusConfigInfo config;

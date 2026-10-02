@@ -50,6 +50,7 @@ class ResolverPool {
     uint64_t apply_wait_timeouts = 0;
     uint64_t durable_wait_timeouts = 0;
     uint64_t append_failures = 0;
+    uint64_t commit_failures = 0;
     uint64_t parse_failures = 0;
     uint64_t replayed_resolveds_emitted = 0;
     size_t cache_entries_total = 0;

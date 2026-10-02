@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** The write path becomes a sequenced write that is decided, logged and applied under the shard lock, then acknowledged at the configured durability class. A cold hit fills hot directly instead of appending a promotion entry, and the read-consistency wait is replaced by the residency invariant (Phase 2). The Flush acknowledgement no longer requires a persisted consumer offset (Phase 1a). The sections below describe current behaviour until each phase lands.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** The write path becomes a sequenced write that is decided, logged and applied under the shard lock, then acknowledged at the configured durability class. A cold hit fills hot directly instead of appending a promotion entry, and the read-consistency wait is replaced by the residency invariant (Phase 2). The Flush acknowledgement no longer requires a persisted consumer offset; §Broadcast Write Path already describes this. The other sections describe current behaviour until each phase lands.
 
 ## Context
 
@@ -118,7 +118,12 @@ The client sees `+OK` only when every consumer on every shard has applied the wi
 
 **Per-shard wipe isolation.** `ColdStore::Wipe(shard)` deletes only the keys whose shard slot equals that shard (ADP-010 §Per-shard wipe). A single embedded RocksDB instance backs all of a pod's shards, but the shard-prefixed key encoding partitions it into disjoint per-shard slices, so a shard's wipe touches no peer's data. This closes a cross-shard data-loss race that a global wipe exposed: during parallel recovery replay (ADP-007) or an aggressive-mode early flush, a lagging shard's replayed `Flush` would re-run a global wipe and destroy data a peer shard had already flushed to cold after *its* own `Flush`. With per-shard isolation, a replayed `Flush` re-wipes only its own slice and is idempotent against it; cross-shard interleaving is irrelevant.
 
-**Durability invariant — Flush ack precedes RPC fulfilment.** Each consumer persists its per-shard Flush ack *before* fulfilling the Flush RPC that the engine waits on, so a FLUSHDB `+OK` never precedes the durable per-shard ack. The invariant holds uniformly across hot/cold/resolver consumers — even where the store is in-memory and self-correcting on recovery — so a future persistent hot snapshot inherits the ordering guarantee. (Per-shard wipe isolation removes the cross-shard destruction this ordering previously had to guard against; the ordering remains because the observable `+OK` must still never run ahead of durability.)
+**Durability of the wipe.** A FLUSHDB `+OK` never runs ahead of durability, for three reasons:
+- The engine waits for every shard's `Flush` entry to be durable in the WAL before it awaits any consumer.
+- Each consumer fulfils its Flush RPC only after applying the wipe, and the cold wipe is a synced write.
+- A replayed `Flush` is idempotent per shard (per-shard wipe isolation), and retention is gated on persisted committed offsets, so every write after a `Flush` is always replayable.
+
+A consumer's committed offset therefore need not have reached the `Flush` before the RPC is fulfilled. Persisting it early only shortens replay; it is not a durability requirement. This amends the earlier rule, "Flush ack precedes RPC fulfilment", which dated from the global wipe and made FLUSHDB fail whenever a WAL flush took longer than a consumer's poll interval.
 
 Multi-pod (Phase 2+) extends this naturally: each pod receives the broadcast at the RESP layer and runs the same fan-out across its owned shards. There is no cross-pod synchronisation step.
 

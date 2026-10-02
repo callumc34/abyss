@@ -156,7 +156,7 @@ TEST(SegmentReaperTest, SkipsSegmentNotYetMinRetention) {
   EXPECT_EQ(registry.segment_count(), 1U);
 }
 
-TEST(SegmentReaperTest, SkipsConsumerWithNoAckAtAll) {
+TEST(SegmentReaperTest, SkipsConsumerWithNoCommitAtAll) {
   FakeRegistry registry;      // NOLINT(misc-const-correctness)
   MemoryOffsetStore offsets;  // NOLINT(misc-const-correctness)
 
@@ -164,7 +164,7 @@ TEST(SegmentReaperTest, SkipsConsumerWithNoAckAtAll) {
   registry.Add(MakeInfo(0, 0, 99, now - 48h));
 
   ASSERT_TRUE(offsets.Set(0, 0, 99).has_value());
-  // consumer 1 has no ack for shard 0 — should retain.
+  // consumer 1 has no commit for shard 0 — should retain.
 
   SegmentReaper reaper(
       registry, offsets,
@@ -307,8 +307,11 @@ TEST(WalQueueReaperTest, ReaperFailureSurfacedAsMetric) {
 
   auto durable = queue->DurableSeq(0);
   ASSERT_TRUE(durable.has_value()) << durable.error().message();
-  auto acked = queue->Ack(0, 0, *durable);
-  ASSERT_TRUE(acked.has_value()) << acked.error().message();
+  auto committed = queue->CommitOffset(0, 0, *durable);
+  ASSERT_TRUE(committed.has_value()) << committed.error().message();
+  // Sweeps follow the persisted offset, so persist to trigger one.
+  auto flushed = queue->FlushOffsets();
+  ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
 
   EXPECT_GT(queue->ReaperFailures(), 0U);
   const auto failures =
@@ -331,8 +334,8 @@ TEST(WalQueueReaperTest, ReaperFailureSurfacedAsMetric) {
   // A later sweep retries it, so the failure count keeps rising rather than
   // going quiet while the disk stays full.
   const uint64_t failures_before = queue->ReaperFailures();
-  auto reacked = queue->Ack(0, 0, *durable);
-  ASSERT_TRUE(reacked.has_value()) << reacked.error().message();
+  auto reflushed = queue->FlushOffsets();
+  ASSERT_TRUE(reflushed.has_value()) << reflushed.error().message();
   EXPECT_GT(queue->ReaperFailures(), failures_before) << "stuck segment was never retried";
   EXPECT_TRUE(queue->OldestEligibleUnreapedAge().has_value());
 }

@@ -232,7 +232,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
           },
       .min_retention = config.queue.min_retention,
       .retention_consumers = {abyss::core::kColdConsumer, abyss::core::kResolverConsumer},
-      .volatile_consumers = {abyss::core::kHotConsumer},
+      .offset_fsync_interval = config.queue.offset_fsync_interval,
   });
   if (!queue.has_value()) return std::unexpected(queue.error());
   if ((*queue)->IsRecovering()) {

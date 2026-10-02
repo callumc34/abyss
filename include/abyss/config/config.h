@@ -49,6 +49,9 @@ struct QueueConfig {
   // are rejected with kValueTooLarge rather than tied to the segment knob.
   size_t max_value_size_bytes = 67108864;
   std::chrono::seconds min_retention{86400};
+  // Cadence of the committed-offset checkpoint. A crash replays at most this
+  // much past the last checkpoint; WAL reclamation trails commits by it.
+  std::chrono::milliseconds offset_fsync_interval{1000};
   std::string fsync_policy = "group_commit";
   uint32_t group_commit_interval_us = 1000;
   size_t group_commit_max_bytes = 1048576;

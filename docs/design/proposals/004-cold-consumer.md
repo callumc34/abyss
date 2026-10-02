@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** The consumer loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain (Phase 1a). Absorption is capped at the power-durable watermark, and consumers run as a pool sized to cores (Phase 1b). The loop below describes current behaviour until then.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** The consumer loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain; the loop below already describes this. Absorption is capped at the power-durable watermark, and consumers run as a pool sized to cores (Phase 1b). Until then the loop absorbs up to the published tail, one thread per shard.
 
 ## Context
 
@@ -72,7 +72,9 @@ Each per-shard thread loop is:
 
 ```
 loop:
-    1. Drain: queue.Read(cold_consumer, shard, max_count, short_timeout)
+    1. Drain: queue.Read(shard, next_read_seq, max_count, short_timeout)
+       - next_read_seq is the consumer's own position: committed offset + 1
+         on start, then one past the last entry read
        - Decode each QueueEntry (Write / Conditional / Resolved-apply)
        - Parse its RESP command into a typed WriteOp
        - Expand multi-key ops (DEL, MSET) into per-key absorbs
@@ -87,12 +89,15 @@ loop:
          - Success: the flushed entries vanish from the buffer
          - Failure: retain entries, back off exponentially, retry
 
-    3. Ack: advance queue offset to min(latest_drained_seq, oldest_pending_seq - 1).
-       This low-water-mark ack pattern keeps the WAL retaining any
-       un-flushed writes, so a crash replays them from the queue.
+    3. Commit: advance the committed offset to min(latest_drained_seq,
+       oldest_pending_seq - 1), clamped to the cold checkpoint and the
+       durable WAL tail. This low-water-mark commit keeps the WAL retaining
+       any un-flushed writes, so a crash replays them from the queue.
 ```
 
-**Ack policy — low-water per shard.** A compacted buffer entry absorbs many seqs. The consumer must not acknowledge past any seq whose writes have not yet been flushed. Because each shard's consumer owns its own buffer and queue partition, the watermark is computed locally: the smallest `first_seen_seq` across the buffer entries, minus one, bounded by the latest drained seq. No cross-shard coordination is required.
+**Commit policy — low-water per shard.** A compacted buffer entry absorbs many seqs. The consumer must not commit past any seq whose writes have not yet been flushed. The committed offset governs retention and restart position only. The read position is separate, so a key that stays in the buffer for hours pins retention without stopping the consumer from draining everything after it. Because each shard's consumer owns its own buffer and queue partition, the watermark is computed locally: the smallest `first_seen_seq` across the buffer entries, minus one, bounded by the latest drained seq. No cross-shard coordination is required.
+
+**Undecodable entries.** An entry whose parser exists but rejects it (decoder skew) is poison. The consumer records it, pins its committed offset below the poison so the WAL keeps the entry, and reads on. The pin stays visible in metrics until an operator intervenes. Until a fixed build replays from the pinned offset, the cold store may hold that key's state from writes after the poison. A `Flush` after the poison releases the pin, because the wipe discards the state the entry would have produced.
 
 **Failure policy.** Apply failures hold the flusher on that shard — it keeps retrying with exponential backoff and records `apply_failures` / `retry_attempts`. Back-pressure is deliberate: if the cold store is unwritable, the WAL retains data and we prefer stalling over silent drops. Drain on other shards is unaffected.
 

@@ -53,8 +53,8 @@ class GroupCommitter {
 
   // Highest seq whose group-commit fsync has completed. Monotonic; 0 = none
   // durable. Under kNone it tracks the highest submitted (published) seq so the
-  // retention-Ack gate is a correct no-op (durability is disabled — see the
-  // CRITICAL startup warning in the validator).
+  // retention-commit gate is a correct no-op (durability is disabled — see
+  // the CRITICAL startup warning in the validator).
   core::SequenceId DurableSeq() const noexcept {
     return durable_seq_.load(std::memory_order_acquire);
   }
