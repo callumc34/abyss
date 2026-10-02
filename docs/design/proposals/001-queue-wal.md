@@ -2,15 +2,14 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-04-18
+**Updated:** 2026-10-02
 
 > **Amended by [ADP-015](015-write-path-and-durability.md).** These sections already describe the amended behaviour:
 > - **§Interface and §Offset persistence:** reads take an explicit consumer-owned position, and acknowledgements are committed offsets persisted lazily in one dual-slot checkpoint.
 > - **§Durability classes and group commit:** writes are acknowledged at a named durability class, `process_crash` by default and `power_loss` opt-in, and flushed by natural batching.
+> - **§Embedded WAL and §Batch atomicity:** recycled, memory-mapped segments in one physical log per volume carrying per-shard streams (Phase 1c, #175).
 >
-> Still to land, with the current behaviour described below until each does:
-> - preallocated, memory-mapped segments in one physical log per volume (Phase 1c, #175);
-> - the entry taxonomy losing `Conditional` and `Resolved` (Phase 2).
+> Still to land, with the current behaviour described below until it does: the entry taxonomy losing `Conditional` and `Resolved` (Phase 2).
 
 ## Context
 
@@ -58,18 +57,21 @@ See `include/abyss/core/queue.h`, `include/abyss/core/queue_entry.h`, and `inclu
 
 ### Embedded WAL
 
-The built-in queue implementation is an append-only WAL on the PVC.
+The built-in queue implementation is an append-only WAL on the PVC: one physical log per data volume, carrying a logical stream per shard ([ADP-015](015-write-path-and-durability.md) §Log durability pipeline).
 
-**Segment management:** The WAL is composed of fixed-size segments per shard. Each segment is a file named by shard and base offset:
+**Logs and segments:**
 
 ```
-/data/wal/shard-0000/00000000000000000000.log
-/data/wal/shard-0000/00000000000000065536.log
+/data/wal/log-0000/00000000000000000041.seg
+/data/wal/log-0000/00000000000000000042.seg
 ```
 
-- Segment size: configurable, default 128 MiB.
-- Segment cleanup runs after each round that persists committed offsets, and after every rotation. A segment is deleted when its `last_seq` is below the minimum *persisted* committed offset across retention consumers AND its age exceeds `min_retention`. The active segment is never eligible. Reclamation uses persisted offsets, never in-memory ones, so a restart never resumes a consumer below a deleted segment. See [ADP-009](009-wal-format.md) for file format details.
-- Committed offsets are persisted lazily to one checkpoint file under `{wal_path}/offsets/`. See "Offset persistence" below.
+- **Logs.** `queue.log_count` logs (default 1); shard `s` belongs to log `s mod log_count`.
+- **Segments.** Each log is a sequence of fixed-size, memory-mapped segments named by ordinal. The default size is 128 MiB.
+- **Preparation and recycling.** A preparer thread keeps two spares ready, so rotation never touches the disk on the append path. Reclaimed segments are recycled; new ones are zero-filled only to grow the pool.
+- **Reclamation runs** after each round that persists committed offsets. It is per segment and oldest first. A segment is reclaimed when, for every shard with frames in it, every retention consumer's *persisted* committed offset has passed that shard's frames there, and it was sealed more than `min_retention` ago. The active segment is never eligible. Reclamation uses persisted offsets, never in-memory ones, so a restart never resumes a consumer below a reclaimed segment.
+- **Format.** See [ADP-009](009-wal-format.md).
+- **Committed offsets** are persisted lazily to one checkpoint file under `{wal_path}/offsets/`. See "Offset persistence" below.
 
 **Retention:** The queue retains entries until all consumers have acknowledged. Minimum retention is:
 
@@ -107,7 +109,7 @@ A persist overwrites the slot that does not hold the highest epoch, with the nex
 
 **Crash semantics.** After a crash, a consumer resumes from its last persisted offset. Entries after it are delivered again, at most one persist interval's worth; cold absorption and resolver replay are idempotent. A consumer with no committed offset starts at the first retained entry.
 
-**Recovered tail.** On open, each shard flushes the tail it recovered, so entries a crashed process left only in the page cache become power-durable before any consumer reads or commits past them. Both durable ends then start at the recovered head.
+**Recovered tail.** On open, each log seals and syncs the tail it recovered, so entries a crashed process left only in the page cache become power-durable before any consumer reads or commits past them. Both durable ends then start at the recovered head.
 
 One residual risk is accepted, the same one PostgreSQL accepts. Linux reports a write-back error that happened before the crash to the first flush on a new file descriptor only if the file's inode stayed cached in between. Nothing at the application level can close that gap.
 
@@ -115,13 +117,20 @@ A committed offset never passes the power-durable end, so a persisted offset at 
 
 **Failures.** A failed persist is logged and counted, and retried on the next round. Persisted offsets stay where they were, so retention waits, visibly. Nothing is lost.
 
+**Retention reads both slots.** Reclamation uses, per consumer and shard, the lower of the two slots' offsets, and reclaims nothing until both slots hold one. If media corruption destroys the newest slot, the surviving one is still at or past everything reclaimed, so recovery never resumes a consumer, or a shard's sequence, inside a reclaimed range. Retention trails by one persist interval.
+
 ### Batch atomicity
 
-`AppendBatch` is atomic across crashes: every entry in a batch is either present in the WAL after recovery, or none is. The mechanism is a per-entry `batch_last_seq` field added in format minor 1.1 — recovery only advances the durable tail when it decodes an entry whose `seq == batch_last_seq` (i.e., the closing entry of a batch). Mid-batch entries left behind by a crash are truncated together with the closing entry that never landed. See [ADP-009](009-wal-format.md) §Schema evolution.
+`AppendBatch` is atomic across crashes: every entry in a batch is either present in the WAL after recovery, or none is.
+- A batch is reserved as one contiguous range of its log, and each frame records the bytes to its batch's end.
+- Recovery drops a trailing batch whose end lies past the recovered end of the log.
+- A shard's `power_loss` durable end advances only at batch ends.
+
+See [ADP-009](009-wal-format.md) §Recovery.
 
 ### Recovery signal
 
-`WalQueue::IsRecovering()` returns `true` while the queue is being opened (segment scan, torn-tail truncation, offset load) and `false` once those steps finish. Open is synchronous today so the flag is only ever observed `false` by external callers — but the shape of the API lets the server gate RESP LOADING on a single uniform check regardless of whether the queue or a consumer is still catching up ([ADP-005](005-resp-frontend.md), [ADP-007](007-recovery.md)).
+`WalQueue::IsRecovering()` returns `true` while the queue is being opened (log scan, torn-tail sealing, offset load) and `false` once those steps finish. Open is synchronous today so the flag is only ever observed `false` by external callers — but the shape of the API lets the server gate RESP LOADING on a single uniform check regardless of whether the queue or a consumer is still catching up ([ADP-005](005-resp-frontend.md), [ADP-007](007-recovery.md)).
 
 ### Durability classes and group commit
 
@@ -129,15 +138,16 @@ A write's durability future resolves when its entry reaches the class set by `qu
 
 | Class | Resolves when | Survives |
 |-------|---------------|----------|
-| `process_crash` (default) | The entry is published: written to its segment, so it is in the page cache | Process crash, OOM kill, container restart. A power loss loses at most the durability window. |
+| `process_crash` (default) | The entry is published: filled into its log's mapped segment, below the log's filled prefix, so it is in the page cache | Process crash, OOM kill, container restart. A power loss loses at most the durability window. |
 | `power_loss` | The fdatasync (`F_FULLFSYNC` on macOS) covering it has completed | Power loss |
 
 The write path still waits for the hot consumer to apply the entry before replying (ADP-006).
 
 **Natural batching.**
-- Each shard has a commit thread. A flush starts as soon as the previous one ends, and covers every entry published while it ran. There is no timer and no batch cap.
+- Each log has a commit thread. A flush starts as soon as the previous one ends, and covers every entry published while it ran. There is no timer and no batch cap.
 - At low load a write waits for one flush; under load each flush covers more writes. This is the leader/follower commit of RocksDB, and of PostgreSQL with `commit_delay = 0`, except that a dedicated thread flushes so appenders never make the system call.
-- Each flush snapshots the active segment and the published end under the shard's append lock, then runs fdatasync outside it. A rotation seals the old segment with its own fdatasync before switching, so every entry below the snapshot's end is covered.
+- Each flush snapshots the log's filled prefix and syncs every segment holding bytes below it. Before it publishes the new durable prefix, it walks the newly durable frames' headers and advances each shard's `power_loss` end at every batch end.
+- A rotation needs no sync on the append path: prepared segments had their headers synced before use.
 
 **Who reads at which class.**
 - Every materialised view reads at the acknowledgement class: hot, the resolver, and the cold consumer's in-memory compaction buffer.
@@ -146,7 +156,7 @@ The write path still waits for the hot consumer to apply the entry before replyi
 - Under `process_crash`, persisted state still never runs ahead of the power-durable log.
 
 **Bounded window.**
-- Acknowledged-but-not-power-durable data is bounded by `queue.durability_window_bytes` (volume-wide unflushed bytes) and `queue.durability_window_ms` (the age of a shard's oldest unflushed entry).
+- Acknowledged-but-not-power-durable data is bounded by `queue.durability_window_bytes` (volume-wide unflushed bytes) and `queue.durability_window_ms` (the age of a log's oldest unflushed entry).
 - Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.write_timeout`, it is rejected with an error saying the device is not keeping up.
 - An empty window always admits, so a single value larger than the window cannot deadlock.
 - `abyss_wal_unflushed_bytes`, `abyss_wal_durability_lag_seconds` and the backpressure counters report it.
@@ -175,12 +185,14 @@ Since we always partition by key hash, ordering within a key is guaranteed by ev
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 134217728       # 128 MiB
+  segment_size_bytes: 134217728       # 128 MiB, per log segment
+  log_count: 1                        # physical logs, a power of two <= shard count
+  ring_entries: 65536                 # per-shard offset ring, a power of two, 4096-2^24
   min_retention_seconds: 86400        # 24 hours
   offset_fsync_interval_ms: 1000      # committed-offset checkpoint cadence, 10–60000
   durability: process_crash           # or power_loss
   durability_window_bytes: 67108864   # unflushed bytes across shards, 1 MiB–4 GiB
-  durability_window_ms: 1000          # oldest unflushed entry per shard, 10–60000
+  durability_window_ms: 1000          # oldest unflushed entry per log, 10–60000
 ```
 
 ## Invariants
@@ -189,7 +201,7 @@ queue:
 2. `Read` returns entries in sequence order. No gaps, no reordering.
 3. The queue retains every entry above the minimum persisted committed offset across retention consumers.
 4. Each consumer owns its read position. No consumer's progress, and no committed offset, affects where another consumer reads.
-5. Sequence IDs are monotonically increasing per shard.
+5. Sequence IDs are contiguous and increasing per shard, including across reclamation of all of a shard's retained entries.
 6. Entry type tags are immutable once appended. A `Conditional` never transforms into a `Write`; the Resolver produces a separate `Resolved` entry.
 7. For every `Conditional` entry at seq X, exactly one `Resolved` entry with `ref = X` follows it in the log. The queue itself does not enforce this — it is an invariant of the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) that the queue must preserve bit-for-bit.
 8. A read below the first retained entry is an explicit out-of-range error. For a retention consumer it signals reclaimed, uncommitted data and is fatal.

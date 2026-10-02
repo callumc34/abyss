@@ -72,19 +72,31 @@ Two consequences follow from the persistence cap, and both are accepted:
 
 There is no batch byte cap. A natural batch is limited by how long the previous flush took, and appenders write their own frames, so a flush is one data sync of the file whatever the batch holds. RocksDB caps its write group only because its leader copies the group's data. The bound that matters is the durability window.
 
-**Preallocated, zero-filled segments, flushed with `fdatasync`.** The next segment is created off the hot path, so a flush syncs data only. Recycled segments would need a per-frame epoch to stop stale frames being replayed past a torn tail (RocksDB's recyclable record format); zero-filling avoids that format change.
+**Recycled segments, flushed with `fdatasync`.**
+- A preparer thread per log keeps two spare segments ready, off the hot path, so a rotation is a pointer swap and a flush syncs data only.
+- Reclaimed segments are recycled. Each frame's commit word carries its segment's generation (the low 32 bits of its ordinal), so a stale frame left from a previous life never reads as filled. This is RocksDB's recyclable record format.
+- New segments are zero-filled only to grow the pool: at start-up, and while retention pins more segments than the pool holds. Zero-filling every segment would write each byte twice, halving WAL bandwidth on a 125 MiB/s volume.
+- `fallocate` or `F_PREALLOCATE` alone is not enough. Unwritten extents cost metadata in the next flush, and on APFS a preallocated but unwritten tail was measured still stalling (p99 1.57 ms).
+- When no spare is ready (a full disk, or a preparer behind), a reservation fails before any state changes. The append waits for a spare until its deadline, then is rejected cleanly. `abyss_wal_spare_segments` and `abyss_wal_spare_waits_total` report it.
 
 **Memory-mapped segments, one log for both classes.**
 - Copying a frame into a shared mapping makes it process-crash durable with no system call. The mapping doubles as a zero-copy tail for readers.
 - `power_loss` additionally waits for the flush covering the frame.
-- Preallocation with zero-fill prevents the allocation failures (`ENOSPC`) that a mapping would raise as `SIGBUS`. Media errors can still surface, as `SIGBUS` on a fault or as an error at flush. Both are fatal.
-- Whether macOS `F_FULLFSYNC` on the file writes back pages dirtied through the mapping, or whether `msync` must come first, is verified when the mapping lands. On Linux, fdatasync covers mapped dirty pages through the unified page cache.
+- Every segment's blocks are written before it becomes active, recycled or zero-filled, which prevents the allocation failures (`ENOSPC`) that a mapping would raise as `SIGBUS`. Media errors can still surface, as `SIGBUS` on a fault or as an error at flush. Both are fatal.
+- On Linux, fdatasync covers mapped dirty pages through the unified page cache. On Windows the flush is `FlushViewOfFile` then `FlushFileBuffers`.
+- On macOS, `F_FULLFSYNC` on the file was observed to write back pages dirtied through the mapping: `mincore`'s modified bit clears. That is an assumption about APFS, not a documented guarantee, so a platform test checks it with `mincore`.
 
 **One physical log per data volume, carrying a logical stream per shard.**
 - Flush count scales with logs, not shards, which matters on IOPS-capped cloud volumes.
-- Space is reserved by an atomic tail offset. A shard's sequence number and its log offset are assigned in the same shard critical section, so per-shard sequence order equals file order.
+- Space is reserved by a compare-and-swap on the log's tail. A plain `fetch_add` could not refuse a reservation that runs into a segment that is not ready. A shard's sequence numbers and its log positions are assigned in the same shard critical section, so per-shard sequence order equals log order.
+- A batch is one contiguous reservation inside one segment. Each frame records the bytes to its batch's end, so batch closure is by position and independent of shards (ADP-009).
+- Appenders fill their reservations concurrently. The *filled prefix*, below which every frame is filled, is the `process_crash` watermark: an append is acknowledged only once the prefix passes it. That wait is microseconds, because a hole's owner is mid-copy inside its own shard's critical section.
+- The flusher syncs up to the filled prefix. Before publishing the new `power_loss` watermark, it walks the newly durable frames' headers and advances each shard's durable end, only at batch ends.
 - The log count is a power-of-two setting with a static shard-to-log mapping.
-- Retention is per log segment. One stuck or poisoned shard therefore pins reclamation of every segment on its volume; the oldest-eligible-unreaped age metric reports it.
+- Retention is per log segment and strictly oldest-first. A segment is reclaimed only once every shard it holds has every retention consumer's persisted offset past its frames there.
+- One stuck or poisoned shard therefore pins reclamation of every later segment on its volume; the oldest-eligible-unreaped age metric reports it.
+- Reclaiming past a pinned segment is not allowed: hot's rebuild from a shard's first retained entry would replay an older write across the gap and shadow cold's newer value.
+- A shard whose frames were all reclaimed keeps its sequence: recovery resumes it after the highest persisted offset.
 
 **Out-of-line large values (#162).**
 - Values above a threshold of 16–64 KiB, sized by the lock-hold budget, are copied into a separate blob lane before sequencing. The log frame carries a reference.
@@ -100,7 +112,11 @@ There is no batch byte cap. A natural batch is limited by how long the previous 
 
 **Consumers own their read position.** A read takes an explicit starting sequence, as a Kafka fetch does. The committed (acknowledged) offset is separate and governs retention only.
 
-**Reads seek, never scan.** A sparse in-memory sequence-to-offset index, rebuilt at open and trimmed after torn-tail truncation, locates any position. The skip from an index point reads frame headers only. Recent frames come from the page cache, and from the mapping itself once the log is memory-mapped.
+**Reads seek, never scan.**
+- Each shard stream keeps an offset ring for its recent frames (`queue.ring_entries`), read lock-free under a per-entry seqlock.
+- A sparse index, one point per 64 KiB of the shard's frame bytes, covers the rest of the retained log. The skip from an index point reads frame headers only.
+- A small per-stream position hint lets consecutive reads continue where the last one stopped.
+- Frames are decoded straight from the mapping.
 
 **Positions below the oldest retained entry are an explicit out-of-range error, never a silent clamp.**
 - Hot resets to the oldest entry.
@@ -190,11 +206,15 @@ No reply, to a read or a write, reflects a write that a failure in the configure
 
 ### Execution resources
 
-Cold consumers run as a pool sized to cores, not one thread per shard.
-- For the in-memory window, they walk their shards' frames through per-shard offset rings.
-- Beyond the window, they use the log's sparse in-memory index, which is rebuilt at open.
+**Pooled cold workers (#177)** move cold from one thread per shard to a pool sized to cores. They are sequenced after Phase 2, because Phase 2 changes cold's inputs and couples hot eviction to cold's drain progress.
+- One shard's drain-and-flush cycle stays on one thread, because the persistence gate's paused absorption and the buffer's node stability depend on it.
+- Pooled workers park on a volume-level publish signal. The log's single atomic tail is what that signal wraps.
 
-Recovery is a single demultiplexing pass over each log.
+**Recovery is a single demultiplexing pass over each log.**
+- Hot rebuilds from each shard's first retained entry, and cold from its committed offset, which can trail by up to the buffer's deadline.
+- Per-shard reads over an interleaved log would read it once per wave of shard replays.
+- Instead, after the resolver phase, one scan per log feeds both. A header-only walker hands per-shard batches of positions to shard-affine decode workers, bounded so they stay inside the walker's page-cache window. Each batch is split between hot and cold by sequence.
+- The retained log is read about once. `abyss_wal_scan_bytes_total` reports it.
 
 ## Invariants
 
@@ -215,12 +235,12 @@ Recovery is a single demultiplexing pass over each log.
 |----------|--------|-------|
 | ADP-001 | Read takes a position, and positions below the oldest retained entry are out of range. Acks become committed offsets, persisted lazily in one dual-slot checkpoint. Volatile consumers are removed. Group commit and fsync policies are replaced by natural batching and durability classes. Segments move to one mapped physical log per volume. The entry taxonomy loses `Conditional` and `Resolved`. | 1a, 1b, 1c, 2 |
 | ADP-002 | Hot is applied by the sequencer. Residency invariant, droppable stubs, eviction gated on cold drain. | 2 |
-| ADP-004 | Consumer loop reads by position, and a poison entry pins the commit offset while reads pass it. Writes to the cold store are capped at the power-durable watermark. Pooled workers. | 1a, 1b, 1c |
+| ADP-004 | Consumer loop reads by position, and a poison entry pins the commit offset while reads pass it. Writes to the cold store are capped at the power-durable watermark. Recovery replay through the demultiplexing scan. Pooled workers. | 1a, 1b, 1c, #177 |
 | ADP-005 | Asynchronous completion. The blocking head-of-line trade-off is removed. Conditional dispatch becomes sequenced writes. | 2, 3 |
 | ADP-006 | Sequenced write path, read fence, cache-fill promotion, no read-consistency wait. The Flush acknowledgement no longer requires a persisted consumer offset: the Flush entry's own durability suffices, Wipe stays synced, and a replayed Flush is idempotent per shard. | 1a, 2 |
-| ADP-007 | Resolver phase removed. Recovery syncs the log before replay. | 1b, 2 |
+| ADP-007 | Recovery syncs the log before replay. Hot and cold replay through one demultiplexing scan per log. Resolver phase removed. | 1b, 1c, 2 |
 | ADP-008 | A broker-backed log requires producer fencing so an outgoing shard owner cannot interleave effects during resharding. | 2 |
-| ADP-009 | Sparse in-memory index. Preallocated segments, where a zero length marks the end of the log. Physical log per volume with per-shard streams. Effect frames. | 1a, 1c, 2 |
+| ADP-009 | Sparse in-memory index. Format 2: a physical log per volume with per-shard streams, recycled segments with per-frame generations, commit words, batch closure by position. Effect frames. | 1a, 1c, 2 |
 | ADP-011 | Resolver, entry pair and block-and-scan superseded. Consumer RPC is reduced to admin and flush use. | 2 |
 | ADP-013 | Target-to-substrate map, write probe, comparative drivers and matrix, load-driver pipelining. | 0 |
 
@@ -236,10 +256,11 @@ Recovery is a single demultiplexing pass over each log.
 | 0 | #157 | Measurement: write probe with device-flush calibration, flush metrics, read-position micro-benchmark, a pipelining load driver, server-identified comparative runs. Targets in `requirements.md`. |
 | 1a | #158 | Read and acknowledgement contract: consumer-owned positions, explicit out-of-range, sparse index with header-only skip, lazy dual-slot offset checkpoint. |
 | 1b | #159 | Durability semantics on the existing per-shard segments: natural batching, durability classes, cold persistence ceiling, bounded durability window, fail-stop, recovery-time sync. |
-| 1c | #175 | Physical log: mapped, preallocated, zero-filled segments in one log per volume with per-shard streams and an atomic-reserve tail; offset rings; the demultiplexing recovery pass; pooled cold workers. Delivers W2 under concurrency and W3, which 1b's per-shard flushes cannot, because they serialise on the device. |
+| 1c | #175 | Physical log: mapped, recycled segments in one log per volume with per-shard streams, a reserve/fill/commit tail and a filled-prefix watermark; offset rings and sparse indexes; per-segment, oldest-first retention; the demultiplexing recovery pass and scan-based hot and cold rebuild. Delivers W2 under concurrency and W3, which 1b's per-shard flushes cannot, because they serialise on the device. |
+| After 2 | #177 | Pooled cold workers, shard-affine. |
 | 2 | #160 | Sequenced write path, residency invariant, read visibility, cross-shard atomic commands, shard-lock measurement under skew; resolver removal. |
 | 3 | #161 | Asynchronous request execution and asynchronous cold I/O. |
-| Later | #162, #170, #88 | Blob lane, atomic multi-key reads, io_uring with several flushes in flight (watermark at the contiguous completed prefix), hot-table and allocator work driven by profiles. |
+| Later | #162, #170, #88, #178 | Blob lane, atomic multi-key reads, io_uring with several flushes in flight (watermark at the contiguous completed prefix), per-segment index footers so open need not scan the retained log, hot-table and allocator work driven by profiles. |
 
 Every phase is measured against the Phase 0 baseline with the same instruments. A three-way property test checks hot, cold and a reference model against each other, replies included. It covers TTL boundaries, flushes at arbitrary points, Flush entries, eviction with loading, and multi-effect batches. It lands with Phase 2 and runs under the unit tier (seeded, bounded) and the fuzz harness (long).
 

@@ -134,12 +134,14 @@ cold:
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 134217728
+  segment_size_bytes: 134217728       # per log segment
+  log_count: 1                        # physical logs, power of two <= shard count
+  ring_entries: 65536                 # per-shard offset ring (power of two, 4096-2^24)
   min_retention_seconds: 86400
   offset_fsync_interval_ms: 1000      # committed-offset checkpoint cadence (10-60000)
   durability: process_crash           # process_crash | power_loss
   durability_window_bytes: 67108864   # unflushed WAL bytes across shards (1 MiB-4 GiB)
-  durability_window_ms: 1000          # oldest unflushed entry per shard (10-60000)
+  durability_window_ms: 1000          # oldest unflushed entry per log (10-60000)
 
 hot_consumer:
   read_batch_size: 256
@@ -176,6 +178,22 @@ admin:
   bind: 0.0.0.0
   port: 8080
 ```
+
+### WAL sizing
+
+**Disk.** Each log holds its retained segments, one active segment, two prepared spares, and up to two reclaimed segments waiting for reuse. Size the WAL volume for `min_retention` at the peak write rate, plus five segments per log.
+
+**Warm-up bandwidth.** Until retention first reclaims a segment (`min_retention`, 24 h by default), every new segment is zero-filled before use, so the WAL writes each byte twice.
+- A sustained write rate above about half the volume's bandwidth can run the spares out during that period.
+- Appends then wait for a spare, and are rejected at their deadline.
+- `abyss_wal_spare_segments`, `abyss_wal_spare_waits_total` and `abyss_wal_segments_grown_total` show it.
+- After warm-up, reclaimed segments are recycled and each byte is written once.
+
+**Memory.**
+- **Sparse index:** one 16-byte point per 64 KiB of retained log, about 0.025% of the retained WAL. For example, 10 MB/s with 24 h retention retains about 864 GB and indexes it in about 210 MB. `abyss_wal_index_bytes` reports the live figure.
+- **Offset ring:** `ring_entries` slots of 16 bytes per shard, allocated at start. That is 1 MiB per shard at the default, 64 MiB at 64 shards, outside `hot.max_memory_bytes`. `abyss_wal_ring_bytes` and the `WAL opened` log line report it. The ring must cover how far consumers normally trail the head; reads further back fall back to the sparse index.
+
+**Log count.** All logs live under `wal_path`, on one volume. The default of one log gives one sequential write stream and one flush per batch. Raise `log_count` only if measurements show a single flusher is the limit.
 
 ### External Profile
 

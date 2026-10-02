@@ -53,7 +53,7 @@ Abyss acknowledges a write when it reaches the durability class set by `queue.du
 
 ### Phase 1 Threading
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** The hot consumer and resolver threads go away. Writes are sequenced under the shard lock on the calling thread, and cold consumers become a pool sized to cores. The list below describes current behaviour.
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** The hot consumer and resolver threads go away (Phase 2). Writes are sequenced under the shard lock on the calling thread. Cold consumers become a pool sized to cores after that (#177). Each log already has one segment-preparer thread and one flusher thread. The list below describes current behaviour.
 
 - **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands, route to tiering engine.
 - **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils Consumer RPC promises for unconditional writes.
@@ -77,7 +77,7 @@ Phase 2 does not change the threading model within a pod. Each pod runs the same
 
 ## Consumer Coordination
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Retention is gated by the persisted committed offsets of the retention consumers (cold, and the resolver until it is removed). In one physical log per volume, a stuck shard pins reclamation for that volume. The text below describes current behaviour.
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Retention is gated by the persisted committed offsets of the retention consumers (cold, and the resolver until it is removed), per log segment and oldest first. In one physical log per volume, a stuck shard pins reclamation for that volume. The text below describes the retention bound, which is unchanged.
 
 The queue retains entries until both consumers have acknowledged. Under normal operation, the cold consumer lags behind the hot consumer by up to the eviction window (since it uses that window to accumulate and compact writes before flushing).
 
