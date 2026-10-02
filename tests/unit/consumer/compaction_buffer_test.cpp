@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <optional>
 
 #include "test_clock.h"
 
@@ -467,7 +468,7 @@ TEST_F(CompactionBufferTest, FlushedEntryCarriesEviction) {
 }
 
 // ---------------------------------------------------------------------------
-// Sequence tracking + low-water ack
+// Sequence tracking + low-water commit
 // ---------------------------------------------------------------------------
 
 TEST_F(CompactionBufferTest, AbsorbRecordsFirstSeenSeq) {
@@ -497,8 +498,7 @@ TEST_F(CompactionBufferTest, OldestPendingSeqReturnsMinimum) {
   buffer_.Absorb("b", WriteOp{StringSet{.key = "b", .value = "v"}}, kDefaultEviction, 3);
   buffer_.Absorb("c", WriteOp{StringSet{.key = "c", .value = "v"}}, kDefaultEviction, 11);
   auto oldest = buffer_.OldestPendingSeq();
-  ASSERT_TRUE(oldest.has_value());
-  EXPECT_EQ(*oldest, 3U);
+  EXPECT_EQ(oldest, std::optional{3U});
 }
 
 TEST_F(CompactionBufferTest, OldestPendingSeqAdvancesAfterFlush) {
@@ -528,8 +528,7 @@ TEST_F(CompactionBufferTest, OldestFirstSeenReturnsMinimumAcrossEntries) {
   AbsorbString("c", "v");
 
   auto oldest = buffer_.OldestFirstSeen();
-  ASSERT_TRUE(oldest.has_value());
-  EXPECT_EQ(*oldest, t0);
+  EXPECT_EQ(oldest, std::optional{t0});
 }
 
 TEST_F(CompactionBufferTest, OldestFirstSeenUnmovedByReabsorbOfSameKey) {
@@ -539,8 +538,7 @@ TEST_F(CompactionBufferTest, OldestFirstSeenUnmovedByReabsorbOfSameKey) {
   AbsorbString("a", "v2");
 
   auto oldest = buffer_.OldestFirstSeen();
-  ASSERT_TRUE(oldest.has_value());
-  EXPECT_EQ(*oldest, t0);
+  EXPECT_EQ(oldest, std::optional{t0});
 }
 
 TEST_F(CompactionBufferTest, OldestFirstSeenAdvancesToNextOldestAfterFlush) {
@@ -555,8 +553,7 @@ TEST_F(CompactionBufferTest, OldestFirstSeenAdvancesToNextOldestAfterFlush) {
   EXPECT_EQ(flushed[0].key, "a");
 
   auto oldest = buffer_.OldestFirstSeen();
-  ASSERT_TRUE(oldest.has_value());
-  EXPECT_EQ(*oldest, t1);
+  EXPECT_EQ(oldest, std::optional{t1});
 }
 
 // ---------------------------------------------------------------------------

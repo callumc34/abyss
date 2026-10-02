@@ -109,8 +109,8 @@ std::string Render(const StatusSnapshot& s) {
     w.String(s.queue.backend);
     w.Key("head_seq");
     w.UInt(s.queue.head_seq);
-    w.Key("tail_seq");
-    w.UInt(s.queue.tail_seq);
+    w.Key("first_seq");
+    w.UInt(s.queue.first_seq);
     w.Key("total_entries");
     w.UInt(s.queue.total_entries);
     w.Key("total_bytes");
@@ -172,19 +172,19 @@ std::string Render(const StatusSnapshot& s) {
     w.Key("cold");
     {
       w.BeginObject();
-      w.Key("last_ack_seq_min");
-      w.UInt(s.consumers.cold.last_ack_seq_min);
-      w.Key("last_ack_seq_max");
-      w.UInt(s.consumers.cold.last_ack_seq_max);
+      w.Key("last_commit_seq_min");
+      w.UInt(s.consumers.cold.last_commit_seq_min);
+      w.Key("last_commit_seq_max");
+      w.UInt(s.consumers.cold.last_commit_seq_max);
       w.EndObject();
     }
     w.Key("resolver");
     {
       w.BeginObject();
-      w.Key("last_ack_seq_min");
-      w.UInt(s.consumers.resolver.last_ack_seq_min);
-      w.Key("last_ack_seq_max");
-      w.UInt(s.consumers.resolver.last_ack_seq_max);
+      w.Key("last_commit_seq_min");
+      w.UInt(s.consumers.resolver.last_commit_seq_min);
+      w.Key("last_commit_seq_max");
+      w.UInt(s.consumers.resolver.last_commit_seq_max);
       w.Key("cache_entries");
       w.UInt(s.consumers.resolver.cache_entries);
       w.Key("cache_bytes");

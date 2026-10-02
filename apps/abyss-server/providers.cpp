@@ -85,7 +85,7 @@ resp::ServerStats ServerStatsImpl::Snapshot() const {
     out.queue_total_entries = stats->total_entries;
     out.queue_total_bytes = stats->total_bytes;
     out.queue_head_seq = stats->head_seq;
-    out.queue_tail_seq = stats->tail_seq;
+    out.queue_first_seq = stats->first_seq;
   }
 
   out.connected_clients = connection_count_ ? connection_count_() : 0;
@@ -182,7 +182,7 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
   if (deps_.queue != nullptr) {
     if (auto qs = deps_.queue->Stats(); qs.has_value()) {
       s.queue.head_seq = qs->head_seq;
-      s.queue.tail_seq = qs->tail_seq;
+      s.queue.first_seq = qs->first_seq;
       s.queue.total_entries = qs->total_entries;
       s.queue.total_bytes = qs->total_bytes;
     }
@@ -254,9 +254,9 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
     collect_lag(
         deps_.cold_pool->ShardCount(),
         [this](uint32_t shard) -> uint64_t {
-          return deps_.cold_pool->ConsumerFor(shard).Snapshot().last_ack_seq;
+          return deps_.cold_pool->ConsumerFor(shard).Snapshot().last_commit_seq;
         },
-        s.consumers.cold.last_ack_seq_min, s.consumers.cold.last_ack_seq_max,
+        s.consumers.cold.last_commit_seq_min, s.consumers.cold.last_commit_seq_max,
         s.lag.cold_max_entries);
   }
 
@@ -268,9 +268,9 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
     collect_lag(
         deps_.resolver_pool->ShardCount(),
         [this](uint32_t shard) -> uint64_t {
-          return deps_.resolver_pool->ConsumerFor(shard).GetSnapshot().last_ack_seq;
+          return deps_.resolver_pool->ConsumerFor(shard).GetSnapshot().last_commit_seq;
         },
-        s.consumers.resolver.last_ack_seq_min, s.consumers.resolver.last_ack_seq_max,
+        s.consumers.resolver.last_commit_seq_min, s.consumers.resolver.last_commit_seq_max,
         s.lag.resolver_max_entries);
   }
 

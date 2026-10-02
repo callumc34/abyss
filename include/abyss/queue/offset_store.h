@@ -2,12 +2,12 @@
 
 #include <optional>
 
-#include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
 namespace abyss::queue {
 
-// Persistent record of the highest sequence ID each consumer has acknowledged.
+// Read-only view of each consumer's PERSISTED committed offset: the floor
+// the segment reaper may reclaim up to. Never an in-memory value.
 class OffsetStore {
  public:
   OffsetStore() = default;
@@ -20,9 +20,6 @@ class OffsetStore {
 
   virtual std::optional<core::SequenceId> Get(core::ConsumerId consumer,
                                               core::ShardId shard) const = 0;
-
-  virtual core::Result<void> Set(core::ConsumerId consumer, core::ShardId shard,
-                                 core::SequenceId seq) = 0;
 };
 
 }  // namespace abyss::queue

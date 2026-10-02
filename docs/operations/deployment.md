@@ -136,7 +136,7 @@ queue:
   wal_path: /data/wal
   segment_size_bytes: 67108864
   min_retention_seconds: 86400
-  offset_fsync_interval_ms: 1000
+  offset_fsync_interval_ms: 1000      # committed-offset checkpoint cadence (10-60000)
   wal_fsync_policy: group_commit
   group_commit_interval_us: 1000
   group_commit_max_bytes: 1048576

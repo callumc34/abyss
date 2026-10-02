@@ -2,7 +2,9 @@
 
 #include <gmock/gmock.h>
 
+#include <algorithm>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -34,20 +36,32 @@ class MockQueue : public core::Queue {
   MOCK_METHOD(core::Result<queue::AppendBatchResult>, AppendBatch,
               (core::ShardId shard, std::span<const core::QueueEntry> entries), (override));
   MOCK_METHOD((core::Result<std::vector<core::QueueEntry>>), Read,
-              (core::ConsumerId consumer, core::ShardId shard, size_t max_count,
+              (core::ShardId shard, core::SequenceId from_seq, size_t max_count,
                core::Duration timeout),
               (override));
-  MOCK_METHOD(core::Result<void>, Ack,
+  MOCK_METHOD(core::Result<void>, CommitOffset,
               (core::ConsumerId consumer, core::ShardId shard, core::SequenceId seq), (override));
+  MOCK_METHOD((core::Result<std::optional<core::SequenceId>>), CommittedOffset,
+              (core::ConsumerId consumer, core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::SequenceId>, DurableSeq, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<bool>, AwaitDurable,
               (core::ShardId shard, core::SequenceId seq, core::Duration timeout), (override));
+  MOCK_METHOD(core::Result<core::SequenceId>, FirstSeq, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::SequenceId>, OldestRetained, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::SequenceId>, TailSeq, (core::ShardId shard), (override));
-  MOCK_METHOD(core::Result<core::SequenceId>, AckOffset,
-              (core::ConsumerId consumer, core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::QueueStats>, Stats, (), (override));
 };
+
+// The Read contract over an in-memory log sorted by seq: up to `max_count`
+// entries with seq >= `from_seq`.
+inline std::vector<core::QueueEntry> ReadFromLog(const std::vector<core::QueueEntry>& log,
+                                                 core::SequenceId from_seq, size_t max_count) {
+  auto it = std::ranges::lower_bound(log, from_seq, std::ranges::less{},
+                                     [](const core::QueueEntry& e) { return e.seq; });
+  std::vector<core::QueueEntry> out;
+  for (; it != log.end() && out.size() < max_count; ++it) out.push_back(*it);
+  return out;
+}
 
 // No-op publisher used by tests that want a PendingAppend without a real WAL.
 class NoopAppendPublisher : public queue::AppendPublisher {

@@ -4,12 +4,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer_pool.h"
@@ -18,6 +18,7 @@
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/core/thread_annotations.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/platform/fs.h"
@@ -143,7 +144,6 @@ class IntegrationHarness {
   core::ConsumerRpc& Rpc() { return *rpc_; }
   TestClock& Clock() { return clock_; }
   ::testing::NiceMock<MockQueue>& Queue() { return queue_; }
-  core::SequenceId PeekNextSeq() const { return next_seq_; }
 
  private:
   void InstallQueueMocks() {
@@ -153,57 +153,43 @@ class IntegrationHarness {
         .WillByDefault([this](core::ShardId shard, core::QueueEntry entry) {
           std::promise<core::Result<void>> p;
           p.set_value(core::Result<void>{});
-          const auto seq = next_seq_++;
-          entry.seq = seq;
-          {
-            const std::lock_guard lock(queue_mutex_);
-            hot_pending_.at(shard).push_back(entry);
-            cold_pending_.at(shard).push_back(std::move(entry));
-          }
+          const auto seq = AppendToLog(shard, std::move(entry));
           return queue::PendingAppend{seq, p.get_future(), std::make_unique<NoopAppendPublisher>()};
         });
     ON_CALL(queue_, Append(::testing::_, ::testing::_))
         .WillByDefault([this](core::ShardId shard, core::QueueEntry entry) {
           std::promise<core::Result<void>> p;
           p.set_value(core::Result<void>{});
-          const auto seq = next_seq_++;
-          entry.seq = seq;
-          {
-            const std::lock_guard lock(queue_mutex_);
-            hot_pending_.at(shard).push_back(entry);
-            cold_pending_.at(shard).push_back(std::move(entry));
-          }
+          const auto seq = AppendToLog(shard, std::move(entry));
           return queue::AppendResult{.seq = seq, .durable = p.get_future()};
         });
     ON_CALL(queue_, Read(::testing::_, ::testing::_, ::testing::_, ::testing::_))
-        .WillByDefault([this](core::ConsumerId consumer, core::ShardId shard, size_t max_count,
+        .WillByDefault([this](core::ShardId shard, core::SequenceId from_seq, size_t max_count,
                               core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
-          std::vector<core::QueueEntry> out;
-          auto& dq =
-              (consumer == core::kHotConsumer) ? hot_pending_.at(shard) : cold_pending_.at(shard);
-          {
-            const std::lock_guard lock(queue_mutex_);
-            while (!dq.empty() && out.size() < max_count) {
-              out.push_back(std::move(dq.front()));
-              dq.pop_front();
-            }
-          }
-          return out;
+          const std::scoped_lock lock(queue_mutex_);
+          return ReadFromLog(log_.at(shard), from_seq, max_count);
         });
-    ON_CALL(queue_, Ack(::testing::_, ::testing::_, ::testing::_))
+    ON_CALL(queue_, CommitOffset(::testing::_, ::testing::_, ::testing::_))
         .WillByDefault(::testing::Return(core::Result<void>{}));
     // NOLINTEND(performance-unnecessary-value-param)
+  }
+
+  core::SequenceId AppendToLog(core::ShardId shard, core::QueueEntry entry) {
+    const std::scoped_lock lock(queue_mutex_);
+    entry.seq = next_seq_++;
+    log_.at(shard).push_back(std::move(entry));
+    return log_.at(shard).back().seq;
   }
 
   std::filesystem::path tmp_dir_;
   TestClock clock_;
   core::EvictionPolicy eviction_policy_{std::chrono::seconds{86400}};
-  uint64_t next_seq_ = 1;
 
   ::testing::NiceMock<MockQueue> queue_;
   std::mutex queue_mutex_;
-  std::array<std::deque<core::QueueEntry>, kShardCount> hot_pending_;
-  std::array<std::deque<core::QueueEntry>, kShardCount> cold_pending_;
+  // Seqs are global across shards, so each shard's log is sorted but sparse.
+  uint64_t next_seq_ ABYSS_GUARDED_BY(queue_mutex_) = 1;
+  std::array<std::vector<core::QueueEntry>, kShardCount> log_ ABYSS_GUARDED_BY(queue_mutex_);
 
   std::unique_ptr<hot::ShardedHotStore> hot_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;

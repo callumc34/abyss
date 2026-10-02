@@ -157,8 +157,8 @@ constexpr size_t kPositionSegmentBytes = size_t{256} * 1024 * 1024;
 constexpr size_t kPositionFillBatch = 1024;
 constexpr size_t kPositionValueBytes = 16;
 
-// Cost of one tail Read against the reader's position in the active
-// segment: O(position) while Read re-decodes from the segment start.
+// Cost of one tail Read at a position deep in the active segment;
+// flat in the position when the segment index resolves it.
 void BM_ReadAtSegmentPosition(benchmark::State& state) {
   TempDir tmp;
   const auto n = static_cast<core::SequenceId>(state.range(0));
@@ -168,7 +168,6 @@ void BM_ReadAtSegmentPosition(benchmark::State& state) {
       .shard_count = 1,
       .commit = {.policy = FsyncPolicy::kNone},
       .min_retention = 1s,
-      .volatile_consumers = {core::kHotConsumer},
   });
   if (!opened.has_value()) {
     state.SkipWithError("open failed");
@@ -189,15 +188,8 @@ void BM_ReadAtSegmentPosition(benchmark::State& state) {
     return;
   }
 
-  // Positions the reader at the newest entry. An explicit start seq on
-  // Read replaces this Ack.
-  if (!queue.Ack(core::kHotConsumer, 0, n - 2).has_value()) {
-    state.SkipWithError("position failed");
-    return;
-  }
-
   for ([[maybe_unused]] auto _ : state) {
-    auto read = queue.Read(core::kHotConsumer, 0, 256, core::Duration{0});
+    auto read = queue.Read(0, n - 1, 256, core::Duration{0});
     if (!read.has_value() || read->size() != 1) {
       state.SkipWithError("tail read failed");
       return;

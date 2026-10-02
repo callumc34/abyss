@@ -71,7 +71,6 @@ void PreloadQueue(const std::string& wal_path, int64_t n_entries) {
                  .max_bytes = 1024 * 1024},
       .min_retention = 24h,
       .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
-      .volatile_consumers = {core::kHotConsumer},
   });
   if (!queue.has_value()) std::abort();
   for (int64_t i = 0; i < n_entries; ++i) {
@@ -102,7 +101,6 @@ void BM_RecoveryColdHot(benchmark::State& state) {
                    .max_bytes = 1024 * 1024},
         .min_retention = 24h,
         .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
-        .volatile_consumers = {core::kHotConsumer},
     });
     if (!queue.has_value()) state.SkipWithError("queue open");
 

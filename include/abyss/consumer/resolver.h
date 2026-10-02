@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -54,7 +56,8 @@ class Resolver {
 
   // Idempotent. Must run before Start() and before cold/hot consumers start.
   // If `cancel` flips true mid-replay, the call returns kUnavailable; partial
-  // progress is still acked so a subsequent invocation resumes cleanly.
+  // progress is still committed and every call rescans from the committed
+  // offset, so a subsequent invocation resumes cleanly.
   core::Result<void> ReplayForRecovery(const std::atomic<bool>& cancel);
 
   void Start();
@@ -79,12 +82,13 @@ class Resolver {
     uint64_t apply_wait_timeouts = 0;
     uint64_t durable_wait_timeouts = 0;
     uint64_t append_failures = 0;
+    uint64_t commit_failures = 0;
     uint64_t parse_failures = 0;
     uint64_t replayed_resolveds_emitted = 0;
     uint64_t flushes_observed = 0;
     uint64_t flush_skip_resolveds_emitted = 0;
     core::SequenceId latest_drained_seq = 0;
-    core::SequenceId last_ack_seq = 0;
+    core::SequenceId last_commit_seq = 0;
     core::SequenceId resolver_durable_floor = 0;
     core::SequenceId latest_flush_seq = 0;
     size_t cache_entries = 0;
@@ -95,7 +99,14 @@ class Resolver {
 
  private:
   void Run();
-  void ProcessEntry(const core::QueueEntry& entry);
+  // Points the read cursor just past the committed offset.
+  core::Result<void> SeedCursor();
+  // Commits `seq`; on success it becomes committed_.
+  void Commit(core::SequenceId seq);
+  // The reaper deleted entries above the persisted offset: fail-stop.
+  [[noreturn]] void FailOutOfRange(core::SequenceId requested);
+  // False when a Conditional's Resolved append failed: retry the entry.
+  [[nodiscard]] bool ProcessEntry(const core::QueueEntry& entry);
   void HandleFlush(const core::QueueEntry& entry);
 
   // Pure function of cache + buffer + cold + entry.appended_at — required
@@ -133,18 +144,28 @@ class Resolver {
   ExistenceCache cache_;
 
   std::atomic<bool> stop_requested_{false};
+  // Wakes the append-retry backoff on RequestStop.
+  std::mutex stop_mu_;
+  std::condition_variable stop_cv_;
   std::atomic<bool> running_{false};
   std::thread thread_;
 
+  // Replay or Run thread state, never both at once: the next seq to read and
+  // the last committed offset.
+  bool cursor_seeded_ = false;
+  core::SequenceId next_read_seq_ = 0;
+  std::optional<core::SequenceId> committed_;
+
   std::atomic<core::SequenceId> latest_drained_seq_{0};
-  std::atomic<core::SequenceId> last_ack_seq_{0};
-  // High-watermark (Kafka HW vs LEO): the highest Conditional seq X such that
-  // every Resolved this resolver emitted for Conditionals <= X is confirmed
-  // fsynced. The persisted retention Ack target is clamped to this so a
-  // Conditional is never acked past until its emitted Resolved is durable
-  // (XDUR-2). `highest_emitted_resolved_seq_` is the durability target the
-  // floor advances behind: the max Resolved seq emitted for any drained
-  // Conditional.
+  // Mirror of committed_ for GetSnapshot(); 0 when nothing is committed.
+  std::atomic<core::SequenceId> last_commit_seq_{0};
+  // High-watermark (Kafka HW vs LEO): the highest Conditional seq X such
+  // that every Resolved this resolver emitted for Conditionals <= X is
+  // confirmed fsynced. The committed offset is clamped to this so a
+  // Conditional is never committed past until its emitted Resolved is
+  // durable (XDUR-2). `highest_emitted_resolved_seq_` is the durability
+  // target the floor advances behind: the max Resolved seq emitted for any
+  // drained Conditional.
   std::atomic<core::SequenceId> resolver_durable_floor_{0};
   std::atomic<core::SequenceId> highest_emitted_resolved_seq_{0};
   // Highest seq of an observed `entry::Flush`. During replay, gates the
@@ -164,6 +185,7 @@ class Resolver {
   std::atomic<uint64_t> apply_wait_timeouts_{0};
   std::atomic<uint64_t> durable_wait_timeouts_{0};
   std::atomic<uint64_t> append_failures_{0};
+  std::atomic<uint64_t> commit_failures_{0};
   std::atomic<uint64_t> parse_failures_{0};
   std::atomic<uint64_t> replayed_resolveds_emitted_{0};
   std::atomic<uint64_t> flushes_observed_{0};

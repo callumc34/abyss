@@ -31,6 +31,8 @@
 - `abyss_hits_total{tier="hot|buffer|cold"}` — read hits by tier
 - `abyss_misses_total` — read misses (key not found in any tier)
 - `abyss_queue_appended_total` — total entries appended to queue
+- `abyss_queue_offset_persist_failures_total` — committed-offset checkpoint writes that failed; retried on the next round
+- `abyss_queue_read_out_of_range_total` — queue reads below the first retained entry
 - `abyss_cold_flush_total{status="success|failure"}` — cold consumer flush operations
 - `abyss_cold_flush_reason_total{reason="quiet|deadline|pressure"}` — flush trigger reason
 - `abyss_cold_flush_batch_size` (histogram) — number of keys per flush batch
@@ -127,7 +129,7 @@ Returns a JSON document with the live operational state of the process. Content-
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "abyss":   { "version": "0.1.0", "build": { "commit": "abc1234", "date": "2026-05-03T12:34:56Z" } },
   "server":  { "node_id": "...", "started_at_unix_ms": 1714742400000,
                "uptime_seconds": 3600, "process_id": 12345,
@@ -140,15 +142,15 @@ Returns a JSON document with the live operational state of the process. Content-
     "admin":   { "bind": "0.0.0.0", "port": 8080, "enabled": true },
     "metrics": { "bind": "0.0.0.0", "port": 9090, "enabled": true }
   },
-  "queue": { "backend": "builtin_wal", "head_seq": 0, "tail_seq": 0,
+  "queue": { "backend": "builtin_wal", "head_seq": 0, "first_seq": 0,
              "total_entries": 0, "total_bytes": 0 },
   "hot":   { "backend": "builtin_hashmap", "key_count": 0, "memory_bytes": 0 },
   "cold":  { "backend": "builtin_rocksdb", "key_count": 0,
              "buffer": { "entries": 0, "bytes": 0 } },
   "consumers": {
     "hot":      { "highest_settled_seq_min": 0, "highest_settled_seq_max": 0 },
-    "cold":     { "last_ack_seq_min": 0, "last_ack_seq_max": 0 },
-    "resolver": { "last_ack_seq_min": 0, "last_ack_seq_max": 0,
+    "cold":     { "last_commit_seq_min": 0, "last_commit_seq_max": 0 },
+    "resolver": { "last_commit_seq_min": 0, "last_commit_seq_max": 0,
                   "cache_entries": 0, "cache_bytes": 0 }
   },
   "lag":     { "hot_max_entries": 0, "cold_max_entries": 0,
@@ -170,12 +172,12 @@ These invariants govern any change to the `/status` payload across releases. Bum
 
 #### Field semantics
 
-- `schema_version` — bumps only when an invariant above is broken. Today: `1`.
+- `schema_version` — bumps only when an invariant above is broken. Today: `2`. Version 2 renamed `queue.tail_seq` to `queue.first_seq`, which now reports the lowest readable sequence across shards. It also renamed `consumers.{cold,resolver}.last_ack_seq_{min,max}` to `last_commit_seq_{min,max}`, following the queue's move from acknowledgements to committed offsets.
 - `abyss.build.commit` / `abyss.build.date` — captured at configure time. `unknown` outside a git checkout.
 - `server.mode` — `"standalone"` or `"cluster"`. Phase 1 always emits `"standalone"`.
 - `server.role` — `"master"` or `"replica"`. Phase 1 always emits `"master"`.
 - `consumers.*.{seq}_min` / `_max` — per-shard min and max of the corresponding sequence positions. Equal values mean uniform progress across shards; divergence indicates shard skew.
-- `lag.*_max_entries` — worst-case lag across shards (`tail_seq − consumer_seq`), in queue entries.
+- `lag.*_max_entries` — worst-case lag across shards (newest assigned seq − consumer seq), in queue entries.
 - `cluster` — reserved for Phase 2; populated with `slots_owned`, `peers`, `epoch` when cluster mode lands.
 
 
@@ -290,6 +292,8 @@ class FlushEngine {
 - `abyss_cold_flush_reason_total{reason="deadline"}` dominating over `{reason="quiet"}` — keys are being written continuously without quiet windows. This may be normal for the workload, or it may indicate the quiet threshold needs tuning.
 - `abyss_cold_ttl_disk_pressure_active == 1` — the cold-store filesystem has crossed `disk_pressure_threshold` and the TTL scanner has switched to maximum aggression. Sustained pressure means provisioning is underspec'd or the cold consumer is producing more than active expiry can reclaim.
 - `rate(abyss_cold_ttl_deleted_total[5m]) == 0 AND abyss_cold_keys > 0` — scanner is alive but reclaiming nothing. Either the workload genuinely has no expiring keys (benign) or the scanner is failing silently (investigate logs at component `abyss.cold.ttl_scanner`).
-- `increase(abyss_queue_reaper_failures_total[15m]) > 0` — the segment reaper could not delete a sealed segment it was entitled to reclaim. One failure is usually a transient filesystem error and the reaper retries; a sustained rate means WAL disk will grow without bound even though every consumer has acked past those segments. Check filesystem permissions and free inodes on the WAL volume. Pair this with the age gauge below — failures alone do not say how much reclamation is being lost.
+- `increase(abyss_queue_offset_persist_failures_total[5m]) > 0` — the committed-offset checkpoint could not be written. Persisted offsets stay where they were, so the next restart replays further and retention cannot advance; nothing acknowledged is lost. Check the WAL volume for space and I/O errors.
+- A pod restarting repeatedly (Kubernetes `CrashLoopBackOff`) after a CRITICAL `fatal invariant breach; terminating` log line means an unrecoverable invariant breach. The process aborts deliberately, so no metric survives to be scraped; the log line names the cause. A retention consumer reading below the first retained WAL entry is one such breach: entries above its persisted offset were reclaimed, so the process stops instead of skipping data, and the line names the consumer, shard and positions. `abyss_queue_read_out_of_range_total` counts the out-of-range reads a live process survives, which are hot-consumer resets to the oldest entry, expected after a restart.
+- `increase(abyss_queue_reaper_failures_total[15m]) > 0` — the segment reaper could not delete a sealed segment it was entitled to reclaim. One failure is usually a transient filesystem error and the reaper retries; a sustained rate means WAL disk will grow without bound even though every retention consumer's persisted committed offset is past those segments. Check filesystem permissions and free inodes on the WAL volume. Pair this with the age gauge below — failures alone do not say how much reclamation is being lost.
 - `abyss_queue_oldest_eligible_unreaped_age_seconds > 3 * min_retention_seconds` — a segment has been eligible for reclamation for far longer than the retention floor and is still on disk. This is the symptom that matters for disk exhaustion; the failure counter above is the cause. If this climbs while the failure counter is flat, the reaper is not running at all rather than failing.
 - `increase(abyss_cold_unsupported_op_total[1h]) > 0` — the log contains write entries this build has no parser for. Live traffic cannot produce these (see [failure-modes.md](failure-modes.md) §poison quarantine), so a non-zero value means the data directory carries entries from a binary with a wider command surface: a downgrade, a mixed-version rollout, or a restore from a newer node. Those writes are absent from both tiers. Treat as a correctness investigation, not a capacity one.

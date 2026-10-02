@@ -258,7 +258,8 @@ TEST(GroupCommitterTest, DurableSeqMonotonicToHighestBatchSeq) {
 }
 
 // Decision 1: under fsync_none durable_seq tracks the published seq so the
-// retention-Ack gate is a correct no-op (durability is disabled, not blocked).
+// retention-commit gate is a correct no-op (durability is disabled, not
+// blocked).
 TEST(GroupCommitterTest, NonePolicyTracksPublishedSeq) {
   std::atomic<int> fsync_count{0};
   GroupCommitter committer({.policy = FsyncPolicy::kNone}, MakeCounter(fsync_count));

@@ -45,6 +45,9 @@ void Init(const config::LogConfig& config);
 
 bool Initialized() noexcept;
 
+// Writes any buffered records through to the sink. Safe from any thread.
+void Flush() noexcept;
+
 class Logger {
  public:
   Logger() noexcept = default;

@@ -1,4 +1,4 @@
-// Oracle for the A6 cold-durable-checkpoint contract: "the cold consumer acked
+// Oracle for the A6 cold-durable-checkpoint contract: "the cold consumer committed
 // WAL seq N" must imply "every write through N is on cold's stable storage".
 //
 // No system or integration test can observe a violation of that contract. Every
@@ -6,7 +6,7 @@
 // a volatile materialised view rebuilt by pure queue replay, so a cold-tier
 // durability loss is repaired by replay before any assertion can see it. This
 // test therefore reads the cold store directly and deliberately never replays
-// the acked WAL prefix — replaying it would reconstruct exactly the data whose
+// the committed WAL prefix — replaying it would reconstruct exactly the data whose
 // loss is under test.
 //
 // The crash victim is a separate process launched through posix_spawn (exec,
@@ -21,7 +21,7 @@
 namespace abyss::cold {
 namespace {
 
-TEST(ColdDurabilityTest, ColdAckedPrefixSurvivesKillWithoutWalReplay) {
+TEST(ColdDurabilityTest, ColdCommittedPrefixSurvivesKillWithoutWalReplay) {
   GTEST_SKIP() << "requires POSIX process spawn and the RocksDB cold backend";
 }
 
@@ -67,9 +67,9 @@ constexpr const char* kVictimFilter = "ColdDurabilityVictim.Run";
 constexpr const char* kReadyFileName = "victim.ready";
 constexpr core::ShardId kShard = 0;
 constexpr uint32_t kShardCount = 1;
-// Arm A (the contract): flushed, checkpointed and acked through a real store.
+// Arm A (the contract): flushed, checkpointed and committed through a real store.
 constexpr int kDurableKeys = 24;
-// Arm B (the negative control): flushed and acked through a store whose
+// Arm B (the negative control): flushed and committed through a store whose
 // Checkpoint is stubbed out, i.e. the exact mutant this file exists to catch.
 constexpr int kMutantKeys = 8;
 constexpr auto kReadyDeadline = 90s;
@@ -78,7 +78,7 @@ constexpr auto kReadyDeadline = 90s;
 struct ArmReport {
   core::SequenceId first = 0;
   core::SequenceId last = 0;
-  core::SequenceId ack = 0;
+  core::SequenceId committed = 0;
 };
 
 struct VictimReport {
@@ -154,7 +154,7 @@ class NoCheckpointColdStore : public core::ColdStore {
 };
 
 // Appends `count` SETs, then drives a real ColdConsumer through
-// drain -> flush -> checkpoint -> ack against `cold`.
+// drain -> flush -> checkpoint -> commit against `cold`.
 void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, int count,
             const core::EvictionPolicy& eviction, core::ConsumerRpc& rpc, ArmReport* out) {
   std::vector<core::QueueEntry> entries;
@@ -186,19 +186,21 @@ void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, 
   auto replay = cold_consumer.ReplayUntil(appended->last_seq, cancel);
   ASSERT_TRUE(replay.has_value()) << replay.error().message();
 
-  auto ack = queue.AckOffset(core::kColdConsumer, kShard);
-  ASSERT_TRUE(ack.has_value()) << ack.error().message();
+  auto committed = queue.CommittedOffset(core::kColdConsumer, kShard);
+  ASSERT_TRUE(committed.has_value()) << committed.error().message();
+  ASSERT_TRUE(committed->has_value()) << "the cold consumer committed nothing";
 
   out->first = appended->first_seq;
   out->last = appended->last_seq;
-  out->ack = *ack;
+  out->committed = committed->value_or(0);
 }
 
-// Fixed field order: durable {first,last,ack}, then mutant {first,last,ack}.
+// Fixed field order: durable {first,last,committed}, then mutant {first,last,committed}.
 std::string SerializeReport(const VictimReport& report) {
   std::ostringstream out;
-  out << report.durable.first << ' ' << report.durable.last << ' ' << report.durable.ack << ' '
-      << report.mutant.first << ' ' << report.mutant.last << ' ' << report.mutant.ack << '\n';
+  out << report.durable.first << ' ' << report.durable.last << ' ' << report.durable.committed
+      << ' ' << report.mutant.first << ' ' << report.mutant.last << ' ' << report.mutant.committed
+      << '\n';
   return out.str();
 }
 
@@ -228,6 +230,10 @@ TEST(ColdDurabilityVictim, Run) {
       RunArm(**durable_queue, **durable_cold, "a", kDurableKeys, eviction, rpc, &report.durable));
   ASSERT_NO_FATAL_FAILURE(
       RunArm(**mutant_queue, stubbed_cold, "b", kMutantKeys, eviction, rpc, &report.mutant));
+  // Committed offsets persist lazily; checkpoint them so the kill tests the
+  // cold store's durability, not the offset cadence.
+  ASSERT_TRUE((*durable_queue)->FlushOffsets().has_value());
+  ASSERT_TRUE((*mutant_queue)->FlushOffsets().has_value());
 
   // Parks with every queue and cold store still open and undestroyed. A clean
   // shutdown would flush RocksDB's WAL buffer and erase the distinction under
@@ -242,8 +248,8 @@ TEST(ColdDurabilityVictim, Run) {
 std::optional<VictimReport> ParseReport(const std::string& payload) {
   std::istringstream in(payload);
   VictimReport report;
-  in >> report.durable.first >> report.durable.last >> report.durable.ack >> report.mutant.first >>
-      report.mutant.last >> report.mutant.ack;
+  in >> report.durable.first >> report.durable.last >> report.durable.committed >>
+      report.mutant.first >> report.mutant.last >> report.mutant.committed;
   if (in.fail()) return std::nullopt;
   return report;
 }
@@ -290,13 +296,13 @@ class ColdDurabilityTest : public ::testing::Test {
     report_ = *report;
   }
 
-  core::SequenceId PersistedColdAck(const std::filesystem::path& wal_dir) {
+  core::SequenceId PersistedColdCommit(const std::filesystem::path& wal_dir) {
     auto reopened = queue::WalQueue::Open(MakeWalConfig(wal_dir));
     EXPECT_TRUE(reopened.has_value());
     if (!reopened.has_value()) return 0;
-    auto ack = (*reopened)->AckOffset(core::kColdConsumer, kShard);
-    EXPECT_TRUE(ack.has_value());
-    return ack.has_value() ? *ack : 0;
+    auto committed = (*reopened)->CommittedOffset(core::kColdConsumer, kShard);
+    EXPECT_TRUE(committed.has_value() && committed->has_value());
+    return committed.has_value() ? committed->value_or(0) : 0;
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -305,29 +311,30 @@ class ColdDurabilityTest : public ::testing::Test {
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
-TEST_F(ColdDurabilityTest, ColdAckedPrefixSurvivesKillWithoutWalReplay) {
+TEST_F(ColdDurabilityTest, ColdCommittedPrefixSurvivesKillWithoutWalReplay) {
   ASSERT_NO_FATAL_FAILURE(CrashVictim());
 
-  const core::SequenceId ack = PersistedColdAck(tmp_dir_ / "wal_durable");
-  EXPECT_EQ(ack, report_.durable.ack) << "the cold ack itself was not durable across the kill";
-  ASSERT_EQ(ack, report_.durable.last)
-      << "cold did not ack the whole appended prefix, so this arm asserts nothing";
+  const core::SequenceId committed = PersistedColdCommit(tmp_dir_ / "wal_durable");
+  EXPECT_EQ(committed, report_.durable.committed)
+      << "the cold commit itself was not durable across the kill";
+  ASSERT_EQ(committed, report_.durable.last)
+      << "cold did not commit the whole appended prefix, so this arm asserts nothing";
 
   // Reopen cold from disk only. No ColdConsumer, no hot store, and above all no
-  // replay of the acked WAL prefix: replay would rebuild the very writes whose
+  // replay of the committed WAL prefix: replay would rebuild the very writes whose
   // durability is under test.
   auto cold = backends::RocksdbStore::Create(MakeColdConfig(tmp_dir_ / "cold_durable"));
   ASSERT_TRUE(cold.has_value()) << cold.error().message();
 
-  for (core::SequenceId seq = report_.durable.first; seq <= ack; ++seq) {
+  for (core::SequenceId seq = report_.durable.first; seq <= committed; ++seq) {
     const uint64_t index = seq - report_.durable.first;
     const std::string key = KeyFor("a", index);
     const auto value = ReadCold(**cold, key);
-    ASSERT_TRUE(value.has_value())
-        << "A6 violation: the cold consumer acked WAL seq " << ack << ", which covers seq " << seq
-        << ", but '" << key
-        << "' is absent from cold's stable storage after SIGKILL. An acked WAL prefix is reapable, "
-           "so this write is recoverable from neither tier.";
+    ASSERT_TRUE(value.has_value()) << "A6 violation: the cold consumer committed WAL seq "
+                                   << committed << ", which covers seq " << seq << ", but '" << key
+                                   << "' is absent from cold's stable storage after SIGKILL. A "
+                                      "committed WAL prefix is reapable, "
+                                      "so this write is recoverable from neither tier.";
     // Guarded by the ASSERT_TRUE above; see the note at report_ assignment.
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     EXPECT_EQ(*value, ValueFor(index));
@@ -336,24 +343,24 @@ TEST_F(ColdDurabilityTest, ColdAckedPrefixSurvivesKillWithoutWalReplay) {
 
 // Without this, the arm above could pass on a machine where the kill loses
 // nothing, and a no-op Checkpoint would go undetected.
-TEST_F(ColdDurabilityTest, UncheckpointedAckedWritesAreDetectablyLost) {
+TEST_F(ColdDurabilityTest, UncheckpointedCommittedWritesAreDetectablyLost) {
   ASSERT_NO_FATAL_FAILURE(CrashVictim());
 
-  const core::SequenceId ack = PersistedColdAck(tmp_dir_ / "wal_mutant");
-  ASSERT_EQ(ack, report_.mutant.last)
-      << "the stubbed-checkpoint arm did not ack, so it demonstrates nothing";
+  const core::SequenceId committed = PersistedColdCommit(tmp_dir_ / "wal_mutant");
+  ASSERT_EQ(committed, report_.mutant.last)
+      << "the stubbed-checkpoint arm did not commit, so it demonstrates nothing";
 
   auto cold = backends::RocksdbStore::Create(MakeColdConfig(tmp_dir_ / "cold_mutant"));
   ASSERT_TRUE(cold.has_value()) << cold.error().message();
 
   size_t survivors = 0;
-  for (core::SequenceId seq = report_.mutant.first; seq <= ack; ++seq) {
+  for (core::SequenceId seq = report_.mutant.first; seq <= committed; ++seq) {
     if (ReadCold(**cold, KeyFor("b", seq - report_.mutant.first)).has_value()) ++survivors;
   }
   EXPECT_EQ(survivors, 0U)
-      << "with Checkpoint stubbed to a no-op the acked writes must be gone after SIGKILL. They "
+      << "with Checkpoint stubbed to a no-op the committed writes must be gone after SIGKILL. They "
          "survived, so this kill does not actually destroy uncheckpointed cold state and "
-         "ColdAckedPrefixSurvivesKillWithoutWalReplay cannot fail.";
+         "ColdCommittedPrefixSurvivesKillWithoutWalReplay cannot fail.";
 }
 
 }  // namespace

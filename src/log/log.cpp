@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "abyss/config/config.h"
+#include "abyss/core/ascii.h"
 #include "abyss/core/thread_annotations.h"
 
 #if ABYSS_WITH_LOGGING
@@ -55,41 +56,35 @@ constexpr std::string_view LevelSpelling(Level level) noexcept {
   return "off";
 }
 
-std::string LowerCase(std::string_view s) {
-  std::string out(s);
-  std::ranges::transform(out, out.begin(), [](unsigned char c) { return std::tolower(c); });
-  return out;
-}
-
 }  // namespace
 
 bool ParseLevel(std::string_view text, Level& out) noexcept {
-  const std::string lc = LowerCase(text);
-  if (lc == "trace") {
+  const auto is = [text](std::string_view word) { return core::AsciiEqualsIgnoreCase(text, word); };
+  if (is("trace")) {
     out = Level::kTrace;
     return true;
   }
-  if (lc == "debug") {
+  if (is("debug")) {
     out = Level::kDebug;
     return true;
   }
-  if (lc == "info") {
+  if (is("info")) {
     out = Level::kInfo;
     return true;
   }
-  if (lc == "warn" || lc == "warning") {
+  if (is("warn") || is("warning")) {
     out = Level::kWarn;
     return true;
   }
-  if (lc == "error" || lc == "err") {
+  if (is("error") || is("err")) {
     out = Level::kError;
     return true;
   }
-  if (lc == "critical" || lc == "fatal") {
+  if (is("critical") || is("fatal")) {
     out = Level::kCritical;
     return true;
   }
-  if (lc == "off" || lc == "none") {
+  if (is("off") || is("none")) {
     out = Level::kOff;
     return true;
   }
@@ -426,7 +421,7 @@ struct Logger::Impl : internal::LoggerImpl {};
 
 void Init(const config::LogConfig& config) {
   Registry& r = State();
-  const std::lock_guard<std::mutex> lk(r.mu);
+  const std::scoped_lock lk(r.mu);
 
   r.sink_destination = config.sink;
   r.sink_format = config.format;
@@ -448,11 +443,28 @@ void Init(const config::LogConfig& config) {
   r.initialized.store(true, std::memory_order_release);
 }
 
+// Only State()'s first-use construction can throw; it runs at startup.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 bool Initialized() noexcept { return State().initialized.load(std::memory_order_acquire); }
+
+void Flush() noexcept {
+  try {
+    std::shared_ptr<spdlog::sinks::sink> sink;
+    {
+      Registry& r = State();
+      const std::scoped_lock lk(r.mu);
+      sink = r.sink;
+    }
+    if (sink) sink->flush();
+  } catch (...) {  // NOLINT(bugprone-empty-catch): flushing is best effort
+  }
+  (void)std::fflush(stderr);
+  (void)std::fflush(stdout);
+}
 
 Logger Get(std::string_view component) {
   Registry& r = State();
-  const std::lock_guard<std::mutex> lk(r.mu);
+  const std::scoped_lock lk(r.mu);
   auto it = r.loggers.find(std::string(component));
   if (it != r.loggers.end()) {
     return Logger(reinterpret_cast<const Logger::Impl*>(it->second.get()));
@@ -515,7 +527,7 @@ namespace internal {
 
 void ResetForTesting() {
   Registry& r = State();
-  const std::lock_guard<std::mutex> lk(r.mu);
+  const std::scoped_lock lk(r.mu);
   r.component_levels.clear();
   r.sink_destination = "stderr";
   r.sink_format = "text";
@@ -532,7 +544,7 @@ void ResetForTesting() {
 
 void InstallTestSink(std::shared_ptr<spdlog::sinks::sink> sink) {
   Registry& r = State();
-  const std::lock_guard<std::mutex> lk(r.mu);
+  const std::scoped_lock lk(r.mu);
   r.sink = std::move(sink);
   for (auto& [name, impl] : r.loggers) {
     (void)name;
@@ -590,6 +602,10 @@ struct Logger::Impl {};
 
 void Init(const config::LogConfig& /*config*/) {}
 bool Initialized() noexcept { return true; }
+void Flush() noexcept {
+  (void)std::fflush(stderr);
+  (void)std::fflush(stdout);
+}
 Logger Get(std::string_view /*component*/) { return Logger{}; }
 
 bool Logger::ShouldLog(Level /*level*/) const noexcept { return false; }

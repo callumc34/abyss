@@ -30,10 +30,14 @@ constexpr size_t kSegmentHeaderSize = 32;
 constexpr size_t kMaxEntryEnvelope = 1024;
 // Redis proto-max-bulk-len: the largest single value we ever accept.
 constexpr size_t kMaxAcceptableValueSize = size_t{512} * 1024 * 1024;
-// Upper bound on the cold checkpoint cadence. The cold ack cannot pass data the
-// last checkpoint did not make durable, so this bounds how far the ack — and
+// Upper bound on the cold checkpoint cadence. The cold commit cannot pass data the
+// last checkpoint did not make durable, so this bounds how far the commit — and
 // therefore WAL retention release — can trail the applied frontier.
 constexpr std::chrono::milliseconds kMaxCheckpointMinInterval{60000};
+// Below the floor the offset fsync dominates the disk; above the ceiling a
+// crash replays, and retention trails, by more than a minute of commits.
+constexpr std::chrono::milliseconds kMinOffsetFsyncInterval{10};
+constexpr std::chrono::milliseconds kMaxOffsetFsyncInterval{60000};
 
 // Snapshot gauges scraped less often than this stop being an alerting signal:
 // Prometheus would sample a value already stale by more than a scrape interval.
@@ -196,6 +200,14 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
   if (q.min_retention.count() < 0)
     return std::unexpected(InvalidArg("queue.min_retention_seconds", "must be >= 0 seconds"));
 
+  if (q.offset_fsync_interval < kMinOffsetFsyncInterval ||
+      q.offset_fsync_interval > kMaxOffsetFsyncInterval) {
+    return std::unexpected(
+        InvalidArg("queue.offset_fsync_interval_ms",
+                   "must be in [" + std::to_string(kMinOffsetFsyncInterval.count()) + ", " +
+                       std::to_string(kMaxOffsetFsyncInterval.count()) + "] milliseconds"));
+  }
+
   if (!OneOf(q.fsync_policy, {"fsync_per_write", "group_commit", "fsync_none"})) {
     return std::unexpected(InvalidArg("queue.wal_fsync_policy",
                                       "must be one of: fsync_per_write, group_commit, fsync_none"));
@@ -209,12 +221,13 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
   }
 
   // Under fsync_none there is no durability barrier: the WAL durable watermark
-  // tracks the published seq so the retention-Ack gate is a correct no-op, but
-  // a crash can lose acknowledged writes. Surface this loudly (Decision 1).
+  // tracks the published seq so the retention-commit gate is a correct
+  // no-op, but a crash can lose acknowledged writes. Surface this loudly
+  // (Decision 1).
   if (q.fsync_policy == "fsync_none") {
     ABYSS_LOG_CRITICAL(
         "queue.wal_fsync_policy=fsync_none: WAL durability is DISABLED; acknowledged writes can be "
-        "lost on crash and the retention-ack durability gate is a no-op");
+        "lost on crash and the retention-commit durability gate is a no-op");
   }
   return {};
 }
@@ -264,7 +277,7 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
   }
   // The checkpoint cadence is the cold durability frontier: a zero cadence
   // fsyncs per batch, and a zero interval is not a cadence at all. Both bounds
-  // must be positive so the ack can only trail durable data by a bounded amount.
+  // must be positive so the commit can only trail durable data by a bounded amount.
   if (auto r = RequirePositive("cold_consumer.checkpoint_max_flushes", c.checkpoint_max_flushes);
       !r) {
     return r;

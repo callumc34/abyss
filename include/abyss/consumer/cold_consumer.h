@@ -84,7 +84,7 @@ class ColdConsumer {
     // hot could not materialise them either, so the tiers do not diverge.
     uint64_t unsupported_ops = 0;
     uint64_t queue_read_failures = 0;
-    core::SequenceId last_ack_seq = 0;
+    core::SequenceId last_commit_seq = 0;
     core::SequenceId latest_drained_seq = 0;
     uint32_t mode_transitions = 0;
   };
@@ -109,10 +109,11 @@ class ColdConsumer {
 
   // Graceful-stop entry point (distinct from the abrupt RequestStop). Sets a
   // draining flag and a deadline so the loop, on exit, drains the buffer to
-  // cold, checkpoints (A6), and advances the durable ack before stopping —
-  // bounded by `deadline`. Non-blocking; finalised by Join(). Composes with
-  // RequestStop: a graceful stop still wakes the loop the same way, but the
-  // exit path runs the bounded drain instead of dropping the buffer.
+  // cold, checkpoints (A6), and advances the committed offset before
+  // stopping — bounded by `deadline`. Non-blocking; finalised by Join().
+  // Composes with RequestStop: a graceful stop still wakes the loop the same
+  // way, but the exit path runs the bounded drain instead of dropping the
+  // buffer.
   void RequestStopAndDrain(std::chrono::steady_clock::time_point deadline);
 
   // Wait for the worker thread. Must be preceded by RequestStop.
@@ -138,9 +139,9 @@ class ColdConsumer {
 
   // Single-writer on this consumer: must not be called from multiple threads
   // concurrently. Safe to interleave with buffer reads from I/O threads.
+  // Returns the number of entries consumed from the queue.
   size_t Drain();
-  // Replay-mode drain — uses replay_batch_size for amortised reads. ReplayUntil
-  // routes through this; steady-state Run() uses Drain().
+  // Drain with an explicit read size.
   size_t DrainWithBatch(size_t max_count);
   FlushOutcome Flush();
   // Replay variant: pops oldest buffer entries regardless of quiet/deadline
@@ -167,30 +168,36 @@ class ColdConsumer {
   void RunLoop();
 
   // Final drain-to-durable on graceful stop (G6). Flushes the buffer
-  // unconditionally (FlushReason::kDrain), then forces a checkpoint + ack so
-  // the advanced cold ack is durable — bounded by drain_deadline_. On deadline
-  // expiry the remaining buffer is left for WAL replay and the truncation is
-  // surfaced (abyss_cold_drain_truncated_total). Runs once, on RunLoop exit.
+  // unconditionally (FlushReason::kDrain), then forces a checkpoint +
+  // commit so the advanced cold offset is durable, bounded by
+  // drain_deadline_. On deadline expiry the remaining buffer is left for
+  // WAL replay and the truncation is surfaced
+  // (abyss_cold_drain_truncated_total). Runs once, on RunLoop exit.
   void DrainAndFlush();
 
-  // Handlers return the poison seq (the un-materialised WAL seq) when an op is
-  // structurally undecodable, std::nullopt otherwise. The drain loop clamps the
-  // drained/ack frontier below it so the WAL retains the entry (XERR-5).
-  std::optional<core::SequenceId> HandleWrite(const core::QueueEntry& entry,
-                                              const core::entry::Write& write);
+  // Seeds the read cursor from the committed offset, once.
+  core::Result<void> SeedCursor();
+  // Applies `batch`, advancing the cursor and drained frontier past each
+  // entry; stops at a Flush whose wipe failed. Returns entries consumed.
+  size_t ConsumeBatch(const std::vector<core::QueueEntry>& batch);
+  // The reaper deleted entries above this retention consumer's persisted
+  // offset: data loss, so fail-stop.
+  [[noreturn]] void FailOutOfRange(core::SequenceId requested);
+
+  // A structurally undecodable op is recorded through RecordPoison; the
+  // drain loop clamps the drained/commit frontier below it (XERR-5).
+  void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
   void HandleConditional(const core::QueueEntry& entry, const core::entry::Conditional& cond);
-  std::optional<core::SequenceId> HandleResolved(const core::QueueEntry& entry,
-                                                 const core::entry::Resolved& resolved);
-  void HandleFlush(const core::QueueEntry& entry);
+  void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
+  // False if the wipe failed: the Flush is retried, never passed.
+  bool HandleFlush(const core::QueueEntry& entry);
 
   // `wall_now_ms` must be the entry's appended_at so hot and cold materialise
-  // identical absolute TTLs from PX/EX args. Returns the seq as poison when the
-  // op cannot be parsed into a materialisable WriteOp (XERR-5).
-  std::optional<core::SequenceId> AbsorbResolvedOp(const core::RespCommand& cmd,
-                                                   core::SequenceId seq, uint64_t wall_now_ms);
+  // identical absolute TTLs from PX/EX args.
+  void AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t wall_now_ms);
 
   // Records `seq` as poison: increments the metric, logs CRITICAL, and lowers
-  // oldest_poison_seq_ so TryAdvanceAck pins the ack below it.
+  // oldest_poison_seq_ so TryAdvanceCommit pins the commit below it.
   void RecordPoison(core::SequenceId seq, std::string_view reason);
 
   std::optional<core::SequenceId> OldestPendingConditional() const ABYSS_EXCLUDES(pending_mu_);
@@ -212,14 +219,15 @@ class ColdConsumer {
                                std::chrono::steady_clock::time_point flush_start);
 
   // Highest first-seen WAL seq among `entries`; passed to ApplyBatch as the
-  // batch's highest_wal_seq. The ack frontier is derived from the live buffer
-  // state, not from this.
+  // batch's highest_wal_seq. The commit frontier is derived from the live
+  // buffer state, not from this.
   static core::SequenceId HighestSeqOf(const std::vector<BufferEntry>& entries);
 
   // Runs Checkpoint(shard, up_to) when the bounded cadence
   // (checkpoint_max_flushes / checkpoint_min_interval) is due, or when `force`
   // is set (replay/flush drain), recording `up_to` as the durable frontier on
-  // success. Returns false if a due checkpoint failed (the ack stays pinned).
+  // success. Returns false if a due checkpoint failed (the commit stays
+  // pinned).
   bool MaybeCheckpoint(core::SequenceId up_to, bool force);
 
   std::vector<core::ops::WriteOp> BuildBatchOps(const std::vector<BufferEntry>& entries,
@@ -229,9 +237,9 @@ class ColdConsumer {
   size_t LowWaterBytes() const;
   void UpdateMode(size_t current_bytes);
   // `force_checkpoint` bypasses the bounded cadence so the post-recovery /
-  // graceful-drain ack is durable-gated even when fewer than the cadence
+  // graceful-drain commit is durable-gated even when fewer than the cadence
   // threshold of batches flushed.
-  void TryAdvanceAck(bool force_checkpoint = false);
+  void TryAdvanceCommit(bool force_checkpoint = false);
   void NotifyDrained();
 
   core::Queue& queue_;
@@ -247,7 +255,7 @@ class ColdConsumer {
 
   std::atomic<bool> stop_requested_{false};
   // Distinct from stop_requested_: when set, RunLoop runs DrainAndFlush on exit
-  // (a bounded final flush + checkpoint + ack) instead of dropping the buffer.
+  // (a bounded final flush + checkpoint + commit) instead of dropping the buffer.
   std::atomic<bool> draining_{false};
   std::atomic<bool> running_{false};
   // Set by a reader blocked on the read-consistency gate to cut short the idle
@@ -263,23 +271,28 @@ class ColdConsumer {
   std::mutex stop_mu_;
   std::condition_variable stop_cv_;
 
+  // Loop-thread state (or the replay thread before Start): the next seq to
+  // read and the last offset committed, both seeded from CommittedOffset.
+  bool cursor_seeded_ = false;
+  // A Flush whose wipe failed holds the cursor until a retry succeeds.
+  bool wipe_pending_ = false;
+  core::SequenceId next_read_seq_ = 0;
+  std::optional<core::SequenceId> committed_;
+
   std::atomic<core::SequenceId> latest_drained_seq_{0};
-  std::atomic<core::SequenceId> last_ack_seq_{0};
+  // Mirror of committed_ for Snapshot(); 0 when nothing is committed.
+  std::atomic<core::SequenceId> last_commit_seq_{0};
   // Highest seq of an applied `entry::Flush`; gates Resolveds whose ref was wiped.
   std::atomic<core::SequenceId> latest_flush_seq_{0};
   // Highest WAL seq materialised by an ApplyBatch but not yet made durable by a
   // Checkpoint, and the highest seq a successful Checkpoint has made durable.
-  // The cold ack target is clamped to last_checkpointed_seq_ so it can never
-  // pass data not yet on cold's stable storage (XDUR-1).
+  // The cold commit target is clamped to last_checkpointed_seq_ so it can
+  // never pass data not yet on cold's stable storage (XDUR-1).
   std::atomic<core::SequenceId> highest_applied_uncheckpointed_seq_{0};
   std::atomic<core::SequenceId> last_checkpointed_seq_{0};
   // Cadence bookkeeping for MaybeCheckpoint (single-writer: the loop thread).
   size_t flushes_since_checkpoint_ = 0;
   std::chrono::steady_clock::time_point last_checkpoint_at_{};
-  bool first_ack_recorded_ = false;
-  // Disambiguates `latest_drained_seq_=0` between "nothing drained" and "drained
-  // seq 0"; prevents Ack(0) before any entry has been appended.
-  bool drained_anything_ = false;
   std::atomic<uint64_t> flushes_applied_{0};
 
   // Guards the read-consistency wait.
@@ -295,9 +308,9 @@ class ColdConsumer {
       ABYSS_GUARDED_BY(pending_mu_);
   bool block_and_scan_warning_emitted_ = false;
 
-  // Lowest seq of a structurally-undecodable op the cold consumer could not
-  // materialise (XERR-5). The ack/drain frontier is pinned below it so the WAL
-  // retains the un-materialised entry until operator intervention. kNoPoison
+  // Lowest seq of a structurally-undecodable op the cold consumer could
+  // not materialise (XERR-5). The commit/drain frontier is pinned below it
+  // so the WAL retains the entry until operator intervention. kNoPoison
   // (max) means no poison seen this run; set monotonically downward.
   static constexpr core::SequenceId kNoPoison = std::numeric_limits<core::SequenceId>::max();
   std::atomic<core::SequenceId> oldest_poison_seq_{kNoPoison};
