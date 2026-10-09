@@ -12,6 +12,7 @@
 - `abyss_queue_offset_persist_duration_seconds` — duration of one durable persist of committed consumer offsets. The rate of persists (`_count`) shows how much flush capacity offset bookkeeping consumes.
 - `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. A failed flush terminates the process, so both histograms record successful flushes only.
 - `abyss_wal_fill_wait_seconds` — time an append waited for earlier reservations in its log to be filled before it could be acknowledged. Recorded only when the wait outlasted a short spin (about 2 µs), so it counts the waits behind a large value or a preempted filler (the head-of-line effect the blob lane, #162, removes), not a neighbour mid-copy.
+- `abyss_wal_publish_wait_seconds` — time a shard's publish waited for an earlier reservation on the same shard to publish, since publishes go in seq order. Recorded only past the same short spin. Behind a large value's fill it rises together with the fill wait.
 
 ### RESP Frontend
 

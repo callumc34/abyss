@@ -78,6 +78,7 @@ TEST(FrameTest, RoundTripsEveryEntryType) {
     std::vector<std::byte> bytes;
     const std::size_t size = EncodeEntry(entry, 3, bytes);
     ASSERT_EQ(size, bytes.size());
+    EXPECT_EQ(EntryFrameSize(entry), size);
     EXPECT_EQ(binary::LoadLE<uint64_t>(bytes.data()) >> 32, 0U) << "gen is sealed by Commit";
     CloseBatch(bytes);
     Seal(bytes, kGen);
@@ -164,6 +165,62 @@ TEST(FrameTest, BatchRestCountsTheBytesLeftInTheBatch) {
   EXPECT_EQ(off, batch.size());
   const View last = InspectAt(std::span(batch).subspan(batch.size() - sizes.back()), kGen);
   EXPECT_EQ(last.header.batch_rest, last.size);
+}
+
+// The append path encodes each frame of a batch into its own reserved
+// span, over whatever bytes were there; the result is byte for byte
+// what the buffered encoder and CloseBatch give.
+TEST(FrameTest, FramesEncodedInPlaceMatchTheirBatchEncodedWhole) {
+  const std::vector<core::QueueEntry> entries{
+      WriteEntry(1, "a"), WriteEntry(2, std::string(100, 'b')),
+      core::QueueEntry{.seq = 3, .payload = core::entry::Flush{}},
+      core::QueueEntry{
+          .seq = 4,
+          .payload = core::entry::Resolved{.ref = 1,
+                                           .decision = core::Decision::kApply,
+                                           .materialised_ops = {core::RespCommand{{"DEL", "k"}}},
+                                           .return_value = core::RespValue::Integer(1)}}};
+  std::vector<std::byte> whole;
+  for (const auto& entry : entries) EncodeEntry(entry, 5, whole);
+  CloseBatch(whole);
+
+  std::vector<std::byte> in_place(whole.size(), std::byte{0xab});
+  std::size_t off = 0;
+  for (const auto& entry : entries) {
+    const std::size_t size = EntryFrameSize(entry);
+    const std::span<std::byte> slot = std::span(in_place).subspan(off, size);
+    const uint32_t len = EncodeEntryInto(entry, 5, slot, whole.size() - off);
+    EXPECT_EQ(FrameSize(len), size);
+    // The commit word is CommitInPlace's; here, as EncodeEntry leaves it.
+    binary::StoreLE(slot.data(), CommitWord(len, 0));
+    off += size;
+  }
+  ASSERT_EQ(off, whole.size());
+  EXPECT_EQ(in_place, whole);
+
+  Seal(in_place, kGen);
+  off = 0;
+  for (const auto& entry : entries) {
+    const View view = InspectAt(std::span(in_place).subspan(off), kGen);
+    ASSERT_EQ(view.state, State::kFilled);
+    auto decoded = DecodeEntry(view);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+    EXPECT_EQ(decoded->seq, entry.seq);
+    EXPECT_EQ(decoded->payload.index(), entry.payload.index());
+    off += view.size;
+  }
+}
+
+TEST(FrameDeathTest, EncodingIntoASpanOfAnotherSizeIsFatal) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  const core::QueueEntry entry = WriteEntry(9, std::string(40, 'v'));
+  const std::size_t size = EntryFrameSize(entry);
+  for (const std::size_t wrong : {size - kAlign, size + kAlign}) {
+    std::vector<std::byte> out(wrong);
+    EXPECT_DEATH(EncodeEntryInto(entry, 0, out, wrong),
+                 "WAL frame of shard 0 seq 9 does not fill its " + std::to_string(wrong) +
+                     "-byte reservation");
+  }
 }
 
 TEST(FrameTest, SealedForOneGenIsUnfilledUnderAnother) {

@@ -55,6 +55,7 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kWalUnflushedBytes.name,
       names::kWalDurabilityLagSeconds.name,
       names::kWalFillWaitSeconds.name,
+      names::kWalPublishWaitSeconds.name,
       names::kWalSpareSegments.name,
       names::kWalFreeSegments.name,
       names::kWalSegmentsGrownTotal.name,

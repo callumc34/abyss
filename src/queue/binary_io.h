@@ -52,6 +52,35 @@ inline void PatchU32LE(std::vector<std::byte>& out, size_t offset, uint32_t v) {
   std::memcpy(out.data() + offset, &v, sizeof(v));
 }
 
+// Writes into a fixed span. A write past its end is dropped and marks
+// the writer overflowed, so a caller checks once at the end.
+class SpanWriter {
+ public:
+  explicit SpanWriter(std::span<std::byte> out) noexcept : out_(out) {}
+
+  void Bytes(const void* src, size_t n) noexcept {
+    if (n > out_.size() - at_) {
+      overflowed_ = true;
+      return;
+    }
+    if (n > 0) std::memcpy(out_.data() + at_, src, n);
+    at_ += n;
+  }
+  template <typename T>
+  void LE(T v) noexcept {
+    if constexpr (!kNativeLittleEndian) v = std::byteswap(v);
+    Bytes(&v, sizeof(v));
+  }
+
+  size_t written() const noexcept { return at_; }
+  bool overflowed() const noexcept { return overflowed_; }
+
+ private:
+  std::span<std::byte> out_;
+  size_t at_ = 0;
+  bool overflowed_ = false;
+};
+
 template <typename T>
 T LoadLE(const std::byte* p) noexcept {
   T v{};

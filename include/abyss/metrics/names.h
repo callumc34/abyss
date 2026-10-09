@@ -362,6 +362,14 @@ inline constexpr HistogramDesc<> kWalFillWaitSeconds{
     .buckets = buckets::kLatencySeconds,
 };
 
+inline constexpr HistogramDesc<> kWalPublishWaitSeconds{
+    .name = "abyss_wal_publish_wait_seconds",
+    .help =
+        "Time a shard's publish waited for an earlier reservation on the shard to publish; "
+        "recorded only when the wait outlasted a short spin.",
+    .buckets = buckets::kLatencySeconds,
+};
+
 inline constexpr GaugeDesc<> kWalSpareSegments{
     .name = "abyss_wal_spare_segments",
     .help = "WAL segments prepared ahead of the active one, across logs.",

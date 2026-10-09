@@ -18,12 +18,18 @@ core::Error Corrupted(const char* what) {
   return {core::ErrorCode::kCorruption, std::string("WAL entry corruption: ") + what};
 }
 
-void WriteRespCommand(std::vector<std::byte>& out, const core::RespCommand& cmd) {
-  binary::WriteU32LE(out, static_cast<uint32_t>(cmd.args.size()));
+void WriteRespCommand(binary::SpanWriter& out, const core::RespCommand& cmd) {
+  out.LE(static_cast<uint32_t>(cmd.args.size()));
   for (const auto& arg : cmd.args) {
-    binary::WriteU32LE(out, static_cast<uint32_t>(arg.size()));
-    binary::AppendBytes(out, arg.data(), arg.size());
+    out.LE(static_cast<uint32_t>(arg.size()));
+    out.Bytes(arg.data(), arg.size());
   }
+}
+
+std::size_t RespCommandSize(const core::RespCommand& cmd) {
+  std::size_t size = sizeof(uint32_t);
+  for (const auto& arg : cmd.args) size += sizeof(uint32_t) + arg.size();
+  return size;
 }
 
 core::Result<core::RespCommand> ReadRespCommand(std::span<const std::byte>& cursor) {
@@ -53,10 +59,10 @@ core::Result<core::RespCommand> ReadRespCommand(std::span<const std::byte>& curs
   return cmd;
 }
 
-void WriteRespValue(std::vector<std::byte>& out, const core::RespValue& val) {
+void WriteRespValue(binary::SpanWriter& out, const core::RespValue& val) {
   auto serialized = resp::Serializer::Serialize(val);
-  binary::WriteU32LE(out, static_cast<uint32_t>(serialized.size()));
-  binary::AppendBytes(out, reinterpret_cast<const char*>(serialized.data()), serialized.size());
+  out.LE(static_cast<uint32_t>(serialized.size()));
+  out.Bytes(serialized.data(), serialized.size());
 }
 
 core::Result<Payload> DecodeResolved(std::span<const std::byte>& cursor) {
@@ -132,25 +138,51 @@ EntryType TypeOf(const core::QueueEntry& entry) {
       entry.payload);
 }
 
-void Encode(const core::QueueEntry& entry, std::vector<std::byte>& out) {
+void Encode(const core::QueueEntry& entry, binary::SpanWriter& out) {
   std::visit(
       [&out](const auto& p) {
         using T = std::decay_t<decltype(p)>;
         if constexpr (std::is_same_v<T, core::entry::Write>) {
           WriteRespCommand(out, p.cmd);
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-          binary::WriteU16LE(out, static_cast<uint16_t>(p.flags));
+          out.LE(static_cast<uint16_t>(p.flags));
           WriteRespCommand(out, p.cmd);
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-          binary::WriteU64LE(out, p.ref);
-          binary::WriteU8(out, static_cast<uint8_t>(p.decision));
-          binary::WriteU32LE(out, static_cast<uint32_t>(p.materialised_ops.size()));
+          out.LE(p.ref);
+          out.LE(static_cast<uint8_t>(p.decision));
+          out.LE(static_cast<uint32_t>(p.materialised_ops.size()));
           for (const auto& op : p.materialised_ops) {
             WriteRespCommand(out, op);
           }
           WriteRespValue(out, p.return_value);
         } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
           // No payload.
+        }
+      },
+      entry.payload);
+}
+
+void Encode(const core::QueueEntry& entry, std::vector<std::byte>& out) {
+  const std::size_t start = out.size();
+  out.resize(start + EncodedSize(entry));
+  binary::SpanWriter writer(std::span(out).subspan(start));
+  Encode(entry, writer);
+}
+
+std::size_t EncodedSize(const core::QueueEntry& entry) {
+  return std::visit(
+      [](const auto& p) -> std::size_t {
+        using T = std::decay_t<decltype(p)>;
+        if constexpr (std::is_same_v<T, core::entry::Write>) {
+          return RespCommandSize(p.cmd);
+        } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
+          return sizeof(uint16_t) + RespCommandSize(p.cmd);
+        } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
+          std::size_t size = sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint32_t);
+          for (const auto& op : p.materialised_ops) size += RespCommandSize(op);
+          return size + sizeof(uint32_t) + resp::Serializer::Serialize(p.return_value).size();
+        } else {
+          return 0;
         }
       },
       entry.payload);

@@ -13,6 +13,7 @@ add_library(abyss_queue
   offset_checkpoint.cpp
   segment_reaper.cpp
   pending_append.cpp
+  reservation.cpp
 )
 add_library(abyss::queue ALIAS abyss_queue)
 

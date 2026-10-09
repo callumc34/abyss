@@ -62,10 +62,21 @@ inline uint32_t CommitGen(uint64_t word) noexcept { return static_cast<uint32_t>
 // Bytes a frame with a `len`-byte body occupies, padding included.
 std::size_t FrameSize(std::size_t len) noexcept;
 
-// Appends `entry`'s frame to `out` and returns its size. CloseBatch
-// then finishes it; the commit word holds only len until Log::Commit.
+// The append path's encoder. Writes `entry`'s frame into `out`, its
+// reserved span, as the frame `batch_rest` bytes from its batch's end:
+// the body, zeroed padding and the body CRC. The commit word is left
+// for Log::CommitInPlace, which takes the returned body length. Fatal
+// unless the frame fills `out` exactly.
+uint32_t EncodeEntryInto(const core::QueueEntry& entry, core::ShardId shard,
+                         std::span<std::byte> out, uint64_t batch_rest);
+
+// Appends `entry`'s frame to `out` as a batch of one and returns its
+// size; the commit word holds only len until Log::Commit. CloseBatch
+// re-closes consecutive frames as one batch.
 std::size_t EncodeEntry(const core::QueueEntry& entry, core::ShardId shard,
                         std::vector<std::byte>& out);
+// The size of `entry`'s frame, without encoding it.
+std::size_t EntryFrameSize(const core::QueueEntry& entry);
 
 // Closes `frames`, consecutive EncodeEntry outputs reserved together,
 // as one batch: writes each frame's batch_rest, then its body CRC into
