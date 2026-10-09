@@ -33,11 +33,8 @@
 #include "abyss/platform/random.h"
 #include "binary_io.h"
 #include "commit_word.h"
+#include "cpu_relax.h"
 #include "segment_header_v2.h"
-
-#if defined(_M_X64) || defined(_M_IX86)
-#include <intrin.h>
-#endif
 
 ABYSS_LOG_COMPONENT("abyss.queue.log")
 
@@ -54,7 +51,6 @@ constexpr std::size_t kFreePool = 2;
 constexpr std::size_t kMinRingSlots = 16;
 constexpr std::size_t kCompletionSlots = 1024;
 constexpr std::size_t kWaitingReserve = 1024;
-constexpr std::size_t kBodyAt = frame::kCommitBytes + frame::kCrcBytes;
 constexpr uint64_t kMaxFrameSpace = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kMaxShards = uint32_t{1} << 16;
 constexpr auto kSpinFor = std::chrono::microseconds(2);
@@ -68,16 +64,6 @@ constexpr std::string_view kTmpSuffix = ".seg.tmp";
 constexpr std::string_view kFreePrefix = "free-";
 
 uint32_t Gen(uint64_t ordinal) noexcept { return static_cast<uint32_t>(ordinal); }
-
-void CpuRelax() noexcept {
-#if defined(_M_X64) || defined(_M_IX86)
-  _mm_pause();
-#elif defined(__x86_64__) || defined(__i386__)
-  __builtin_ia32_pause();
-#elifdef __aarch64__
-  __asm__ __volatile__("yield");
-#endif
-}
 
 std::string Padded(uint64_t ordinal) {
   const std::string digits = std::to_string(ordinal);
@@ -1289,15 +1275,21 @@ bool Log::WaitForSpare(core::SteadyTime deadline) {
   return ready && !impl.stopping;
 }
 
-void Log::Commit(const Reservation& reservation, std::span<const std::byte> frame) {
-  const uint64_t word =
-      frame::CommitWord(frame::CommitLen(binary::LoadLE<uint64_t>(frame.data())), reservation.gen);
-  const auto body_crc = binary::LoadLE<uint32_t>(frame.data() + frame::kCommitBytes);
-  binary::StoreLE(reservation.dst + frame::kCommitBytes,
-                  frame::SealCrc(body_crc, reservation.salt, word));
-  std::memcpy(reservation.dst + kBodyAt, frame.data() + kBodyAt, frame.size() - kBodyAt);
+// The bytes before the commit word were written in place, unordered.
+// Readers and recovery trust a frame only through its commit word (its
+// gen) and its CRC, so that is as safe as a copy made first would be.
+void Log::CommitInPlace(const Reservation& reservation, uint32_t len) {
+  const uint64_t word = frame::CommitWord(len, reservation.gen);
+  std::byte* crc = reservation.dst + frame::kCommitBytes;
+  binary::StoreLE(crc, frame::SealCrc(binary::LoadLE<uint32_t>(crc), reservation.salt, word));
   frame::StoreCommitWord(reservation.dst, word);
-  impl_->Complete(Completion{.pos = reservation.pos, .end = reservation.pos + frame.size()});
+  impl_->Complete(Completion{.pos = reservation.pos, .end = reservation.pos + reservation.size});
+}
+
+void Log::Commit(const Reservation& reservation, std::span<const std::byte> frame) {
+  std::memcpy(reservation.dst + frame::kCommitBytes, frame.data() + frame::kCommitBytes,
+              frame.size() - frame::kCommitBytes);
+  CommitInPlace(reservation, frame::CommitLen(binary::LoadLE<uint64_t>(frame.data())));
 }
 
 void Log::AwaitFilled(LogPosition end) const {

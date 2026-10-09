@@ -27,6 +27,7 @@
 #include "abyss/queue/group_commit.h"
 #include "abyss/queue/log.h"
 #include "abyss/queue/pending_append.h"
+#include "abyss/queue/reservation.h"
 
 namespace abyss::queue {
 
@@ -44,6 +45,11 @@ struct LogUnit {
   // Commit thread only: shards whose power end the current flush moved.
   std::vector<core::ShardId> touched;
   std::vector<bool> is_touched;
+  // Commit thread only: each shard's highest seq in the batch the flush
+  // walk is inside.
+  std::vector<std::pair<core::ShardId, core::SequenceId>> batch;
+  // Reservations not yet completed.
+  std::atomic<uint64_t> ready_to_complete{0};
 };
 
 struct ShardStreamConfig {
@@ -58,10 +64,11 @@ struct ShardStreamConfig {
 };
 
 // One shard's stream of frames in its log (ADP-015 §Shard streams).
-// next_seq_ is under the append lock, which a PendingAppend holds until
-// it publishes. Readers locate frames lock-free through the offset
-// ring, then through the position hints, then from a sparse index
-// point.
+// next_seq_ is under the append lock. A PendingAppend holds it until it
+// publishes; a Reservation releases it at once and publishes in
+// Complete. Either publishes only after every earlier seq has. Readers
+// locate frames lock-free through the offset ring, then through the
+// position hints, then from a sparse index point.
 class ShardStream {
  public:
   explicit ShardStream(ShardStreamConfig config);
@@ -84,6 +91,12 @@ class ShardStream {
   core::Result<PendingAppend> BeginAppend(core::QueueEntry entry, core::SteadyTime admit_by);
   core::Result<PendingBatchAppend> BeginAppendBatch(std::span<const core::QueueEntry> entries,
                                                     core::SteadyTime admit_by);
+  // WalQueue::Reserve once its checks pass, never waiting. `streams`
+  // are the parts' streams, all on one log; `sizes` every entry's frame
+  // size, in order.
+  static core::Result<Reservation> Reserve(
+      std::span<ShardStream* const> streams, std::span<const ShardEntries> parts,
+      std::span<const uint32_t> sizes) ABYSS_NO_THREAD_SAFETY_ANALYSIS;
   core::Result<std::vector<core::QueueEntry>> Read(core::SequenceId from, std::size_t max_count,
                                                    core::Duration timeout,
                                                    core::Durability visible);
@@ -95,9 +108,9 @@ class ShardStream {
                     core::Duration timeout) const;
 
   // Commit thread, in the flush walk, before the log's durable prefix
-  // moves. True iff the frame closed its batch and that moved the power
-  // end, which never passes the published end.
-  bool Durable(const frame::Header& header, uint32_t size) noexcept;
+  // moves: a batch that ends this shard's seqs at `end` is durable. True
+  // iff that moved the power end, which never passes the published end.
+  bool Durable(core::SequenceId end) noexcept;
   // After the power end moved: resolves append futures below it and
   // wakes its waiters.
   void PowerAdvanced();
@@ -114,6 +127,7 @@ class ShardStream {
 
   // Stops admission and wakes readers.
   void Shutdown();
+  bool stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
   // After the committer stopped: what still waits resolves
   // kUnavailable.
   void CommitterStopped();
@@ -150,12 +164,18 @@ class ShardStream {
     std::unique_ptr<AppendPublisher> publisher;
   };
   class Publisher;
+  class Filler;
 
   Log& log() const noexcept { return *config_.unit->log; }
 
   core::Result<Begun> Begin(std::span<core::QueueEntry> entries, core::SteadyTime admit_by);
   void Record(core::SequenceId seq, LogPosition pos, uint32_t size) ABYSS_REQUIRES(append_mu_);
   DurabilityFuture WhenPowerDurable(core::SequenceId seq);
+  // Until every seq below `first` is published.
+  void AwaitPublished(core::SequenceId first) noexcept;
+  // Complete's publish of [first, end).
+  void PublishInOrder(core::SequenceId first, core::SequenceId end) noexcept;
+  void WakeReaders() const noexcept;
   void Published(LogPosition end_pos) noexcept;
   bool WaitForEnd(core::SequenceId seq, core::Durability durability, core::Duration timeout) const;
 
@@ -172,6 +192,7 @@ class ShardStream {
 
   ShardStreamConfig config_;
   metrics::CounterHandle appended_;
+  metrics::HistogramHandle publish_wait_;
   metrics::GaugeHandle index_gauge_;
   metrics::GaugeHandle ring_gauge_;
 

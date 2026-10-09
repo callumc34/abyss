@@ -100,12 +100,15 @@ class Log {
   // False at the deadline, or once the log is shutting down.
   bool WaitForSpare(core::SteadyTime deadline);
 
+  // Commits the frame EncodeEntryInto wrote at the reservation's dst,
+  // whose body is `len` bytes: seals its CRC for the reservation's gen
+  // and salt, stores the commit word with release ordering, then
+  // advances the filled prefix past every frame already filled. A
+  // batch reserves once and commits each frame through its own slice
+  // {pos + off, size, gen, salt, dst + off} of the reservation.
+  void CommitInPlace(const Reservation& reservation, uint32_t len);
   // Copies `frame` (one EncodeEntry output, sized to the reservation)
-  // into the log: everything after the commit word, the CRC sealed for
-  // the reservation's gen, then the commit word with release ordering;
-  // then advances the filled prefix past every frame already filled.
-  // A batch reserves once and commits each frame through its own slice
-  // {pos + off, size, gen, dst + off} of the reservation.
+  // to dst after its commit word, then CommitInPlace.
   void Commit(const Reservation& reservation, std::span<const std::byte> frame);
   // Spins, then yields, until the filled prefix reaches `end`.
   void AwaitFilled(LogPosition end) const;

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -28,24 +29,16 @@ core::QueueEntry MakeEntry(size_t value_size) {
   };
 }
 
-uint64_t LoadU64(const std::byte* at) {
-  uint64_t value = 0;
-  std::memcpy(&value, at, sizeof(value));
-  return value;
-}
-
 uint32_t LoadU32(const std::byte* at) {
   uint32_t value = 0;
   std::memcpy(&value, at, sizeof(value));
   return value;
 }
 
-// Everything an append computes before Log::Commit copies the frame:
-// encode, close it as a batch of one, seal the CRC for its segment.
-uint64_t EncodeSealed(const core::QueueEntry& entry, std::vector<std::byte>& out) {
-  frame::EncodeEntry(entry, 0, out);
-  frame::CloseBatch(out);
-  const uint64_t word = frame::CommitWord(frame::CommitLen(LoadU64(out.data())), kGen);
+// Everything an append computes for a frame in its reserved span:
+// encode it in place as a batch of one, then seal its CRC.
+uint64_t EncodeSealed(const core::QueueEntry& entry, std::span<std::byte> out) {
+  const uint64_t word = frame::CommitWord(frame::EncodeEntryInto(entry, 0, out, out.size()), kGen);
   const uint32_t crc = frame::SealCrc(LoadU32(out.data() + frame::kCommitBytes), kSalt, word);
   std::memcpy(out.data() + frame::kCommitBytes, &crc, sizeof(crc));
   std::memcpy(out.data(), &word, sizeof(word));
@@ -54,10 +47,8 @@ uint64_t EncodeSealed(const core::QueueEntry& entry, std::vector<std::byte>& out
 
 void BM_FrameEncode(benchmark::State& state) {
   const auto entry = MakeEntry(static_cast<size_t>(state.range(0)));
-  std::vector<std::byte> buf;
-  buf.reserve(size_t{1} << 17);
+  std::vector<std::byte> buf(frame::EntryFrameSize(entry));
   for ([[maybe_unused]] auto _ : state) {
-    buf.clear();
     benchmark::DoNotOptimize(EncodeSealed(entry, buf));
     benchmark::ClobberMemory();
   }
@@ -69,7 +60,7 @@ BENCHMARK(BM_FrameEncode)->Arg(64)->Arg(1 << 10)->Arg(1 << 16);
 // A consumer read: classify with the CRC verified, then decode.
 void BM_FrameDecode(benchmark::State& state) {
   const auto entry = MakeEntry(static_cast<size_t>(state.range(0)));
-  std::vector<std::byte> buf;
+  std::vector<std::byte> buf(frame::EntryFrameSize(entry));
   const uint64_t word = EncodeSealed(entry, buf);
   for ([[maybe_unused]] auto _ : state) {
     const frame::View view = frame::Inspect(word, buf, kGen, kSalt, true);

@@ -36,6 +36,7 @@ add_executable(abyss_queue_tests
   queue/log_stress_test.cpp
   queue/queue_scan_test.cpp
   queue/shard_stream_test.cpp
+  queue/reservation_test.cpp
 )
 
 target_include_directories(abyss_queue_tests PRIVATE

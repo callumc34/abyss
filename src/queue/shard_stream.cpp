@@ -1,12 +1,16 @@
 #include "shard_stream.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "abyss/core/fatal.h"
+#include "abyss/core/queue.h"
 #include "abyss/metrics/names.h"
+#include "cpu_relax.h"
 
 namespace abyss::queue {
 
@@ -18,9 +22,8 @@ constexpr uint64_t kNever = ~uint64_t{0};
 constexpr uint64_t kIndexStride = uint64_t{64} << 10;
 constexpr std::size_t kReadReserve = 256;
 // Keeps a thread's encode buffer from pinning a large value's memory.
-constexpr std::size_t kKeepEncodeBytes = std::size_t{1} << 20;
+constexpr auto kSpinFor = std::chrono::microseconds(2);
 
-thread_local std::vector<std::byte> t_frames;
 thread_local std::vector<uint32_t> t_sizes;
 
 core::Error Stopping() { return {core::ErrorCode::kUnavailable, "queue shutting down"}; }
@@ -31,20 +34,28 @@ DurabilityFuture ReadyFuture(core::Result<void> value) {
   return promise.get_future();
 }
 
+// Encodes `entry` straight into its reserved slice, then commits it.
+void CommitEncoded(Log& log, const core::QueueEntry& entry, core::ShardId shard,
+                   const Log::Reservation& slice, uint64_t batch_rest) {
+  log.CommitInPlace(slice,
+                    frame::EncodeEntryInto(entry, shard, {slice.dst, slice.size}, batch_rest));
+}
+
 }  // namespace
 
 class ShardStream::Publisher final : public AppendPublisher {
  public:
-  Publisher(ShardStream& stream, std::unique_lock<std::mutex> lock, core::SequenceId end,
-            LogPosition end_pos) noexcept
-      : stream_(stream), lock_(std::move(lock)), end_(end), end_pos_(end_pos) {}
+  Publisher(ShardStream& stream, std::unique_lock<std::mutex> lock, core::SequenceId first,
+            core::SequenceId end, LogPosition end_pos) noexcept
+      : stream_(stream), lock_(std::move(lock)), first_(first), end_(end), end_pos_(end_pos) {}
 
   // Only allocation can throw here, and an OOM while publishing may
   // terminate.
   // NOLINTNEXTLINE(bugprone-exception-escape)
   void Publish() noexcept override {
     if (!lock_.owns_lock()) return;
-    // Under the lock, so published ends never regress.
+    // A reservation before this append may not have completed.
+    stream_.AwaitPublished(first_);
     stream_.published_end_.store(end_, std::memory_order_seq_cst);
     lock_.unlock();
     // A flush may have covered these frames before they were published.
@@ -55,13 +66,72 @@ class ShardStream::Publisher final : public AppendPublisher {
  private:
   ShardStream& stream_;
   std::unique_lock<std::mutex> lock_;
+  core::SequenceId first_;
   core::SequenceId end_;
   LogPosition end_pos_;
+};
+
+// A reservation's remaining work. Deadlock-free by log position: each
+// stream reserves log space inside its append lock, so a shard's
+// reservation order is position order, across shards too. AwaitFilled
+// and each in-order publish wait only on frames at earlier positions,
+// whose owners hold no lock until they complete, so no wait closes a
+// cycle.
+class ShardStream::Filler final : public ReservationFiller {
+ public:
+  struct Part {
+    ShardStream* stream = nullptr;
+    core::SequenceId first = 0;
+    core::SequenceId end = 0;
+  };
+  struct Deferred {
+    core::QueueEntry entry;
+    core::ShardId shard = 0;
+    Log::Reservation slice;
+    uint64_t batch_rest = 0;
+  };
+
+  Filler(LogUnit& unit, std::vector<Part> parts, LogPosition end, std::vector<Deferred> deferred,
+         std::function<void(std::size_t)> hook, std::size_t committed, std::size_t frames)
+      : unit_(unit),
+        parts_(std::move(parts)),
+        end_(end),
+        deferred_(std::move(deferred)),
+        hook_(std::move(hook)),
+        committed_(committed),
+        frames_(frames) {}
+
+  // Only allocation can throw here, and an OOM while filling may
+  // terminate.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
+  void Fill() noexcept override {
+    Log& log = *unit_.log;
+    for (Deferred& deferred : deferred_) {
+      CommitEncoded(log, deferred.entry, deferred.shard, deferred.slice, deferred.batch_rest);
+      if (hook_ && ++committed_ < frames_) hook_(committed_);
+    }
+    deferred_.clear();
+    log.AwaitFilled(end_);
+    for (const Part& part : parts_) part.stream->PublishInOrder(part.first, part.end);
+    unit_.committer->Published(end_);
+    unit_.ready_to_complete.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+ private:
+  LogUnit& unit_;
+  std::vector<Part> parts_;
+  LogPosition end_;
+  std::vector<Deferred> deferred_;
+  std::function<void(std::size_t)> hook_;
+  std::size_t committed_;
+  std::size_t frames_;
 };
 
 ShardStream::ShardStream(ShardStreamConfig config)
     : config_(config),
       appended_(metrics::Registry::Instance().Counter(metrics::names::kQueueAppendedTotal)),
+      publish_wait_(
+          metrics::Registry::Instance().Histogram(metrics::names::kWalPublishWaitSeconds)),
       index_gauge_(metrics::Registry::Instance().Gauge(metrics::names::kWalIndexBytes)),
       ring_gauge_(metrics::Registry::Instance().Gauge(metrics::names::kWalRingBytes)),
       ring_mask_(config_.ring_entries - 1),
@@ -150,34 +220,29 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
       return std::unexpected(admitted.error());
     }
   }
-  std::vector<std::byte>& frames = t_frames;
   std::vector<uint32_t>& sizes = t_sizes;
+  sizes.clear();
+  uint64_t total = 0;
+  for (const core::QueueEntry& entry : entries) {
+    const std::size_t size = frame::EntryFrameSize(entry);
+    if (size > config_.max_value_size_bytes) {
+      return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
+                                         std::string(batch ? "batch entry of " : "entry of ") +
+                                             std::to_string(size) +
+                                             " bytes exceeds queue.max_value_size_bytes (" +
+                                             std::to_string(config_.max_value_size_bytes) + ")"});
+    }
+    sizes.push_back(static_cast<uint32_t>(size));
+    total += size;
+  }
+  if (total > std::numeric_limits<uint32_t>::max()) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kResourceExhausted, "batch exceeds segment capacity"});
+  }
   for (;;) {
     std::unique_lock lock(append_mu_);
     if (stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
-
-    const core::SequenceId first = next_seq_;
-    frames.clear();
-    sizes.clear();
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-      entries[i].seq = first + i;
-      const std::size_t size = frame::EncodeEntry(entries[i], config_.shard, frames);
-      if (size > config_.max_value_size_bytes) {
-        return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
-                                           std::string(batch ? "batch entry of " : "entry of ") +
-                                               std::to_string(size) +
-                                               " bytes exceeds queue.max_value_size_bytes (" +
-                                               std::to_string(config_.max_value_size_bytes) + ")"});
-      }
-      sizes.push_back(static_cast<uint32_t>(size));
-    }
-    frame::CloseBatch(frames);
-
-    if (frames.size() > std::numeric_limits<uint32_t>::max()) {
-      return std::unexpected(
-          core::Error{core::ErrorCode::kResourceExhausted, "batch exceeds segment capacity"});
-    }
-    auto reserved = log().Reserve(static_cast<uint32_t>(frames.size()));
+    auto reserved = log().Reserve(static_cast<uint32_t>(total));
     if (!reserved.has_value()) {
       const core::ErrorCode code = reserved.error().code();
       if (code == core::ErrorCode::kUnavailable) {
@@ -196,21 +261,23 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
     }
 
     const Log::Reservation& at = *reserved;
-    if (config_.window != nullptr) config_.window->Add(frames.size());
+    if (config_.window != nullptr) config_.window->Add(total);
     config_.unit->age.Start(DurabilityWindow::Clock::now());
+    const core::SequenceId first = next_seq_;
     uint64_t off = 0;
     for (std::size_t i = 0; i < entries.size(); ++i) {
+      entries[i].seq = first + i;
       const Log::Reservation slice{.pos = at.pos + off,
                                    .size = sizes[i],
                                    .gen = at.gen,
                                    .salt = at.salt,
                                    .dst = at.dst + off};
-      log().Commit(slice, {frames.data() + off, sizes[i]});
+      CommitEncoded(log(), entries[i], config_.shard, slice, total - off);
       Record(first + i, slice.pos, sizes[i]);
       off += sizes[i];
       if (batch_commit_hook_ && i + 1 < entries.size()) batch_commit_hook_(i + 1);
     }
-    const LogPosition end_pos = at.pos + frames.size();
+    const LogPosition end_pos = at.pos + total;
     log().AwaitFilled(end_pos);
 
     const core::SequenceId last = first + entries.size() - 1;
@@ -219,16 +286,101 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
     DurabilityFuture durable = config_.ack_durability == core::Durability::kPowerLoss
                                    ? WhenPowerDurable(last)
                                    : ReadyFuture({});
-    if (frames.capacity() > kKeepEncodeBytes) {
-      frames.clear();
-      frames.shrink_to_fit();
-    }
     return Begun{
         .first = first,
         .last = last,
         .durable = std::move(durable),
-        .publisher = std::make_unique<Publisher>(*this, std::move(lock), last + 1, end_pos)};
+        .publisher = std::make_unique<Publisher>(*this, std::move(lock), first, last + 1, end_pos)};
   }
+}
+
+core::Result<Reservation> ShardStream::Reserve(std::span<ShardStream* const> streams,
+                                               std::span<const ShardEntries> parts,
+                                               std::span<const uint32_t> sizes) {
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(streams.size());
+  for (ShardStream* stream : streams) {
+    locks.emplace_back(stream->append_mu_);
+    if (stream->stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
+  }
+  ShardStream& lead = *streams.front();
+  LogUnit& unit = *lead.config_.unit;
+  Log& log = *unit.log;
+  uint64_t total = 0;
+  for (const uint32_t size : sizes) total += size;
+  // Sizes do not depend on seqs, so space comes first and a refusal
+  // leaves nothing to undo.
+  auto at = log.Reserve(static_cast<uint32_t>(total));
+  if (!at.has_value()) {
+    const core::ErrorCode code = at.error().code();
+    if (code == core::ErrorCode::kUnavailable) {
+      return std::unexpected(core::Error{
+          code, "no spare WAL segment ready: the disk is full or the segment preparer is behind"});
+    }
+    if (code == core::ErrorCode::kResourceExhausted) {
+      return std::unexpected(
+          core::Error{core::ErrorCode::kValueTooLarge,
+                      "batch exceeds segment capacity: " + at.error().message()});
+    }
+    return std::unexpected(at.error());
+  }
+
+  if (lead.config_.window != nullptr) lead.config_.window->Add(total);
+  unit.age.Start(DurabilityWindow::Clock::now());
+  const std::function<void(std::size_t)>& hook = lead.batch_commit_hook_;
+  std::vector<ReservedRange> ranges;
+  ranges.reserve(parts.size());
+  DurableFutures durable;
+  durable.reserve(parts.size());
+  std::vector<Filler::Part> publish;
+  publish.reserve(parts.size());
+  std::vector<Filler::Deferred> deferred;
+  std::size_t committed = 0;
+  std::size_t k = 0;
+  uint64_t off = 0;
+  for (std::size_t p = 0; p < parts.size(); ++p) {
+    ShardStream& stream = *streams[p];
+    const ShardEntries& part = parts[p];
+    const core::SequenceId first = stream.next_seq_;
+    for (std::size_t i = 0; i < part.entries.size(); ++i, ++k) {
+      core::QueueEntry& entry = part.entries[i];
+      const core::SequenceId seq = first + i;
+      entry.seq = seq;
+      const Log::Reservation slice{.pos = at->pos + off,
+                                   .size = sizes[k],
+                                   .gen = at->gen,
+                                   .salt = at->salt,
+                                   .dst = at->dst + off};
+      if (slice.size <= core::kLockHoldFrameBytes) {
+        CommitEncoded(log, entry, part.shard, slice, total - off);
+        if (hook && ++committed < sizes.size()) hook(committed);
+      } else {
+        deferred.push_back(Filler::Deferred{.entry = std::move(entry),
+                                            .shard = part.shard,
+                                            .slice = slice,
+                                            .batch_rest = total - off});
+      }
+      stream.Record(seq, slice.pos, slice.size);
+      off += slice.size;
+    }
+    const core::SequenceId last = first + part.entries.size() - 1;
+    stream.next_seq_ = last + 1;
+    stream.appended_.Increment(static_cast<double>(part.entries.size()));
+    ranges.push_back(ReservedRange{.shard = part.shard, .first = first, .last = last});
+    durable.push_back(
+        ShardDurable{.shard = part.shard,
+                     .durable = stream.config_.ack_durability == core::Durability::kPowerLoss
+                                    ? stream.WhenPowerDurable(last)
+                                    : ReadyFuture({})});
+    publish.push_back(Filler::Part{.stream = &stream, .first = first, .end = last + 1});
+  }
+  std::function<void(std::size_t)> fill_hook;
+  if (hook && !deferred.empty()) fill_hook = hook;
+  unit.ready_to_complete.fetch_add(1, std::memory_order_acq_rel);
+  auto filler =
+      std::make_unique<Filler>(unit, std::move(publish), at->pos + total, std::move(deferred),
+                               std::move(fill_hook), committed, sizes.size());
+  return Reservation(std::move(ranges), std::move(durable), std::move(filler));
 }
 
 DurabilityFuture ShardStream::WhenPowerDurable(core::SequenceId seq) {
@@ -244,14 +396,54 @@ DurabilityFuture ShardStream::WhenPowerDurable(core::SequenceId seq) {
   return future;
 }
 
+// Spins, then yields: the wait is a predecessor's fill and publish.
+// The acquire pairs with that publish's store, so its frames are filled
+// before this publisher's store too.
+void ShardStream::AwaitPublished(core::SequenceId first) noexcept {
+  if (published_end_.load(std::memory_order_acquire) < first) {
+    const auto start = std::chrono::steady_clock::now();
+    bool spinning = true;
+    while (published_end_.load(std::memory_order_acquire) < first) {
+      if (spinning && std::chrono::steady_clock::now() - start >= kSpinFor) spinning = false;
+      if (spinning) {
+        CpuRelax();
+      } else {
+        std::this_thread::yield();
+      }
+    }
+    if (!spinning) {
+      publish_wait_.Observe(
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    }
+  }
+  // Only the publisher of `first` stores, so anything else is a bug
+  // that the store after this would hide by moving the end backwards.
+  ABYSS_DCHECK(published_end_.load(std::memory_order_acquire) == first,
+               "a shard's published end passed a seq not yet published");
+}
+
+// As the Publisher's, only allocation can throw here.
+// NOLINTNEXTLINE(bugprone-exception-escape)
+void ShardStream::PublishInOrder(core::SequenceId first, core::SequenceId end) noexcept {
+  AwaitPublished(first);
+  // Only the publisher of `first` stores now, so the end never regresses.
+  published_end_.store(end, std::memory_order_seq_cst);
+  if (RaisePowerEnd()) PowerAdvanced();
+  WakeReaders();
+}
+
 // The publisher stored published_end_ seq_cst, then reads the waiter
 // count; a reader counts itself, then reads the end. One of them sees
 // the other.
-void ShardStream::Published(LogPosition end_pos) noexcept {
+void ShardStream::WakeReaders() const noexcept {
   if (readers_waiting_.load(std::memory_order_seq_cst) > 0) {
     const std::scoped_lock lock(read_mu_);
     read_cv_.notify_all();
   }
+}
+
+void ShardStream::Published(LogPosition end_pos) noexcept {
+  WakeReaders();
   config_.unit->committer->Published(end_pos);
 }
 
@@ -295,11 +487,8 @@ bool ShardStream::AwaitDurable(core::SequenceId seq, core::Durability durability
   return WaitForEnd(seq, durability, timeout);
 }
 
-bool ShardStream::Durable(const frame::Header& header, uint32_t size) noexcept {
-  // A batch is visible at power_loss only once its last frame is
-  // durable.
-  if (header.batch_rest != size) return false;
-  flushed_end_.store(header.seq + 1, std::memory_order_seq_cst);
+bool ShardStream::Durable(core::SequenceId end) noexcept {
+  flushed_end_.store(end, std::memory_order_seq_cst);
   return RaisePowerEnd();
 }
 

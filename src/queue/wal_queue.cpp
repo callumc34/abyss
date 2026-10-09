@@ -13,6 +13,7 @@
 #include <string_view>
 #include <utility>
 
+#include "abyss/core/fatal.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
@@ -318,13 +319,25 @@ core::Result<void> WalQueue::RecoverOffsets() {
   return {};
 }
 
+// A batch is visible at power_loss only once its last frame is
+// durable, and then on every shard it spans.
 core::Result<GroupCommitter::Extent> WalQueue::FlushLog(LogUnit& unit) {
   const auto snapshot_at = DurabilityWindow::Clock::now();
   auto flushed = unit.log->Flush([this, &unit](const frame::Header& header, uint32_t size) {
-    if (streams_[header.shard]->Durable(header, size) && !unit.is_touched[header.shard]) {
-      unit.is_touched[header.shard] = true;
-      unit.touched.push_back(header.shard);
+    auto& batch = unit.batch;
+    if (!batch.empty() && batch.back().first == header.shard) {
+      batch.back().second = header.seq;
+    } else {
+      batch.emplace_back(header.shard, header.seq);
     }
+    if (header.batch_rest != size) return;
+    for (const auto& [shard, seq] : batch) {
+      if (streams_[shard]->Durable(seq + 1) && !unit.is_touched[shard]) {
+        unit.is_touched[shard] = true;
+        unit.touched.push_back(shard);
+      }
+    }
+    batch.clear();
   });
   if (!flushed.has_value()) return std::unexpected(flushed.error());
   unit.age.Flushed(snapshot_at, flushed->to, [&unit] { return unit.log->ReservedTail(); });
@@ -461,6 +474,11 @@ const ShardStream& WalQueue::StreamForTesting(core::ShardId shard) const {
   return *streams_.at(shard);
 }
 
+std::optional<uint64_t> WalQueue::PositionForTesting(core::ShardId shard,
+                                                     core::SequenceId seq) const {
+  return streams_.at(shard)->RingPositionForTesting(seq);
+}
+
 core::Duration WalQueue::DurabilityLag() const {
   const auto now = DurabilityWindow::Clock::now();
   DurabilityWindow::Clock::duration lag = DurabilityWindow::Clock::duration::zero();
@@ -527,14 +545,90 @@ core::SteadyTime WalQueue::DefaultAdmitBy() const {
 
 core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry,
                                                   core::SteadyTime admit_by) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL append by a thread holding a reservation");
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
   return streams_[shard]->BeginAppend(std::move(entry), admit_by);
 }
 
 core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
     core::ShardId shard, std::span<const core::QueueEntry> entries, core::SteadyTime admit_by) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL append by a thread holding a reservation");
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
   return streams_[shard]->BeginAppendBatch(entries, admit_by);
+}
+
+core::Result<void> WalQueue::Admit(core::ShardId shard, core::SteadyTime admit_by) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL admission wait by a thread holding a reservation");
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return window_.Admit(logs_[shard % config_.log_count]->age, admit_by);
+}
+
+bool WalQueue::WaitForSpare(core::ShardId shard, core::SteadyTime deadline) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL spare wait by a thread holding a reservation");
+  // A stopping queue refuses Reserve, so a ready spare must not invite
+  // another attempt.
+  if (shard >= config_.shard_count || streams_[shard]->stopping()) return false;
+  return logs_[shard % config_.log_count]->log->WaitForSpare(deadline);
+}
+
+core::Result<Reservation> WalQueue::Reserve(std::span<const ShardEntries> parts) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL reservation by a thread holding one");
+  if (parts.empty()) return std::unexpected(Invalid("reservation has no parts"));
+  thread_local std::vector<ShardStream*> streams;
+  thread_local std::vector<uint32_t> sizes;
+  streams.clear();
+  sizes.clear();
+  const uint32_t log = parts.front().shard % config_.log_count;
+  uint64_t total = 0;
+  for (std::size_t p = 0; p < parts.size(); ++p) {
+    const ShardEntries& part = parts[p];
+    if (auto v = ValidateShard(part.shard); !v.has_value()) return std::unexpected(v.error());
+    if (part.entries.empty()) {
+      return std::unexpected(
+          Invalid("reservation part for shard " + std::to_string(part.shard) + " has no entries"));
+    }
+    if (p > 0 && part.shard <= parts[p - 1].shard) {
+      return std::unexpected(Invalid("reservation parts must be sorted by shard and distinct"));
+    }
+    if (part.shard % config_.log_count != log) {
+      return std::unexpected(Invalid("CROSSSLOT a write's shards span WAL logs: shard " +
+                                     std::to_string(parts.front().shard) + " is on log " +
+                                     std::to_string(log) + ", shard " + std::to_string(part.shard) +
+                                     " on log " + std::to_string(part.shard % config_.log_count)));
+    }
+    streams.push_back(streams_[part.shard].get());
+    for (const core::QueueEntry& entry : part.entries) {
+      const std::size_t size = frame::EntryFrameSize(entry);
+      if (size > config_.max_value_size_bytes) {
+        return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
+                                           "entry of " + std::to_string(size) +
+                                               " bytes exceeds queue.max_value_size_bytes (" +
+                                               std::to_string(config_.max_value_size_bytes) + ")"});
+      }
+      sizes.push_back(static_cast<uint32_t>(size));
+      total += size;
+    }
+  }
+  if (total > frame_space_) {
+    return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
+                                       "batch of " + std::to_string(total) +
+                                           " bytes exceeds the segment frame space of " +
+                                           std::to_string(frame_space_) + " bytes"});
+  }
+  // Re-checked without waiting: the caller holds its hot shard locks.
+  if (auto admitted = window_.Admit(logs_[log]->age, core::SteadyTime{}); !admitted) {
+    return std::unexpected(admitted.error());
+  }
+  return ShardStream::Reserve(streams, parts, sizes);
+}
+
+DurableFutures WalQueue::Complete(Reservation&& reservation) {
+  Reservation owned = std::move(reservation);
+  return owned.Finish();
+}
+
+uint64_t WalQueue::ReadyToComplete(uint32_t log) const {
+  return logs_.at(log)->ready_to_complete.load(std::memory_order_acquire);
 }
 
 core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry,

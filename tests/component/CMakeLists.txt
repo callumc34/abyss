@@ -3,6 +3,7 @@ add_executable(abyss_component_tests
   wal_queue_test.cpp
   wal_queue_crash_test.cpp
   wal_queue_streams_test.cpp
+  wal_queue_reserve_test.cpp
   hot_consumer_test.cpp
   cold_durability_test.cpp
   cold_log_clock_test.cpp

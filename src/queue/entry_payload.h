@@ -7,6 +7,7 @@
 
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
+#include "binary_io.h"
 
 // An entry frame's payload: everything after its fixed header.
 namespace abyss::queue::entry_payload {
@@ -23,7 +24,10 @@ using Payload = decltype(core::QueueEntry::payload);
 
 EntryType TypeOf(const core::QueueEntry& entry);
 
+// EncodedSize bytes; past the writer's end it overflows.
+void Encode(const core::QueueEntry& entry, binary::SpanWriter& out);
 void Encode(const core::QueueEntry& entry, std::vector<std::byte>& out);
+std::size_t EncodedSize(const core::QueueEntry& entry);
 
 // Consumes the payload of `type` from the front of `cursor`.
 core::Result<Payload> Decode(EntryType type, std::span<const std::byte>& cursor);

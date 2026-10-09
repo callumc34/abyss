@@ -23,6 +23,7 @@
 #include "abyss/queue/durability_window.h"
 #include "abyss/queue/group_commit.h"
 #include "abyss/queue/offset_checkpoint.h"
+#include "abyss/queue/reservation.h"
 #include "abyss/queue/segment_reaper.h"
 #include "abyss/queue/segment_registry.h"
 
@@ -90,6 +91,11 @@ class WalQueue : public core::Queue, public SegmentRegistry {
                                               std::span<const core::QueueEntry> entries,
                                               core::SteadyTime admit_by) override;
 
+  core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by) override;
+  bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline) override;
+  core::Result<Reservation> Reserve(std::span<const ShardEntries> parts) override;
+  DurableFutures Complete(Reservation&& reservation) override;
+
   // As above, admitting within WalConfig::admission_timeout.
   core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry);
   core::Result<PendingBatchAppend> BeginAppendBatch(core::ShardId shard,
@@ -145,6 +151,9 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   // everything it is allowed to.
   [[nodiscard]] std::optional<core::Duration> OldestEligibleUnreapedAge() const;
 
+  // Reservations on `log` not yet completed.
+  uint64_t ReadyToComplete(uint32_t log) const;
+
   // Filled bytes not yet power-durable, across logs.
   uint64_t UnflushedBytes() const { return window_.UnflushedBytes(); }
   // Age bound of the oldest entry not yet power-durable, across logs.
@@ -161,8 +170,9 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   uint64_t SyncCountForTesting(uint32_t log) const;
   // Close without the final flush, as a power loss at teardown would.
   void SkipFinalFlushForTesting();
-  // Runs inside a batch append after each of its frames but the last is
-  // committed, with the count committed so far. It may block.
+  // Runs inside a batch append or reservation after each of its frames
+  // but the last is committed, with the count committed so far. It may
+  // block.
   void SetBatchCommitHookForTesting(const std::function<void(std::size_t committed)>& hook);
   // While paused, `log` prepares no spare segments.
   void PauseSegmentPreparerForTesting(uint32_t log, bool paused);
@@ -170,6 +180,9 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void InjectSegmentRemoveErrorForTesting(uint32_t log, core::Error error);
   // For tests that look at how a shard's reads locate frames.
   const ShardStream& StreamForTesting(core::ShardId shard) const;
+  // The log position `seq`'s frame was reserved at, while the shard's
+  // offset ring still holds it.
+  std::optional<uint64_t> PositionForTesting(core::ShardId shard, core::SequenceId seq) const;
 
  private:
   static constexpr int64_t kNoUnreapedEpochMs = std::numeric_limits<int64_t>::min();
