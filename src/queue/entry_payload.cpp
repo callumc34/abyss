@@ -74,7 +74,7 @@ void Encode(const core::QueueEntry& entry, binary::SpanWriter& out) {
 void Encode(const core::QueueEntry& entry, std::vector<std::byte>& out) {
   const std::size_t start = out.size();
   out.resize(start + EncodedSize(entry));
-  binary::SpanWriter writer(std::span(out).subspan(start));
+  binary::SpanWriter writer{std::span(out).subspan(start)};
   Encode(entry, writer);
 }
 

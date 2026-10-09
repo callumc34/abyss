@@ -58,9 +58,6 @@
 namespace abyss::queue {
 namespace {
 
-// A committing consumer besides cold; the queue treats ids alike.
-constexpr core::ConsumerId kTestConsumer = 0;
-
 #ifdef _WIN32
 
 TEST(WalCrashTest, ConfirmedWritesSurviveKillNine) {
@@ -74,6 +71,9 @@ TEST(WalCrashTest, AcknowledgedWritesOnEveryShardSurviveKillNine) {
 #else
 
 using namespace std::chrono_literals;
+
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
 
 constexpr const char* kVictimDirEnv = "ABYSS_WAL_CRASH_VICTIM_DIR";
 constexpr const char* kReadyFile = "wal_victim.ready";
