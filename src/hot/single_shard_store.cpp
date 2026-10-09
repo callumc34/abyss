@@ -395,7 +395,9 @@ void StubCache::EraseNode(Order::iterator node) {
 SingleShardStore::SingleShardStore(SingleShardConfig config)
     : config_(std::move(config)),
       governor_(config_.max_memory_bytes),
-      stubs_(config_.stub_max_entries) {}
+      stubs_(config_.stub_max_entries) {
+  if (config_.reserve_keys > 0) entries_.reserve(config_.reserve_keys);
+}
 
 // --- Read operations (const) ---
 
@@ -1464,7 +1466,7 @@ bool SingleShardStore::InstallLoad(std::string_view key, LoadToken token, LoadRe
     return true;
   }
 
-  const auto it = entries_.try_emplace(std::string(key)).first;
+  const auto it = EmplaceEntry(key);
   Entry& entry = it->second;
   entry.key = &it->first;
   entry.type = full->type();
@@ -1618,11 +1620,23 @@ const Entry* SingleShardStore::FindLiveEntry(std::string_view key) const {
   return entry;
 }
 
+EntryMap::iterator SingleShardStore::EmplaceEntry(std::string_view key) {
+  const auto buckets = static_cast<double>(entries_.bucket_count());
+  const bool rehashes =
+      static_cast<double>(entries_.size() + 1) > entries_.max_load_factor() * buckets;
+  if (!rehashes || !config_.on_rehash) return entries_.try_emplace(std::string(key)).first;
+  const auto start = std::chrono::steady_clock::now();
+  const auto it = entries_.try_emplace(std::string(key)).first;
+  config_.on_rehash(
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  return it;
+}
+
 Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type,
                                           core::EvictionTTL eviction) {
   auto it = entries_.find(key);
   const bool inserted = it == entries_.end();
-  if (inserted) it = entries_.try_emplace(std::string(key)).first;
+  if (inserted) it = EmplaceEntry(key);
   Entry& entry = it->second;
   entry.key = &it->first;
   // A tombstone is reborn as a fresh live key. Untrack its footprint first so
@@ -1701,7 +1715,7 @@ void SingleShardStore::TombstoneEntry(Entry& entry, std::string_view key, core::
 }
 
 void SingleShardStore::InsertTombstone(std::string_view key, core::SequenceId seq) {
-  const auto it = entries_.try_emplace(std::string(key)).first;
+  const auto it = EmplaceEntry(key);
   Entry& entry = it->second;
   entry.key = &it->first;
   entry.type = Entry::Type::kString;

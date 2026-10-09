@@ -1146,5 +1146,29 @@ TEST_F(SingleShardStoreTest, HotZrangeByLexMalformedBoundIsCleanError) {
   EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
 }
 
+// A rehash moves every node under the shard's exclusive lock; a map
+// sized up front for the keys it will hold never does one.
+size_t RehashesInserting(size_t reserve, size_t keys) {
+  size_t rehashes = 0;
+  SingleShardStore store{SingleShardConfig{
+      .reserve_keys = reserve, .on_rehash = [&rehashes](double /*seconds*/) { ++rehashes; }}};
+  for (size_t i = 0; i < keys; ++i) {
+    const std::string key = "key:" + std::to_string(i);
+    EXPECT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}},
+                           core::EvictionTTL{86400})
+                    .has_value());
+  }
+  return rehashes;
+}
+
+TEST(SingleShardRehashTest, AMapSizedForItsKeysNeverRehashes) {
+  EXPECT_EQ(RehashesInserting(/*reserve=*/4096, /*keys=*/4000), 0U);
+}
+
+TEST(SingleShardRehashTest, AnUnsizedMapReportsEachRehash) {
+  EXPECT_GT(RehashesInserting(/*reserve=*/0, /*keys=*/4000), 0U);
+}
+
 }  // namespace
 }  // namespace abyss::hot

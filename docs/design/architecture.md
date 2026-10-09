@@ -62,7 +62,7 @@ Abyss distinguishes between two independent time-to-live values:
 
 | TTL Type | Semantics | On Expiry |
 |----------|-----------|-----------|
-| `eviction` | How long a key lives in the hot store. Refreshed on every read. | Key is evicted from hot. Remains available in cold. Data is not deleted — it moves tier. |
+| `eviction` | How long a key lives in the hot store. Refreshed on every read. | Key is evicted from hot, within one `eviction` window after its deadline and never before it. Remains available in cold. Data is not deleted — it moves tier. |
 | `ttl` | Absolute time-to-live. How long the key exists at all. Not refreshed. | Key is deleted from both hot and cold. Data is gone. |
 
 Behaviour matrix:

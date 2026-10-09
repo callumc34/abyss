@@ -14,8 +14,10 @@
 
 namespace abyss::metrics::testing {
 
-// Replaces the registry's internal backend with a fresh instance. Handles
-// issued before Reset orphan onto the prior backend; tests re-register.
+// Replaces the registry's internal backend with a fresh instance. Every
+// handle issued before Reset is invalid after it, including those held
+// by objects built earlier (stores register in their constructors):
+// build such objects after Reset.
 // Not safe to call concurrently with registration or observation.
 void Reset();
 

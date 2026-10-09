@@ -195,6 +195,7 @@ admin:
 
 **Memory.**
 - **Sparse index:** one 16-byte point per 64 KiB of retained log, about 0.025% of the retained WAL. For example, 10 MB/s with 24 h retention retains about 864 GB and indexes it in about 210 MB. `abyss_wal_index_bytes` reports the live figure.
+- **Hot entry map buckets:** each shard's map is sized at startup for `hot.max_memory_bytes` at 512 bytes per key, 8 bytes a bucket: about 1.6% of `hot.max_memory_bytes` (67 MiB at the 4 GiB default), outside it. It removes the stall of rehashing a whole shard under its lock; `abyss_hot_rehash_seconds` shows any rehash that still happens.
 - **Offset ring:** `ring_entries` slots of 16 bytes per shard, allocated at start. That is 1 MiB per shard at the default, 64 MiB at 64 shards, outside `hot.max_memory_bytes`. `abyss_wal_ring_bytes` and the `WAL opened` log line report it. The ring must cover how far consumers normally trail the head; reads further back fall back to the sparse index.
 
 **Log count.** All logs live under `wal_path`, on one volume. The default of one log gives one sequential write stream and one flush per batch. Raise `log_count` only if measurements show a single flusher is the limit.
