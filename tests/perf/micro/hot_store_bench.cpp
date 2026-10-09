@@ -8,6 +8,7 @@
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 
 // Single-threaded lower-bound measurement of hot store Get / Apply. Provides
@@ -43,7 +44,7 @@ struct HotFixture {
       const auto key = KeyFor(i);
       const core::ops::StringSet set_op{.key = key, .value = value, .abs_ttl_ms = 0};
       const core::ops::WriteOp op = set_op;
-      auto rc = store.Apply(op, /*seq=*/0);
+      auto rc = store.Apply(op, /*seq=*/core::kFirstSeq);
       if (!rc.has_value()) std::abort();
     }
   }
@@ -73,7 +74,7 @@ void BM_HotStringSet(benchmark::State& state) {
     const auto key = KeyFor(i % key_count);
     const core::ops::StringSet set_op{.key = key, .value = fixture.value, .abs_ttl_ms = 0};
     const core::ops::WriteOp op = set_op;
-    benchmark::DoNotOptimize(fixture.store.Apply(op, /*seq=*/0));
+    benchmark::DoNotOptimize(fixture.store.Apply(op, /*seq=*/core::kFirstSeq));
     ++i;
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));

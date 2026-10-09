@@ -43,6 +43,7 @@ using namespace std::chrono_literals;
 constexpr size_t kTinySegment = 4096 + 512;
 constexpr size_t kOneFrameSegment = 4096 + 160;
 constexpr size_t kSmallSegment = 4096 + 2048;
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 
 core::QueueEntry MakeWrite(std::vector<std::string> args) {
   core::QueueEntry e;
@@ -191,8 +192,8 @@ TEST_F(WalQueueTest, AppendAssignsMonotonicSeqs) {
   auto r2 = queue_->Append(0, MakeWrite({"SET", "b", "2"}));
   ASSERT_TRUE(r1.has_value());
   ASSERT_TRUE(r2.has_value());
-  EXPECT_EQ(r1->seq, 0U);
-  EXPECT_EQ(r2->seq, 1U);
+  EXPECT_EQ(r1->seq, kFirst);
+  EXPECT_EQ(r2->seq, kFirst + 1);
 }
 
 TEST_F(WalQueueTest, DurabilityFutureResolvesOk) {
@@ -233,8 +234,8 @@ TEST_F(WalQueueTest, ShardsAreIndependent) {
   auto b = queue_->Append(1, MakeWrite({"SET", "b", "0"}));
   ASSERT_TRUE(a.has_value());
   ASSERT_TRUE(b.has_value());
-  EXPECT_EQ(a->seq, 0U);
-  EXPECT_EQ(b->seq, 0U);
+  EXPECT_EQ(a->seq, kFirst);
+  EXPECT_EQ(b->seq, kFirst);
 }
 
 TEST_F(WalQueueTest, InvalidShardRejected) {
@@ -255,18 +256,18 @@ TEST_F(WalQueueTest, ReadReturnsAppendedEntries) {
     EXPECT_TRUE(r->durable.get().has_value());
   }
 
-  auto read = queue_->Read(0, 0, 100, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 100, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 5U);
   for (size_t i = 0; i < read->size(); ++i) {
-    EXPECT_EQ((*read)[i].seq, i);
+    EXPECT_EQ((*read)[i].seq, kFirst + i);
   }
 }
 
 TEST_F(WalQueueTest, ReadOnEmptyQueueTimesOut) {
   OpenWith(DefaultConfig());
   auto start = std::chrono::steady_clock::now();
-  auto read = queue_->Read(0, 0, 10, 50ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 50ms, core::Durability::kProcessCrash);
   auto elapsed = std::chrono::steady_clock::now() - start;
   ASSERT_TRUE(read.has_value());
   EXPECT_TRUE(read->empty());
@@ -282,7 +283,7 @@ TEST_F(WalQueueTest, ReadReturnsFastWhenAppendRacesWithRead) {
   });
 
   auto start = std::chrono::steady_clock::now();
-  auto read = queue_->Read(0, 0, 10, 5s, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 5s, core::Durability::kProcessCrash);
   auto elapsed = std::chrono::steady_clock::now() - start;
 
   ASSERT_TRUE(read.has_value());
@@ -302,12 +303,12 @@ TEST_F(WalQueueTest, ReadAtHeadWaitsForTheNextAppend) {
     ASSERT_TRUE(r.has_value());
   });
   reading.set_value();
-  auto read = queue_->Read(0, 3, 10, 5s, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst + 3, 10, 5s, core::Durability::kProcessCrash);
   producer.join();
 
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 1U);
-  EXPECT_EQ(read->front().seq, 3U);
+  EXPECT_EQ(read->front().seq, kFirst + 3);
   EXPECT_EQ(ValueOf(read->front()), "next");
 }
 
@@ -315,22 +316,22 @@ TEST_F(WalQueueTest, ReadFromSeqStartsThere) {
   OpenWith(DefaultConfig());
   AppendDurable(4);
 
-  auto read = queue_->Read(0, 2, 10, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst + 2, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 2U);
-  EXPECT_EQ((*read)[0].seq, 2U);
-  EXPECT_EQ((*read)[1].seq, 3U);
+  EXPECT_EQ((*read)[0].seq, kFirst + 2);
+  EXPECT_EQ((*read)[1].seq, kFirst + 3);
 }
 
 TEST_F(WalQueueTest, ReadRespectsMaxCount) {
   OpenWith(DefaultConfig());
   AppendDurable(10);
 
-  auto read = queue_->Read(0, 4, 3, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst + 4, 3, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 3U);
-  EXPECT_EQ((*read)[0].seq, 4U);
-  EXPECT_EQ((*read)[2].seq, 6U);
+  EXPECT_EQ((*read)[0].seq, kFirst + 4);
+  EXPECT_EQ((*read)[2].seq, kFirst + 6);
 }
 
 TEST_F(WalQueueTest, ReadSpansSealedAndActiveSegments) {
@@ -340,10 +341,10 @@ TEST_F(WalQueueTest, ReadSpansSealedAndActiveSegments) {
   AppendDurable(20);
   ASSERT_GE(queue_->ListSealedSegments().size(), 2U);
 
-  for (core::SequenceId from = 0; from < 20; ++from) {
+  for (core::SequenceId from = kFirst; from < kFirst + 20; ++from) {
     auto read = queue_->Read(0, from, 100, 100ms, core::Durability::kProcessCrash);
     ASSERT_TRUE(read.has_value()) << read.error().message();
-    ASSERT_EQ(read->size(), 20 - from) << "from " << from;
+    ASSERT_EQ(read->size(), kFirst + 20 - from) << "from " << from;
     for (size_t i = 0; i < read->size(); ++i) EXPECT_EQ((*read)[i].seq, from + i);
   }
 }
@@ -359,11 +360,11 @@ TEST_F(WalQueueTest, AppendBatchAtomic) {
 
   auto r = queue_->AppendBatch(0, batch);
   ASSERT_TRUE(r.has_value());
-  EXPECT_EQ(r->first_seq, 0U);
-  EXPECT_EQ(r->last_seq, 4U);
+  EXPECT_EQ(r->first_seq, kFirst);
+  EXPECT_EQ(r->last_seq, kFirst + 4);
   EXPECT_TRUE(r->durable.get().has_value());
 
-  auto read = queue_->Read(0, 0, 100, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 100, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->size(), 5U);
 }
@@ -378,10 +379,10 @@ TEST_F(WalQueueTest, ReadReturnsBatchEntriesFromTheMiddle) {
   ASSERT_TRUE(r.has_value());
   ASSERT_TRUE(r->durable.get().has_value());
 
-  auto read = queue_->Read(0, 3, 10, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst + 3, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 3U);
-  EXPECT_EQ((*read)[0].seq, 3U);
+  EXPECT_EQ((*read)[0].seq, kFirst + 3);
   EXPECT_EQ(ValueOf((*read)[0]), "1");
   EXPECT_EQ(ValueOf((*read)[2]), "3");
 }
@@ -394,12 +395,12 @@ TEST_F(WalQueueTest, ReadBelowReclaimedFloorIsOutOfRange) {
   OpenWith(cfg);
   AppendDurable(20);
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 19).has_value());
-  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst + 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 19).has_value());
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
   const core::SequenceId first = queue_->FirstSeq(0).value();
-  ASSERT_GT(first, 0U) << "nothing was reclaimed";
+  ASSERT_GT(first, kFirst) << "nothing was reclaimed";
   EXPECT_TRUE(queue_->ListSealedSegments().empty());
 
   auto below = queue_->Read(0, first - 1, 10, 10ms, core::Durability::kProcessCrash);
@@ -413,7 +414,7 @@ TEST_F(WalQueueTest, ReadBelowReclaimedFloorIsOutOfRange) {
   ASSERT_TRUE(at_floor.has_value());
   ASSERT_FALSE(at_floor->empty());
   EXPECT_EQ(at_floor->front().seq, first);
-  EXPECT_EQ(at_floor->back().seq, 19U);
+  EXPECT_EQ(at_floor->back().seq, kFirst + 19);
 }
 
 TEST_F(WalQueueTest, FirstSeqTracksTheOldestRetainedSegment) {
@@ -421,18 +422,18 @@ TEST_F(WalQueueTest, FirstSeqTracksTheOldestRetainedSegment) {
   cfg.segment_size_bytes = kTinySegment;
   cfg.min_retention = 0s;
   OpenWith(cfg);
-  EXPECT_EQ(queue_->FirstSeq(0).value(), 0U);
+  EXPECT_EQ(queue_->FirstSeq(0).value(), kFirst);
   AppendDurable(20);
-  EXPECT_EQ(queue_->FirstSeq(0).value(), 0U) << "nothing committed, nothing reclaimed";
+  EXPECT_EQ(queue_->FirstSeq(0).value(), kFirst) << "nothing committed, nothing reclaimed";
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 19).has_value());
-  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst + 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 19).has_value());
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
   const core::SequenceId first = queue_->FirstSeq(0).value();
-  EXPECT_GT(first, 0U);
-  EXPECT_LE(first, 19U);
-  EXPECT_EQ(queue_->Stats()->first_seq, 0U) << "shard 1 still holds seq 0";
+  EXPECT_GT(first, kFirst);
+  EXPECT_LE(first, kFirst + 19);
+  EXPECT_EQ(queue_->Stats()->first_seq, kFirst) << "shard 1 reclaimed nothing";
 }
 
 // Random single and batch appends; every random Read(from, max) must match
@@ -470,21 +471,23 @@ void WalQueueTest::RunRandomReadProperty(size_t segment_bytes, size_t max_value_
   }
   // Segments are sealed once the flush passes their end.
   ASSERT_TRUE(
-      queue_->AwaitDurable(0, reference.size() - 1, core::Durability::kPowerLoss, 5s).value());
+      queue_->AwaitDurable(0, kFirst + reference.size() - 1, core::Durability::kPowerLoss, 5s)
+          .value());
   ASSERT_GE(queue_->ListSealedSegments().size(), min_sealed);
 
   auto check_reads = [&](std::string_view phase) {
     for (int i = 0; i < 1500; ++i) {
-      const core::SequenceId from = rng() % (reference.size() + 2);
+      const size_t at = rng() % (reference.size() + 2);
+      const core::SequenceId from = kFirst + at;
       const size_t max = 1 + (rng() % 64);
       auto read = queue_->Read(0, from, max, 0ms, core::Durability::kProcessCrash);
       ASSERT_TRUE(read.has_value()) << phase << ": " << read.error().message();
       const size_t expected =
-          from >= reference.size() ? 0 : std::min<size_t>(max, reference.size() - from);
+          at >= reference.size() ? 0 : std::min<size_t>(max, reference.size() - at);
       ASSERT_EQ(read->size(), expected) << phase << " from=" << from << " max=" << max;
       for (size_t j = 0; j < read->size(); ++j) {
         ASSERT_EQ((*read)[j].seq, from + j) << phase;
-        ASSERT_EQ(ValueOf((*read)[j]), reference[from + j]) << phase << " seq=" << from + j;
+        ASSERT_EQ(ValueOf((*read)[j]), reference[at + j]) << phase << " seq=" << from + j;
       }
     }
   };
@@ -512,11 +515,11 @@ TEST_F(WalQueueTest, SegmentRotationPreservesOrder) {
   OpenWith(cfg);
   AppendDurable(10);
 
-  auto read = queue_->Read(0, 0, 100, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 100, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 10U);
   for (size_t i = 0; i < read->size(); ++i) {
-    EXPECT_EQ((*read)[i].seq, i);
+    EXPECT_EQ((*read)[i].seq, kFirst + i);
   }
 }
 
@@ -540,11 +543,11 @@ TEST_F(WalQueueTest, BackToBackRotationsPreserveDurability) {
     EXPECT_TRUE(f.get().has_value());
   }
 
-  auto read = queue_->Read(0, 0, 1000, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 1000, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), static_cast<size_t>(kWrites));
   for (size_t i = 0; i < read->size(); ++i) {
-    EXPECT_EQ((*read)[i].seq, i);
+    EXPECT_EQ((*read)[i].seq, kFirst + i);
   }
 }
 
@@ -571,7 +574,7 @@ TEST_F(WalQueueTest, ConcurrentAppendsAllDurable) {
 
   EXPECT_EQ(failures.load(), 0);
 
-  auto read = queue_->Read(0, 0, 10000, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10000, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->size(), kThreads * kPerThread);
 
@@ -579,7 +582,7 @@ TEST_F(WalQueueTest, ConcurrentAppendsAllDurable) {
   seqs.reserve(read->size());
   for (auto& e : *read) seqs.push_back(e.seq);
   for (size_t i = 0; i < seqs.size(); ++i) {
-    EXPECT_EQ(seqs[i], i);
+    EXPECT_EQ(seqs[i], kFirst + i);
   }
 }
 
@@ -591,7 +594,7 @@ TEST_F(WalQueueTest, RecoveryPreservesEntries) {
   }
 
   OpenWith(DefaultConfig());
-  auto read = queue_->Read(0, 0, 100, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 100, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 3U);
 }
@@ -629,11 +632,11 @@ TEST_F(WalQueueTest, RecoveryAcrossRotation) {
   }
 
   OpenWith(cfg);
-  auto read = queue_->Read(0, 0, 100, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 100, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->size(), 10U);
   for (size_t i = 0; i < read->size(); ++i) {
-    EXPECT_EQ((*read)[i].seq, i);
+    EXPECT_EQ((*read)[i].seq, kFirst + i);
   }
 }
 
@@ -657,12 +660,12 @@ TEST_F(WalQueueTest, ReopenSetsBothDurableEndsToHead) {
 
     const log::testing::CapturingSink logs;
     OpenWith(cfg);
-    ASSERT_EQ(queue_->TailSeq(0).value(), 2U);
-    EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), 3U);
-    EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 3U);
-    EXPECT_TRUE(queue_->AwaitDurable(0, 2, core::Durability::kPowerLoss, 0ms).value());
-    EXPECT_FALSE(queue_->AwaitDurable(0, 3, core::Durability::kPowerLoss, 0ms).value());
-    EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 2).has_value());
+    ASSERT_EQ(queue_->TailSeq(0).value(), kFirst + 2);
+    EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), kFirst + 3);
+    EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 3);
+    EXPECT_TRUE(queue_->AwaitDurable(0, kFirst + 2, core::Durability::kPowerLoss, 0ms).value());
+    EXPECT_FALSE(queue_->AwaitDurable(0, kFirst + 3, core::Durability::kPowerLoss, 0ms).value());
+    EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 2).has_value());
     const auto records = logs.Records();
     EXPECT_TRUE(std::ranges::any_of(records, [](const log::testing::CapturedRecord& r) {
       return r.msg == "WAL log recovered";
@@ -684,13 +687,13 @@ TEST_F(WalQueueTest, OffsetBeyondRecoveredHeadIsCorruption) {
     {
       OpenWith(cfg);
       AppendDurable(1);
-      ASSERT_TRUE(queue_->AwaitDurable(0, 0, core::Durability::kPowerLoss, 5s).value());
+      ASSERT_TRUE(queue_->AwaitDurable(0, kFirst, core::Durability::kPowerLoss, 5s).value());
       lost_from = queue_->DurableExtentForTesting(0);
       for (int i = 0; i < 3; ++i) {
         ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "k", "v"})).has_value());
       }
-      ASSERT_TRUE(queue_->AwaitDurable(0, 3, core::Durability::kPowerLoss, 5s).value());
-      ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 3).has_value());
+      ASSERT_TRUE(queue_->AwaitDurable(0, kFirst + 3, core::Durability::kPowerLoss, 5s).value());
+      ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 3).has_value());
       ASSERT_TRUE(queue_->FlushOffsets().has_value());
       queue_.reset();
     }
@@ -703,7 +706,8 @@ TEST_F(WalQueueTest, OffsetBeyondRecoveredHeadIsCorruption) {
   }
 }
 
-// An empty recovered tail syncs nothing, so seq 0 stays uncommittable.
+// An empty recovered tail syncs nothing, so the first seq stays
+// uncommittable.
 TEST_F(WalQueueTest, ReopenedEmptyShardHasNothingDurable) {
   {
     OpenWith(DefaultConfig());
@@ -711,7 +715,8 @@ TEST_F(WalQueueTest, ReopenedEmptyShardHasNothingDurable) {
   }
 
   OpenWith(DefaultConfig());
-  auto rejected = queue_->CommitOffset(core::kColdConsumer, 0, 0);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
+  auto rejected = queue_->CommitOffset(core::kColdConsumer, 0, kFirst);
   ASSERT_FALSE(rejected.has_value());
   EXPECT_EQ(rejected.error().code(), core::ErrorCode::kFailedPrecondition);
 }
@@ -735,17 +740,17 @@ TEST_F(WalQueueTest, ReopenWatermarkCoversSealedSegmentsAndTail) {
   OpenWith(cfg);
   const auto sealed = queue_->ListSealedSegments();
   ASSERT_FALSE(sealed.empty());
-  ASSERT_EQ(queue_->TailSeq(0).value(), 9U);
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 10U);
+  ASSERT_EQ(queue_->TailSeq(0).value(), kFirst + 9);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 10);
   EXPECT_TRUE(
       queue_->CommitOffset(core::kColdConsumer, 0, MaxSeqOf(sealed.front(), 0)).has_value());
-  EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 9).has_value());
+  EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 9).has_value());
 
   const size_t sealed_before = sealed.size();
   AppendDurable(10);
   EXPECT_GT(queue_->ListSealedSegments().size(), sealed_before);
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 20U);
-  EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 20);
+  EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 19).has_value());
 }
 
 TEST_F(WalQueueTest, StatsReflectsState) {
@@ -760,8 +765,8 @@ TEST_F(WalQueueTest, StatsReflectsState) {
   EXPECT_EQ(stats->total_entries, 10U);
   // The active segment and its two spares, all fixed-size files.
   EXPECT_EQ(stats->total_bytes, 3U * 8192);
-  EXPECT_EQ(stats->head_seq, 5U);
-  EXPECT_EQ(stats->first_seq, 0U);
+  EXPECT_EQ(stats->head_seq, kFirst + 5);
+  EXPECT_EQ(stats->first_seq, kFirst);
 }
 
 TEST_F(WalQueueTest, AppendAboveMaxValueSizeRejected) {
@@ -795,7 +800,7 @@ TEST_F(WalQueueTest, ValueWithinMaxValueSizeAcceptedAndRecovers) {
   }
 
   OpenWith(cfg);
-  auto read = queue_->Read(0, 0, 10, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 1U);
   const auto* w = std::get_if<core::entry::Write>(&read->front().payload);
@@ -816,8 +821,9 @@ TEST_F(WalQueueTest, CommittedOffsetIsVisibleImmediately) {
   AppendDurable(3);
 
   EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 0).value(), std::nullopt);
-  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 0).has_value());
-  EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 0).value(), std::optional<uint64_t>{0});
+  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst).has_value());
+  EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 0).value(),
+            std::optional<uint64_t>{kFirst});
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 2).has_value());
   EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 0).value(), std::optional<uint64_t>{2});
   EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 1).value(), std::nullopt);
@@ -854,8 +860,8 @@ TEST_F(WalQueueTest, CommitRejectedUntilPowerDurable) {
   ASSERT_TRUE(r.has_value());
   ASSERT_TRUE(r->durable.get().has_value());
   ASSERT_TRUE(stall.AwaitEntered());
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), 1U);
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), kFirst + 1);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
 
   auto rejected = queue_->CommitOffset(core::kColdConsumer, 0, r->seq);
   ASSERT_FALSE(rejected.has_value());
@@ -922,7 +928,7 @@ TEST_F(WalQueueTest, CrashResumesFromLastPersistedOffset) {
 
   OpenWith(DefaultConfig());
   EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 0).value(), std::optional<uint64_t>{3})
-      << "only the persisted offset survives a crash; seqs 4..7 are redelivered";
+      << "only the persisted offset survives a crash; seqs 4..8 are redelivered";
 }
 
 // The reaper reclaims only below PERSISTED offsets. An in-memory commit
@@ -965,14 +971,14 @@ TEST_F(WalQueueTest, OldestRetainedTracksPersistedOffsets) {
   OpenWith(DefaultConfig());
   AppendDurable(3);
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 1).has_value());
-  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 0).has_value());
-  EXPECT_EQ(queue_->OldestRetained(0).value(), 0U) << "nothing persisted: FirstSeq";
+  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst + 1).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst).has_value());
+  EXPECT_EQ(queue_->OldestRetained(0).value(), kFirst) << "nothing persisted: FirstSeq";
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
 
   auto oldest = queue_->OldestRetained(0);
   ASSERT_TRUE(oldest.has_value());
-  EXPECT_EQ(*oldest, 0U);  // cold is behind, so min is 0
+  EXPECT_EQ(*oldest, kFirst);  // cold is behind, so min is its offset
 }
 
 TEST_F(WalQueueTest, PersistFailureCountsRetriesAndHoldsRetention) {
@@ -1047,7 +1053,7 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
   std::thread consumer([this, &stop, &observed_seqs] {
     // The consumer owns its read position; commits trail it, clamped to the
     // durable tail as every retention consumer's must be.
-    core::SequenceId next = 0;
+    core::SequenceId next = kFirst;
     auto consume = [&](core::Duration timeout) -> bool {
       auto read = queue_->Read(0, next, 128, timeout, core::Durability::kProcessCrash);
       if (!read.has_value() || read->empty()) return false;
@@ -1057,7 +1063,7 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
         next = e.seq + 1;
       }
       if (auto end = queue_->DurableEnd(0, core::Durability::kPowerLoss);
-          end.has_value() && *end > 1) {
+          end.has_value() && *end > kFirst) {
         EXPECT_TRUE(
             queue_->CommitOffset(core::kHotConsumer, 0, std::min(next - 1, *end - 1)).has_value());
       }
@@ -1075,7 +1081,7 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
   EXPECT_EQ(produced.load(), kProducers * kPerProducer);
   EXPECT_EQ(observed_seqs.size(), static_cast<size_t>(kProducers * kPerProducer));
   for (size_t i = 0; i < observed_seqs.size(); ++i) {
-    EXPECT_EQ(observed_seqs[i], i);
+    EXPECT_EQ(observed_seqs[i], kFirst + i);
   }
 }
 
@@ -1097,7 +1103,7 @@ TEST_F(WalQueueTest, ConcurrentReadersSurviveRotationAndReaping) {
   std::atomic<bool> done{false};
   std::thread appender([this, &done] {
     const auto deadline = std::chrono::steady_clock::now() + 10s;
-    for (int i = 0; i < kAppends || (queue_->FirstSeq(0).value() == 0 &&
+    for (int i = 0; i < kAppends || (queue_->FirstSeq(0).value() == kFirst &&
                                      std::chrono::steady_clock::now() < deadline);
          ++i) {
       if (i % 5 == 0) {
@@ -1114,7 +1120,7 @@ TEST_F(WalQueueTest, ConcurrentReadersSurviveRotationAndReaping) {
   std::thread committer([this, &done] {
     while (!done.load(std::memory_order_acquire)) {
       if (auto end = queue_->DurableEnd(0, core::Durability::kPowerLoss);
-          end.has_value() && *end > 1) {
+          end.has_value() && *end > kFirst) {
         EXPECT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, *end - 1).has_value());
       }
       EXPECT_TRUE(queue_->FlushOffsets().has_value());
@@ -1125,7 +1131,7 @@ TEST_F(WalQueueTest, ConcurrentReadersSurviveRotationAndReaping) {
   std::atomic<int> rejoins{0};
   auto reader = [this, &done, &rejoins](uint64_t seed) {
     std::mt19937_64 rng(seed);
-    core::SequenceId next = 0;
+    core::SequenceId next = kFirst;
     while (!done.load(std::memory_order_acquire)) {
       auto read = queue_->Read(0, next, 1 + (rng() % 32), 1ms, core::Durability::kProcessCrash);
       if (!read.has_value()) {
@@ -1147,7 +1153,7 @@ TEST_F(WalQueueTest, ConcurrentReadersSurviveRotationAndReaping) {
   r1.join();
   r2.join();
 
-  EXPECT_GT(queue_->FirstSeq(0).value(), 0U) << "the reaper never ran under the readers";
+  EXPECT_GT(queue_->FirstSeq(0).value(), kFirst) << "the reaper never ran under the readers";
 }
 
 TEST_F(WalQueueTest, LaggingConsumerKeepsOldSegmentsAlive) {
@@ -1201,15 +1207,15 @@ TEST_F(WalQueueTest, ActiveSegmentNeverDeleted) {
   cfg.min_retention = 0s;
   OpenWith(cfg);
   AppendDurable(1);
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 0).has_value());
-  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 0).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst).has_value());
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
 
-  // The active segment (which contains seq 0) must not be in the sealed list
+  // The active segment (which holds the first seq) must not be in the sealed list
   // and must not be removed.
   auto sealed = queue_->ListSealedSegments();
   EXPECT_TRUE(sealed.empty());
-  auto read = queue_->Read(0, 0, 10, 10ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 10ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 1U);
 }
@@ -1219,15 +1225,15 @@ TEST_F(WalQueueTest, BeginAppendPublishMakesEntryVisible) {
 
   auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "k", "v"}));
   ASSERT_TRUE(pending.has_value());
-  EXPECT_EQ(pending->seq(), 0U);
+  EXPECT_EQ(pending->seq(), kFirst);
 
   pending->Publish();
   ASSERT_TRUE(pending->durable().get().has_value());
 
-  auto read = queue_->Read(0, 0, 10, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 1U);
-  EXPECT_EQ(read->front().seq, 0U);
+  EXPECT_EQ(read->front().seq, kFirst);
 }
 
 // Auto-publish on drop: forgetting Publish() is a latency bug, not data loss.
@@ -1245,7 +1251,7 @@ TEST_F(WalQueueTest, DroppingPendingAppendAutoPublishes) {
   }
 
   ASSERT_TRUE(durable_future.get().has_value());
-  auto read = queue_->Read(0, 0, 10, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 1U);
   EXPECT_EQ(read->front().seq, seq);
@@ -1262,15 +1268,15 @@ TEST_F(WalQueueTest, BeginAppendBatchPublishMakesEntriesVisible) {
 
   auto pending = queue_->BeginAppendBatch(0, batch);
   ASSERT_TRUE(pending.has_value());
-  EXPECT_EQ(pending->first_seq(), 0U);
-  EXPECT_EQ(pending->last_seq(), 2U);
+  EXPECT_EQ(pending->first_seq(), kFirst);
+  EXPECT_EQ(pending->last_seq(), kFirst + 2);
   EXPECT_EQ(pending->size(), 3U);
-  EXPECT_EQ(pending->seq_at(1), 1U);
+  EXPECT_EQ(pending->seq_at(1), kFirst + 1);
 
   pending->Publish();
   ASSERT_TRUE(pending->durable().get().has_value());
 
-  auto read = queue_->Read(0, 0, 10, 100ms, core::Durability::kProcessCrash);
+  auto read = queue_->Read(0, kFirst, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->size(), 3U);
 }
@@ -1284,7 +1290,7 @@ TEST_F(WalQueueTest, TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace) {
   std::atomic<bool> stop_consumer{false};
 
   std::thread consumer([&]() {
-    core::SequenceId next = 0;
+    core::SequenceId next = kFirst;
     auto drain = [&]() -> bool {
       auto read = queue_->Read(0, next, 32, 10ms, core::Durability::kProcessCrash);
       if (!read.has_value() || read->empty()) return false;
@@ -1352,13 +1358,13 @@ TEST_F(WalQueueTest, AppendBatchCrashMidBatchLosesWholeBatch) {
   }
 
   OpenWith(cfg);
-  EXPECT_EQ(queue_->TailSeq(0).value(), 1U);
-  auto read = queue_->Read(0, 0, 100, 50ms, core::Durability::kProcessCrash);
+  EXPECT_EQ(queue_->TailSeq(0).value(), kFirst + 1);
+  auto read = queue_->Read(0, kFirst, 100, 50ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->size(), 2U);
   auto next = queue_->Append(0, MakeWrite({"SET", "k", "after"}));
   ASSERT_TRUE(next.has_value());
-  EXPECT_EQ(next->seq, 2U);
+  EXPECT_EQ(next->seq, kFirst + 2);
 }
 
 // A stalled device: what each class shows while the flush cannot finish.
@@ -1378,23 +1384,23 @@ TEST_F(WalQueueTest, ProcessCrashAcksAndShowsWritesTheFlushHasNotCovered) {
   }
   ASSERT_TRUE(stall.AwaitEntered());
 
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), 3U);
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
-  EXPECT_TRUE(queue_->AwaitDurable(0, 2, core::Durability::kProcessCrash, 0ms).value());
-  EXPECT_FALSE(queue_->AwaitDurable(0, 0, core::Durability::kPowerLoss, 20ms).value());
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), kFirst + 3);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
+  EXPECT_TRUE(queue_->AwaitDurable(0, kFirst + 2, core::Durability::kProcessCrash, 0ms).value());
+  EXPECT_FALSE(queue_->AwaitDurable(0, kFirst, core::Durability::kPowerLoss, 20ms).value());
   EXPECT_GT(queue_->UnflushedBytes(), 0U);
   EXPECT_GT(queue_->DurabilityLag(), core::Duration::zero());
 
-  auto withheld = queue_->Read(0, 0, 100, 20ms, core::Durability::kPowerLoss);
+  auto withheld = queue_->Read(0, kFirst, 100, 20ms, core::Durability::kPowerLoss);
   ASSERT_TRUE(withheld.has_value());
   EXPECT_TRUE(withheld->empty());
-  auto shown = queue_->Read(0, 0, 100, 20ms, core::Durability::kProcessCrash);
+  auto shown = queue_->Read(0, kFirst, 100, 20ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(shown.has_value());
   EXPECT_EQ(shown->size(), 3U);
 
   stall.Release();
-  ASSERT_TRUE(queue_->AwaitDurable(0, 2, core::Durability::kPowerLoss, 5s).value());
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 3U);
+  ASSERT_TRUE(queue_->AwaitDurable(0, kFirst + 2, core::Durability::kPowerLoss, 5s).value());
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 3);
   EXPECT_EQ(queue_->UnflushedBytes(), 0U);
   EXPECT_EQ(queue_->DurabilityLag(), core::Duration::zero());
 }
@@ -1410,12 +1416,12 @@ TEST_F(WalQueueTest, PowerLossFuturePendsUntilTheFlushLands) {
   ASSERT_TRUE(r.has_value());
   ASSERT_TRUE(stall.AwaitEntered());
   EXPECT_EQ(r->durable.wait_for(50ms), std::future_status::timeout);
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), 1U);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), kFirst + 1);
 
   stall.Release();
   ASSERT_EQ(r->durable.wait_for(5s), std::future_status::ready);
   EXPECT_TRUE(r->durable.get().has_value());
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 1U);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 1);
 }
 
 // The flush wakes power_loss readers; they never sit out their timeout.
@@ -1427,7 +1433,7 @@ TEST_F(WalQueueTest, PowerLossReaderWakesOnTheFlush) {
   queue_->SetFlushHookForTesting(stall.Hook());
 
   auto reader = std::async(std::launch::async, [this] {
-    return queue_->Read(0, 0, 100, 10s, core::Durability::kPowerLoss);
+    return queue_->Read(0, kFirst, 100, 10s, core::Durability::kPowerLoss);
   });
   auto r = queue_->Append(0, MakeWrite({"SET", "k", "v"}));
   ASSERT_TRUE(r.has_value());
@@ -1441,7 +1447,7 @@ TEST_F(WalQueueTest, PowerLossReaderWakesOnTheFlush) {
   auto read = reader.get();
   ASSERT_TRUE(read.has_value());
   ASSERT_EQ(read->size(), 1U);
-  EXPECT_EQ(read->front().seq, 0U);
+  EXPECT_EQ(read->front().seq, kFirst);
 }
 
 TEST_F(WalQueueTest, StalledFlushBackpressuresThenRejectsAppends) {
@@ -1484,7 +1490,7 @@ TEST_F(WalQueueTest, StalledFlushBackpressuresThenRejectsAppends) {
   stall.Release();
   auto after = queue_->Append(0, MakeWrite({"SET", "k", value}));
   ASSERT_TRUE(after.has_value()) << after.error().message();
-  EXPECT_EQ(after->seq, static_cast<core::SequenceId>(admitted));
+  EXPECT_EQ(after->seq, kFirst + admitted);
 }
 
 // One value larger than the whole window is admitted when nothing is
@@ -1508,7 +1514,7 @@ TEST_F(WalQueueTest, DurableExtentTracksTheLastFlush) {
   cfg.durability = core::Durability::kProcessCrash;
   OpenWith(cfg);
   AppendDurable(1);
-  ASSERT_TRUE(queue_->AwaitDurable(0, 0, core::Durability::kPowerLoss, 5s).value());
+  ASSERT_TRUE(queue_->AwaitDurable(0, kFirst, core::Durability::kPowerLoss, 5s).value());
   const auto flushed = queue_->DurableExtentForTesting(0);
   std::vector<std::byte> frame;
   const std::size_t size =

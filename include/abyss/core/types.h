@@ -10,6 +10,9 @@ using ShardId = uint32_t;
 using SequenceId = uint64_t;
 using ConsumerId = uint32_t;
 
+// A shard's first seq. 0 names no entry: "none", "nothing drained".
+inline constexpr SequenceId kFirstSeq = 1;
+
 using SteadyClock = std::chrono::steady_clock;
 using SteadyTime = SteadyClock::time_point;
 using WallClock = std::chrono::system_clock;

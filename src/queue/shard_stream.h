@@ -210,7 +210,7 @@ class ShardStream {
   metrics::GaugeHandle ring_gauge_;
 
   mutable std::mutex append_mu_;
-  core::SequenceId next_seq_ ABYSS_GUARDED_BY(append_mu_) = 0;
+  core::SequenceId next_seq_ ABYSS_GUARDED_BY(append_mu_) = core::kFirstSeq;
   // Frame bytes since the last index point this stream appended.
   uint64_t since_point_ ABYSS_GUARDED_BY(append_mu_) = 0;
   bool has_point_ ABYSS_GUARDED_BY(append_mu_) = false;
@@ -226,11 +226,12 @@ class ShardStream {
   mutable std::mutex index_mu_;
   std::deque<IndexPoint> index_ ABYSS_GUARDED_BY(index_mu_);
 
-  std::atomic<core::SequenceId> first_seq_{0};
-  std::atomic<core::SequenceId> published_end_{0};
+  // Exclusive ends, so an empty stream's are kFirstSeq.
+  std::atomic<core::SequenceId> first_seq_{core::kFirstSeq};
+  std::atomic<core::SequenceId> published_end_{core::kFirstSeq};
   // Batch ends the flush walk has found durable, published or not.
-  std::atomic<core::SequenceId> flushed_end_{0};
-  std::atomic<core::SequenceId> power_end_{0};
+  std::atomic<core::SequenceId> flushed_end_{core::kFirstSeq};
+  std::atomic<core::SequenceId> power_end_{core::kFirstSeq};
 
   // Readers of published_end_, Dekker-counted so a publish notifies
   // only when someone waits.

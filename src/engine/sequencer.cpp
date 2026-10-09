@@ -294,14 +294,10 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
     if (decision.error.has_value() || decision.effects.empty()) {
       // Nothing to log: the reply, an error included, still waits until
       // what it read is durable.
-      std::vector<ShardSeq> fences;
-      for (const ShardSeq& seen : decision.observed) {
-        if (const auto seq = (*hold)->FenceFor(seen.shard, seen.seq)) {
-          fences.push_back({.shard = seen.shard, .seq = *seq});
-        }
-      }
       hold->Unlock();
-      if (auto fenced = Fence(fences, deadline); !fenced) return std::unexpected(fenced.error());
+      if (auto fenced = Fence(decision.observed, deadline); !fenced) {
+        return std::unexpected(fenced.error());
+      }
       if (decision.error.has_value()) return std::unexpected(*std::move(decision.error));
       ABYSS_DCHECK(decision.reply.has_value(), "a decision with no effect has no reply");
       return *std::move(decision.reply);

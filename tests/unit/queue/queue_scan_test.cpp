@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "abyss/core/queue.h"
+#include "abyss/core/types.h"
 #include "mock_queue.h"
 
 namespace abyss::core {
@@ -15,6 +16,8 @@ using ::testing::_;
 using ::testing::Invoke;
 
 constexpr ShardId kShards = 4;
+// Each shard's log holds 3000 entries, so its exclusive end is this.
+constexpr SequenceId kEnd = kFirstSeq + 3000;
 
 QueueEntry Entry(SequenceId seq) {
   return QueueEntry{.seq = seq, .payload = entry::Write{.cmd = RespCommand{{"SET", "k", "v"}}}};
@@ -25,7 +28,7 @@ using Logs = std::vector<std::vector<QueueEntry>>;
 Logs MakeLogs() {
   Logs logs(kShards);
   for (auto& log : logs) {
-    for (SequenceId seq = 0; seq < 3000; ++seq) log.push_back(Entry(seq));
+    for (SequenceId seq = kFirstSeq; seq < kEnd; ++seq) log.push_back(Entry(seq));
   }
   return logs;
 }
@@ -44,8 +47,8 @@ TEST(QueueScanTest, DeliversEachShardsRangeInOrderNeverConcurrentlyPerShard) {
   const Logs logs = MakeLogs();
   ::testing::NiceMock<testing::MockQueue> queue;
   ServeReads(queue, logs);
-  const std::vector<SequenceId> from{0, 10, 2999, 3000};
-  const std::vector<SequenceId> end{3000, 2500, 3000, 3000};
+  const std::vector<SequenceId> from{kFirstSeq, 10, kEnd - 1, kEnd};
+  const std::vector<SequenceId> end{kEnd, 2500, kEnd, kEnd};
   std::vector<std::atomic<bool>> busy(kShards);
   std::vector<std::vector<SequenceId>> seen(kShards);
   std::atomic<bool> overlapped{false};
@@ -76,8 +79,8 @@ TEST(QueueScanTest, ASinkErrorStopsTheScanAndIsReturned) {
   const Logs logs = MakeLogs();
   ::testing::NiceMock<testing::MockQueue> queue;
   ServeReads(queue, logs);
-  const std::vector<SequenceId> from(kShards, 0);
-  const std::vector<SequenceId> end(kShards, 3000);
+  const std::vector<SequenceId> from(kShards, kFirstSeq);
+  const std::vector<SequenceId> end(kShards, kEnd);
   const std::atomic<bool> cancel{false};
   std::atomic<int> calls{0};
   auto scanned = queue.Scan(
@@ -96,8 +99,8 @@ TEST(QueueScanTest, CancelIsUnavailable) {
   const Logs logs = MakeLogs();
   ::testing::NiceMock<testing::MockQueue> queue;
   ServeReads(queue, logs);
-  const std::vector<SequenceId> from(kShards, 0);
-  const std::vector<SequenceId> end(kShards, 3000);
+  const std::vector<SequenceId> from(kShards, kFirstSeq);
+  const std::vector<SequenceId> end(kShards, kEnd);
   const std::atomic<bool> cancelled{true};
   auto scanned = queue.Scan(from, end, 2, Accept, cancelled);
   ASSERT_FALSE(scanned.has_value());
@@ -109,18 +112,39 @@ TEST(QueueScanTest, AMissingEntryBelowTheEndIsAnError) {
   logs.at(1).erase(logs.at(1).begin() + 100);
   ::testing::NiceMock<testing::MockQueue> queue;
   ServeReads(queue, logs);
-  const std::vector<SequenceId> from(kShards, 0);
-  const std::vector<SequenceId> end{0, 3000, 0, 0};
+  const std::vector<SequenceId> from(kShards, kFirstSeq);
+  const std::vector<SequenceId> end{kFirstSeq, kEnd, kFirstSeq, kFirstSeq};
   const std::atomic<bool> cancel{false};
   auto scanned = queue.Scan(from, end, 2, Accept, cancel);
   ASSERT_FALSE(scanned.has_value());
   EXPECT_EQ(scanned.error().code(), ErrorCode::kInternal);
 }
 
+// An empty shard's range is [kFirstSeq, kFirstSeq); one from 0 names no
+// entry, so it is refused even when empty.
+TEST(QueueScanTest, AnEmptyRangeDeliversNothingAndOneFromZeroIsOutOfRange) {
+  ::testing::NiceMock<testing::MockQueue> queue;
+  ServeReads(queue, Logs(kShards));
+  const std::atomic<bool> cancel{false};
+  int calls = 0;
+  const auto count = [&calls](ShardId, std::vector<QueueEntry>&) -> Result<void> {
+    ++calls;
+    return {};
+  };
+  const std::vector<SequenceId> empty(kShards, kFirstSeq);
+  ASSERT_TRUE(queue.Scan(empty, empty, 2, count, cancel).has_value());
+  EXPECT_EQ(calls, 0);
+
+  const std::vector<SequenceId> zero(kShards, 0);
+  auto scanned = queue.Scan(zero, zero, 2, count, cancel);
+  ASSERT_FALSE(scanned.has_value());
+  EXPECT_EQ(scanned.error().code(), ErrorCode::kOutOfRange);
+}
+
 TEST(QueueScanTest, MismatchedBoundsAreRejected) {
   ::testing::NiceMock<testing::MockQueue> queue;
-  const std::vector<SequenceId> from(2, 0);
-  const std::vector<SequenceId> end(3, 0);
+  const std::vector<SequenceId> from(2, kFirstSeq);
+  const std::vector<SequenceId> end(3, kFirstSeq);
   const std::atomic<bool> cancel{false};
   auto scanned = queue.Scan(from, end, 1, Accept, cancel);
   ASSERT_FALSE(scanned.has_value());

@@ -16,6 +16,7 @@
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
 #include "abyss/queue/wal_queue.h"
@@ -67,8 +68,12 @@ class ShardStreamTest : public ::testing::Test {
     const std::string key = "s" + std::to_string(shard) + "-" + std::to_string(keys_[shard].size());
     auto appended = queue_->Append(shard, Set(key, value_bytes));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    ASSERT_EQ(appended->seq, keys_[shard].size());
+    ASSERT_EQ(appended->seq, core::kFirstSeq + keys_[shard].size());
     keys_[shard].push_back(key);
+  }
+
+  const std::string& KeyAt(core::ShardId shard, core::SequenceId seq) const {
+    return keys_.at(shard).at(seq - core::kFirstSeq);
   }
 
   std::vector<core::QueueEntry> Read(core::ShardId shard, core::SequenceId from,
@@ -81,15 +86,17 @@ class ShardStreamTest : public ::testing::Test {
   // Every seq read alone and in chunks matches what was appended.
   void ExpectEveryReadMatches(std::size_t shards) {
     for (core::ShardId shard = 0; shard < shards; ++shard) {
-      const auto& keys = keys_[shard];
-      for (core::SequenceId seq = 0; seq < keys.size(); ++seq) {
+      const core::SequenceId end = core::kFirstSeq + keys_[shard].size();
+      for (core::SequenceId seq = core::kFirstSeq; seq < end; ++seq) {
         const auto one = Read(shard, seq);
         ASSERT_EQ(one.size(), 1U) << shard << "/" << seq;
         EXPECT_EQ(one[0].seq, seq);
-        EXPECT_EQ(KeyOf(one[0]), keys[seq]);
+        EXPECT_EQ(KeyOf(one[0]), KeyAt(shard, seq));
         const auto chunk = Read(shard, seq, 7);
-        ASSERT_EQ(chunk.size(), std::min<std::size_t>(7, keys.size() - seq));
-        for (std::size_t i = 0; i < chunk.size(); ++i) EXPECT_EQ(KeyOf(chunk[i]), keys[seq + i]);
+        ASSERT_EQ(chunk.size(), std::min<std::size_t>(7, end - seq));
+        for (std::size_t i = 0; i < chunk.size(); ++i) {
+          EXPECT_EQ(KeyOf(chunk[i]), KeyAt(shard, seq + i));
+        }
       }
     }
   }
@@ -134,22 +141,22 @@ TEST_F(ShardStreamTest, RingHitsRecentSeqsAndAWrappedSlotFallsBackToTheIndex) {
     Append(1, 64);
   }
   const ShardStream& stream = Stream(0);
-  EXPECT_TRUE(stream.RingPositionForTesting(99).has_value());
-  EXPECT_TRUE(stream.RingPositionForTesting(92).has_value());
+  EXPECT_TRUE(stream.RingPositionForTesting(100).has_value());
+  EXPECT_TRUE(stream.RingPositionForTesting(93).has_value());
   // Slot 50 % 8 now holds seq 98.
   EXPECT_FALSE(stream.RingPositionForTesting(50).has_value());
-  EXPECT_FALSE(stream.RingPositionForTesting(100).has_value());
+  EXPECT_FALSE(stream.RingPositionForTesting(101).has_value());
 
   const uint64_t before = stream.SkippedForTesting();
   auto recent = Read(0, 95, 5);
   ASSERT_EQ(recent.size(), 5U);
-  EXPECT_EQ(KeyOf(recent[0]), keys_[0][95]);
+  EXPECT_EQ(KeyOf(recent[0]), KeyAt(0, 95));
   EXPECT_EQ(stream.SkippedForTesting(), before) << "a ring hit needs no skip";
 
   auto wrapped = Read(0, 50);
   ASSERT_EQ(wrapped.size(), 1U);
   EXPECT_EQ(wrapped[0].seq, 50U);
-  EXPECT_EQ(KeyOf(wrapped[0]), keys_[0][50]);
+  EXPECT_EQ(KeyOf(wrapped[0]), KeyAt(0, 50));
   EXPECT_GT(stream.SkippedForTesting(), before) << "the miss went through the index";
 }
 
@@ -167,7 +174,7 @@ TEST_F(ShardStreamTest, TheIndexKeepsAPointEvery64KiBOfAShardsFrames) {
   const uint64_t before = Stream(0).SkippedForTesting();
   auto read = Read(0, 200);
   ASSERT_EQ(read.size(), 1U);
-  EXPECT_EQ(KeyOf(read[0]), keys_[0][200]);
+  EXPECT_EQ(KeyOf(read[0]), KeyAt(0, 200));
   // From the floor point, at most a stride of shard 0 plus shard 1's
   // few.
   EXPECT_LE(Stream(0).SkippedForTesting() - before, 80U);
@@ -202,14 +209,16 @@ TEST_F(ShardStreamTest, AHintSavesConsecutiveReadsTheSkipFromTheFloor) {
   ASSERT_EQ(stream.index_points(), 1U);
 
   const uint64_t start = stream.SkippedForTesting();
-  ASSERT_EQ(Read(0, 30).size(), 1U);
+  // The 31st frame of shard 0, past 30 rounds of every shard's.
+  constexpr core::SequenceId kSeq = core::kFirstSeq + 30;
+  ASSERT_EQ(Read(0, kSeq).size(), 1U);
   const uint64_t from_floor = stream.SkippedForTesting() - start;
   EXPECT_GE(from_floor, 30U * kShards);
 
   const uint64_t mid = stream.SkippedForTesting();
-  auto next = Read(0, 31);
+  auto next = Read(0, kSeq + 1);
   ASSERT_EQ(next.size(), 1U);
-  EXPECT_EQ(KeyOf(next[0]), keys_[0][31]);
+  EXPECT_EQ(KeyOf(next[0]), KeyAt(0, kSeq + 1));
   EXPECT_LE(stream.SkippedForTesting() - mid, kShards);
 }
 
@@ -229,8 +238,8 @@ TEST_F(ShardStreamTest, SeqlockReadersRacingAWrappingWriter) {
   for (int r = 0; r < 3; ++r) {
     readers.emplace_back([&] {
       while (!stop.load(std::memory_order_acquire)) {
-        const core::SequenceId end = queue_->DurableEnd(0, kNow).value_or(0);
-        for (core::SequenceId back = 1; back <= 24 && back <= end; ++back) {
+        const core::SequenceId end = queue_->DurableEnd(0, kNow).value_or(core::kFirstSeq);
+        for (core::SequenceId back = 1; back <= 24 && back + core::kFirstSeq <= end; ++back) {
           auto read = queue_->Read(0, end - back, 1, 0ms, kNow);
           ASSERT_TRUE(read.has_value()) << read.error().message();
           ASSERT_EQ(read->size(), 1U);

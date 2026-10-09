@@ -956,7 +956,7 @@ core::Result<void> Resolver::SeedCursor() {
   auto committed = queue_.CommittedOffset(core::kResolverConsumer, config_.shard);
   if (!committed.has_value()) return std::unexpected(committed.error());
   committed_ = *committed;
-  next_read_seq_ = committed_.has_value() ? *committed_ + 1 : 0;
+  next_read_seq_ = committed_.has_value() ? *committed_ + 1 : core::kFirstSeq;
   if (committed_.has_value()) {
     AdvanceMaxSeq(latest_drained_seq_, *committed_);
     last_commit_seq_.store(*committed_, std::memory_order_release);
@@ -992,16 +992,14 @@ void Resolver::AdvanceFloor() {
   if (pending_floors_.empty()) return;
   const auto end = queue_.DurableEnd(config_.shard, core::Durability::kPowerLoss);
   if (!end.has_value()) return;
-  bool advanced = false;
   while (!pending_floors_.empty() && pending_floors_.front().durable_target < *end) {
     AdvanceMaxSeq(resolver_durable_floor_, pending_floors_.front().drained);
     pending_floors_.pop_front();
-    advanced = true;
   }
-  // The commit never passes the durable floor. The floor's 0 is ambiguous
-  // until one advance is confirmed, so the first commit waits for that.
+  // The commit never passes the durable floor, 0 until one advance is
+  // confirmed.
   const auto target = resolver_durable_floor_.load(std::memory_order_acquire);
-  if (committed_.has_value() ? target > *committed_ : advanced) Commit(target);
+  if (target > committed_.value_or(0)) Commit(target);
 }
 
 void Resolver::FailOutOfRange(core::SequenceId requested) {
@@ -1055,7 +1053,8 @@ void Resolver::Run() {
       next_read_seq_ = entry.seq + 1;
       latest_drained_seq_.store(entry.seq, std::memory_order_release);
     }
-    if (next_read_seq_ > 0 && (!committed_.has_value() || *committed_ + 1 < next_read_seq_)) {
+    if (next_read_seq_ > core::kFirstSeq &&
+        (!committed_.has_value() || *committed_ + 1 < next_read_seq_)) {
       // Kafka HW vs LEO: the cursor is read progress (log-end); the committed
       // offset is the high-watermark and must never outrun the durable tail. A
       // Conditional at X may have emitted a Resolved at Y > X that is
@@ -1336,16 +1335,8 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
     // dangling Conditional whose Resolved we have not yet emitted is rescanned
     // by the next ReplayForRecovery.
     core::SequenceId commit_to = next_read_seq_ - 1;
-    bool committable = true;
-    if (!dangling.empty()) {
-      core::SequenceId oldest_dangling = std::numeric_limits<core::SequenceId>::max();
-      for (const auto& [seq, _] : dangling) {
-        oldest_dangling = std::min(oldest_dangling, seq);
-      }
-      committable = oldest_dangling > 0;
-      if (committable) commit_to = std::min(commit_to, oldest_dangling - 1);
-    }
-    if (committable && (!committed_.has_value() || commit_to > *committed_)) {
+    for (const auto& [seq, _] : dangling) commit_to = std::min(commit_to, seq - 1);
+    if (commit_to > committed_.value_or(0)) {
       // A pre-flush Skip erased its dangling: it must be durable before the
       // commit passes that Conditional.
       if (highest_reemitted_seq > awaited_reemitted_seq) {
@@ -1398,7 +1389,7 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
   // replay scans Resolveds an earlier attempt appended) and everything
   // re-emitted. On timeout the offset stays at the per-scan low-water clamp
   // and kUnavailable makes the RecoveryCoordinator retry the shard.
-  if (next_read_seq_ > 0) {
+  if (next_read_seq_ > core::kFirstSeq) {
     const core::SequenceId scanned = next_read_seq_ - 1;
     if (auto barrier = await_durable(std::max(scanned, highest_reemitted_seq));
         !barrier.has_value()) {

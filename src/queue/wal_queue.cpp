@@ -283,7 +283,7 @@ core::Result<void> WalQueue::RecoverOffsets() {
     ShardStream& stream = *streams_[shard];
     const std::optional<core::SequenceId> head = stream.recovered_next();
     const std::optional<core::SequenceId> first = stream.recovered_first();
-    core::SequenceId next = head.value_or(0);
+    core::SequenceId next = head.value_or(core::kFirstSeq);
     for (size_t c = 0; c < config_.retention_consumers.size(); ++c) {
       const core::ConsumerId consumer = config_.retention_consumers[c];
       const auto persisted = checkpoint_->Get(consumer, shard);
@@ -299,7 +299,8 @@ core::Result<void> WalQueue::RecoverOffsets() {
                                            "persisted offset exceeds WAL head for consumer/shard"});
       }
       // Only frames every consumer persisted are ever reclaimed.
-      if (first.has_value() && *first > 0 && (!persisted.has_value() || *persisted + 1 < *first)) {
+      if (first.has_value() && *first > core::kFirstSeq &&
+          (!persisted.has_value() || *persisted + 1 < *first)) {
         ABYSS_LOG_CRITICAL("WAL frames missing below the first retained frame",
                            {"consumer", static_cast<uint64_t>(consumer)},
                            {"shard", static_cast<int64_t>(shard)},
@@ -739,6 +740,7 @@ core::Result<void> WalQueue::CommitOffset(core::ConsumerId consumer, core::Shard
             std::to_string(durable_end) + " for shard " + std::to_string(shard)});
   }
 
+  ABYSS_DCHECK(seq >= core::kFirstSeq, "commit of seq 0, which names no entry");
   const uint64_t want = OffsetCheckpoint::Encode(seq);
   auto& slot = committed_[*index];
   uint64_t current = slot.load(std::memory_order_acquire);
@@ -746,7 +748,7 @@ core::Result<void> WalQueue::CommitOffset(core::ConsumerId consumer, core::Shard
     if (current == want) return {};
     if (current > want) {
       return std::unexpected(Invalid("commit seq " + std::to_string(seq) +
-                                     " is below committed offset " + std::to_string(current - 1) +
+                                     " is below committed offset " + std::to_string(current) +
                                      " for consumer " + std::to_string(consumer) + " on shard " +
                                      std::to_string(shard)));
     }
@@ -796,7 +798,9 @@ core::Result<core::SequenceId> WalQueue::FirstSeq(core::ShardId shard) {
 core::Result<core::SequenceId> WalQueue::OldestRetained(core::ShardId shard) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
 
-  // The offsets retention actually honours.
+  // The offsets retention actually honours. A floor is a committed
+  // seq, inclusive, so the frame it names is kept: one processed
+  // frame more than needed, never one fewer.
   core::SequenceId min_offset = streams_[shard]->next_seq();
   for (auto consumer : config_.retention_consumers) {
     const auto floor = checkpoint_->ReclaimFloor(consumer, shard);
@@ -810,9 +814,8 @@ core::Result<core::SequenceId> WalQueue::TailSeq(core::ShardId shard) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
   // next_seq is the next seq to assign; the highest assigned (matching
   // what a consumer's HighestSettledSeq will reach once caught up) is
-  // one less.
-  const auto head = streams_[shard]->next_seq();
-  return head > 0 ? head - 1 : 0;
+  // one less, and 0 when nothing was.
+  return streams_[shard]->next_seq() - 1;
 }
 
 core::Result<core::QueueStats> WalQueue::Stats() {

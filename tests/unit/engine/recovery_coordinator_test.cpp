@@ -47,6 +47,7 @@ using ::testing::Return;
 using ::testing::UnorderedElementsAreArray;
 
 constexpr uint32_t kShards = 2;
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 constexpr std::string_view kMissed = "replay after the recovery scan found entries it missed";
 
 std::string KeyOf(core::ShardId shard, core::SequenceId seq) {
@@ -117,7 +118,7 @@ std::vector<std::string> Concat(std::vector<std::string> a, const std::vector<st
   return a;
 }
 
-// A queue each shard of which holds entries 0..size-1, with first
+// A queue each shard of which holds entries from kFirstSeq, with first
 // retained seqs and cold commits the test picks. The resolver has
 // committed everything, so its phase replays nothing.
 class RecoveryCoordinatorTest : public ::testing::Test {
@@ -133,10 +134,10 @@ class RecoveryCoordinatorTest : public ::testing::Test {
       return core::Result<core::SequenceId>(first_[shard]);
     });
     ON_CALL(queue_, DurableEnd(_, _)).WillByDefault([this](core::ShardId shard, core::Durability) {
-      return core::Result<core::SequenceId>(logs_[shard].size());
+      return core::Result<core::SequenceId>(kFirst + logs_[shard].size());
     });
     ON_CALL(queue_, TailSeq(_)).WillByDefault([this](core::ShardId shard) {
-      return core::Result<core::SequenceId>(logs_[shard].empty() ? 0 : logs_[shard].size() - 1);
+      return core::Result<core::SequenceId>(kFirst + logs_[shard].size() - 1);
     });
     ON_CALL(queue_, CommittedOffset(core::kColdConsumer, _))
         .WillByDefault([this](core::ConsumerId, core::ShardId shard) {
@@ -146,7 +147,8 @@ class RecoveryCoordinatorTest : public ::testing::Test {
         .WillByDefault([this](core::ConsumerId, core::ShardId shard) {
           const auto& log = logs_[shard];
           return core::Result<std::optional<core::SequenceId>>(
-              log.empty() ? std::nullopt : std::optional<core::SequenceId>(log.size() - 1));
+              log.empty() ? std::nullopt
+                          : std::optional<core::SequenceId>(kFirst + log.size() - 1));
         });
     ON_CALL(queue_, CommitOffset(_, _, _)).WillByDefault(Return(core::Result<void>{}));
 
@@ -165,7 +167,9 @@ class RecoveryCoordinatorTest : public ::testing::Test {
   }
 
   void Fill(core::ShardId shard, core::SequenceId count) {
-    for (core::SequenceId seq = 0; seq < count; ++seq) logs_[shard].push_back(Write(shard, seq));
+    for (core::SequenceId seq = kFirst; seq < kFirst + count; ++seq) {
+      logs_[shard].push_back(Write(shard, seq));
+    }
   }
 
   RecoveryCoordinator& Coordinator() {
@@ -208,7 +212,7 @@ class RecoveryCoordinatorTest : public ::testing::Test {
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   std::vector<std::vector<core::QueueEntry>> logs_ =
       std::vector<std::vector<core::QueueEntry>>(kShards);
-  std::vector<core::SequenceId> first_ = std::vector<core::SequenceId>(kShards, 0);
+  std::vector<core::SequenceId> first_ = std::vector<core::SequenceId>(kShards, kFirst);
   std::vector<std::optional<core::SequenceId>> cold_commit_ =
       std::vector<std::optional<core::SequenceId>>(kShards);
   consumer::ColdConsumer::Config cold_config_;
@@ -233,44 +237,46 @@ class RecoveryCoordinatorTest : public ::testing::Test {
 // gets what is at or past FirstSeq, cold what is past its commit.
 TEST_F(RecoveryCoordinatorTest, OneScanFeedsHotFromFirstSeqAndColdPastItsCommit) {
   Fill(0, 10);
-  first_[0] = 2;
-  cold_commit_[0] = 5;
+  first_[0] = kFirst + 2;
+  cold_commit_[0] = kFirst + 5;
   Fill(1, 4);
   const log::testing::CapturingSink logs;
 
   ASSERT_TRUE(RunBounded().has_value());
 
-  EXPECT_EQ(queue_.ScannedFrom(), (std::vector<core::SequenceId>{2, 0}));
-  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{10, 4}));
+  EXPECT_EQ(queue_.ScannedFrom(), (std::vector<core::SequenceId>{kFirst + 2, kFirst}));
+  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{kFirst + 10, kFirst + 4}));
   EXPECT_THAT(hot_applied_.Keys(),
-              UnorderedElementsAreArray(Concat(KeysOf(0, 2, 10), KeysOf(1, 0, 4))));
+              UnorderedElementsAreArray(
+                  Concat(KeysOf(0, kFirst + 2, kFirst + 10), KeysOf(1, kFirst, kFirst + 4))));
   EXPECT_THAT(cold_applied_.Keys(),
-              UnorderedElementsAreArray(Concat(KeysOf(0, 6, 10), KeysOf(1, 0, 4))));
+              UnorderedElementsAreArray(
+                  Concat(KeysOf(0, kFirst + 6, kFirst + 10), KeysOf(1, kFirst, kFirst + 4))));
   EXPECT_TRUE(Missed(logs).empty());
-  EXPECT_EQ(cold_pool_->ConsumerFor(0).LatestDrainedSeq(), 9U);
-  EXPECT_EQ(hot_pool_->ConsumerFor(1).HighestSettledSeq(), 3U);
+  EXPECT_EQ(cold_pool_->ConsumerFor(0).LatestDrainedSeq(), kFirst + 9);
+  EXPECT_EQ(hot_pool_->ConsumerFor(1).HighestSettledSeq(), kFirst + 3);
 }
 
 // Cold trails behind hot's start, so the scan starts at cold's cursor
 // and hot skips what precedes its own.
 TEST_F(RecoveryCoordinatorTest, AColdCommitBehindFirstSeqStartsTheScanAtCold) {
   Fill(0, 8);
-  first_[0] = 6;
-  cold_commit_[0] = 2;
+  first_[0] = kFirst + 6;
+  cold_commit_[0] = kFirst + 2;
 
   ASSERT_TRUE(RunBounded().has_value());
 
-  EXPECT_EQ(queue_.ScannedFrom()[0], 3U);
-  EXPECT_THAT(hot_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, 6, 8)));
-  EXPECT_THAT(cold_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, 3, 8)));
+  EXPECT_EQ(queue_.ScannedFrom()[0], kFirst + 3);
+  EXPECT_THAT(hot_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, kFirst + 6, kFirst + 8)));
+  EXPECT_THAT(cold_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, kFirst + 3, kFirst + 8)));
 }
 
 // A scan that misses entries is caught by the trailing ReplayUntil,
 // which applies them and warns, naming the tier, shard and count.
 TEST_F(RecoveryCoordinatorTest, TheTrailingReplayWarnsAboutWhatTheScanMissed) {
   Fill(0, 10);
-  first_[0] = 2;
-  cold_commit_[0] = 5;
+  first_[0] = kFirst + 2;
+  cold_commit_[0] = kFirst + 5;
   Fill(1, 4);
   queue_.instead = [] { return core::Result<void>{}; };
   const log::testing::CapturingSink logs;
@@ -288,7 +294,8 @@ TEST_F(RecoveryCoordinatorTest, TheTrailingReplayWarnsAboutWhatTheScanMissed) {
                           {"tier=cold shard=0 entries=4 ", "tier=hot shard=0 entries=8 ",
                            "tier=cold shard=1 entries=4 ", "tier=hot shard=1 entries=4 "}));
   EXPECT_THAT(hot_applied_.Keys(),
-              UnorderedElementsAreArray(Concat(KeysOf(0, 2, 10), KeysOf(1, 0, 4))));
+              UnorderedElementsAreArray(
+                  Concat(KeysOf(0, kFirst + 2, kFirst + 10), KeysOf(1, kFirst, kFirst + 4))));
 }
 
 // A shard with nothing written gets no trailing ReplayUntil, which
@@ -299,7 +306,7 @@ TEST_F(RecoveryCoordinatorTest, AnEmptyShardGetsNoTrailingReplay) {
 
   ASSERT_TRUE(RunBounded().has_value());
 
-  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{3, 0}));
+  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{kFirst + 3, kFirst}));
   std::vector<std::string> started;
   for (const auto& record : logs.Records()) {
     if (record.msg != "hot replay starting" && record.msg != "cold replay starting") continue;
@@ -340,7 +347,7 @@ TEST_F(RecoveryCoordinatorTest, ACancelDuringTheScanReturnsUnavailable) {
 // A wipe that never succeeds stops the scan once drain_grace is spent,
 // and recovery fails rather than hanging on it.
 TEST_F(RecoveryCoordinatorTest, AColdWipeThatAlwaysFailsFailsRecoveryWithinDrainGrace) {
-  logs_[0] = {Write(0, 0), Flush(1), Write(0, 2)};
+  logs_[0] = {Write(0, kFirst), Flush(kFirst + 1), Write(0, kFirst + 2)};
   cold_config_.drain_grace = 50ms;
   cold_config_.loop_max_backoff = 10ms;
   EXPECT_CALL(cold_, Wipe(0))
@@ -351,7 +358,7 @@ TEST_F(RecoveryCoordinatorTest, AColdWipeThatAlwaysFailsFailsRecoveryWithinDrain
   ASSERT_FALSE(run.has_value());
   EXPECT_EQ(run.error().code(), core::ErrorCode::kTimeout);
   EXPECT_THAT(run.error().message(), ::testing::HasSubstr("shard 0"));
-  EXPECT_THAT(run.error().message(), ::testing::HasSubstr("seq 1"));
+  EXPECT_THAT(run.error().message(), ::testing::HasSubstr("seq " + std::to_string(kFirst + 1)));
   EXPECT_FALSE(cancel_.load()) << "recovery returned only once cancelled";
 }
 

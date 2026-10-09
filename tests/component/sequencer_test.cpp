@@ -33,6 +33,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/core/types.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -185,7 +186,7 @@ class SequencedEngineTest : public ::testing::Test {
   }
 
   std::vector<core::QueueEntry> Logged(core::ShardId shard) {
-    auto read = queue_->Read(shard, 0, 100000, 0ms, core::Durability::kProcessCrash);
+    auto read = queue_->Read(shard, core::kFirstSeq, 100000, 0ms, core::Durability::kProcessCrash);
     EXPECT_TRUE(read.has_value()) << read.error().message();
     return read.has_value() ? std::move(*read) : std::vector<core::QueueEntry>{};
   }
@@ -399,7 +400,7 @@ TEST_F(SequencedEngineTest, AnMsetPastASegmentFailsCleanly) {
   const std::string refused = Write(mset);
   EXPECT_NE(refused.find("exceeds the segment frame space"), std::string::npos) << refused;
   EXPECT_EQ(Read({"GET", "k0"}), "nil");
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), 0U);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kProcessCrash).value(), core::kFirstSeq);
   EXPECT_EQ(Write({"SET", "after", "v"}), "OK") << "the log is left usable";
 }
 

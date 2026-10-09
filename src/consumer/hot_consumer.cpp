@@ -110,7 +110,7 @@ core::Result<std::vector<core::QueueEntry>> HotConsumer::ReadFromCursor(size_t m
   if (!first.has_value()) return std::unexpected(first.error());
   // From a fresh cursor this is the normal restart path; mid-stream it means
   // the reaper overtook hot and entries it never applied are gone.
-  if (next_read_seq_ == 0) {
+  if (next_read_seq_ == core::kFirstSeq) {
     ABYSS_LOG_DEBUG("hot consumer rebuilding from first retained seq",
                     {"shard", static_cast<int64_t>(config_.shard)},
                     {"first_seq", static_cast<uint64_t>(*first)});
@@ -323,8 +323,7 @@ void HotConsumer::HandleResolved(const core::QueueEntry& entry,
   const core::WallTime reference_at = conditional_appended_at.value_or(entry.appended_at);
 
   // Drop if the Conditional ref lives on the wiped side of a Flush.
-  const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
-  const bool wiped_by_flush = flush_high > 0 && resolved.ref < flush_high;
+  const bool wiped_by_flush = resolved.ref < latest_flush_seq_.load(std::memory_order_acquire);
 
   if (!wiped_by_flush && resolved.decision == core::Decision::kApply) {
     auto applied = ApplyResolvedOps(resolved.materialised_ops, reference_at, entry.seq);
@@ -412,8 +411,7 @@ void HotConsumer::MarkSettled(core::SequenceId seq) {
     }
   }
 
-  // The published floor never passes an unresolved Conditional. One pending
-  // at seq 0 has nothing settled before it, so the floor cannot move at all.
+  // The published floor never passes an unresolved Conditional.
   core::SequenceId target = seq;
   std::optional<core::SequenceId> oldest_pending;
   {
@@ -422,10 +420,7 @@ void HotConsumer::MarkSettled(core::SequenceId seq) {
       if (!oldest_pending.has_value() || pseq < *oldest_pending) oldest_pending = pseq;
     }
   }
-  if (oldest_pending.has_value()) {
-    if (*oldest_pending == 0) return;
-    target = std::min(target, *oldest_pending - 1);
-  }
+  if (oldest_pending.has_value()) target = std::min(target, *oldest_pending - 1);
 
   auto floor = settled_floor_.load(std::memory_order_acquire);
   while (target > floor) {

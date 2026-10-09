@@ -34,7 +34,8 @@ struct KeyLoad {
   bool operator==(const KeyLoad&) const = default;
 };
 
-// The highest latest_seq a decision read on one shard.
+// The highest latest_seq a decision read on one shard; 0 when it read
+// only loaded state.
 struct ShardSeq {
   core::ShardId shard = 0;
   core::SequenceId seq = 0;

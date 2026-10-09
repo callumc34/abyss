@@ -759,6 +759,7 @@ std::vector<core::RespValue> SingleShardStore::ApplyEffects(std::span<core::Effe
                                                             core::WallTime appended_at,
                                                             const core::EvictionPolicy& policy,
                                                             core::SequenceId horizon) {
+  ABYSS_DCHECK(first_seq >= core::kFirstSeq, "effects applied from seq 0, which names no entry");
   const int64_t at_ms = WallMs(appended_at);
   const FlagScope applying(applying_effects_);
   std::vector<core::RespValue> replies;
@@ -1243,6 +1244,7 @@ core::MemoryStats SingleShardStore::Stats() const {
 }
 
 void SingleShardStore::Wipe(core::SequenceId seq) {
+  ABYSS_DCHECK(seq >= core::kFirstSeq, "a Flush at seq 0, which names no entry");
   if (graveyard_ != nullptr) {
     graveyard_->entries.push_back(std::move(entries_));
     graveyard_->stubs.push_back(stubs_.Release());
@@ -1253,7 +1255,6 @@ void SingleShardStore::Wipe(core::SequenceId seq) {
   lru_dry_ = false;
   stubs_.Clear();
   loading_.clear();
-  if (seq == 0) applied_seq_zero_ = true;
   entry_bytes_ = 0;
   live_bytes_ = 0;
   key_count_ = 0;
@@ -1392,23 +1393,18 @@ SingleShardStore::ReadAnswer SingleShardStore::Read(const core::ops::ReadOp& op,
       return {.result = std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))};
     }
     return {.result = exists != nullptr ? core::RespValue::Integer(0) : EmptyReadResponse(op),
-            .fence = FenceFor(flush_seq_)};
+            .fence = flush_seq_};
   }
   // A resident entry is the key's latest state, so one deleted or past
   // its TTL is absent, whatever older value buffer or cold still hold.
   if (entry->tombstoned || IsExpiredByTtl(*entry, config_.wall_clock)) {
     return {.result = exists != nullptr ? core::RespValue::Integer(0) : EmptyReadResponse(op),
-            .fence = FenceFor(entry->latest_seq)};
+            .fence = entry->latest_seq};
   }
   if (exists != nullptr) {
-    return {.result = core::RespValue::Integer(1), .fence = FenceFor(entry->latest_seq)};
+    return {.result = core::RespValue::Integer(1), .fence = entry->latest_seq};
   }
-  return {.result = Exec(op), .fence = FenceFor(entry->latest_seq)};
-}
-
-std::optional<core::SequenceId> SingleShardStore::FenceFor(core::SequenceId seq) const {
-  if (seq == 0 && !applied_seq_zero_) return std::nullopt;
-  return seq;
+  return {.result = Exec(op), .fence = entry->latest_seq};
 }
 
 void SingleShardStore::RaiseAppendedAt(core::WallTime at) {
@@ -1575,7 +1571,7 @@ void SingleShardStore::TrackRemove(const Entry& entry, std::string_view key) {
 }
 
 void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq) {
-  if (seq == 0) applied_seq_zero_ = true;
+  ABYSS_DCHECK(seq >= core::kFirstSeq, "a write applied at seq 0, which names no entry");
   const std::string owned(key);
   if (const auto it = entries_.find(owned); it != entries_.end()) {
     it->second.latest_seq = seq;

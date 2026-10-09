@@ -42,9 +42,11 @@ struct QueueStats {
 // read cursor and passes it to Read; CommitOffset only records where it is
 // safe to resume and, for retention, how far the WAL may be reclaimed.
 //
-// Durable ends are exclusive: seqs below DurableEnd(shard, d) are durable
-// at d; 0 means none is. DurableEnd(kPowerLoss) never passes
-// DurableEnd(kProcessCrash): nothing is visible before it is published.
+// A shard's seqs start at kFirstSeq; 0 names no entry. Durable ends are
+// exclusive: seqs below DurableEnd(shard, d) are durable at d, so an
+// empty shard's is kFirstSeq and 0 is always below it.
+// DurableEnd(kPowerLoss) never passes DurableEnd(kProcessCrash): nothing
+// is visible before it is published.
 class Queue {
  public:
   Queue() = default;
@@ -134,7 +136,9 @@ class Queue {
   // for one shard. An error stops the scan and is returned from it.
   using ScanSink = std::function<Result<void>(ShardId, std::vector<QueueEntry>&)>;
   // Delivers every shard's entries in [from[s], end[s]) to `sink`, up to
-  // `parallelism` shards at a time; every one of them must be readable.
+  // `parallelism` shards at a time; every one of them must be readable:
+  // kOutOfRange for a from below FirstSeq, and for a from of 0 even in an
+  // empty range.
   // A log-structured queue reads each log once; this default reads each
   // shard in turn. kUnavailable once `cancel` is set.
   virtual Result<void> Scan(std::span<const SequenceId> from, std::span<const SequenceId> end,

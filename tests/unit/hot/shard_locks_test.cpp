@@ -14,6 +14,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
 
@@ -159,9 +160,9 @@ TEST_F(ShardLocksTest, AReadFencesOnWhatAnswers) {
   EXPECT_EQ(floor.fence, 9U);
 }
 
-// Loaded state carries seq 0, which a write at seq 0 shares: only that
-// write makes a 0 worth waiting for.
-TEST_F(ShardLocksTest, SeqZeroIsFencedOnlyOnceAWriteCarriedIt) {
+// Loaded state carries 0, below every durable end, and a shard's first
+// write carries kFirstSeq: the two never share a fence.
+TEST_F(ShardLocksTest, LoadedStateFencesOnZeroAndAFirstWriteOnItsSeq) {
   const std::string loaded = KeyOn(3, 0);
   {
     auto locks = store_->LockExclusive(std::vector<core::ShardId>{3});
@@ -170,13 +171,12 @@ TEST_F(ShardLocksTest, SeqZeroIsFencedOnlyOnceAWriteCarriedIt) {
     std::vector<LoadCompletion> loads;
     loads.push_back({.key = loaded, .token = start.token, .result = LoadedAbsent{}});
     locks.CompleteLoads(3, loads);
-    EXPECT_FALSE(locks.FenceFor(3, 0).has_value());
   }
-  EXPECT_FALSE(store_->Read(ops::ReadOp{ops::StringGet{.key = loaded}}).fence.has_value());
+  EXPECT_EQ(store_->Read(ops::ReadOp{ops::StringGet{.key = loaded}}).fence, 0U);
 
-  Apply(3, {"SET", KeyOn(3, 1), "v"}, 0);
-  auto locks = store_->LockExclusive(std::vector<core::ShardId>{3});
-  EXPECT_EQ(locks.FenceFor(3, 0), 0U);
+  const std::string written = KeyOn(3, 1);
+  Apply(3, {"SET", written, "v"}, core::kFirstSeq);
+  EXPECT_EQ(store_->Read(ops::ReadOp{ops::StringGet{.key = written}}).fence, core::kFirstSeq);
 }
 
 TEST_F(ShardLocksTest, TheShardClockOnlyRises) {

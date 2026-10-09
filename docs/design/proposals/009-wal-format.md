@@ -186,7 +186,7 @@ Each minor bump ships with a round-trip compatibility test in both directions.
 2. Every byte below the filled prefix `P` belongs to a filled frame. An append acknowledged at `process_crash` lies below `P`; one acknowledged at `power_loss` lies below `D`.
 3. A frame left over from a segment's previous life never reads as filled: its generation is smaller. The filled prefix never depends on bytes read from the mapping.
 4. The end of the log is the first frame that is unfilled or fails its CRC. No frame past it is ever replayed.
-5. Within a shard, sequence ids are contiguous and their positions increase. Per-shard seq order is log order.
+5. Within a shard, sequence ids start at 1, are contiguous, and their positions increase. Per-shard seq order is log order. Seq 0 names no entry, so a frame that carries it is corruption.
 6. After recovery, every batch is present in full or not at all.
 7. A reader refuses a log with an unsupported `format_major`, an unknown frame kind, or a header that does not verify.
 8. Every `Write` entry holds a command that parses. Unconditional writes are canonicalised before the append ([ADP-006](006-read-write-paths.md) §Canonical form on the write path). A parse failure on a `Write` is therefore a corruption signal, or a command whose parser is absent from the reading build.

@@ -7,6 +7,7 @@
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
 #include "test_clock.h"
@@ -36,7 +37,7 @@ class EvictionWorkerTest : public ::testing::Test {
 TEST_F(EvictionWorkerTest, TickOnceDrainsBuffersAndEvicts) {
   ASSERT_TRUE(store_
                   .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                         /*seq=*/0)
+                         /*seq=*/core::kFirstSeq)
                   .has_value());
 
   EvictionWorker worker(store_, EvictionWorker::Config{.tick = 50ms}, clock_.SteadyFn());
@@ -65,7 +66,7 @@ TEST_F(EvictionWorkerTest, TickAttributesEvictionVsTtl) {
                              .value = "v",
                              .abs_ttl_ms = 0,
                          }},
-                         /*seq=*/0)
+                         /*seq=*/core::kFirstSeq)
                   .has_value());
   // TTL entry: short TTL inside the eviction window, so TTL fires first.
   ASSERT_TRUE(store_
@@ -74,7 +75,7 @@ TEST_F(EvictionWorkerTest, TickAttributesEvictionVsTtl) {
                              .value = "v",
                              .abs_ttl_ms = static_cast<uint64_t>(now_ms + 500),
                          }},
-                         /*seq=*/0)
+                         /*seq=*/core::kFirstSeq)
                   .has_value());
 
   EvictionWorker worker(store_, EvictionWorker::Config{.tick = 50ms}, clock_.SteadyFn());
@@ -127,7 +128,9 @@ TEST(EvictionWorkerMemoryTest, TickEnforcesMemoryBudgetAndPublishesGauges) {
                                                 .eviction_policy = &policy,
                                                 .steady_clock = clock.SteadyFn(),
                                                 .wall_clock = clock.WallFn()}};
-    ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}}, 0)
+    ASSERT_TRUE(probe
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}},
+                           core::kFirstSeq)
                     .has_value());
     per_entry = probe.Stats()->used_bytes;
   }
@@ -146,7 +149,7 @@ TEST(EvictionWorkerMemoryTest, TickEnforcesMemoryBudgetAndPublishesGauges) {
     ASSERT_TRUE(store
                     .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k" + std::to_string(i),
                                                                    .value = value}},
-                           0)
+                           core::kFirstSeq)
                     .has_value());
     store.SetReplayMode(false);
     clock.Advance(1ms);
@@ -173,7 +176,7 @@ TEST_F(EvictionWorkerTest, TickReclaimsTombstonesAtOrBelowHorizon) {
 
   ASSERT_TRUE(store_
                   .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                         /*seq=*/0)
+                         /*seq=*/core::kFirstSeq)
                   .has_value());
   ASSERT_TRUE(
       store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, /*seq=*/5).has_value());

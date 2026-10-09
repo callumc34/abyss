@@ -52,13 +52,12 @@ class OffsetCheckpoint final : public OffsetStore {
   static constexpr size_t kBlockSize = 4096;
   static constexpr std::array<char, 8> kMagic{'A', 'B', 'Y', 'S', 'O', 'C', 'K', 'P'};
 
-  // In-memory form of a committed offset: seq + 1, or 0 for never committed.
-  static constexpr uint64_t Encode(std::optional<core::SequenceId> seq) {
-    return seq.has_value() ? *seq + 1 : 0;
-  }
+  // In-memory form of a committed offset: the seq, or 0 for never
+  // committed, since no entry has seq 0.
+  static constexpr uint64_t Encode(std::optional<core::SequenceId> seq) { return seq.value_or(0); }
   static constexpr std::optional<core::SequenceId> Decode(uint64_t encoded) {
     if (encoded == 0) return std::nullopt;
-    return encoded - 1;
+    return encoded;
   }
 
   static size_t SlotBytes(uint32_t shard_count, size_t consumer_count);

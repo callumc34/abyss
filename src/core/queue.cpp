@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/core/types.h"
+
 namespace abyss::core {
 
 namespace {
@@ -35,6 +37,11 @@ Result<void> Queue::Scan(std::span<const SequenceId> from, std::span<const Seque
 
   const auto scan_shard = [&](ShardId shard) {
     SequenceId seq = from[shard];
+    if (seq < kFirstSeq) {
+      fail(Error{ErrorCode::kOutOfRange,
+                 "scan of shard " + std::to_string(shard) + " from seq 0, which names no entry"});
+      return;
+    }
     while (seq < end[shard]) {
       if (stop.load(std::memory_order_acquire)) return;
       if (cancel.load(std::memory_order_acquire)) {

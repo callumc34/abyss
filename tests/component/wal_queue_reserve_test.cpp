@@ -31,6 +31,7 @@
 #include "abyss/queue/reservation.h"
 #include "abyss/queue/wal_queue.h"
 #include "crash_harness.h"
+#include "durability_printer.h"
 #include "latch.h"
 #include "on_exit.h"
 #include "temp_dir.h"
@@ -43,6 +44,7 @@ using abyss::testing::Latch;
 
 constexpr auto kProcess = core::Durability::kProcessCrash;
 constexpr auto kPower = core::Durability::kPowerLoss;
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 constexpr uint64_t kHeaderBlock = 4096;
 constexpr LogPosition kNoPosition = ~LogPosition{0};
 constexpr std::size_t kSegmentBytes = std::size_t{1} << 20;
@@ -119,7 +121,7 @@ class WalQueueReserveTest : public ::testing::Test {
   }
 
   std::vector<core::QueueEntry> ReadAll(core::ShardId shard) {
-    auto read = queue_->Read(shard, 0, 1000, 0ms, kProcess);
+    auto read = queue_->Read(shard, kFirst, 1000, 0ms, kProcess);
     EXPECT_TRUE(read.has_value()) << read.error().message();
     return read.has_value() ? std::move(*read) : std::vector<core::QueueEntry>{};
   }
@@ -129,6 +131,64 @@ class WalQueueReserveTest : public ::testing::Test {
   std::unique_ptr<WalQueue> queue_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
+
+class FreshShardTest : public WalQueueReserveTest,
+                       public ::testing::WithParamInterface<core::Durability> {};
+
+// An empty shard's exclusive ends are kFirstSeq at both classes, so a
+// fence on 0 returns at once and an empty scan delivers nothing; its
+// first write, appended or reserved, publishes and resolves.
+TEST_P(FreshShardTest, EndsStartAtTheFirstSeqAndTheFirstWriteResolves) {
+  OpenWith(ReserveConfig(dir_.Path(), GetParam()));
+  for (const core::Durability durability : {kProcess, kPower}) {
+    SCOPED_TRACE(core::DurabilityName(durability));
+    EXPECT_EQ(queue_->DurableEnd(0, durability).value(), core::kFirstSeq);
+    EXPECT_TRUE(queue_->AwaitDurable(0, 0, durability, 0ms).value()) << "a fence on 0 waited";
+  }
+  EXPECT_EQ(queue_->FirstSeq(0).value(), core::kFirstSeq);
+  EXPECT_EQ(queue_->TailSeq(0).value(), 0U);
+
+  const std::vector<core::SequenceId> empty(4, core::kFirstSeq);
+  std::size_t delivered = 0;
+  const std::atomic<bool> cancel{false};
+  auto scanned = queue_->Scan(
+      empty, empty, 2,
+      [&delivered](core::ShardId, std::vector<core::QueueEntry>& batch) {
+        delivered += batch.size();
+        return core::Result<void>{};
+      },
+      cancel);
+  ASSERT_TRUE(scanned.has_value()) << scanned.error().message();
+  EXPECT_EQ(delivered, 0U);
+
+  auto appended = queue_->Append(0, MakeWrite("a"));
+  ASSERT_TRUE(appended.has_value()) << appended.error().message();
+  EXPECT_EQ(appended->seq, core::kFirstSeq);
+  ASSERT_EQ(appended->durable.wait_for(10s), std::future_status::ready);
+  EXPECT_TRUE(appended->durable.get().has_value());
+
+  std::vector<core::QueueEntry> b{MakeWrite("b")};
+  auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 1, .entries = b}});
+  ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
+  EXPECT_EQ(reserved->ranges().front().first, core::kFirstSeq);
+  for (ShardDurable& part : queue_->Complete(std::move(*reserved))) {
+    ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
+    EXPECT_TRUE(part.durable.get().has_value());
+  }
+  for (const core::ShardId shard : {0U, 1U}) {
+    SCOPED_TRACE(shard);
+    EXPECT_EQ(queue_->DurableEnd(shard, GetParam()).value(), core::kFirstSeq + 1);
+    auto read = queue_->Read(shard, core::kFirstSeq, 10, 0ms, GetParam());
+    ASSERT_TRUE(read.has_value()) << read.error().message();
+    ASSERT_EQ(read->size(), 1U);
+    EXPECT_EQ(read->front().seq, core::kFirstSeq);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(BothClasses, FreshShardTest, ::testing::Values(kProcess, kPower),
+                         [](const ::testing::TestParamInfo<core::Durability>& param) {
+                           return param.param == kProcess ? "ProcessCrash" : "PowerLoss";
+                         });
 
 // The flush walk raises every shard of a batch at its last frame: a
 // flush that ends inside the batch moves no shard's power end, even
@@ -186,7 +246,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchIsPowerDurableOnlyOnceItsLastFrameIs
 
   // The second flush ends after shard 1's frame, inside the batch.
   first_flush->Open();
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(3, 1));
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(3, kFirst + 1));
   stall->store(true);
   finish_batch->Open();
   ASSERT_TRUE(stalled->Wait());
@@ -195,18 +255,18 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchIsPowerDurableOnlyOnceItsLastFrameIs
   ASSERT_EQ(durable.size(), 3U);
   for (ShardDurable& part : durable) {
     SCOPED_TRACE(part.shard);
-    EXPECT_EQ(queue_->DurableEnd(part.shard, kProcess).value(), 1U);
-    EXPECT_EQ(queue_->DurableEnd(part.shard, kPower).value(), 0U);
+    EXPECT_EQ(queue_->DurableEnd(part.shard, kProcess).value(), kFirst + 1);
+    EXPECT_EQ(queue_->DurableEnd(part.shard, kPower).value(), kFirst);
     EXPECT_EQ(part.durable.wait_for(0s), std::future_status::timeout);
   }
-  EXPECT_FALSE(queue_->AwaitDurable(0, 0, kPower, 20ms).value());
+  EXPECT_FALSE(queue_->AwaitDurable(0, kFirst, kPower, 20ms).value());
 
   unstall->Open();
   for (ShardDurable& part : durable) {
     SCOPED_TRACE(part.shard);
     ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
     EXPECT_TRUE(part.durable.get().has_value());
-    EXPECT_EQ(queue_->DurableEnd(part.shard, kPower).value(), 1U);
+    EXPECT_EQ(queue_->DurableEnd(part.shard, kPower).value(), kFirst + 1);
   }
 }
 
@@ -218,7 +278,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
   OpenWith(config);
   for (core::ShardId shard = 0; shard < 4; ++shard) {
     ASSERT_TRUE(queue_->Append(shard, MakeWrite("before")).has_value());
-    ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, 0));
+    ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, kFirst));
   }
   std::vector<core::QueueEntry> a{MakeWrite("a0"), MakeWrite("a1")};
   std::vector<core::QueueEntry> b{MakeWrite("b0", kLarge)};
@@ -232,10 +292,10 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
     ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
   }
   for (core::ShardId shard = 0; shard < 4; ++shard) {
-    ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, 0));
+    ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, kFirst));
   }
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(3, 1));
-  const LogPosition last = queue_->PositionForTesting(3, 1).value_or(kNoPosition);
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(3, kFirst + 1));
+  const LogPosition last = queue_->PositionForTesting(3, kFirst + 1).value_or(kNoPosition);
   ASSERT_NE(last, kNoPosition);
   queue_.reset();
 
@@ -251,7 +311,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
   OpenWith(config);
   for (core::ShardId shard = 0; shard < 4; ++shard) {
     SCOPED_TRACE(shard);
-    EXPECT_EQ(queue_->TailSeq(shard).value(), 0U);
+    EXPECT_EQ(queue_->TailSeq(shard).value(), kFirst);
     const auto read = ReadAll(shard);
     ASSERT_EQ(read.size(), 1U);
     EXPECT_EQ(KeyOf(read[0]), "before");
@@ -262,8 +322,8 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
   auto again = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = again_a},
                                           ShardEntries{.shard = 3, .entries = again_d}});
   ASSERT_TRUE(again.has_value()) << again.error().message();
-  EXPECT_EQ(again->ranges()[0].first, 1U);
-  EXPECT_EQ(again->ranges()[1].first, 1U);
+  EXPECT_EQ(again->ranges()[0].first, kFirst + 1);
+  EXPECT_EQ(again->ranges()[1].first, kFirst + 1);
   for (ShardDurable& part : queue_->Complete(std::move(*again))) {
     ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
   }
@@ -273,7 +333,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
   for (const core::ShardId shard : {0U, 3U}) {
     const auto read = ReadAll(shard);
     ASSERT_EQ(read.size(), 2U) << shard;
-    EXPECT_EQ(read[1].seq, 1U);
+    EXPECT_EQ(read[1].seq, kFirst + 1);
     EXPECT_EQ(KeyOf(read[1]), "x" + std::to_string(shard));
   }
 }
@@ -312,7 +372,7 @@ TEST(WalReserveCrashVictim, HalfFilledBatch) {
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   std::ostringstream positions;
   for (core::ShardId shard = 0; shard < 3; ++shard) {
-    const auto pos = (*queue)->PositionForTesting(shard, 1);
+    const auto pos = (*queue)->PositionForTesting(shard, kFirst + 1);
     ASSERT_TRUE(pos.has_value());
     positions << *pos << ' ';
   }
@@ -348,7 +408,7 @@ TEST_F(WalReserveCrashTest, AHalfFilledCrossShardBatchIsDroppedOnEveryShard) {
     const frame::View view = InspectAt(dir_.Path(), positions.at(shard), bytes);
     ASSERT_EQ(view.state, frame::State::kFilled) << shard;
     EXPECT_EQ(view.header.shard, shard);
-    EXPECT_EQ(view.header.seq, 1U);
+    EXPECT_EQ(view.header.seq, kFirst + 1);
   }
   EXPECT_EQ(InspectAt(dir_.Path(), positions[2], bytes).state, frame::State::kUnfilled);
 
@@ -356,14 +416,14 @@ TEST_F(WalReserveCrashTest, AHalfFilledCrossShardBatchIsDroppedOnEveryShard) {
   ASSERT_TRUE(queue.has_value()) << queue.error().message();
   for (core::ShardId shard = 0; shard < 3; ++shard) {
     SCOPED_TRACE(shard);
-    EXPECT_EQ((*queue)->TailSeq(shard).value(), 0U);
-    auto read = (*queue)->Read(shard, 0, 100, 0ms, kProcess);
+    EXPECT_EQ((*queue)->TailSeq(shard).value(), kFirst);
+    auto read = (*queue)->Read(shard, kFirst, 100, 0ms, kProcess);
     ASSERT_TRUE(read.has_value()) << read.error().message();
     ASSERT_EQ(read->size(), 1U);
     EXPECT_EQ(KeyOf(read->front()), "before");
     auto appended = (*queue)->Append(shard, MakeWrite("after"));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    EXPECT_EQ(appended->seq, 1U);
+    EXPECT_EQ(appended->seq, kFirst + 1);
   }
 }
 

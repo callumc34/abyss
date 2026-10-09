@@ -107,7 +107,7 @@ SlotState ParseSlot(std::span<const std::byte> slot, ParsedSlot& out) {
   for (size_t i = 0; i < out.encoded.size(); ++i) {
     const std::byte* entry = entries + (i * kEntryBytes);
     const auto flags = static_cast<uint8_t>(entry[kEntryFlagsOffset]);
-    out.encoded[i] = (flags & kCommittedFlag) != 0 ? GetU64(entry) + 1 : 0;
+    out.encoded[i] = (flags & kCommittedFlag) != 0 ? GetU64(entry) : 0;
   }
   return SlotState::kValid;
 }
@@ -128,7 +128,7 @@ void EncodeSlot(std::span<std::byte> slot, uint64_t epoch, uint32_t shard_count,
   for (size_t i = 0; i < encoded.size(); ++i) {
     if (encoded[i] == 0) continue;
     std::byte* entry = entries + (i * kEntryBytes);
-    PutU64(entry, encoded[i] - 1);
+    PutU64(entry, encoded[i]);
     entry[kEntryFlagsOffset] = std::byte{kCommittedFlag};
   }
   const size_t payload = PayloadBytes(shard_count, consumers.size());

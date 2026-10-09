@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "abyss/core/queue.h"
+#include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "latch.h"
 #include "sequencer_fixture.h"
@@ -116,10 +117,12 @@ TEST_F(SequencerTest, EveryCommandFamilyRepliesLogsAndApplies) {
     std::ranges::sort(expected);
     EXPECT_EQ(logged, expected);
   }
-  // Each shard's seqs run from 0 without a gap, in log order.
+  // Each shard's seqs run from kFirstSeq without a gap, in log order.
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     const auto published = queue_.Published(shard);
-    for (size_t i = 0; i < published.size(); ++i) EXPECT_EQ(published[i].seq, i) << shard;
+    for (size_t i = 0; i < published.size(); ++i) {
+      EXPECT_EQ(published[i].seq, core::kFirstSeq + i) << shard;
+    }
   }
   EXPECT_EQ(HotString("a"), "1");
   EXPECT_EQ(HotString("n3"), "v");
@@ -291,7 +294,9 @@ TEST_F(SequencerTest, ANoEffectDecisionFencesOnWhatItRead) {
   EXPECT_EQ(reply.wait_for(50ms), std::future_status::timeout) << "replied before the fence";
   release.Open();
   EXPECT_EQ(reply.get(), ":0");
-  EXPECT_EQ(fenced, (std::optional<std::pair<core::ShardId, core::SequenceId>>{{ShardOf("k"), 0}}));
+  EXPECT_EQ(
+      fenced,
+      (std::optional<std::pair<core::ShardId, core::SequenceId>>{{ShardOf("k"), core::kFirstSeq}}));
 }
 
 TEST_F(SequencerTest, AFenceTimeoutRepliesWithTheTimeoutText) {
@@ -303,11 +308,19 @@ TEST_F(SequencerTest, AFenceTimeoutRepliesWithTheTimeoutText) {
   EXPECT_TRUE(result.error().message().starts_with("durable wait exceeded server timeout"));
 }
 
-// Loaded state carries seq 0 too: with no write here at 0, nothing to
-// fence, so a no-op on a key just loaded absent replies at once.
-TEST_F(SequencerTest, LoadedStateNeedsNoFence) {
-  EXPECT_CALL(queue_, AwaitDurable(_, _, _, _)).Times(0);
+// Loaded state carries 0, which names no entry: its fence is below
+// every durable end, so with nothing durable a no-op on a key just
+// loaded absent still replies at once.
+TEST_F(SequencerTest, LoadedStateFencesOnZeroWhichIsDurableAlready) {
+  std::vector<core::SequenceId> fenced;
+  EXPECT_CALL(queue_, AwaitDurable(_, _, _, _))
+      .WillRepeatedly([&fenced](core::ShardId, core::SequenceId seq, core::Durability,
+                                core::Duration) -> core::Result<bool> {
+        fenced.push_back(seq);
+        return seq < core::kFirstSeq;
+      });
   EXPECT_EQ(Reply({"SREM", "absent", "m"}), ":0");
+  EXPECT_EQ(fenced, std::vector<core::SequenceId>{0});
 }
 
 // --- CROSSSLOT ---
@@ -340,9 +353,10 @@ TEST_F(SequencerTest, MultiKeyWritesAcrossLogsAreCrossSlot) {
 class SequencerBackpressureTest : public SequencerTest {
  protected:
   void SetUp() override {
-    // 16 KiB a shard, over its limit past 20 KiB; nothing drains.
+    // 16 KiB a shard, over its limit past 20 KiB; nothing drains, so
+    // no fill is evictable.
     Build(Options{.max_memory_bytes = 64 << 10, .write_timeout = 300ms, .drain_gated = true});
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 3; ++i) {
       ASSERT_EQ(Reply({"SET", KeyOn(0, i, "fill"), std::string(8 << 10, 'f')}), "OK");
     }
     ASSERT_TRUE(Over(0));
@@ -370,7 +384,7 @@ TEST_F(SequencerBackpressureTest, AGrowingWriteIsRejectedAtTheDeadline) {
   EXPECT_EQ(Reply({"SADD", key, "m"}),
             "-OOM command not allowed when hot memory is over its limit and cold is behind");
   EXPECT_EQ(sequencer_->Snapshot().backpressure_rejections, 1U);
-  EXPECT_EQ(Logged(0).size(), 4U) << "a rejected write logs nothing";
+  EXPECT_EQ(Logged(0).size(), 3U) << "a rejected write logs nothing";
 }
 
 // A command that must load a whole key grows memory however it reads:
@@ -479,7 +493,7 @@ TEST_F(SequencerTest, StampsFollowSeqOrderWhenTheWallClockStepsBack) {
 TEST_F(SequencerTest, TheNextWriteIsStampedAtOrAfterTheReplayedTail) {
   const int64_t t = NowMs();
   const core::WallTime ahead{std::chrono::milliseconds{t + 3'600'000}};
-  core::QueueEntry tail{.seq = 0,
+  core::QueueEntry tail{.seq = core::kFirstSeq,
                         .appended_at = ahead,
                         .payload = core::entry::Write{.cmd = {.args = {"SET", "x", "v"}}},
                         .replaces_state = true};

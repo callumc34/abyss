@@ -101,7 +101,7 @@ class ReservationTest : public ::testing::Test {
   }
 
   std::vector<core::QueueEntry> ReadAll(core::ShardId shard) {
-    auto read = queue_->Read(shard, 0, 100000, 0ms, kProcess);
+    auto read = queue_->Read(shard, core::kFirstSeq, 100000, 0ms, kProcess);
     EXPECT_TRUE(read.has_value()) << read.error().message();
     return read.has_value() ? std::move(*read) : std::vector<core::QueueEntry>{};
   }
@@ -172,12 +172,12 @@ TEST_F(ReservationTest, OneShardReservesThenPublishesOnComplete) {
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   ASSERT_EQ(reserved->ranges().size(), 1U);
   EXPECT_EQ(reserved->ranges()[0].shard, 1U);
-  EXPECT_EQ(reserved->ranges()[0].first, 0U);
-  EXPECT_EQ(reserved->ranges()[0].last, 1U);
-  EXPECT_EQ(entries[1].seq, 1U);
+  EXPECT_EQ(reserved->ranges()[0].first, core::kFirstSeq);
+  EXPECT_EQ(reserved->ranges()[0].last, core::kFirstSeq + 1);
+  EXPECT_EQ(entries[1].seq, core::kFirstSeq + 1);
   EXPECT_EQ(queue_->ReadyToComplete(0), 1U);
   EXPECT_EQ(ReservationsHeld(), 1U);
-  EXPECT_EQ(PublishedEnd(1), 0U) << "nothing is visible before Complete";
+  EXPECT_EQ(PublishedEnd(1), core::kFirstSeq) << "nothing is visible before Complete";
 
   DurableFutures durable = queue_->Complete(std::move(*reserved));
   EXPECT_EQ(ReservationsHeld(), 0U);
@@ -186,7 +186,7 @@ TEST_F(ReservationTest, OneShardReservesThenPublishesOnComplete) {
   EXPECT_EQ(durable[0].shard, 1U);
   ASSERT_EQ(durable[0].durable.wait_for(0s), std::future_status::ready);
   EXPECT_TRUE(durable[0].durable.get().has_value());
-  EXPECT_EQ(PublishedEnd(1), 2U);
+  EXPECT_EQ(PublishedEnd(1), core::kFirstSeq + 2);
   const auto read = ReadAll(1);
   ASSERT_EQ(read.size(), 2U);
   EXPECT_EQ(KeyOf(read[0]), "a");
@@ -195,9 +195,9 @@ TEST_F(ReservationTest, OneShardReservesThenPublishesOnComplete) {
   std::vector<core::QueueEntry> more{Write("c")};
   auto next = queue_->Reserve(std::array{ShardEntries{.shard = 1, .entries = more}});
   ASSERT_TRUE(next.has_value()) << next.error().message();
-  EXPECT_EQ(next->ranges()[0].first, 2U);
+  EXPECT_EQ(next->ranges()[0].first, core::kFirstSeq + 2);
   queue_->Complete(std::move(*next));
-  EXPECT_EQ(PublishedEnd(1), 3U);
+  EXPECT_EQ(PublishedEnd(1), core::kFirstSeq + 3);
 }
 
 // One log reservation: the shards' frames are back to back in part
@@ -219,12 +219,12 @@ TEST_F(ReservationTest, ThreeShardsShareOneContiguousBatch) {
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   const std::vector<ReservedRange> ranges = reserved->ranges();
   ASSERT_EQ(ranges.size(), 3U);
-  EXPECT_EQ(ranges[0].first, 0U);
-  EXPECT_EQ(ranges[0].last, 1U);
-  EXPECT_EQ(ranges[1].first, 1U) << "shard 1 continues its own seqs";
-  EXPECT_EQ(ranges[1].last, 1U);
-  EXPECT_EQ(ranges[2].first, 0U);
-  EXPECT_EQ(ranges[2].last, 2U);
+  EXPECT_EQ(ranges[0].first, core::kFirstSeq);
+  EXPECT_EQ(ranges[0].last, core::kFirstSeq + 1);
+  EXPECT_EQ(ranges[1].first, core::kFirstSeq + 1) << "shard 1 continues its own seqs";
+  EXPECT_EQ(ranges[1].last, core::kFirstSeq + 1);
+  EXPECT_EQ(ranges[2].first, core::kFirstSeq);
+  EXPECT_EQ(ranges[2].last, core::kFirstSeq + 2);
   DurableFutures durable = queue_->Complete(std::move(*reserved));
   ASSERT_EQ(durable.size(), 3U);
 
@@ -250,10 +250,10 @@ TEST_F(ReservationTest, ThreeShardsShareOneContiguousBatch) {
         header.appended_at_us,
         std::chrono::duration_cast<std::chrono::microseconds>(kStamp.time_since_epoch()).count());
   }
-  EXPECT_EQ(PublishedEnd(0), 2U);
-  EXPECT_EQ(PublishedEnd(1), 2U);
-  EXPECT_EQ(PublishedEnd(3), 3U);
-  EXPECT_EQ(PublishedEnd(2), 0U);
+  EXPECT_EQ(PublishedEnd(0), core::kFirstSeq + 2);
+  EXPECT_EQ(PublishedEnd(1), core::kFirstSeq + 2);
+  EXPECT_EQ(PublishedEnd(3), core::kFirstSeq + 3);
+  EXPECT_EQ(PublishedEnd(2), core::kFirstSeq);
   EXPECT_EQ(ValueBytes(ReadAll(3).at(1)), kLarge);
 }
 
@@ -268,27 +268,27 @@ TEST_F(ReservationTest, FramesEncodedInPlaceMatchTheBufferedEncoderOnDisk) {
   std::vector<core::QueueEntry> zero{Write("small"), Write("large", kLarge)};
   std::vector<core::QueueEntry> one{Write("other", 300)};
   std::vector<std::byte> reserved_batch;
-  frame::EncodeEntry(seq_of(zero[0], 0), 0, reserved_batch);
-  frame::EncodeEntry(seq_of(zero[1], 1), 0, reserved_batch);
-  frame::EncodeEntry(seq_of(one[0], 0), 1, reserved_batch);
+  frame::EncodeEntry(seq_of(zero[0], core::kFirstSeq), 0, reserved_batch);
+  frame::EncodeEntry(seq_of(zero[1], core::kFirstSeq + 1), 0, reserved_batch);
+  frame::EncodeEntry(seq_of(one[0], core::kFirstSeq), 1, reserved_batch);
   frame::CloseBatch(reserved_batch);
   auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = zero},
                                              ShardEntries{.shard = 1, .entries = one}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   queue_->Complete(std::move(*reserved));
   const LogPosition reserved_at =
-      queue_->StreamForTesting(0).RingPositionForTesting(0).value_or(kNoPosition);
+      queue_->StreamForTesting(0).RingPositionForTesting(core::kFirstSeq).value_or(kNoPosition);
   ASSERT_NE(reserved_at, kNoPosition);
   ExpectOnDisk(reserved_at, reserved_batch);
 
   const std::vector<core::QueueEntry> appended{Write("a0"), Write("a1", kLarge)};
   std::vector<std::byte> appended_batch;
-  frame::EncodeEntry(seq_of(appended[0], 1), 1, appended_batch);
-  frame::EncodeEntry(seq_of(appended[1], 2), 1, appended_batch);
+  frame::EncodeEntry(seq_of(appended[0], core::kFirstSeq + 1), 1, appended_batch);
+  frame::EncodeEntry(seq_of(appended[1], core::kFirstSeq + 2), 1, appended_batch);
   frame::CloseBatch(appended_batch);
   ASSERT_TRUE(queue_->AppendBatch(1, appended).has_value());
   const LogPosition appended_at =
-      queue_->StreamForTesting(1).RingPositionForTesting(1).value_or(kNoPosition);
+      queue_->StreamForTesting(1).RingPositionForTesting(core::kFirstSeq + 1).value_or(kNoPosition);
   ASSERT_NE(appended_at, kNoPosition);
   ExpectOnDisk(appended_at, appended_batch);
   EXPECT_EQ(ReadAll(0).size(), 2U) << "every frame's sealed CRC verifies on read";
@@ -315,7 +315,7 @@ TEST_F(ReservationTest, AWindowRefusalConsumesNothing) {
   auto refused = queue_->Reserve(parts);
   ASSERT_FALSE(refused.has_value());
   EXPECT_EQ(refused.error().code(), core::ErrorCode::kResourceExhausted);
-  EXPECT_EQ(queue_->TailSeq(0).value(), 0U);
+  EXPECT_EQ(queue_->TailSeq(0).value(), core::kFirstSeq);
   EXPECT_EQ(queue_->ReadyToComplete(0), 0U);
   EXPECT_EQ(ReservationsHeld(), 0U);
   EXPECT_EQ(ValueBytes(entries[1]), kLarge) << "a refused entry is not moved from";
@@ -330,7 +330,7 @@ TEST_F(ReservationTest, AWindowRefusalConsumesNothing) {
   ASSERT_TRUE(queue_->Admit(0, std::chrono::steady_clock::now() + 10s).has_value());
   auto reserved = queue_->Reserve(parts);
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
-  EXPECT_EQ(reserved->ranges()[0].first, 1U);
+  EXPECT_EQ(reserved->ranges()[0].first, core::kFirstSeq + 1);
   queue_->Complete(std::move(*reserved));
   const auto read = ReadAll(0);
   ASSERT_EQ(read.size(), 3U);
@@ -363,8 +363,8 @@ TEST_F(ReservationTest, NoSpareRefusesWithoutConsumingASeq) {
   ASSERT_FALSE(refusal.has_value()) << "the spares never ran out";
   EXPECT_EQ(refusal.error().code(), core::ErrorCode::kUnavailable) << refusal.error().message();
   for (core::ShardId shard = 0; shard < 2; ++shard) {
-    EXPECT_EQ(queue_->TailSeq(shard).value(), accepted - 1) << shard;
-    EXPECT_EQ(PublishedEnd(shard), accepted) << shard;
+    EXPECT_EQ(queue_->TailSeq(shard).value(), core::kFirstSeq + accepted - 1) << shard;
+    EXPECT_EQ(PublishedEnd(shard), core::kFirstSeq + accepted) << shard;
   }
   EXPECT_EQ(queue_->ReadyToComplete(0), 0U);
   EXPECT_EQ(ValueBytes(large[0]), kLarge) << "a refused entry is not moved from";
@@ -374,8 +374,8 @@ TEST_F(ReservationTest, NoSpareRefusesWithoutConsumingASeq) {
   ASSERT_TRUE(queue_->WaitForSpare(0, std::chrono::steady_clock::now() + 10s));
   auto reserved = queue_->Reserve(parts);
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
-  EXPECT_EQ(reserved->ranges()[0].first, accepted);
-  EXPECT_EQ(reserved->ranges()[1].first, accepted);
+  EXPECT_EQ(reserved->ranges()[0].first, core::kFirstSeq + accepted);
+  EXPECT_EQ(reserved->ranges()[1].first, core::kFirstSeq + accepted);
   queue_->Complete(std::move(*reserved));
   EXPECT_EQ(ReadAll(0).size(), accepted + 1);
   EXPECT_EQ(ReadAll(1).size(), accepted + 1);
@@ -398,7 +398,7 @@ TEST_F(ReservationTest, ShardsOnDifferentLogsAreCrossSlot) {
   auto reserved = queue_->Reserve(
       std::array{ShardEntries{.shard = 0, .entries = a}, ShardEntries{.shard = 2, .entries = b}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
-  EXPECT_EQ(reserved->ranges()[0].first, 0U) << "the refusal took no seq";
+  EXPECT_EQ(reserved->ranges()[0].first, core::kFirstSeq) << "the refusal took no seq";
   queue_->Complete(std::move(*reserved));
 }
 
@@ -427,10 +427,10 @@ TEST_F(ReservationTest, ALargeFrameIsFilledInComplete) {
   auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   const LogPosition large_at =
-      queue_->StreamForTesting(0).RingPositionForTesting(1).value_or(kNoPosition);
+      queue_->StreamForTesting(0).RingPositionForTesting(core::kFirstSeq + 1).value_or(kNoPosition);
   ASSERT_NE(large_at, kNoPosition);
   EXPECT_FALSE(HeaderAt(large_at).has_value()) << "filled before Complete";
-  EXPECT_EQ(PublishedEnd(0), 0U);
+  EXPECT_EQ(PublishedEnd(0), core::kFirstSeq);
 
   queue_->Complete(std::move(*reserved));
   EXPECT_TRUE(HeaderAt(large_at).has_value());
@@ -454,7 +454,7 @@ TEST_F(ReservationTest, ABatchEncodesNoMoreThanTheBudgetUnderTheLock) {
   auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   std::vector<LogPosition> at;
-  for (core::SequenceId seq = 0; seq < 4; ++seq) {
+  for (core::SequenceId seq = core::kFirstSeq; seq < core::kFirstSeq + 4; ++seq) {
     at.push_back(queue_->StreamForTesting(0).RingPositionForTesting(seq).value_or(kNoPosition));
     ASSERT_NE(at.back(), kNoPosition);
   }
@@ -491,7 +491,7 @@ TEST_F(ReservationTest, AFlushOverSeveralLogsIsOneReservation) {
   EXPECT_EQ(queue_->ReadyToComplete(1), 1U);
   ASSERT_EQ(reserved->ranges().size(), 4U);
   for (const ReservedRange& range : reserved->ranges()) {
-    EXPECT_EQ(range.first, range.shard == 1 ? 1U : 0U) << range.shard;
+    EXPECT_EQ(range.first, range.shard == 1 ? core::kFirstSeq + 1 : core::kFirstSeq) << range.shard;
   }
 
   queue_->Complete(std::move(*reserved));
@@ -515,7 +515,7 @@ TEST_F(ReservationTest, AFlushReservationTakesOnlyFlushesOfEveryShard) {
   EXPECT_TRUE(refused(std::array{ShardEntries{.shard = 0, .entries = flush}}));
   EXPECT_TRUE(refused(std::array{ShardEntries{.shard = 0, .entries = flush},
                                  ShardEntries{.shard = 1, .entries = write}}));
-  EXPECT_EQ(PublishedEnd(0), 0U);
+  EXPECT_EQ(PublishedEnd(0), core::kFirstSeq);
 }
 
 // Two reservations on one shard, completed in reverse order, publish in
@@ -548,9 +548,9 @@ TEST_F(ReservationTest, ReservationsPublishInSeqOrderWhenCompletedInReverse) {
     EXPECT_EQ(later.get(), base + 1);
     EXPECT_EQ(PublishedEnd(0), base + 2);
     const auto read = ReadAll(0);
-    ASSERT_EQ(read.size(), base + 2);
-    EXPECT_EQ(KeyOf(read[base]), "earlier");
-    EXPECT_EQ(KeyOf(read[base + 1]), "later");
+    ASSERT_EQ(read.size(), base + 2 - core::kFirstSeq);
+    EXPECT_EQ(KeyOf(read[base - core::kFirstSeq]), "earlier");
+    EXPECT_EQ(KeyOf(read[base + 1 - core::kFirstSeq]), "later");
   }
 }
 
@@ -578,9 +578,9 @@ TEST_F(ReservationTest, AnAppendAfterAnOpenReservationPublishesAfterIt) {
     EXPECT_EQ(appended.get(), base + 1);
     EXPECT_EQ(PublishedEnd(0), base + 2);
     const auto read = ReadAll(0);
-    ASSERT_EQ(read.size(), base + 2);
-    EXPECT_EQ(KeyOf(read[base]), "reserved");
-    EXPECT_EQ(KeyOf(read[base + 1]), "appended");
+    ASSERT_EQ(read.size(), base + 2 - core::kFirstSeq);
+    EXPECT_EQ(KeyOf(read[base - core::kFirstSeq]), "reserved");
+    EXPECT_EQ(KeyOf(read[base + 1 - core::kFirstSeq]), "appended");
   }
 }
 
@@ -599,8 +599,8 @@ TEST_F(ReservationTest, PowerLossFuturesResolveOncePowerDurable) {
     ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready) << part.shard;
     EXPECT_TRUE(part.durable.get().has_value());
   }
-  EXPECT_EQ(queue_->DurableEnd(0, kPower).value(), 1U);
-  EXPECT_EQ(queue_->DurableEnd(2, kPower).value(), 2U);
+  EXPECT_EQ(queue_->DurableEnd(0, kPower).value(), core::kFirstSeq + 1);
+  EXPECT_EQ(queue_->DurableEnd(2, kPower).value(), core::kFirstSeq + 2);
 }
 
 // The threadsafe style re-runs the test in a child, which opens its own
@@ -697,6 +697,7 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
 
   auto monitor = std::async(std::launch::async, [&] {
     std::array<core::SequenceId, kShards> checked{};
+    checked.fill(core::kFirstSeq);
     while (!done.load()) {
       for (core::ShardId shard = 0; shard < kShards; ++shard) {
         const core::SequenceId power = queue_->DurableEnd(shard, kPower).value();
@@ -825,21 +826,21 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
   std::array<std::vector<std::string>, kShards> keys;
   for (Placed& at : placed) {
     auto& shard_keys = keys.at(at.shard);
-    if (shard_keys.size() <= at.seq) shard_keys.resize(at.seq + 1);
-    EXPECT_TRUE(shard_keys[at.seq].empty())
-        << "shard " << at.shard << " seq " << at.seq << " twice";
-    shard_keys[at.seq] = std::move(at.key);
+    const std::size_t i = at.seq - core::kFirstSeq;
+    if (shard_keys.size() <= i) shard_keys.resize(i + 1);
+    EXPECT_TRUE(shard_keys[i].empty()) << "shard " << at.shard << " seq " << at.seq << " twice";
+    shard_keys[i] = std::move(at.key);
   }
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     SCOPED_TRACE(shard);
     const auto& expected = keys.at(shard);
-    EXPECT_EQ(PublishedEnd(shard), expected.size());
-    EXPECT_EQ(queue_->DurableEnd(shard, kPower).value(), expected.size());
+    EXPECT_EQ(PublishedEnd(shard), core::kFirstSeq + expected.size());
+    EXPECT_EQ(queue_->DurableEnd(shard, kPower).value(), core::kFirstSeq + expected.size());
     const auto read = ReadAll(shard);
     ASSERT_EQ(read.size(), expected.size());
-    for (std::size_t seq = 0; seq < read.size(); ++seq) {
-      ASSERT_FALSE(expected[seq].empty()) << "seq " << seq << " was never assigned";
-      EXPECT_EQ(KeyOf(read[seq]), expected[seq]) << "seq " << seq;
+    for (std::size_t i = 0; i < read.size(); ++i) {
+      ASSERT_FALSE(expected[i].empty()) << "seq " << read[i].seq << " was never assigned";
+      EXPECT_EQ(KeyOf(read[i]), expected[i]) << "seq " << read[i].seq;
     }
   }
 }

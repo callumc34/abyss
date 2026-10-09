@@ -186,7 +186,7 @@ TEST_F(HotConsumerTest, AFlushWipesOnlyItsOwnShard) {
   std::vector<core::QueueEntry> writes;
   for (int i = 0; i < kKeys; ++i) {
     writes.push_back(MakeWrite({"SET", "key:" + std::to_string(i), "v"}));
-    writes.back().seq = static_cast<core::SequenceId>(i);
+    writes.back().seq = core::kFirstSeq + static_cast<core::SequenceId>(i);
   }
   writer.BeginReplay();
   writer.ApplyReplayBatch(writes);
@@ -194,6 +194,7 @@ TEST_F(HotConsumerTest, AFlushWipesOnlyItsOwnShard) {
   ASSERT_EQ(hot_->Stats()->key_count, static_cast<uint64_t>(kKeys));
 
   std::vector<core::QueueEntry> flush(1);
+  flush[0].seq = core::kFirstSeq;
   flush[0].appended_at = core::WallClock::now();
   flush[0].payload = core::entry::Flush{};
   flusher.BeginReplay();
@@ -766,7 +767,9 @@ TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
 
   // Probe one entry's footprint to size the per-shard budget below the set.
   hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
-  ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}}, 0)
+  ASSERT_TRUE(probe
+                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "p", .value = value}},
+                         core::kFirstSeq)
                   .has_value());
   const uint64_t per_entry = probe.Stats()->used_bytes;
 
@@ -801,7 +804,9 @@ TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
 // overshoots, which Stats reports, and the consumer does not wedge.
 TEST_F(HotConsumerTest, OverBudgetWriteStillApplies) {
   hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
-  ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "small", .value = "v"}}, 0)
+  ASSERT_TRUE(probe
+                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "small", .value = "v"}},
+                         core::kFirstSeq)
                   .has_value());
   const uint64_t small_entry = probe.Stats()->used_bytes;
 

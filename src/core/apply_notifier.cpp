@@ -6,6 +6,9 @@
 #include <utility>
 #include <vector>
 
+#include "abyss/core/fatal.h"
+#include "abyss/core/types.h"
+
 namespace abyss::core {
 
 AppliedSeqNotifier::AppliedSeqNotifier(AppliedSeqNotifierConfig config) {
@@ -24,10 +27,8 @@ std::future<void> AppliedSeqNotifier::AwaitApplied(ShardId shard, SequenceId seq
   auto& s = ShardFor(shard);
   const std::scoped_lock lock(s.mu);
 
-  // Already applied at or past seq: ready immediately. kNoSeqApplied is the
-  // largest possible value, so guard it explicitly before the >= compare.
-  const auto applied = s.applied_seq.load(std::memory_order_acquire);
-  if (applied != kNoSeqApplied && applied >= seq) {
+  // Already applied at or past seq: ready immediately.
+  if (s.applied_seq.load(std::memory_order_acquire) >= seq) {
     std::promise<void> p;
     p.set_value();
     return p.get_future();
@@ -40,15 +41,14 @@ std::future<void> AppliedSeqNotifier::AwaitApplied(ShardId shard, SequenceId seq
 }
 
 void AppliedSeqNotifier::NotifyApplied(ShardId shard, SequenceId seq) {
+  ABYSS_DCHECK(seq >= kFirstSeq, "applied at seq 0, which names no entry");
   auto& s = ShardFor(shard);
   std::vector<std::promise<void>> to_fulfill;
   {
     const std::scoped_lock lock(s.mu);
 
     // All advances happen under the lock, so a plain monotonic max suffices.
-    // `seq` is a real value, so the new high-water is never kNoSeqApplied.
-    const auto cur = s.applied_seq.load(std::memory_order_relaxed);
-    const auto high = (cur == kNoSeqApplied || seq > cur) ? seq : cur;
+    const auto high = std::max(s.applied_seq.load(std::memory_order_relaxed), seq);
     s.applied_seq.store(high, std::memory_order_release);
 
     auto end = s.waiters.upper_bound(high);

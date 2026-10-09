@@ -156,7 +156,7 @@ class HotConsumer {
       ABYSS_GUARDED_BY(pending_mu_);
 
   // Next seq to read. Touched by replay or the Run thread, never both.
-  core::SequenceId next_read_seq_ = 0;
+  core::SequenceId next_read_seq_ = core::kFirstSeq;
 
   std::atomic<core::SequenceId> highest_settled_seq_{0};
   // The settled floor published to HotConsumerProgress: clamped behind the

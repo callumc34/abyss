@@ -68,7 +68,6 @@ class ShardLocks {
   bool OverBackpressure(core::ShardId shard) const;
   core::WallTime LastAppendedAt(core::ShardId shard) const;
   void RaiseAppendedAt(core::ShardId shard, core::WallTime at);
-  std::optional<core::SequenceId> FenceFor(core::ShardId shard, core::SequenceId seq) const;
 
   // Ends the hold, handing back what its applies replaced so the caller
   // can free it once it has published; dropped, it is freed at once.
@@ -122,7 +121,8 @@ class ShardedHotStore : public core::HotStore {
 
   struct HotRead {
     core::Result<core::RespValue> result;
-    // What the reply must be durable through; nullopt on a miss.
+    // What the reply must be durable through; nullopt on a miss. Loaded
+    // state's 0 is durable already.
     std::optional<core::SequenceId> fence;
   };
   // SingleShardStore::Read under one shared hold: the result is a copy,
