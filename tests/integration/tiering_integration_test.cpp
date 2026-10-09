@@ -16,6 +16,7 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/queue/append_result.h"
+#include "cold_read.h"
 #include "integration_harness.h"
 
 namespace abyss::engine {
@@ -55,8 +56,7 @@ TEST_F(TieringIntegrationTest, ColdReadThroughEngine) {
 
 TEST_F(TieringIntegrationTest, BufferReadThroughEngine) {
   harness_.BufferFor("k1").Absorb(
-      "k1", core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "buf"}}, kEviction, 1, 1,
-      0);
+      "k1", core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "buf"}}, kEviction, 1, 0);
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
   ASSERT_TRUE(result.has_value()) << result.error().message();
@@ -81,10 +81,9 @@ TEST_F(TieringIntegrationTest, BufferTombstoneBlocksColdRead) {
   ASSERT_TRUE(apply_cold.has_value());
 
   harness_.BufferFor("k1").Absorb(
-      "k1", core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "v"}}, kEviction, 1, 1,
-      0);
+      "k1", core::ops::WriteOp{core::ops::StringSet{.key = "k1", .value = "v"}}, kEviction, 1, 0);
   harness_.BufferFor("k1").Absorb("k1", core::ops::WriteOp{core::ops::Del{.keys = {"k1"}}},
-                                  kEviction, 1, 1, 0);
+                                  kEviction, 1, 0);
 
   auto result = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
   ASSERT_TRUE(result.has_value());
@@ -123,7 +122,8 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
 }
 
 TEST_F(TieringIntegrationTest, WriteIsInHotWhenItReplies) {
-  auto result = harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "k1", "v1"}));
+  auto result = harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "k1", "v1"}),
+                                                core::PredicateFlags::kNone);
 
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsSimpleString());
@@ -178,7 +178,7 @@ TEST_F(TieringIntegrationTest, DrainFlushPersistsWriteToColdStoreAfterQuietWindo
   consumer.Flush();
 
   core::ops::ReadOp read_op{core::ops::StringGet{.key = key}};
-  auto from_cold = harness_.Cold().Exec(read_op);
+  auto from_cold = testing::ColdRead(harness_.Cold(), read_op);
   ASSERT_TRUE(from_cold.has_value()) << from_cold.error().message();
   EXPECT_EQ(from_cold->AsString(), "persisted");
   EXPECT_EQ(consumer.Buffer().Size(), 0);
@@ -219,7 +219,7 @@ TEST_F(TieringIntegrationTest, TenThousandWritesToSameKeyProduceOneColdWrite) {
   EXPECT_EQ(consumer.Snapshot().ops_flushed, 1U);
 
   core::ops::ReadOp read_op{core::ops::StringGet{.key = key}};
-  auto from_cold = harness_.Cold().Exec(read_op);
+  auto from_cold = testing::ColdRead(harness_.Cold(), read_op);
   ASSERT_TRUE(from_cold.has_value());
   EXPECT_EQ(from_cold->AsString(), "v" + std::to_string(kWrites - 1));
 }
@@ -232,7 +232,7 @@ TEST_F(TieringIntegrationTest, MultipleKeysTieredAcrossStores) {
 
   harness_.BufferFor("buf_key").Absorb(
       "buf_key", core::ops::WriteOp{core::ops::StringSet{.key = "buf_key", .value = "bv"}},
-      kEviction, 1, 1, 0);
+      kEviction, 1, 0);
 
   auto r1 = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "hot_key"}));
   ASSERT_TRUE(r1.has_value());

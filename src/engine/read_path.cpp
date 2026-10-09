@@ -173,13 +173,15 @@ core::Result<core::RespValue> ReadPath::Fill(const ops::ReadOp& op, core::KeyTyp
     CountFill(filled);
     if (!filled.has_value()) return Failed(op, filled.error());
     if (filled->result.has_value()) return Answer(op, *filled->result, filled->source);
-    const bool loaded_here = filled->fill == Loader::Fill::kInstalled;
-    if (auto hot = FromHot(op, loaded_here ? std::optional(filled->source) : std::nullopt);
-        hot.has_value()) {
-      return *std::move(hot);
+    if (filled->fill != Loader::Fill::kPending) {
+      const bool loaded_here = filled->fill == Loader::Fill::kInstalled;
+      if (auto hot = FromHot(op, loaded_here ? std::optional(filled->source) : std::nullopt);
+          hot.has_value()) {
+        return *std::move(hot);
+      }
     }
-    // Evicted since, so drained: buffer and cold hold it, and that hot
-    // read found no flush floor.
+    // Pending, or evicted since and so drained: buffer and cold hold
+    // it, and no hot read found a flush floor.
   }
   Loader::Source source = Loader::Source::kBuffer;
   auto loaded = loader_.LoadAs(shard, key, type, deadline, &source);
@@ -230,6 +232,7 @@ void ReadPath::CountFill(const core::Result<Loader::Filled>& filled) {
       break;
     case Loader::Fill::kResident:
     case Loader::Fill::kFlushed:
+    case Loader::Fill::kPending:
       break;
   }
 }

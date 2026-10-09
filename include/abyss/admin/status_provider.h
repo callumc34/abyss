@@ -79,27 +79,13 @@ struct StatusColdInfo {
   uint64_t disk_bytes = 0;
 };
 
-struct StatusHotConsumerInfo {
-  uint64_t highest_settled_seq_min = 0;
-  uint64_t highest_settled_seq_max = 0;
-};
-
 struct StatusColdConsumerInfo {
   uint64_t last_commit_seq_min = 0;
   uint64_t last_commit_seq_max = 0;
 };
 
-struct StatusResolverInfo {
-  uint64_t last_commit_seq_min = 0;
-  uint64_t last_commit_seq_max = 0;
-  uint64_t cache_entries = 0;
-  uint64_t cache_bytes = 0;
-};
-
 struct StatusConsumersInfo {
-  StatusHotConsumerInfo hot;
   StatusColdConsumerInfo cold;
-  StatusResolverInfo resolver;
 };
 
 struct StatusLagInfo {
@@ -117,15 +103,12 @@ struct StatusConnectionsInfo {
 // engine-side renames. Order matches engine::RecoverySnapshot::Phase.
 enum class StatusRecoveryPhase : uint8_t {
   kQueueOpen = 0,
-  kResolverReplay = 1,
-  kColdHotReplay = 2,
-  kComplete = 3,
+  kColdHotReplay = 1,
+  kComplete = 2,
 };
 
 struct StatusRecoveryInfo {
   StatusRecoveryPhase phase = StatusRecoveryPhase::kComplete;
-  uint64_t resolver_entries_replayed = 0;
-  uint64_t resolver_entries_target = 0;
   uint64_t cold_entries_replayed = 0;
   uint64_t cold_entries_target = 0;
   uint64_t hot_entries_replayed = 0;
@@ -138,7 +121,7 @@ struct StatusRecoveryInfo {
 // schema_version bump. Unset/inapplicable fields render as JSON null or as
 // the type's neutral value (0, "", false), never as missing keys.
 struct StatusSnapshot {
-  uint32_t schema_version = 4;
+  uint32_t schema_version = 5;
   StatusBuildInfo build;
   StatusServerInfo server;
   StatusConfigInfo config;

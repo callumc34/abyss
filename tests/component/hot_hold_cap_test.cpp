@@ -48,10 +48,13 @@ TEST(HotHoldCapTest, NoMaintenanceHoldOverTheCapWithAMillionKeys) {
   // A second eviction class, so a second LRU list.
   core::EvictionPolicy policy{core::EvictionTTL{1},
                               {{.prefix = "k09", .eviction = core::EvictionTTL{86400}}}};
+  // Nothing drained while loading, so the writes cannot evict.
+  core::SequenceId drained = 0;
   ShardedHotStore store{ShardedHotStoreConfig{
       .max_memory_bytes = size_t{16} << 20,
       .shard_count = 1,
       .backpressure_ratio = 100,
+      .drained = [&drained](core::ShardId) { return drained; },
       .eviction_policy = &policy,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
@@ -60,7 +63,6 @@ TEST(HotHoldCapTest, NoMaintenanceHoldOverTheCapWithAMillionKeys) {
       std::chrono::duration_cast<std::chrono::milliseconds>(clock.WallNow().time_since_epoch())
           .count();
   // Load past the budget: the memory pass is under test, not the writes.
-  store.SetReplayMode(true);
   for (int i = 0; i < kKeys; ++i) {
     const std::string key = Key(i);
     const bool expires = i % 4 == 0 && i < 900'000;
@@ -77,7 +79,7 @@ TEST(HotHoldCapTest, NoMaintenanceHoldOverTheCapWithAMillionKeys) {
                            static_cast<core::SequenceId>(kKeys + i) + 1)
                     .has_value());
   }
-  store.SetReplayMode(false);
+  drained = kAllDrained;
   ASSERT_GT(store.Stats()->used_bytes, store.Stats()->max_bytes);
 
   std::array<PassHolds, 5> holds{};

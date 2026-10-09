@@ -27,6 +27,7 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/testing.h"
+#include "cold_read.h"
 
 namespace abyss::cold::backends {
 namespace {
@@ -108,7 +109,6 @@ class SweepFixture : public ::testing::Test {
     RocksdbConfig config;
     config.data_path = path_.string();
     config.shard_count = shard_count;
-    config.wall_clock = clock_.Fn();
     config.log_clock = [this](core::ShardId shard) { return LogClockMs(shard); };
     config.ttl_scanner_mode = TtlScanner::ExecutionMode::kManualTick;
     config.ttl_scanner.base_sample_size = 200;
@@ -127,6 +127,11 @@ class SweepFixture : public ::testing::Test {
   uint64_t LogClockMs(core::ShardId shard) const {
     const auto it = shard_log_ms_.find(shard);
     return it == shard_log_ms_.end() ? log_ms_.load() : it->second;
+  }
+
+  // What a read of `op` returns from `store` at the test clock.
+  core::Result<core::RespValue> Read(RocksdbStore& store, const core::ops::ReadOp& op) const {
+    return abyss::testing::ColdRead(store, op, static_cast<int64_t>(clock_.Now()));
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -191,7 +196,7 @@ TEST_F(SweepFixture, FutureTtlIsNotDeleted) {
     EXPECT_EQ(r->deleted_strings, 0U);
   }
   // Live key still readable.
-  auto get = store->Exec(core::ops::StringGet{.key = k});
+  auto get = Read(*store, core::ops::StringGet{.key = k});
   ASSERT_TRUE(get.has_value());
   EXPECT_EQ(get->AsString(), "v");
 }
@@ -209,7 +214,7 @@ TEST_F(SweepFixture, NoTtlIsNotDeleted) {
     EXPECT_EQ(r->expired_strings, 0U);
     EXPECT_EQ(r->deleted_strings, 0U);
   }
-  auto get = store->Exec(core::ops::StringGet{.key = k});
+  auto get = Read(*store, core::ops::StringGet{.key = k});
   ASSERT_TRUE(get.has_value());
   EXPECT_EQ(get->AsString(), "v");
 }
@@ -251,7 +256,7 @@ TEST_F(SweepFixture, RepeatedSweepsRemoveAllExpired) {
 
   // Live keys must remain reachable.
   for (int i = 0; i < 100; ++i) {
-    auto get = store->Exec(core::ops::StringGet{.key = "live:" + std::to_string(i)});
+    auto get = Read(*store, core::ops::StringGet{.key = "live:" + std::to_string(i)});
     ASSERT_TRUE(get.has_value());
     EXPECT_EQ(get->AsString(), "v") << "i=" << i;
   }
@@ -283,7 +288,7 @@ TEST_F(SweepFixture, ExpiredHashCollectionIsCleanedByScanner) {
   EXPECT_GT(deletions, 0U);
 
   // After deletion, the hash must look empty: a Get on a field returns nil.
-  auto get = store->Exec(core::ops::HashGet{.key = key, .field = "f"});
+  auto get = Read(*store, core::ops::HashGet{.key = key, .field = "f"});
   ASSERT_TRUE(get.has_value());
   EXPECT_TRUE(get->IsNull());
 }
@@ -431,7 +436,7 @@ TEST_F(SweepFixture, ConcurrentReSetTriggersCasConflict) {
 
   // Final read of every key must return "new" (no false deletion).
   for (const auto& k : key_storage) {
-    auto get = store->Exec(core::ops::StringGet{.key = k});
+    auto get = Read(*store, core::ops::StringGet{.key = k});
     ASSERT_TRUE(get.has_value()) << k;
     EXPECT_EQ(get->AsString(), "new") << k;
   }

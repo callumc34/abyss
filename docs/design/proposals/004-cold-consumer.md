@@ -6,10 +6,10 @@
 > **Amended by [ADP-015](015-write-path-and-durability.md).** These parts already describe the amended behaviour:
 > - **§Consumer Thread Loop:** the loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain.
 > - **§Persisting at the power-durable log:** writes to the cold store never run ahead of the power-durable log.
+> - **§Replay at recovery:** the demultiplexing scan of each log hands this consumer its shard's entries in batches.
+> - **Throughout:** the log carries only decided effects (decide-then-log), so the consumer applies each `Write` and `Flush` as it reads it. It has no conditional to wait for, since block-and-scan is gone, and it acknowledges nothing to the write path: a write replies once its frame is durable, and FLUSHDB once its `Flush` frames are.
 >
-> Also amended: replay at recovery is driven by the demultiplexing scan of each log (Phase 1c), which hands this consumer its shard's entries in batches.
->
-> Still to land: consumers run as a pool sized to cores, shard-affine, after Phase 2 (#177). Until then each shard has its own thread.
+> Still to land: consumers run as a pool sized to cores, shard-affine (#177). Until then each shard has its own thread.
 
 ## Context
 
@@ -31,9 +31,9 @@ Raw Queue ──▶ Cold Consumer ──▶ Compaction Buffer ──▶ (flush d
 
 Each entry in the compaction buffer tracks the key, its compacted state, the time it first entered the buffer, the time of its last modification, and a count of absorbed writes. This provides the flush strategy with everything it needs to decide when to persist.
 
-The buffer is protected by a shared mutex. The cold consumer thread holds an exclusive lock when absorbing new entries or removing flushed entries. I/O threads performing reads hold a shared lock. This allows concurrent buffer reads with minimal contention.
+The buffer is protected by a shared mutex. The cold consumer thread holds an exclusive lock when absorbing new entries or removing flushed entries. Threads loading a key hold a shared lock while they copy its entry. This allows concurrent buffer reads with minimal contention.
 
-The buffer is also part of the read path: reads that miss the hot store check the compaction buffer before falling through to cold. See [ADP-006](006-read-write-paths.md).
+The buffer is also part of the read path. A read or write that misses hot loads the key: it copies the key's compacted delta from the buffer, then merges it over cold's state. The buffer answers no command itself; the engine answers from the loaded state. See [ADP-006](006-read-write-paths.md).
 
 ### Compaction Semantics
 
@@ -72,7 +72,7 @@ Where `jitter` is a per-key random offset in the range `[0, quiet_threshold * ji
 
 ### Consumer Thread Loop
 
-The cold consumer is **per-shard**: each shard has its own `ColdConsumer` owning its own `CompactionBuffer`, and a dedicated thread running a fused drain-flush loop. A `ColdConsumerPool` orchestrator owns the fleet and exposes a `CompactionBufferRouter` through which the tiering engine resolves key→shard→buffer for read-path lookups. This follows the shared-nothing direction described in ADP-008 and avoids the central-lock bottleneck a single shared buffer would introduce at scale.
+The cold consumer is **per-shard**: each shard has its own `ColdConsumer` owning its own `CompactionBuffer`, and a dedicated thread running a fused drain-flush loop. A `ColdConsumerPool` orchestrator owns the fleet and exposes a `CompactionBufferRouter` through which the engine's loader reaches a shard's buffer to copy a key's delta. This follows the shared-nothing direction described in ADP-008 and avoids the central-lock bottleneck a single shared buffer would introduce at scale.
 
 Each per-shard thread loop is:
 
@@ -83,10 +83,11 @@ loop:
        - next_read_seq is the consumer's own position: committed offset + 1
          on start (the first seq, 1, with nothing committed), then one past
          the last entry read
-       - Decode each QueueEntry (Write / Conditional / Resolved-apply)
-       - Parse its RESP command into a typed WriteOp
+       - Decode each QueueEntry (a Write, or a Flush, which wipes)
+       - Parse each Write's RESP command into a typed WriteOp
        - Expand multi-key ops (DEL, MSET) into per-key absorbs
-       - buffer.Absorb(key, op, eviction, position, carrier, appended_at)
+       - Absorb each into the buffer with the entry's seq, the key's
+         eviction and the entry's appended_at
 
     2. Flush: under normal mode, select entries whose scheduled_time ≤ now
        (quiet window or eviction-deadline fired). Under aggressive mode
@@ -116,19 +117,22 @@ loop:
 
 **Post-flush:** When its apply succeeds, the entry is removed from the buffer. Until then it stays readable, so a read of a key hot has evicted never falls through to the cold store's older state while the batch is in flight. If a new write arrives for the same key later, it re-enters with a fresh `first_seen` and `first_seen_seq`.
 
+### Replay at recovery
+
+During recovery the consumer's thread does not run. Recovery's one scan of each log ([ADP-007](007-recovery.md)) hands the consumer its shard's entries in batches, from its committed offset plus one, and it absorbs them as the loop would, flushing when the buffer passes high-water. In each batch cold is fed before the hot replayer, so cold's drained seq covers the batch before hot applies it.
+- **Finishing.** Once the scan ends, the consumer fails recovery unless its cursor reached the shard's end. It then flushes its whole buffer and checkpoints, so reads after recovery never meet a cold store behind the log.
+- **Drain requests.** If hot reaches its backpressure limit during replay with nothing it can evict, the hot replayer asks the consumer to flush its buffer through the current frame, capped at the power-durable end. Each batch still passes the persistence gate below. A request that makes no progress for `drain_grace_seconds`, or meets a batch the cold store refuses, fails recovery.
+- **Wipes.** A wipe that keeps failing during the scan gives up after `drain_grace_seconds` and fails recovery, rather than hanging every shard on its worker.
+
 ### Persisting at the power-durable log
 
 No persisted derived state runs ahead of the power-durable log ([ADP-015](015-write-path-and-durability.md) §Durability classes). The consumer splits that rule in two:
 - **Absorb at the acknowledgement class.** It reads and absorbs at the class the queue acknowledges at. The buffer is volatile, so it can never hold more than hot can show.
 - **Persist at `power_loss`.** It writes to the cold store only effects whose entries are power-durable.
 
-Gating absorption itself would break reads. A collection read waits until the buffer has drained to hot's settled position (ADP-006). Under `process_crash`, hot runs at the published end, so every collection read on a written shard would wait for a device flush.
+Gating absorption itself would tie hot to the device. Hot evicts a key only once cold's drained seq, the highest seq absorbed, passes the key's latest write ([ADP-002](002-hot-store.md)). Under `process_crash`, every eviction, and with it memory backpressure on writes, would then wait for a device flush.
 
-**Position and carrier.** Each absorb carries two sequence numbers:
-- **Position** is the entry the consumer must resume from to re-derive the effect. It feeds `first_seen_seq` and so the commit low-water mark.
-- **Carrier** is the entry that holds the effect. It feeds the buffer entry's `last_seq`, the maximum over everything absorbed into it.
-
-For a `Write` the two are the same. For a `Resolved`, the position is its `Conditional` and the carrier is the `Resolved` itself. Its effect must not reach the cold store while the `Resolved` could still be lost: after a power loss the resolver would decide again, possibly differently.
+**One sequence number per absorb.** Each absorb carries its entry's own seq. A new buffer entry takes it as its `first_seen_seq`, which feeds the commit low-water mark, and every absorb raises the entry's `last_seq`, the maximum over everything absorbed into it. Every effect is logged at its own position, so the seq replay resumes from and the seq that carries the effect are the same.
 
 **The gate.** Before `ApplyBatch`, the consumer waits until the largest `last_seq` in the batch is below the power-durable end. The wait is bounded by `queue_read_timeout`.
 - **Absorption is paused while it waits,** because absorbing and flushing share one thread. The target cannot move, so a healthy wait lasts at most two device flushes.
@@ -137,16 +141,16 @@ For a `Write` the two are the same. For a `Resolved`, the position is its `Condi
 - **The gate sits at `ApplyBatch`, not at the cold checkpoint,** because the cold store can persist an applied batch in the background before any checkpoint.
 - **Reads do not wait on it.** While the consumer waits, its drained position is frozen. That holds back hot's eviction and so, at worst, writes under hot memory backpressure; a read that misses hot reads buffer plus cold without waiting for the drain.
 
-**Wipes.** A `Flush` entry's wipe waits for that entry to be power-durable, through the same hold-and-retry as a failed wipe. FLUSHDB therefore pays `power_loss` latency in every class.
+**Wipes.** A `Flush` entry's wipe waits for that entry to be power-durable, through the same hold-and-retry as a failed wipe. The client does not wait for it. FLUSHDB replies once its `Flush` frames reach the acknowledgement class, and until the wipe lands and cold's drained seq passes the `Flush`, hot's flush floor answers every miss on that shard as absent ([ADP-006](006-read-write-paths.md)). The consumer drops its buffer only after the wipe, so until then reads never fall back to older cold data.
 
 **Bounded.** What is absorbed but not yet persistable is bounded by the WAL durability window (ADP-001 §Durability classes and group commit). Under a flush stall it stays bounded and observable (invariant 3).
 
 ### Expiry
 
-Cold applies each effect as it was logged. The write path decided it against the key's full state and logged any expiry it observed as a DEL ([ADP-015](015-write-path-and-durability.md)), so cold judges no TTL on apply: a PERSIST or SADD lands on the key as it stands, expired or not. Every state change by TTL follows the shard's **log clock**, never the wall clock. Reads still judge by the wall clock, to answer nil, but never write.
+Cold applies each effect as it was logged. The write path decided it against the key's full state and logged any expiry it observed as a DEL ([ADP-015](015-write-path-and-durability.md)), so cold judges no TTL on apply: a PERSIST or SADD lands on the key as it stands, expired or not. Every state change by TTL follows the shard's **log clock**, never the wall clock. Neither the buffer nor the cold store reads the wall clock. Reads are loads, and the engine judges a loaded key's TTL by the wall clock to answer nil; a read never writes.
 
 **The log clock** of a shard is the `appended_at` of the first unflushed write in the oldest entry its buffer holds. With nothing pending, it is the newest `appended_at` the buffer has absorbed.
-- **It tracks the commit low-water mark.** The buffer keeps its pending entries in order, so the oldest pending seq and the clock each cost O(log n) per new entry or flush.
+- **It tracks the commit low-water mark.** The buffer keeps its pending entries in one FIFO in absorb order, which orders their first seq, first `appended_at` and first-seen time alike. A flushed entry leaves a dead slot, dropped once it reaches the front. The FIFO is compacted when dead slots outnumber live ones, so its memory stays proportional to the live entries even behind a long-lived head. The oldest pending seq, the clock and the oldest first-seen time each cost O(1).
 - **An entry stays pending until its batch lands.** Selection for a flush, a failed apply and a reschedule all leave the clock where it was.
 - **A later write to a pending entry keeps the entry's first time.** An entry re-created after its flush starts afresh.
 - **A Flush entry advances it,** once its wipe has run.
@@ -181,10 +185,10 @@ CRIT if oldest_unflushed_age > default_eviction
 Additionally:
 
 ```
-cold_consumer_queue_lag = hot_consumer_seq - cold_consumer_seq
+cold_consumer_queue_lag = queue_tail_seq - cold_consumer_seq
 ```
 
-Where `cold_consumer_seq` reflects the latest entry read into the buffer, not the latest entry flushed to cold.
+Where `cold_consumer_seq` reflects the latest entry read into the buffer, not the latest entry flushed to cold. It is reported as `abyss_cold_consumer_lag_entries`.
 
 The two flush-trigger counters are a leading indicator of buffer churn:
 
@@ -225,7 +229,7 @@ The checkpoint knobs bound the cold durable-checkpoint cadence. The cold consume
 2. The buffer never contains stale data — `Absorb` is the only write path, and it merges correctly per data structure type.
 3. A `DEL` resets all accumulated state for a key. No prior writes survive a tombstone.
 4. Flush is idempotent from cold's perspective. If the cold consumer crashes mid-flush and replays, the same compacted state is re-emitted and applied. Last-write-wins in the cold store handles duplicates.
-5. Buffer reads do not promote. The cold consumer owns data in the buffer and will flush it on its own schedule. See [ADP-006](006-read-write-paths.md) for promotion semantics.
+5. Reads never change the buffer. The cold consumer owns data in the buffer and flushes it on its own schedule. A read that fills hot from buffer plus cold installs into hot only, and never appends to the log ([ADP-006](006-read-write-paths.md)).
 6. Cold changes state only as the log says: it applies effects as logged, deletes by TTL only once the shard's log clock passes it, and never writes on a read. Replaying the same log leaves the same cold state whatever the wall clock reads.
 
 ## Trade-offs

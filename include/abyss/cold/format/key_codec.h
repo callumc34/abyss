@@ -11,7 +11,7 @@
 
 namespace abyss::cold::format {
 
-// The varint codec lives in core::encoding (shared with the existence cache).
+// The varint codec lives in core::encoding.
 // Re-exported here so existing cold callers keep using the unqualified names.
 using core::encoding::AppendVarint;
 using core::encoding::DecodeVarint;

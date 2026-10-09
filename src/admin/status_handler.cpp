@@ -164,15 +164,6 @@ std::string Render(const StatusSnapshot& s) {
   w.Key("consumers");
   {
     w.BeginObject();
-    w.Key("hot");
-    {
-      w.BeginObject();
-      w.Key("highest_settled_seq_min");
-      w.UInt(s.consumers.hot.highest_settled_seq_min);
-      w.Key("highest_settled_seq_max");
-      w.UInt(s.consumers.hot.highest_settled_seq_max);
-      w.EndObject();
-    }
     w.Key("cold");
     {
       w.BeginObject();
@@ -180,19 +171,6 @@ std::string Render(const StatusSnapshot& s) {
       w.UInt(s.consumers.cold.last_commit_seq_min);
       w.Key("last_commit_seq_max");
       w.UInt(s.consumers.cold.last_commit_seq_max);
-      w.EndObject();
-    }
-    w.Key("resolver");
-    {
-      w.BeginObject();
-      w.Key("last_commit_seq_min");
-      w.UInt(s.consumers.resolver.last_commit_seq_min);
-      w.Key("last_commit_seq_max");
-      w.UInt(s.consumers.resolver.last_commit_seq_max);
-      w.Key("cache_entries");
-      w.UInt(s.consumers.resolver.cache_entries);
-      w.Key("cache_bytes");
-      w.UInt(s.consumers.resolver.cache_bytes);
       w.EndObject();
     }
     w.EndObject();
@@ -224,9 +202,6 @@ std::string Render(const StatusSnapshot& s) {
       case StatusRecoveryPhase::kQueueOpen:
         w.String("queue_open");
         break;
-      case StatusRecoveryPhase::kResolverReplay:
-        w.String("resolver_replay");
-        break;
       case StatusRecoveryPhase::kColdHotReplay:
         w.String("cold_hot_replay");
         break;
@@ -234,10 +209,6 @@ std::string Render(const StatusSnapshot& s) {
         w.String("complete");
         break;
     }
-    w.Key("resolver_entries_replayed");
-    w.UInt(s.recovery.resolver_entries_replayed);
-    w.Key("resolver_entries_target");
-    w.UInt(s.recovery.resolver_entries_target);
     w.Key("cold_entries_replayed");
     w.UInt(s.recovery.cold_entries_replayed);
     w.Key("cold_entries_target");

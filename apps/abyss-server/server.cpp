@@ -145,8 +145,7 @@ bool Server::Initialize() {
       .min_retention = config_.queue.min_retention,
       // Only cold commits offsets and gates retention; hot commits none
       // and rebuilds from the queue on restart (ADP-002 §"Eviction refresh vs
-      // queue retention"). The resolver no longer runs, and a frozen
-      // offset of its would pin retention forever.
+      // queue retention").
       .retention_consumers = {core::kColdConsumer},
       .offset_fsync_interval = config_.queue.offset_fsync_interval,
   });
@@ -160,13 +159,6 @@ bool Server::Initialize() {
     return false;
   }
   queue_ = std::move(*queue_result);
-
-  consumer_rpc_ = std::make_unique<core::ConsumerRpc>(config_.consumer_rpc);
-  // Must be indexed by the REAL shard count, not the default, or AwaitApplied /
-  // NotifyApplied misroute across the modulo and read-your-write silently
-  // breaks (ENGINE-3 wiring; the notifier requires the true shard_count).
-  apply_notifier_ = std::make_unique<core::AppliedSeqNotifier>(
-      core::AppliedSeqNotifierConfig{.shard_count = hot_store_->shard_count()});
 
   auto cold_result = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
       .data_path = config_.cold.data_path,
@@ -200,7 +192,6 @@ bool Server::Initialize() {
                   .buffer_low_water_bytes = config_.cold_consumer.buffer_low_water_bytes,
                   .max_flush_batch_size = config_.cold_consumer.max_flush_batch_size,
                   .queue_read_max_count = config_.cold_consumer.queue_read_max_count,
-                  .replay_batch_size = config_.recovery.cold_replay_batch_size,
                   .queue_read_timeout = config_.cold_consumer.queue_read_timeout,
                   .retry_initial_backoff = config_.cold_consumer.retry_initial_backoff,
                   .retry_max_backoff = config_.cold_consumer.retry_max_backoff,
@@ -209,19 +200,6 @@ bool Server::Initialize() {
                   .loop_initial_backoff = config_.cold_consumer.loop_initial_backoff,
                   .loop_max_backoff = config_.cold_consumer.loop_max_backoff,
                   .drain_grace = config_.cold_consumer.drain_grace,
-              },
-      },
-      *eviction_policy_, *consumer_rpc_);
-
-  hot_pool_ = std::make_unique<consumer::HotConsumerPool>(
-      *queue_, *hot_store_, *consumer_rpc_, *apply_notifier_,
-      consumer::HotConsumerPool::Config{
-          .shard_count = hot_store_->shard_count(),
-          .consumer =
-              consumer::HotConsumer::Config{
-                  .read_batch_size = config_.hot_consumer.read_batch_size,
-                  .replay_batch_size = config_.recovery.hot_replay_batch_size,
-                  .read_timeout = config_.hot_consumer.read_timeout,
               },
       },
       *eviction_policy_);
@@ -243,27 +221,12 @@ bool Server::Initialize() {
 
   hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
       *hot_store_, hot::EvictionWorker::Config{.tick = config_.hot.eviction_tick});
-  resolver_pool_ = std::make_unique<consumer::ResolverPool>(
-      *queue_, *cold_store_, *cold_pool_, *consumer_rpc_, *apply_notifier_,
-      consumer::ResolverPool::Config{
-          .shard_count = hot_store_->shard_count(),
-          .consumer =
-              consumer::Resolver::Config{
-                  .replay_batch_size = config_.recovery.resolver_replay_batch_size,
-              },
-      });
 
   recovery_scheduler_ =
       std::make_unique<engine::BoundedThreadShardScheduler>(config_.recovery.replay_parallelism);
   recovery_coordinator_ = std::make_unique<engine::RecoveryCoordinator>(
-      *queue_, *resolver_pool_, *cold_pool_, *hot_pool_, *recovery_scheduler_,
-      engine::RecoveryConfig{
-          .replay_parallelism = config_.recovery.replay_parallelism,
-          .hot_replay_batch_size = config_.recovery.hot_replay_batch_size,
-          .cold_replay_batch_size = config_.recovery.cold_replay_batch_size,
-          .resolver_replay_batch_size = config_.recovery.resolver_replay_batch_size,
-          .replay_resolver = false,
-      });
+      *queue_, *cold_pool_, *hot_store_, *recovery_scheduler_,
+      engine::RecoveryConfig{.replay_parallelism = config_.recovery.replay_parallelism});
 
   auto identity = resp::NodeIdentity::Open(config_.queue.wal_path);
   if (!identity.has_value()) {
@@ -324,9 +287,7 @@ bool Server::Initialize() {
       .queue = queue_.get(),
       .hot_store = hot_store_.get(),
       .cold_store = cold_store_.get(),
-      .hot_pool = hot_pool_.get(),
       .cold_pool = cold_pool_.get(),
-      .resolver_pool = resolver_pool_.get(),
       .recovery_coordinator = recovery_coordinator_.get(),
       .node_identity = node_identity_.get(),
       .ready = [this] { return IsReady(); },
@@ -465,10 +426,9 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
 
   // Recovery is complete; start the cold consumers' steady-state tailing,
   // plus the eviction maintenance worker. The sequencer applies every
-  // write to hot itself, so neither the hot consumers nor the resolvers
-  // run past recovery: nothing else consumes the queue. The LOADING gate
-  // is STILL asserted here; it lifts only at the single kServing edge
-  // below.
+  // write to hot itself, so nothing else consumes the queue. The LOADING
+  // gate is STILL asserted here; it lifts only at the single kServing
+  // edge below.
   if (hot_eviction_worker_) hot_eviction_worker_->Start();
   if (cold_pool_) cold_pool_->Start();
 
@@ -598,8 +558,6 @@ void Server::Shutdown() {
     cold_pool_->Stop(
         std::chrono::duration_cast<std::chrono::milliseconds>(config_.cold_consumer.drain_grace));
   }
-  if (hot_pool_) hot_pool_->Stop();
-  if (resolver_pool_) resolver_pool_->Stop();
   // Every committing consumer has stopped, so this persist captures their
   // final offsets; a restart then replays only what was never committed.
   if (queue_) {

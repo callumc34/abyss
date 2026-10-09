@@ -58,10 +58,6 @@ class CountingColdStore : public core::ColdStore {
  public:
   explicit CountingColdStore(core::ColdStore& inner) : inner_(inner) {}
 
-  core::Result<core::RespValue> Exec(const ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override {
-    return inner_.Exec(op, deadline);
-  }
   core::Result<void> ApplyBatch(std::span<const ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
     return inner_.ApplyBatch(ops, highest_wal_seq);
@@ -76,6 +72,10 @@ class CountingColdStore : public core::ColdStore {
                                                           core::SteadyTime deadline) override {
     Note(deadline);
     ++loads;
+    if (hold_full_loads_) {
+      entered.Open();
+      release.Wait();
+    }
     return inner_.LoadKey(key, deadline);
   }
   core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
@@ -104,6 +104,8 @@ class CountingColdStore : public core::ColdStore {
 
   int Reads() const { return loads + probes + member_batches; }
   void HoldLoads() { hold_loads_ = true; }
+  // A write's: a read loads as its type.
+  void HoldFullLoads() { hold_full_loads_ = true; }
   // The budget the last read was given.
   core::SteadyClock::duration LastBudget() const {
     const std::scoped_lock lock(mu_);
@@ -126,6 +128,7 @@ class CountingColdStore : public core::ColdStore {
 
   core::ColdStore& inner_;
   std::atomic<bool> hold_loads_{false};
+  std::atomic<bool> hold_full_loads_{false};
   mutable std::mutex mu_;
   core::SteadyClock::duration last_budget_{};
 };
@@ -135,10 +138,6 @@ class CountingColdStore : public core::ColdStore {
 class OneBufferRouter : public consumer::CompactionBufferRouter {
  public:
   explicit OneBufferRouter(consumer::CompactionBuffer& buffer) : buffer_(buffer) {}
-  core::Result<core::RespValue> Exec(const ops::ReadOp& op,
-                                     std::optional<core::Duration> /*deadline*/) override {
-    return buffer_.Exec(op);
-  }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view key) const override {
     return buffer_.Snapshot(key);
@@ -241,7 +240,7 @@ class ReadPathFixture : public ::testing::Test {
   // Absorbed and unflushed.
   void Buffer(std::string_view key, const ops::WriteOp& op) {
     const core::SequenceId seq = ++seq_;
-    buffer_.Absorb(std::string(key), op, kEviction, seq, seq, static_cast<uint64_t>(NowMs()));
+    buffer_.Absorb(std::string(key), op, kEviction, seq, static_cast<uint64_t>(NowMs()));
   }
 
   core::Result<core::RespValue> Read(std::vector<std::string> args) {
@@ -266,7 +265,7 @@ class ReadPathFixture : public ::testing::Test {
   abyss::testing::TempDir dir_{"read_path"};
   std::unique_ptr<cold::backends::RocksdbStore> rocks_ = OpenCold(dir_);
   CountingColdStore cold_{*rocks_};
-  consumer::CompactionBuffer buffer_{clock_.SteadyFn(), clock_.WallFn()};
+  consumer::CompactionBuffer buffer_{clock_.SteadyFn()};
   OneBufferRouter router_{buffer_};
   ::testing::NiceMock<abyss::testing::MockQueue> queue_;
   hot::ShardedHotStore hot_{hot::ShardedHotStoreConfig{
@@ -638,7 +637,7 @@ TEST_F(ReadPathDefaultTest, ConcurrentScansOfOneColdSetLoadItOnce) {
                                [this] { return Describe(Read({"SMEMBERS", "set"}), true); }));
   }
   ASSERT_TRUE(cold_.entered.Wait());
-  // Every other reader waits on that load, in flight or as a placeholder.
+  // Every other reader joins that load in flight.
   ASSERT_TRUE(JoinedBy(loader_, kReaders - 1)) << loader_.JoinsForTesting() << " joined";
   cold_.release.Open();
   for (auto& scan : scans) {
@@ -686,6 +685,60 @@ TEST_F(ReadPathTest, AMissAfterADrainedWriteStartsItsOwnLoad) {
   const auto hot = hot_.Read(ops::ReadOp{ops::StringGet{.key = "k"}});
   ASSERT_TRUE(hot.result.has_value());
   EXPECT_EQ(Describe(hot.result), "$v2") << "pre-write state was made resident";
+}
+
+// A write's placeholder is a miss that buffer and cold answer: however
+// long the write's full load takes, a read never waits on it, nor
+// fills over it.
+TEST_F(ReadPathTest, AReadNeverWaitsOnAWritesLoad) {
+  Cold({ops::StringSet{.key = "k", .value = "v"},
+        ops::HashSet{.key = "h",
+                     .fields = {{.field = "f", .value = "1"}, {.field = "g", .value = "2"}}}});
+  Buffer("h", ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "9"}}});
+  const auto fills = [] {
+    using metrics::FillOutcome;
+    double total = 0;
+    for (const FillOutcome outcome :
+         {FillOutcome::kInstalled, FillOutcome::kDiscarded, FillOutcome::kSkippedBackpressure,
+          FillOutcome::kSkippedSize, FillOutcome::kSkippedEvictCap, FillOutcome::kFailed}) {
+      total += Fills(outcome);
+    }
+    return total;
+  };
+  const double filled = fills();
+  const auto write = [this](std::vector<std::string> args) {
+    return std::async(std::launch::async, [this, args = std::move(args)]() mutable {
+      return sequencer_.Execute(core::RespCommand{.args = std::move(args)},
+                                core::PredicateFlags::kNone);
+    });
+  };
+  cold_.HoldFullLoads();
+  std::future<core::Result<core::RespValue>> persist;
+  std::future<core::Result<core::RespValue>> hsetnx;
+  const abyss::testing::OnExit release([this] { cold_.release.Open(); });
+  persist = write({"PERSIST", "k"});
+  hsetnx = write({"HSETNX", "h", "x", "1"});
+  const auto until = core::SteadyClock::now() + 10s;
+  while (cold_.loads.load() < 2) {
+    ASSERT_LT(core::SteadyClock::now(), until) << "the writes never began their loads";
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_TRUE(hot_.LoadPending("k") && hot_.LoadPending("h"));
+
+  EXPECT_EQ(Describe(Read({"GET", "k"})), "$v");
+  EXPECT_LE(cold_.LastBudget(), ReadPathConfig{}.cold_read_deadline) << "a point read's deadline";
+  EXPECT_EQ(DescribePairs(Read({"HGETALL", "h"})), "{f=9,g=2}");
+  EXPECT_EQ(fills(), filled);
+  EXPECT_EQ(loader_.JoinsForTesting(), 0U);
+  EXPECT_TRUE(hot_.LoadPending("k"));
+  EXPECT_TRUE(hot_.LoadPending("h"));
+
+  cold_.release.Open();
+  ASSERT_EQ(persist.wait_for(10s), std::future_status::ready);
+  ASSERT_EQ(hsetnx.wait_for(10s), std::future_status::ready);
+  EXPECT_EQ(Describe(persist.get()), ":0");
+  EXPECT_EQ(Describe(hsetnx.get()), ":1");
+  EXPECT_EQ(DescribePairs(Read({"HGETALL", "h"})), "{f=9,g=2,x=1}");
 }
 
 TEST_F(ReadPathTest, NoFillPastTheBackpressureLimit) {

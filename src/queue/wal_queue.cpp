@@ -812,9 +812,8 @@ core::Result<core::SequenceId> WalQueue::OldestRetained(core::ShardId shard) {
 
 core::Result<core::SequenceId> WalQueue::TailSeq(core::ShardId shard) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  // next_seq is the next seq to assign; the highest assigned (matching
-  // what a consumer's HighestSettledSeq will reach once caught up) is
-  // one less, and 0 when nothing was.
+  // next_seq is the next seq to assign; the highest assigned is one
+  // less, and 0 when nothing was.
   return streams_[shard]->next_seq() - 1;
 }
 

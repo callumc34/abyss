@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
     };
     abyss::core::ops::WriteOp op = set_op;
     const auto seq = abyss::core::kFirstSeq + static_cast<abyss::core::SequenceId>(i);
-    buffer.Absorb(key, op, abyss::core::EvictionTTL{86400}, seq, seq, 0);
+    buffer.Absorb(key, op, abyss::core::EvictionTTL{86400}, seq, 0);
   }
 
   auto cfg = abyss::perf::probe::MakeRunLoopConfig(args, mix);
@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
   // Every key was preloaded, so a miss is a failed read.
   abyss::perf::OpFn op_fn = [&](int /*worker_id*/, std::string_view /*op_name*/,
                                 uint64_t key_index) {
-    return buffer.Read(KeyFor(key_index)).has_value();
+    return buffer.Snapshot(KeyFor(key_index)).has_value();
   };
 
   const auto result = abyss::perf::RunLoop(cfg, op_fn);

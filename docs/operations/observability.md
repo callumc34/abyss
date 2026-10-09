@@ -25,7 +25,6 @@
 
 - `abyss_cold_consumer_lag_entries` — entries between cold consumer position and queue head
 - `abyss_cold_buffer_oldest_entry_age_seconds` — age of the oldest un-flushed buffer entry. **This is the most critical metric.** It directly indicates cold gap risk.
-- `abyss_hot_consumer_seq` — hot consumer's current sequence position
 - `abyss_cold_consumer_seq` — cold consumer's current sequence position (reflects latest entry read into buffer, not latest entry flushed to cold)
 
 ### Counters
@@ -34,7 +33,7 @@
 - `abyss_misses_total` — read misses (key not found in any tier)
 - `abyss_queue_appended_total` — total entries appended to queue
 - `abyss_wal_backpressure_waits_total` — appends that waited for a WAL flush because the durability window was full
-- `abyss_wal_backpressure_rejections_total` — appends rejected after waiting `engine.write_timeout` for the durability window
+- `abyss_wal_backpressure_rejections_total` — appends rejected after waiting `engine.write_timeout_ms` for the durability window
 - `abyss_queue_offset_persist_failures_total` — committed-offset checkpoint writes that failed; retried on the next round
 - `abyss_queue_read_out_of_range_total` — queue reads below the first retained entry
 - `abyss_wal_spare_waits_total` — appends that found no prepared segment ready and waited for one (a full disk, or the preparer behind)
@@ -44,16 +43,20 @@
 - `abyss_cold_flush_total{status="success|failure"}` — cold consumer flush operations
 - `abyss_cold_flush_reason_total{reason="quiet|deadline|pressure"}` — flush trigger reason
 - `abyss_cold_flush_batch_size` (histogram) — number of keys per flush batch
+- `abyss_cold_drain_truncated_total` — graceful shutdown drains that stopped before the compaction buffer emptied: the drain hit `cold_consumer.drain_grace_seconds`, or a flush made no progress. Nothing is lost: the rest replays from the WAL at the next start. A non-zero count means the drain budget is too small for what the buffer holds at shutdown, and the next start replays further.
 - `abyss_ttl_expired_total{tier="hot|cold"}` — TTL expirations by tier. On cold, only the TTL scanner's deletes count: reads never delete.
 - `abyss_cold_apply_type_conflicts_total` — logged SADD, HSET or ZADD effects that found their key holding another type in cold. Any increase means the write path and cold disagree (see [failure-modes.md](failure-modes.md)).
-- `abyss_evicted_total` — keys evicted from hot (moved to cold-only)
+- `abyss_evicted_total` — keys evicted from hot by their eviction deadline (moved to cold-only)
+- `abyss_hot_memory_evicted_total` — keys the eviction worker's memory-pressure pass evicted, least recently used first, to bring each shard down to its budget (`hot.max_memory_bytes` ÷ `hot.shard_count`) before their eviction deadline. A tier transition, counted apart from deadline evictions; a steady rate means hot is smaller than the working set.
 - `abyss_hot_fills_total{outcome="installed|discarded|skipped_backpressure|skipped_size|skipped_evict_cap|failed"}` — cache fills on read misses: installed; discarded because a write overtook the load; skipped because the shard was over its backpressure limit, the key is over `hot.fill_max_fraction` of a shard's budget, or evicting one maintenance hold's worth (64 keys or 1 ms) did not make room for it; or failed to load from cold
 - `abyss_hot_maintenance_hold_seconds{pass="tombstones|parked|ttl|deadline|memory"}` (histogram) — how long one hold of a hot maintenance pass kept a shard exclusively. Every pass examines at most 64 keys or runs for about 1 ms per hold, then lets writers and readers in, so this should stay near or below 1 ms whatever the keyspace size. `parked` releases keys that were due but waited for cold to drain them.
 - `abyss_hot_rehash_seconds` (histogram) — time an insert spent rehashing a shard's entry map under that shard's exclusive lock; its count is the number of rehashes. The map is sized at startup for `hot.max_memory_bytes` at 512 bytes per key, so a steady workload should show none; a rising count means keys are smaller than that and each rehash stalls the shard (#186).
 - `abyss_hot_expiry_sweep_seconds` (histogram) — time for the TTL pass to reach every key that was past its TTL when its sweep began. The pass gets a quarter of each `hot.eviction_tick_ms`; a sweep longer than a tick means expired keys are accumulating faster than they are reclaimed.
-- `abyss_hot_backpressure_waits_total` — writes that waited for cold to drain because a hot shard was over `hot.max_memory_bytes` × `hot.backpressure_ratio`
-- `abyss_hot_backpressure_rejections_total` — writes rejected with `-OOM` after waiting `engine.write_timeout` for cold to drain (see [failure-modes.md](failure-modes.md))
-- `abyss_sequencer_redecides_total{reason="admission|spare|load|backpressure"}` — writes decided again: the durability window was full, no spare WAL segment was ready, a load was overtaken by a write, or a shard was over its memory limit. Each is bounded by `engine.write_timeout`.
+- `abyss_hot_backpressure_waits_total` — writes that waited for cold to drain because their hot shard was over its budget (`hot.max_memory_bytes` ÷ `hot.shard_count`) × `hot.backpressure_ratio`. The limit is per shard, so under skew one shard can wait, and reject with `-OOM`, while `abyss_hot_memory_bytes` is under `abyss_hot_max_memory_bytes`.
+- `abyss_hot_backpressure_rejections_total` — writes rejected with `-OOM` after waiting `engine.write_timeout_ms` for cold to drain (see [failure-modes.md](failure-modes.md))
+- `abyss_sequencer_redecides_total{reason="admission|spare|load|backpressure"}` — writes decided again: the durability window was full, no spare WAL segment was ready, a load was overtaken by a write, or a shard was over its memory limit. Each is bounded by `engine.write_timeout_ms`.
+- `abyss_hot_stub_drops_total` — stubs of evicted keys dropped, least recently written first, past the stub cap set by `hot.stub_memory_fraction`. Without its stub, `EXISTS`, `TYPE` or `DEL` on an evicted key loads it from cold.
+- `abyss_hot_load_discards_total` — loads of a non-resident key thrown away because a write or FLUSHDB replaced the key's load token while the load ran
 - `abyss_sequencer_locked_copy_bytes_total` — bytes of written values (string values, members, fields) copied into log entries while hot shard locks were held. Arguments over 16 KiB, or every argument of a request over 16 KiB, are copied before the locks, so large writes add nothing; `COPY` and `RENAMENX` of a large key do, since they rebuild it from hot.
 
 ### Cold-store active TTL expiry
@@ -82,7 +85,9 @@ Gauges:
 ### Gauges
 
 - `abyss_hot_memory_bytes` — hot store memory usage
+- `abyss_hot_max_memory_bytes` — the configured hot memory budget, `hot.max_memory_bytes`; 0 means unlimited. Each shard's budget is this ÷ `hot.shard_count`.
 - `abyss_hot_keys` — number of keys in hot store
+- `abyss_hot_stub_entries` — stubs hot holds for evicted keys (type, absolute TTL and latest seq, about 80 bytes plus the key each), counted in `abyss_hot_memory_bytes`
 - `abyss_hot_negative_entries` — keys hot holds as known absent after a read found them in neither buffer nor cold, a negative cache bounded by `hot.negative_max_entries`
 - `abyss_hot_unevictable_bytes` — hot bytes held for cold: keys due for TTL or idle eviction that cold has not yet drained, or every live byte once a memory-pressure walk found nothing it could evict
 - `abyss_cold_disk_bytes` — cold store disk usage
@@ -98,6 +103,21 @@ Gauges:
 - `abyss_wal_ring_bytes` — memory held by the per-shard offset rings, allocated at start: 16 bytes × `queue.ring_entries` × shard count. The `WAL opened` log line states the same figure.
 - `abyss_cold_buffer_entries` — number of keys in compaction buffer
 - `abyss_cold_buffer_bytes` — estimated memory usage of compaction buffer
+- `abyss_cold_flush_heap_depth` — live entries in the compaction buffer's flush heap, which orders keys by when they are due to flush. Its entries are charged to `abyss_cold_buffer_bytes`, so heap growth (keys whose quiet deadline keeps sliding) shows as buffer pressure rather than accumulating unseen.
+- `abyss_server_lifecycle_state` — the server's lifecycle state: `0` initializing, `1` recovering, `2` serving, `3` draining, `4` stopped. Clients get `LOADING` in every state but serving, so this is the one signal for whether the data plane is open.
+
+### Recovery
+
+Recovery is one scan of the log that feeds each shard's cold consumer and the hot replayer ([ADP-007](../design/proposals/007-recovery.md)).
+
+- `abyss_recovery_phase` (gauge) — `0` queue_open, `1` cold_hot_replay, `2` complete. The numbering changed when the resolver phase was removed; dashboards that matched `3` for complete must match `2`.
+- `abyss_recovery_cold_entries_replayed` / `abyss_recovery_cold_entries_target` (gauges) — entries cold drains during recovery, from its committed offset to the end of the log, all shards
+- `abyss_recovery_hot_entries_replayed` / `abyss_recovery_hot_entries_target` (gauges) — log entries the hot replayer applied or skipped, from each shard's first retained seq to its durable end, all shards. Recovery fails unless every shard's count matches.
+- `abyss_recovery_hot_skipped_frames_total` (counter) — replayed entries hot left to the buffer and cold: an effect that does not replace its key's state, on a key the rebuild does not hold. Normal after retention reclaims a key's earlier frames; not an error.
+- `abyss_recovery_cold_drain_requests_total` (counter) — times the hot replayer, with a shard at its `hot.backpressure_ratio` limit and nothing it could evict, made the shard's cold consumer flush its buffer. Zero on a healthy log; non-zero means cold's drained seq lagged the scan (see [failure-modes.md](failure-modes.md#recovery-failures)).
+- `abyss_recovery_duration_seconds` (gauge) — elapsed time of the recovery run
+
+**Removed.** `abyss_hot_consumer_seq` went with the hot consumer: the sequencer applies each write to hot under the shard lock, so hot has no position behind the log. `abyss_recovery_resolver_entries_replayed` and `abyss_recovery_resolver_entries_target` went with recovery's resolver phase, and `abyss_resolver_durable_wait_timeouts_total` with the resolver: the sequencer decides each conditional write before it is logged, and replay re-decides nothing.
 
 ### TCP server
 
@@ -132,7 +152,7 @@ Always returns `200 OK` with body `ok\n` once the listener is up. The fact that 
 Returns `200 OK` only when **all** of the following hold:
 
 - The RESP TCP listener is bound and accepting traffic.
-- Recovery is complete (queue is no longer in `IsRecovering` state and every hot consumer has caught up to its ready watermark).
+- Recovery is complete (the recovery scan has rebuilt hot and cold to the end of the log, and the cold consumers and eviction worker are running).
 - The server is not in `shutting_down` state.
 
 Otherwise returns `503 Service Unavailable`. The body is plain text key:value pairs naming each condition's truth value, so an operator can see at a glance which check failed:
@@ -155,7 +175,7 @@ Returns a JSON document with the live operational state of the process. Content-
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "abyss":   { "version": "0.1.0", "build": { "commit": "abc1234", "date": "2026-05-03T12:34:56Z" } },
   "server":  { "node_id": "...", "started_at_unix_ms": 1714742400000,
                "uptime_seconds": 3600, "process_id": 12345,
@@ -175,13 +195,14 @@ Returns a JSON document with the live operational state of the process. Content-
   "cold":  { "backend": "builtin_rocksdb", "key_count": 0,
              "buffer": { "entries": 0, "bytes": 0 } },
   "consumers": {
-    "hot":      { "highest_settled_seq_min": 0, "highest_settled_seq_max": 0 },
-    "cold":     { "last_commit_seq_min": 0, "last_commit_seq_max": 0 },
-    "resolver": { "last_commit_seq_min": 0, "last_commit_seq_max": 0,
-                  "cache_entries": 0, "cache_bytes": 0 }
+    "cold":     { "last_commit_seq_min": 0, "last_commit_seq_max": 0 }
   },
   "lag":     { "cold_max_entries": 0 },
   "connections": { "active": 0 },
+  "recovery": { "phase": "complete",
+                "cold_entries_replayed": 0, "cold_entries_target": 0,
+                "hot_entries_replayed": 0, "hot_entries_target": 0,
+                "elapsed_ms": 0 },
   "cluster": null
 }
 ```
@@ -198,8 +219,9 @@ These invariants govern any change to the `/status` payload across releases. Bum
 
 #### Field semantics
 
-- `schema_version` — bumps only when an invariant above is broken. Today: `4`.
-  - Version 4 removed `lag.hot_max_entries` and `lag.resolver_max_entries`: hot and the resolver consume only during recovery, so behind the tail they grew without bound.
+- `schema_version` — bumps only when an invariant above is broken. Today: `5`.
+  - Version 5 removed `consumers.hot` (`highest_settled_seq_{min,max}`), `consumers.resolver` (`last_commit_seq_{min,max}`, `cache_entries`, `cache_bytes`) and `recovery.resolver_entries_{replayed,target}`, and dropped `resolver_replay` from `recovery.phase`. The sequencer applies each write to hot as it decides it, so there is no hot consumer position or settled floor to report, and decide-then-log removed the resolver and its existence cache.
+  - Version 4 removed `lag.hot_max_entries` and `lag.resolver_max_entries`: hot and the resolver then consumed only during recovery, so behind the tail they grew without bound.
   - Version 3 replaced `config.fsync_policy` with `config.durability` (`process_crash` or `power_loss`).
   - Version 2 renamed `queue.tail_seq` to `queue.first_seq`, which now reports the lowest readable sequence across shards. It also renamed `consumers.{cold,resolver}.last_ack_seq_{min,max}` to `last_commit_seq_{min,max}`, following the queue's move from acknowledgements to committed offsets.
 - `queue.unflushed_bytes` / `queue.durability_lag_ms` — the same values as `abyss_wal_unflushed_bytes` and `abyss_wal_durability_lag_seconds`, at snapshot time.
@@ -208,6 +230,8 @@ These invariants govern any change to the `/status` payload across releases. Bum
 - `server.role` — `"master"` or `"replica"`. Phase 1 always emits `"master"`.
 - `consumers.*.{seq}_min` / `_max` — per-shard min and max of the corresponding sequence positions. Equal values mean uniform progress across shards; divergence indicates shard skew.
 - `lag.*_max_entries` — worst-case lag across shards (newest assigned seq − consumer seq), in queue entries.
+- `recovery.phase` — `queue_open`, `cold_hot_replay` or `complete`, as `abyss_recovery_phase` reports it.
+- `recovery.{cold,hot}_entries_{replayed,target}` — the recovery progress gauges below, at snapshot time. The hot pair counts log entries the hot replayer applied or skipped, from each shard's first retained seq to its durable end.
 - `cluster` — reserved for Phase 2; populated with `slots_owned`, `peers`, `epoch` when cluster mode lands.
 
 
@@ -326,7 +350,7 @@ class FlushEngine {
 - `abyss_cold_ttl_disk_pressure_active == 1` — the cold-store filesystem has crossed `disk_pressure_threshold` and the TTL scanner has switched to maximum aggression. Sustained pressure means provisioning is underspec'd or the cold consumer is producing more than active expiry can reclaim.
 - `rate(abyss_cold_ttl_deleted_total[5m]) == 0 AND abyss_cold_keys > 0` — scanner is alive but reclaiming nothing. Either the workload genuinely has no expiring keys (benign) or the scanner is failing silently (investigate logs at component `abyss.cold.ttl_scanner`).
 - `increase(abyss_queue_offset_persist_failures_total[5m]) > 0` — the committed-offset checkpoint could not be written. Persisted offsets stay where they were, so the next restart replays further and retention cannot advance; nothing acknowledged is lost. Check the WAL volume for space and I/O errors.
-- A pod restarting repeatedly (Kubernetes `CrashLoopBackOff`) after a CRITICAL `fatal invariant breach; terminating` log line means an unrecoverable invariant breach. The process aborts deliberately, so no metric survives to be scraped; the log line names the cause. A retention consumer reading below the first retained WAL entry is one such breach: entries above its persisted offset were reclaimed, so the process stops instead of skipping data, and the line names the consumer, shard and positions. `abyss_queue_read_out_of_range_total` counts the out-of-range reads a live process survives, which are hot-consumer resets to the oldest entry, expected after a restart.
+- A pod restarting repeatedly (Kubernetes `CrashLoopBackOff`) after a CRITICAL `fatal invariant breach; terminating` log line means an unrecoverable invariant breach. The process aborts deliberately, so no metric survives to be scraped; the log line names the cause. A retention consumer reading below the first retained WAL entry is one such breach: entries above its persisted offset were reclaimed, so the process stops instead of skipping data, and the line names the consumer, shard and positions. `abyss_queue_read_out_of_range_total` counts every out-of-range read. The cold consumer is the only built-in reader that reads by position, and it stops on one, so a running node should not see it rise.
 - `increase(abyss_queue_reaper_failures_total[15m]) > 0` — the segment reaper could not delete a sealed segment it was entitled to reclaim. One failure is usually a transient filesystem error and the reaper retries; a sustained rate means WAL disk will grow without bound even though every retention consumer's persisted committed offset is past those segments. Check filesystem permissions and free inodes on the WAL volume. Pair this with the age gauge below — failures alone do not say how much reclamation is being lost.
-- `abyss_queue_oldest_eligible_unreaped_age_seconds > 3 * min_retention_seconds` — a segment has been eligible for reclamation for far longer than the retention floor and is still on disk. This is the symptom that matters for disk exhaustion; the failure counter above is one cause. Reclamation is oldest-first per log, so if this climbs while the failure counter is flat, an earlier segment is pinned: some shard on that log has a retention consumer (cold or the resolver) whose persisted offset is not moving. Find it from per-shard consumer lag and the poison counters before restarting anything; a restart does not unpin it.
+- `abyss_queue_oldest_eligible_unreaped_age_seconds > 3 * min_retention_seconds` — a segment has been eligible for reclamation for far longer than the retention floor and is still on disk. This is the symptom that matters for disk exhaustion; the failure counter above is one cause. Reclamation is oldest-first per log, so if this climbs while the failure counter is flat, an earlier segment is pinned: some shard on that log has a cold consumer, the only retention consumer, whose persisted offset is not moving. Find it from per-shard consumer lag and the poison counters before restarting anything; a restart does not unpin it.
 - `increase(abyss_cold_unsupported_op_total[1h]) > 0` — the log contains write entries this build has no parser for. Live traffic cannot produce these (see [failure-modes.md](failure-modes.md) §poison quarantine), so a non-zero value means the data directory carries entries from a binary with a wider command surface: a downgrade, a mixed-version rollout, or a restore from a newer node. Those writes are absent from both tiers. Treat as a correctness investigation, not a capacity one.

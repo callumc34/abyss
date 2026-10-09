@@ -15,15 +15,14 @@ namespace abyss::consumer {
 
 ColdConsumerPool::ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
                                    const core::EvictionPolicy& eviction_policy,
-                                   core::ConsumerRpc& rpc, const core::SteadyClockFn& steady_clock,
-                                   const core::WallClockFn& wall_clock) {
+                                   const core::SteadyClockFn& steady_clock) {
   if (config.shard_count == 0) {
     throw std::invalid_argument("ColdConsumerPool requires shard_count >= 1");
   }
   consumers_.reserve(config.shard_count);
   for (uint32_t shard = 0; shard < config.shard_count; ++shard) {
-    consumers_.push_back(std::make_unique<ColdConsumer>(
-        queue, cold_store, shard, config.consumer, eviction_policy, rpc, steady_clock, wall_clock));
+    consumers_.push_back(std::make_unique<ColdConsumer>(queue, cold_store, shard, config.consumer,
+                                                        eviction_policy, steady_clock));
   }
 }
 
@@ -68,28 +67,6 @@ bool ColdConsumerPool::IsRunning() const {
   return false;
 }
 
-core::Result<core::RespValue> ColdConsumerPool::Exec(const core::ops::ReadOp& op,
-                                                     std::optional<core::Duration> /*deadline*/) {
-  if (const auto* exists = std::get_if<core::ops::Exists>(&op)) {
-    int64_t total = 0;
-    for (auto key : exists->keys) {
-      auto sub = consumers_[ShardForKey(key)]->Buffer().Exec(
-          core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
-      if (!sub.has_value()) {
-        if (sub.error().code() == core::ErrorCode::kNotFound) continue;
-        return std::unexpected(sub.error());
-      }
-      total += sub->AsInteger();
-    }
-    return core::RespValue::Integer(total);
-  }
-  const auto key = core::ops::PrimaryKey(op);
-  if (key.empty()) {
-    return std::unexpected(core::Error(core::ErrorCode::kInternal, "empty primary key"));
-  }
-  return consumers_[ShardForKey(key)]->Buffer().Exec(op);
-}
-
 std::optional<CompactedState> ColdConsumerPool::Snapshot(core::ShardId shard,
                                                          std::string_view key) const {
   if (shard >= consumers_.size() || ShardForKey(key) != shard) {
@@ -102,7 +79,7 @@ bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId t
                                          std::chrono::milliseconds timeout) {
   if (shard >= consumers_.size()) return false;
   // Signal-driven wait on the owning consumer — the drain loop wakes us when it
-  // advances past the target, so a hot-miss read never busy-polls the reactor.
+  // advances past the target, so a waiting write never busy-polls.
   return consumers_[shard]->WaitForDrainedSeq(target_seq, timeout);
 }
 

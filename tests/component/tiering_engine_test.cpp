@@ -31,10 +31,6 @@ using namespace std::chrono_literals;
 class SingleBufferRouter : public consumer::CompactionBufferRouter {
  public:
   explicit SingleBufferRouter(consumer::CompactionBuffer& buffer) : buffer_(buffer) {}
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
-                                     std::optional<core::Duration> /*deadline*/) override {
-    return buffer_.Exec(op);
-  }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view key) const override {
     return buffer_.Snapshot(key);
@@ -82,7 +78,7 @@ class TieringEngineTest : public ::testing::Test {
 
   // Writes through the engine, so hot holds the key as decided.
   void Seed(TieringEngine& engine, std::initializer_list<std::string> args) {
-    auto written = engine.DispatchWrite(*args.begin(), MakeCmd(args));
+    auto written = engine.DispatchWrite(*args.begin(), MakeCmd(args), core::PredicateFlags::kNone);
     ASSERT_TRUE(written.has_value()) << written.error().message();
     ASSERT_FALSE(written->IsError()) << written->AsString();
   }
@@ -94,7 +90,8 @@ class TieringEngineTest : public ::testing::Test {
 
 TEST_F(TieringEngineTest, WriteGoesThroughTheSequencer) {
   auto engine = MakeEngine();
-  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  auto result =
+      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
 
@@ -110,7 +107,8 @@ TEST_F(TieringEngineTest, WriteGoesThroughTheSequencer) {
 TEST_F(TieringEngineTest, WriteDecideErrorLogsNothing) {
   auto engine = MakeEngine();
   ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "key", "v"}));
-  auto result = engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}));
+  auto result =
+      engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}), core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kWrongType);
   EXPECT_EQ(queue_.Published(ShardOf("key")).size(), 1U);
@@ -121,7 +119,8 @@ TEST_F(TieringEngineTest, WriteReserveFailureAppliesNothing) {
   queue_.SetReserveFault([](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
     return core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"};
   });
-  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  auto result =
+      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
   EXPECT_TRUE(queue_.Published(ShardOf("key")).empty());
@@ -133,7 +132,8 @@ TEST_F(TieringEngineTest, WriteReserveFailureAppliesNothing) {
 TEST_F(TieringEngineTest, WriteDurableFailurePropagates) {
   auto engine = MakeEngine();
   queue_.FailDurable(core::Error{core::ErrorCode::kInternal, "fsync failed"});
-  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  auto result =
+      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
 }
@@ -143,7 +143,8 @@ TEST_F(TieringEngineTest, WriteDurableTimeoutRepliesWithTheTimeoutText) {
   TieringEngine engine(reads_, fast);
   queue_.HoldDurable();
   const testing::OnExit release([this] { queue_.ReleaseDurable(); });
-  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  auto result =
+      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
   EXPECT_TRUE(result.error().message().starts_with("write durable wait exceeded server timeout"))
@@ -159,7 +160,7 @@ TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
   auto engine = MakeEngine();
   ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "a", "from_hot"}));
   buffer_.Absorb("b", core::ops::WriteOp{core::ops::StringSet{.key = "b", .value = "from_buf"}},
-                 core::EvictionTTL{86400}, 1, 1, 0);
+                 core::EvictionTTL{86400}, 1, 0);
 
   // Only c and d read cold: a hits hot, and b's delta is its whole state.
   using LoadAsResult = core::Result<std::optional<core::LoadedAs>>;
@@ -197,9 +198,9 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
   auto engine = MakeEngine();
   // Buffer holds a SET then a DEL — tombstone state for "k".
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                 core::EvictionTTL{86400}, 1, 1, 0);
+                 core::EvictionTTL{86400}, 1, 0);
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, core::EvictionTTL{86400},
-                 1, 1, 0);
+                 1, 0);
 
   // Hot has no record; cold is never consulted because the buffer's
   // tombstone decides.

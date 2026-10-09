@@ -24,13 +24,8 @@ core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*t
 }
 
 core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
-                                                           core::RespCommand cmd) {
-  return sequencer_.Execute(std::move(cmd), core::PredicateFlags::kNone);
-}
-
-core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_view /*name*/,
-                                                                 core::RespCommand cmd,
-                                                                 core::PredicateFlags flags) {
+                                                           core::RespCommand cmd,
+                                                           core::PredicateFlags flags) {
   return sequencer_.Execute(std::move(cmd), flags);
 }
 

@@ -20,7 +20,6 @@
 #include <variant>
 #include <vector>
 
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
@@ -35,6 +34,10 @@
 
 namespace abyss::queue {
 namespace {
+
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
+constexpr core::ConsumerId kOtherConsumer = 2;
 
 using namespace std::chrono_literals;
 
@@ -145,7 +148,7 @@ class WalQueueTest : public ::testing::Test {
         .shard_count = 2,
         .durability = core::Durability::kPowerLoss,
         .min_retention = 1s,
-        .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+        .retention_consumers = {kTestConsumer, core::kColdConsumer},
         // Long enough that only FlushOffsets or teardown persists.
         .offset_fsync_interval = std::chrono::hours{1},
     };
@@ -395,7 +398,7 @@ TEST_F(WalQueueTest, ReadBelowReclaimedFloorIsOutOfRange) {
   OpenWith(cfg);
   AppendDurable(20);
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst + 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, kFirst + 19).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 19).has_value());
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
@@ -426,7 +429,7 @@ TEST_F(WalQueueTest, FirstSeqTracksTheOldestRetainedSegment) {
   AppendDurable(20);
   EXPECT_EQ(queue_->FirstSeq(0).value(), kFirst) << "nothing committed, nothing reclaimed";
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst + 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, kFirst + 19).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst + 19).has_value());
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
@@ -841,10 +844,10 @@ TEST_F(WalQueueTest, CommitOffsetRejectsRegressionAndNonRetentionConsumers) {
   ASSERT_FALSE(regress.has_value());
   EXPECT_EQ(regress.error().code(), core::ErrorCode::kInvalidArgument);
 
-  auto stranger = queue_->CommitOffset(core::kResolverConsumer, 0, 1);
+  auto stranger = queue_->CommitOffset(kOtherConsumer, 0, 1);
   ASSERT_FALSE(stranger.has_value());
   EXPECT_EQ(stranger.error().code(), core::ErrorCode::kInvalidArgument);
-  EXPECT_FALSE(queue_->CommittedOffset(core::kResolverConsumer, 0).has_value());
+  EXPECT_FALSE(queue_->CommittedOffset(kOtherConsumer, 0).has_value());
 }
 
 // QUEUE-2: a committed offset cannot pass the power-durable log, even
@@ -912,7 +915,7 @@ TEST_F(WalQueueTest, CleanCloseCheckpointsCommittedOffsets) {
 
   OpenWith(DefaultConfig());
   EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 0).value(), std::optional<uint64_t>{1});
-  EXPECT_EQ(queue_->CommittedOffset(core::kHotConsumer, 0).value(), std::nullopt);
+  EXPECT_EQ(queue_->CommittedOffset(kTestConsumer, 0).value(), std::nullopt);
 }
 
 TEST_F(WalQueueTest, CrashResumesFromLastPersistedOffset) {
@@ -941,10 +944,10 @@ TEST_F(WalQueueTest, ReaperHonoursPersistedNotCommittedOffsets) {
   OpenWith(cfg);
   AppendDurable(20);
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 2).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, 2).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 2).has_value());
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 9).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, 9).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 9).has_value());
 
   // A persist that fails sweeps nothing, whatever was committed.
@@ -971,7 +974,7 @@ TEST_F(WalQueueTest, OldestRetainedTracksPersistedOffsets) {
   OpenWith(DefaultConfig());
   AppendDurable(3);
 
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst + 1).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, kFirst + 1).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst).has_value());
   EXPECT_EQ(queue_->OldestRetained(0).value(), kFirst) << "nothing persisted: FirstSeq";
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
@@ -1065,7 +1068,7 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
       if (auto end = queue_->DurableEnd(0, core::Durability::kPowerLoss);
           end.has_value() && *end > kFirst) {
         EXPECT_TRUE(
-            queue_->CommitOffset(core::kHotConsumer, 0, std::min(next - 1, *end - 1)).has_value());
+            queue_->CommitOffset(kTestConsumer, 0, std::min(next - 1, *end - 1)).has_value());
       }
       return true;
     };
@@ -1165,7 +1168,7 @@ TEST_F(WalQueueTest, LaggingConsumerKeepsOldSegmentsAlive) {
 
   // Hot caught up; cold is far behind. Segments must stay because cold hasn't
   // committed past them.
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, 19).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 1).has_value());
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
 
@@ -1189,7 +1192,7 @@ TEST_F(WalQueueTest, PersistedCommitAcrossRotationReclaimsOldSegments) {
   ASSERT_GT(sealed_before.size(), 0U);
 
   // Both consumers catch up past the sealed segments.
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, 19).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, 19).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, 19).has_value());
   EXPECT_EQ(queue_->ListSealedSegments().size(), sealed_before.size())
       << "reclaimed before the commit was persisted";
@@ -1207,7 +1210,7 @@ TEST_F(WalQueueTest, ActiveSegmentNeverDeleted) {
   cfg.min_retention = 0s;
   OpenWith(cfg);
   AppendDurable(1);
-  ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, 0, kFirst).has_value());
+  ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, 0, kFirst).has_value());
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, kFirst).has_value());
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
 
@@ -1279,46 +1282,6 @@ TEST_F(WalQueueTest, BeginAppendBatchPublishMakesEntriesVisible) {
   auto read = queue_->Read(0, kFirst, 10, 100ms, core::Durability::kProcessCrash);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->size(), 3U);
-}
-
-// Hangs or fails if Publish ever became visible to readers before Register.
-TEST_F(WalQueueTest, TwoPhaseWritePathEliminatesFulfillBeforeRegisterRace) {
-  OpenWith(DefaultConfig());
-  core::ConsumerRpc rpc;
-
-  constexpr int kWrites = 500;
-  std::atomic<bool> stop_consumer{false};
-
-  std::thread consumer([&]() {
-    core::SequenceId next = kFirst;
-    auto drain = [&]() -> bool {
-      auto read = queue_->Read(0, next, 32, 10ms, core::Durability::kProcessCrash);
-      if (!read.has_value() || read->empty()) return false;
-      for (auto& e : *read) {
-        EXPECT_EQ(e.seq, next++);
-        rpc.Fulfill(e.seq, core::RespValue::SimpleString("OK"));
-      }
-      return true;
-    };
-    while (!stop_consumer.load(std::memory_order_acquire)) (void)drain();
-    while (drain()) {
-    }
-  });
-
-  for (int i = 0; i < kWrites; ++i) {
-    auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "k", std::to_string(i)}));
-    ASSERT_TRUE(pending.has_value());
-    auto future = rpc.Register(pending->seq());
-    pending->Publish();
-
-    ASSERT_TRUE(pending->durable().get().has_value());
-    auto value = future.get();
-    EXPECT_TRUE(value.IsSimpleString());
-  }
-
-  stop_consumer.store(true, std::memory_order_release);
-  consumer.join();
-  EXPECT_EQ(rpc.PendingCount(), 0U);
 }
 
 // The closing frame of a batch never reached the disk, though the ones

@@ -17,9 +17,7 @@ bool IsArityError(const Decision& d) {
   return MessageOf(d).starts_with("wrong number of arguments for ");
 }
 
-bool IsWrite(resp::Dispatch dispatch) {
-  return dispatch == resp::Dispatch::kWritePath || dispatch == resp::Dispatch::kConditionalWrite;
-}
+bool IsWrite(resp::Dispatch dispatch) { return dispatch == resp::Dispatch::kWritePath; }
 
 // Decide keeps its own command table; it must agree with the registry,
 // which checks arity before a command reaches decide.

@@ -12,7 +12,6 @@
 
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/engine/loader.h"
@@ -67,20 +66,17 @@ class IntegrationHarness {
         .data_path = (tmp_dir_ / "cold").string(),
         .shard_count = kShardCount,
         .write_buffer_size_bytes = 1024UL * 1024UL,
-        .wall_clock = clock_.WallFn(),
         .log_clock = [this](core::ShardId shard) -> uint64_t {
           return cold_pool_ ? cold_pool_->LogClockMs(shard) : 0;
         },
     });
     cold_ = std::move(cold_result).value();
 
-    rpc_ = std::make_unique<core::ConsumerRpc>();
-
     InstallQueueMocks();
 
     cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
-        eviction_policy_, *rpc_, clock_.SteadyFn(), clock_.WallFn());
+        eviction_policy_, clock_.SteadyFn());
 
     loader_ = std::make_unique<engine::Loader>(*hot_, *cold_pool_, *cold_, clock_.WallFn());
     sequencer_ =
@@ -100,7 +96,6 @@ class IntegrationHarness {
     cold_pool_.reset();
     cold_.reset();
     hot_.reset();
-    rpc_.reset();
     std::filesystem::remove_all(tmp_dir_);
   }
 
@@ -117,7 +112,7 @@ class IntegrationHarness {
   core::Result<core::RespValue> SeedHot(std::initializer_list<std::string> args) {
     core::RespCommand cmd{.args = std::vector<std::string>(args)};
     return engine_->DispatchWrite(cmd.args.empty() ? std::string_view{} : cmd.args.front(),
-                                  std::move(cmd));
+                                  std::move(cmd), core::PredicateFlags::kNone);
   }
   consumer::ColdConsumerPool& ColdPool() { return *cold_pool_; }
   engine::Sequencer& Sequencer() { return *sequencer_; }
@@ -125,7 +120,6 @@ class IntegrationHarness {
     auto shard = core::ComputeShard(key, kShardCount);
     return cold_pool_->ConsumerFor(shard).Buffer();
   }
-  core::ConsumerRpc& Rpc() { return *rpc_; }
   TestClock& Clock() { return clock_; }
   ::testing::NiceMock<MockQueue>& Queue() { return queue_; }
 
@@ -153,7 +147,6 @@ class IntegrationHarness {
   std::unique_ptr<hot::ShardedHotStore> hot_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
-  std::unique_ptr<core::ConsumerRpc> rpc_;
   std::unique_ptr<engine::Loader> loader_;
   std::unique_ptr<engine::Sequencer> sequencer_;
   std::unique_ptr<engine::ReadPath> reads_;

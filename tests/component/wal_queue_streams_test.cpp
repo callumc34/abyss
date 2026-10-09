@@ -22,7 +22,6 @@
 #include <variant>
 #include <vector>
 
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
@@ -40,6 +39,9 @@
 
 namespace abyss::queue {
 namespace {
+
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
 
 using namespace std::chrono_literals;
 using abyss::testing::Latch;
@@ -76,7 +78,7 @@ class WalQueueStreamsTest : public ::testing::Test {
         .shard_count = shards,
         .durability = kAck,
         .min_retention = 0s,
-        .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+        .retention_consumers = {kTestConsumer, core::kColdConsumer},
         // Long enough that only FlushOffsets or teardown persists.
         .offset_fsync_interval = std::chrono::hours{1},
     };
@@ -106,7 +108,7 @@ class WalQueueStreamsTest : public ::testing::Test {
   // Both retention consumers commit `seq` on `shard`.
   void CommitBoth(core::ShardId shard, core::SequenceId seq) {
     ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, seq));
-    ASSERT_TRUE(queue_->CommitOffset(core::kHotConsumer, shard, seq).has_value());
+    ASSERT_TRUE(queue_->CommitOffset(kTestConsumer, shard, seq).has_value());
     ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, shard, seq).has_value());
   }
 
@@ -535,7 +537,7 @@ TEST_F(WalQueueStreamsTest, AGapBelowTheFirstRetainedFrameIsCorruption) {
     auto checkpoint = OffsetCheckpoint::Open(OffsetCheckpointConfig{
         .dir = dir_.Path() / "offsets",
         .shard_count = 1,
-        .consumers = {core::kHotConsumer, core::kColdConsumer},
+        .consumers = {kTestConsumer, core::kColdConsumer},
     });
     ASSERT_TRUE(checkpoint.has_value()) << checkpoint.error().message();
     const std::vector<uint64_t> low{OffsetCheckpoint::Encode(kFirst),
@@ -1155,6 +1157,9 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
   EXPECT_LT(SegmentsGrown() - grown_before, static_cast<double>(active + 1))
       << "no segment was recycled";
 
+  // The reopened queue's reaper must not reclaim between FirstSeq and
+  // the read below, or the read starts before the first retained frame.
+  config.min_retention = std::chrono::hours(1);
   OpenWith(config);
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     SCOPED_TRACE("shard " + std::to_string(shard));

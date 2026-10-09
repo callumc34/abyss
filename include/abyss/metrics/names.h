@@ -538,11 +538,6 @@ inline constexpr GaugeDesc<> kColdBufferOldestEntryAgeSeconds{
     .help = "Age of the oldest un-flushed compaction-buffer entry.",
 };
 
-inline constexpr GaugeDesc<> kHotConsumerSeq{
-    .name = "abyss_hot_consumer_seq",
-    .help = "Hot consumer current sequence position.",
-};
-
 inline constexpr GaugeDesc<> kColdConsumerSeq{
     .name = "abyss_cold_consumer_seq",
     .help = "Cold consumer current sequence position.",
@@ -921,38 +916,10 @@ inline constexpr GaugeDesc<> kColdTtlDiskPressureActive{
 // ---------------------------------------------------------------------------
 
 // Encoded as the underlying value of engine::RecoverySnapshot::Phase:
-// 0=queue_open, 1=resolver_replay, 2=cold_hot_replay, 3=complete.
+// 0=queue_open, 1=cold_hot_replay, 2=complete.
 inline constexpr GaugeDesc<> kRecoveryPhase{
     .name = "abyss_recovery_phase",
-    .help =
-        "Current recovery phase (0=queue_open, 1=resolver_replay, "
-        "2=cold_hot_replay, 3=complete).",
-};
-
-// Per-consumer counters live under separate metric names rather than a Tier
-// label because the resolver is not a tier and the closed Tier enum should
-// not be widened just for recovery observability.
-inline constexpr GaugeDesc<> kRecoveryResolverEntriesReplayed{
-    .name = "abyss_recovery_resolver_entries_replayed",
-    .help = "Live entries scanned by the resolver during recovery, all shards.",
-};
-
-inline constexpr GaugeDesc<> kRecoveryResolverEntriesTarget{
-    .name = "abyss_recovery_resolver_entries_target",
-    .help = "Total entries the resolver must scan during recovery, all shards.",
-};
-
-// Conditional-write durability pressure: the resolver could not confirm a
-// self-emitted Resolved's WAL fsync within its budget before fulfilling the
-// client (steady state) or before advancing the recovery commit past a re-decided
-// dangling. A non-zero rate means conditional acks are stalling/erroring on
-// durable-layer latency, not silently losing writes (the Resolved stays in the
-// WAL and applies on catch-up). Surfaces XDUR-2 / HOTC-5 (no silent degradation).
-inline constexpr CounterDesc<> kResolverDurableWaitTimeoutsTotal{
-    .name = "abyss_resolver_durable_wait_timeouts_total",
-    .help =
-        "Resolver self-emitted Resolved durability waits that timed out before "
-        "the conditional ack (steady-state) or the recovery commit barrier.",
+    .help = "Current recovery phase (0=queue_open, 1=cold_hot_replay, 2=complete).",
 };
 
 inline constexpr GaugeDesc<> kRecoveryColdEntriesReplayed{
@@ -967,12 +934,26 @@ inline constexpr GaugeDesc<> kRecoveryColdEntriesTarget{
 
 inline constexpr GaugeDesc<> kRecoveryHotEntriesReplayed{
     .name = "abyss_recovery_hot_entries_replayed",
-    .help = "Live entries settled by the hot consumer during recovery, all shards.",
+    .help = "Log entries the hot replayer applied or skipped during recovery, all shards.",
 };
 
 inline constexpr GaugeDesc<> kRecoveryHotEntriesTarget{
     .name = "abyss_recovery_hot_entries_target",
-    .help = "Total entries the hot consumer must settle during recovery, all shards.",
+    .help = "Log entries the hot replayer must apply or skip during recovery, all shards.",
+};
+
+inline constexpr CounterDesc<> kRecoveryHotSkippedFramesTotal{
+    .name = "abyss_recovery_hot_skipped_frames_total",
+    .help =
+        "Replayed log entries hot left to buffer and cold: a partial effect on a key "
+        "it does not hold.",
+};
+
+inline constexpr CounterDesc<> kRecoveryColdDrainRequestsTotal{
+    .name = "abyss_recovery_cold_drain_requests_total",
+    .help =
+        "Times recovery made cold flush its buffer because hot reached its backpressure "
+        "limit with nothing it could evict.",
 };
 
 inline constexpr GaugeDesc<> kRecoveryDurationSeconds{

@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "abyss/consumer/cold_consumer.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
@@ -47,7 +46,6 @@ class ColdConsumerPoolWaitTest : public ::testing::Test {
   NiceMock<testing::MockColdStore> cold_;
   testing::TestClock clock_;
   core::EvictionPolicy policy_{core::EvictionTTL{3600}};
-  core::ConsumerRpc rpc_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
   std::unique_ptr<ColdConsumerPool> MakePool(uint32_t shard_count = 2) {
@@ -55,7 +53,7 @@ class ColdConsumerPoolWaitTest : public ::testing::Test {
         queue_, cold_,
         ColdConsumerPool::Config{.shard_count = shard_count,
                                  .consumer = ColdConsumer::Config{.rng_seed = 42}},
-        policy_, rpc_, clock_.SteadyFn(), clock_.WallFn());
+        policy_, clock_.SteadyFn());
   }
 };
 
@@ -125,7 +123,6 @@ class ColdConsumerPoolMetricsTest : public ::testing::Test {
   NiceMock<testing::MockColdStore> cold_;
   testing::TestClock clock_;
   core::EvictionPolicy policy_{core::EvictionTTL{3600}};
-  core::ConsumerRpc rpc_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
   std::unique_ptr<ColdConsumerPool> MakePool(uint32_t shard_count = 2) {
@@ -133,7 +130,7 @@ class ColdConsumerPoolMetricsTest : public ::testing::Test {
         queue_, cold_,
         ColdConsumerPool::Config{.shard_count = shard_count,
                                  .consumer = ColdConsumer::Config{.rng_seed = 42}},
-        policy_, rpc_, clock_.SteadyFn(), clock_.WallFn());
+        policy_, clock_.SteadyFn());
   }
 };
 

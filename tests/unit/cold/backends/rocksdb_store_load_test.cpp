@@ -36,9 +36,7 @@ class RocksdbLoadTest : public ::testing::Test {
  protected:
   RocksdbLoadTest() {
     clock_.SetWall(core::WallTime{std::chrono::milliseconds{kTtlMs * 2}});
-    RocksdbConfig config{.data_path = dir_.String(),
-                         .wall_clock = clock_.WallFn(),
-                         .steady_clock = [this] { return Steady(); }};
+    RocksdbConfig config{.data_path = dir_.String(), .steady_clock = [this] { return Steady(); }};
     auto created = RocksdbStore::Create(std::move(config));
     EXPECT_TRUE(created.has_value()) << (created.has_value() ? "" : created.error().message());
     if (created.has_value()) store_ = std::move(*created);

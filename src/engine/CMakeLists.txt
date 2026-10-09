@@ -1,6 +1,7 @@
 add_library(abyss_engine
   decide.cpp
   doorkeeper.cpp
+  hot_replayer.cpp
   loader.cpp
   read_path.cpp
   sequencer.cpp

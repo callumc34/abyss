@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "abyss/core/ops.h"
-#include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/string_hash.h"
@@ -53,17 +52,15 @@ using MemberValue = std::variant<std::monostate, std::string, double>;
 // else only its meta.
 using LoadedAs = std::variant<KeyMeta, ColdKeyState>;
 
-class ColdStore : public Reader {
+// Reads are loads: the engine answers from what they return.
+class ColdStore {
  public:
   ColdStore() = default;
-  ~ColdStore() override = default;
+  virtual ~ColdStore() = default;
   ColdStore(const ColdStore&) = delete;
   ColdStore& operator=(const ColdStore&) = delete;
   ColdStore(ColdStore&&) = delete;
   ColdStore& operator=(ColdStore&&) = delete;
-
-  Result<RespValue> Exec(const ops::ReadOp& op,
-                         std::optional<Duration> deadline = std::nullopt) override = 0;
 
   // Applies a compacted batch. `highest_wal_seq` is the highest WAL sequence
   // this batch materialises. The write is a non-durable (memtable-only) write;

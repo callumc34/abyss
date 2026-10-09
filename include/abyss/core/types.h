@@ -27,8 +27,7 @@ using WallClockFn = std::function<WallTime()>;
 inline SteadyTime DefaultSteadyClock() { return SteadyClock::now(); }
 inline WallTime DefaultWallClock() { return WallClock::now(); }
 
-inline constexpr ConsumerId kHotConsumer = 0;
+// The only consumer that commits offsets; 0 and 2 are retired.
 inline constexpr ConsumerId kColdConsumer = 1;
-inline constexpr ConsumerId kResolverConsumer = 2;
 
 }  // namespace abyss::core

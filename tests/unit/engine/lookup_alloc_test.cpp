@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <string>
 
-#include "abyss/consumer/compaction_buffer.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/types.h"
@@ -81,32 +80,6 @@ TEST(LookupAllocTest, HotReadsOfLongKeysAllocateNothing) {
   ASSERT_TRUE(typed.result.has_value()) << "a stub answers TYPE, keeping no access";
   EXPECT_EQ(typed.result->AsString(), "string");
   EXPECT_FALSE(missed.result.has_value());
-}
-
-TEST(LookupAllocTest, BufferReadsOfLongKeysAllocateNothing) {
-  testing::TestClock clock;
-  consumer::CompactionBuffer buffer{clock.SteadyFn(), clock.WallFn()};
-  const std::string str = LongKey('k');
-  const std::string hash = LongKey('h');
-  const std::string member = LongKey('m');
-  buffer.Absorb(str, ops::WriteOp{ops::StringSet{.key = str, .value = "v"}}, core::EvictionTTL{60},
-                1, 1, 0);
-  buffer.Absorb(
-      hash, ops::WriteOp{ops::HashSet{.key = hash, .fields = {{.field = member, .value = "v"}}}},
-      core::EvictionTTL{60}, 2, 2, 0);
-  const ops::ReadOp get{ops::StringGet{.key = str}};
-  const ops::ReadOp hget{ops::HashGet{.key = hash, .field = member}};
-
-  const size_t before = testing::Allocs();
-  const auto got = buffer.Exec(get);
-  const auto field = buffer.Exec(hget);
-  const size_t allocs = testing::Allocs() - before;
-
-  EXPECT_EQ(allocs, 0U);
-  ASSERT_TRUE(got.has_value());
-  EXPECT_EQ(got->AsString(), "v");
-  ASSERT_TRUE(field.has_value());
-  EXPECT_EQ(field->AsString(), "v");
 }
 
 }  // namespace

@@ -20,6 +20,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
+#include "cold_read.h"
 
 // Per-shard wipe isolation (ADP-010): wiping one shard must not destroy another
 // shard's data. These assertions failed under the previous global wipe.
@@ -103,31 +104,33 @@ class WipeFixture : public ::testing::Test {
   // Asserts every type's record for `keys` is present (true) or absent (false).
   // Exercises the zset score-index CF via ZRANGEBYSCORE, not just the member CF.
   void ExpectAllTypes(RocksdbStore& store, const TypedKeys& keys, bool present) {
-    auto str = store.Exec(core::ops::StringGet{.key = keys.str});
+    auto str = abyss::testing::ColdRead(store, core::ops::StringGet{.key = keys.str});
     ASSERT_TRUE(str.has_value());
     EXPECT_EQ(!str->IsNull(), present) << "string " << keys.str;
 
-    auto hash = store.Exec(core::ops::HashLen{.key = keys.hash});
+    auto hash = abyss::testing::ColdRead(store, core::ops::HashLen{.key = keys.hash});
     ASSERT_TRUE(hash.has_value());
     EXPECT_EQ(hash->AsInteger() > 0, present) << "hash " << keys.hash;
 
-    auto set = store.Exec(core::ops::SetCard{.key = keys.set});
+    auto set = abyss::testing::ColdRead(store, core::ops::SetCard{.key = keys.set});
     ASSERT_TRUE(set.has_value());
     EXPECT_EQ(set->AsInteger() > 0, present) << "set " << keys.set;
 
-    auto zcard = store.Exec(core::ops::ZsetCard{.key = keys.zset});
+    auto zcard = abyss::testing::ColdRead(store, core::ops::ZsetCard{.key = keys.zset});
     ASSERT_TRUE(zcard.has_value());
     EXPECT_EQ(zcard->AsInteger() > 0, present) << "zset card " << keys.zset;
 
     // Score-indexed read: confirms the separate zset_score_idx CF slice is
     // wiped (or retained) in step with the primary records.
-    auto zrange = store.Exec(
+    auto zrange = abyss::testing::ColdRead(
+        store,
         core::ops::ZsetRange{.key = keys.zset, .min = "-inf", .max = "+inf", .by_score = true});
     ASSERT_TRUE(zrange.has_value());
     ASSERT_TRUE(zrange->IsArray());
     EXPECT_EQ(!zrange->AsArray().empty(), present) << "zset score index " << keys.zset;
   }
 
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::filesystem::path path_;
 };
 
@@ -188,7 +191,7 @@ TEST_F(WipeFixture, WipedShardAcceptsFreshWritesAfterward) {
   std::vector<core::ops::WriteOp> ops = {core::ops::StringSet{.key = keys.str, .value = "again"}};
   ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
-  auto got = store->Exec(core::ops::StringGet{.key = keys.str});
+  auto got = abyss::testing::ColdRead(*store, core::ops::StringGet{.key = keys.str});
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(got->AsString(), "again");
 }

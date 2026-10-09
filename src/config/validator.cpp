@@ -10,9 +10,11 @@
 #include <utility>
 #include <vector>
 
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
+#include "abyss/log/log.h"
+
+ABYSS_LOG_COMPONENT("abyss.config.validator")
 
 namespace abyss::config::internal {
 
@@ -34,6 +36,8 @@ constexpr size_t kFrameAlign = 8;
 constexpr uint64_t kMaxFrameSpace = 0xFFFFFFFFULL;
 constexpr uint32_t kMinRingEntries = uint32_t{1} << 12;
 constexpr uint32_t kMaxRingEntries = uint32_t{1} << 24;
+// A WAL frame's shard field, and cold's key envelope, are 16 bits.
+constexpr uint32_t kMaxShardCount = uint32_t{1} << 16;
 // Redis proto-max-bulk-len: the largest single value we ever accept.
 constexpr size_t kMaxAcceptableValueSize = size_t{512} * 1024 * 1024;
 // Upper bound on the cold checkpoint cadence. The cold commit cannot pass data the
@@ -92,11 +96,10 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
   if (auto r = RequireNonEmpty("hot.backend", hot.backend); !r) return r;
   if (auto r = RequirePositive("hot.max_memory_bytes", hot.max_memory_bytes); !r) return r;
   if (auto r = RequirePositive("hot.shard_count", hot.shard_count); !r) return r;
-  if (hot.shard_count > core::kRpcMaxShardCount) {
-    return std::unexpected(
-        InvalidArg("hot.shard_count", "must be <= " + std::to_string(core::kRpcMaxShardCount) +
-                                          " (RpcId packing reserves bit 63 for the flush tag; "
-                                          "ADP-011 inv 6 / ENGINE-4)"));
+  if (hot.shard_count > kMaxShardCount) {
+    return std::unexpected(InvalidArg(
+        "hot.shard_count", "must be <= " + std::to_string(kMaxShardCount) +
+                               " (WAL frames and cold keys carry the shard in 16 bits)"));
   }
   if (hot.eviction_tick.count() <= 0) {
     return std::unexpected(InvalidArg("hot.eviction_tick_ms", "must be > 0 milliseconds"));
@@ -268,14 +271,6 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
   return {};
 }
 
-core::Result<void> ValidateHotConsumer(const HotConsumerConfig& c) {
-  if (auto r = RequirePositive("hot_consumer.read_batch_size", c.read_batch_size); !r) return r;
-  if (c.read_timeout.count() <= 0) {
-    return std::unexpected(InvalidArg("hot_consumer.read_timeout_ms", "must be > 0 milliseconds"));
-  }
-  return {};
-}
-
 core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
   if (auto r = RequirePositive("cold_consumer.quiet_threshold_seconds", c.quiet_threshold); !r)
     return r;
@@ -346,16 +341,6 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
   return {};
 }
 
-core::Result<void> ValidateConsumerRpc(const ConsumerRpcConfig& c) {
-  if (auto r = RequirePositive("consumer_rpc.registry_shard_count", c.registry_shard_count); !r)
-    return r;
-  if (c.default_timeout.count() <= 0) {
-    return std::unexpected(
-        InvalidArg("consumer_rpc.default_timeout_ms", "must be > 0 milliseconds"));
-  }
-  return {};
-}
-
 core::Result<void> ValidateEngine(const EngineConfig& e) {
   if (e.write_timeout.count() <= 0) {
     return std::unexpected(InvalidArg("engine.write_timeout_ms", "must be > 0 milliseconds"));
@@ -365,10 +350,6 @@ core::Result<void> ValidateEngine(const EngineConfig& e) {
 
 core::Result<void> ValidateRecovery(const RecoveryConfig& r) {
   if (auto res = RequirePositive("recovery.replay_parallelism", r.replay_parallelism); !res)
-    return res;
-  if (auto res = RequirePositive("recovery.hot_replay_batch_size", r.hot_replay_batch_size); !res)
-    return res;
-  if (auto res = RequirePositive("recovery.cold_replay_batch_size", r.cold_replay_batch_size); !res)
     return res;
   return {};
 }
@@ -476,6 +457,13 @@ core::Result<void> ValidateLogCountVsShards(const Config& c) {
         InvalidArg("queue.log_count",
                    "must be <= hot.shard_count (" + std::to_string(c.hot.shard_count) + ")"));
   }
+  // Valid, but it narrows what one atomic batch can span (#169).
+  if (c.queue.log_count > 1) {
+    ABYSS_LOG_WARN(
+        "queue.log_count > 1: a multi-key write whose keys span logs is rejected with CROSSSLOT, "
+        "and FLUSHDB across logs is not crash-atomic (a crash can leave some logs flushed)",
+        {"log_count", static_cast<int64_t>(c.queue.log_count)});
+  }
   return {};
 }
 
@@ -509,9 +497,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateHot(config.hot); !r) return r;
   if (auto r = ValidateCold(config.cold); !r) return r;
   if (auto r = ValidateQueue(config.queue); !r) return r;
-  if (auto r = ValidateHotConsumer(config.hot_consumer); !r) return r;
   if (auto r = ValidateColdConsumer(config.cold_consumer); !r) return r;
-  if (auto r = ValidateConsumerRpc(config.consumer_rpc); !r) return r;
   if (auto r = ValidateEngine(config.engine); !r) return r;
   if (auto r = ValidateRecovery(config.recovery); !r) return r;
   if (auto r = ValidateNet(config.net); !r) return r;

@@ -137,7 +137,7 @@ core::Result<core::PredicateFlags> ExtractCopyFlags(const core::RespCommand& cmd
     const auto opt = AsciiUpper(cmd.args[i]);
     if (opt == "REPLACE") replace = true;
   }
-  // COPY always routes through the resolver — even REPLACE needs to read src.
+  // Even REPLACE reads the source; decide judges both keys either way.
   return replace ? core::PredicateFlags::kNone : core::PredicateFlags::kNx;
 }
 

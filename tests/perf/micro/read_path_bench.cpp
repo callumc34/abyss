@@ -41,10 +41,6 @@ constexpr uint64_t kWarmup = 200'000;
 
 class NoBuffers : public consumer::CompactionBufferRouter {
  public:
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& /*op*/,
-                                     std::optional<core::Duration> /*deadline*/) override {
-    return std::unexpected(core::Error{core::ErrorCode::kNotFound, "none"});
-  }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view /*key*/) const override {
     return std::nullopt;

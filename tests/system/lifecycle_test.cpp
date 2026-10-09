@@ -9,18 +9,18 @@
 namespace abyss::system_test {
 namespace {
 
-// ENGINE-1: the LOADING gate must lift in exactly one observable edge, AFTER
-// the consumer pools are live. The moment the readiness pipe line is written
-// (which Server::Run emits only after the kServing transition), a write must be
-// fulfillable by a hot consumer — never time out or return -LOADING.
+// ENGINE-1: the LOADING gate must lift in exactly one observable edge,
+// after recovery and once the cold consumer pool is live. The moment
+// the readiness pipe line is written (which Server::Run emits only
+// after the kServing transition), a write must succeed: never time out
+// or return -LOADING.
 using LifecycleTest = IsolatedServerTest;
 using LifecycleDataTest = IsolatedDataServerTest;
 
 TEST_F(LifecycleTest, WritesSucceedImmediatelyAtReady) {
-  // WaitForReady() (run in the fixture SetUp) returned the instant the ready
-  // line was emitted. Fire a burst of pipelined writes with no settle delay:
-  // pre-fix, this could race the pool startup and hit a started data plane with
-  // no consumer (timeout). Post-fix the gate guarantees a consumer is live.
+  // WaitForReady() (run in the fixture SetUp) returned the instant the
+  // ready line was emitted. Fire a burst of pipelined writes with no
+  // settle delay: none may race the end of startup.
   constexpr int kKeys = 200;
   std::vector<std::vector<std::string>> writes;
   writes.reserve(kKeys);
@@ -38,9 +38,10 @@ TEST_F(LifecycleTest, WritesSucceedImmediatelyAtReady) {
 }
 
 TEST_F(LifecycleDataTest, WritesSucceedImmediatelyAcrossGracefulRestart) {
-  // Repeat the at-ready write burst across a graceful (SIGTERM) restart, which
-  // drives the recovery->serving edge with prior data in the WAL. The gate must
-  // still lift only once consumers are live.
+  // Repeat the at-ready write burst across a graceful (SIGTERM)
+  // restart, which drives the recovery->serving edge with prior data in
+  // the WAL. The gate must still lift only once recovery is done and
+  // the cold consumer pool is live.
   ASSERT_TRUE(Client().Command({"SET", "seed", "v"}).IsOk());
   RestartServer();  // graceful: SIGTERM then re-Start, re-waits the ready line.
 

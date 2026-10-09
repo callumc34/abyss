@@ -53,10 +53,6 @@ class CountingColdStore : public core::ColdStore {
  public:
   explicit CountingColdStore(core::ColdStore& inner) : inner_(inner) {}
 
-  core::Result<core::RespValue> Exec(const ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override {
-    return inner_.Exec(op, deadline);
-  }
   core::Result<void> ApplyBatch(std::span<const ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
     return inner_.ApplyBatch(ops, highest_wal_seq);
@@ -113,10 +109,6 @@ class CountingColdStore : public core::ColdStore {
 class OneBufferRouter : public consumer::CompactionBufferRouter {
  public:
   explicit OneBufferRouter(consumer::CompactionBuffer& buffer) : buffer_(buffer) {}
-  core::Result<core::RespValue> Exec(const ops::ReadOp& op,
-                                     std::optional<core::Duration> /*deadline*/) override {
-    return buffer_.Exec(op);
-  }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view key) const override {
     return buffer_.Snapshot(key);
@@ -156,7 +148,7 @@ class LoaderComponentTest : public ::testing::Test {
   // Leaves `op` in the buffer, unflushed.
   void Buffer(std::string_view key, const ops::WriteOp& op) {
     const core::SequenceId seq = ++seq_;
-    buffer_.Absorb(std::string(key), op, kEviction, seq, seq, 0);
+    buffer_.Absorb(std::string(key), op, kEviction, seq, 0);
   }
   core::Result<hot::LoadResult> Load(std::string_view key, Need need = Need::kState) {
     return loader_.Load(0, key, need, Deadline());

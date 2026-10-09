@@ -4,6 +4,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -93,26 +94,39 @@ void UnindexScore(ZsetValue& zset, size_t& bytes, double score, const std::strin
   }
 }
 
-// Total, non-throwing parse of a ZRANGEBYSCORE bound into a double. A score
-// bound is a remote-supplied string read under a shared lock, so a throwing
-// conversion (std::stod) could unwind through the reactor; std::from_chars
-// never throws and surfaces malformed input as a clean error Result instead.
-// `empty_default`/the -inf/+inf sentinels stand in for an unbounded edge, since
-// from_chars(double) does not itself accept "inf". C8's ParseLexBound should
-// follow this same from_chars/Result discipline for lex bounds.
-core::Result<double> ParseScoreBound(std::string_view s, double empty_default) {
-  if (s.empty()) return empty_default;
-  if (s == "-inf") return -std::numeric_limits<double>::infinity();
-  if (s == "+inf" || s == "inf") return std::numeric_limits<double>::infinity();
+// A ZRANGEBYSCORE bound: a score, "(" before it for exclusive, or
+// -inf/+inf. from_chars never throws, so remote input read under the
+// shared lock fails cleanly; it does not accept "inf" or a leading
+// "+", hence the explicit cases.
+struct ScoreBound {
   double value = 0.0;
+  bool exclusive = false;
+};
+
+core::Result<ScoreBound> ParseScoreBound(std::string_view s, double empty_default) {
+  if (s.empty()) return ScoreBound{.value = empty_default};
+  ScoreBound bound;
+  if (s.front() == '(') {
+    bound.exclusive = true;
+    s.remove_prefix(1);
+  }
+  if (s == "-inf") {
+    bound.value = -std::numeric_limits<double>::infinity();
+    return bound;
+  }
+  if (s == "+inf" || s == "inf") {
+    bound.value = std::numeric_limits<double>::infinity();
+    return bound;
+  }
+  if (s.size() > 1 && s.front() == '+' && s[1] != '+' && s[1] != '-') s.remove_prefix(1);
   const auto* begin = s.data();
   const auto* end = s.data() + s.size();
-  const auto [ptr, ec] = std::from_chars(begin, end, value);
-  if (ec != std::errc{} || ptr != end) {
-    return std::unexpected(core::Error(core::ErrorCode::kInvalidArgument,
-                                       "not a valid score: '" + std::string(s) + "'"));
+  const auto [ptr, ec] = std::from_chars(begin, end, bound.value);
+  if (s.empty() || ec != std::errc{} || ptr != end || std::isnan(bound.value)) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kInvalidArgument, "min or max is not a float"));
   }
-  return value;
+  return bound;
 }
 
 // Total, non-throwing parse of a ZRANGE index bound (a signed integer) into an
@@ -464,6 +478,8 @@ core::Result<core::RespValue> ReadOf(const core::ops::ZsetRange& op, const ZsetV
     if (!min_parsed.has_value()) return std::unexpected(min_parsed.error());
     auto max_parsed = ParseLexBound(op.max);
     if (!max_parsed.has_value()) return std::unexpected(max_parsed.error());
+    // With REV the first bound given is the maximum.
+    if (op.rev) std::swap(*min_parsed, *max_parsed);
 
     // Lex range is over member names in pure lexicographic order (Redis assumes
     // equal scores). member_scores keys are the members; collect and sort so
@@ -492,18 +508,24 @@ core::Result<core::RespValue> ReadOf(const core::ops::ZsetRange& op, const ZsetV
     if (!min_parsed.has_value()) return std::unexpected(min_parsed.error());
     auto max_parsed = ParseScoreBound(op.max, std::numeric_limits<double>::infinity());
     if (!max_parsed.has_value()) return std::unexpected(max_parsed.error());
-    double min_score = *min_parsed;
-    double max_score = *max_parsed;
-
-    if (op.rev) std::swap(min_score, max_score);
-
-    auto lo = zset.score_members.lower_bound(std::min(min_score, max_score));
-    auto hi = zset.score_members.upper_bound(std::max(min_score, max_score));
+    ScoreBound min = *min_parsed;
+    ScoreBound max = *max_parsed;
+    // With REV the first bound given is the maximum.
+    if (op.rev) std::swap(min, max);
 
     std::vector<std::pair<std::string, double>> collected;
-    for (auto it = lo; it != hi; ++it) {
-      for (const auto& member : it->second) {
-        collected.emplace_back(member, it->first);
+    // As Redis: a minimum above the maximum, or an equal pair with
+    // either end exclusive, is an empty range.
+    const bool empty =
+        min.value > max.value || (min.value == max.value && (min.exclusive || max.exclusive));
+    if (!empty) {
+      const auto& sm = zset.score_members;
+      auto lo = min.exclusive ? sm.upper_bound(min.value) : sm.lower_bound(min.value);
+      auto hi = max.exclusive ? sm.lower_bound(max.value) : sm.upper_bound(max.value);
+      for (auto it = lo; it != hi; ++it) {
+        for (const auto& member : it->second) {
+          collected.emplace_back(member, it->first);
+        }
       }
     }
 
@@ -736,14 +758,14 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
                                                       core::EvictionTTL eviction,
                                                       core::SequenceId seq,
                                                       core::SequenceId horizon) {
-  auto result = Mutate(op, eviction, seq, SetMove{});
+  auto result = Mutate(op, eviction, seq, SetMove{}, config_.steady_clock());
   HoldBudget budget = HoldBudget::Capped();
   // The write has already applied (and is durable in the queue). Make room by
   // evicting OTHER LRU victims down to the budget, protecting the just-written
   // key. If even then the entry cannot fit (a single value larger than the
   // whole budget, no other victims), surface kResourceExhausted as an admission
   // signal — the entry is NOT lost, it stays durable in the queue/cold
-  // (invariant 2). Suppressed during replay.
+  // (invariant 2).
   if (Grows(op) && result.has_value() &&
       !EnsureCapacityFor(core::ops::PrimaryKey(op), horizon, budget)) {
     return std::unexpected(
@@ -754,7 +776,8 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
 
 core::Result<core::RespValue> SingleShardStore::Mutate(const core::ops::WriteOp& op,
                                                        core::EvictionTTL eviction,
-                                                       core::SequenceId seq, SetMove move) {
+                                                       core::SequenceId seq, SetMove move,
+                                                       core::SteadyTime linked_at) {
   auto result = std::visit(
       [this, eviction, seq, move](const auto& o) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(o)>;
@@ -788,20 +811,20 @@ core::Result<core::RespValue> SingleShardStore::Mutate(const core::ops::WriteOp&
       op);
 
   if (const auto* del = std::get_if<core::ops::Del>(&op)) {
-    for (const auto key : del->keys) MarkWritten(key, seq);
+    for (const auto key : del->keys) MarkWritten(key, seq, linked_at);
   } else {
-    MarkWritten(core::ops::PrimaryKey(op), seq);
+    MarkWritten(core::ops::PrimaryKey(op), seq, linked_at);
   }
   return result;
 }
 
-std::vector<core::RespValue> SingleShardStore::ApplyEffects(std::span<core::Effect> effects,
-                                                            core::SequenceId first_seq,
-                                                            core::WallTime appended_at,
-                                                            const core::EvictionPolicy& policy,
-                                                            core::SequenceId horizon) {
+std::vector<core::RespValue> SingleShardStore::ApplyEffects(
+    std::span<core::Effect> effects, core::SequenceId first_seq, core::WallTime appended_at,
+    const core::EvictionPolicy& policy, core::SequenceId horizon,
+    std::optional<core::SteadyTime> linked_at) {
   ABYSS_DCHECK(first_seq >= core::kFirstSeq, "effects applied from seq 0, which names no entry");
   const int64_t at_ms = WallMs(appended_at);
+  const core::SteadyTime link = linked_at.has_value() ? *linked_at : config_.steady_clock();
   const FlagScope applying(applying_effects_);
   std::vector<core::RespValue> replies;
   replies.reserve(effects.size());
@@ -821,7 +844,7 @@ std::vector<core::RespValue> SingleShardStore::ApplyEffects(std::span<core::Effe
         .value = std::holds_alternative<core::ops::StringSet>(*op) ? &effect.cmd.args[2] : nullptr,
         .reply_old_value = effect.reply_old_value,
     };
-    auto result = Mutate(*op, policy.Resolve(key), first_seq + i, move);
+    auto result = Mutate(*op, policy.Resolve(key), first_seq + i, move, link);
     if (effect.observed_expiry) ++expired_count_;
     // Decided effects always apply: an overshoot shows in Stats.
     if (Grows(*op)) EnsureCapacityFor(key, horizon, budget);
@@ -1331,10 +1354,8 @@ bool SingleShardStore::EnsureCapacityFor(std::string_view protect_key, core::Seq
                                          HoldBudget& budget) {
   // Called post-write: the just-written entry (protect_key) is already counted
   // in used bytes and must survive, so make room by evicting OTHER LRU keys
-  // toward the budget. Suppressed during replay: evicting mid-replay would
-  // make the rebuilt hot view depend on memory timing, breaking deterministic
-  // queue replay (invariant 4). The eviction worker reconverges after replay.
-  if (replay_mode_ || !governor_.Enabled()) return true;
+  // toward the budget.
+  if (!governor_.Enabled()) return true;
   if (!governor_.WouldExceed(UsedBytes(), 0)) {
     UpdateBackpressure();
     return true;
@@ -1581,10 +1602,31 @@ void SingleShardStore::RaiseAppendedAt(core::WallTime at) {
   last_appended_at_ = std::max(last_appended_at_, at);
 }
 
+void SingleShardStore::ShiftLinks(core::SteadyClock::duration shift, core::SteadyTime now) {
+  const auto moved = [shift, now](core::SteadyTime at) { return std::min(at + shift, now); };
+  for (LruList& list : lru_lists_) {
+    for (Entry* entry = list.oldest; entry != nullptr; entry = entry->lru_newer) {
+      entry->linked_at = moved(entry->linked_at);
+      const std::atomic_ref<core::SteadyTime::rep> stamp(entry->accessed);
+      const auto accessed = stamp.load(std::memory_order_relaxed);
+      if (accessed != 0) {
+        stamp.store(moved(AccessedAt(*entry)).time_since_epoch().count(),
+                    std::memory_order_relaxed);
+      }
+    }
+  }
+}
+
 bool SingleShardStore::OverBackpressure() const {
   return governor_.Enabled() &&
          static_cast<double>(UsedBytes()) >
              static_cast<double>(governor_.max_bytes()) * config_.backpressure_ratio;
+}
+
+uint64_t SingleShardStore::BackpressureLimit() const {
+  if (!governor_.Enabled()) return 0;
+  return static_cast<uint64_t>(static_cast<double>(governor_.max_bytes()) *
+                               config_.backpressure_ratio);
 }
 
 // --- Internal helpers ---
@@ -1773,7 +1815,8 @@ void SingleShardStore::TrackRemove(const Entry& entry, std::string_view key) {
   if (Parked(entry)) parked_bytes_ = (parked_bytes_ >= bytes) ? parked_bytes_ - bytes : 0;
 }
 
-void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq) {
+void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq,
+                                   core::SteadyTime linked_at) {
   ABYSS_DCHECK(seq >= core::kFirstSeq, "a write applied at seq 0, which names no entry");
   if (Entry* entry = FindEntry(key); entry != nullptr) {
     ForgetNegative(*entry);
@@ -1787,7 +1830,7 @@ void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq) {
     } else {
       if (Parked(*entry)) Unpark(*entry);
       if (Linked(*entry)) LruUnlink(*entry);
-      LruLink(*entry, config_.steady_clock());
+      LruLink(*entry, linked_at);
       IndexTtl(*entry);
       NoteEvictable(seq);
     }

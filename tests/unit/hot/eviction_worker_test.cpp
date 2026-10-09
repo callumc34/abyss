@@ -140,26 +140,27 @@ TEST(EvictionWorkerMemoryTest, TickEnforcesMemoryBudgetAndPublishesGauges) {
     per_entry = probe.Stats()->used_bytes;
   }
 
+  // Nothing drained while writing, so the writes cannot evict; the tick
+  // is what we are exercising here.
+  core::SequenceId drained = 0;
   ShardedHotStore store{ShardedHotStoreConfig{
       .max_memory_bytes = (per_entry * 2) + (per_entry / 2),  // holds 2, not 4
       .shard_count = 1,
+      .drained = [&drained](core::ShardId) { return drained; },
       .eviction_policy = &policy,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
   for (int i = 0; i < 4; ++i) {
-    // SetReplayMode so the apply-time enforcement does not pre-trim; the tick
-    // is what we are exercising here.
-    store.SetReplayMode(true);
     ASSERT_TRUE(store
                     .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k" + std::to_string(i),
                                                                    .value = value}},
                            core::kFirstSeq)
                     .has_value());
-    store.SetReplayMode(false);
     clock.Advance(1ms);
   }
   ASSERT_GT(store.Stats()->used_bytes, store.Stats()->max_bytes);
+  drained = kAllDrained;
 
   EvictionWorker worker(store, EvictionWorker::Config{.tick = 50ms}, clock.SteadyFn());
   worker.TickOnce();

@@ -4,12 +4,12 @@ add_executable(abyss_component_tests
   wal_queue_crash_test.cpp
   wal_queue_streams_test.cpp
   wal_queue_reserve_test.cpp
-  hot_consumer_test.cpp
   cold_durability_test.cpp
   cold_log_clock_test.cpp
   cold_persistence_gate_test.cpp
-  resolver_recovery_test.cpp
   recovery_coordinator_test.cpp
+  hot_replayer_test.cpp
+  regression_test.cpp
   loader_test.cpp
   read_path_test.cpp
   sequencer_test.cpp

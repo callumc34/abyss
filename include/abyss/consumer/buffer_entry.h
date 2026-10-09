@@ -32,6 +32,8 @@ struct BufferEntry {
   core::SteadyTime scheduled_in_heap_{};
   // Selected for a flush that has neither landed nor been rescheduled.
   bool in_flight_ = false;
+  // Its slot in the buffer's pending order.
+  uint64_t pending_ticket_ = 0;
 };
 
 }  // namespace abyss::consumer

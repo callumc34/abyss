@@ -78,22 +78,25 @@ TEST(StatusHandlerTest, BodyHasAllTopLevelKeys) {
                                          }));
 }
 
-// Renaming queue.tail_seq, consumers.*.last_ack_seq_* and
-// config.fsync_policy, and dropping the hot and resolver lags, broke
-// the schema: no aliases for the old keys.
-TEST(StatusHandlerTest, SchemaVersionFourHasOnlyRenamedKeys) {
+// Version 5 drops the hot consumer's and the resolver's positions and
+// the resolver's recovery phase, all gone with them; no aliases for
+// keys earlier versions renamed.
+TEST(StatusHandlerTest, SchemaVersionFiveHasNoHotConsumerOrResolver) {
   FakeProvider provider(MakeMinimalSnapshot());
   StatusHandler handler(&provider);
   HttpRequest request;
   const auto response = handler.Handle(request);
   EXPECT_TRUE(ContainsAll(response.body,
-                          {"\"schema_version\":4", "\"durability\":\"power_loss\"", "\"first_seq\"",
-                           "\"last_commit_seq_min\"", "\"last_commit_seq_max\""}));
+                          {"\"schema_version\":5", "\"durability\":\"power_loss\"", "\"first_seq\"",
+                           "\"last_commit_seq_min\"", "\"last_commit_seq_max\"",
+                           "\"hot_entries_replayed\"", "\"hot_entries_target\""}));
   EXPECT_FALSE(response.body.contains("\"tail_seq\""));
   EXPECT_FALSE(response.body.contains("last_ack_seq"));
   EXPECT_FALSE(response.body.contains("fsync_policy"));
   EXPECT_FALSE(response.body.contains("hot_max_entries"));
-  EXPECT_FALSE(response.body.contains("resolver_max_entries"));
+  EXPECT_FALSE(response.body.contains("resolver"));
+  EXPECT_FALSE(response.body.contains("highest_settled_seq"));
+  EXPECT_FALSE(response.body.contains("cache_entries"));
 }
 
 TEST(StatusHandlerTest, QueueReportsTheDurabilityWindow) {

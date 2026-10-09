@@ -1,8 +1,6 @@
 add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
-  core/consumer_rpc_test.cpp
-  core/apply_notifier_test.cpp
   core/fire_and_forget_test.cpp
   core/ops_test.cpp
   core/ops_set_test.cpp
@@ -105,6 +103,8 @@ if(ABYSS_WITH_ROCKSDB)
     cold/backends/rocksdb_store_wipe_test.cpp
     cold/backends/rocksdb_store_load_test.cpp
   )
+  # The reads these tests check are answered as hot answers them.
+  target_link_libraries(abyss_cold_tests PRIVATE abyss::hot)
   target_include_directories(abyss_cold_tests SYSTEM PRIVATE
     $<TARGET_PROPERTY:RocksDB::rocksdb,INTERFACE_INCLUDE_DIRECTORIES>
   )
@@ -116,8 +116,6 @@ add_executable(abyss_consumer_tests
   consumer/compaction_buffer_test.cpp
   consumer/cold_consumer_test.cpp
   consumer/cold_consumer_pool_test.cpp
-  consumer/existence_cache_test.cpp
-  consumer/resolver_test.cpp
 )
 
 target_link_libraries(abyss_consumer_tests PRIVATE
@@ -139,6 +137,7 @@ add_executable(abyss_config_tests
 
 target_compile_definitions(abyss_config_tests PRIVATE
   ABYSS_EXAMPLE_CONFIG_PATH="${PROJECT_SOURCE_DIR}/config/abyss.example.yaml"
+  ABYSS_DEPLOYMENT_DOC_PATH="${PROJECT_SOURCE_DIR}/docs/operations/deployment.md"
 )
 
 target_link_libraries(abyss_config_tests PRIVATE
@@ -234,9 +233,9 @@ add_executable(abyss_engine_tests
   engine/recovery_coordinator_test.cpp
   engine/decide_test.cpp
   engine/decide_multi_key_test.cpp
-  engine/decide_equivalence_test.cpp
   engine/decide_registry_test.cpp
   engine/doorkeeper_test.cpp
+  engine/hot_replayer_test.cpp
   engine/loader_merge_test.cpp
   engine/loader_test.cpp
   engine/sequencer_test.cpp

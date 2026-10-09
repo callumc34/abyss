@@ -46,14 +46,8 @@ class StubDispatcher : public core::CommandDispatcher {
     read_calls.fetch_add(1);
     return core::RespValue::BulkString(read_payload);
   }
-  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/,
-                                              core::RespCommand /*cmd*/) override {
-    write_calls.fetch_add(1);
-    return core::RespValue::SimpleString("OK");
-  }
-  core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
-                                                    core::RespCommand /*cmd*/,
-                                                    core::PredicateFlags /*flags*/) override {
+  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/, core::RespCommand /*cmd*/,
+                                              core::PredicateFlags /*flags*/) override {
     write_calls.fetch_add(1);
     return core::RespValue::SimpleString("OK");
   }
@@ -271,7 +265,7 @@ TEST_F(TcpServerComponentTest, AcceptBurstHandledWithoutDrops) {
 // NET-4: the read-buffer high-water is a fleet-wide max over live connections,
 // not whichever connection wrote the shared gauge last.
 TEST_F(TcpServerComponentTest, ReadBufferHighWaterIsFleetMaxNotLastWriter) {
-  constexpr size_t kBigValueBytes = 64 * 1024;
+  constexpr size_t kBigValueBytes = size_t{64} * 1024;
   TcpServerConfig cfg = DefaultTestConfig();
   cfg.io_threads = 2;
   StubDispatcher dispatcher;

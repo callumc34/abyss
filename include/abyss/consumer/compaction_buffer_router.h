@@ -5,28 +5,19 @@
 #include <string_view>
 
 #include "abyss/consumer/compacted_state.h"
-#include "abyss/consumer/compaction_buffer.h"
-#include "abyss/core/ops.h"
-#include "abyss/core/reader.h"
-#include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
 namespace abyss::consumer {
 
 // Routes reads to the per-shard compaction buffers; concrete pools shard by key.
-class CompactionBufferRouter : public core::Reader {
+class CompactionBufferRouter {
  public:
   CompactionBufferRouter() = default;
-  ~CompactionBufferRouter() override = default;
+  virtual ~CompactionBufferRouter() = default;
   CompactionBufferRouter(const CompactionBufferRouter&) = delete;
   CompactionBufferRouter& operator=(const CompactionBufferRouter&) = delete;
   CompactionBufferRouter(CompactionBufferRouter&&) = delete;
   CompactionBufferRouter& operator=(CompactionBufferRouter&&) = delete;
-
-  core::Result<core::RespValue> Exec(
-      const core::ops::ReadOp& op,
-      std::optional<core::Duration> deadline = std::nullopt) override = 0;
 
   // CompactionBuffer::Snapshot on `shard`'s buffer, which owns `key`.
   virtual std::optional<CompactedState> Snapshot(core::ShardId shard,

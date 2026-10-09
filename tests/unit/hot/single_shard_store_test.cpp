@@ -847,6 +847,48 @@ TEST_F(SingleShardStoreTest, ZsetRangeMalformedScoreReturnsInvalidArgument) {
   EXPECT_EQ(ok2->AsArray().size(), 2U);
 }
 
+// Redis's score ranges: "(" excludes a bound, REV gives the maximum
+// first, and a minimum above the maximum is empty.
+TEST_F(SingleShardStoreTest, ZsetRangeByScoreHonoursExclusiveBoundsAndOrder) {
+  core::ops::ZsetAdd add{.key = "z",
+                         .entries = {{.score = 1.0, .member = "a"},
+                                     {.score = 2.0, .member = "b"},
+                                     {.score = 3.0, .member = "c"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+  const auto members = [this](std::string_view min, std::string_view max, bool rev) {
+    core::ops::ZsetRange op{.key = "z", .min = min, .max = max, .by_score = true, .rev = rev};
+    auto r = store_.Exec(core::ops::ReadOp{op});
+    std::vector<std::string> out;
+    if (!r.has_value()) {
+      ADD_FAILURE() << r.error().message();
+      return out;
+    }
+    for (const auto& v : r->AsArray()) out.push_back(v.AsString());
+    return out;
+  };
+  using V = std::vector<std::string>;
+  EXPECT_EQ(members("(1", "3", false), (V{"b", "c"}));
+  EXPECT_EQ(members("1", "(3", false), (V{"a", "b"}));
+  EXPECT_EQ(members("(1", "(3", false), (V{"b"}));
+  EXPECT_EQ(members("-inf", "(2", false), (V{"a"}));
+  EXPECT_EQ(members("(2", "+inf", false), (V{"c"}));
+  EXPECT_EQ(members("3", "1", false), V{}) << "minimum above maximum";
+  EXPECT_EQ(members("(2", "2", false), V{}) << "an equal pair, one end exclusive";
+  EXPECT_EQ(members("3", "(1", true), (V{"c", "b"})) << "REV: the maximum first";
+  EXPECT_EQ(members("1", "3", true), V{}) << "REV: a minimum given first is empty";
+
+  core::ops::ZsetRange lex_rev{.key = "z", .min = "[c", .max = "(a", .by_lex = true, .rev = true};
+  auto lex = store_.Exec(core::ops::ReadOp{lex_rev});
+  ASSERT_TRUE(lex.has_value());
+  ASSERT_EQ(lex->AsArray().size(), 2U) << "BYLEX REV: the maximum first";
+  EXPECT_EQ(lex->AsArray()[0].AsString(), "c");
+
+  core::ops::ZsetRange bad{.key = "z", .min = "(", .max = "2", .by_score = true};
+  auto r = store_.Exec(core::ops::ReadOp{bad});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().message(), "min or max is not a float");
+}
+
 TEST_F(SingleShardStoreTest, ZsetRangeArbitraryBytesNeverThrow) {
   core::ops::ZsetAdd add{.key = "z", .entries = {{.score = 1.0, .member = "a"}}};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
@@ -956,30 +998,28 @@ TEST(SingleShardStoreMemoryTest, ApplyReturnsResourceExhaustedWhenNoVictims) {
   EXPECT_EQ(r.error().code(), core::ErrorCode::kResourceExhausted);
 }
 
-TEST(SingleShardStoreMemoryTest, ReplayModeSuppressesMemoryEviction) {
+// Eviction waits for cold, in replay as in steady state: writes past the
+// budget all apply while nothing has drained, and once it has, eviction
+// brings the store back under.
+TEST(SingleShardStoreMemoryTest, OverBudgetWritesApplyUntilColdDrains) {
   abyss::testing::TestClock clock;
-  const uint64_t small_entry = MeasureStringEntryBytes("k", "v");
+  const uint64_t entry = MeasureStringEntryBytes("k0", std::string(256, 'x'));
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = small_entry,
+      .max_memory_bytes = 3 * entry,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
-  store.SetReplayMode(true);
-  // Over-budget writes must all apply during replay: no eviction, no
-  // kResourceExhausted (deterministic replay, invariant 4).
   for (int i = 0; i < 5; ++i) {
     auto r = store.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k" + std::to_string(i),
                                                                  .value = std::string(256, 'x')}},
-                         core::EvictionTTL{86400});
-    ASSERT_TRUE(r.has_value()) << "replay write " << i << " should not be rejected";
+                         core::EvictionTTL{86400}, static_cast<core::SequenceId>(i) + 1,
+                         /*horizon=*/0);
+    ASSERT_TRUE(r.has_value()) << "write " << i << " should not be rejected";
   }
   EXPECT_EQ(store.Stats().eviction_count, 0U);
   EXPECT_EQ(store.Stats().key_count, 5U);
-  EXPECT_GT(store.Stats().used_bytes, store.Stats().max_bytes)
-      << "over budget during replay (enforced only after)";
+  EXPECT_GT(store.Stats().used_bytes, store.Stats().max_bytes);
 
-  // After replay, the ceiling is enforced by EvictLru.
-  store.SetReplayMode(false);
   store.EvictLru(store.Stats().max_bytes, kAllDrained);
   EXPECT_LE(store.Stats().used_bytes, store.Stats().max_bytes);
 }
@@ -1132,7 +1172,9 @@ TEST_F(SingleShardStoreTest, HotZrangeByLexAppliesBounds) {
   EXPECT_EQ(collect("[b", "(d"), (std::vector<std::string>{"b", "c"}));
   EXPECT_EQ(collect("-", "+"), (std::vector<std::string>{"a", "b", "c", "d"}));
   EXPECT_EQ(collect("(a", "[c"), (std::vector<std::string>{"b", "c"}));
-  EXPECT_EQ(collect("-", "+", /*rev=*/true), (std::vector<std::string>{"d", "c", "b", "a"}));
+  // With REV the maximum comes first, as ZRANGE z + - BYLEX REV.
+  EXPECT_EQ(collect("+", "-", /*rev=*/true), (std::vector<std::string>{"d", "c", "b", "a"}));
+  EXPECT_TRUE(collect("-", "+", /*rev=*/true).empty());
 }
 
 TEST_F(SingleShardStoreTest, HotZrangeByLexMalformedBoundIsCleanError) {

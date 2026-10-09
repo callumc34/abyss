@@ -14,10 +14,6 @@
 
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_pool.h"
-#include "abyss/consumer/resolver_pool.h"
-#include "abyss/core/apply_notifier.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue_entry.h"
@@ -75,7 +71,7 @@ queue::WalConfig QueueConfig(const std::string& wal_path) {
       .log_count = 1,
       .durability = core::Durability::kProcessCrash,
       .min_retention = 24h,
-      .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
+      .retention_consumers = {core::kColdConsumer},
   };
 }
 
@@ -89,9 +85,8 @@ core::QueueEntry MakeEntry(int64_t i) {
 }
 
 // `n` entries across every shard of one log. Cold commits kColdLag
-// entries into each shard; the resolver has committed everything, so
-// recovery is the cold and hot rebuild. Returns the entry frame bytes,
-// or nullopt on failure.
+// entries into each shard, so recovery is the cold and hot rebuild.
+// Returns the entry frame bytes, or nullopt on failure.
 std::optional<uint64_t> PreloadQueue(const std::string& wal_path, int64_t n) {
   auto opened = queue::WalQueue::Open(QueueConfig(wal_path));
   if (!opened.has_value()) return std::nullopt;
@@ -114,8 +109,7 @@ std::optional<uint64_t> PreloadQueue(const std::string& wal_path, int64_t n) {
     if (!tail.has_value()) return std::nullopt;
     auto durable = queue.AwaitDurable(shard, *tail, core::Durability::kPowerLoss, 60s);
     if (!durable.has_value() || !*durable) return std::nullopt;
-    if (!queue.CommitOffset(core::kColdConsumer, shard, kColdLag - 1).has_value() ||
-        !queue.CommitOffset(core::kResolverConsumer, shard, *tail).has_value()) {
+    if (!queue.CommitOffset(core::kColdConsumer, shard, kColdLag - 1).has_value()) {
       return std::nullopt;
     }
   }
@@ -167,22 +161,13 @@ void BM_RecoveryColdHot(benchmark::State& state) {
         .max_memory_bytes = 1024 * kMiB,
         .shard_count = kShardCount,
     });
-    core::ConsumerRpc rpc;
-    core::AppliedSeqNotifier notifier(core::AppliedSeqNotifierConfig{.shard_count = kShardCount});
     core::EvictionPolicy eviction_policy{86400s};
     auto cold_pool = std::make_unique<consumer::ColdConsumerPool>(
         **queue, **cold, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
-        eviction_policy, rpc);
-    auto hot_pool = std::make_unique<consumer::HotConsumerPool>(
-        **queue, *hot, rpc, notifier, consumer::HotConsumerPool::Config{.shard_count = kShardCount},
         eviction_policy);
-    auto resolver_pool = std::make_unique<consumer::ResolverPool>(
-        **queue, **cold, *cold_pool, rpc, notifier,
-        consumer::ResolverPool::Config{.shard_count = kShardCount});
 
     BoundedThreadShardScheduler scheduler(4);
-    RecoveryCoordinator coord(**queue, *resolver_pool, *cold_pool, *hot_pool, scheduler,
-                              RecoveryConfig{});
+    RecoveryCoordinator coord(**queue, *cold_pool, *hot, scheduler, RecoveryConfig{});
     const std::atomic<bool> cancel{false};
     const auto rebuilding = Clock::now();
     auto r = coord.Run(cancel);

@@ -116,11 +116,38 @@ class ShardedHotStore : public core::HotStore {
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId seq) override;
   core::HotKeyPresence Probe(std::string_view key) override;
-  void SetReplayMode(bool replaying) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Wipe(core::ShardId shard, core::SequenceId seq) override;
+  // Replay's apply: see Replay.
   std::optional<core::RespValue> ApplyLogged(core::ShardId shard, core::QueueEntry& entry) override;
   void RaiseAppendedAt(core::ShardId shard, core::WallTime at) override;
+
+  struct ShardMemory {
+    uint64_t used_bytes = 0;
+    // SingleShardStore::BackpressureLimit.
+    uint64_t limit_bytes = 0;
+  };
+  ShardMemory Memory(core::ShardId shard) const;
+
+  struct Replayed {
+    // The hot shard the frame applied to, or would have.
+    core::ShardId shard = 0;
+    bool applied = false;
+    // That shard is over its backpressure limit after it.
+    bool over_backpressure = false;
+    // That shard's, after it.
+    ShardMemory memory;
+  };
+  // Applies a logged frame as recovery replays it. A Write flagged
+  // replaces_state, or a Flush, makes its key resident; another Write
+  // applies only to a key with an entry, a tombstone included, and
+  // otherwise drops the key's stub, which it made stale. A written key
+  // is linked at the frame's appended_at read as steady ticks, so
+  // replay reads no clock; ShiftReplayedLinks maps the links after.
+  Replayed Replay(core::ShardId shard, core::QueueEntry& entry);
+  // Moves each replayed link at appended_at t to steady_now minus
+  // (wall_now - t), never past steady_now.
+  void ShiftReplayedLinks(core::SteadyTime steady_now, core::WallTime wall_now);
 
   // Takes each of `shards`, sorted and distinct, exclusively and in
   // ascending order. The thread must hold no queue reservation.
@@ -197,6 +224,7 @@ class ShardedHotStore : public core::HotStore {
 
   // Reclaims each shard's tombstones cold has drained.
   size_t GcTombstones();
+  size_t GcTombstones(core::ShardId shard);
 
   // Called after each maintenance hold, with what it examined.
   using HoldObserver = std::function<void(metrics::MaintenancePass,
@@ -233,6 +261,9 @@ class ShardedHotStore : public core::HotStore {
   FillResult Install(std::string_view key, LoadToken token, LoadResult&& result, bool fill);
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
+  // Replay, with the frame's reply when it applied.
+  Replayed ReplayFrame(core::ShardId shard, core::QueueEntry& entry,
+                       std::optional<core::RespValue>& reply);
   // Runs `step(store, horizon, budget)` on shard `index` in capped
   // exclusive holds until it is done or `more(budget)` declines another.
   template <typename Step, typename More>
