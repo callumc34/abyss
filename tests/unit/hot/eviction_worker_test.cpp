@@ -219,10 +219,10 @@ TEST(EvictionWorkerResidencyTest, TickPublishesStubAndLoadMetrics) {
   };
   set("a", 1);
   set("b", 2);
-  const LoadToken token = store.BeginLoad("c").value_or(LoadToken{});
+  const LoadToken token = store.BeginLoad("c").token_if_started().value_or(LoadToken{});
   ASSERT_NE(token.id, 0U) << "no load token";
   set("c", 3);
-  ASSERT_FALSE(store.CompleteLoad("c", token, LoadedState{}));
+  ASSERT_FALSE(store.CompleteLoad("c", token, LoadedAbsent{}));
 
   clock.Advance(2s);
   horizon = 2;

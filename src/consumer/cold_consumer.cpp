@@ -24,6 +24,12 @@ namespace {
 constexpr size_t kDefaultLowWaterNumerator = 3;
 constexpr size_t kDefaultLowWaterDenominator = 4;
 
+uint64_t AppendedAtMs(const core::QueueEntry& entry) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
+          .count());
+}
+
 }  // namespace
 
 ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard,
@@ -37,9 +43,8 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
       config_(config),
       eviction_policy_(eviction_policy),
       steady_clock_(std::move(steady_clock)),
-      wall_clock_(std::move(wall_clock)),
       strategy_(config_.quiet_threshold, config_.safety_margin, config_.jitter_fraction),
-      buffer_(strategy_, steady_clock_, config_.rng_seed) {
+      buffer_(strategy_, steady_clock_, config_.rng_seed, std::move(wall_clock)) {
   auto& reg = metrics::Registry::Instance();
   flush_reason_quiet_ =
       reg.Counter(metrics::names::kColdFlushReasonTotal, metrics::FlushReason::kQuiet);
@@ -487,10 +492,7 @@ void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry:
     RecordPoison(entry.seq, "empty write command");
     return;
   }
-  const uint64_t wall_now_ms = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
-          .count());
-  AbsorbResolvedOp(write.cmd, entry.seq, entry.seq, wall_now_ms);
+  AbsorbResolvedOp(write.cmd, entry.seq, entry.seq, AppendedAtMs(entry));
 }
 
 void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
@@ -511,10 +513,7 @@ void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
   const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
   if (flush_high > 0 && resolved.ref < flush_high) return;
   if (resolved.decision != core::Decision::kApply) return;
-  // Materialised ops use PXAT so wall_now_ms is unused; pass appended_at for symmetry.
-  const uint64_t wall_now_ms = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
-          .count());
+  const uint64_t appended_at_ms = AppendedAtMs(entry);
   for (const auto& cmd : resolved.materialised_ops) {
     if (cmd.args.empty()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
@@ -523,7 +522,7 @@ void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
     }
     // Non-poison ops in the same Resolved still absorb. Replay resumes at the
     // Conditional, but the effect is only as durable as this Resolved.
-    AbsorbResolvedOp(cmd, resolved.ref, entry.seq, wall_now_ms);
+    AbsorbResolvedOp(cmd, resolved.ref, entry.seq, appended_at_ms);
   }
 }
 
@@ -566,7 +565,7 @@ bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   wipe_pending_ = false;
   // Only after the wipe: until then the buffer is the newest pre-Flush
   // state, and dropping it would let reads fall back to older cold data.
-  buffer_.Clear();
+  buffer_.Clear(AppendedAtMs(entry));
 
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
   flushes_applied_.fetch_add(1, std::memory_order_relaxed);
@@ -603,7 +602,7 @@ bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
 }
 
 void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId position,
-                                    core::SequenceId carrier, uint64_t wall_now_ms) {
+                                    core::SequenceId carrier, uint64_t appended_at_ms) {
   // A command with no parser at all cannot be materialised by ANY tier in this
   // build, so hot rejected it too and there is no state for cold to be missing:
   // both views agree the entry produced nothing. Poisoning here would pin WAL
@@ -619,7 +618,7 @@ void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::Sequence
     return;
   }
 
-  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, wall_now_ms);
+  auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, appended_at_ms);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     RecordPoison(position, "ParseWriteOp failed");
@@ -635,7 +634,7 @@ void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::Sequence
 
   const std::string key_str(key);
   auto eviction = eviction_policy_.Resolve(key_str);
-  buffer_.Absorb(key_str, *op, eviction, position, carrier);
+  buffer_.Absorb(key_str, *op, eviction, position, carrier, appended_at_ms);
 }
 
 void ColdConsumer::RecordPoison(core::SequenceId seq, std::string_view reason) {
@@ -729,7 +728,8 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
     const FlushBatch& to_flush, std::optional<metrics::FlushReason> aggressive_reason,
     std::chrono::steady_clock::time_point flush_start) {
   const bool aggressive = aggressive_reason.has_value();
-  const auto wall_now = wall_clock_();
+  // The batch stays buffered until it lands, so the clock cannot pass it.
+  const uint64_t log_now_ms = buffer_.LogClockMs();
   uint64_t quiet_count = 0;
   uint64_t deadline_count = 0;
   core::SequenceId max_last_seq = 0;
@@ -739,9 +739,9 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
   const core::SequenceId batch_highest_seq = HighestSeqOf(to_flush);
   uint64_t expired = 0;
   for (const BufferEntry& entry : to_flush) {
-    // An expired entry still flushes, as a delete: cold may hold an
-    // older value of the key that would otherwise resurface.
-    if (AbsTtlExpired(entry, wall_now)) ++expired;
+    // An entry expired by the log clock still flushes, as a delete: cold
+    // may hold an older value of the key that would otherwise resurface.
+    if (AbsTtlExpired(entry, log_now_ms)) ++expired;
     if (entry.last_trigger == FlushTrigger::kQuiet) {
       ++quiet_count;
     } else {
@@ -754,7 +754,7 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
   FlushOutcome outcome = FlushOutcome::kProgress;
   if (!to_flush.empty()) {
     if (AwaitPowerDurable(max_last_seq)) {
-      outcome = ApplyBatchWithRetry(to_flush, batch_highest_seq, wall_now);
+      outcome = ApplyBatchWithRetry(to_flush, batch_highest_seq, log_now_ms);
     } else {
       buffer_.Reschedule(to_flush);
       outcome = FlushOutcome::kDurabilityPending;
@@ -807,13 +807,13 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
 
 std::vector<core::ops::WriteOp> ColdConsumer::BuildBatchOps(
     const FlushBatch& entries, std::vector<core::ops::Del>& del_storage,
-    core::WallTime wall_now) const {
+    uint64_t log_now_ms) const {
   std::vector<core::ops::WriteOp> ops;
   ops.reserve(entries.size());
   del_storage.reserve(entries.size());
 
   for (const BufferEntry& entry : entries) {
-    if (entry.state.IsTombstone() || AbsTtlExpired(entry, wall_now)) {
+    if (entry.state.IsTombstone() || AbsTtlExpired(entry, log_now_ms)) {
       del_storage.push_back(core::ops::Del{.keys = {entry.key}});
       ops.emplace_back(del_storage.back());
       continue;
@@ -847,9 +847,9 @@ core::SequenceId ColdConsumer::HighestSeqOf(const FlushBatch& entries) {
 
 ColdConsumer::FlushOutcome ColdConsumer::ApplyBatchWithRetry(const FlushBatch& entries,
                                                              core::SequenceId highest_wal_seq,
-                                                             core::WallTime wall_now) {
+                                                             uint64_t log_now_ms) {
   std::vector<core::ops::Del> del_storage;
-  auto ops = BuildBatchOps(entries, del_storage, wall_now);
+  auto ops = BuildBatchOps(entries, del_storage, log_now_ms);
 
   auto result = cold_store_.ApplyBatch(std::span<const core::ops::WriteOp>(ops), highest_wal_seq);
   if (result.has_value()) {
@@ -904,12 +904,9 @@ bool ColdConsumer::AwaitPowerDurable(core::SequenceId seq) {
   return false;
 }
 
-bool ColdConsumer::AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const {
-  const uint64_t ttl_ms = entry.state.StringTtlMs();
-  if (ttl_ms == 0) return false;
-  const uint64_t now_ms = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(wall_now.time_since_epoch()).count());
-  return now_ms >= ttl_ms;
+bool ColdConsumer::AbsTtlExpired(const BufferEntry& entry, uint64_t log_now_ms) {
+  const uint64_t ttl_ms = entry.state.AbsTtlMs();
+  return ttl_ms != 0 && ttl_ms <= log_now_ms;
 }
 
 size_t ColdConsumer::LowWaterBytes() const {

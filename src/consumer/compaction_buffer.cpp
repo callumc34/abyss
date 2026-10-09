@@ -34,7 +34,8 @@ CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock, core::WallClockFn 
 
 void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op,
                               core::EvictionTTL eviction, core::SequenceId position,
-                              core::SequenceId carrier) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+                              core::SequenceId carrier,
+                              uint64_t appended_at_ms) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   // A selected batch is applied by reference; changing it would let
   // EraseFlushed drop state that never reached cold.
@@ -44,12 +45,19 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
 
   size_t old_entry_bytes = is_new ? 0 : EntryBytes(entry);
 
+  // The engine stamps appended_at before it appends, so it may run
+  // behind an earlier seq's; the running max keeps the clock monotonic.
+  max_absorbed_ms_ = std::max(max_absorbed_ms_, appended_at_ms);
   if (is_new) {
     entry.key = key;
     entry.first_seen = clock_();
     entry.jitter_offset = ComputeJitter();
     entry.first_seen_seq = position;
+    entry.first_appended_at_ms = max_absorbed_ms_;
+    pending_seqs_.insert(position);
+    pending_times_.insert(max_absorbed_ms_);
   }
+  PublishLogClock();
 
   entry.last_seq = std::max(entry.last_seq, carrier);
   entry.eviction = eviction;
@@ -77,6 +85,18 @@ void CompactionBuffer::PushHeapEntry(BufferEntry& entry, core::SteadyTime schedu
   entry.scheduled_in_heap_ = scheduled;
   heap_overhead_bytes_ += kHeapEntryOverhead + entry.key.size();
   flush_heap_.push({scheduled, entry.key});
+}
+
+void CompactionBuffer::ErasePending(const BufferEntry& entry) {
+  pending_seqs_.erase(pending_seqs_.find(entry.first_seen_seq));
+  pending_times_.erase(pending_times_.find(entry.first_appended_at_ms));
+}
+
+void CompactionBuffer::PublishLogClock() {
+  const uint64_t clock = pending_times_.empty() ? max_absorbed_ms_ : *pending_times_.begin();
+  ABYSS_DCHECK(clock >= log_clock_ms_.load(std::memory_order_relaxed),
+               "compaction buffer log clock moved backwards");
+  log_clock_ms_.store(clock, std::memory_order_release);
 }
 
 namespace {
@@ -247,6 +267,14 @@ HashOverlay CompactionBuffer::HashOverlayFor(std::string_view key) const
   };
 }
 
+std::optional<CompactedState> CompactionBuffer::Snapshot(std::string_view key) const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  const auto it = entries_.find(std::string(key));
+  if (it == entries_.end()) return std::nullopt;
+  return it->second.state;
+}
+
 FlushBatch CompactionBuffer::FlushReady(core::SteadyTime now,
                                         size_t max_count) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
@@ -315,9 +343,11 @@ void CompactionBuffer::EraseFlushed(const FlushBatch& batch) ABYSS_NO_THREAD_SAF
     // Erase by iterator: the key argument would alias the erased node.
     const auto it = entries_.find(entry.key);
     bytes_estimate_ -= EntryBytes(it->second);
+    ErasePending(it->second);
     entries_.erase(it);
     --in_flight_;
   }
+  PublishLogClock();
 }
 
 void CompactionBuffer::Reschedule(const FlushBatch& batch) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
@@ -335,10 +365,27 @@ void CompactionBuffer::Reschedule(const FlushBatch& batch) ABYSS_NO_THREAD_SAFET
 std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeq() const
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
+  if (pending_seqs_.empty()) return std::nullopt;
+  return *pending_seqs_.begin();
+}
+
+std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeqScanForTesting() const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
   if (entries_.empty()) return std::nullopt;
   core::SequenceId oldest = std::numeric_limits<core::SequenceId>::max();
   for (const auto& [_, entry] : entries_) {
     oldest = std::min(oldest, entry.first_seen_seq);
+  }
+  return oldest;
+}
+
+uint64_t CompactionBuffer::LogClockScanForTesting() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  if (entries_.empty()) return max_absorbed_ms_;
+  uint64_t oldest = std::numeric_limits<uint64_t>::max();
+  for (const auto& [_, entry] : entries_) {
+    oldest = std::min(oldest, entry.first_appended_at_ms);
   }
   return oldest;
 }
@@ -348,8 +395,7 @@ std::optional<core::SteadyTime> CompactionBuffer::OldestFirstSeen() const
   const std::shared_lock lock(mutex_);
   if (entries_.empty()) return std::nullopt;
   // entries_ is unordered and flush_heap_ is keyed on scheduled_time, not
-  // first_seen, so a scan is the only exact answer — same cost profile as
-  // OldestPendingSeq().
+  // first_seen, so a scan is the only exact answer.
   core::SteadyTime oldest = core::SteadyTime::max();
   for (const auto& [_, entry] : entries_) {
     oldest = std::min(oldest, entry.first_seen);
@@ -357,7 +403,7 @@ std::optional<core::SteadyTime> CompactionBuffer::OldestFirstSeen() const
   return oldest;
 }
 
-void CompactionBuffer::Clear() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+void CompactionBuffer::Clear(uint64_t flush_appended_at_ms) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::unique_lock lock(mutex_);
   if (in_flight_ != 0) core::Fatal("compaction buffer cleared during an in-flight flush");
   entries_.clear();
@@ -366,6 +412,10 @@ void CompactionBuffer::Clear() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   flush_heap_.swap(empty);
   bytes_estimate_ = 0;
   heap_overhead_bytes_ = 0;
+  pending_seqs_.clear();
+  pending_times_.clear();
+  max_absorbed_ms_ = std::max(max_absorbed_ms_, flush_appended_at_ms);
+  PublishLogClock();
 }
 
 size_t CompactionBuffer::Size() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {

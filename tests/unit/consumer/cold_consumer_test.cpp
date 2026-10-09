@@ -580,23 +580,27 @@ TEST_F(ColdConsumerTest, FlushRetriesOnTransientApplyFailure) {
   EXPECT_EQ(snap.ops_flushed, 1U);
 }
 
-TEST_F(ColdConsumerTest, AbsTtlExpiredEntryFlushesAsDelete) {
-  // ParseWriteOp("SET EX ...") reads real wall-clock, so we bypass RESP parsing.
+uint64_t WallMs(const testing::TestClock& clock) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(clock.WallNow().time_since_epoch())
+          .count());
+}
+
+// A write stamped at or past its own TTL is expired by the log clock, so
+// it flushes as a delete: cold may hold an older value that would
+// otherwise resurface.
+TEST_F(ColdConsumerTest, EntryExpiredByTheLogClockFlushesAsDelete) {
   ColdConsumer::Config cfg;
   cfg.quiet_threshold = 30s;
   cfg.jitter_fraction = 0.0;
   auto c = MakeConsumer(cfg);
 
-  const auto now_ms = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
-          .count());
-  const uint64_t ttl_ms = now_ms + 1000;  // 1s in the future.
+  const uint64_t appended_at_ms = WallMs(clock_);
+  c->Buffer().Absorb("k",
+                     core::ops::WriteOp{core::ops::StringSet{
+                         .key = "k", .value = "v", .abs_ttl_ms = appended_at_ms - 1}},
+                     core::EvictionTTL{3600}, /*position=*/1, /*carrier=*/1, appended_at_ms);
 
-  c->Buffer().Absorb(
-      "k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = ttl_ms}},
-      core::EvictionTTL{3600}, /*position=*/1, /*carrier=*/1);
-
-  // Cold may hold an older value of "k"; only a delete keeps it gone.
   std::vector<std::string> observed_dels;
   size_t observed_ops = 0;
   EXPECT_CALL(cold_, ApplyBatch(_, _))
@@ -618,6 +622,39 @@ TEST_F(ColdConsumerTest, AbsTtlExpiredEntryFlushesAsDelete) {
   EXPECT_EQ(observed_dels, std::vector<std::string>{"k"});
   EXPECT_EQ(c->Snapshot().entries_expired_abs_ttl, 1U);
   EXPECT_EQ(c->Buffer().Size(), 0U);
+}
+
+// The wall clock running past a TTL deletes nothing: until the log's
+// clock passes it, a later write may still have relied on the key.
+TEST_F(ColdConsumerTest, AnEntryExpiredOnlyByTheWallClockFlushesAsWritten) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  const uint64_t appended_at_ms = WallMs(clock_);
+  const uint64_t ttl_ms = appended_at_ms + 1000;
+  c->Buffer().Absorb(
+      "k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = ttl_ms}},
+      core::EvictionTTL{3600}, /*position=*/1, /*carrier=*/1, appended_at_ms);
+
+  std::vector<core::ops::WriteOp> observed;
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillOnce([&](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
+        observed.assign(ops.begin(), ops.end());
+        return core::Result<void>{};
+      });
+
+  clock_.Advance(60s);
+  c->Drain();
+  c->Flush();
+
+  ASSERT_EQ(observed.size(), 1U);
+  const auto* set = std::get_if<core::ops::StringSet>(observed.data());
+  ASSERT_NE(set, nullptr);
+  EXPECT_EQ(set->abs_ttl_ms, ttl_ms);
+  EXPECT_EQ(c->Snapshot().entries_expired_abs_ttl, 0U);
+  EXPECT_EQ(c->LogClockMs(), appended_at_ms);
 }
 
 // --- Mode hysteresis ---------------------------------------------------------
@@ -723,6 +760,37 @@ TEST_F(ColdConsumerTest, FlushCommitsOffsetWhenDurable) {
   ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
   EXPECT_TRUE(fut.get().IsSimpleString());
   EXPECT_EQ(c->Snapshot().last_commit_seq, kFlushSeq);
+}
+
+TEST_F(ColdConsumerTest, LogClockFollowsTheOldestUnflushedWriteThenTheFlush) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 30s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  const auto base = clock_.WallNow();
+  const uint64_t base_ms = WallMs(clock_);
+  auto first = MakeWriteEntry(1, {"SET", "a", "v"});
+  first.appended_at = base;
+  auto second = MakeWriteEntry(2, {"SET", "b", "v"});
+  second.appended_at = base + 5s;
+  auto flush = MakeFlushEntry(3);
+  flush.appended_at = base + 9s;
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{first, second}))
+      .WillOnce(Return(std::vector<core::QueueEntry>{flush}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+  EXPECT_CALL(cold_, Wipe(kShard)).WillOnce(Return(core::Result<void>{}));
+
+  EXPECT_EQ(c->LogClockMs(), 0U);
+  c->Drain();
+  EXPECT_EQ(c->LogClockMs(), base_ms);
+  clock_.Advance(60s);
+  c->Flush();
+  EXPECT_EQ(c->LogClockMs(), base_ms + 5000);
+
+  c->Drain();
+  EXPECT_EQ(c->LogClockMs(), base_ms + 9000);
 }
 
 // A failed Wipe never lets the consumer pass the Flush: the cursor and

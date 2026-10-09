@@ -16,3 +16,19 @@ using FatalHandler = void (*)(std::string_view reason);
 void SetFatalHandlerForTesting(FatalHandler handler) noexcept;
 
 }  // namespace abyss::core
+
+// Fatal when `cond` is false, in debug builds only. Under NDEBUG it
+// still compiles both arguments but evaluates neither.
+// NOLINTBEGIN(cppcoreguidelines-macro-usage)
+#ifdef NDEBUG
+#define ABYSS_DCHECK(cond, message)                     \
+  do {                                                  \
+    if (false && (cond)) ::abyss::core::Fatal(message); \
+  } while (false)
+#else
+#define ABYSS_DCHECK(cond, message)             \
+  do {                                          \
+    if (!(cond)) ::abyss::core::Fatal(message); \
+  } while (false)
+#endif
+// NOLINTEND(cppcoreguidelines-macro-usage)

@@ -164,6 +164,11 @@ bool Server::Initialize() {
       // Must match the hot/consumer shard count.
       .shard_count = hot_store_->shard_count(),
       .write_buffer_size_bytes = config_.cold.write_buffer_size_bytes,
+      // Cold expires keys by the shard's log clock, which its consumer
+      // keeps. The pool is built below; until then nothing expires.
+      .log_clock = [this](core::ShardId shard) -> uint64_t {
+        return cold_pool_ ? cold_pool_->LogClockMs(shard) : 0;
+      },
       .ttl_scanner = config_.cold.ttl_scanner,
   });
   if (!cold_result.has_value()) {

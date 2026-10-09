@@ -32,6 +32,14 @@ class MockColdStore : public core::ColdStore {
   MOCK_METHOD(core::Result<void>, Compact, (), (override));
   MOCK_METHOD((core::Result<std::optional<core::RespCommand>>), GetPromotionCommand,
               (std::string_view key), (override));
+  MOCK_METHOD((core::Result<std::optional<core::ColdKeyState>>), LoadKey,
+              (std::string_view key, core::SteadyTime deadline), (override));
+  MOCK_METHOD((core::Result<std::optional<core::KeyMeta>>), ProbeKey,
+              (std::string_view key, core::SteadyTime deadline), (override));
+  MOCK_METHOD((core::Result<std::optional<core::MemberValue>>), LoadMember,
+              (std::string_view key, core::KeyType type, std::string_view member,
+               core::SteadyTime deadline),
+              (override));
 };
 
 }  // namespace abyss::testing

@@ -35,6 +35,8 @@ class CompactedState {
 
   bool IsTombstone() const { return is_tombstone_; }
   DataType Type() const { return type_; }
+  BaseInvalidation Invalidation() const { return base_invalidation_; }
+  TtlIntent Ttl() const { return ttl_intent_; }
 
   const std::string& StringValue() const {
     return string_value_.has_value() ? *string_value_ : kEmpty;
@@ -51,8 +53,14 @@ class CompactedState {
   const std::unordered_set<std::string>& HashRemovedFields() const { return hash_removed_fields_; }
   bool SetHasMember(std::string_view member) const;
   size_t SetCardinality() const { return set_members_.size(); }
+  const std::unordered_set<std::string>& SetMembers() const { return set_members_; }
+  const std::unordered_set<std::string>& SetRemovedMembers() const { return set_removed_members_; }
   std::optional<double> ZsetMemberScore(std::string_view member) const;
   size_t ZsetCardinality() const { return zset_members_.size(); }
+  const std::unordered_map<std::string, double>& ZsetMembers() const { return zset_members_; }
+  const std::unordered_set<std::string>& ZsetRemovedMembers() const {
+    return zset_removed_members_;
+  }
 
  private:
   static const std::string kEmpty;

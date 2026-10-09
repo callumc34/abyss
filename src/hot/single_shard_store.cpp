@@ -21,9 +21,11 @@ namespace abyss::hot {
 
 namespace {
 
-int64_t WallMs(const core::WallClockFn& clock) {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(clock().time_since_epoch()).count();
+int64_t WallMs(core::WallTime t) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
 }
+
+int64_t WallMs(const core::WallClockFn& clock) { return WallMs(clock()); }
 
 bool IsExpiredByTtl(const Entry& entry, const core::WallClockFn& clock) {
   if (entry.abs_ttl_ms == 0) return false;
@@ -34,6 +36,30 @@ bool IsExpiredByTtl(const Entry& entry, const core::WallClockFn& clock) {
 size_t Footprint(const Entry& entry, std::string_view key) {
   return entry.bytes + sizeof(std::string) + key.size();
 }
+
+// Only create/replace ops grow memory; delete/expire ops only shrink it, so
+// the budget post-check runs solely on growth ops.
+bool Grows(const core::ops::WriteOp& op) {
+  return std::holds_alternative<core::ops::StringSet>(op) ||
+         std::holds_alternative<core::ops::SetAdd>(op) ||
+         std::holds_alternative<core::ops::ZsetAdd>(op) ||
+         std::holds_alternative<core::ops::HashSet>(op) ||
+         std::holds_alternative<core::ops::HashMSet>(op);
+}
+
+// Sets a flag for one scope, clearing it however the scope ends.
+class FlagScope {
+ public:
+  explicit FlagScope(bool& flag) : flag_(flag) { flag_ = true; }
+  FlagScope(const FlagScope&) = delete;
+  FlagScope& operator=(const FlagScope&) = delete;
+  FlagScope(FlagScope&&) = delete;
+  FlagScope& operator=(FlagScope&&) = delete;
+  ~FlagScope() { flag_ = false; }
+
+ private:
+  bool& flag_;
+};
 
 // One stored collection string, as ApproximateBytes counts it.
 size_t StringBytes(const std::string& s) { return sizeof(std::string) + s.capacity(); }
@@ -177,7 +203,9 @@ core::RespValue EmptyReadResponse(const core::ops::ReadOp& op) {
 
 }  // namespace
 
-size_t Entry::ApproximateBytes() const {
+size_t Entry::ApproximateBytes() const { return hot::ApproximateBytes(value); }
+
+size_t ApproximateBytes(const Value& value) {
   size_t bytes = sizeof(Entry);
   std::visit(
       [&bytes](const auto& v) {
@@ -210,6 +238,57 @@ size_t Entry::ApproximateBytes() const {
       },
       value);
   return bytes;
+}
+
+LoadedFull MakeLoadedFull(Value value, int64_t abs_ttl_ms) {
+  const size_t bytes = ApproximateBytes(value);
+  return LoadedFull{.value = std::move(value), .abs_ttl_ms = abs_ttl_ms, .bytes = bytes};
+}
+
+std::string_view KeyView::string_value() const {
+  const auto* str = value != nullptr ? std::get_if<std::string>(value) : nullptr;
+  return str != nullptr ? std::string_view(*str) : std::string_view{};
+}
+
+bool KeyView::set_has(std::string_view member) const {
+  const auto* set = value != nullptr ? std::get_if<SetValue>(value) : nullptr;
+  return set != nullptr && set->members.contains(std::string(member));
+}
+
+std::optional<double> KeyView::zset_score(std::string_view member) const {
+  const auto* zset = value != nullptr ? std::get_if<ZsetValue>(value) : nullptr;
+  if (zset == nullptr) return std::nullopt;
+  const auto it = zset->member_scores.find(std::string(member));
+  if (it == zset->member_scores.end()) return std::nullopt;
+  return it->second;
+}
+
+bool KeyView::hash_has(std::string_view field) const { return hash_get(field).has_value(); }
+
+std::optional<std::string_view> KeyView::hash_get(std::string_view field) const {
+  const auto* hash = value != nullptr ? std::get_if<HashValue>(value) : nullptr;
+  if (hash == nullptr) return std::nullopt;
+  const auto it = hash->fields.find(std::string(field));
+  if (it == hash->fields.end()) return std::nullopt;
+  return std::string_view(it->second);
+}
+
+size_t KeyView::collection_size() const {
+  if (value == nullptr) return 0;
+  return std::visit(
+      [](const auto& v) -> size_t {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, SetValue>) {
+          return v.members.size();
+        } else if constexpr (std::is_same_v<T, HashValue>) {
+          return v.fields.size();
+        } else if constexpr (std::is_same_v<T, ZsetValue>) {
+          return v.member_scores.size();
+        } else {
+          return 0;
+        }
+      },
+      *value);
 }
 
 const Stub* StubCache::Find(std::string_view key) const {
@@ -609,19 +688,28 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
                                                       core::EvictionTTL eviction,
                                                       core::SequenceId seq,
                                                       core::SequenceId horizon) {
-  // Only create/replace ops grow memory; delete/expire ops only shrink it, so
-  // the budget post-check runs solely on growth ops.
-  const bool grows = std::holds_alternative<core::ops::StringSet>(op) ||
-                     std::holds_alternative<core::ops::SetAdd>(op) ||
-                     std::holds_alternative<core::ops::ZsetAdd>(op) ||
-                     std::holds_alternative<core::ops::HashSet>(op) ||
-                     std::holds_alternative<core::ops::HashMSet>(op);
+  auto result = Mutate(op, eviction, seq, SetMove{});
+  // The write has already applied (and is durable in the queue). Make room by
+  // evicting OTHER LRU victims down to the budget, protecting the just-written
+  // key. If even then the entry cannot fit (a single value larger than the
+  // whole budget, no other victims), surface kResourceExhausted as an admission
+  // signal — the entry is NOT lost, it stays durable in the queue/cold
+  // (invariant 2). Suppressed during replay.
+  if (Grows(op) && result.has_value() && !EnsureCapacityFor(core::ops::PrimaryKey(op), horizon)) {
+    return std::unexpected(
+        core::Error(core::ErrorCode::kResourceExhausted, "hot store memory budget exhausted"));
+  }
+  return result;
+}
 
+core::Result<core::RespValue> SingleShardStore::Mutate(const core::ops::WriteOp& op,
+                                                       core::EvictionTTL eviction,
+                                                       core::SequenceId seq, SetMove move) {
   auto result = std::visit(
-      [this, eviction, seq](const auto& o) -> core::Result<core::RespValue> {
+      [this, eviction, seq, move](const auto& o) -> core::Result<core::RespValue> {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, core::ops::StringSet>) {
-          return ApplyStringSet(o, eviction);
+          return ApplyStringSet(o, eviction, move);
         } else if constexpr (std::is_same_v<T, core::ops::Del>) {
           return ApplyDel(o, seq);
         } else if constexpr (std::is_same_v<T, core::ops::SetAdd>) {
@@ -654,18 +742,43 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
   } else {
     MarkWritten(core::ops::PrimaryKey(op), seq);
   }
-
-  // The write has already applied (and is durable in the queue). Make room by
-  // evicting OTHER LRU victims down to the budget, protecting the just-written
-  // key. If even then the entry cannot fit (a single value larger than the
-  // whole budget, no other victims), surface kResourceExhausted as an admission
-  // signal — the entry is NOT lost, it stays durable in the queue/cold
-  // (invariant 2). Suppressed during replay.
-  if (grows && result.has_value() && !EnsureCapacityFor(core::ops::PrimaryKey(op), horizon)) {
-    return std::unexpected(
-        core::Error(core::ErrorCode::kResourceExhausted, "hot store memory budget exhausted"));
-  }
   return result;
+}
+
+std::vector<core::RespValue> SingleShardStore::ApplyEffects(std::span<core::Effect> effects,
+                                                            core::SequenceId first_seq,
+                                                            core::WallTime appended_at,
+                                                            const core::EvictionPolicy& policy,
+                                                            core::SequenceId horizon) {
+  const int64_t at_ms = WallMs(appended_at);
+  const FlagScope applying(applying_effects_);
+  std::vector<core::RespValue> replies;
+  replies.reserve(effects.size());
+  for (size_t i = 0; i < effects.size(); ++i) {
+    core::Effect& effect = effects[i];
+    auto op = core::ops::ParseWriteOp(effect.cmd.Name(), effect.cmd, static_cast<uint64_t>(at_ms));
+    if (!op.has_value()) {
+      core::Fatal("decided effect does not parse: " + op.error().message());
+    }
+    const auto key = core::ops::PrimaryKey(*op);
+    ABYSS_DCHECK(ExpiryIsLogged(effect, key, at_ms),
+                 "an effect that reads state met a key expired at appended_at: " + effect.key);
+    const SetMove move{
+        .value = std::holds_alternative<core::ops::StringSet>(*op) ? &effect.cmd.args[2] : nullptr,
+        .reply_old_value = effect.reply_old_value,
+    };
+    auto result = Mutate(*op, policy.Resolve(key), first_seq + i, move);
+    if (effect.observed_expiry) ++expired_count_;
+    // Decided effects always apply: an overshoot shows in Stats.
+    if (Grows(*op)) EnsureCapacityFor(key, horizon);
+    // Decide ruled out every apply error and the effect is logged, so
+    // an error here means hot and the log disagree.
+    if (!result.has_value()) {
+      core::Fatal("a decided effect failed to apply: " + result.error().message());
+    }
+    replies.push_back(std::move(*result));
+  }
+  return replies;
 }
 
 core::Result<void> SingleShardStore::ApplyBatch(std::span<const core::ops::WriteOp> ops,
@@ -679,7 +792,14 @@ core::Result<void> SingleShardStore::ApplyBatch(std::span<const core::ops::Write
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::StringSet& op,
-                                                               core::EvictionTTL eviction) {
+                                                               core::EvictionTTL eviction,
+                                                               SetMove move) {
+  // op.value views *move.value, so it is read before the move.
+  const auto take_value = [&op, move] {
+    return move.value != nullptr ? std::move(*move.value) : std::string(op.value);
+  };
+  core::RespValue reply =
+      move.reply_old_value ? core::RespValue::Null() : core::RespValue::SimpleString("OK");
   auto it = entries_.find(std::string(op.key));
   // A tombstone is treated as absent: fall to the create path so the key is
   // resurrected as a live string (with the key_count increment that implies).
@@ -687,33 +807,37 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
     if (it->second.type != Entry::Type::kString) {
       TrackRemove(it->second, op.key);
       it->second.type = Entry::Type::kString;
-      it->second.value = std::string(op.value);
+      it->second.value = take_value();
       it->second.bytes = it->second.ApproximateBytes();
       it->second.eviction = eviction;
       it->second.eviction_deadline = config_.steady_clock() + eviction;
       it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
       TrackInsert(it->second, op.key);
-      return core::RespValue::SimpleString("OK");
+      return reply;
     }
     TrackRemove(it->second, op.key);
-    std::get<std::string>(it->second.value) = std::string(op.value);
+    auto& value = std::get<std::string>(it->second.value);
+    if (move.reply_old_value && !ExpiredForApply(it->second)) {
+      reply = core::RespValue::BulkString(std::move(value));
+    }
+    value = take_value();
     it->second.bytes = it->second.ApproximateBytes();
     it->second.eviction = eviction;
     it->second.eviction_deadline = config_.steady_clock() + eviction;
     it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
     TrackInsert(it->second, op.key);
-    return core::RespValue::SimpleString("OK");
+    return reply;
   }
 
   // GetOrCreateEntry now tracks an empty-entry baseline; remove it before
   // re-adding the populated footprint so the create path stays balanced.
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kString, eviction);
   TrackRemove(entry, op.key);
-  entry.value = std::string(op.value);
+  entry.value = take_value();
   entry.bytes = entry.ApproximateBytes();
   entry.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
   TrackInsert(entry, op.key);
-  return core::RespValue::SimpleString("OK");
+  return reply;
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& op,
@@ -726,12 +850,15 @@ core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& o
       continue;
     }
     if (it->second.tombstoned) continue;
-    // Already TTL-dead: cold applies the same expiry deterministically, so no
-    // tombstone is needed and the key does not count as removed (Redis parity).
-    // The entry stays, read as absent, until eviction finds this drained.
-    if (IsExpiredByTtl(it->second, config_.wall_clock)) continue;
+    // Already TTL-dead, so not counted (Redis parity), but tombstoned
+    // all the same: an older value may still be in buffer or cold.
+    const bool expired = ExpiredForApply(it->second);
     TombstoneEntry(it->second, key, seq);
-    ++removed;
+    if (expired) {
+      ++expired_count_;
+    } else {
+      ++removed;
+    }
   }
   return core::RespValue::Integer(removed);
 }
@@ -739,13 +866,12 @@ core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& o
 core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
                                                             core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
-  if (it != entries_.end() && !it->second.tombstoned &&
-      !IsExpiredByTtl(it->second, config_.wall_clock) && it->second.type != Entry::Type::kSet) {
+  if (it != entries_.end() && !it->second.tombstoned && !ExpiredForApply(it->second) &&
+      it->second.type != Entry::Type::kSet) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
-  if (it != entries_.end() && !it->second.tombstoned &&
-      IsExpiredByTtl(it->second, config_.wall_clock)) {
+  if (it != entries_.end() && !it->second.tombstoned && ExpiredForApply(it->second)) {
     RemoveEntry(std::string(op.key));
   }
 
@@ -772,8 +898,7 @@ core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::Set
 core::Result<core::RespValue> SingleShardStore::ApplySetRem(const core::ops::SetRem& op,
                                                             core::SequenceId seq) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || it->second.tombstoned ||
-      IsExpiredByTtl(it->second, config_.wall_clock)) {
+  if (it == entries_.end() || it->second.tombstoned || ExpiredForApply(it->second)) {
     return core::RespValue::Integer(0);
   }
   if (it->second.type != Entry::Type::kSet) {
@@ -802,13 +927,12 @@ core::Result<core::RespValue> SingleShardStore::ApplySetRem(const core::ops::Set
 core::Result<core::RespValue> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
                                                              core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
-  if (it != entries_.end() && !it->second.tombstoned &&
-      !IsExpiredByTtl(it->second, config_.wall_clock) && it->second.type != Entry::Type::kZset) {
+  if (it != entries_.end() && !it->second.tombstoned && !ExpiredForApply(it->second) &&
+      it->second.type != Entry::Type::kZset) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
-  if (it != entries_.end() && !it->second.tombstoned &&
-      IsExpiredByTtl(it->second, config_.wall_clock)) {
+  if (it != entries_.end() && !it->second.tombstoned && ExpiredForApply(it->second)) {
     RemoveEntry(std::string(op.key));
   }
 
@@ -841,8 +965,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyZsetAdd(const core::ops::Zs
 core::Result<core::RespValue> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op,
                                                              core::SequenceId seq) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || it->second.tombstoned ||
-      IsExpiredByTtl(it->second, config_.wall_clock)) {
+  if (it == entries_.end() || it->second.tombstoned || ExpiredForApply(it->second)) {
     return core::RespValue::Integer(0);
   }
   if (it->second.type != Entry::Type::kZset) {
@@ -872,13 +995,12 @@ core::Result<core::RespValue> SingleShardStore::ApplyZsetRem(const core::ops::Zs
 core::Result<core::RespValue> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
                                                              core::EvictionTTL eviction) {
   auto it = entries_.find(std::string(op.key));
-  if (it != entries_.end() && !it->second.tombstoned &&
-      !IsExpiredByTtl(it->second, config_.wall_clock) && it->second.type != Entry::Type::kHash) {
+  if (it != entries_.end() && !it->second.tombstoned && !ExpiredForApply(it->second) &&
+      it->second.type != Entry::Type::kHash) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
-  if (it != entries_.end() && !it->second.tombstoned &&
-      IsExpiredByTtl(it->second, config_.wall_clock)) {
+  if (it != entries_.end() && !it->second.tombstoned && ExpiredForApply(it->second)) {
     RemoveEntry(std::string(op.key));
   }
 
@@ -917,8 +1039,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashMSet(const core::ops::H
 core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op,
                                                              core::SequenceId seq) {
   auto it = entries_.find(std::string(op.key));
-  if (it == entries_.end() || it->second.tombstoned ||
-      IsExpiredByTtl(it->second, config_.wall_clock)) {
+  if (it == entries_.end() || it->second.tombstoned || ExpiredForApply(it->second)) {
     return core::RespValue::Integer(0);
   }
   if (it->second.type != Entry::Type::kHash) {
@@ -950,7 +1071,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Exp
   // tombstone — the tombstone is reclaimed by GcTombstones, not by a TTL op.
   if (it->second.tombstoned) return core::RespValue::Integer(0);
   // An expired entry stays, read as absent, until cold drains it.
-  if (IsExpiredByTtl(it->second, config_.wall_clock)) return core::RespValue::Integer(0);
+  if (ExpiredForApply(it->second)) return core::RespValue::Integer(0);
   TrackRemove(it->second, op.key);
   it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
   TrackInsert(it->second, op.key);
@@ -962,7 +1083,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyPersist(const core::ops::Pe
   if (it == entries_.end()) return core::RespValue::Integer(0);
   // A tombstone is logically absent: PERSIST returns 0 and leaves it untouched.
   if (it->second.tombstoned) return core::RespValue::Integer(0);
-  if (IsExpiredByTtl(it->second, config_.wall_clock)) return core::RespValue::Integer(0);
+  if (ExpiredForApply(it->second)) return core::RespValue::Integer(0);
   if (it->second.abs_ttl_ms == 0) {
     return core::RespValue::Integer(0);
   }
@@ -1135,7 +1256,7 @@ std::optional<LoadToken> SingleShardStore::BeginLoad(std::string_view key) {
   return token;
 }
 
-bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadedState state,
+bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result,
                                     core::EvictionTTL eviction, core::SequenceId horizon) {
   const std::string owned(key);
   const auto pending = loading_.find(owned);
@@ -1148,18 +1269,25 @@ bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, Loade
     ++load_discards_;
     return false;
   }
+  LoadResult installed = std::move(result);
+  if (const auto* exists = std::get_if<LoadedExists>(&installed)) {
+    stubs_.Put(key, Stub{.type = exists->type, .abs_ttl_ms = exists->abs_ttl_ms});
+    return stubs_.Find(key) != nullptr;
+  }
   stubs_.Erase(key);
-  if (!state.exists) return true;
-  if (state.value.index() != static_cast<size_t>(state.type)) {
-    core::Fatal("hot load installs a value that does not match its type");
+  auto* full = std::get_if<LoadedFull>(&installed);
+  if (full == nullptr) {
+    // Drained by definition, so tombstone GC may take it.
+    InsertTombstone(key, 0);
+    return true;
   }
 
   const auto it = entries_.try_emplace(owned).first;
   Entry& entry = it->second;
-  entry.type = state.type;
-  entry.value = std::move(state.value);
-  entry.bytes = entry.ApproximateBytes();
-  entry.abs_ttl_ms = state.abs_ttl_ms;
+  entry.type = full->type();
+  entry.value = std::move(full->value);
+  entry.bytes = full->bytes;
+  entry.abs_ttl_ms = full->abs_ttl_ms;
   entry.eviction = eviction;
   entry.eviction_deadline = config_.steady_clock() + eviction;
   // Loaded state is already drained.
@@ -1172,6 +1300,19 @@ bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, Loade
   return true;
 }
 
+size_t SingleShardStore::CompleteLoads(std::span<LoadCompletion> loads,
+                                       const core::EvictionPolicy& policy,
+                                       core::SequenceId horizon) {
+  size_t installed = 0;
+  for (auto& load : loads) {
+    if (CompleteLoad(load.key, load.token, std::move(load.result), policy.Resolve(load.key),
+                     horizon)) {
+      ++installed;
+    }
+  }
+  return installed;
+}
+
 void SingleShardStore::AbortLoad(std::string_view key, LoadToken token) {
   const auto pending = loading_.find(std::string(key));
   if (pending != loading_.end() && pending->second == token) loading_.erase(pending);
@@ -1181,7 +1322,52 @@ bool SingleShardStore::LoadPending(std::string_view key) const {
   return !loading_.empty() && loading_.contains(std::string(key));
 }
 
+KeyView SingleShardStore::View(std::string_view key, core::SequenceId horizon,
+                               uint64_t now_ms) const {
+  const auto expired = [now_ms](int64_t abs_ttl_ms) {
+    return abs_ttl_ms != 0 && std::cmp_greater_equal(now_ms, abs_ttl_ms);
+  };
+  using Presence = KeyView::Presence;
+  if (const Entry* entry = FindEntry(key); entry != nullptr) {
+    KeyView view{
+        .type = entry->type, .abs_ttl_ms = entry->abs_ttl_ms, .latest_seq = entry->latest_seq};
+    if (entry->tombstoned) {
+      view.presence = Presence::kTombstoned;
+      return view;
+    }
+    view.presence = expired(entry->abs_ttl_ms) ? Presence::kExpired : Presence::kLive;
+    view.value = &entry->value;
+    return view;
+  }
+  // The floor first: a stub older than the Flush is dead.
+  if (KnownAbsentAfterFlush(horizon)) {
+    return KeyView{
+        .presence = Presence::kTombstoned, .flush_floor = true, .latest_seq = flush_seq_};
+  }
+  if (LoadPending(key)) return KeyView{};
+  if (const Stub* stub = stubs_.Find(key); stub != nullptr) {
+    return KeyView{.presence = expired(stub->abs_ttl_ms) ? Presence::kExpired : Presence::kStub,
+                   .type = stub->type,
+                   .abs_ttl_ms = stub->abs_ttl_ms,
+                   .latest_seq = stub->latest_seq};
+  }
+  return KeyView{};
+}
+
 // --- Internal helpers ---
+
+bool SingleShardStore::ExpiredForApply(const Entry& entry) const {
+  if (applying_effects_ || entry.abs_ttl_ms == 0) return false;
+  return WallMs(config_.wall_clock) >= entry.abs_ttl_ms;
+}
+
+bool SingleShardStore::ExpiryIsLogged(const core::Effect& effect, std::string_view key,
+                                      int64_t at_ms) const {
+  if (effect.replaces_state && !effect.reply_old_value) return true;
+  const Entry* entry = FindEntry(key);
+  return entry == nullptr || entry->tombstoned || entry->abs_ttl_ms == 0 ||
+         at_ms < entry->abs_ttl_ms;
+}
 
 const Entry* SingleShardStore::FindEntry(std::string_view key) const {
   auto it = entries_.find(std::string(key));

@@ -59,6 +59,10 @@ class IntegrationHarness {
     tmp_dir_ = std::filesystem::temp_directory_path() / ("abyss_test_" + unique);
     std::filesystem::create_directories(tmp_dir_);
 
+    // The engine stamps appended_at by the real clock, and cold expires
+    // by appended_at: TTLs taken from the test clock must share its epoch.
+    clock_.SetWall(core::WallClock::now());
+
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
         .max_memory_bytes = kHotMemory,
         .shard_count = kShardCount,
@@ -72,6 +76,9 @@ class IntegrationHarness {
         .shard_count = kShardCount,
         .write_buffer_size_bytes = 1024UL * 1024UL,
         .wall_clock = clock_.WallFn(),
+        .log_clock = [this](core::ShardId shard) -> uint64_t {
+          return cold_pool_ ? cold_pool_->LogClockMs(shard) : 0;
+        },
     });
     cold_ = std::move(cold_result).value();
 

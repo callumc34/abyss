@@ -14,7 +14,7 @@
 //   commit word   u64   {len: low u32, gen: high u32}, stored last
 //   crc32c        u32   over body[0, covered), the segment's salt, then
 //                       the commit word
-//   body          len   kind u8, type u8, shard u16, reserved u32,
+//   body          len   kind u8, type u8, shard u16, flags u32,
 //                       seq u64, batch_rest u64, appended_at_us i64,
 //                       then the entry payload
 //   pad                 zeros up to the next 8-byte boundary
@@ -39,9 +39,14 @@ inline constexpr std::size_t kMinFrameBytes = 48;
 
 enum class Kind : uint8_t { kEntry = 1, kPadding = 2 };
 
+// Header::flags bits. An unknown bit is corruption.
+inline constexpr uint32_t kReplacesState = 1U << 0;
+
 struct Header {
   Kind kind = Kind::kEntry;
   core::ShardId shard = 0;
+  // Formerly reserved; ADP-009's frame table predates it.
+  uint32_t flags = 0;
   core::SequenceId seq = 0;
   uint64_t batch_rest = 0;
   // Zero for padding.

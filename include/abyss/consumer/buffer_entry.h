@@ -20,6 +20,9 @@ struct BufferEntry {
   core::EvictionTTL eviction{0};
   std::chrono::milliseconds jitter_offset{0};
   core::SequenceId first_seen_seq = 0;
+  // appended_at of the first write absorbed since the last flush, never
+  // below an earlier entry's (CompactionBuffer::LogClockMs).
+  uint64_t first_appended_at_ms = 0;
   // Highest seq of an entry carrying an absorbed effect.
   core::SequenceId last_seq = 0;
   FlushTrigger last_trigger = FlushTrigger::kQuiet;

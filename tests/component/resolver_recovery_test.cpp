@@ -46,6 +46,10 @@ class EmptyBufferRouter : public CompactionBufferRouter {
     return BufferKeyPresence::kAbsent;
   }
   HashOverlay HashOverlayFor(std::string_view /*key*/) const override { return HashOverlay{}; }
+  std::optional<CompactedState> Snapshot(core::ShardId /*shard*/,
+                                         std::string_view /*key*/) const override {
+    return std::nullopt;
+  }
   bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId /*target_seq*/,
                          std::chrono::milliseconds /*timeout*/) override {
     return true;

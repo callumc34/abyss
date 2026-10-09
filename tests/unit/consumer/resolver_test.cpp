@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -47,6 +48,10 @@ class EmptyBufferRouter : public CompactionBufferRouter {
   }
   consumer::HashOverlay HashOverlayFor(std::string_view /*key*/) const override {
     return consumer::HashOverlay{};
+  }
+  std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
+                                                   std::string_view /*key*/) const override {
+    return std::nullopt;
   }
   // Resolver tests don't depend on cold-consumer drain; report "caught up" so
   // the engine's gate never blocks.

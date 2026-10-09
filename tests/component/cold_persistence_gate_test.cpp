@@ -131,6 +131,20 @@ class ApplyHookColdStore : public core::ColdStore {
   PromotionCommand GetPromotionCommand(std::string_view key) override {
     return inner_.GetPromotionCommand(key);
   }
+  core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
+                                                          core::SteadyTime deadline) override {
+    return inner_.LoadKey(key, deadline);
+  }
+  core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
+                                                      core::SteadyTime deadline) override {
+    return inner_.ProbeKey(key, deadline);
+  }
+  core::Result<std::optional<core::MemberValue>> LoadMember(std::string_view key,
+                                                            core::KeyType type,
+                                                            std::string_view member,
+                                                            core::SteadyTime deadline) override {
+    return inner_.LoadMember(key, type, member, deadline);
+  }
 
  private:
   core::ColdStore& inner_;

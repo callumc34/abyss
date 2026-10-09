@@ -77,12 +77,18 @@ core::Result<core::PredicateFlags> ExtractZAddFlags(const core::RespCommand& cmd
       lt = true;
     } else if (opt == "CH") {
       flags |= core::PredicateFlags::kZAddCh;
+    } else if (opt == "INCR") {
+      return std::unexpected(SyntaxError("ZADD INCR is not supported"));
     } else {
       break;
     }
   }
-  if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
-    return std::unexpected(SyntaxError("syntax error"));
+  if (nx && xx) {
+    return std::unexpected(SyntaxError("XX and NX options at the same time are not compatible"));
+  }
+  if ((gt && lt) || (nx && (gt || lt))) {
+    return std::unexpected(
+        SyntaxError("GT, LT, and/or NX options at the same time are not compatible"));
   }
   return flags;
 }
@@ -107,10 +113,16 @@ core::Result<core::PredicateFlags> ExtractExpireFlags(const core::RespCommand& c
     } else if (opt == "LT") {
       flags |= core::PredicateFlags::kExpireLt;
       lt = true;
+    } else {
+      return std::unexpected(SyntaxError("Unsupported option " + std::string(cmd.args[i])));
     }
   }
-  if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
-    return std::unexpected(SyntaxError("syntax error"));
+  if (nx && (xx || gt || lt)) {
+    return std::unexpected(
+        SyntaxError("NX and XX, GT or LT options at the same time are not compatible"));
+  }
+  if (gt && lt) {
+    return std::unexpected(SyntaxError("GT and LT options at the same time are not compatible"));
   }
   return flags;
 }

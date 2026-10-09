@@ -425,7 +425,7 @@ SetParse ParseSetArgs(const core::RespCommand& cmd, core::PredicateFlags flags, 
   out.keep_ttl = core::HasFlag(flags, core::PredicateFlags::kKeepTtl);
 
   if (out.nx && out.xx) {
-    out.error = "syntax error — NX and XX are mutually exclusive";
+    out.error = "syntax error";
     return out;
   }
   auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, now_ms);
@@ -576,10 +576,17 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
       const auto opt = AsciiUpper(cmd.args[i]);
       if (opt != "NX" && opt != "XX" && opt != "GT" && opt != "LT" && opt != "CH") break;
     }
-    if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
+    if (nx && xx) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
-      return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                  "syntax error — incompatible ZADD flags"));
+      return MakeSkip(
+          seq, core::RespValue::Error(core::ErrorPrefix::kErr,
+                                      "XX and NX options at the same time are not compatible"));
+    }
+    if ((gt && lt) || (nx && (gt || lt))) {
+      parse_failures_.fetch_add(1, std::memory_order_relaxed);
+      return MakeSkip(seq, core::RespValue::Error(
+                               core::ErrorPrefix::kErr,
+                               "GT, LT, and/or NX options at the same time are not compatible"));
     }
     if ((cmd.args.size() - i) < 2 || (cmd.args.size() - i) % 2 != 0) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -659,10 +666,17 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
     const bool xx = core::HasFlag(cond.flags, core::PredicateFlags::kXx);
     const bool gt = core::HasFlag(cond.flags, core::PredicateFlags::kExpireGt);
     const bool lt = core::HasFlag(cond.flags, core::PredicateFlags::kExpireLt);
-    if ((nx && xx) || (gt && lt) || (nx && (gt || lt))) {
+    if (nx && (xx || gt || lt)) {
       parse_failures_.fetch_add(1, std::memory_order_relaxed);
-      return MakeSkip(seq, core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                  "syntax error — incompatible EXPIRE flags"));
+      return MakeSkip(seq, core::RespValue::Error(
+                               core::ErrorPrefix::kErr,
+                               "NX and XX, GT or LT options at the same time are not compatible"));
+    }
+    if (gt && lt) {
+      parse_failures_.fetch_add(1, std::memory_order_relaxed);
+      return MakeSkip(
+          seq, core::RespValue::Error(core::ErrorPrefix::kErr,
+                                      "GT and LT options at the same time are not compatible"));
     }
 
     const std::string_view key = cmd.args[1];

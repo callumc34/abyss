@@ -16,6 +16,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
@@ -23,6 +24,7 @@
 #include "abyss/cold/ttl_scanner.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/result.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/testing.h"
 
@@ -102,11 +104,12 @@ class SweepFixture : public ::testing::Test {
     metrics::testing::Reset();
   }
 
-  std::unique_ptr<RocksdbStore> OpenStore() {
+  std::unique_ptr<RocksdbStore> OpenStore(uint32_t shard_count = kFixtureShardCount) {
     RocksdbConfig config;
     config.data_path = path_.string();
-    config.shard_count = kFixtureShardCount;
+    config.shard_count = shard_count;
     config.wall_clock = clock_.Fn();
+    config.log_clock = [this](core::ShardId shard) { return LogClockMs(shard); };
     config.ttl_scanner_mode = TtlScanner::ExecutionMode::kManualTick;
     config.ttl_scanner.base_sample_size = 200;
     config.ttl_scanner.max_sample_size = 200;
@@ -121,9 +124,20 @@ class SweepFixture : public ::testing::Test {
     return std::move(*store);
   }
 
+  uint64_t LogClockMs(core::ShardId shard) const {
+    const auto it = shard_log_ms_.find(shard);
+    return it == shard_log_ms_.end() ? log_ms_.load() : it->second;
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   TestClock clock_;
+  // Every shard's log clock unless shard_log_ms_ names it. Level with the
+  // wall clock's start, so keys written already past their TTL sweep.
+  std::atomic<uint64_t> log_ms_{1'000'000};
+  std::unordered_map<core::ShardId, uint64_t> shard_log_ms_;
   std::filesystem::path path_;
   std::vector<std::string> keys_;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
 // --- Empty store -----------------------------------------------------------
@@ -202,8 +216,10 @@ TEST_F(SweepFixture, NoTtlIsNotDeleted) {
 
 // --- Repeat sweeps eventually drain expired keys ---------------------------
 
+// Several shards, so samples must land in every one: a seek past the
+// last shard would wrap to the first key and starve the rest.
 TEST_F(SweepFixture, RepeatedSweepsRemoveAllExpired) {
-  auto store = OpenStore();
+  auto store = OpenStore(4);
   // Mix of expired and live, to make sure we don't touch the live ones.
   for (int i = 0; i < 100; ++i) {
     auto& live_key = keys_.emplace_back("live:" + std::to_string(i));
@@ -230,7 +246,8 @@ TEST_F(SweepFixture, RepeatedSweepsRemoveAllExpired) {
     ASSERT_TRUE(r.has_value());
     total_deleted += r->deleted_strings;
   }
-  EXPECT_GT(total_deleted, 0U);
+  EXPECT_EQ(total_deleted, 100U);
+  EXPECT_EQ(store->RecordsForTesting().size(), 101U) << "the live keys and the format version";
 
   // Live keys must remain reachable.
   for (int i = 0; i < 100; ++i) {
@@ -269,6 +286,81 @@ TEST_F(SweepFixture, ExpiredHashCollectionIsCleanedByScanner) {
   auto get = store->Exec(core::ops::HashGet{.key = key, .field = "f"});
   ASSERT_TRUE(get.has_value());
   EXPECT_TRUE(get->IsNull());
+}
+
+// --- The log clock ----------------------------------------------------------
+
+// The wall clock runs far past the TTL first; only the log clock, once
+// it reaches the TTL, lets the scanner delete.
+TEST_F(SweepFixture, DeletesOnlyOnceItsShardsLogClockReachesTheTtl) {
+  auto store = OpenStore();
+  const uint64_t ttl = clock_.Now() + 100;
+  core::ops::WriteOp op = core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = ttl};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
+  log_ms_ = ttl - 1;
+  clock_.Advance(3'600'000);
+
+  for (int i = 0; i < 5; ++i) {
+    auto r = store->RunScannerTickForTesting();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->deleted_strings, 0U);
+  }
+  EXPECT_EQ(store->RecordsForTesting().size(), 2U) << "k was deleted early";
+
+  log_ms_ = ttl;
+  size_t deleted = 0;
+  for (int i = 0; i < 5 && deleted == 0; ++i) {
+    auto r = store->RunScannerTickForTesting();
+    ASSERT_TRUE(r.has_value());
+    deleted += r->deleted_strings;
+  }
+  EXPECT_EQ(deleted, 1U);
+  EXPECT_EQ(store->RecordsForTesting().size(), 1U) << "only the format version is left";
+}
+
+// The first key whose shard lies within [lo, hi) of 65536.
+std::string KeyOnShardIn(uint32_t lo, uint32_t hi, uint32_t shard_count) {
+  for (int i = 0;; ++i) {
+    std::string key = "key:" + std::to_string(i);
+    const auto shard = core::ComputeShard(key, shard_count);
+    if (shard >= lo && shard < hi) return key;
+  }
+}
+
+// The scanner's random seeks spread over the shard prefix, so with
+// every shard slot in use both keys are sampled many times a tick.
+TEST_F(SweepFixture, AKeyOnAShardWithALowerLogClockStays) {
+  constexpr uint32_t kShards = 65536;
+  auto store = OpenStore(kShards);
+  const std::string ahead = KeyOnShardIn(12'000, 20'000, kShards);
+  const std::string behind = KeyOnShardIn(45'000, 53'000, kShards);
+  const uint64_t ttl = clock_.Now() + 100;
+  std::vector<core::ops::WriteOp> ops = {
+      core::ops::StringSet{.key = ahead, .value = "v", .abs_ttl_ms = ttl},
+      core::ops::StringSet{.key = behind, .value = "v", .abs_ttl_ms = ttl},
+  };
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+  log_ms_ = 0;
+  shard_log_ms_[core::ComputeShard(ahead, kShards)] = ttl;
+  shard_log_ms_[core::ComputeShard(behind, kShards)] = ttl - 1;
+  clock_.Advance(3'600'000);
+
+  size_t with_ttl = 0;
+  size_t expired = 0;
+  size_t deleted = 0;
+  for (int i = 0; i < 20; ++i) {
+    auto r = store->RunScannerTickForTesting();
+    ASSERT_TRUE(r.has_value());
+    with_ttl += r->with_ttl_strings;
+    expired += r->expired_strings;
+    deleted += r->deleted_strings;
+  }
+  EXPECT_EQ(deleted, 1U);
+  EXPECT_EQ(expired, 1U) << "the key behind was judged expired";
+  EXPECT_GT(with_ttl, 100U) << "the key behind was hardly sampled";
+  auto loaded = store->LoadKey(behind, core::SteadyClock::now() + std::chrono::seconds(5));
+  ASSERT_TRUE(loaded.has_value() && loaded->has_value()) << "the shard behind lost its key";
+  EXPECT_EQ(store->RecordsForTesting().size(), 2U) << "the format version and the key behind";
 }
 
 // --- ScannerSnapshot --------------------------------------------------------

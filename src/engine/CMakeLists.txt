@@ -1,4 +1,6 @@
 add_library(abyss_engine
+  decide.cpp
+  loader.cpp
   tiering_engine.cpp
   recovery_coordinator.cpp
   bounded_thread_shard_scheduler.cpp

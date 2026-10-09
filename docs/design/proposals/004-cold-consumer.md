@@ -85,13 +85,14 @@ loop:
        - Decode each QueueEntry (Write / Conditional / Resolved-apply)
        - Parse its RESP command into a typed WriteOp
        - Expand multi-key ops (DEL, MSET) into per-key absorbs
-       - buffer.Absorb(key, op, eviction, position, carrier)
+       - buffer.Absorb(key, op, eviction, position, carrier, appended_at)
 
     2. Flush: under normal mode, select entries whose scheduled_time ≤ now
        (quiet window or eviction-deadline fired). Under aggressive mode
        (see Memory Management), select by deadline order irrespective of now.
        Selected entries stay in the buffer, readable, until the apply lands.
-       - Entries whose absolute TTL has expired are written as deletes
+       - Entries whose absolute TTL is at or below the log clock are
+         written as deletes (see Expiry)
        - Wait, bounded, until every selected entry's last_seq is
          power-durable (see Persisting at the power-durable log)
        - Emit typed ops (tombstones become DEL, live states emit per-type ops)
@@ -139,7 +140,25 @@ For a `Write` the two are the same. For a `Resolved`, the position is its `Condi
 
 **Bounded.** What is absorbed but not yet persistable is bounded by the WAL durability window (ADP-001 §Durability classes and group commit). Under a flush stall it stays bounded and observable (invariant 3).
 
-**Absolute TTL interaction:** If a key's absolute `ttl` has expired by flush time, the entry is written to cold as a delete. Dropping it instead would let an older value of the key, flushed in an earlier window, resurface once hot no longer holds the key.
+### Expiry
+
+Cold applies each effect as it was logged. The write path decided it against the key's full state and logged any expiry it observed as a DEL ([ADP-015](015-write-path-and-durability.md)), so cold judges no TTL on apply: a PERSIST or SADD lands on the key as it stands, expired or not. Every state change by TTL follows the shard's **log clock**, never the wall clock. Reads still judge by the wall clock, to answer nil, but never write.
+
+**The log clock** of a shard is the `appended_at` of the first unflushed write in the oldest entry its buffer holds. With nothing pending, it is the newest `appended_at` the buffer has absorbed.
+- **It tracks the commit low-water mark.** The buffer keeps its pending entries in order, so the oldest pending seq and the clock each cost O(log n) per new entry or flush.
+- **An entry stays pending until its batch lands.** Selection for a flush, a failed apply and a reschedule all leave the clock where it was.
+- **A later write to a pending entry keeps the entry's first time.** An entry re-created after its flush starts afresh.
+- **A Flush entry advances it,** once its wipe has run.
+- **It never moves backwards.** An `appended_at` below the running maximum, stamped before an earlier seq was appended, counts as that maximum.
+- **It is volatile.** After a restart it starts at 0, and replay rebuilds it.
+
+**Why it is safe.** `appended_at` is monotonic per shard, so every write not yet in cold, buffered or not yet read, was appended at or after the clock. It was decided with its keys live, so every TTL it relied on is later than the clock. A key whose TTL is at or below the clock can therefore be deleted without racing any write that needed it. The highest `appended_at` cold has applied would not be safe: keys flush on their own schedules, so a key written later can flush first while an earlier PERSIST still waits in the buffer.
+
+**Who uses it:**
+- the cold store's TTL scanner ([ADP-003](003-cold-store.md) §TTL Expiry), which reads each sampled key's shard clock from the consumer;
+- the flush: an entry whose own absolute TTL is at or below the clock is written as a delete. Dropping it instead would let an older value of the key, flushed in an earlier window, resurface once hot no longer holds the key.
+
+**Cost.** The clock trails the wall clock by up to the buffer's hold time, and stops at an idle shard's last write. Expired keys therefore stay on disk longer, until the shard's next write on an idle shard. That costs space only, since reads answer nil.
 
 ### Memory Management
 
@@ -206,6 +225,7 @@ The checkpoint knobs bound the cold durable-checkpoint cadence. The cold consume
 3. A `DEL` resets all accumulated state for a key. No prior writes survive a tombstone.
 4. Flush is idempotent from cold's perspective. If the cold consumer crashes mid-flush and replays, the same compacted state is re-emitted and applied. Last-write-wins in the cold store handles duplicates.
 5. Buffer reads do not promote. The cold consumer owns data in the buffer and will flush it on its own schedule. See [ADP-006](006-read-write-paths.md) for promotion semantics.
+6. Cold changes state only as the log says: it applies effects as logged, deletes by TTL only once the shard's log clock passes it, and never writes on a read. Replaying the same log leaves the same cold state whatever the wall clock reads.
 
 ## Trade-offs
 

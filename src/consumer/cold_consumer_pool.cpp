@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
 
@@ -102,6 +103,14 @@ BufferKeyPresence ColdConsumerPool::Probe(std::string_view key) const {
 HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {
   const auto shard = ShardForKey(key);
   return consumers_[shard]->Buffer().HashOverlayFor(key);
+}
+
+std::optional<CompactedState> ColdConsumerPool::Snapshot(core::ShardId shard,
+                                                         std::string_view key) const {
+  if (shard >= consumers_.size() || ShardForKey(key) != shard) {
+    core::Fatal("buffer snapshot asked of a shard that does not own the key");
+  }
+  return consumers_[shard]->Buffer().Snapshot(key);
 }
 
 bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,

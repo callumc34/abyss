@@ -257,6 +257,9 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       .data_path = config.cold.data_path,
       .shard_count = shards,
       .write_buffer_size_bytes = config.cold.write_buffer_size_bytes,
+      .log_clock = [path = wp.get()](abyss::core::ShardId shard) -> uint64_t {
+        return path->cold_pool ? path->cold_pool->LogClockMs(shard) : 0;
+      },
       .ttl_scanner = config.cold.ttl_scanner,
   });
   if (!cold.has_value()) return std::unexpected(cold.error());

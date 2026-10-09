@@ -5,9 +5,11 @@ add_executable(abyss_component_tests
   wal_queue_streams_test.cpp
   hot_consumer_test.cpp
   cold_durability_test.cpp
+  cold_log_clock_test.cpp
   cold_persistence_gate_test.cpp
   resolver_recovery_test.cpp
   recovery_coordinator_test.cpp
+  loader_test.cpp
 )
 
 target_link_libraries(abyss_component_tests PRIVATE
