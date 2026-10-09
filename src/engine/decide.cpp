@@ -380,8 +380,15 @@ Decision Decider::Set(std::string_view name) {
   const bool get = Has(PredicateFlags::kGet);
   const bool keep_ttl = Has(PredicateFlags::kKeepTtl);
   if (nx && xx) return Fail(Syntax("syntax error"));
+  // A TTL already past deletes the key, logged as a DEL as EXPIRE's is.
+  const auto past = [this](uint64_t ttl) { return ttl != 0 && ttl <= now_ms_; };
   if (!nx && !xx && !get && !keep_ttl) {
-    EmitSet(1, value, set.abs_ttl_ms);
+    if (past(set.abs_ttl_ms)) {
+      Delete(Arg(1));
+      Reply(RespValue::SimpleString("OK"));
+    } else {
+      EmitSet(1, value, set.abs_ttl_ms);
+    }
     return Finish();
   }
 
@@ -400,6 +407,17 @@ Decision Decider::Set(std::string_view name) {
   uint64_t ttl = set.abs_ttl_ms;
   if (keep_ttl && key.present() && key.view.abs_ttl_ms > 0) {
     ttl = static_cast<uint64_t>(key.view.abs_ttl_ms);
+  }
+  if (past(ttl)) {
+    if (!get) {
+      Reply(RespValue::SimpleString("OK"));
+    } else if (key.present()) {
+      Reply(RespValue::BulkString(std::string(key.view.string_value())));
+    } else {
+      Reply(RespValue::Null());
+    }
+    if (key.present()) Delete(Arg(1));
+    return Finish();
   }
   EmitSet(1, value, ttl, /*reply_old_value=*/get && key.present());
   if (get && !key.present()) Reply(RespValue::Null());

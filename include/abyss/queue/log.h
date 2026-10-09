@@ -198,6 +198,10 @@ class Log {
   // Open fails right after `step`, leaving the disk as a crash would.
   enum class OpenStep : uint8_t { kNone, kPastEndRenamed, kTailSynced };
   static void CrashOpenAfterForTesting(OpenStep step);
+  // Called after each directory sync any log makes; an error it
+  // returns is the sync's. Null for none.
+  static void SetDirSyncHookForTesting(
+      std::function<core::Result<void>(const std::filesystem::path&)> hook);
 
  private:
   explicit Log(LogConfig config);

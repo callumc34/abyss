@@ -21,6 +21,10 @@ if(NOT ABYSS_SANITIZER IN_LIST ABYSS_SANITIZER_VALUES)
     "ABYSS_SANITIZER='${ABYSS_SANITIZER}' is not one of: ${ABYSS_SANITIZER_VALUES}")
 endif()
 
+# Reset on every configure, so a build dir reconfigured to none drops it.
+set(ABYSS_SANITIZER_ACTIVE FALSE CACHE INTERNAL
+  "True if any sanitizer is enabled. Used to gate test discovery mode.")
+
 if(ABYSS_SANITIZER STREQUAL "none")
   return()
 endif()

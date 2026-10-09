@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
@@ -105,6 +106,10 @@ core::Error UnknownKind(uint32_t log_id, uint64_t ordinal, uint64_t offset, Kind
                       std::to_string(static_cast<unsigned>(kind)));
 }
 
+std::mutex g_dir_sync_hook_mu;
+std::function<core::Result<void>(const std::filesystem::path&)> g_dir_sync_hook;
+std::atomic<bool> g_dir_sync_hooked{false};
+
 core::Result<void> SyncDir(const std::filesystem::path& dir) {
   auto out = pfs::FsyncDir(dir);
   if (!out.has_value()) return std::unexpected(out.error());
@@ -113,6 +118,10 @@ core::Result<void> SyncDir(const std::filesystem::path& dir) {
         core::Error{core::ErrorCode::kFailedPrecondition,
                     "WAL directory durability unsupported on volume '" + dir.string() +
                         "'; a segment's directory entry cannot be made durable"});
+  }
+  if (g_dir_sync_hooked.load(std::memory_order_acquire)) {
+    const std::scoped_lock lock(g_dir_sync_hook_mu);
+    if (g_dir_sync_hook) return g_dir_sync_hook(dir);
   }
   return {};
 }
@@ -841,6 +850,15 @@ core::Result<void> Log::Impl::RecycleReady(std::unique_lock<std::mutex>& lock) {
     if (const auto& pooled = *removed; pooled.has_value()) {
       recycled.push_back(PoolEntry{.path = *pooled, .last = work[done].ordinal});
     }
+    // A power loss may lose any directory change since the last sync,
+    // in any subset, and a lost removal below a kept one leaves a gap
+    // recovery refuses: so each removal is synced before the next. A
+    // failed sync is fatal, as a failed flush is: a retry could report
+    // success for a change the device dropped.
+    if (auto synced = SyncDir(log.config_.dir); !synced.has_value()) {
+      core::Fatal("WAL directory sync failed after reclaiming " + work[done].path.string() + ": " +
+                  synced.error().message());
+    }
   }
 
   lock.lock();
@@ -1070,26 +1088,24 @@ core::Result<void> Log::Impl::Adopt(OnDisk& disk, Replayed& replayed) {
   // crash midway leaves the ordinals contiguous. This comes before the
   // tail is padded: until the padding lands the hole stops a later
   // walk, and after it the next segment is gone.
+  // Each move is synced before the next, so a power loss that loses
+  // one leaves the moves before it, highest first, in place.
   const std::scoped_lock lock(mu);
-  bool moved_any = false;
   for (auto it = disk.found.rbegin(); it != disk.found.rend() && it->first >= active; ++it) {
     Found& seg = it->second;
     seg.map.Unmap();
     seg.file.Close();
-    moved_any = true;
     if (!seg.right_size || !seg.header.has_value()) {
       if (auto unlinked = pfs::Unlink(seg.path); !unlinked.has_value()) {
         return std::unexpected(unlinked.error());
       }
-      continue;
+    } else {
+      const std::filesystem::path dest = config.dir / FreeName(next_free_name++);
+      if (auto moved = pfs::Rename(seg.path, dest); !moved.has_value()) {
+        return std::unexpected(moved.error());
+      }
+      pool.push_back(PoolEntry{.path = dest, .last = seg.header->ordinal});
     }
-    const std::filesystem::path dest = config.dir / FreeName(next_free_name++);
-    if (auto moved = pfs::Rename(seg.path, dest); !moved.has_value()) {
-      return std::unexpected(moved.error());
-    }
-    pool.push_back(PoolEntry{.path = dest, .last = seg.header->ordinal});
-  }
-  if (moved_any) {
     if (auto dir = SyncDir(config.dir); !dir.has_value()) return std::unexpected(dir.error());
   }
   if (auto crashed = CrashPoint(Log::OpenStep::kPastEndRenamed); !crashed.has_value()) {
@@ -1570,6 +1586,13 @@ void Log::ResumeCombinerForTesting() { impl_->combining.store(false, std::memory
 
 void Log::CrashOpenAfterForTesting(OpenStep step) {
   g_crash_after.store(step, std::memory_order_relaxed);
+}
+
+void Log::SetDirSyncHookForTesting(
+    std::function<core::Result<void>(const std::filesystem::path&)> hook) {
+  const std::scoped_lock lock(g_dir_sync_hook_mu);
+  g_dir_sync_hooked.store(static_cast<bool>(hook), std::memory_order_release);
+  g_dir_sync_hook = std::move(hook);
 }
 
 void Log::InjectRemoveErrorForTesting(core::Error error) {

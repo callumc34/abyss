@@ -523,6 +523,11 @@ core::Result<Loader::Typed> Loader::MetaAs(core::ShardId shard, std::string_view
   }
   const auto meta = KeyAfter(out.base, changes);
   if (!meta.has_value()) return out;
+  // Past its TTL a key is absent, whatever its type.
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(wall_clock_().time_since_epoch())
+          .count();
+  if (meta->abs_ttl_ms != 0 && now_ms >= meta->abs_ttl_ms) return out;
   if (meta->type != type) {
     // A key of another type that removals emptied is absent, not
     // WRONGTYPE.
@@ -533,10 +538,6 @@ core::Result<Loader::Typed> Loader::MetaAs(core::ShardId shard, std::string_view
     }
     return std::unexpected(WrongType());
   }
-  const auto now_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(wall_clock_().time_since_epoch())
-          .count();
-  if (meta->abs_ttl_ms != 0 && now_ms >= meta->abs_ttl_ms) return out;
   out.meta = meta;
   return out;
 }

@@ -1,10 +1,15 @@
 #include "abyss/queue/log.h"
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -26,6 +32,7 @@
 #include "abyss/platform/fs.h"
 #include "binary_io.h"
 #include "crc32c.h"
+#include "on_exit.h"
 #include "segment_header_v2.h"
 #include "temp_dir.h"
 
@@ -639,6 +646,180 @@ TEST_F(LogTest, ReclaimedFilesLeaveTheDiskOldestFirst) {
     return !std::filesystem::exists(SegPath(0)) && !std::filesystem::exists(SegPath(1));
   }));
 }
+
+#ifndef _WIN32
+using Listing = std::map<std::string, ino_t>;
+
+// A log directory's files by name, with each one's inode.
+Listing ListDir(const std::filesystem::path& dir) {
+  Listing files;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    struct stat st{};
+    if (::stat(entry.path().c_str(), &st) == 0) files[entry.path().filename().string()] = st.st_ino;
+  }
+  return files;
+}
+
+// Segment files named in `before` but not in `after`.
+size_t SegmentsGone(const Listing& before, const Listing& after) {
+  size_t gone = 0;
+  for (const auto& [name, inode] : before) {
+    if (name.ends_with(".seg") && !name.starts_with("free-") && !after.contains(name)) ++gone;
+  }
+  return gone;
+}
+
+// A power loss that keeps the last synced listing and loses the oldest
+// segment removal or move made since, if any: that file returns under
+// its old name.
+void LoseOldestUnsyncedMove(const std::filesystem::path& dir, const Listing& last_synced,
+                            const Listing& now) {
+  for (const auto& [name, inode] : last_synced) {
+    if (!name.ends_with(".seg") || name.starts_with("free-") || now.contains(name)) continue;
+    for (const auto& [now_named, same] : now) {
+      if (same != inode) continue;
+      std::filesystem::rename(dir / now_named, dir / name);
+      return;
+    }
+  }
+}
+
+// A power loss may lose any subset of the directory changes made since
+// the last directory sync (ALICE). Reclaim renames or unlinks old
+// segments; were two removals unsynced and only the older one lost, it
+// would return below a gap and recovery would refuse the log. Between
+// syncs the log removes at most one segment, oldest first, so whatever
+// is lost leaves the files contiguous.
+TEST_F(LogTest, LosingAnyUnsyncedReclaimLeavesTheLogOpenable) {
+  std::mutex mu;
+  std::vector<Listing> synced;
+  Log::SetDirSyncHookForTesting([&](const std::filesystem::path& dir) -> core::Result<void> {
+    const std::scoped_lock lock(mu);
+    synced.push_back(ListDir(dir));
+    return {};
+  });
+  const testing::OnExit unhook([] { Log::SetDirSyncHookForTesting(nullptr); });
+  Listing at_crash;
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 7; ++seq) Append(*log, 0, seq, 20000);
+    ASSERT_TRUE(log->Flush({}).has_value());
+    ASSERT_TRUE(Eventually([&] { return log->spare_count() == 2; }));
+    ASSERT_TRUE(log->Reclaim(0).has_value());
+    ASSERT_TRUE(log->Reclaim(1).has_value());
+    ASSERT_TRUE(Eventually([&] {
+      return !std::filesystem::exists(SegPath(0)) && !std::filesystem::exists(SegPath(1));
+    }));
+    const std::scoped_lock lock(mu);
+    at_crash = ListDir(Config().dir);
+    for (size_t i = 1; i < synced.size(); ++i) {
+      EXPECT_LE(SegmentsGone(synced[i - 1], synced[i]), 1U)
+          << "two segments removed between directory syncs";
+    }
+  }
+  Log::SetDirSyncHookForTesting(nullptr);
+  LoseOldestUnsyncedMove(Config().dir, synced.back(), at_crash);
+  std::vector<RecoveredFrame> recovered;
+  auto reopened = OpenLog(&recovered);
+  ASSERT_NE(reopened, nullptr) << "a power loss during reclaim left the log unopenable";
+}
+
+// Recovery moves each segment past the recovered end to the free pool,
+// highest first, each move synced before the next. A power loss at any
+// sync of it, losing the move that sync covered, still leaves a log
+// that opens with every frame.
+TEST_F(LogTest, APowerLossAtAnyRecoveryMoveLeavesTheLogOpenable) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+    ASSERT_TRUE(log->Flush({}).has_value());
+    // Spares past the end, for recovery to move.
+    ASSERT_TRUE(Eventually([&] { return log->spare_count() == 2; }));
+  }
+  for (int fail_at = 0;; ++fail_at) {
+    SCOPED_TRACE("the power fails at directory sync " + std::to_string(fail_at));
+    std::mutex mu;
+    std::vector<Listing> synced{ListDir(Config().dir)};
+    int syncs = 0;
+    Log::SetDirSyncHookForTesting([&](const std::filesystem::path& dir) -> core::Result<void> {
+      const std::scoped_lock lock(mu);
+      if (syncs++ == fail_at) {
+        return std::unexpected(core::Error{core::ErrorCode::kInternal, "injected: power fails"});
+      }
+      synced.push_back(ListDir(dir));
+      return {};
+    });
+    const testing::OnExit unhook([] { Log::SetDirSyncHookForTesting(nullptr); });
+    auto crashed = Log::Open(Config(), [](const RecoveredFrame&) {});
+    Log::SetDirSyncHookForTesting(nullptr);
+    if (crashed.has_value()) {
+      // Past the last sync: nothing left to fail.
+      ASSERT_GT(fail_at, 0);
+      break;
+    }
+    for (size_t i = 1; i < synced.size(); ++i) {
+      EXPECT_LE(SegmentsGone(synced[i - 1], synced[i]), 1U) << "two moves between syncs";
+    }
+    LoseOldestUnsyncedMove(Config().dir, synced.back(), ListDir(Config().dir));
+    std::vector<RecoveredFrame> recovered;
+    auto reopened = OpenLog(&recovered);
+    ASSERT_NE(reopened, nullptr) << "a power loss during recovery left the log unopenable";
+    EXPECT_EQ(recovered.size(), 4U);
+    // The next open has the same spares to move.
+    ASSERT_TRUE(Eventually([&] { return reopened->spare_count() == 2; }));
+    ASSERT_LT(fail_at, 20) << "recovery never stopped syncing";
+  }
+}
+
+// A directory sync that fails after a reclaim is fatal, as a failed
+// flush is: a retry of the sync could report success for a removal the
+// device dropped. The preparer thread cannot unwind a throwing fatal
+// capture, so this runs in a child process.
+TEST_F(LogTest, AReclaimDirectorySyncFailureIsFatal) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto log = OpenLog();
+        for (core::SequenceId seq = 0; seq < 7; ++seq) Append(*log, 0, seq, 20000);
+        ASSERT_TRUE(log->Flush({}).has_value());
+        ASSERT_TRUE(Eventually([&] { return log->spare_count() == 2; }));
+        Log::SetDirSyncHookForTesting([](const std::filesystem::path&) -> core::Result<void> {
+          return std::unexpected(core::Error{core::ErrorCode::kInternal, "injected EIO"});
+        });
+        ASSERT_TRUE(log->Reclaim(0).has_value());
+        std::this_thread::sleep_for(10s);
+      },
+      "WAL directory sync failed after reclaiming .*: injected EIO");
+}
+#endif
+
+#ifdef __APPLE__
+// Recovery syncs what it adopts before it serves anything: a sync that
+// fails there fails the open, whatever it would have recovered, and a
+// later open with a healthy device recovers it all.
+TEST_F(LogTest, ASyncFailureDuringRecoveryFailsTheOpen) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 4096);
+    ASSERT_TRUE(log->Flush({}).has_value());
+  }
+  platform::fs::testing::SetFullFsyncForTesting([](int) {
+    errno = EIO;
+    return -1;
+  });
+  auto failed = Log::Open(Config(), [](const RecoveredFrame&) {});
+  platform::fs::testing::SetFullFsyncForTesting(nullptr);
+  ASSERT_FALSE(failed.has_value()) << "an open whose sync failed served the log";
+
+  std::vector<RecoveredFrame> recovered;
+  auto reopened = OpenLog(&recovered);
+  ASSERT_NE(reopened, nullptr);
+  EXPECT_EQ(recovered.size(), 4U);
+}
+#endif
 
 TEST_F(LogTest, AFileThatCannotBeRemovedHoldsBackLaterReclaims) {
   {

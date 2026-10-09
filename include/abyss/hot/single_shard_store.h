@@ -356,9 +356,9 @@ class SingleShardStore {
   KeyView View(std::string_view key, core::SequenceId horizon, uint64_t now_ms) const;
 
   // Applies decided effects in order, effect i at `first_seq + i`, and
-  // returns each one's reply. It judges no TTL: decide logged a DEL for
-  // every expired key it read. `appended_at` is only for the DCHECK
-  // that no effect reading state meets a key expired at that time. A
+  // returns each one's reply. Expiry is judged only at `appended_at`,
+  // the instant decide used, so replay sees what the decision saw; the
+  // DCHECK checks decide logged a DEL for each expired key it read. A
   // SET's value is moved out of its effect. An unparsable effect is
   // fatal. Written keys are linked at `linked_at`, else at the clock.
   std::vector<core::RespValue> ApplyEffects(
@@ -543,12 +543,15 @@ class SingleShardStore {
   // Uncounts `entry` from the negative cache if it is in it: a seq-0
   // tombstone about to be rewritten or removed.
   void ForgetNegative(const Entry& entry);
-  // Drops the oldest absent loads past negative_max_entries.
-  bool TrimNegatives(HoldBudget& budget);
+  // Drops the oldest absent loads past negative_max_entries, and while
+  // used bytes exceed `target`.
+  bool TrimNegatives(HoldBudget& budget, size_t target = SIZE_MAX);
   Entry* FindEntry(std::string_view key);
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;
-  // TTL expiry as writes see it: never while applying effects.
+  // TTL expiry as writes see it: an effect's at its appended_at, the
+  // instant it was decided at, so replay sees what the decision saw
+  // even where no decision logged the expiry.
   bool ExpiredForApply(const Entry& entry) const;
   // False when `effect` reads `key` past its TTL at `at_ms`: decide
   // logs such an expiry as a DEL before the read.
@@ -600,6 +603,9 @@ class SingleShardStore {
   // `protect_key`, empty to protect none) until UsedBytes() <= target_bytes.
   bool EvictLru(size_t target_bytes, std::string_view protect_key, core::SequenceId horizon,
                 HoldBudget& budget, size_t& evicted);
+  // EvictLru's walk of the lists, oldest link first.
+  bool WalkLru(size_t target_bytes, std::string_view protect_key, core::SequenceId horizon,
+               HoldBudget& budget, size_t& evicted);
 
   SingleShardConfig config_;
   MemoryGovernor governor_;
@@ -630,8 +636,8 @@ class SingleShardStore {
   uint64_t negative_entries_ = 0;
   // The last Flush's seq; 0 for none.
   core::SequenceId flush_seq_ = 0;
-  // Set while ApplyEffects runs.
-  bool applying_effects_ = false;
+  // While ApplyEffects runs, the effects' appended_at in ms.
+  std::optional<int64_t> applying_at_ms_;
   core::WallTime last_appended_at_{};
   Graveyard* graveyard_ = nullptr;
   uint64_t entry_bytes_ = 0;

@@ -37,7 +37,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #else
@@ -79,7 +79,7 @@ namespace crash_internal {
 inline constexpr std::chrono::milliseconds kReadyPollInterval{10};
 
 inline char** CurrentEnviron() {
-#if defined(__APPLE__)
+#ifdef __APPLE__
   return *_NSGetEnviron();
 #else
   return environ;
@@ -88,7 +88,7 @@ inline char** CurrentEnviron() {
 
 inline std::optional<std::filesystem::path> SelfExecutablePath() {
   std::filesystem::path raw;
-#if defined(__APPLE__)
+#ifdef __APPLE__
   constexpr size_t kMaxPathBytes = 4096;
   std::string buf(kMaxPathBytes, '\0');
   auto size = static_cast<uint32_t>(buf.size());
@@ -211,6 +211,18 @@ inline void SignalReady(const std::filesystem::path& dir, std::string_view ready
   }
   std::error_code ec;
   std::filesystem::rename(tmp_path, final_path, ec);
+}
+
+// Victim side: exits when its parent does, as when the parent dies
+// before it can kill it, or after `limit`, so no victim outlives its
+// test.
+inline void ExitWithParent(std::chrono::seconds limit) {
+  const pid_t parent = ::getppid();
+  std::thread([parent] {
+    while (::getppid() == parent) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::_Exit(1);
+  }).detach();
+  ::alarm(static_cast<unsigned>(limit.count()));
 }
 
 // Victim side: signal, then park forever. For victims whose interesting state

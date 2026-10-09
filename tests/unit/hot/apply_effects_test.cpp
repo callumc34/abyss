@@ -239,13 +239,34 @@ TEST_F(ApplyEffectsTest, DelOfAStubOnlyKeyLeavesATombstone) {
   EXPECT_EQ(store_.GcTombstones(5), 1U);
 }
 
+// Replay can meet a value past its TTL at an effect's instant whose
+// expiry no decision logged, cold having deleted it first: the effect
+// applies as it was decided, over an absent key.
+TEST_F(ApplyEffectsTest, AnEffectJudgesExpiryAtItsOwnInstant) {
+  Write(ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = NowMs() + 10}, 1);
+  std::vector<core::Effect> effects = {EffectOf({"ZADD", "k", "1", "m"})};
+  effects[0].replaces_state = true;
+  const auto replies = Apply(effects, 2, NowMs() + 10);
+  EXPECT_EQ(replies.at(0).AsInteger(), 1);
+  const KeyView view = View("k");
+  EXPECT_EQ(view.presence, Presence::kLive);
+  EXPECT_EQ(view.type, Entry::Type::kZset);
+  EXPECT_EQ(view.abs_ttl_ms, 0);
+
+  // Before its TTL the same value is live to an effect.
+  Write(ops::StringSet{.key = "j", .value = "v", .abs_ttl_ms = NowMs() + 10}, 3);
+  std::vector<core::Effect> get = {EffectOf({"SET", "j", "w"})};
+  get[0].reply_old_value = true;
+  EXPECT_EQ(Apply(get, 4, NowMs() + 9).at(0).AsString(), "v");
+}
+
 TEST_F(ApplyEffectsTest, AnObservedExpiryDelTombstonesTheEntry) {
   Write(ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = NowMs() + 10}, 1);
   std::vector<core::Effect> effects = {EffectOf({"DEL", "k"})};
   effects[0].observed_expiry = true;
   const uint64_t expired_before = store_.Stats().expired_count;
   const auto replies = Apply(effects, 2, NowMs() + 10);
-  EXPECT_EQ(replies.at(0).AsInteger(), 1) << "apply judges no TTL; decide replies";
+  EXPECT_EQ(replies.at(0).AsInteger(), 0) << "expired at its instant; decide replies";
   EXPECT_EQ(View("k").presence, Presence::kTombstoned);
   EXPECT_EQ(store_.Stats().key_count, 0U);
   EXPECT_EQ(store_.Stats().expired_count, expired_before + 1) << "an expiry, not a delete";

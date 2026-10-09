@@ -102,6 +102,7 @@ if(ABYSS_WITH_ROCKSDB)
     cold/backends/rocksdb_store_sweep_test.cpp
     cold/backends/rocksdb_store_wipe_test.cpp
     cold/backends/rocksdb_store_load_test.cpp
+    cold/backends/rocksdb_store_sync_failure_test.cpp
   )
   # The reads these tests check are answered as hot answers them.
   target_link_libraries(abyss_cold_tests PRIVATE abyss::hot)

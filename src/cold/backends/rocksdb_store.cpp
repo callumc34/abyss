@@ -332,6 +332,10 @@ core::Result<std::unique_ptr<RocksdbStore>> RocksdbStore::Create(RocksdbConfig c
   // until the checkpoint, so a checkpoint is the single group-amortised fsync
   // of the WAL tail rather than one fsync per micro-flush (A6 / XDUR-1).
   db_opts.manual_wal_flush = true;
+  // A WAL sync failure then stops every later write, so no checkpoint
+  // can report durable what the device dropped (failure-modes.md).
+  db_opts.paranoid_checks = true;
+  if (config.env != nullptr) db_opts.env = config.env;
 
   const auto cf_opts = MakeCfOptions(config);
   const std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs{
