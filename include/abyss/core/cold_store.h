@@ -5,8 +5,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -14,6 +12,7 @@
 #include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 
 namespace abyss::core {
@@ -37,9 +36,7 @@ struct KeyMeta {
 };
 
 // A string, a set's members, a hash's fields, or a zset's scores.
-using ColdValue = std::variant<std::string, std::unordered_set<std::string>,
-                               std::unordered_map<std::string, std::string>,
-                               std::unordered_map<std::string, double>>;
+using ColdValue = std::variant<std::string, StringSet, StringMap<std::string>, StringMap<double>>;
 
 struct ColdKeyState {
   KeyType type = KeyType::kString;

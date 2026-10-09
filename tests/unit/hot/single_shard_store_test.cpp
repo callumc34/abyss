@@ -452,13 +452,14 @@ TEST_F(SingleShardStoreTest, EvictExpiredRemovesOldKeys) {
   EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
+TEST_F(SingleShardStoreTest, AReadExtendsTheDeadline) {
   core::ops::StringSet op{.key = "k", .value = "v"};
   auto short_eviction = core::EvictionTTL{1};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
   clock_.Advance(500ms);
-  store_.RefreshAccess("k", clock_.SteadyNow());
+  store_.SetAccessTime(clock_.SteadyNow());
+  ASSERT_TRUE(GetString("k").has_value());
 
   clock_.Advance(700ms);
   auto evicted = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
@@ -503,8 +504,7 @@ TEST_F(SingleShardStoreTest, EvictExpiredTtlWinsWhenBothApply) {
 
 TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {
   SetString("old", std::string(512, 'x'));
-  store_.RefreshAccess("old", clock_.SteadyNow() - 100s);
-
+  clock_.Advance(1s);
   SetString("new", std::string(512, 'y'));
 
   auto target = store_.Stats().used_bytes * 3 / 4;

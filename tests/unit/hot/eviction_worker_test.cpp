@@ -19,7 +19,14 @@ using namespace std::chrono_literals;
 
 class EvictionWorkerTest : public ::testing::Test {
  protected:
+  static bool ResetMetrics() {
+    abyss::metrics::testing::Reset();
+    return true;
+  }
+
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  // First: a reset frees the metrics the store registers.
+  bool metrics_reset_ = ResetMetrics();
   abyss::testing::TestClock clock_;
   core::EvictionPolicy policy_{core::EvictionTTL{1}};
   core::SequenceId horizon_ = kAllDrained;
@@ -34,7 +41,7 @@ class EvictionWorkerTest : public ::testing::Test {
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
-TEST_F(EvictionWorkerTest, TickOnceDrainsBuffersAndEvicts) {
+TEST_F(EvictionWorkerTest, TickOnceEvicts) {
   ASSERT_TRUE(store_
                   .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
                          /*seq=*/core::kFirstSeq)
@@ -54,8 +61,6 @@ TEST_F(EvictionWorkerTest, TickAttributesEvictionVsTtl) {
   // single tick the counters must bump independently — kEvictedTotal for the
   // deadline path, kTtlExpiredTotal{tier=hot} for the TTL path. Without this
   // split the operator can't distinguish "moved tier" from "deleted entirely".
-  abyss::metrics::testing::Reset();
-
   const auto now_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(clock_.WallNow().time_since_epoch())
           .count();
@@ -172,8 +177,6 @@ TEST(EvictionWorkerMemoryTest, TickEnforcesMemoryBudgetAndPublishesGauges) {
 }
 
 TEST_F(EvictionWorkerTest, TickReclaimsTombstonesAtOrBelowHorizon) {
-  abyss::metrics::testing::Reset();
-
   ASSERT_TRUE(store_
                   .Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
                          /*seq=*/core::kFirstSeq)

@@ -9,8 +9,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -19,6 +17,7 @@
 #include "abyss/core/cold_store.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "temp_dir.h"
 #include "test_clock.h"
@@ -85,17 +84,15 @@ TEST_F(RocksdbLoadTest, LoadKeyRoundTripsEachTypeWithItsTtl) {
             (core::ColdKeyState{.type = KeyType::kString, .value = "v", .abs_ttl_ms = kTtlMs}));
   EXPECT_EQ(MustLoad("plain"), (core::ColdKeyState{.type = KeyType::kString, .value = ""}));
   EXPECT_EQ(MustLoad("set"), (core::ColdKeyState{.type = KeyType::kSet,
-                                                 .value = std::unordered_set<std::string>{"a", "b"},
+                                                 .value = core::StringSet{"a", "b"},
                                                  .abs_ttl_ms = kTtlMs + 1}));
-  EXPECT_EQ(
-      MustLoad("hash"),
-      (core::ColdKeyState{.type = KeyType::kHash,
-                          .value = std::unordered_map<std::string, std::string>{{"f", "1"}}}));
-  EXPECT_EQ(
-      MustLoad("zset"),
-      (core::ColdKeyState{.type = KeyType::kZset,
-                          .value = std::unordered_map<std::string, double>{{"m", 1.5}, {"n", -2}},
-                          .abs_ttl_ms = kTtlMs + 2}));
+  EXPECT_EQ(MustLoad("hash"),
+            (core::ColdKeyState{.type = KeyType::kHash,
+                                .value = core::StringMap<std::string>{{"f", "1"}}}));
+  EXPECT_EQ(MustLoad("zset"),
+            (core::ColdKeyState{.type = KeyType::kZset,
+                                .value = core::StringMap<double>{{"m", 1.5}, {"n", -2}},
+                                .abs_ttl_ms = kTtlMs + 2}));
 
   auto absent = store_->LoadKey("absent", Later());
   ASSERT_TRUE(absent.has_value());
@@ -215,7 +212,7 @@ TEST_F(RocksdbLoadTest, LoadKeyAsReadsMembersOnlyOfTheAskedType) {
   auto set = store_->LoadKeyAs("big", KeyType::kSet, Later());
   ASSERT_TRUE(set.has_value() && set->has_value());
   const auto loaded_set = std::get<core::ColdKeyState>(set->value_or(core::ColdKeyState{}));
-  EXPECT_EQ(std::get<std::unordered_set<std::string>>(loaded_set.value).size(), 2000U);
+  EXPECT_EQ(std::get<core::StringSet>(loaded_set.value).size(), 2000U);
   auto absent = store_->LoadKeyAs("absent", KeyType::kHash, Later());
   ASSERT_TRUE(absent.has_value());
   EXPECT_FALSE(absent->has_value());

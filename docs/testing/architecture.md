@@ -156,4 +156,4 @@ CompactionBuffer constructor → steady_clock
 
 Default values point to the real clock. Tests override with `TestClock` to control time precisely. This eliminates `sleep()` calls from tests and makes timing-sensitive behaviour deterministic.
 
-Components that already accept time as a parameter (e.g. `EvictExpired(SteadyTime now)`, `RefreshAccess(..., SteadyTime now)`) continue to work as-is. Clock injection is for internal time reads that callers cannot control.
+Components that already accept time as a parameter (e.g. `EvictExpired(SteadyTime now)`, `SetAccessTime(SteadyTime now)`) continue to work as-is. Clock injection is for internal time reads that callers cannot control.

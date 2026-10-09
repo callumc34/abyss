@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include "abyss/core/string_hash.h"
+
 #ifdef ABYSS_HAVE_ROCKSDB
 
 #include <atomic>
@@ -14,8 +16,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -42,9 +42,9 @@ namespace {
 
 using namespace std::chrono_literals;
 namespace ops = core::ops;
-using Members = std::unordered_set<std::string>;
-using Fields = std::unordered_map<std::string, std::string>;
-using Scores = std::unordered_map<std::string, double>;
+using Members = core::StringSet;
+using Fields = core::StringMap<std::string>;
+using Scores = core::StringMap<double>;
 
 constexpr core::EvictionTTL kEviction{3600};
 

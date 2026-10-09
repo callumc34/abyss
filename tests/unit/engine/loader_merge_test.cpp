@@ -3,8 +3,6 @@
 #include <optional>
 #include <ostream>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -12,6 +10,7 @@
 #include "abyss/consumer/compacted_state.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/engine/loader.h"
 #include "abyss/hot/single_shard_store.h"
 
@@ -21,9 +20,9 @@ namespace {
 namespace ops = core::ops;
 using core::ColdKeyState;
 using core::KeyType;
-using Members = std::unordered_set<std::string>;
-using Fields = std::unordered_map<std::string, std::string>;
-using Scores = std::unordered_map<std::string, double>;
+using Members = core::StringSet;
+using Fields = core::StringMap<std::string>;
+using Scores = core::StringMap<double>;
 
 ColdKeyState Str(std::string value, int64_t ttl = 0) {
   return {.type = KeyType::kString, .value = std::move(value), .abs_ttl_ms = ttl};

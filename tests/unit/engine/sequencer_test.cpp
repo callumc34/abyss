@@ -15,12 +15,12 @@
 #include <span>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "abyss/core/queue.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "latch.h"
@@ -133,6 +133,25 @@ TEST_F(SequencerTest, EveryCommandFamilyRepliesLogsAndApplies) {
 
 // --- Retries ---
 
+// Redis counts a write's lookup as an access too: a key written only
+// with no-ops must not age out as idle.
+TEST_F(SequencerTest, AWriteThatChangesNothingStillCountsAsUse) {
+  const std::string used = KeyOn(0, 0);
+  const std::string idle = KeyOn(0, 1);
+  ASSERT_EQ(Reply({"SADD", used, "a"}), ":1");
+  ASSERT_EQ(Reply({"SADD", idle, "a"}), ":1");
+  const core::SteadyTime start = core::SteadyClock::now();
+  // The default eviction is a day; reads and decisions stamp 12h on.
+  hot_->SetAccessTime(start + std::chrono::hours{12});
+  EXPECT_EQ(Reply({"SADD", used, "a"}), ":0");
+  EXPECT_EQ(Reply({"SREM", used, "absent"}), ":0");
+
+  const auto report = hot_->EvictExpired(start + std::chrono::hours{30});
+  EXPECT_EQ(report.by_deadline, 1U);
+  EXPECT_EQ(hot_->Probe(used), core::HotKeyPresence::kPresent);
+  EXPECT_EQ(hot_->Probe(idle), core::HotKeyPresence::kAbsent);
+}
+
 TEST_F(SequencerTest, AdmissionFailureRetriesWithTheRequestRestored) {
   FailReserves(core::ErrorCode::kResourceExhausted, 1);
   int admits = 0;
@@ -188,8 +207,7 @@ TEST_F(SequencerTest, ValueTooLargeIsNeverRetried) {
 // A blind write replaces the placeholder of a load in flight, so the
 // load is discarded; once the key is evicted again it is reloaded.
 TEST_F(SequencerTest, ALoadABlindWriteDiscardedIsTakenAgain) {
-  PutCold("k", core::ColdKeyState{.type = core::KeyType::kSet,
-                                  .value = std::unordered_set<std::string>{"a"}});
+  PutCold("k", core::ColdKeyState{.type = core::KeyType::kSet, .value = core::StringSet{"a"}});
   bool raced = false;
   on_load_ = [&](std::string_view) {
     if (std::exchange(raced, true)) return;
@@ -391,8 +409,7 @@ TEST_F(SequencerBackpressureTest, AGrowingWriteIsRejectedAtTheDeadline) {
 // an EXPIRE of a cold set waits like a SADD would.
 TEST_F(SequencerBackpressureTest, AFullLoadWaitsLikeAGrowingWrite) {
   const std::string key = KeyOn(0, 9, "cold");
-  PutCold(key, core::ColdKeyState{.type = core::KeyType::kSet,
-                                  .value = std::unordered_set<std::string>{"a", "b"}});
+  PutCold(key, core::ColdKeyState{.type = core::KeyType::kSet, .value = core::StringSet{"a", "b"}});
   std::thread drainer([this] {
     std::this_thread::sleep_for(50ms);
     router_.Advance(100);

@@ -31,7 +31,6 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -44,6 +43,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
@@ -848,7 +848,7 @@ core::Result<std::optional<core::LoadedAs>> RocksdbStore::Impl::LoadKey(
       state.value = std::move(payload);
       break;
     case core::KeyType::kSet: {
-      auto& members = state.value.emplace<std::unordered_set<std::string>>();
+      auto& members = state.value.emplace<core::StringSet>();
       members.reserve(cardinality);
       scanned = LoadPrefix(*ro, fmt::SetMemberPrefix(key, config.shard_count), deadline,
                            [&](std::string_view member, std::string_view) -> core::Result<void> {
@@ -858,7 +858,7 @@ core::Result<std::optional<core::LoadedAs>> RocksdbStore::Impl::LoadKey(
       break;
     }
     case core::KeyType::kHash: {
-      auto& fields = state.value.emplace<std::unordered_map<std::string, std::string>>();
+      auto& fields = state.value.emplace<core::StringMap<std::string>>();
       fields.reserve(cardinality);
       scanned =
           LoadPrefix(*ro, fmt::HashFieldPrefix(key, config.shard_count), deadline,
@@ -869,7 +869,7 @@ core::Result<std::optional<core::LoadedAs>> RocksdbStore::Impl::LoadKey(
       break;
     }
     case core::KeyType::kZset: {
-      auto& scores = state.value.emplace<std::unordered_map<std::string, double>>();
+      auto& scores = state.value.emplace<core::StringMap<double>>();
       scores.reserve(cardinality);
       scanned =
           LoadPrefix(*ro, fmt::ZsetMemberPrefix(key, config.shard_count), deadline,

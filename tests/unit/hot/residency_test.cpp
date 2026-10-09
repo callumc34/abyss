@@ -717,13 +717,15 @@ TEST(ResidencyMemoryTest, UndrainedStoreOverItsRatioIsBackpressured) {
 
 // --- LRU order and footprint cache ---
 
-TEST_F(ResidencyTest, AppliesAndRefreshesMoveKeysToTheHotEnd) {
+TEST_F(ResidencyTest, AppliesMoveKeysToTheHotEndAndReadsGetASecondChance) {
   Set("a", 1);
   Set("b", 1);
   Set("c", 1);
   Write(ops::Expire{.key = "a", .abs_ttl_ms = uint64_t{1} << 50}, 2);
-  store_.RefreshAccess("b", clock_.SteadyNow());
-  // Coldest first: c, a, b.
+  clock_.Advance(10ms);
+  store_.SetAccessTime(clock_.SteadyNow());
+  ASSERT_TRUE(store_.Exec(ops::ReadOp{ops::StringGet{.key = "b"}}).has_value());
+  // Coldest first: b, c, a; b was read, so c, a, b.
   EXPECT_EQ(store_.EvictLru(store_.Stats().used_bytes - 1, kAllDrained), 1U);
   EXPECT_FALSE(Resident("c"));
   EXPECT_EQ(store_.EvictLru(store_.Stats().used_bytes - 1, kAllDrained), 1U);
@@ -783,7 +785,7 @@ TEST(ResidencyMemoryTest, UndrainedStoreDoesNotRewalkUntilColdAdvances) {
   };
   for (int i = 0; i < 11; ++i) ASSERT_TRUE(write(i, 0).has_value());
   const uint64_t first_walk = store.LruVisitsForTesting();
-  EXPECT_EQ(first_walk, 11U) << "one full walk finds nothing drained";
+  EXPECT_EQ(first_walk, 10U) << "one walk of all but the written key finds nothing drained";
   for (int i = 11; i < 30; ++i) ASSERT_TRUE(write(i, 0).has_value());
   EXPECT_EQ(store.LruVisitsForTesting(), first_walk) << "no rewalk at the same horizon";
   EXPECT_EQ(store.Stats().eviction_count, 0U);

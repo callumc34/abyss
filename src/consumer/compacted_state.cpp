@@ -14,12 +14,12 @@ struct AbsorbVisitor {
   bool& is_tombstone;
   std::optional<std::string>& string_value;
   uint64_t& abs_ttl_ms;
-  std::unordered_set<std::string>& set_members;
-  std::unordered_set<std::string>& set_removed_members;
-  std::unordered_map<std::string, double>& zset_members;
-  std::unordered_set<std::string>& zset_removed_members;
-  std::unordered_map<std::string, std::string>& hash_fields;
-  std::unordered_set<std::string>& hash_removed_fields;
+  core::StringSet& set_members;
+  core::StringSet& set_removed_members;
+  core::StringMap<double>& zset_members;
+  core::StringSet& zset_removed_members;
+  core::StringMap<std::string>& hash_fields;
+  core::StringSet& hash_removed_fields;
   CompactedState::BaseInvalidation& base_invalidation;
   CompactedState::TtlIntent& ttl_intent;
 
@@ -307,14 +307,14 @@ size_t CompactedState::EstimatedBytes() const {
 
 std::optional<std::string> CompactedState::HashFieldValue(std::string_view field) const {
   if (type_ != DataType::kHash || is_tombstone_) return std::nullopt;
-  auto it = hash_fields_.find(std::string(field));
+  auto it = hash_fields_.find(field);
   if (it == hash_fields_.end()) return std::nullopt;
   return it->second;
 }
 
 std::optional<double> CompactedState::ZsetMemberScore(std::string_view member) const {
   if (type_ != DataType::kZset || is_tombstone_) return std::nullopt;
-  auto it = zset_members_.find(std::string(member));
+  auto it = zset_members_.find(member);
   if (it == zset_members_.end()) return std::nullopt;
   return it->second;
 }

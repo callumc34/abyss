@@ -14,7 +14,6 @@
 #include <ostream>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,6 +26,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "mock_queue.h"
 #include "temp_dir.h"
@@ -231,7 +231,7 @@ TEST_P(LogClockRaceTest, AWriteDecidedWhileItsKeyWasLiveLands) {
       race.write == Write::kPersist
           ? core::ColdKeyState{.type = core::KeyType::kString, .value = std::string("v")}
           : core::ColdKeyState{.type = core::KeyType::kSet,
-                               .value = std::unordered_set<std::string>{"a", "b"},
+                               .value = core::StringSet{"a", "b"},
                                .abs_ttl_ms = static_cast<int64_t>(kTtlMs)};
 
   ASSERT_EQ(shard.Consumer().Drain(), race.j_flushes_first ? 2U : 1U);

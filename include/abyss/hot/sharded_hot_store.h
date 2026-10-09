@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -11,23 +12,20 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <vector>
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/hot_store.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/hot/single_shard_store.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
 
 namespace abyss::hot {
 
 struct ShardedHotStoreConfig {
   size_t max_memory_bytes = 4294967296;
   uint32_t shard_count = 64;
-  // Per-shard cap on the deferred read-access refresh buffer (XRES-2). Past the
-  // cap, refreshes are dropped (a dropped refresh only shortens a key's
-  // deadline — safe, the key is still in queue/cold). 0 means unbounded.
-  size_t access_buffer_high_water = 65536;
   // Share of max_memory_bytes for stubs, at kStubBytes each.
   double stub_memory_fraction = 0.02;
   // Keys held as loaded absent, across shards.
@@ -146,10 +144,18 @@ class ShardedHotStore : public core::HotStore {
   // Installs `result` unless a write overtook it, evicting to make
   // room; what it evicts is freed after the lock.
   bool CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result);
-  enum class FillResult : uint8_t { kInstalled, kDiscarded, kOverBackpressure, kTooLarge };
+  enum class FillResult : uint8_t {
+    kInstalled,
+    kDiscarded,
+    kOverBackpressure,
+    kTooLarge,
+    // One hold's eviction did not make room.
+    kNoRoom,
+  };
   // A read's cache fill: CompleteLoad, unless the shard is over its
-  // backpressure limit or `result` is over fill_max_fraction of its
-  // budget, when the load is aborted. Only kInstalled moves `result`.
+  // backpressure limit, `result` is over fill_max_fraction of its
+  // budget, or evicting one hold's worth leaves no room for it, when
+  // the load is aborted. Only kInstalled moves `result`.
   FillResult Fill(std::string_view key, LoadToken token, LoadResult&& result);
   // SingleShardStore::CompleteLoads on `shard`, in one exclusive hold.
   size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
@@ -166,27 +172,36 @@ class ShardedHotStore : public core::HotStore {
   // only after seeing the miss, so the drain read is no older than it.
   bool KnownAbsentAfterFlush(std::string_view key);
 
-  // Refreshes the deadline for every buffered access, using the per-key
-  // eviction cached on each Entry at Apply time. See ADP-002 §Eviction.
-  void DrainAccessBuffers(core::SteadyTime now);
+  // What read hits stamp until the next call. See ADP-002 §Eviction.
+  void SetAccessTime(core::SteadyTime now);
+
+  // Every maintenance pass below runs in exclusive holds of at most
+  // HoldBudget's cap, resuming where the last hold stopped.
+  //
+  // Parked keys cold has drained, keys past their TTL, then keys idle
+  // past their eviction. The TTL pass goes round the shards from where
+  // it last stopped, taking another hold while more than a quarter of
+  // a hold's keys had expired, for at most `ttl_budget` of real time.
   using EvictExpiredReport = SingleShardStore::EvictExpiredReport;
-  EvictExpiredReport EvictExpired(core::SteadyTime now);
+  EvictExpiredReport EvictExpired(core::SteadyTime now,
+                                  std::optional<core::Duration> ttl_budget = std::nullopt);
 
   // Evicts each shard down to its per-shard memory budget by LRU. Eviction is a
   // tier transition (data stays durable in queue/cold). Returns the number of
   // keys evicted across all shards (HOT-1 memory-pressure pass).
   size_t EvictToMemoryTarget();
 
-  // Current total depth of the per-shard access buffers and the count of
-  // refreshes dropped past the high-water cap since construction (XRES-2).
-  struct AccessBufferStats {
-    size_t depth = 0;
-    uint64_t dropped = 0;
-  };
-  AccessBufferStats AccessBufferSnapshot() const;
-
   // Reclaims each shard's tombstones cold has drained.
   size_t GcTombstones();
+
+  // Called after each maintenance hold, with what it examined.
+  using HoldObserver = std::function<void(metrics::MaintenancePass,
+                                          core::SteadyClock::duration held, size_t examined)>;
+  void SetHoldObserverForTesting(HoldObserver observer) { hold_observer_ = std::move(observer); }
+  // A shared hold on `shard`, as a read takes.
+  std::shared_lock<std::shared_mutex> LockSharedForTesting(core::ShardId shard) {
+    return std::shared_lock(shards_.at(shard)->mutex);
+  }
 
   uint32_t shard_count() const { return config_.shard_count; }
 
@@ -196,13 +211,6 @@ class ShardedHotStore : public core::HotStore {
   struct Shard {
     mutable std::shared_mutex mutex;
     SingleShardStore store;
-    mutable std::mutex access_mutex;
-    // Deferred read-access refresh queue, bounded at access_buffer_high_water.
-    // access_seen de-dups within a drain interval so a hot key is buffered
-    // once per tick rather than once per read (XRES-2).
-    std::vector<std::string> access_buffer ABYSS_GUARDED_BY(access_mutex);
-    std::unordered_set<std::string> access_seen ABYSS_GUARDED_BY(access_mutex);
-    uint64_t access_dropped ABYSS_GUARDED_BY(access_mutex) = 0;
     // Signalled when a load placeholder may have gone.
     std::condition_variable_any load_cv;
 
@@ -221,13 +229,28 @@ class ShardedHotStore : public core::HotStore {
   FillResult Install(std::string_view key, LoadToken token, LoadResult&& result, bool fill);
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
-  // Queues `key` for a deferred LRU refresh after a read hit.
-  void RecordAccess(Shard& shard, std::string_view key) const;
+  // Runs `step(store, horizon, budget)` on shard `index` in capped
+  // exclusive holds until it is done or `more(budget)` declines another.
+  template <typename Step, typename More>
+  void RunHolds(core::ShardId index, metrics::MaintenancePass pass, Step step, More more);
+  template <typename Step>
+  void RunHolds(core::ShardId index, metrics::MaintenancePass pass, Step step);
+  void ExpireByTtl(core::SteadyTime now, std::optional<core::Duration> budget,
+                   EvictExpiredReport& total);
 
   ShardedHotStoreConfig config_;
   // Fallback when config_.eviction_policy is null; keeps Resolve() infallible.
   core::EvictionPolicy default_policy_;
   std::vector<std::unique_ptr<Shard>> shards_;
+  // By metrics::MaintenancePass.
+  std::array<metrics::HistogramHandle, 5> hold_seconds_;
+  metrics::HistogramHandle expiry_sweep_seconds_;
+  HoldObserver hold_observer_;
+  // The TTL pass's place in its sweep of the shards.
+  std::mutex ttl_mu_;
+  core::ShardId ttl_next_shard_ ABYSS_GUARDED_BY(ttl_mu_) = 0;
+  uint32_t ttl_swept_ ABYSS_GUARDED_BY(ttl_mu_) = 0;
+  std::optional<core::SteadyTime> sweep_started_ ABYSS_GUARDED_BY(ttl_mu_);
 };
 
 }  // namespace abyss::hot

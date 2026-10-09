@@ -70,11 +70,13 @@ class Loader {
     // The flush floor makes the key absent.
     kFlushed,
     // Not installed, and `result` holds what was read: a write overtook
-    // the load, the shard is over its backpressure limit, or the key is
-    // too large to fill (ShardedHotStore::Fill).
+    // the load, the shard is over its backpressure limit, the key is too
+    // large to fill, or one hold's eviction left no room for it
+    // (ShardedHotStore::Fill).
     kDiscarded,
     kSkippedBackpressure,
     kSkippedSize,
+    kSkippedEvictCap,
   };
   struct Filled {
     Fill fill = Fill::kInstalled;

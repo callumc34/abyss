@@ -31,7 +31,7 @@ The number of lock shards should equal the planned horizontal shard count. Phase
 
 **Data structures per key:**
 - Value storage (string, set members, sorted set members + scores)
-- Eviction deadline (steady clock timestamp, refreshed on read)
+- Eviction deadline: the later of the last write and the last read, plus the key's eviction (steady clock). A read stamps the time the eviction worker last published, so at most one tick old, without an exclusive lock.
 - Absolute TTL deadline (wall clock timestamp, not refreshed)
 
 ### Eviction
@@ -52,7 +52,7 @@ hot:
 
 The resolved per-key eviction is computed once at apply time (longest-prefix wins, default if no match) and **cached on the per-key store entry**. Read-driven refresh extends the deadline using that cached value; the per-read path performs no prefix scan. This makes refresh O(1) and keeps the multi-key write path (e.g. `MSET` across mixed prefixes) honest — each entry resolves independently. Configuration is immutable post-startup, so the cached value is canonical for the key's hot residency. The `min_retention_seconds` constraint coupling the WAL retention to `max(default_eviction, max(eviction_overrides))` is enforced at startup by the config validator (see [Requirements §Consumer Coordination](../requirements.md#consumer-coordination)).
 
-**LRU eviction under memory pressure:** If the hot store's memory usage exceeds its configured maximum, keys are evicted in LRU order (by last-read time) regardless of their eviction deadline. Data is safe — it's in the queue and eventually in cold. Reads for prematurely evicted keys fall through to the buffer and cold store.
+**LRU eviction under memory pressure:** If the hot store's memory usage exceeds its configured maximum, keys are evicted in LRU order (by last write, a read since giving a key a second chance) regardless of their eviction deadline. Data is safe — it's in the queue and eventually in cold. Reads for prematurely evicted keys fall through to the buffer and cold store.
 
 **Absolute TTL:** If a key has an absolute `ttl` set (via Redis `SET ... EX`, `EXPIRE`, etc.), the hot store tracks this separately. When the absolute TTL expires, the key is deleted — not just evicted. It is removed from both hot and cold. This is different from eviction: TTL expiry means the data is gone.
 
@@ -79,7 +79,13 @@ The hot consumer runs as a dedicated thread **per shard owned by this pod**. Eac
 
 **Eviction refresh vs queue retention:** Read refreshes extend a key's life in the hot store indefinitely, but the key's queue entry is subject to normal retention (`min_retention_seconds`). If the pod crashes and the key has outlived its queue entry, it is lost from hot but present in cold (the cold consumer flushed it before the eviction deadline). The first read post-recovery hits cold, triggers a promotion (fresh queue entry), and the key returns to hot. Cost: one cold-path read per such key after recovery.
 
-**Eviction worker:** A dedicated maintenance thread (`hot::EvictionWorker`) periodically drains the per-shard access buffers (applying deferred timer refreshes from the last tick) and evicts keys whose eviction deadline has passed. The tick interval is operator-configurable (`hot.eviction_tick_ms`, default 1s). This is also the natural home for future LRU-under-memory-pressure enforcement.
+**Eviction worker:** A dedicated maintenance thread (`hot::EvictionWorker`) publishes the time read hits stamp, then each tick runs the maintenance passes: keys idle past their eviction, keys past their TTL, LRU down to the memory budget, and tombstone reclamation. The tick interval is operator-configurable (`hot.eviction_tick_ms`, default 1s).
+
+**Bounded maintenance:** Every pass holds a shard exclusively for at most 64 keys examined or 1 ms, whichever comes first, then releases it and resumes. No pass scans the keyspace:
+- Idle eviction walks each eviction class's LRU list from its cold end. A write relinks its key at the warm end; a read only stamps it, so a key read since it was linked gets a second chance (CLOCK, as SIEVE) and is relinked at its read. The walk stops at the first key not due by its link time.
+- TTL expiry takes keys from an index of one-second buckets holding the entries themselves, earliest first; the current second's bucket is checked key by key, so no key expires early. The pass gets a quarter of the tick and takes another hold while more than a quarter of the keys it examined had expired.
+- A key that is due but not yet drained by cold waits in a heap ordered by its last write's seq, with delete tombstones in one of their own, and is taken when the drain horizon passes it. Nothing is examined twice per horizon.
+- What a pass removes is freed after the hold.
 
 ### Configuration
 

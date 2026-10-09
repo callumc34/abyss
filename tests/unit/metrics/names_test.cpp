@@ -16,6 +16,7 @@ TEST(Names, LabelKeyStringSpellings) {
   EXPECT_EQ(ToStringView(LabelKey::kStatus), "status");
   EXPECT_EQ(ToStringView(LabelKey::kOp), "op");
   EXPECT_EQ(ToStringView(LabelKey::kOutcome), "outcome");
+  EXPECT_EQ(ToStringView(LabelKey::kPass), "pass");
 }
 
 TEST(Names, TierEnumSpellings) {
@@ -48,8 +49,18 @@ TEST(Names, FillOutcomeSpellings) {
   EXPECT_EQ(ToStringView(FillOutcome::kDiscarded), "discarded");
   EXPECT_EQ(ToStringView(FillOutcome::kSkippedBackpressure), "skipped_backpressure");
   EXPECT_EQ(ToStringView(FillOutcome::kSkippedSize), "skipped_size");
+  EXPECT_EQ(ToStringView(FillOutcome::kSkippedEvictCap), "skipped_evict_cap");
   EXPECT_EQ(ToStringView(FillOutcome::kFailed), "failed");
   static_assert(LabelKeyOf<FillOutcome>::value == LabelKey::kOutcome);
+}
+
+TEST(Names, MaintenancePassSpellings) {
+  EXPECT_EQ(ToStringView(MaintenancePass::kTombstones), "tombstones");
+  EXPECT_EQ(ToStringView(MaintenancePass::kParked), "parked");
+  EXPECT_EQ(ToStringView(MaintenancePass::kTtl), "ttl");
+  EXPECT_EQ(ToStringView(MaintenancePass::kDeadline), "deadline");
+  EXPECT_EQ(ToStringView(MaintenancePass::kMemory), "memory");
+  static_assert(LabelKeyOf<MaintenancePass>::value == LabelKey::kPass);
 }
 
 TEST(Names, LabelKeyOfMapping) {
@@ -94,6 +105,8 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kHotNegativeEntries.name,
       names::kHotFillsTotal.name,
       names::kHotUnevictableBytes.name,
+      names::kHotMaintenanceHoldSeconds.name,
+      names::kHotExpirySweepSeconds.name,
       names::kColdDiskBytes.name,
       names::kColdKeys.name,
       names::kQueueDepth.name,

@@ -9,6 +9,7 @@
 namespace abyss::testing {
 namespace {
 
+std::atomic<std::size_t> g_allocs{0};
 std::atomic<std::size_t> g_big_allocs{0};
 std::atomic<std::size_t> g_big_frees{0};
 std::atomic<std::size_t> g_frees{0};
@@ -16,6 +17,7 @@ std::atomic<std::size_t> g_frees{0};
 std::array<std::atomic<void*>, 256> g_big_live{};
 
 void NoteAlloc(void* ptr, std::size_t size) {
+  g_allocs.fetch_add(1, std::memory_order_relaxed);
   if (size < kBigAllocBytes) return;
   g_big_allocs.fetch_add(1, std::memory_order_relaxed);
   for (auto& slot : g_big_live) {
@@ -37,6 +39,7 @@ void NoteFree(void* ptr) {
 
 }  // namespace
 
+std::size_t Allocs() { return g_allocs.load(); }
 std::size_t BigAllocs() { return g_big_allocs.load(); }
 std::size_t BigFrees() { return g_big_frees.load(); }
 std::size_t Frees() { return g_frees.load(); }

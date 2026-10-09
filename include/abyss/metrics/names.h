@@ -19,6 +19,7 @@ enum class LabelKey : uint8_t {
   kProto,
   kSubject,
   kOutcome,
+  kPass,
 };
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
@@ -41,6 +42,8 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "subject";
     case LabelKey::kOutcome:
       return "outcome";
+    case LabelKey::kPass:
+      return "pass";
   }
   return {};
 }
@@ -205,6 +208,7 @@ enum class FillOutcome : uint8_t {
   kDiscarded,
   kSkippedBackpressure,
   kSkippedSize,
+  kSkippedEvictCap,
   kFailed,
 };
 
@@ -218,8 +222,29 @@ constexpr std::string_view ToStringView(FillOutcome o) noexcept {
       return "skipped_backpressure";
     case FillOutcome::kSkippedSize:
       return "skipped_size";
+    case FillOutcome::kSkippedEvictCap:
+      return "skipped_evict_cap";
     case FillOutcome::kFailed:
       return "failed";
+  }
+  return {};
+}
+
+// A hot store maintenance pass, each run in capped exclusive holds.
+enum class MaintenancePass : uint8_t { kTombstones, kParked, kTtl, kDeadline, kMemory };
+
+constexpr std::string_view ToStringView(MaintenancePass p) noexcept {
+  switch (p) {
+    case MaintenancePass::kTombstones:
+      return "tombstones";
+    case MaintenancePass::kParked:
+      return "parked";
+    case MaintenancePass::kTtl:
+      return "ttl";
+    case MaintenancePass::kDeadline:
+      return "deadline";
+    case MaintenancePass::kMemory:
+      return "memory";
   }
   return {};
 }
@@ -274,6 +299,10 @@ struct LabelKeyOf<FillOutcome> {
   static constexpr LabelKey value = LabelKey::kOutcome;
 };
 template <>
+struct LabelKeyOf<MaintenancePass> {
+  static constexpr LabelKey value = LabelKey::kPass;
+};
+template <>
 struct LabelKeyOf<CmdLabel> {
   static constexpr LabelKey value = LabelKey::kCmd;
 };
@@ -304,6 +333,7 @@ inline std::string ToLabelString(CloseReason r) { return std::string(ToStringVie
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RedecideReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(FillOutcome o) { return std::string(ToStringView(o)); }
+inline std::string ToLabelString(MaintenancePass p) { return std::string(ToStringView(p)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
@@ -533,11 +563,6 @@ inline constexpr GaugeDesc<> kHotMaxMemoryBytes{
     .help = "Configured hot store memory budget in bytes; 0 means unlimited.",
 };
 
-inline constexpr GaugeDesc<> kHotAccessBufferDepth{
-    .name = "abyss_hot_access_buffer_depth",
-    .help = "Total depth of the per-shard deferred read-access refresh buffers.",
-};
-
 inline constexpr GaugeDesc<> kHotStubEntries{
     .name = "abyss_hot_stub_entries",
     .help = "Stubs the hot store holds for evicted keys.",
@@ -551,6 +576,18 @@ inline constexpr CounterDesc<FillOutcome> kHotFillsTotal{
 inline constexpr GaugeDesc<> kHotNegativeEntries{
     .name = "abyss_hot_negative_entries",
     .help = "Keys the hot store holds as loaded absent, a negative cache.",
+};
+
+inline constexpr HistogramDesc<MaintenancePass> kHotMaintenanceHoldSeconds{
+    .name = "abyss_hot_maintenance_hold_seconds",
+    .help = "Time a hot maintenance pass held a shard exclusively, per capped hold.",
+    .buckets = buckets::kLockHoldSeconds,
+};
+
+inline constexpr HistogramDesc<> kHotExpirySweepSeconds{
+    .name = "abyss_hot_expiry_sweep_seconds",
+    .help = "Time for the TTL pass to reach every key due when its sweep began.",
+    .buckets = buckets::kLatencySeconds,
 };
 
 inline constexpr GaugeDesc<> kHotUnevictableBytes{
@@ -710,11 +747,6 @@ inline constexpr CounterDesc<> kEvictedTotal{
 inline constexpr CounterDesc<> kHotMemoryEvictedTotal{
     .name = "abyss_hot_memory_evicted_total",
     .help = "Keys evicted from the hot store under memory pressure (LRU tier transition).",
-};
-
-inline constexpr CounterDesc<> kHotAccessBufferDroppedTotal{
-    .name = "abyss_hot_access_buffer_dropped_total",
-    .help = "Deferred read-access refreshes dropped past the access-buffer high-water cap.",
 };
 
 inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{

@@ -10,7 +10,6 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "abyss/consumer/buffer_entry.h"
@@ -18,6 +17,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
 
@@ -122,7 +122,7 @@ class CompactionBuffer {
   core::SteadyClockFn clock_;
   core::WallClockFn wall_clock_;
   mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, BufferEntry> entries_ ABYSS_GUARDED_BY(mutex_);
+  core::StringMap<BufferEntry> entries_ ABYSS_GUARDED_BY(mutex_);
   std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<>> flush_heap_
       ABYSS_GUARDED_BY(mutex_);
   size_t bytes_estimate_ ABYSS_GUARDED_BY(mutex_) = 0;
