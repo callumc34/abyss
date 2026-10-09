@@ -88,8 +88,12 @@ void CompactionBuffer::PushHeapEntry(BufferEntry& entry, core::SteadyTime schedu
 }
 
 void CompactionBuffer::ErasePending(const BufferEntry& entry) {
-  pending_seqs_.erase(pending_seqs_.find(entry.first_seen_seq));
-  pending_times_.erase(pending_times_.find(entry.first_appended_at_ms));
+  const auto seq = pending_seqs_.find(entry.first_seen_seq);
+  const auto time = pending_times_.find(entry.first_appended_at_ms);
+  ABYSS_DCHECK(seq != pending_seqs_.end() && time != pending_times_.end(),
+               "a buffered entry is missing from the pending order");
+  pending_seqs_.erase(seq);
+  pending_times_.erase(time);
 }
 
 void CompactionBuffer::PublishLogClock() {

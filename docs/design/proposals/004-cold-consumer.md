@@ -156,7 +156,7 @@ Cold applies each effect as it was logged. The write path decided it against the
 
 **Who uses it:**
 - the cold store's TTL scanner ([ADP-003](003-cold-store.md) §TTL Expiry), which reads each sampled key's shard clock from the consumer;
-- the flush: an entry whose own absolute TTL is at or below the clock is written as a delete. Dropping it instead would let an older value of the key, flushed in an earlier window, resurface once hot no longer holds the key.
+- the flush: an entry whose own absolute TTL is at or below the clock is written as a delete. Dropping it instead would let an older value of the key, flushed in an earlier window, resurface once hot no longer holds the key. The case is rare by design, because the clock cannot pass a pending entry's first write. It arises only for a TTL that was already past when written, such as SET with a PXAT in the past. Moving this check back to the wall clock would reintroduce the race above.
 
 **Cost.** The clock trails the wall clock by up to the buffer's hold time, and stops at an idle shard's last write. Expired keys therefore stay on disk longer, until the shard's next write on an idle shard. That costs space only, since reads answer nil.
 
