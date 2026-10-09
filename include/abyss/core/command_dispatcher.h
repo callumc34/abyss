@@ -31,9 +31,10 @@ class CommandDispatcher {
   CommandDispatcher& operator=(CommandDispatcher&&) = delete;
 
   virtual Result<RespValue> DispatchRead(std::string_view name, const RespCommand& cmd) = 0;
-  virtual Result<RespValue> DispatchWrite(std::string_view name, RespCommand cmd) = 0;
-  virtual Result<RespValue> DispatchConditional(std::string_view name, RespCommand cmd,
-                                                PredicateFlags flags) = 0;
+  // `flags` are the command's extracted predicates; kNone when it has
+  // none. The sequencer decides either kind of write.
+  virtual Result<RespValue> DispatchWrite(std::string_view name, RespCommand cmd,
+                                          PredicateFlags flags) = 0;
   virtual Result<RespValue> DispatchFanOut(MultiKeyKind kind, RespCommand cmd) = 0;
   virtual Result<RespValue> DispatchFlush(FlushTarget target) = 0;
 };

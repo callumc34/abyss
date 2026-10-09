@@ -27,8 +27,6 @@ class MockColdStore : public core::ColdStore {
         });
   }
 
-  MOCK_METHOD(core::Result<core::RespValue>, Exec,
-              (const core::ops::ReadOp& op, std::optional<core::Duration> deadline), (override));
   MOCK_METHOD(core::Result<void>, ApplyBatch,
               (std::span<const core::ops::WriteOp> ops, core::SequenceId highest_wal_seq),
               (override));

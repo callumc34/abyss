@@ -63,10 +63,6 @@ T Ok(core::Result<T> result) {
 class OneBufferRouter : public consumer::CompactionBufferRouter {
  public:
   explicit OneBufferRouter(consumer::CompactionBuffer& buffer) : buffer_(buffer) {}
-  core::Result<core::RespValue> Exec(const ops::ReadOp& op,
-                                     std::optional<core::Duration> /*deadline*/) override {
-    return buffer_.Exec(op);
-  }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view key) const override {
     return buffer_.Snapshot(key);
@@ -84,7 +80,7 @@ class LoaderTest : public ::testing::Test {
  protected:
   void Buffer(std::string_view key, const ops::WriteOp& op) {
     const core::SequenceId seq = ++seq_;
-    buffer_.Absorb(std::string(key), op, kEviction, seq, seq, 0);
+    buffer_.Absorb(std::string(key), op, kEviction, seq, 0);
   }
 
   core::Result<hot::LoadResult> Load(std::string_view key, Need need) const {
@@ -398,41 +394,37 @@ bool JoinedBy(const Loader& loader, uint64_t n) {
   return true;
 }
 
-TEST_F(LoaderTest, ConcurrentInstallsShareOneColdRead) {
-  constexpr int kReaders = 8;
+// The reader answers through LoadAs, which joins a read's load.
+TEST_F(LoaderTest, AnInstallFindingAnotherInFlightFillsNothingAtOnce) {
   std::atomic<int> loads{0};
+  abyss::testing::Latch entered;
   abyss::testing::Latch release;
   EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"set"}, KeyType::kSet, _))
       .WillOnce([&](auto, auto, auto) {
         ++loads;
+        entered.Open();
         release.Wait();
         return LoadAsResult{core::LoadedAs{
             core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a", "b"}}}};
       });
+  auto first = std::async(std::launch::async,
+                          [&] { return loader_.Install("set", KeyType::kSet, Deadline()); });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  ASSERT_TRUE(entered.Wait());
 
-  std::vector<Loader::Fill> fills(kReaders, Loader::Fill::kDiscarded);
-  std::vector<std::thread> readers;
-  readers.reserve(kReaders);
-  const abyss::testing::OnExit join([&] {
-    release.Open();
-    for (auto& reader : readers) reader.join();
-  });
-  for (int i = 0; i < kReaders; ++i) {
-    readers.emplace_back([&, i] {
-      auto filled = loader_.Install("set", KeyType::kSet, Deadline());
-      ASSERT_TRUE(filled.has_value());
-      fills[static_cast<size_t>(i)] = filled->fill;
-    });
+  for (int i = 0; i < 3; ++i) {
+    auto filled = loader_.Install("set", KeyType::kSet, Deadline());
+    ASSERT_TRUE(filled.has_value()) << filled.error().message();
+    EXPECT_EQ(filled->fill, Loader::Fill::kPending);
+    EXPECT_FALSE(filled->result.has_value());
   }
-  // Every other reader waits on the placeholder.
-  ASSERT_TRUE(JoinedBy(loader_, kReaders - 1)) << loader_.JoinsForTesting() << " joined";
+  EXPECT_EQ(loader_.JoinsForTesting(), 0U);
   release.Open();
-  for (auto& reader : readers) reader.join();
-  readers.clear();
-
+  ASSERT_EQ(first.wait_for(10s), std::future_status::ready);
+  const auto filled = first.get();
+  ASSERT_TRUE(filled.has_value()) << filled.error().message();
+  EXPECT_EQ(filled->fill, Loader::Fill::kInstalled);
   EXPECT_EQ(loads.load(), 1);
-  EXPECT_EQ(std::ranges::count(fills, Loader::Fill::kInstalled), 1);
-  EXPECT_EQ(std::ranges::count(fills, Loader::Fill::kResident), kReaders - 1);
   auto card = hot_.Exec(ops::ReadOp{ops::SetCard{.key = "set"}});
   ASSERT_TRUE(card.has_value());
   EXPECT_EQ(card->AsInteger(), 2);
@@ -448,11 +440,13 @@ TEST_F(LoaderTest, AFailedInstallAbortsItsPlaceholder) {
   EXPECT_FALSE(hot_.LoadPending("k"));
 }
 
-TEST_F(LoaderTest, InstallAwaitingAnotherLoadTimesOut) {
+// As a write's load leaves it: a deadline-long wait would fail the read.
+TEST_F(LoaderTest, InstallNeverWaitsOnAWritesPlaceholder) {
   ASSERT_TRUE(hot_.BeginLoad("k").started());
-  auto filled = loader_.Install("k", KeyType::kString, core::SteadyClock::now() + 20ms);
-  ASSERT_FALSE(filled.has_value());
-  EXPECT_EQ(filled.error().code(), core::ErrorCode::kTimeout);
+  auto filled = loader_.Install("k", KeyType::kString, Deadline());
+  ASSERT_TRUE(filled.has_value()) << filled.error().message();
+  EXPECT_EQ(filled->fill, Loader::Fill::kPending);
+  EXPECT_TRUE(hot_.LoadPending("k"));
 }
 
 // Concurrent misses share one cold load; a waiter gets the leader's

@@ -8,9 +8,9 @@ These are the invariants that all components must uphold. They are not guideline
 
 **No reply, to a read or a write, reflects a write that a failure in the configured durability class can lose.** In particular, a write is acknowledged only after its queue entry reaches the configured durability class and its effect is applied to hot. If the process fails before then, the client never saw OK and can retry. See [ADP-015](proposals/015-write-path-and-durability.md) §Durability classes and §Read visibility.
 
-**Cold lag is decoupled from writes.** The cold consumer reads from the queue at its own pace and deliberately lags to accumulate writes for compaction. Its lag reaches the write path only through bounded, observable memory backpressure: hot cannot evict a key that cold has not drained. It never causes unbounded memory growth. (Until [ADP-015](proposals/015-write-path-and-durability.md) Phase 2 lands, hot is also a queue consumer that stays near the head.)
+**Cold lag is decoupled from writes.** The cold consumer reads from the queue at its own pace and deliberately lags to accumulate writes for compaction. Its lag reaches the write path only through bounded, observable memory backpressure: hot cannot evict a key that cold has not drained. It never causes unbounded memory growth. Hot is not a queue consumer: the per-shard sequencer applies each write to hot as it logs it ([ADP-015](proposals/015-write-path-and-durability.md) §Sequenced write path).
 
-**Recovery is pure queue replay.** The cold store is never read during recovery. Both consumers rebuild their state entirely from the queue. This eliminates consistency concerns between the queue and the stores.
+**Recovery is pure queue replay.** The cold store is never read during recovery. Hot and cold rebuild their state entirely from the queue: one scan of each log feeds the cold consumer and the hot replayer, which apply the logged effects and re-decide nothing. This eliminates consistency concerns between the queue and the stores.
 
 **No magic resource management.** If you run out of disk, writes fail. If you under-provision memory, reads degrade. Abyss surfaces resource pressure through metrics and errors rather than silently degrading.
 
@@ -53,23 +53,24 @@ Abyss acknowledges a write when it reaches the durability class set by `queue.du
 
 ### Phase 1 Threading
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** The hot consumer and resolver threads go away (Phase 2). Writes are sequenced under the shard lock on the calling thread. Cold consumers become a pool sized to cores after that (#177). Each log already has one segment-preparer thread and one flusher thread. The list below describes current behaviour.
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Reactors will stop waiting on durability and cold reads (#161), and cold consumers will become a pool sized to cores (#177). The list below describes current behaviour.
 
-- **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands, route to tiering engine.
-- **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils Consumer RPC promises for unconditional writes.
-- **Cold consumer thread** (single, dedicated) — tails queue into compaction buffer, flushes to cold.
-- **Resolver thread** (single, dedicated) — tails queue, resolves conditional writes, emits `Resolved` entries, fulfils Consumer RPC promises for conditional writes.
-- **Background threads** — WAL segment cleanup, cold store compaction, TTL expiry scanning.
+- **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands and run each one through the tiering engine on the calling thread: a read, or a write's sequencer step (decide, reserve, apply to hot, publish) followed by its durable wait.
+- **Cold consumer threads** (one per shard) — tail the queue into the compaction buffer, flush to cold.
+- **WAL threads** — one segment-preparer thread and one flusher thread per log.
+- **Background threads** — WAL segment cleanup, hot eviction and tombstone reclamation, cold store compaction, TTL expiry scanning.
+
+There is no hot consumer or resolver thread: the sequencer applies each write to hot on the calling thread, and decides conditional writes there too. At startup, recovery's scan workers (`recovery.replay_parallelism`) rebuild hot through the hot replayer before any client is served.
 
 ### Lock Discipline
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** The shard lock is taken by the per-shard sequencer, not a hot consumer, and becomes a spin-then-park lock with a constant-time critical section. The Consumer RPC registry is reduced to admin and flush use. The text below describes current behaviour.
+**Hot store:** Sharded lock scheme (lock striping by shard, where the shard is derived from the key's CRC16 slot — see [ADP-014](proposals/014-slot-routing-and-topology.md)). I/O threads acquire a shared lock on the relevant shard for reads. The sequencer acquires it exclusively to decide, reserve and apply a write; a multi-key write takes its shards' locks in ascending shard order. Loading a non-resident key runs off the lock: a per-key load token placed under the lock lets the loaded state be installed only if nothing replaced it meanwhile. No cold or buffer lock is ever taken under a shard lock. The number of lock shards is fixed at deployment and should equal the planned horizontal shard count to ease migration to Phase 2.
 
-**Hot store:** Sharded lock scheme (lock striping by shard, where the shard is derived from the key's CRC16 slot — see [ADP-014](proposals/014-slot-routing-and-topology.md)). I/O threads acquire a shared lock on the relevant shard for reads. The hot consumer acquires an exclusive lock for writes. The number of lock shards is fixed at deployment and should equal the planned horizontal shard count to ease migration to Phase 2.
+**WAL stream:** each shard stream's append mutex is taken under the hot shard lock and covers only sequence assignment, reservation, committing frames until the reservation's total reaches 16 KiB, and the offset-ring record. The reservation's later frames are filled, and frames are published in sequence order, after every lock is released.
 
 **Compaction buffer:** `shared_mutex`. I/O threads acquire a shared lock for reads. The cold consumer acquires an exclusive lock when absorbing new entries or removing flushed entries.
 
-**Consumer RPC registry:** `mutex`. The write handler registers a promise keyed by sequence id (or RPC id); the responsible consumer (hot for unconditional writes, Resolver for conditional writes, any consumer for admin RPCs) fulfils it. Short critical section — insert or erase from an unordered map. See [ADP-011](proposals/011-conditional-writes-and-consumer-rpc.md).
+There is no Consumer RPC registry: a write replies once its own frames are durable at the configured class, with no consumer apply to wait for.
 
 ### Phase 2+ Threading
 
@@ -77,9 +78,9 @@ Phase 2 does not change the threading model within a pod. Each pod runs the same
 
 ## Consumer Coordination
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Retention is gated by the persisted committed offsets of the retention consumers (cold, and the resolver until it is removed), per log segment and oldest first. In one physical log per volume, a stuck shard pins reclamation for that volume. The text below describes the retention bound, which is unchanged.
+The cold consumer is the only retention consumer. The queue retains entries until its persisted committed offset has passed them, per log segment and oldest first ([ADP-015](proposals/015-write-path-and-durability.md) §Log durability pipeline). In one physical log per volume, a stuck shard pins reclamation for that volume. Under normal operation, the cold consumer lags the head of the log by up to the eviction window (since it uses that window to accumulate and compact writes before flushing).
 
-The queue retains entries until both consumers have acknowledged. Under normal operation, the cold consumer lags behind the hot consumer by up to the eviction window (since it uses that window to accumulate and compact writes before flushing).
+Hot is not a queue consumer and commits no offset. The sequencer applies each write to hot as it logs it, and recovery rebuilds hot from each shard's first retained entry, so retention must also cover every key's hot residency:
 
 ```
 minimum_queue_retention = max(default_eviction, max(eviction_overrides))
@@ -92,10 +93,10 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 | Scenario | Impact | Resolution |
 |----------|--------|------------|
 | Queue full (embedded WAL disk full) | `append()` returns error. Writes fail. | Provision more WAL storage or speed up cold consumer to allow segment cleanup. |
-| Hot consumer stalled | Promise times out. Write returns Redis error. Write is durable in queue, will be applied when hot consumer recovers. | Investigate hot consumer. Self-regulating: write latency increases as promises wait. |
-| Cold consumer falling behind | Warning metrics fire. Hot store continues serving reads. No writes blocked. | Speed up cold consumer or extend `eviction`. |
+| Cold consumer falling behind | Warning metrics fire. Hot store continues serving reads. Writes are unaffected until hot reaches its memory backpressure limit with nothing drained to evict (next row). | Speed up cold consumer or extend `eviction`. |
+| Hot memory over its limit with cold behind | Hot evicts only keys cold has drained. Backpressure is per shard: once a shard is over `hot.max_memory_bytes` ÷ `hot.shard_count` × `hot.backpressure_ratio`, a write to it that grows memory waits for cold to drain, then fails with `-OOM` at `engine.write_timeout_ms`, having applied and logged nothing. Under skew one shard can reject writes while hot's total memory is under `hot.max_memory_bytes`. | Speed up the cold consumer or provision more hot memory. Self-regulating: write latency rises as writes wait. |
 | Cold store disk full | Cold consumer's `apply_batch()` fails. Cold consumer stalls. Queue grows. Eventually queue fills and writes fail. | Provision more cold storage. |
-| Hot store memory pressure | LRU evicts keys before `eviction` expires. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or tune eviction. Data is safe — in queue and eventually in cold. |
+| Hot store memory pressure | LRU evicts drained keys before `eviction` expires. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or tune eviction. Data is safe — in queue and eventually in cold. |
 
 ## Success Criteria
 
@@ -117,22 +118,22 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 - Durability classes (`process_crash`, `power_loss`) with natural-batching group commit
 - Built-in hash map hot store with LRU eviction, eviction refresh on read, absolute TTL
 - Built-in RocksDB cold store with TTL expiry: reads answer nil for expired keys, and an active scanner deletes them by the log's clock
-- Hot consumer (eager, real-time, promise-based write ACK)
+- Hot consumer (eager, real-time, promise-based write ACK); since replaced by the per-shard sequencer, which applies hot as it logs each write ([ADP-015](proposals/015-write-path-and-durability.md))
 - Cold consumer with compaction buffer (quiet-window + deadline + jitter flush)
 - Compaction: scalar last-write-wins, set/sorted-set merge-accumulate
 - Tiering engine: read routing (hot → buffer → cold), write routing (→ queue)
-- Cold-hit promotion via queue
+- Cold-hit promotion via queue; since replaced by a direct cache fill that writes nothing to the log
 - Two-TTL model: eviction + absolute TTL
-- Recovery: queue replay to both consumers
+- Recovery: queue replay into hot and cold
 - RESP2 frontend (parse, classify, route)
-- Multi-key fan-out (MGET/MSET decomposition)
+- Multi-key commands: MGET and multi-key EXISTS read per key; MSET and multi-key DEL are one atomic decision and one log batch
 - Prometheus metrics and health endpoints
 - Kubernetes StatefulSet + Helm chart
 - Unit, integration, performance tests
 
 ### Phase 2: External Profile + Horizontal Scaling
 
-- Redis client hot/cold store backend
+- Redis client cold store backend. An external hot backend is an open decision ([#187](https://github.com/callumc34/abyss/issues/187)): the sequencer decides against hot in-process.
 - Kafka queue backend
 - NATS JetStream queue backend
 - Hybrid profile configuration

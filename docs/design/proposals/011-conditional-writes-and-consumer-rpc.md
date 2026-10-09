@@ -1,9 +1,16 @@
 # ADP-011: Conditional Writes and Consumer RPC
 
-**Status:** Accepted
+**Status:** Superseded by [ADP-015](015-write-path-and-durability.md)
 **Created:** 2026-04-15
+**Updated:** 2026-10-09
 
-> **Superseded in part by [ADP-015](015-write-path-and-durability.md).** The resolver, the `Conditional`/`Resolved` entry pair and block-and-scan are replaced by decide-then-log on the per-shard sequencer, and Consumer RPC is reduced to admin and flush use (Phase 2). This document describes current behaviour until then, with one change already made. The resolver now reads only entries durable at the acknowledgement class. Under `power_loss` a conditional therefore waits for its Conditional's flush and then its Resolved's, and §Parallel Execution with Fsync describes the earlier fixed commit window ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
+> **Superseded by [ADP-015](015-write-path-and-durability.md) §Sequenced write path.** Of its mechanisms only the predicate flags remain (last item below). The document is kept as the record of the design that decide-then-log replaced: the body is history, not current behaviour. What replaced each part:
+>
+> - **The Resolver** is removed. The per-shard sequencer decides every conditional command under the shard lock, against the key's complete state in hot (a non-resident key is loaded first), and logs only the decided effects. A decision with no effect logs nothing. Recovery replays effects and re-decides nothing, so §Decision determinism and §Recovery Ordering no longer apply, and recovery has no resolver phase ([ADP-007](007-recovery.md)).
+> - **The `Conditional` and `Resolved` entry types** are retired. Decided effects are logged as ordinary `Write` frames, and a cross-shard conditional (`MSETNX`, `RENAMENX`, `COPY`) is one atomic batch within its log. Their type bytes `0x01` and `0x02` are reserved, and a frame carrying either is corruption ([ADP-009](009-wal-format.md)).
+> - **Consumer block-and-scan** is removed: the log holds no pending decision, so cold has nothing to wait for and applies each entry as it reads it ([ADP-004](004-cold-consumer.md)).
+> - **Consumer RPC and the apply notifier** are removed. A write applies to hot inside the sequencer and replies once its frame reaches the configured durability class, with no consumer apply to wait for. FLUSHDB replies on its `Flush` frames' durability, and hot's flush floor answers reads as absent until cold's wipe lands ([ADP-006](006-read-write-paths.md)). The `consumer_rpc` configuration section is removed, and a config that still has it fails to load. `DBSIZE` and `OBJECT IDLETIME` are admin commands answered from server state.
+> - **Still in use:** the predicate flags and their per-command extraction in the command registry, which the sequencer's decisions read.
 
 ## Context
 

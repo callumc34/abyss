@@ -9,7 +9,7 @@
 
 Two foundational defects could not be fixed without changing previously Accepted decisions.
 
-The first is a routing divergence. The wire-visible slot and the data-placement shard were computed by two different hash functions. `CLUSTER KEYSLOT`/`SLOTS`/`SHARDS` reported `CRC16` of the hash-tag content modulo 16384, the Redis Cluster standard, while every placement decision — hot striping, the cold key's 2-byte shard prefix, the WAL shard directories, the resolver stripes, and consumer routing — used a separate xxHash of the raw key modulo the shard count. The two hashes are independent. A cluster-aware client routes by the CRC16 slot, but the data lives where xxHash placed it. In single-pod this is latent because `MOVED` never fires; in multi-pod a `MOVED` derived from CRC16 slot ownership would redirect a client to a pod that does not own the key's xxHash shard, making ADP-008's redirect-correctness invariant unsatisfiable.
+The first is a routing divergence. The wire-visible slot and the data-placement shard were computed by two different hash functions. `CLUSTER KEYSLOT`/`SLOTS`/`SHARDS` reported `CRC16` of the hash-tag content modulo 16384, the Redis Cluster standard, while every placement decision — hot striping, the cold key's 2-byte shard prefix, the WAL shard directories, and consumer routing — used a separate xxHash of the raw key modulo the shard count. The two hashes are independent. A cluster-aware client routes by the CRC16 slot, but the data lives where xxHash placed it. In single-pod this is latent because `MOVED` never fires; in multi-pod a `MOVED` derived from CRC16 slot ownership would redirect a client to a pod that does not own the key's xxHash shard, making ADP-008's redirect-correctness invariant unsatisfiable.
 
 A slot-to-shard lookup table cannot reconcile the two, because there is no function of the slot alone that equals the xxHash placement: many distinct keys collide into one of the 16384 slots, and those colliding keys scatter across the xxHash shards. The only coherent fix is to make placement a function of the slot — the actual Redis Cluster model.
 
@@ -25,7 +25,7 @@ The keyspace is partitioned into 16384 slots via the Redis Cluster standard: the
 
 A shard is the unit of placement and ownership, derived from the slot by a documented, deterministic, total function that partitions the 16384 slots into contiguous ranges — one per shard. Contiguous range division (the slot scaled into the shard-count space) gives each shard a single contiguous slot range, matching ADP-008's over-provisioning and rebalance model: a reshard moves shard-to-pod ownership, not the slot count and not the on-disk encoding.
 
-Hot striping, the WAL shard directories, the cold key prefix, the resolver stripes, and consumer routing all derive the shard from the slot through this one function. The single placement entry point becomes the composition of slot-from-key and shard-from-slot. Every existing caller already routes through that entry point, so the change is transparent to them.
+Hot striping, the WAL shard directories, the cold key prefix, and consumer routing all derive the shard from the slot through this one function. The single placement entry point becomes the composition of slot-from-key and shard-from-slot. Every existing caller already routes through that entry point, so the change is transparent to them.
 
 ### Cold key encoding and format epoch
 
@@ -63,6 +63,6 @@ ADP-008's invariants on consistent placement, deterministic shard assignment, an
 
 **Why scheme identifiers rather than implicit versioning?** Persisting stable identifier strings for the wire-slot and data-shard schemes lets a future change to either scheme be detected as a mismatch instead of silently re-routing on-disk data. The identifiers are versioned constants; a scheme change bumps its identifier rather than reusing it.
 
-**Single-pod shard-count cap.** In-memory consumer-RPC identity packing caps the single-pod shard count at 2^15. The configuration validator enforces this bound; the manifest records the actual count. The cold on-disk shard envelope is wider (2^16) than the in-memory packing limit, which is intentional and documented — on-disk width need not equal in-memory packing width until the RPC identity becomes a structured key (deferred).
+**Single-pod shard-count cap.** WAL frames and the cold on-disk key envelope carry the shard in 16 bits, so the single-pod shard count is capped at 2^16 (65536). The configuration validator enforces this bound; the manifest records the actual count. The earlier 2^15 cap came from consumer-RPC identity packing, which [ADP-015](015-write-path-and-durability.md) removed with the resolver.
 
 **Manifest scope.** The manifest lives under the WAL data directory and so binds topology identity to that directory. It cannot, on its own, detect a cold volume from a different deployment pointed at a mismatched path; the cold-format epoch recorded in both the manifest and the cold store's own format record cross-check the encoding epoch, and a future enhancement may stamp the shard count into a cold system record so each volume self-describes.

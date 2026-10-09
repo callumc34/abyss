@@ -4,7 +4,7 @@
 
 | Scenario | Impact | Recovery |
 |----------|--------|----------|
-| Pod crash (embedded) | Hot store lost. WAL + cold store intact on PVC. | Pod restarts. Queue replay rebuilds hot store. Cold consumer catches up from its last ack point. |
+| Pod crash (embedded) | Hot store lost. WAL + cold store intact on PVC. | Pod restarts. One scan of the log rebuilds hot through the hot replayer, and the cold consumer catches up from its last ack point. |
 | Pod crash (external) | In-process orchestrator lost. External stores (Redis, Kafka, KVRocks) retain data. | Pod restarts, resumes queue consumption. |
 | Cold store PVC full | Cold consumer's `apply_batch()` fails. Cold consumer stalls. Queue grows. Eventually queue fills and writes fail. | Provision more cold storage. |
 | Cold store cannot fsync (checkpoint fails) | The cold consumer applies flushes to the memtable but `Checkpoint()` (durable WAL fsync) fails, so it does **not** advance its WAL ack — the WAL is retained, not reaped. No acked write is lost; the queue keeps growing until the fsync path recovers. | Inspect `abyss_cold_checkpoint_total{status="failure"}` and the cold-store volume. Resolve the I/O fault; the ack resumes advancing once a checkpoint succeeds. |
@@ -12,14 +12,14 @@
 | Cold parse poison (undecodable WAL op) | A WAL entry the cold consumer cannot parse into a materialisable op (`ParseWriteOp` failure, empty command, or empty key). The cold view never advances its ack past the un-materialised seq — the WAL retains it for the whole shard — and the loop backs off instead of busy-spinning. No acked write is dropped; cold simply stops making forward progress on that shard until the entry is dealt with. | Inspect `abyss_cold_parse_poison_total` and the `cold parse poison; WAL retention pinned below seq` CRITICAL log (carries the shard + seq). The shard's WAL retention age / disk bytes will rise. See [Cold Parse Poison Quarantine](#cold-parse-poison-quarantine) below for the inspect / quarantine / skip recovery procedure. |
 | Queue WAL PVC full | The segment preparer cannot create a spare, so the next rotation finds none. Appends wait for a spare until their deadline, then fail with "no spare WAL segment ready". Nothing is applied or acknowledged for a rejected write. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). `abyss_wal_segment_prepare_failures_total` rises first, then `abyss_wal_spare_segments` falls to 0 and `abyss_wal_spare_waits_total` rises. |
 | Spares exhausted during warm-up | Before retention first reclaims a segment, every new segment is zero-filled. A sustained write rate above about half the volume's bandwidth can outrun the preparer, with the same symptoms as a full PVC. | Lower the write rate, or provision more volume bandwidth. `abyss_wal_segments_grown_total` rising with spares at zero confirms it. It clears once recycling starts. |
-| Cold consumer lag > eviction | Reads may miss hot (evicted) and cold (not yet flushed). Data is in the queue/buffer. Buffer serves reads during the gap. | Cold consumer catches up. No data loss — buffer reads bridge the gap. |
+| Cold consumer lag > eviction | Hot evicts a key only once cold's drained seq has passed the key's latest write, so a key past its eviction stays in hot until cold has absorbed it. A read of an evicted key finds it in the compaction buffer or cold, never a stale value. If the lag outgrows hot's budget, writes meet memory backpressure (see [Hot Memory Over Its Limit](#hot-memory-over-its-limit)). | Cold consumer catches up. No data loss, and no read waits for it. |
 | Cold scan exceeds the scan deadline | A large `SMEMBERS`/`ZRANGE`/`HGETALL` served from cold could not complete within `cold_scan_deadline`. The read fails closed with a timeout error to the client rather than returning a silently truncated result. | Inspect `abyss_cold_scan_deadline_exceeded_total`. Raise `cold_scan_deadline` for workloads with large cold-resident collections, or address the cold-volume I/O pressure (compaction, disk) that slowed the scan. |
-| Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
+| Hot store memory pressure | LRU evicts keys cold has drained before their eviction deadline. Reads for evicted keys fall through to buffer then cold. Once a shard is over its share of `hot.max_memory_bytes` (÷ `hot.shard_count`) × `hot.backpressure_ratio` with nothing drained left to evict, writes to it that grow memory wait, then fail with `-OOM`; under skew this can happen while total hot memory is under the limit. | Provision more hot store memory or reduce eviction durations; if writes see `-OOM`, find why cold is behind. Data is safe in queue and eventually in cold. |
 | Active TTL scanner stalled | Expired keys accumulate on disk; the scanner is the only path that deletes them. Reads still answer nil for them, so storage drifts upward but no reply is wrong. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
 | Idle shard keeps expired keys in cold | Cold deletes a key by TTL only once its shard's log clock passes the TTL. The clock is the `appended_at` of the shard's oldest unflushed write, or of its newest write when none is pending ([ADP-004](../design/proposals/004-cold-consumer.md) §Expiry). On a shard with no new writes the clock stops, so its expired keys stay on disk until the shard's next write. After a restart the clock starts at 0 until replay or new writes advance it. Reads answer nil throughout, so this costs space only. | None needed: the shard's next write advances its clock, and the scanner reclaims the keys. If cold disk use matters on a mostly idle keyspace, compare `abyss_cold_disk_bytes` with `abyss_cold_ttl_expired_total`. |
 | Cold apply finds a key holding another type | A logged SADD, HSET or ZADD found its key holding another type in cold, live or expired. The write path logs a DEL before any add that changes a key's type, so the write path and cold disagree. Cold drops the other type and applies the add as logged, so the shard keeps draining. | Inspect `abyss_cold_apply_type_conflicts_total` and the ERROR log `cold apply: an add found its key holding another type` (carries the shard and the add's type). Treat any increase as a correctness investigation. |
 | Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). This is a **refuse-to-start** condition under both durability classes: a power loss could drop whole segments, far beyond the durability window. | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk; Docker Desktop bind mounts often do not, so use a named volume). Watch `abyss_fs_durable_dir_supported`. |
-| WAL flush cannot keep up | The device flushes slower than writes arrive, so acknowledged-but-not-power-durable data grows until it hits `queue.durability_window_bytes` or `queue.durability_window_ms`. Writes then wait for a flush, and after `engine.write_timeout` fail with "WAL durability window full". Acknowledged data is untouched. | Inspect `abyss_wal_durability_lag_seconds`, `abyss_wal_unflushed_bytes`, `abyss_wal_flush_duration_seconds` and `abyss_wal_backpressure_*`. Provision a faster or higher-IOPS volume; widening the window trades a larger power-loss exposure for headroom. |
+| WAL flush cannot keep up | The device flushes slower than writes arrive, so acknowledged-but-not-power-durable data grows until it hits `queue.durability_window_bytes` or `queue.durability_window_ms`. Writes then wait for a flush, and after `engine.write_timeout_ms` fail with "WAL durability window full". Acknowledged data is untouched. | Inspect `abyss_wal_durability_lag_seconds`, `abyss_wal_unflushed_bytes`, `abyss_wal_flush_duration_seconds` and `abyss_wal_backpressure_*`. Provision a faster or higher-IOPS volume; widening the window trades a larger power-loss exposure for headroom. |
 | WAL flush fails, or a mapped segment faults | An fdatasync of published WAL data returns an error, or a write into a mapped segment raises `SIGBUS`. The kernel may already have dropped the dirty pages, so the process terminates rather than let a later flush mark lost data durable. The pod restarts (CrashLoopBackOff if the fault persists) and recovery replays the log. | Look for the CRITICAL `fatal invariant breach; terminating` log naming the WAL flush. Check the volume for I/O errors before restarting. |
 | WAL media corruption | A reader finds a CRC failure below the range recovery verifies, in bytes that were synced long ago. This is media corruption, not a torn write, so the process terminates, naming the log, segment ordinal and offset. It is never skipped as a poison entry. | Check the volume for I/O errors. The entry is lost from the log, so restore the volume from backup, or truncate the log at the reported position and accept the loss. |
 | WAL from another format or layout | The WAL directory holds the format 1 layout (`shard-NNNN/`), a segment of another major version, or a frame of a kind this build does not know. Abyss refuses to start and names which. | There is no migration. Start with an empty WAL directory, or run the build that wrote it. |
@@ -62,19 +62,32 @@ Cold store disk full
             → writes return errors to clients
 ```
 
+A stalled cold consumer reaches writes sooner through hot memory, because hot evicts only what cold has drained:
+
+```
+Cold consumer stalls or lags
+  → cold's drained seq stops advancing
+    → hot cannot evict keys written since
+      → a shard passes hot.max_memory_bytes ÷ hot.shard_count × hot.backpressure_ratio
+        → writes that grow memory wait for cold
+          → -OOM at engine.write_timeout_ms
+```
+
 There is no magic. Each stage is visible in metrics. Operators must provision resources or tune configuration to resolve the cascade.
 
 ## Write Failures
 
-A write rejected before it is published returns a Redis error to the client: disk full creating the next segment, an I/O error on the segment write, or the durability window still full at the command's deadline. The write was never committed to the queue, so no state is inconsistent.
+A write rejected before it is published returns a Redis error to the client: disk full creating the next segment, an I/O error on the segment write, the durability window still full at the command's deadline, hot memory backpressure (`-OOM`, see [Hot Memory Over Its Limit](#hot-memory-over-its-limit)), or keys that span logs (`-CROSSSLOT`, below). The sequencer rejects before it reserves, so the write was never committed to the queue or applied to hot, and no state is inconsistent.
 
 A failed WAL flush or segment seal after publication terminates the process instead (see "WAL flush or segment seal fails" above); there is no error reply for it.
 
-A write that is published but not durable at the acknowledgement class within `engine.write_timeout` returns a Redis error to the client. It is already in the queue and applied to hot, and becomes durable when the WAL flush catches up. Under `process_crash` a power loss before that flush can still drop it. The client received an error, so it may retry. The retry is a duplicate write, which is safe because last-write-wins is the default semantic.
+A write that is published but not durable at the acknowledgement class within `engine.write_timeout_ms` returns a Redis error to the client. It is already in the queue and applied to hot, and becomes durable when the WAL flush catches up. Under `process_crash` a power loss before that flush can still drop it. The client received an error, so it may retry. The retry is a duplicate write, which is safe because last-write-wins is the default semantic.
 
-A multi-key write (`MSET`, `MSETNX`, multi-key `DEL` and `UNLINK`, `RENAMENX`, `COPY`) is one decision and one reservation in the log, so a refused one applies none of its keys. Its keys must share a WAL log: with `queue.log_count` above 1, one whose keys span logs is rejected with `-CROSSSLOT` and nothing is logged (#169). One whose frames cannot fit a single segment fails whole with a "batch exceeds the segment frame space" error; raise `queue.segment_size_bytes`.
+A multi-key write (`MSET`, `MSETNX`, multi-key `DEL` and `UNLINK`, `RENAMENX`, `COPY`) is one decision and one reservation in the log, so a refused one applies none of its keys. Its keys must share a WAL log: with `queue.log_count` above 1, one whose keys span logs is rejected with `-CROSSSLOT Keys in request don't hash to the same slot` and nothing is logged ([#169](https://github.com/callumc34/abyss/issues/169)). With the default single log every multi-key write is atomic across shards. One whose frames cannot fit a single segment is refused whole with a "batch exceeds the segment frame space" error, and nothing is applied. The client should split it: fewer keys, or smaller values. `queue.segment_size_bytes` can be raised only on an empty data directory, before first start. The log cannot change its segment size while it holds data, so raising it on an existing deployment stops the server from starting.
 
-FLUSHDB locks every shard and reserves one `Flush` per shard as a single reservation, so a refused FLUSHDB wipes nothing and readers see it whole. With one log the Flushes are one batch, atomic across a crash too. With several logs each log's Flushes are a batch of their own: a crash can keep one log's and lose another's, leaving the flush applied to some shards only. Retrying completes it, because a wipe is idempotent.
+FLUSHDB locks every shard and reserves one `Flush` per shard as a single reservation, so a refused FLUSHDB wipes nothing and readers see it whole. It replies once its Flush frames are durable at the acknowledgement class; it does not wait for cold's wipe. Until cold has drained past a shard's Flush, hot's flush floor answers every miss on that shard as absent, so no pre-flush value is read from the buffer or cold. A durable wait past `engine.write_timeout_ms` replies "flush durable wait exceeded server timeout; retry to complete the wipe".
+
+With one log the Flushes are one batch, atomic across a crash too. With several logs each log's Flushes are a batch of their own: a crash can keep one log's and lose another's, leaving the flush applied to some shards only. Retrying completes it, because a wipe is idempotent. The validator warns about this, and about `-CROSSSLOT`, at startup whenever `queue.log_count` is above 1.
 
 ## Recovery After Crash
 
@@ -85,6 +98,22 @@ See [ADP-007](../design/proposals/007-recovery.md) for the full recovery design.
 3. The readiness probe (`/ready`) returns 503 until recovery is complete.
 4. Recovery time is bounded by the retained log. Open scans each log once (CRC-verifying only the range that can hold unflushed bytes), and the hot and cold rebuild reads it about once more through one demultiplexing scan.
 5. A torn write at a power loss, including a sector that persisted a new commit word over a recycled segment's old frame, ends the log cleanly at the tear. Writes acknowledged at `power_loss` are below it.
+6. Recovery re-decides nothing. The log holds decided effects, and the hot replayer applies them through the same function the sequencer uses. A frame that replaces its key's whole state (a SET, a DEL, an add that created its key) makes its key resident, and a Flush wipes its shard and sets the flush floor. Any other frame applies only to a key already resident in the rebuild; otherwise it is skipped, and the key is served from the buffer plus cold, which hold it whole. Skipping is normal, not a failure: a key whose earlier frames were reclaimed would otherwise be rebuilt from part of its history. `abyss_recovery_hot_skipped_frames_total` counts skipped frames.
+7. After the scan and cold's final flush, a sweep evicts keys whose last write is past their eviction window, then evicts by LRU down to `hot.max_memory_bytes`. A key last written longer ago than its eviction before the restart is therefore not resident after recovery, and its first read goes to cold. This changes where a key is served from, never its value.
+
+### Recovery failures
+
+Each of these fails recovery: the server logs CRITICAL `recovery failed; shutting down` with the error, exits non-zero, and `/ready` stays 503. Recovery changes nothing a later run cannot redo: hot is rebuilt from scratch, and cold's absorption is idempotent.
+
+- **A shard's frames do not add up.** The hot replayer checks that every frame reaches its shard's cursor in order, and that each shard got exactly its retained frames, from its first retained seq to the durable end. Otherwise the error reads `hot replay of shard N was handed seq A at its cursor B` or `hot replay of shard N got X of its Y frames from the Scan`. Cold's final flush checks the same way: `cold replay of shard N stopped at seq A short of its end B`. Either points at the log scan, not the data. Keep the log and the WAL directory for the bug report; restarting runs the same scan.
+- **Cold cannot finish.** A cold wipe or final flush that keeps failing gives up after `cold_consumer.drain_grace_seconds` rather than hang every shard (`cold replay flush stalled`, or the wipe's error).
+- **Hot cannot make room during replay.** Replay memory is limited per shard, at the shard's budget (`hot.max_memory_bytes` ÷ `hot.shard_count`) × `hot.backpressure_ratio`, the same limit as write backpressure.
+  - Normally replay stays within it. At the limit the hot replayer reclaims drained tombstones and evicts the shard to its budget.
+  - If nothing is evictable it makes the shard's cold consumer flush its buffer through the current frame (capped at the power-durable end, which recovery has synced), then evicts again; each such request counts on `abyss_recovery_cold_drain_requests_total`. If the shard is still over with nothing evictable, replay carries on and retries eviction with each new scan batch, so at most one batch's growth can take it over the limit.
+  - Recovery fails loudly past a hard ceiling of twice that limit, with an error naming the shard, the seq and the likely cause: cold's drained seq pinned (most often by a [cold parse poison](#cold-parse-poison-quarantine)), or one entry larger than the shard's budget.
+  - Recovery also fails if the forced flush hits a batch cold refuses, or makes no progress for `cold_consumer.drain_grace_seconds`: `hot replay of shard N is over its memory limit and cold could not drain: …`.
+
+The forced flush is only a fallback. Cold's drained seq means absorbed into its compaction buffer, and cold is fed each scan batch before hot, so everything hot holds is already drained and on a healthy log `abyss_recovery_cold_drain_requests_total` stays at 0. A non-zero value means cold's drained seq lagged the scan, most likely pinned below a cold parse poison; check `abyss_cold_parse_poison_total`. If recovery fails at the ceiling for an entry larger than the shard's budget, raise `hot.max_memory_bytes` and restart.
 
 ## Cold Consumer Stall
 
@@ -93,18 +122,20 @@ If the cold consumer stalls (cold store I/O errors, bugs, resource exhaustion):
 - Hot store continues serving reads normally.
 - The compaction buffer continues serving buffer-hit reads.
 - The queue grows because the cold consumer isn't acking entries.
-- Write throughput is unaffected until the queue fills.
-- **Metric to watch:** `abyss_cold_buffer_oldest_entry_age_seconds` and `abyss_cold_consumer_lag_entries`.
+- Hot cannot evict what cold has not drained, so hot memory grows with the writes since the stall.
+- Write throughput is unaffected until a shard passes `hot.max_memory_bytes` ÷ `hot.shard_count` × `hot.backpressure_ratio` (writes to it that grow memory then wait, and fail with `-OOM`), or the queue fills.
+- **Metric to watch:** `abyss_cold_buffer_oldest_entry_age_seconds`, `abyss_cold_consumer_lag_entries` and `abyss_hot_unevictable_bytes`.
 
-The cold consumer stall is the most insidious failure because it has no immediate client-visible impact. Writes succeed, reads work (from hot + buffer). The danger is delayed: if the buffer eventually exceeds its high-water mark, it switches to aggressive flush mode. If the stall persists long enough, the queue fills and writes fail.
+The cold consumer stall is the most insidious failure because it has no immediate client-visible impact. Writes succeed, reads work (from hot + buffer). The danger is delayed: if the buffer eventually exceeds its high-water mark, it switches to aggressive flush mode. If the stall persists long enough, hot memory backpressure rejects writes that grow memory, and in the end the queue fills and every write fails.
 
 ## Cold Parse Poison Quarantine
 
 The cold consumer parses every WAL entry it drains with the SAME deterministic `ParseWriteOp`
-the hot consumer uses. If an entry is structurally undecodable from cold's perspective — a parse
+hot's apply uses. If an entry is structurally undecodable from cold's perspective — a parse
 failure, an empty command, or an op with an empty primary key — it is a **poison**: a real
-decoder/format-skew bug, because hot already accepted the same bytes. Silently skipping it would
-let cold diverge from hot forever and would drop a delivered write from the cold view.
+decoder/format-skew bug, because the sequencer decided those bytes and hot already applied them.
+Silently skipping it would let cold diverge from hot forever and would drop a delivered write
+from the cold view.
 
 **A missing parser is not a poison.** Quarantine applies only when a parser exists and rejects
 bytes hot accepted. If the command has no parser at all in this build, no tier could materialise
@@ -115,8 +146,8 @@ retention permanently by sending one command the registry advertises but the sto
 not implement, which is a denial of service rather than a safety property.
 
 A rising `abyss_cold_unsupported_op_total` is not a data-loss signal, but it is a real defect
-signal. Live traffic can no longer produce one: the registry only advertises an unconditional
-write when a typed-operation parser backs it, and a unit test asserts that agreement. So a
+signal. Live traffic can no longer produce one: the registry only advertises a write the
+sequencer can decide into typed effects, and a unit test asserts that agreement. So a
 non-zero counter on a running node means the log contains entries written by a build whose
 command surface was wider than this one's — a downgrade, a mixed-version rollout, or a data
 directory restored from a newer node. Check the binary version that wrote the affected segments
@@ -251,7 +282,11 @@ never returns a partial/silently-capped array that the client would mistake for 
 
 Hot may exceed `hot.max_memory_bytes` only by what cold has not drained: eviction takes only keys cold has absorbed.
 
-- Past `hot.max_memory_bytes` × `hot.backpressure_ratio` on a shard, a write that can grow memory (the `SET` family, `SADD`, `ZADD`, `HSET`, `HMSET`, `HSETNX`, `MSET`, `MSETNX`, `RENAMENX`, `COPY`, or one that must load a whole key) evicts what cold has drained, then waits for cold to drain more.
-- At `engine.write_timeout` it is rejected with `-OOM command not allowed when hot memory is over its limit and cold is behind`, having applied and logged nothing.
+- Backpressure is per shard. Each shard's budget is `hot.max_memory_bytes` ÷ `hot.shard_count`; once a shard is over its budget × `hot.backpressure_ratio`, a write to it that can grow memory (the `SET` family, `SADD`, `ZADD`, `HSET`, `HMSET`, `HSETNX`, `MSET`, `MSETNX`, `RENAMENX`, `COPY`, or one that must load a whole key) evicts what cold has drained, then waits for cold to drain more.
+- At `engine.write_timeout_ms` it is rejected with `-OOM command not allowed when hot memory is over its limit and cold is behind`, having applied and logged nothing.
+- Under skewed load one hot shard can reject writes with `-OOM` while `abyss_hot_memory_bytes` is under `hot.max_memory_bytes`: its own share is what counts. Hash tags that pile related keys onto one shard make this likelier.
 - Deletes, removals, expiry changes and FLUSHDB never wait, unless one must first load a whole key from cold.
+- Reads never wait. A read miss that would fill hot from cold skips the fill while its shard is over the ratio, and is answered from the buffer and cold as usual.
+- Stubs of evicted keys count toward hot memory, up to `hot.stub_memory_fraction` of `hot.max_memory_bytes`; past that cap the least recently written stub is dropped, never a live key.
+- During recovery the same per-shard ratio bounds replay, to within one scan batch; see [Recovery failures](#recovery-failures).
 - **Metrics to watch:** `abyss_hot_backpressure_waits_total`, `abyss_hot_backpressure_rejections_total`, `abyss_hot_unevictable_bytes`, and the cold consumer's lag, which is the usual cause.

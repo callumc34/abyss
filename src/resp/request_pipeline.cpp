@@ -169,8 +169,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         return finish(std::move(*result));
       }
 
-    case Dispatch::kWritePath:
-    case Dispatch::kConditionalWrite: {
+    case Dispatch::kWritePath: {
       if (deps_.dispatcher == nullptr) {
         return finish(InternalServerError("dispatcher missing for write path", parent.name));
       }
@@ -189,8 +188,6 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       // so the parser replies before dispatch. Commands with no parser are
       // exempt: that is a capability gap, not malformed input, and the
       // registry stays the sole authority for them.
-      const bool unconditional =
-          flags == core::PredicateFlags::kNone && parent.dispatch == Dispatch::kWritePath;
       if (core::ops::HasWriteParser(parent.name)) {
         auto parsed = core::ops::ParseWriteOp(parent.name, cmd);
         if (!parsed.has_value()) {
@@ -201,10 +198,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
 
       // The client's spelling: the engine logs the canonical effect it
       // decides, its TTLs made absolute at the instant it decides at.
-      core::Result<RespValue> result =
-          unconditional
-              ? deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd))
-              : deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
+      auto result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd), flags);
       if (!result.has_value()) {
         ABYSS_LOG_WARN("engine write error", {"client_id", state_.client_id},
                        {"cmd", std::string_view{parent.name}},
@@ -215,7 +209,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       return finish(std::move(*result));
     }
 
-    case Dispatch::kConsumerRpc:
+    case Dispatch::kAdmin:
       if (parent.name == "DBSIZE") {
         if (deps_.stats == nullptr) {
           return finish(InternalServerError("stats missing for DBSIZE", parent.name));
@@ -228,7 +222,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
           label.push_back('|');
           label.append(resolved.subcommand->name);
         }
-        std::string msg = "consumer RPC commands are not supported in this build (";
+        std::string msg = "not supported in this build (";
         msg.append(label);
         msg.append("); tracked in abyss#97");
         return finish(RespValue::Error(ErrorPrefix::kErr, std::move(msg)));

@@ -62,16 +62,6 @@ int64_t Micros(core::WallTime t) {
 TEST(FrameTest, RoundTripsEveryEntryType) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(WriteEntry(10, "value"));
-  entries.push_back(core::QueueEntry{
-      .seq = 11,
-      .payload = core::entry::Conditional{.cmd = core::RespCommand{{"SET", "k", "v", "NX"}},
-                                          .flags = core::PredicateFlags::kNx}});
-  entries.push_back(core::QueueEntry{
-      .seq = 12,
-      .payload = core::entry::Resolved{.ref = 11,
-                                       .decision = core::Decision::kApply,
-                                       .materialised_ops = {core::RespCommand{{"SET", "k", "v"}}},
-                                       .return_value = core::RespValue::SimpleString("OK")}});
   entries.push_back(core::QueueEntry{.seq = 13, .payload = core::entry::Flush{}});
 
   for (const auto& entry : entries) {
@@ -97,23 +87,24 @@ TEST(FrameTest, RoundTripsEveryEntryType) {
     EXPECT_EQ(Micros(decoded->appended_at), Micros(entry.appended_at));
     EXPECT_EQ(decoded->payload.index(), entry.payload.index());
   }
+}
 
-  std::vector<std::byte> bytes = Closed(entries[2]);
-  Seal(bytes, kGen);
-  auto resolved = DecodeEntry(InspectAt(bytes, kGen));
-  ASSERT_TRUE(resolved.has_value());
-  const auto& r = std::get<core::entry::Resolved>(resolved->payload);
-  EXPECT_EQ(r.ref, 11U);
-  ASSERT_EQ(r.materialised_ops.size(), 1U);
-  EXPECT_EQ(r.materialised_ops[0].args, (std::vector<std::string>{"SET", "k", "v"}));
-  EXPECT_EQ(r.return_value.AsString(), "OK");
-
-  bytes = Closed(entries[1]);
-  Seal(bytes, kGen);
-  auto conditional = DecodeEntry(InspectAt(bytes, kGen));
-  ASSERT_TRUE(conditional.has_value());
-  EXPECT_EQ(std::get<core::entry::Conditional>(conditional->payload).flags,
-            core::PredicateFlags::kNx);
+// 0x01 and 0x02, the retired conditional and resolved types, are
+// reserved: a whole, sealed frame carrying one is corruption.
+TEST(FrameTest, AFrameOfAReservedTypeIsCorruption) {
+  for (const uint8_t type : {uint8_t{0x01}, uint8_t{0x02}}) {
+    std::vector<std::byte> bytes;
+    EncodeEntry(WriteEntry(9, "v"), 3, bytes);
+    // The type byte follows the kind; CloseBatch then seals the body.
+    bytes[kBodyAt + 1] = std::byte{type};
+    CloseBatch(bytes);
+    Seal(bytes, kGen);
+    const View view = InspectAt(bytes, kGen);
+    ASSERT_EQ(view.state, State::kFilled) << "type " << static_cast<int>(type);
+    auto decoded = DecodeEntry(view);
+    ASSERT_FALSE(decoded.has_value()) << "type " << static_cast<int>(type);
+    EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
+  }
 }
 
 TEST(FrameTest, CarriesReplacesState) {
@@ -174,12 +165,8 @@ TEST(FrameTest, FramesEncodedInPlaceMatchTheirBatchEncodedWhole) {
   const std::vector<core::QueueEntry> entries{
       WriteEntry(1, "a"), WriteEntry(2, std::string(100, 'b')),
       core::QueueEntry{.seq = 3, .payload = core::entry::Flush{}},
-      core::QueueEntry{
-          .seq = 4,
-          .payload = core::entry::Resolved{.ref = 1,
-                                           .decision = core::Decision::kApply,
-                                           .materialised_ops = {core::RespCommand{{"DEL", "k"}}},
-                                           .return_value = core::RespValue::Integer(1)}}};
+      core::QueueEntry{.seq = 4,
+                       .payload = core::entry::Write{.cmd = core::RespCommand{{"DEL", "k"}}}}};
   std::vector<std::byte> whole;
   for (const auto& entry : entries) EncodeEntry(entry, 5, whole);
   CloseBatch(whole);

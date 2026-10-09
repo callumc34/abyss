@@ -2,9 +2,9 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-05-31
+**Updated:** 2026-10-09
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Dispatch becomes asynchronous: reactors never wait on durability or cold reads, each command is sequenced before the next on its connection, and replies keep command order (Phase 3). Conditional writes become ordinary sequenced writes that log their decided effects (Phase 2). §TCP server implementation's head-of-line trade-off and §Write Acknowledgement describe current behaviour until then.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Conditional writes are ordinary sequenced writes that log their decided effects; §Command Classification and Dispatch, §Multi-Key Commands and §Write Acknowledgement describe that. Dispatch will become asynchronous (#161): reactors will never wait on durability or cold reads, each command will be sequenced before the next on its connection, and replies will keep command order. §TCP server implementation's head-of-line trade-off describes current behaviour until then.
 
 > **§CLUSTER Commands refined by [ADP-014](014-slot-routing-and-topology.md).** `CLUSTER KEYSLOT` still returns the `CRC16` wire slot unchanged. `CLUSTER SLOTS`/`SHARDS` now advertise slot ranges grouped by their owning shard (resolved through slot-to-shard mapping) rather than a single full-range stub; in single-pod the ranges still cover the whole slot space, partitioned disjointly by shard. The `MOVED` path (gated behind multi-pod) computes its target from slot ownership, so a redirect always names the pod whose shard owns the key. Invariant 8's "only the slot-to-pod mapping differs between phases" is upgraded: that mapping is now explicit, slot-derived, and tested, not coincidental.
 
@@ -22,7 +22,7 @@ This ADP defines:
 - Admin command handling: `HELLO`, `CLUSTER`, `INFO`, `DBSIZE`, `CLIENT`.
 - Unknown-command and arity-mismatch behaviour.
 
-Conditional writes (`SET NX`, `ZADD GT`, etc.) and the Consumer RPC primitive that underpins write acknowledgement are specified in [ADP-011](011-conditional-writes-and-consumer-rpc.md). This ADP references that design but does not duplicate it.
+Conditional writes (`SET NX`, `ZADD GT`, etc.) are decided by the per-shard sequencer against the key's complete state and logged as the effects they decided (decide-then-log), as specified in [ADP-015](015-write-path-and-durability.md) §Sequenced write path. That replaced [ADP-011](011-conditional-writes-and-consumer-rpc.md)'s resolver and Consumer RPC. This ADP references that design but does not duplicate it.
 
 ## Design
 
@@ -38,44 +38,33 @@ Parser and serializer are RESP2-only. RESP3-specific types (maps, sets, doubles,
 
 ### RespValue Type Contract
 
-`RespValue` (core/resp_types.h) distinguishes simple and bulk strings as separate variants:
-
-```cpp
-enum class Type { kNull, kSimpleString, kBulkString, kInteger, kError, kArray };
-```
+The RESP value type has six variants, and keeps simple and bulk strings separate: null, simple string, bulk string, integer, error and array.
 
 Wire serialisation:
 
 | Variant | Wire format | Use |
 |---------|-------------|-----|
-| `kNull` | `$-1\r\n` (bulk null) or `*-1\r\n` (array null) | Missing key, NX-fail, array absence |
-| `kSimpleString` | `+<value>\r\n` | Protocol constants: `OK`, `PONG`, `QUEUED` |
-| `kBulkString` | `$<len>\r\n<bytes>\r\n` | User values, binary-safe |
-| `kInteger` | `:<n>\r\n` | Counts, bool as 0/1 |
-| `kError` | `-<prefix> <message>\r\n` | See §Error Prefix Table |
-| `kArray` | `*<len>\r\n<elems>` | Multi-value responses |
+| Null | `$-1\r\n` (bulk null) or `*-1\r\n` (array null) | Missing key, NX-fail, array absence |
+| Simple string | `+<value>\r\n` | Protocol constants: `OK`, `PONG`, `QUEUED` |
+| Bulk string | `$<len>\r\n<bytes>\r\n` | User values, binary-safe |
+| Integer | `:<n>\r\n` | Counts, bool as 0/1 |
+| Error | `-<prefix> <message>\r\n` | See §Error Prefix Table |
+| Array | `*<len>\r\n<elems>` | Multi-value responses |
 
 Parser emits the correct variant based on type byte (`+`/`-`/`:`/`$`/`*`). Serializer is deterministic — no guessing between simple and bulk.
 
-Error construction is funneled through a single helper so the prefix vocabulary is enforced at the type level:
-
-```cpp
-RespValue::Error(ErrorPrefix::kWrongType,
-                 "Operation against a key holding the wrong kind of value");
-```
-
-Hand-formatted error strings (`"-ERR ..."`) are disallowed.
+Every error is built by one helper that takes a prefix from the fixed set in §Error Prefix Table and a message, so the prefix vocabulary is enforced by the type system. A `WRONGTYPE` error, for example, is that helper given the wrong-type prefix and Redis's message "Operation against a key holding the wrong kind of value". Hand-formatted error strings (`"-ERR ..."`) are disallowed.
 
 ### Error Prefix Table
 
 | Prefix | Semantics | Owner | Emitted when |
 |--------|-----------|-------|--------------|
 | `ERR` | Generic: syntax, bad args, unknown command | Frontend | Unknown command, arity mismatch, malformed args, parse error |
-| `WRONGTYPE` | Key exists with a different type | Hot / Cold store | Type mismatch at apply time |
+| `WRONGTYPE` | Key exists with a different type | Sequencer / read path | Type mismatch found when a write is decided (nothing is logged) or when a read meets the key |
 | `LOADING` | Server is loading state from the queue | Frontend | Recovery gate open ([ADP-007](007-recovery.md)) |
 | `MOVED <slot> <ip>:<port>` | Key belongs to a different shard | Frontend | Phase 2+ cluster routing ([ADP-008](008-horizontal-scaling.md)); emission path exists in Phase 1 but never triggered |
-| `CROSSSLOT` | Multi-key command spans shards | Frontend | Phase 2+ multi-key across pods |
-| `OOM` | Write rejected due to memory limit | Hot store | At `max_memory_bytes` and cannot evict |
+| `CROSSSLOT` | Multi-key write spans what one atomic batch can cover | Sequencer | Keys span WAL logs when `queue.log_count` > 1 (#169); Phase 2+ multi-key across pods |
+| `OOM` | Write rejected due to memory limit | Sequencer | The write's hot shard over `hot.max_memory_bytes` ÷ `hot.shard_count` × `hot.backpressure_ratio` with cold behind, still at the write's deadline; nothing is applied or logged. Per shard, so under skew one shard can reject writes while hot's total is under its limit |
 | `NOSCRIPT` | Script not loaded / not supported | Frontend | Any script-related command in Phase 1 (`EVAL`, `EVALSHA`, `SCRIPT`) |
 | `NOPROTO` | Unsupported protocol version | Frontend | `HELLO 3` |
 | `READONLY` | (Reserved) | — | Not emitted in Phase 1. Reserved for future replica mode. |
@@ -110,14 +99,13 @@ Every command is classified along two axes.
 
 | Dispatch | Handling | Ack via |
 |----------|----------|---------|
-| `kStateless` | Frontend computes locally; no consumer interaction | Direct return |
-| `kTieredRead` | Read path: hot → buffer → cold ([ADP-006](006-read-write-paths.md)) | Direct sync tiered read |
-| `kWritePath` | Unconditional write: queue append → hot apply | Consumer RPC ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) |
-| `kConditionalWrite` | Conditional: resolver resolves ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) | Consumer RPC |
-| `kConsumerRpc` | Requires live consumer state (e.g. `DBSIZE`, `OBJECT IDLETIME`) | Consumer RPC |
-| `kFlush` | Broadcast wipe (`FLUSHDB`/`FLUSHALL`): per-shard `Flush` entry, fan-out apply ([ADP-006](006-read-write-paths.md) §Broadcast Write Path) | Consumer RPC (per shard × consumer) |
+| `kStateless` | Frontend computes locally; no engine interaction | Direct return |
+| `kTieredRead` | Read path: hot, then on a miss a stub, the flush floor, or buffer plus cold, with no wait ([ADP-006](006-read-write-paths.md)) | Direct return, after the read fence |
+| `kWritePath` | Every write, conditional or not: the sequencer decides it against the key's complete state, reserves, applies to hot and publishes ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). The command's predicate extractor supplies its predicate flags (`NX`, `XX`, `GT`, `LT`, `GET`, ...) per call | The decided reply, once its frames reach the durability class |
+| `kAdmin` | Answered from server state, not the data path (`DBSIZE`, `OBJECT IDLETIME`) | Direct return |
+| `kFlush` | Broadcast wipe (`FLUSHDB`/`FLUSHALL`): one `Flush` frame per shard, reserved as one batch under every shard lock ([ADP-006](006-read-write-paths.md) §Broadcast Write Path) | `+OK`, once the Flush frames reach the durability class |
 
-The request pipeline (issue #34) becomes a data-driven 6-way dispatch against the command registry, not a growing switch.
+The request pipeline (issue #34) is a data-driven five-way dispatch against the command registry, not a growing switch.
 
 ### Container Commands and Subcommands
 
@@ -127,14 +115,14 @@ This means:
 
 - The set of accepted subcommands is the registry's truth. Unknown subcommands surface `ERR Unknown <PARENT> subcommand` at the frontend and never reach the queue or any handler.
 - Per-subcommand `loading_safe` is authoritative when a subcommand resolves. The narrow recovery-time allowlist (`CLUSTER SLOTS`, `CLUSTER INFO`, `CLUSTER MYID`, `COMMAND` / `COMMAND COUNT|INFO|DOCS`, `PING`, `INFO`, `HELLO`, `QUIT`) lives on the spec, not in handler-side `if` chains.
-- `OBJECT ENCODING` (read) and `OBJECT IDLETIME` (consumer RPC) carry distinct `Dispatch` values on their respective subspecs; the parent's dispatch is unused when a subcommand resolves.
+- `OBJECT ENCODING` (read) and `OBJECT IDLETIME` (admin) carry distinct `Dispatch` values on their respective subspecs; the parent's dispatch is unused when a subcommand resolves.
 - Arity on `SubcommandSpec` is the total RESP arg count including the parent token, so `CLUSTER KEYSLOT key` is arity 3 and `COMMAND INFO [name ...]` is arity -2.
 
 When a container is invoked with no subcommand argument (e.g. `COMMAND` alone), parent dispatch applies. Containers whose parent arity rules out the no-subcommand form (e.g. `CONFIG` with arity -3) cannot reach this fallback.
 
 ### Command Registry (Phase 1)
 
-Phase 1 restricts the surface to **direct key access and modification**, plus the `FLUSHDB`/`FLUSHALL` global wipe (routed through the queue as a broadcast write — [ADP-006](006-read-write-paths.md) §Broadcast Write Path) — no enumeration (`KEYS`, `SCAN`, `RANDOMKEY`), no other global operations (`SWAPDB`, `MOVE`, `SELECT`), no pub/sub, no scripting, no transactions (groundwork exists in ADP-011; activation deferred), no streams.
+Phase 1 restricts the surface to **direct key access and modification**, plus the `FLUSHDB`/`FLUSHALL` global wipe (routed through the queue as a broadcast write — [ADP-006](006-read-write-paths.md) §Broadcast Write Path) — no enumeration (`KEYS`, `SCAN`, `RANDOMKEY`), no other global operations (`SWAPDB`, `MOVE`, `SELECT`), no pub/sub, no scripting, no transactions (not yet implemented; they will execute on the sequencer, ADP-015), no streams.
 
 Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "at least |n|".
 
@@ -158,14 +146,14 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 | `COMMAND DOCS [cmd ...]` | -2 | Map-as-array of docs |
 | `CONFIG GET param` | 3 | Array[key, value] pairs for matching params |
 
-**Admin — consumer RPC:**
+**Admin — server state:**
 
 | Command | Arity | Response | Reason |
 |---------|-------|----------|--------|
 | `DBSIZE` | 1 | Integer | Needs hot + cold key count |
-| `INFO [section]` | -1 | Bulk string | Needs live stats from all consumers |
+| `INFO [section]` | -1 | Bulk string | Needs live stats from every tier |
 
-> **Phase 1 note.** Both commands are served from a synchronous `ServerStatsProvider` snapshot rather than a live Consumer RPC round-trip. The same stats already feed Prometheus gauges so a second query path would be redundant. When the Resolver lands, the plumbing can move to RPC without changing the command contract.
+Both are served from a synchronous `ServerStatsProvider` snapshot, the same stats that feed the Prometheus gauges, so neither touches the data path. `DBSIZE` has the `kAdmin` dispatch class; `INFO` is `kStateless`.
 
 **Admin — cluster (Phase 1 single-shard view; see §CLUSTER Commands):**
 
@@ -186,21 +174,21 @@ Arity follows Redis's `COMMAND INFO` convention: positive = exact; negative = "a
 | `FLUSHDB [ASYNC\|SYNC]` | -1 | Write | Flush | `+OK` |
 | `FLUSHALL [ASYNC\|SYNC]` | -1 | Write | Flush | `+OK` |
 
-Both route through the queue as a per-shard `Flush` broadcast and ack only after every consumer on every owned shard has applied the wipe ([ADP-006](006-read-write-paths.md) §Broadcast Write Path). The `ASYNC`/`SYNC` modifier is accepted (hence arity -1) but ignored — the wipe is always synchronous. Single-pod Phase 1 has only DB 0, so `FLUSHALL` and `FLUSHDB` are equivalent. Both are `loading_safe = false`: during recovery they return `LOADING`.
+Both take every shard lock, log one `Flush` frame per shard in a single reservation, and wipe hot before the locks are released. The reply waits only for the Flush frames to reach the durability class; until cold's wipe lands, hot's flush floor answers a miss on each shard as absent ([ADP-006](006-read-write-paths.md) §Broadcast Write Path). With `queue.log_count` above 1, each log's Flushes are a batch of their own, so a crash can leave the wipe applied to some shards only; a retry completes it (#169). The `ASYNC`/`SYNC` modifier is accepted (hence arity -1) but ignored — the wipe is always synchronous. Single-pod Phase 1 has only DB 0, so `FLUSHALL` and `FLUSHDB` are equivalent. Both are `loading_safe = false`: during recovery they return `LOADING`.
 
 **Strings (direct key only):**
 
 | Command | Arity | Class | Dispatch | Response |
 |---------|-------|-------|----------|----------|
 | `GET key` | 2 | Read | TieredRead | Bulk or nil |
-| `SET key value [options...]` | -3 | Write | Write or Conditional (§SET) | `+OK` / nil / bulk |
-| `SETNX key value` | 3 | Write | Conditional | Integer 0/1 |
+| `SET key value [options...]` | -3 | Write | Write (§SET) | `+OK` / nil / bulk |
+| `SETNX key value` | 3 | Write | Write (conditional) | Integer 0/1 |
 | `SETEX key seconds value` | 4 | Write | Write | `+OK` |
 | `PSETEX key ms value` | 4 | Write | Write | `+OK` |
 | `STRLEN key` | 2 | Read | TieredRead | Integer |
 | `MGET key [key ...]` | -2 | Read | TieredRead (fan-out) | Array of bulk/nil |
-| `MSET k v [k v ...]` | -3 | Write | Write (fan-out) | `+OK` |
-| `MSETNX k v [k v ...]` | -3 | Write | Conditional (atomic) | Integer 0/1 |
+| `MSET k v [k v ...]` | -3 | Write | Write (fan-out, atomic) | `+OK` |
+| `MSETNX k v [k v ...]` | -3 | Write | Write (conditional, atomic) | Integer 0/1 |
 
 **Sets (direct key only):**
 
@@ -218,7 +206,7 @@ Both route through the queue as a per-shard `Flush` broadcast and ack only after
 
 | Command | Arity | Class | Dispatch | Response |
 |---------|-------|-------|----------|----------|
-| `ZADD key [NX\|XX\|GT\|LT] [CH] [INCR] score m ...` | -4 | Write | Write or Conditional | Integer / bulk |
+| `ZADD key [NX\|XX\|GT\|LT] [CH] [INCR] score m ...` | -4 | Write | Write | Integer / bulk |
 | `ZREM key m [m ...]` | -3 | Write | Write | Integer |
 | `ZSCORE key m` | 3 | Read | TieredRead | Bulk or nil |
 | `ZMSCORE key m [m ...]` | -3 | Read | TieredRead | Array |
@@ -246,7 +234,7 @@ Both route through the queue as a per-shard `Flush` broadcast and ack only after
 | `HVALS key` | 2 | Read | TieredRead | Array of values |
 | `HLEN key` | 2 | Read | TieredRead | Integer (field count) |
 
-`HSETNX` is registered separately under conditional writes. The remaining hash commands (`HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD`, `HSCAN`, `HSTRLEN`, `HEXPIRE` family) are deferred until the corresponding store ops are exposed.
+`HSETNX` is registered separately, as an always-conditional write. The remaining hash commands (`HINCRBY`, `HINCRBYFLOAT`, `HRANDFIELD`, `HSCAN`, `HSTRLEN`, `HEXPIRE` family) are deferred until the corresponding store ops are exposed.
 
 When the hot store does not hold the key — typical after eviction — multi-field hash reads (`HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HMGET`, `HEXISTS`) are answered by merging the compaction buffer's overlay with cold's persisted state in the tiering engine. The buffer alone never holds the complete picture for these reads: its hash-field map captures only net writes since the last flush. The merge enforces buffer-removed fields and buffer-overridden values without dropping cold-resident fields.
 
@@ -254,29 +242,29 @@ When the hot store does not hold the key — typical after eviction — multi-fi
 
 | Command | Arity | Class | Dispatch | Response |
 |---------|-------|-------|----------|----------|
-| `DEL key [key ...]` | -2 | Write | Write | Integer (count) |
-| `UNLINK key [key ...]` | -2 | Write | Write | Integer (Phase 1: alias for DEL) |
+| `DEL key [key ...]` | -2 | Write | Write (fan-out, atomic) | Integer (count) |
+| `UNLINK key [key ...]` | -2 | Write | Write (fan-out, atomic) | Integer (Phase 1: alias for DEL) |
 | `EXISTS key [key ...]` | -2 | Read | TieredRead | Integer |
-| `EXPIRE key s [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
-| `PEXPIRE key ms [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
-| `EXPIREAT key ts [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
-| `PEXPIREAT key ts-ms [NX\|XX\|GT\|LT]` | -3 | Write | Write or Conditional | Integer 0/1 |
+| `EXPIRE key s [NX\|XX\|GT\|LT]` | -3 | Write | Write | Integer 0/1 |
+| `PEXPIRE key ms [NX\|XX\|GT\|LT]` | -3 | Write | Write | Integer 0/1 |
+| `EXPIREAT key ts [NX\|XX\|GT\|LT]` | -3 | Write | Write | Integer 0/1 |
+| `PEXPIREAT key ts-ms [NX\|XX\|GT\|LT]` | -3 | Write | Write | Integer 0/1 |
 | `PERSIST key` | 2 | Write | Write | Integer 0/1 |
 | `TTL key` | 2 | Read | TieredRead | Integer |
 | `PTTL key` | 2 | Read | TieredRead | Integer |
 | `EXPIRETIME key` | 2 | Read | TieredRead | Integer |
 | `PEXPIRETIME key` | 2 | Read | TieredRead | Integer |
 | `TYPE key` | 2 | Read | TieredRead | Simple string |
-| `RENAMENX src dst` | 3 | Write | Conditional | Integer 0/1 |
-| `COPY src dst [DB n] [REPLACE]` | -3 | Write | Conditional | Integer 0/1 |
+| `RENAMENX src dst` | 3 | Write | Write (conditional, atomic) | Integer 0/1 |
+| `COPY src dst [DB n] [REPLACE]` | -3 | Write | Write (conditional, atomic) | Integer 0/1 |
 | `OBJECT ENCODING key` | 3 | Read | TieredRead | Bulk |
-| `OBJECT IDLETIME key` | 3 | Read | ConsumerRpc | Integer (from hot consumer LRU) |
+| `OBJECT IDLETIME key` | 3 | Read | Admin | `ERR not supported in this build` (abyss#97) |
 
 **Excluded in Phase 1** (reject with `ERR unknown command`):
 
 - Enumeration — `KEYS`, `SCAN`, `HSCAN`, `SSCAN`, `ZSCAN`, `RANDOMKEY`
 - Global — `SWAPDB`, `MOVE`, `SELECT` (non-zero DB). `FLUSHDB`/`FLUSHALL` are **supported** — see §Command Registry above and [ADP-006](006-read-write-paths.md) §Broadcast Write Path.
-- Transactions — `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` ([ADP-011](011-conditional-writes-and-consumer-rpc.md) lays the groundwork; activation deferred to Phase 2+)
+- Transactions — `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` (not yet implemented; they will execute on the sequencer as one batch, [ADP-015](015-write-path-and-durability.md) §Sequenced write path)
 - Pub/sub — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB`
 - Scripting — `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` (`NOSCRIPT` where Redis semantics demand it)
 - Streams — `XADD`, `XREAD`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL`, `XGROUP`, `XACK`, ...
@@ -284,7 +272,7 @@ When the hot store does not hold the key — typical after eviction — multi-fi
 - Dump / restore — `DUMP`, `RESTORE`, `MIGRATE`
 - Deferred types — lists (`LPUSH` et al.), bitmaps, hyperloglog, geo. Rejected with `ERR unknown command` in Phase 1; added in Phase 2 when the hot store supports them. Hashes are partially supported (see "Hashes" above); the remaining hash commands listed there are deferred.
 - Read-modify-write — `APPEND`, `DECR`, `DECRBY`, `GETDEL`, `GETSET`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `SPOP`, `ZINCRBY`. See below.
-- Multi-key rename — `RENAME`. `RENAMENX` is supported; the unconditional form is excluded with the read-modify-write group because it shares their resolver dependency and additionally spans two keys, so under [ADP-014](014-slot-routing-and-topology.md) slot routing it needs cross-shard atomicity that does not exist yet.
+- Multi-key rename — `RENAME`. `RENAMENX` is supported; the unconditional form is excluded with the read-modify-write group: like them it computes its effect from the source's current state, so it must be decided by the sequencer as `RENAMENX` is, and that has not been added yet.
 
 #### Why read-modify-write commands cannot be plain writes
 
@@ -294,7 +282,7 @@ Every one of these commands computes its result from the key's current value. Th
 
 This is why Redis can record `INCR` verbatim in its AOF and Abyss cannot: Redis has a single authoritative copy and no compacting secondary view. Systems that do have one resolve atomic operations to concrete values before the log records them.
 
-Abyss already has the mechanism — the resolver, which reads current state and emits a `Resolved` entry carrying materialised ops and a return value ([ADP-011](011-conditional-writes-and-consumer-rpc.md)). The correct implementation routes these commands through it, so the log records the computed result rather than the intent to compute. Hot and cold then apply an ordinary concrete write, compaction collapses it normally, and replay is deterministic because the resolved value is in the log. Until that lands they are excluded rather than advertised, so clients get an honest, feature-detectable `ERR unknown command` instead of an accepted write that fails after a round trip.
+Abyss already has the mechanism — decide-then-log: the sequencer evaluates every write against the key's complete state in hot, under the shard lock, and logs the concrete effect it decided together with its reply ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). The correct implementation decides these commands the same way (#142), so the log records the computed result rather than the intent to compute. Hot and cold then apply an ordinary concrete write, compaction collapses it normally, and replay is deterministic because the decided value is in the log. Until that lands they are excluded rather than advertised, so clients get an honest, feature-detectable `ERR unknown command` instead of an accepted write that fails after a round trip.
 
 ### SET Command Full Specification
 
@@ -308,10 +296,10 @@ Supported options:
 | `PX ms` | Set absolute TTL to `ms` from now | Same, ms precision. |
 | `EXAT unix-seconds` | Set absolute TTL to a Unix timestamp | Same, absolute. |
 | `PXAT unix-ms` | Set absolute TTL to a Unix ms timestamp | Same, absolute ms. |
-| `KEEPTTL` | Preserve existing TTL on the key | Conditional — Resolver reads existing TTL ([ADP-011](011-conditional-writes-and-consumer-rpc.md)). |
-| `NX` | Only set if key does not exist | Conditional ([ADP-011](011-conditional-writes-and-consumer-rpc.md)). |
-| `XX` | Only set if key exists | Conditional. |
-| `GET` | Return prior value, set new | Conditional; value returned via Consumer RPC return value. |
+| `KEEPTTL` | Preserve existing TTL on the key | Decided: the sequencer reads the existing TTL from hot and logs the `SET` with it as an absolute expiry ([ADP-015](015-write-path-and-durability.md)). |
+| `NX` | Only set if key does not exist | Decided; a key that exists gets nil, and nothing is logged. |
+| `XX` | Only set if key exists | Decided; an absent key gets nil, and nothing is logged. |
+| `GET` | Return prior value, set new | Decided; the prior value is the reply, sent once the write is durable at the class. |
 
 Excluded options:
 
@@ -319,10 +307,7 @@ Excluded options:
 |--------|--------|
 | `IDLE seconds` | Redis-specific LRU knob; does not fit Abyss's eviction model (eviction is duration-based, not LRU-based except under memory pressure). |
 
-Dispatch rule:
-
-- No conditional options (no `NX`/`XX`/`KEEPTTL`/`GET`) → `kWritePath`.
-- Any conditional option present → `kConditionalWrite`.
+Dispatch rule: every form is `kWritePath`. The predicate extractor reports `NX`, `XX`, `KEEPTTL` and `GET` as predicate flags, and the sequencer decides the `SET` against hot with them; with none, the decision is a plain overwrite.
 
 TTL option conflict detection (multiple TTL forms in one command) produces `ERR syntax error` at the frontend.
 
@@ -342,9 +327,9 @@ Arity is a weaker check than the parser: `SET k v BOGUS` and `HSET k f v f` both
 
 **3. Known command name, no typed-operation parser exists** — a log entry names a command no tier in this build can materialise.
 
-This is no longer reachable from the wire. The registry advertises an unconditional write only when a typed-operation parser backs it, and that agreement is asserted rather than maintained by hand (`CommandRegistryTest.EveryUnconditionalWriteCommandHasAParser`). Fan-out writes are exempt because the engine decomposes them into per-key commands before anything is queued; conditional writes are exempt because the resolver materialises them into concrete ops.
+This is no longer reachable from the wire. The registry advertises a write only when a typed-operation parser backs it, and a registry test asserts that agreement rather than leaving it to be maintained by hand. Fan-out writes are exempt because the sequencer logs them as per-key effects that do parse; the always-conditional writes (`SETNX`, `MSETNX`, `RENAMENX`, `COPY`, `HSETNX`) are exempt because the sequencer decides them whole and logs effects that do parse.
 
-The case survives for replay: a log written by a build with a wider command surface can still contain such an entry. Consumers must distinguish it from genuine decoder skew. An entry no parser can decode was not applied by any tier, so the materialised views agree it produced nothing and the consumer skips it, counting the occurrence. Quarantining it — refusing to advance past it — would be wrong: it protects nothing, and while the registry could still advertise such a command it let any client suspend log retention indefinitely. Quarantine is reserved for an entry whose parser exists and fails, which is a real skew bug because another tier accepted the same bytes.
+The case survives for replay: a log written by a build with a wider command surface can still contain such an entry. The cold consumer must distinguish it from genuine decoder skew. An entry no parser can decode cannot be materialised by this build, so the cold consumer skips it, counting the occurrence. Recovery's hot replayer does not skip it: every frame it applies is a decided effect, and a decided effect that does not parse terminates the process ([ADP-007](007-recovery.md) §Hot replay). Its residency rule skips the frame only when the key is not resident. Quarantining it — refusing to advance past it — would be wrong: it protects nothing, and while the registry could still advertise such a command it let any client suspend log retention indefinitely. Quarantine is reserved for an entry whose parser exists and fails, which is a real skew bug because another tier accepted the same bytes.
 
 **Arity mismatch** — known command with wrong argument count. Frontend rejects with `ERR wrong number of arguments for '<name>' command`, no queue interaction.
 
@@ -352,14 +337,12 @@ The case survives for replay: a log written by a build with a wider command surf
 
 Per-connection state (frontend-local, not a queue concern):
 
-```
-ConnectionState {
-  uint64_t client_id;           // monotonic frontend counter
-  std::string client_name;      // set by CLIENT SETNAME
-  int protocol_version = 2;     // locked to 2 in Phase 1
-  bool authenticated = true;    // Phase 1: always true (no AUTH)
-}
-```
+| Field | Meaning |
+|-------|---------|
+| Client id | A monotonic frontend counter |
+| Client name | Set by `CLIENT SETNAME` |
+| Protocol version | 2, locked in Phase 1 |
+| Authenticated | Always true in Phase 1 (no `AUTH`) |
 
 `HELLO` responses (map-as-array per RESP2 convention — alternating key/value pairs):
 
@@ -369,7 +352,7 @@ ConnectionState {
 - `HELLO 2 AUTH <user> <pass>` → Phase 1 ignores AUTH arguments (future: verify credentials).
 - `HELLO 2 SETNAME <name>` → sets `client_name`.
 
-`CLIENT ID` reads from connection state; never a queue concern. `CLIENT SETNAME` / `CLIENT GETNAME` operate on connection state. All handshake commands are `kStateless` — Consumer RPC is not involved.
+`CLIENT ID` reads from connection state; never a queue concern. `CLIENT SETNAME` / `CLIENT GETNAME` operate on connection state. All handshake commands are classed stateless — the engine is not involved.
 
 ### CLUSTER Commands in Phase 1
 
@@ -395,20 +378,20 @@ Invariant: **slot computation is phase-invariant**. `CLUSTER KEYSLOT` always ret
 
 ### Multi-Key Commands
 
-`MGET`, `MSET`, `DEL`, `UNLINK`, and `EXISTS` accept multiple keys that may target different shards. The registry tags each one with a `MultiKeyKind` (kMget / kMset / kDelete / kExists); the request pipeline routes those through `CommandDispatcher::DispatchFanOut`, and the engine decomposes per key before queueing or aggregating. `MSETNX` is the exception — it is conditional and routes through the Resolver instead.
+`MGET`, `MSET`, `DEL`, `UNLINK`, and `EXISTS` accept multiple keys that may target different shards. The registry tags each one with its multi-key kind (get, set, delete or exists), and the request pipeline routes tagged commands through the dispatcher's fan-out path. Reads are answered key by key; writes go to the sequencer as one command. `MSETNX` is the exception — it is always conditional, a write-path command the sequencer decides whole.
 
-**Single-pod (Phase 1):** All keys are local. The engine decomposes:
+**Single-pod (Phase 1):** All keys are local. The engine handles them as follows:
 
 - `MGET k1 k2 ...` → per-key single-key reads across hot → buffer → cold (tombstone-aware), assembled positionally. A `WRONGTYPE` on any key collapses to nil at that slot, matching Redis behaviour.
-- `MSET k1 v1 k2 v2 ...` → N `SET` `Write` queue entries, each appended to its owning shard's WAL.
-- `DEL` / `UNLINK k1 k2 ...` → N single-key `DEL` `Write` queue entries; per-key integer replies are summed.
+- `MSET k1 v1 k2 v2 ...` → one `SET` effect per key, logged as one batch.
+- `DEL` / `UNLINK k1 k2 ...` → one `DEL` effect per key, logged as one batch; per-key integer replies are summed.
 - `EXISTS k1 k2 ...` → per-key existence probe across hot → buffer → cold; the buffer probe overrides cold (a not-yet-flushed `DEL` reports the key as absent even if cold still holds a residual). Duplicate keys are counted once each, matching Redis.
 
-There is no cross-key atomicity guarantee for `MSET`, `DEL`, or `UNLINK` — a crash or partial failure mid-decomposition may persist some keys but not others. The client receives an error and may retry. This matches DragonflyDB's behaviour under internal sharding and is consistent with how Redis Cluster clients handle cross-slot fan-out.
+Multi-key writes are atomic. The sequencer takes every involved shard's lock in ascending shard order, decides every key, makes one log reservation for all the frames, applies them to hot and publishes once ([ADP-015](015-write-path-and-durability.md) §Cross-shard atomic commands). A refused one applies none of its keys, and a crash keeps all of its frames or none, because the log closes a batch by position. `MSETNX`, `RENAMENX` and `COPY` are decided the same way: `MSETNX` checks every key's existence under the locks and logs all its `SET`s as one batch, or nothing.
 
-For partial failures specifically: if one sub-command's `BeginAppend` fails after prior subs succeeded, the prior pendings still auto-publish on scope exit (their destructor calls `Publish`) — the queue durably absorbs them, the responsible consumers apply them, and the client sees the first error. Subsequent reads observe the partial state.
+A batch cannot span WAL logs. With `queue.log_count` above 1, a multi-key write whose keys map to different logs is rejected with `CROSSSLOT` and nothing is logged (#169); hash tags keep related keys on one shard.
 
-`MSETNX` is a conditional multi-key write — routed to the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)), which evaluates existence of all keys atomically under shard-striped locks and emits a single `Resolved` entry that either applies all sets or none.
+Multi-key reads are not atomic: `MGET` and multi-key `EXISTS` read each shard in turn and can observe a cross-shard write half-applied (#170).
 
 **Multi-pod (Phase 2+):** If keys span pods, Abyss responds with `CROSSSLOT` error. Clients handle this by fanning out per-slot and assembling results client-side. Users can use hash tags (e.g. `{user123}.name`, `{user123}.email`) to co-locate related keys on the same shard.
 
@@ -416,20 +399,16 @@ For partial failures specifically: if one sub-command's `BeginAppend` fails afte
 
 A write is acknowledged to the client only after two things have happened:
 
-1. The queue append reaches the configured durability class: published under `process_crash`, or covered by a completed fdatasync under `power_loss` ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
-2. The responsible consumer has applied the write and fulfilled the Consumer RPC promise ([ADP-011](011-conditional-writes-and-consumer-rpc.md)).
+1. The sequencer has decided it against the key's complete state, reserved its log frames, applied its effects to hot and published them, under the shard lock ([ADP-015](015-write-path-and-durability.md) §Sequenced write path).
+2. Its frames have reached the configured durability class: published under `process_crash`, or covered by a completed fdatasync under `power_loss` ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
 
-For **unconditional writes** (`kWritePath`), the responsible consumer is the hot consumer. Fulfillment carries `RespValue::SimpleString("OK")` or an error.
+The reply is the one the sequencer decided: `+OK`, nil, the prior value for `SET … GET`, an integer for `SETNX` or a count, or an error such as `WRONGTYPE`. Conditional and unconditional writes take the same path. A decision with no effect (`SETNX` on a present key) logs nothing, and its reply waits only until what it observed is durable at the class.
 
-For **conditional writes** (`kConditionalWrite`), the responsible consumer is the Resolver, which fulfils the promise with the resolved `RespValue` (`+OK` / nil / bulk for `SET GET` / integer for `SETNX` / array for `ZADD CH INCR`).
+The queue is the sole write path — there is no dual write. Hot is applied in the same critical section that sequences the write, so there is no consumer to wait for.
 
-These happen in parallel with the queue fsync — see [ADP-011](011-conditional-writes-and-consumer-rpc.md) for the full parallel-execution pattern and latency profile.
+**Timeout:** `engine.write_timeout_ms`, default 5s, bounds a write's admission, loads, memory backpressure and durable wait. A write that runs out of time before its reservation is rejected having applied nothing. One that runs out on its durable wait returns a Redis error, but it is already in the queue and applied to hot, and becomes durable when the flush catches up.
 
-The queue is the sole write path — there is no dual write. Consumer RPC fulfillment is an in-process synchronisation: the write handler registers a promise keyed by the queue sequence ID, then awaits it. The responsible consumer fulfils the promise after applying.
-
-**Timeout:** Configurable, default 5s. If the responsible consumer fails to fulfil within this window, the handler returns a Redis error to the client. The write is still durable in the queue and will eventually be applied.
-
-See [ADP-006](006-read-write-paths.md) for read and write path details, and [ADP-011](011-conditional-writes-and-consumer-rpc.md) for Consumer RPC and conditional resolution.
+See [ADP-006](006-read-write-paths.md) for read and write path details, and [ADP-015](015-write-path-and-durability.md) for the sequencer and decide-then-log.
 
 ### Loading State
 
@@ -449,7 +428,7 @@ The `LOADING` gate is a frontend-level check before dispatch. It lifts automatic
 Implementation-level commentary on the listener that drives the per-connection `RequestPipeline`. The interface contract above is unchanged; this section records the choices a reviewer should expect to see in `include/abyss/net/`.
 
 - **Concurrency.** A pool of reactor threads, sized by the `net.io_threads` config (default `min(hardware_concurrency, 16)`). Each reactor owns a `Poller` (epoll on Linux, kqueue on macOS) and a sticky set of connections — connections do not migrate across reactors after accept. The shared `CommandDispatcher` (the tiering engine) handles the cross-reactor synchronisation. Phase 4 shared-nothing per-core (#59-#63) tightens reactor count to shard count and removes the shared dispatcher.
-- **Head-of-line trade-off.** `RequestPipeline::Dispatch` is synchronous from the reactor's view. A slow dispatch (a `power_loss` flush stall, durability-window backpressure, a cold-store p99 spike) blocks one reactor's other connections for the duration of that call, but not the other reactors. Operators tune `net.io_threads` to bound the blast radius of a single slow dispatch.
+- **Head-of-line trade-off.** The request pipeline's dispatch is synchronous from the reactor's view. A slow dispatch (a `power_loss` flush stall, durability-window or hot-memory backpressure, a key load or cold-store p99 spike) blocks one reactor's other connections for the duration of that call, but not the other reactors. Operators tune `net.io_threads` to bound the blast radius of a single slow dispatch.
 - **Back-pressure.** Per-connection write buffer with three thresholds: `write_backpressure_bytes` (default 4 MiB) pauses reading on the connection; `write_resume_bytes` (default 1 MiB) re-enables it; `write_hard_limit_bytes` (default 16 MiB) closes the connection. TCP's own receive-window flow control then propagates the pressure back to the client. The pause/resume transitions are fd-level — the reactor disarms `kReadable` on the offending connection without affecting siblings.
 - **Shutdown grace.** `RequestStop` is non-blocking: it flips a flag and wakes every reactor. Each reactor disarms its listener registration (acceptor only), then continues to drain in-flight responses for `net.shutdown_grace_seconds` (default 30, aligned with Kubernetes' `terminationGracePeriodSeconds`). On expiry the reactor force-closes remaining connections with `reason=server_shutdown`. `Join` waits for every reactor to exit; the split mirrors the per-shard `RequestStop`/`Join` pattern from #94 — never call a blocking join inside a stop loop.
 - **Idle reaper.** A wall-clock-cheap sweep on every Poll-Wait cycle (default 1 s) closes connections whose `last_activity` is older than `idle_timeout`. Activity refers to either successful recv or successful send, so a client paused on back-pressure but still receiving the server's drain is not idle.
@@ -458,21 +437,24 @@ Implementation-level commentary on the listener that drives the per-connection `
 ### Configuration
 
 ```yaml
-resp:
+net:
   bind: 0.0.0.0
   port: 6379
   max_connections: 1024
   idle_timeout_seconds: 300
-  consumer_rpc_timeout_ms: 5000
+  io_threads: 0            # 0 = min(hardware_concurrency, 16)
+
+engine:
+  write_timeout_ms: 5000   # a write's whole budget, durable wait included
 ```
 
 ## Invariants
 
 1. Every write command is routed through the queue. There is no path that writes directly to a store.
 2. Unknown command names are rejected at the frontend with `ERR unknown command` and never touch the queue.
-3. Known commands whose store does not support them reach the queue and surface errors at apply time.
-4. A write is not acknowledged until the queue append is durable AND the responsible consumer (hot for `kWritePath`, Resolver for `kConditionalWrite`) has fulfilled its Consumer RPC promise.
-5. The promise timeout returns an error to the client but does not discard the write from the queue.
+3. A write the sequencer rejects when deciding it (a type mismatch, an unsupported form) logs nothing; only decided effects reach the queue.
+4. A write is not acknowledged until the sequencer has applied it to hot and its log frames have reached the configured durability class.
+5. A write that times out on its durable wait returns an error to the client, but it is not discarded: it is already in the queue and applied to hot.
 6. RESP2 is the only protocol. `HELLO 3` is rejected with `NOPROTO`. RESP3-specific types are not emitted on the wire.
 7. `RespValue` simple strings and bulk strings are distinct types. Error values are constructed via the prefix-enum helper, never hand-formatted.
 8. Slot computation (`CRC16(key) mod 16384`, honouring `{hashtag}`) is phase-invariant. Only the slot-to-pod mapping changes between phases.
@@ -495,6 +477,6 @@ resp:
 
 **Why single-shard CLUSTER responses in Phase 1?** Redis Cluster clients (Jedis, Lettuce, redis-py cluster mode, ioredis cluster mode) expect a topology on connect. Returning a valid single-shard topology lets cluster-aware clients work against Phase 1 unchanged. The alternative (rejecting CLUSTER commands until Phase 2) would force users to re-configure clients when migrating — a cost we avoid for a few lines now. Phase-invariant slot computation means clients hash keys identically in both phases.
 
-**Why keep unknown-command bias as write for known-but-unsupported commands?** Safety for the narrow case where the registry knows about a command but the configured store does not yet support it. Classifying it as a read would bypass the queue entirely and risk silent data divergence if the store later gains support. Classifying it as a write means it's captured durably in the queue; the store returns an error at apply time.
+**Why keep unknown-command bias as write for known-but-unsupported commands?** Safety for the narrow case where the registry knows about a command but the configured store does not yet support it. Classifying it as a read would bypass the write path entirely and risk silent data divergence if the store later gains support. Classifying it as a write sends it to the sequencer, which rejects a form it cannot decide before anything is logged.
 
-**Why no cross-key atomicity for `MSET`?** Redis itself doesn't guarantee atomicity for multi-key commands across slots in cluster mode. `MSET` is syntactic sugar for multiple `SET` commands. Providing atomicity would require distributed transactions, contradicting Abyss's simplicity principle. Partial failures are explicitly acceptable — the client can retry failed keys. `MSETNX` is the exception: it is conditional and routes through the Resolver, which does evaluate all keys atomically under shard-striped locks.
+**Why cross-key atomicity for `MSET` within a pod, and `CROSSSLOT` across logs?** Standalone Redis executes multi-key commands atomically, and Redis Cluster rejects them across slots. Inside one pod the sequencer already takes shard locks in a fixed order and the log closes a batch by position, so one batch carrying every shard's effects makes `MSET`, `DEL`, `UNLINK`, `MSETNX`, `RENAMENX` and `COPY` atomic at little cost. Across WAL logs it would need a two-phase commit with a recovery protocol of its own, contradicting Abyss's simplicity principle, so those writes are rejected with `CROSSSLOT` instead (#169).

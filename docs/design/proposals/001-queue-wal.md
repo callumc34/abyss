@@ -2,18 +2,17 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-10-02
+**Updated:** 2026-10-09
 
 > **Amended by [ADP-015](015-write-path-and-durability.md).** These sections already describe the amended behaviour:
 > - **§Interface and §Offset persistence:** reads take an explicit consumer-owned position, and acknowledgements are committed offsets persisted lazily in one dual-slot checkpoint.
 > - **§Durability classes and group commit:** writes are acknowledged at a named durability class, `process_crash` by default and `power_loss` opt-in, and flushed by natural batching.
-> - **§Embedded WAL and §Batch atomicity:** recycled, memory-mapped segments in one physical log per volume carrying per-shard streams (Phase 1c, #175).
->
-> Still to land, with the current behaviour described below until it does: the entry taxonomy losing `Conditional` and `Resolved` (Phase 2).
+> - **§Embedded WAL and §Batch atomicity:** recycled, memory-mapped segments in one physical log per volume carrying per-shard streams (#175).
+> - **§Entry Types and §Interface:** the log carries only decided effects, `Write` and `Flush`, appended by the per-shard sequencer (#160). The `Conditional` and `Resolved` types are retired.
 
 ## Context
 
-The queue is the single source of truth in Abyss. Every write is committed to the queue before it is applied to any store. All consumers (hot, cold, resolver) read from the queue independently and rebuild their state from it on recovery. The queue's durability and ordering guarantees are the foundation of Abyss's correctness.
+The queue is the single source of truth in Abyss. Every write is committed to the queue before it is applied to any store. The cold consumer reads from the queue independently, and hot and cold both rebuild their state from it on recovery. The queue's durability and ordering guarantees are the foundation of Abyss's correctness.
 
 The queue interface must be shard-aware from the start to support horizontal scaling in Phase 2, even though Phase 1 runs on a single pod.
 
@@ -21,37 +20,36 @@ The queue interface must be shard-aware from the start to support horizontal sca
 
 ### Entry Types
 
-Each log entry carries a type tag that determines how consumers process it. Phase 1 defines four variants; the set is closed and extended only by ADP:
+Each log entry carries a type tag that determines how consumers process it. There are two variants; the set is closed and extended only by ADP:
 
 | Type | Semantics | Written by | Read by |
 |------|-----------|------------|---------|
-| `Write` | Unconditional op (SET, DEL, SADD, ...) | Frontend | Hot, Cold |
-| `Conditional` | Op + predicate (SET NX, ZADD GT, ...) | Frontend | Resolver |
-| `Resolved` | ref to a Conditional + decision + materialised op + return value | Resolver | Hot, Cold |
-| `Flush` | FLUSHDB / FLUSHALL tombstone — wipes every key on the shard | Frontend | Hot, Cold, Resolver |
+| `Write` | One decided effect in canonical form (SET, DEL, SADD, PEXPIREAT, ...) | The sequencer | Cold; the hot replayer at recovery |
+| `Flush` | FLUSHDB / FLUSHALL tombstone — wipes every key on the shard | The sequencer | Cold; the hot replayer at recovery |
 
-The `Conditional` / `Resolved` pair and the block-and-scan protocol are specified in [ADP-011](011-conditional-writes-and-consumer-rpc.md). The `Flush` variant is specified in [ADP-006](006-read-write-paths.md) §Broadcast write path; it is the queue-routed expression of FLUSHDB so all materialised views observe the wipe at the same logical position. The queue itself is agnostic to the semantics — it stores entries in order, preserves the type tag, and hands them to consumers unchanged.
+The log records decided effects, not intents ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). The sequencer decides a conditional command against the key's complete state and logs the `Write`s it decided on, or nothing. Replay applies them and decides nothing again. The `Conditional` and `Resolved` types, which carried an intent and its later decision ([ADP-011](011-conditional-writes-and-consumer-rpc.md)), are retired, and their type bytes stay reserved ([ADP-009](009-wal-format.md)). A `Write` whose effect alone determines its key's state carries the `kReplacesState` flag (ADP-009). The `Flush` variant is specified in [ADP-006](006-read-write-paths.md) §Broadcast write path; it is the queue-routed expression of FLUSHDB so all materialised views observe the wipe at the same logical position. The queue itself is agnostic to the semantics — it stores entries in order, preserves the type tag, and hands them to consumers unchanged.
 
 ### Interface
 
-The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wall-clock timestamp) and a payload variant that discriminates the three entry types. Common fields are direct field accesses — no visitor needed just to read a sequence number. Type dispatch uses the variant only when consumers need to act on the payload.
+The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wall-clock timestamp) and a payload variant that discriminates the entry types. Common fields are direct field accesses — no visitor needed just to read a sequence number. Type dispatch uses the variant only when consumers need to act on the payload.
 
-The queue interface offers two append flavours:
+The queue interface offers two append paths:
 
-- **Two-phase** — `BeginAppend` / `BeginAppendBatch` allocate a sequence id and write the encoded entry to the segment, but leave it invisible to consumers until the caller runs `Publish()` on the returned RAII handle. The handle's durability future resolves when the entry reaches the configured durability class (§Durability classes and group commit). The handle holds the per-shard append mutex for the duration of the window, bounding the critical section to the caller's per-seq setup (e.g. registering a Consumer RPC promise). The destructor auto-publishes if the caller drops the handle without calling `Publish()`, so a forgotten publish degrades to a latency bug, never a lost write.
-- **One-shot** — `Append` / `AppendBatch` are `BeginAppend` + `Publish()` inline. Safe only for fire-and-forget callers that do not register per-seq state before publication. Used by cold-hit promotion and by the Resolver when emitting `Resolved` entries.
-
-Callers that await consumer apply (the tiering engine's write path) MUST use the two-phase primitive. Publishing before the producer has registered its RPC promise would race with the consumer's Fulfill — the producer could miss the response. Two-phase closes this structurally by letting the producer register under the same lock that gates visibility.
+- **The sequencer's append** ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). Every write the server takes goes through it, in three steps:
+  - `Admit` waits for room in the shard's durability window, and `WaitForSpare` for a prepared segment, under no lock.
+  - `Reserve` runs under the hot shard locks and never waits. It assigns each involved shard's seqs and reserves every part as one batch in one log, committing its frames in place until their total reaches 16 KiB. On failure nothing is taken and no seq is used: the window is full, no spare is ready, an entry is too large, or the shards span logs (`CROSSSLOT`). `ReserveFlush` reserves one `Flush` per shard, one batch per log.
+  - `Complete` runs once the locks are released. It fills the reservation's remaining frames, publishes each shard once its earlier seqs are published, and returns the durability futures, which resolve when the entries reach the configured durability class (§Durability classes and group commit).
+- **Two-phase and one-shot** — `BeginAppend` / `BeginAppendBatch` return a handle that publishes the entry when the caller publishes it, or on destruction if the caller drops it, so a forgotten publish degrades to a latency bug, never a lost write. `Append` / `AppendBatch` publish inline. The server's write path no longer uses them.
 
 **Read position and committed offset are separate**, as a Kafka fetch position and committed offset are.
 - **Read.** A consumer owns its read position and passes it to `Read`, together with the durability class the returned entries must have reached. `Read` returns the contiguous entries at or after that sequence that are durable at that class. A position below the oldest retained entry is an explicit out-of-range error, never silently moved forward.
 - **Commit.** `CommitOffset` records how far a retention consumer has processed. It takes effect in memory at once, never passes the power-durable end of the log, and is persisted lazily (see "Offset persistence" below).
 - **Durable ends.** `DurableEnd(shard, class)` is exclusive: every sequence below it is durable at that class, and 0 means none is. It is monotonic per shard and class. `AwaitDurable` waits for one sequence to reach a class, and `AckDurability` reports the class the queue acknowledges at.
 - **Retention.** Committed offsets govern retention and where a consumer resumes after a restart. They never govern where a running consumer reads.
-- **Hot.** The hot consumer keeps its position in memory and commits nothing. After a restart it rebuilds from the oldest retained entry.
+- **Hot.** Hot is not a consumer: the sequencer applies each write to it, and it commits nothing. After a restart the hot replayer rebuilds it from the oldest retained entry, through recovery's scan ([ADP-007](007-recovery.md) §Hot replay).
 - **Accessors.** `FirstSeq` reports the lowest readable sequence on a shard. `CommittedOffset` reports a consumer's committed offset, or none if it has never committed.
 
-The frontend creates Write and Conditional entries. The Resolver creates Resolved entries. Hot and cold consumers are read-only against the queue.
+The sequencer creates every entry. The cold consumer and recovery's scan are read-only against the queue.
 
 See `include/abyss/core/queue.h`, `include/abyss/core/queue_entry.h`, and `include/abyss/queue/pending_append.h` for the current interface.
 
@@ -107,7 +105,7 @@ A persist overwrites the slot that does not hold the highest epoch, with the nex
 - A shard-count or consumer mismatch refuses to start.
 - An older per-consumer, per-shard offset layout refuses to start and names the layout, rather than silently starting from nothing.
 
-**Crash semantics.** After a crash, a consumer resumes from its last persisted offset. Entries after it are delivered again, at most one persist interval's worth; cold absorption and resolver replay are idempotent. A consumer with no committed offset starts at the first retained entry.
+**Crash semantics.** After a crash, a consumer resumes from its last persisted offset. Entries after it are delivered again, at most one persist interval's worth; cold absorption is idempotent. A consumer with no committed offset starts at the first retained entry.
 
 **Recovered tail.** On open, each log seals and syncs the tail it recovered, so entries a crashed process left only in the page cache become power-durable before any consumer reads or commits past them. Both durable ends then start at the recovered head.
 
@@ -121,16 +119,18 @@ A committed offset never passes the power-durable end, so a persisted offset at 
 
 ### Batch atomicity
 
-`AppendBatch` is atomic across crashes: every entry in a batch is either present in the WAL after recovery, or none is.
+A batch (an `AppendBatch`, or one `Reserve` of several shards' entries in one log) is atomic across crashes: every entry in it is either present in the WAL after recovery, or none is.
 - A batch is reserved as one contiguous range of its log, and each frame records the bytes to its batch's end.
 - Recovery drops a trailing batch whose end lies past the recovered end of the log.
 - A shard's `power_loss` durable end advances only at batch ends.
+
+A batch never spans logs. With `queue.log_count` above 1, a multi-key write whose keys span logs is rejected with `CROSSSLOT`, and FLUSHDB writes one batch per log, so a crash can leave some logs flushed and not others (#169).
 
 See [ADP-009](009-wal-format.md) §Recovery.
 
 ### Recovery signal
 
-`WalQueue::IsRecovering()` returns `true` while the queue is being opened (log scan, torn-tail sealing, offset load) and `false` once those steps finish. Open is synchronous today so the flag is only ever observed `false` by external callers — but the shape of the API lets the server gate RESP LOADING on a single uniform check regardless of whether the queue or a consumer is still catching up ([ADP-005](005-resp-frontend.md), [ADP-007](007-recovery.md)).
+The queue reports that it is recovering while it is being opened (log scan, torn-tail sealing, offset load), and stops once those steps finish. Open is synchronous today, so external callers only ever see it not recovering — but the signal lets the server gate RESP LOADING on a single uniform check regardless of whether the queue or a consumer is still catching up ([ADP-005](005-resp-frontend.md), [ADP-007](007-recovery.md)).
 
 ### Durability classes and group commit
 
@@ -141,7 +141,7 @@ A write's durability future resolves when its entry reaches the class set by `qu
 | `process_crash` (default) | The entry is published: filled into its log's mapped segment, below the log's filled prefix, so it is in the page cache | Process crash, OOM kill, container restart. A power loss loses at most the durability window. |
 | `power_loss` | The fdatasync (`F_FULLFSYNC` on macOS) covering it has completed | Power loss |
 
-The write path still waits for the hot consumer to apply the entry before replying (ADP-006).
+The sequencer applies the entry's effect to hot before the entry is published, and the write replies once its future resolves (ADP-006).
 
 **Natural batching.**
 - Each log has a commit thread. A flush starts as soon as the previous one ends, and covers every entry published while it ran. There is no timer and no batch cap.
@@ -150,14 +150,14 @@ The write path still waits for the hot consumer to apply the entry before replyi
 - A rotation needs no sync on the append path: prepared segments had their headers synced before use.
 
 **Who reads at which class.**
-- Every materialised view reads at the acknowledgement class: hot, the resolver, and the cold consumer's in-memory compaction buffer.
+- The cold consumer's in-memory compaction buffer reads at the acknowledgement class. Hot reads nothing from the log at steady state; the read fence keeps a reply from showing a write before the write reaches the class (ADP-015 §Read visibility).
 - Persisted derived state is gated at `power_loss`: cold-store writes and wipes ([ADP-004](004-cold-consumer.md)) and committed offsets.
 - Under `power_loss`, no reply can therefore reflect an entry a power loss could drop.
 - Under `process_crash`, persisted state still never runs ahead of the power-durable log.
 
 **Bounded window.**
 - Acknowledged-but-not-power-durable data is bounded by `queue.durability_window_bytes` (volume-wide unflushed bytes) and `queue.durability_window_ms` (the age of a log's oldest unflushed entry).
-- Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.write_timeout`, it is rejected with an error saying the device is not keeping up.
+- Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.write_timeout_ms`, it is rejected with an error saying the device is not keeping up.
 - An empty window always admits, so a single value larger than the window cannot deadlock.
 - `abyss_wal_unflushed_bytes`, `abyss_wal_durability_lag_seconds` and the backpressure counters report it.
 
@@ -202,8 +202,8 @@ queue:
 3. The queue retains every entry above the minimum persisted committed offset across retention consumers.
 4. Each consumer owns its read position. No consumer's progress, and no committed offset, affects where another consumer reads.
 5. Sequence IDs are contiguous and increasing per shard, including across reclamation of all of a shard's retained entries.
-6. Entry type tags are immutable once appended. A `Conditional` never transforms into a `Write`; the Resolver produces a separate `Resolved` entry.
-7. For every `Conditional` entry at seq X, exactly one `Resolved` entry with `ref = X` follows it in the log. The queue itself does not enforce this — it is an invariant of the Resolver ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) that the queue must preserve bit-for-bit.
+6. Entry type tags are immutable once appended. Every entry is a decided effect, logged once by the sequencer; replay applies it and never decides again.
+7. A frame with a retired or unknown entry type is corruption, never skipped ([ADP-009](009-wal-format.md)).
 8. A read below the first retained entry is an explicit out-of-range error. For a retention consumer it signals reclaimed, uncommitted data and is fatal.
 
 ## Trade-offs

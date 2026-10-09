@@ -1,6 +1,7 @@
 #include "abyss/hot/sharded_hot_store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <optional>
 #include <ranges>
@@ -155,16 +156,7 @@ core::HotKeyPresence ShardedHotStore::Probe(std::string_view key) ABYSS_NO_THREA
   return shard.store.Probe(key);
 }
 
-void ShardedHotStore::SetReplayMode(bool replaying) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  for (auto& shard : shards_) {
-    std::unique_lock lock(shard->mutex);
-    shard->store.SetReplayMode(replaying);
-  }
-}
-
-// Engine fan-out always issues Del{single key}. The vector iteration is
-// preserved so resolver-materialised single-key Dels and any future single-key
-// Del callers share the same path; multi-key Del WAL entries no longer occur.
+// One Del per key, on its own shard: a multi-key Del is never logged.
 core::Result<core::RespValue> ShardedHotStore::ApplyDel(const core::ops::Del& op,
                                                         core::SequenceId seq) {
   int64_t total_removed = 0;
@@ -223,23 +215,38 @@ core::Result<void> ShardedHotStore::Wipe(core::ShardId shard,
   return {};
 }
 
-std::optional<core::RespValue> ShardedHotStore::ApplyLogged(
-    core::ShardId shard, core::QueueEntry& entry) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+std::optional<core::RespValue> ShardedHotStore::ApplyLogged(core::ShardId shard,
+                                                            core::QueueEntry& entry) {
+  std::optional<core::RespValue> reply;
+  ReplayFrame(shard, entry, reply);
+  return reply;
+}
+
+ShardedHotStore::Replayed ShardedHotStore::Replay(core::ShardId shard, core::QueueEntry& entry) {
+  std::optional<core::RespValue> reply;
+  return ReplayFrame(shard, entry, reply);
+}
+
+ShardedHotStore::Replayed ShardedHotStore::ReplayFrame(core::ShardId shard, core::QueueEntry& entry,
+                                                       std::optional<core::RespValue>& reply)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   auto* write = std::get_if<core::entry::Write>(&entry.payload);
   // A Write applies on its key's shard, the stream's in any real log.
   if (write != nullptr && write->cmd.args.size() > 1) shard = ShardIndex(write->cmd.args[1]);
   // Read before the lock: never a cold call under a shard lock.
   const auto horizon = Horizon(shard);
+  const core::SteadyTime linked_at(std::chrono::duration_cast<core::SteadyClock::duration>(
+      entry.appended_at.time_since_epoch()));
   Shard& target = *shards_.at(shard);
   std::unique_lock lock(target.mutex);
   const size_t loads = target.store.PendingLoads();
   target.store.RaiseAppendedAt(entry.appended_at);
-  std::optional<core::RespValue> reply = core::RespValue::SimpleString("OK");
+  reply.reset();
   if (write != nullptr && !entry.replaces_state &&
       (write->cmd.args.size() < 2 || !target.store.HasEntry(write->cmd.args[1]))) {
-    // Its key's earlier history was skipped or reclaimed: buffer and
-    // cold hold the key whole.
-    reply.reset();
+    // Its key's earlier history was evicted or reclaimed: buffer and
+    // cold hold the key whole, and a stub no longer describes it.
+    if (write->cmd.args.size() > 1) target.store.DropStub(write->cmd.args[1]);
   } else if (write != nullptr) {
     core::Effect effect{
         .key = write->cmd.args.size() > 1 ? write->cmd.args[1] : std::string{},
@@ -247,17 +254,44 @@ std::optional<core::RespValue> ShardedHotStore::ApplyLogged(
         .replaces_state = entry.replaces_state,
     };
     auto replies = target.store.ApplyEffects(std::span(&effect, 1), entry.seq, entry.appended_at,
-                                             Policy(), horizon);
+                                             Policy(), horizon, linked_at);
     reply = std::move(replies.front());
   } else if (std::holds_alternative<core::entry::Flush>(entry.payload)) {
     target.store.Wipe(entry.seq);
+    reply = core::RespValue::SimpleString("OK");
   } else {
     core::Fatal("only Write and Flush entries apply to hot as logged");
   }
+  const Replayed replayed{
+      .shard = shard,
+      .applied = reply.has_value(),
+      .over_backpressure = target.store.OverBackpressure(),
+      .memory = {.used_bytes = target.store.UsedBytes(),
+                 .limit_bytes = target.store.BackpressureLimit()},
+  };
   const bool load_ended = target.store.PendingLoads() != loads;
   lock.unlock();
   if (load_ended) target.load_cv.notify_all();
-  return reply;
+  return replayed;
+}
+
+ShardedHotStore::ShardMemory ShardedHotStore::Memory(core::ShardId shard) const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const Shard& target = *shards_.at(shard);
+  const std::shared_lock lock(target.mutex);
+  return {.used_bytes = target.store.UsedBytes(), .limit_bytes = target.store.BackpressureLimit()};
+}
+
+void ShardedHotStore::ShiftReplayedLinks(core::SteadyTime steady_now,
+                                         core::WallTime wall_now) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  // Replay linked at wall ticks; one shift maps them all to steady.
+  const auto shift =
+      steady_now.time_since_epoch() -
+      std::chrono::duration_cast<core::SteadyClock::duration>(wall_now.time_since_epoch());
+  for (auto& shard : shards_) {
+    const std::unique_lock lock(shard->mutex);
+    shard->store.ShiftLinks(shift, steady_now);
+  }
 }
 
 void ShardedHotStore::RaiseAppendedAt(core::ShardId shard,
@@ -521,11 +555,17 @@ size_t ShardedHotStore::EvictToMemoryTarget() {
 size_t ShardedHotStore::GcTombstones() {
   size_t reclaimed = 0;
   for (core::ShardId index = 0; index < config_.shard_count; ++index) {
-    RunHolds(index, metrics::MaintenancePass::kTombstones,
-             [&reclaimed](SingleShardStore& store, core::SequenceId horizon, HoldBudget& budget) {
-               return store.GcTombstones(horizon, budget, reclaimed);
-             });
+    reclaimed += GcTombstones(index);
   }
+  return reclaimed;
+}
+
+size_t ShardedHotStore::GcTombstones(core::ShardId shard) {
+  size_t reclaimed = 0;
+  RunHolds(shard, metrics::MaintenancePass::kTombstones,
+           [&reclaimed](SingleShardStore& store, core::SequenceId horizon, HoldBudget& budget) {
+             return store.GcTombstones(horizon, budget, reclaimed);
+           });
   return reclaimed;
 }
 

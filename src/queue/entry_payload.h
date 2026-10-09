@@ -13,10 +13,10 @@
 namespace abyss::queue::entry_payload {
 
 // The frame header's type byte (ADP-009).
+// 0x01 and 0x02 are reserved, retired conditional and resolved types;
+// those and any other type byte are corruption.
 enum class EntryType : uint8_t {
   kWrite = 0x00,
-  kConditional = 0x01,
-  kResolved = 0x02,
   kFlush = 0x03,
 };
 

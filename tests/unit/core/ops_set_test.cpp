@@ -7,9 +7,10 @@
 namespace abyss::core::ops {
 namespace {
 
-// ENGINE-7: ParseSet is the unconditional SET path; the resolver's ParseSetArgs
-// is the conditional one. Both must accept exactly the same option tokens, or a
-// SET the frontend admits becomes unparseable once queued.
+// ENGINE-7: the frontend reads SET's NX, XX, GET and KEEPTTL into
+// predicate flags, then decide parses the SET with ParseSet. Both must
+// accept exactly the same option tokens, or a SET the frontend admits
+// fails in decide.
 
 TEST(ParseSetOptionsTest, UnconditionalSetRejectsUnknownOption) {
   RespCommand cmd{{"SET", "k", "v", "BOGUS"}};
@@ -47,9 +48,10 @@ TEST(ParseSetOptionsTest, TtlOptionIsCaseInsensitiveAndNeedsAValue) {
   EXPECT_FALSE(ParseWriteOp("SET", non_numeric).has_value());
 }
 
-// NX/XX/GET/KEEPTTL are routed to the resolver, which materialises a plain SET.
-// They stay legal here so the two parse paths agree on the accepted token set.
-TEST(ParseSetOptionsTest, ResolverRoutedOptionsRemainAccepted) {
+// NX/XX/GET/KEEPTTL are decided by the sequencer, which logs a plain
+// SET. They stay legal here so the pipeline's parse accepts every token
+// decide does.
+TEST(ParseSetOptionsTest, DecidedOptionsRemainAccepted) {
   for (const std::string& opt :
        {std::string("NX"), std::string("XX"), std::string("GET"), std::string("KEEPTTL")}) {
     RespCommand cmd{{"SET", "k", "v", opt}};

@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "abyss/cold/ttl_scanner.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/result.h"
 #include "abyss/log/log.h"
@@ -82,11 +81,6 @@ struct QueueConfig {
   std::chrono::milliseconds durability_window{1000};
 };
 
-struct HotConsumerConfig {
-  size_t read_batch_size = 256;
-  std::chrono::milliseconds read_timeout{100};
-};
-
 struct ColdConsumerConfig {
   std::chrono::seconds quiet_threshold{30};
   std::chrono::seconds safety_margin{300};
@@ -117,22 +111,10 @@ struct ColdConsumerConfig {
 };
 
 struct RecoveryConfig {
-  // Concurrent shard-replay tasks scheduled at startup. Capped operationally
-  // to keep thread count below shard count on small pods. Per-shard threads
-  // resume normal independent operation after recovery completes.
+  // Workers the recovery Scan reads and replays shards on, at most one
+  // per shard. Capped operationally to keep thread count below shard
+  // count on small pods.
   uint32_t replay_parallelism = 4;
-
-  // Bigger batches than steady-state amortise queue Read syscalls during a
-  // long catch-up backlog. Steady-state batch sizes (hot_consumer.read_batch_size,
-  // cold_consumer.queue_read_max_count) are tuned for low-latency tailing,
-  // not bulk drain.
-  size_t hot_replay_batch_size = 10000;
-  size_t cold_replay_batch_size = 50000;
-
-  // Internal default — not exposed in YAML. The resolver scan is CPU-bound
-  // cache updates on the common path; tuning won't materially move recovery
-  // latency.
-  size_t resolver_replay_batch_size = 5000;
 };
 
 struct NetConfig {
@@ -151,8 +133,6 @@ struct NetConfig {
   std::chrono::seconds shutdown_grace{30};
   std::chrono::milliseconds reaper_tick{1000};
 };
-
-using ConsumerRpcConfig = core::ConsumerRpcConfig;
 
 struct EngineConfig {
   // A write's whole budget: admission, loads, backpressure and its
@@ -197,9 +177,7 @@ struct Config {
   HotConfig hot;
   ColdConfig cold;
   QueueConfig queue;
-  HotConsumerConfig hot_consumer;
   ColdConsumerConfig cold_consumer;
-  ConsumerRpcConfig consumer_rpc;
   EngineConfig engine;
   RecoveryConfig recovery;
   NetConfig net;

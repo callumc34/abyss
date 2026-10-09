@@ -69,6 +69,9 @@ class Loader {
     kResident,
     // The flush floor makes the key absent.
     kFlushed,
+    // Another's load holds the key's placeholder: a miss, which buffer
+    // and cold answer (LoadAs) with no wait. Nothing is filled.
+    kPending,
     // Not installed, and `result` holds what was read: a write overtook
     // the load, the shard is over its backpressure limit, the key is too
     // large to fill, or one hold's eviction left no room for it
@@ -85,8 +88,8 @@ class Loader {
     Source source = Source::kBuffer;
   };
   // The read path's cache fill: begin, load as `type` and fill, each in
-  // its own hold. A load already in flight is awaited, not repeated, so
-  // concurrent fills share one cold read.
+  // its own hold. A read's load already in flight is joined, not
+  // repeated; another's placeholder is never awaited.
   core::Result<Filled> Install(std::string_view key, core::KeyType type, core::SteadyTime deadline);
 
   struct Members {
@@ -122,7 +125,7 @@ class Loader {
                                                      std::string_view field,
                                                      core::SteadyTime deadline) const;
 
-  // Calls that waited on another's load, in flight or as a placeholder.
+  // Calls that joined another's load in flight.
   uint64_t JoinsForTesting() const { return joins_.load(); }
 
  private:

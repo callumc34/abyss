@@ -8,6 +8,8 @@
 
 #include "abyss/config/config.h"
 #include "abyss/core/durability.h"
+#include "abyss/log/log.h"
+#include "abyss/log/testing.h"
 
 namespace abyss::config {
 namespace {
@@ -108,16 +110,47 @@ TEST(ConfigValidate, RejectsJitterRatioAboveOne) {
   EXPECT_NE(cfg.error().message().find("jitter_fraction"), std::string::npos);
 }
 
-TEST(ConfigValidate, RejectsZeroHotConsumerBatchSize) {
-  auto cfg = Config::ParseFromYaml("hot_consumer:\n  read_batch_size: 0\n");
-  ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("hot_consumer.read_batch_size"), std::string::npos);
+// The hot consumer and the consumer RPC registry are gone; a config
+// that still names them fails, saying what replaced them.
+TEST(ConfigValidate, RemovedSectionsNameWhatReplacedThem) {
+  const std::array<std::pair<const char*, const char*>, 2> removed = {{
+      {"hot_consumer:\n  read_batch_size: 128\n", "the sequencer applies each write to hot"},
+      {"consumer_rpc:\n  default_timeout_ms: 100\n", "no consumer apply to wait for"},
+  }};
+  for (const auto& [yaml, reason] : removed) {
+    auto cfg = Config::ParseFromYaml(yaml);
+    ASSERT_FALSE(cfg.has_value()) << yaml;
+    const std::string section(yaml, std::string_view(yaml).find(':'));
+    EXPECT_NE(cfg.error().message().find(section), std::string::npos) << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find(reason), std::string::npos) << cfg.error().message();
+  }
 }
 
-TEST(ConfigValidate, RejectsNonPositiveHotConsumerReadTimeout) {
-  auto cfg = Config::ParseFromYaml("hot_consumer:\n  read_timeout_ms: 0\n");
-  ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("hot_consumer.read_timeout_ms"), std::string::npos);
+TEST(ConfigValidate, RemovedRecoveryBatchSizesNameTheScan) {
+  for (const char* key : {"hot_replay_batch_size", "cold_replay_batch_size"}) {
+    auto cfg = Config::ParseFromYaml(std::string("recovery:\n  ") + key + ": 100\n");
+    ASSERT_FALSE(cfg.has_value()) << key;
+    EXPECT_NE(cfg.error().message().find(std::string("recovery.") + key), std::string::npos)
+        << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find("the Scan's batches"), std::string::npos)
+        << cfg.error().message();
+  }
+}
+
+// More than one log is valid but narrows what one atomic batch spans,
+// so the validator says so (#169).
+TEST(ConfigValidate, SeveralLogsWarnOfCrossSlotAndFlushdb) {
+  const log::testing::CapturingSink sink;
+  auto one = Config::ParseFromYaml("queue:\n  log_count: 1\n");
+  ASSERT_TRUE(one.has_value()) << one.error().message();
+  EXPECT_EQ(sink.Size(), 0U);
+  auto two = Config::ParseFromYaml("queue:\n  log_count: 2\n");
+  ASSERT_TRUE(two.has_value()) << two.error().message();
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 1U);
+  EXPECT_EQ(records[0].level, log::Level::kWarn);
+  EXPECT_NE(records[0].msg.find("CROSSSLOT"), std::string::npos) << records[0].msg;
+  EXPECT_NE(records[0].msg.find("FLUSHDB across logs"), std::string::npos) << records[0].msg;
 }
 
 TEST(ConfigValidate, RejectsColdConsumerLowWaterAboveHigh) {

@@ -1,13 +1,13 @@
 #include "abyss/consumer/compaction_buffer.h"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <utility>
 
 #include "abyss/core/fatal.h"
-#include "abyss/core/resp_format.h"
 #include "abyss/core/thread_annotations.h"
 
 namespace abyss::consumer {
@@ -24,21 +24,18 @@ size_t EntryBytes(const BufferEntry& entry) {
 }  // namespace
 
 CompactionBuffer::CompactionBuffer(FlushStrategy strategy, core::SteadyClockFn clock,
-                                   std::optional<uint64_t> rng_seed, core::WallClockFn wall_clock)
+                                   std::optional<uint64_t> rng_seed)
     : strategy_(strategy),
       clock_(std::move(clock)),
-      wall_clock_(std::move(wall_clock)),
       rng_(rng_seed.value_or(std::random_device{}())) {}
 
-CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock, core::WallClockFn wall_clock)
-    : CompactionBuffer(FlushStrategy{}, std::move(clock), std::nullopt, std::move(wall_clock)) {}
+CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock)
+    : CompactionBuffer(FlushStrategy{}, std::move(clock), std::nullopt) {}
 
 void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op,
-                              core::EvictionTTL eviction, core::SequenceId position,
-                              core::SequenceId carrier,
+                              core::EvictionTTL eviction, core::SequenceId seq,
                               uint64_t appended_at_ms) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  ABYSS_DCHECK(std::min(position, carrier) >= core::kFirstSeq,
-               "absorbed an effect at seq 0, which names no entry");
+  ABYSS_DCHECK(seq >= core::kFirstSeq, "absorbed an effect at seq 0, which names no entry");
   const std::unique_lock lock(mutex_);
   // A selected batch is applied by reference; changing it would let
   // EraseFlushed drop state that never reached cold.
@@ -55,18 +52,26 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
                "a shard's appended_at went backwards: " + std::to_string(appended_at_ms) + " < " +
                    std::to_string(max_absorbed_ms_));
   max_absorbed_ms_ = std::max(max_absorbed_ms_, appended_at_ms);
+  // The pending order is absorb order, so it orders seqs only if they
+  // arrive in order.
+  ABYSS_DCHECK(seq >= max_absorbed_seq_,
+               "a shard's seqs were absorbed out of order: " + std::to_string(seq) + " < " +
+                   std::to_string(max_absorbed_seq_));
+  max_absorbed_seq_ = std::max(max_absorbed_seq_, seq);
   if (is_new) {
     entry.key = key;
-    entry.first_seen = clock_();
+    // Never before an earlier entry's, so the pending order orders it.
+    last_first_seen_ = std::max(last_first_seen_, clock_());
+    entry.first_seen = last_first_seen_;
     entry.jitter_offset = ComputeJitter();
-    entry.first_seen_seq = position;
+    entry.first_seen_seq = seq;
     entry.first_appended_at_ms = max_absorbed_ms_;
-    pending_seqs_.insert(position);
-    pending_times_.insert(max_absorbed_ms_);
+    entry.pending_ticket_ = pending_base_ + pending_.size();
+    pending_.push_back(&entry);
   }
   PublishLogClock();
 
-  entry.last_seq = std::max(entry.last_seq, carrier);
+  entry.last_seq = std::max(entry.last_seq, seq);
   entry.eviction = eviction;
   entry.state.Absorb(op);
   entry.last_modified = clock_();
@@ -95,98 +100,44 @@ void CompactionBuffer::PushHeapEntry(BufferEntry& entry, core::SteadyTime schedu
 }
 
 void CompactionBuffer::ErasePending(const BufferEntry& entry) {
-  const auto seq = pending_seqs_.find(entry.first_seen_seq);
-  const auto time = pending_times_.find(entry.first_appended_at_ms);
-  ABYSS_DCHECK(seq != pending_seqs_.end() && time != pending_times_.end(),
-               "a buffered entry is missing from the pending order");
-  pending_seqs_.erase(seq);
-  pending_times_.erase(time);
+  const uint64_t slot = entry.pending_ticket_ - pending_base_;
+  const bool listed = slot < pending_.size() && pending_[slot] == &entry;
+  ABYSS_DCHECK(listed, "a buffered entry is missing from the pending order");
+  pending_[slot] = nullptr;
+  ++pending_dead_;
+}
+
+void CompactionBuffer::TrimPending() {
+  while (!pending_.empty() && pending_.front() == nullptr) {
+    pending_.pop_front();
+    ++pending_base_;
+    --pending_dead_;
+  }
+  // Flushes run out of absorb order, so a long-lived front entry can
+  // hold many dead slots behind it.
+  if (pending_dead_ <= pending_.size() - pending_dead_) return;
+  std::deque<BufferEntry*> live;
+  for (BufferEntry* entry : pending_) {
+    if (entry == nullptr) continue;
+    entry->pending_ticket_ = pending_base_ + live.size();
+    live.push_back(entry);
+  }
+  pending_.swap(live);
+  pending_dead_ = 0;
+}
+
+const BufferEntry* CompactionBuffer::OldestPending() const {
+  const bool trimmed = pending_.empty() || pending_.front() != nullptr;
+  ABYSS_DCHECK(trimmed, "the pending order's front was flushed but not trimmed");
+  return pending_.empty() ? nullptr : pending_.front();
 }
 
 void CompactionBuffer::PublishLogClock() {
-  const uint64_t clock = pending_times_.empty() ? max_absorbed_ms_ : *pending_times_.begin();
+  const BufferEntry* oldest = OldestPending();
+  const uint64_t clock = oldest == nullptr ? max_absorbed_ms_ : oldest->first_appended_at_ms;
   ABYSS_DCHECK(clock >= log_clock_ms_.load(std::memory_order_relaxed),
                "compaction buffer log clock moved backwards");
   log_clock_ms_.store(clock, std::memory_order_release);
-}
-
-namespace {
-
-constexpr std::string_view kBufferMissMsg = "buffer has no state for key";
-
-}  // namespace
-
-core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op) const
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  const std::shared_lock lock(mutex_);
-
-  // Lazy abs-TTL expiry mirrors the hot-store read path: an entry whose
-  // absolute TTL has elapsed must surface as a miss/null even before the
-  // cold consumer flushes a tombstone.
-  const uint64_t now_ms = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(wall_clock_().time_since_epoch())
-          .count());
-  auto is_expired = [&](const CompactedState& state) {
-    const uint64_t ttl = state.AbsTtlMs();
-    return ttl > 0 && ttl <= now_ms;
-  };
-
-  return std::visit(
-      [&](const auto& read) -> core::Result<core::RespValue> {
-        using T = std::decay_t<decltype(read)>;
-
-        if constexpr (std::is_same_v<T, core::ops::Exists>) {
-          int64_t count = 0;
-          for (auto key : read.keys) {
-            auto it = entries_.find(key);
-            if (it == entries_.end()) continue;
-            if (it->second.state.IsTombstone()) continue;
-            if (is_expired(it->second.state)) continue;
-            ++count;
-          }
-          return core::RespValue::Integer(count);
-        }
-
-        auto key = core::ops::PrimaryKey(core::ops::ReadOp{read});
-        auto it = entries_.find(key);
-        if (it == entries_.end()) {
-          return std::unexpected(
-              core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
-        }
-        const auto& state = it->second.state;
-
-        if (state.IsTombstone() || is_expired(state)) return core::RespValue::Null();
-
-        if constexpr (std::is_same_v<T, core::ops::StringGet>) {
-          if (state.Type() != CompactedState::DataType::kString) {
-            // Defer to cold for the canonical WRONGTYPE against live state.
-            return std::unexpected(
-                core::Error(core::ErrorCode::kNotFound, "buffer key is not a string"));
-          }
-          return core::RespValue::BulkString(state.StringValue());
-        } else if constexpr (std::is_same_v<T, core::ops::HashGet>) {
-          auto value = state.HashFieldValue(read.field);
-          if (!value.has_value()) return core::RespValue::Null();
-          return core::RespValue::BulkString(*value);
-        } else if constexpr (std::is_same_v<T, core::ops::ZsetScore>) {
-          if (state.Type() != CompactedState::DataType::kZset) {
-            return std::unexpected(
-                core::Error(core::ErrorCode::kWrongType,
-                            "Operation against a key holding the wrong kind of value"));
-          }
-          auto score = state.ZsetMemberScore(read.member);
-          if (!score.has_value()) return core::RespValue::Null();
-          return core::RespValue::BulkString(core::FormatRespDouble(*score));
-        } else {
-          return std::unexpected(
-              core::Error(core::ErrorCode::kInternal, "unsupported buffer read op"));
-        }
-      },
-      op);
-}
-
-core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) const {
-  return Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
 }
 
 std::optional<CompactedState> CompactionBuffer::Snapshot(std::string_view key) const
@@ -269,6 +220,7 @@ void CompactionBuffer::EraseFlushed(const FlushBatch& batch) ABYSS_NO_THREAD_SAF
     entries_.erase(it);
     --in_flight_;
   }
+  TrimPending();
   PublishLogClock();
 }
 
@@ -287,8 +239,9 @@ void CompactionBuffer::Reschedule(const FlushBatch& batch) ABYSS_NO_THREAD_SAFET
 std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeq() const
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
-  if (pending_seqs_.empty()) return std::nullopt;
-  return *pending_seqs_.begin();
+  const BufferEntry* oldest = OldestPending();
+  if (oldest == nullptr) return std::nullopt;
+  return oldest->first_seen_seq;
 }
 
 std::optional<core::SequenceId> CompactionBuffer::OldestPendingSeqScanForTesting() const
@@ -315,14 +268,25 @@ uint64_t CompactionBuffer::LogClockScanForTesting() const ABYSS_NO_THREAD_SAFETY
 std::optional<core::SteadyTime> CompactionBuffer::OldestFirstSeen() const
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
+  const BufferEntry* oldest = OldestPending();
+  if (oldest == nullptr) return std::nullopt;
+  return oldest->first_seen;
+}
+
+std::optional<core::SteadyTime> CompactionBuffer::OldestFirstSeenScanForTesting() const
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
   if (entries_.empty()) return std::nullopt;
-  // entries_ is unordered and flush_heap_ is keyed on scheduled_time, not
-  // first_seen, so a scan is the only exact answer.
   core::SteadyTime oldest = core::SteadyTime::max();
   for (const auto& [_, entry] : entries_) {
     oldest = std::min(oldest, entry.first_seen);
   }
   return oldest;
+}
+
+size_t CompactionBuffer::PendingSlotsForTesting() const ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  const std::shared_lock lock(mutex_);
+  return pending_.size();
 }
 
 void CompactionBuffer::Clear(uint64_t flush_appended_at_ms) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
@@ -334,8 +298,8 @@ void CompactionBuffer::Clear(uint64_t flush_appended_at_ms) ABYSS_NO_THREAD_SAFE
   flush_heap_.swap(empty);
   bytes_estimate_ = 0;
   heap_overhead_bytes_ = 0;
-  pending_seqs_.clear();
-  pending_times_.clear();
+  pending_.clear();
+  pending_dead_ = 0;
   max_absorbed_ms_ = std::max(max_absorbed_ms_, flush_appended_at_ms);
   PublishLogClock();
 }

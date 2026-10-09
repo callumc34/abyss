@@ -32,7 +32,7 @@ Micro-benchmarks are not run via ctest. Build with the `bench` preset and run th
 
 **P2 — Tests own time.** Components that take a clock function inject `abyss::testing::TestClock` in tests. Real wall-clock sleeps are a code smell: they make tests slow, flaky, or both.
 
-**P3 — Events, not durations.** When waiting for an observable effect, wait for the signal (atomic flag, `std::future`, condition variable, `ConsumerRpc::PendingCount`) rather than sleeping for "long enough". The one legitimate exception is `TestServer::WaitForReady`, which polls the server's stdout for a single real external event.
+**P3 — Events, not durations.** When waiting for an observable effect, wait for the signal (atomic flag, `std::future`, condition variable, `ColdConsumer::WaitForDrainedSeq`) rather than sleeping for "long enough". The one legitimate exception is `TestServer::WaitForReady`, which polls the server's stdout for a single real external event.
 
 **P4 — Lifecycle is proportional.** Unit tests hold no external state. Integration tests use per-test temp dirs. System tests share a server across a suite when the test neither restarts nor asserts against server-wide baselines; otherwise `IsolatedServerTest` spawns a fresh server per test.
 

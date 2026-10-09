@@ -97,7 +97,6 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kColdFlushBatchSize.name,
       names::kColdConsumerLagEntries.name,
       names::kColdBufferOldestEntryAgeSeconds.name,
-      names::kHotConsumerSeq.name,
       names::kColdConsumerSeq.name,
       names::kHotMemoryBytes.name,
       names::kHotKeys.name,
@@ -131,6 +130,14 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kSequencerLockHoldSeconds.name,
       names::kQueueOffsetPersistFailuresTotal.name,
       names::kQueueReadOutOfRangeTotal.name,
+      names::kRecoveryPhase.name,
+      names::kRecoveryColdEntriesReplayed.name,
+      names::kRecoveryColdEntriesTarget.name,
+      names::kRecoveryHotEntriesReplayed.name,
+      names::kRecoveryHotEntriesTarget.name,
+      names::kRecoveryHotSkippedFramesTotal.name,
+      names::kRecoveryColdDrainRequestsTotal.name,
+      names::kRecoveryDurationSeconds.name,
   };
   std::set<std::string_view> seen;
   for (const auto name : kAllNames) {

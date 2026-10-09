@@ -12,11 +12,7 @@
 #include "abyss/admin/status_handler.h"
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_pool.h"
-#include "abyss/consumer/resolver_pool.h"
-#include "abyss/core/apply_notifier.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/result.h"
 #include "abyss/core/topology_manifest.h"
@@ -91,23 +87,19 @@ class Server {
   // Component graph. Declaration order = construction order.
   // Destruction is reverse — dependents destroyed before their dependencies.
   //
-  // Single source of truth for per-prefix eviction. Borrowed by ShardedHotStore,
-  // HotConsumerPool, ColdConsumerPool — declared above them so it outlives
-  // every borrower. Do not reorder.
+  // Single source of truth for per-prefix eviction. Borrowed by
+  // ShardedHotStore and ColdConsumerPool, declared above them so it
+  // outlives every borrower. Do not reorder.
   std::unique_ptr<core::EvictionPolicy> eviction_policy_;
   // Validated cluster topology. Written/checked before any data subsystem opens.
   std::unique_ptr<core::TopologyManifest> topology_;
   // Outlives every consumer, so its final offset persist sees all commits.
   std::unique_ptr<queue::WalQueue> queue_;
-  std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
-  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
   std::unique_ptr<hot::ShardedHotStore> hot_store_;
   std::unique_ptr<core::ColdStore> cold_store_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   // Declared after cold_pool_ so it is destroyed before it.
   std::unique_ptr<hot::EvictionWorker> hot_eviction_worker_;
-  std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
-  std::unique_ptr<consumer::ResolverPool> resolver_pool_;
   std::unique_ptr<engine::Loader> loader_;
   std::unique_ptr<engine::Sequencer> sequencer_;
   std::unique_ptr<engine::ReadPath> read_path_;

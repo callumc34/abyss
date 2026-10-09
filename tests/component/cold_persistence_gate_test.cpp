@@ -27,7 +27,6 @@
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
@@ -44,6 +43,8 @@
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/wal_queue.h"
+#include "cold_read.h"
+#include "cold_replay.h"
 #include "durability_printer.h"
 #include "latch.h"
 #include "on_exit.h"
@@ -112,10 +113,6 @@ class ApplyHookColdStore : public core::ColdStore {
 
   void SetOnApply(std::function<void()> on_apply) { on_apply_ = std::move(on_apply); }
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override {
-    return inner_.Exec(op, deadline);
-  }
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
     if (on_apply_) on_apply_();
@@ -161,21 +158,8 @@ core::QueueEntry WriteEntry(std::vector<std::string> args) {
                           .payload = core::entry::Write{.cmd = Cmd(std::move(args))}};
 }
 
-core::QueueEntry ConditionalEntry(std::vector<std::string> args) {
-  return core::QueueEntry{.appended_at = core::WallClock::now(),
-                          .payload = core::entry::Conditional{.cmd = Cmd(std::move(args))}};
-}
-
-// What the resolver appends for an applied Conditional.
-core::QueueEntry ResolvedEntry(core::SequenceId ref, std::vector<std::string> args) {
-  core::entry::Resolved resolved{.ref = ref, .decision = core::Decision::kApply};
-  resolved.materialised_ops.push_back(Cmd(std::move(args)));
-  return core::QueueEntry{.appended_at = core::WallClock::now(), .payload = std::move(resolved)};
-}
-
 std::optional<std::string> ReadCold(core::ColdStore& cold, const std::string& key) {
-  const core::ops::ReadOp op = core::ops::StringGet{.key = key};
-  auto value = cold.Exec(op);
+  auto value = testing::ColdRead(cold, core::ops::StringGet{.key = key});
   EXPECT_TRUE(value.has_value()) << value.error().message();
   if (!value.has_value() || value->IsNull()) return std::nullopt;
   return value->AsString();
@@ -245,8 +229,7 @@ class ColdPersistenceGateTest : public ::testing::Test {
   }
 
   ColdConsumer& AddConsumer(core::ShardId shard, const ColdConsumer::Config& cfg) {
-    consumers_.push_back(
-        std::make_unique<ColdConsumer>(*queue_, *cold_, shard, cfg, policy_, rpc_));
+    consumers_.push_back(std::make_unique<ColdConsumer>(*queue_, *cold_, shard, cfg, policy_));
     return *consumers_.back();
   }
 
@@ -283,7 +266,6 @@ class ColdPersistenceGateTest : public ::testing::Test {
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   core::EvictionPolicy policy_{core::EvictionTTL{86400}};
-  core::ConsumerRpc rpc_;
   FlushStall stall_;
   std::vector<std::unique_ptr<ColdConsumer>> consumers_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -383,31 +365,6 @@ TEST_F(ColdPersistenceGateTest, RewrittenKeyNeverPersistsAboveThePowerDurableEnd
   EXPECT_GT(checks, 0);
 }
 
-// The Conditional X is durable, its Resolved Y is not. Y carries the
-// effect, so the effect must not reach cold until Y is power-durable.
-TEST_F(ColdPersistenceGateTest, ConditionalEffectWaitsForItsResolved) {
-  ASSERT_NO_FATAL_FAILURE(OpenWal(core::Durability::kProcessCrash));
-  ASSERT_NO_FATAL_FAILURE(OpenCold());
-  auto& consumer = AddConsumer(0, AggressiveConfig());
-
-  const core::SequenceId x = Append(0, ConditionalEntry({"SET", "k", "v"}));
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, x));
-  queue_->SetFlushHookForTesting(stall_.Hook());
-  const core::SequenceId y = Append(0, ResolvedEntry(x, {"SET", "k", "v"}));
-
-  EXPECT_EQ(consumer.Drain(), 2U);
-  EXPECT_EQ(consumer.LatestDrainedSeq(), y);
-  EXPECT_EQ(consumer.Flush(), ColdConsumer::FlushOutcome::kDurabilityPending);
-  EXPECT_EQ(PowerEnd(0), x + 1);
-  EXPECT_EQ(ReadCold(*cold_, "k"), std::nullopt) << "persisted a Resolved a power loss could drop";
-  EXPECT_EQ(ColdCommit(0), std::nullopt) << "committed past the Conditional";
-
-  stall_.Release();
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, y));
-  EXPECT_EQ(consumer.Flush(), ColdConsumer::FlushOutcome::kProgress);
-  EXPECT_EQ(ReadCold(*cold_, "k"), "v");
-}
-
 // A buffered key absent from hot is served from the buffer, never from
 // cold's older state, while its batch is selected, held and applied.
 TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight) {
@@ -417,7 +374,7 @@ TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight)
   ColdConsumer::Config cfg = AggressiveConfig();
   cfg.queue_read_timeout = 100ms;
   ColdConsumerPool pool(*queue_, cold, ColdConsumerPool::Config{.shard_count = 1, .consumer = cfg},
-                        policy_, rpc_);
+                        policy_);
   hot::ShardedHotStore hot(hot::ShardedHotStoreConfig{
       .max_memory_bytes = 16UL * 1024UL * 1024UL,
       .shard_count = 1,
@@ -516,13 +473,12 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
   queue_->SetFlushHookForTesting(stall_.Hook());
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     Append(shard, WriteEntry({"SET", key("b", shard), "b"}));
-    const core::SequenceId x = Append(shard, ConditionalEntry({"SET", key("c", shard), "c"}));
-    Append(shard, ResolvedEntry(x, {"SET", key("c", shard), "c"}));
+    const core::SequenceId c = Append(shard, WriteEntry({"SET", key("c", shard), "c"}));
     auto& consumer = *consumers_[shard];
     consumer.Drain();
     const auto outcome = consumer.Flush();
     if (GetParam() == core::Durability::kProcessCrash) {
-      EXPECT_EQ(consumer.LatestDrainedSeq(), x + 1) << "cold absorbs at the ack class";
+      EXPECT_EQ(consumer.LatestDrainedSeq(), c) << "cold absorbs at the ack class";
       EXPECT_EQ(outcome, ColdConsumer::FlushOutcome::kDurabilityPending);
     } else {
       EXPECT_EQ(outcome, ColdConsumer::FlushOutcome::kIdle) << "absorbed an unflushed entry";
@@ -769,7 +725,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     }
 
     auto& consumer = AddConsumer(shard, AggressiveConfig());
-    auto replayed = consumer.ReplayUntil(end - 1, cancel);
+    auto replayed = testing::ReplayCold(*queue_, consumer, end, cancel);
     ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
     std::vector<std::optional<std::string>> want(kKeys);
     for (core::SequenceId seq = kFirst; seq < end; ++seq) {

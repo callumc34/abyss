@@ -99,13 +99,6 @@ core::Result<void> ParseQueue(const YamlCursor& cur, QueueConfig& out) {
       .Finish();
 }
 
-core::Result<void> ParseHotConsumer(const YamlCursor& cur, HotConsumerConfig& out) {
-  return SectionDecoder(cur)
-      .Optional("read_batch_size", out.read_batch_size)
-      .Optional("read_timeout_ms", out.read_timeout)
-      .Finish();
-}
-
 core::Result<void> ParseColdConsumer(const YamlCursor& cur, ColdConsumerConfig& out) {
   return SectionDecoder(cur)
       .Optional("quiet_threshold_seconds", out.quiet_threshold)
@@ -129,17 +122,19 @@ core::Result<void> ParseColdConsumer(const YamlCursor& cur, ColdConsumerConfig& 
 core::Result<void> ParseRecovery(const YamlCursor& cur, RecoveryConfig& out) {
   return SectionDecoder(cur)
       .Optional("replay_parallelism", out.replay_parallelism)
-      .Optional("hot_replay_batch_size", out.hot_replay_batch_size)
-      .Optional("cold_replay_batch_size", out.cold_replay_batch_size)
+      .Removed("hot_replay_batch_size",
+               "removed; recovery reads the log once, in the Scan's batches")
+      .Removed("cold_replay_batch_size",
+               "removed; recovery reads the log once, in the Scan's batches")
       .Finish();
 }
 
-core::Result<void> ParseConsumerRpc(const YamlCursor& cur, ConsumerRpcConfig& out) {
-  return SectionDecoder(cur)
-      .Optional("registry_shard_count", out.registry_shard_count)
-      .Optional("default_timeout_ms", out.default_timeout)
-      .Finish();
-}
+// Sections that no longer exist; each fails the parse with its hint.
+constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kRemovedSections{{
+    {"hot_consumer",
+     "removed; the sequencer applies each write to hot, and recovery's one log Scan rebuilds it"},
+    {"consumer_rpc", "removed; a write replies once durable, with no consumer apply to wait for"},
+}};
 
 core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
   return SectionDecoder(cur)
@@ -282,6 +277,11 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
       !r) {
     return std::unexpected(r.error());
   }
+  for (const auto& [name, hint] : kRemovedSections) {
+    if (auto removed = root_cur.Child(name); removed.node().IsDefined()) {
+      return std::unexpected(removed.MakeError(hint));
+    }
+  }
 
   if (auto profile_node = root_cur.Child("profile");
       profile_node.node().IsDefined() && !profile_node.node().IsNull()) {
@@ -295,16 +295,12 @@ core::Result<Config> Config::ParseFromYaml(std::string_view yaml_text) {
     core::Result<void> (*parse)(const YamlCursor&, Config&);
   };
 
-  const std::array<Section, 12> sections = {{
+  const std::array<Section, 10> sections = {{
       {"hot", [](const YamlCursor& c, Config& cfg) { return ParseHot(c, cfg.hot); }},
       {"cold", [](const YamlCursor& c, Config& cfg) { return ParseCold(c, cfg.cold); }},
       {"queue", [](const YamlCursor& c, Config& cfg) { return ParseQueue(c, cfg.queue); }},
-      {"hot_consumer",
-       [](const YamlCursor& c, Config& cfg) { return ParseHotConsumer(c, cfg.hot_consumer); }},
       {"cold_consumer",
        [](const YamlCursor& c, Config& cfg) { return ParseColdConsumer(c, cfg.cold_consumer); }},
-      {"consumer_rpc",
-       [](const YamlCursor& c, Config& cfg) { return ParseConsumerRpc(c, cfg.consumer_rpc); }},
       {"engine", [](const YamlCursor& c, Config& cfg) { return ParseEngine(c, cfg.engine); }},
       {"recovery", [](const YamlCursor& c, Config& cfg) { return ParseRecovery(c, cfg.recovery); }},
       {"net", [](const YamlCursor& c, Config& cfg) { return ParseNet(c, cfg.net); }},

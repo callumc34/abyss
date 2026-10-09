@@ -183,12 +183,10 @@ TEST_F(DurabilityTestFixture, ExpiredAbsoluteTtlIsAbsentAfterRecovery) {
 }
 
 TEST_F(DurabilityTestFixture, MsetnxAtomicOutcomeSurvivesCrash) {
-  // MSETNX is conditional: succeeds only if all keys are absent. Run it,
-  // crash-and-restart, and verify that whichever side the resolver decided is
-  // the side observed by the client. (We don't assert success-vs-skip because
-  // the crash may happen before or after the Resolved emission; the property
-  // is determinism — the post-crash decision matches the pre-crash one had it
-  // landed.)
+  // MSETNX sets its keys only if all are absent. The sequencer decides
+  // it before logging and logs only the decision's effects, so after a
+  // crash recovery replays the outcome the client saw, deciding
+  // nothing again.
   ASSERT_TRUE(Client().Command({"DEL", "a", "b"}).IsInteger());
   auto r = Client().Command({"MSETNX", "a", "1", "b", "2"});
   ASSERT_TRUE(r.IsInteger());

@@ -29,6 +29,7 @@
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "cold_read.h"
 
 namespace abyss::cold::backends {
 namespace {
@@ -80,7 +81,6 @@ class TtlFixture : public ::testing::Test {
     RocksdbConfig config;
     config.data_path = path_.string();
     config.shard_count = kFixtureShardCount;
-    config.wall_clock = clock_.Fn();
     config.log_clock = [clock = log_clock_ms_](core::ShardId) { return clock->load(); };
     auto store = RocksdbStore::Create(config);
     EXPECT_TRUE(store.has_value()) << (store.has_value() ? "" : store.error().message());
@@ -92,6 +92,11 @@ class TtlFixture : public ::testing::Test {
     auto loaded = store.LoadKey(key, core::SteadyClock::now() + std::chrono::seconds(5));
     EXPECT_TRUE(loaded.has_value() && loaded->has_value()) << key << " is missing";
     return loaded.value_or(std::nullopt).value_or(core::ColdKeyState{});
+  }
+
+  // What a read of `op` returns from `store` at the test clock.
+  core::Result<core::RespValue> Read(RocksdbStore& store, const core::ops::ReadOp& op) const {
+    return abyss::testing::ColdRead(store, op, static_cast<int64_t>(clock_.Now()));
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -112,7 +117,7 @@ TEST_F(TtlFixture, StringWithFutureTtlReturnsValue) {
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 60'000};
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
-  auto r = store->Exec(core::ops::StringGet{.key = k});
+  auto r = Read(*store, core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(r->AsString(), "v");
 }
@@ -125,7 +130,7 @@ TEST_F(TtlFixture, StringWithPastTtlReturnsNull) {
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() - 1};
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
 
-  auto r = store->Exec(core::ops::StringGet{.key = k});
+  auto r = Read(*store, core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
   EXPECT_TRUE(r->IsNull());
 }
@@ -140,7 +145,7 @@ TEST_F(TtlFixture, ZeroTtlNeverExpires) {
 
   // Avoid overflow issues
   clock_.SetTo(1'000'000'000'000ULL);
-  auto r = store->Exec(core::ops::StringGet{.key = k});
+  auto r = Read(*store, core::ops::StringGet{.key = k});
   ASSERT_TRUE(r.has_value());
   EXPECT_EQ(r->AsString(), "v");
 }
@@ -165,13 +170,13 @@ TEST_F(TtlFixture, ReadOfAWallExpiredStringLeavesItsRecord) {
   clock_.Advance(200);
 
   for (int i = 0; i < 2; ++i) {
-    auto r = store->Exec(core::ops::StringGet{.key = "k"});
+    auto r = Read(*store, core::ops::StringGet{.key = "k"});
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(r->IsNull());
   }
   core::ops::Exists exists;
   exists.keys = {"k"};
-  EXPECT_EQ(store->Exec(exists)->AsInteger(), 0);
+  EXPECT_EQ(Read(*store, exists)->AsInteger(), 0);
 
   EXPECT_EQ(store->RecordsForTesting(), before);
   EXPECT_EQ(
@@ -189,7 +194,7 @@ TEST_F(TtlFixture, PersistOfAKeyPastItsTtlOnlyByTheWallClockClearsIt) {
   ASSERT_TRUE(store->ApplyBatch(std::span{&set, 1}, 0).has_value());
   log_clock_ms_->store(ttl - 1);
   clock_.Advance(10'000);
-  EXPECT_TRUE(store->Exec(core::ops::StringGet{.key = "k"})->IsNull());
+  EXPECT_TRUE(Read(*store, core::ops::StringGet{.key = "k"})->IsNull());
 
   core::ops::WriteOp persist = core::ops::Persist{.key = "k"};
   ASSERT_TRUE(store->ApplyBatch(std::span{&persist, 1}, 0).has_value());
@@ -197,7 +202,7 @@ TEST_F(TtlFixture, PersistOfAKeyPastItsTtlOnlyByTheWallClockClearsIt) {
   const auto k = MustLoad(*store, "k");
   EXPECT_EQ(k.value, core::ColdValue{std::string("v")});
   EXPECT_EQ(k.abs_ttl_ms, 0);
-  EXPECT_EQ(store->Exec(core::ops::StringGet{.key = "k"})->AsString(), "v");
+  EXPECT_EQ(Read(*store, core::ops::StringGet{.key = "k"})->AsString(), "v");
 }
 
 // --- Collection TTL ---------------------------------------------------------
@@ -241,7 +246,7 @@ TEST_F(TtlFixture, CollectionWithoutTtlSurvivesTimeAdvance) {
   ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
 
   clock_.Advance(1'000'000'000);
-  auto card = store->Exec(core::ops::SetCard{.key = "s"});
+  auto card = Read(*store, core::ops::SetCard{.key = "s"});
   EXPECT_EQ(card->AsInteger(), 1);
 }
 
@@ -262,14 +267,14 @@ TEST_F(TtlFixture, ReadsOfAWallExpiredCollectionLeaveItsRecords) {
   ASSERT_EQ(before.size(), 4U) << "the format version, s's meta and two members";
   clock_.Advance(200);
 
-  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "s"})->AsInteger(), 0);
-  EXPECT_TRUE(store->Exec(core::ops::SetMembers{.key = "s"})->AsArray().empty());
-  EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = "s", .member = "a"})->AsInteger(), 0);
+  EXPECT_EQ(Read(*store, core::ops::SetCard{.key = "s"})->AsInteger(), 0);
+  EXPECT_TRUE(Read(*store, core::ops::SetMembers{.key = "s"})->AsArray().empty());
+  EXPECT_EQ(Read(*store, core::ops::SetIsMember{.key = "s", .member = "a"})->AsInteger(), 0);
   // A hash read of s checks s for another type, and finds it expired.
-  EXPECT_TRUE(store->Exec(core::ops::HashGet{.key = "s", .field = "f"})->IsNull());
+  EXPECT_TRUE(Read(*store, core::ops::HashGet{.key = "s", .field = "f"})->IsNull());
   core::ops::Exists exists;
   exists.keys = {"s"};
-  EXPECT_EQ(store->Exec(exists)->AsInteger(), 0);
+  EXPECT_EQ(Read(*store, exists)->AsInteger(), 0);
 
   EXPECT_EQ(store->RecordsForTesting(), before);
   EXPECT_EQ(
@@ -314,7 +319,7 @@ TEST_F(TtlFixture, PersistOfASetPastItsTtlOnlyByTheWallClockClearsIt) {
 
   core::ops::WriteOp persist = core::ops::Persist{.key = "s"};
   ASSERT_TRUE(store->ApplyBatch(std::span{&persist, 1}, 0).has_value());
-  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "s"})->AsInteger(), 1);
+  EXPECT_EQ(Read(*store, core::ops::SetCard{.key = "s"})->AsInteger(), 1);
 }
 
 TEST_F(TtlFixture, RemOnAWallExpiredZsetAppliesAsLogged) {
@@ -364,8 +369,10 @@ TEST_F(TtlFixture, AnAddOverAnotherTypeIsReportedAndApplied) {
   core::ops::WriteOp add = core::ops::SetAdd{.key = "k", .members = members};
   ASSERT_TRUE(store->ApplyBatch(std::span{&add, 1}, 0).has_value());
   EXPECT_EQ(conflicts(), 1.0);
-  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "k"})->AsInteger(), 1);
-  EXPECT_TRUE(store->Exec(core::ops::StringGet{.key = "k"})->IsNull());
+  EXPECT_EQ(Read(*store, core::ops::SetCard{.key = "k"})->AsInteger(), 1);
+  const auto get = Read(*store, core::ops::StringGet{.key = "k"});
+  ASSERT_FALSE(get.has_value()) << "the stale string survived the add";
+  EXPECT_EQ(get.error().code(), core::ErrorCode::kWrongType);
 }
 
 TEST_F(TtlFixture, ExistsDoesNotCountExpiredCollection) {
@@ -382,7 +389,7 @@ TEST_F(TtlFixture, ExistsDoesNotCountExpiredCollection) {
   auto store = OpenStore();
   core::ops::Exists op;
   op.keys = {key};
-  EXPECT_EQ(store->Exec(op)->AsInteger(), 0);
+  EXPECT_EQ(Read(*store, op)->AsInteger(), 0);
 }
 
 // --- Concurrent reads ---------------------------------------------------
@@ -405,7 +412,7 @@ TEST_F(TtlFixture, ConcurrentReadsOfAnExpiredKeyNeverWrite) {
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&] {
       for (int j = 0; j < 64; ++j) {
-        auto r = store->Exec(core::ops::StringGet{.key = k});
+        auto r = Read(*store, core::ops::StringGet{.key = k});
         if (r.has_value() && r->IsNull()) null_count.fetch_add(1, std::memory_order_relaxed);
       }
     });

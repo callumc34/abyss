@@ -6,10 +6,9 @@
 
 #include "abyss/core/result.h"
 
-// Neutral home for the LEB128 varint codec shared by the cold key encoder and
-// the in-memory existence cache. Keeping it in core avoids a consumer->cold
-// include edge while letting both layers use one byte-for-byte identical
-// length-prefix scheme.
+// Neutral home for the LEB128 varint codec the cold key encoder uses,
+// in core so another layer can share its byte-for-byte length-prefix
+// scheme without a cold include edge.
 namespace abyss::core::encoding {
 
 inline void AppendVarint(std::string& out, uint64_t value) {

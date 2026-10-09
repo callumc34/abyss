@@ -58,6 +58,9 @@
 namespace abyss::queue {
 namespace {
 
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
+
 #ifdef _WIN32
 
 TEST(WalCrashTest, ConfirmedWritesSurviveKillNine) {
@@ -102,7 +105,7 @@ WalConfig VictimConfig(const std::filesystem::path& dir, core::Durability durabi
       .shard_count = 1,
       .durability = durability,
       .min_retention = 1s,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {kTestConsumer, core::kColdConsumer},
   };
 }
 
@@ -197,7 +200,7 @@ WalConfig ShardsConfig(const std::filesystem::path& dir, core::Durability durabi
       .ring_entries = 4096,
       .durability = durability,
       .min_retention = 1s,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {kTestConsumer, core::kColdConsumer},
   };
 }
 

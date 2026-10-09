@@ -10,7 +10,7 @@ namespace abyss::core {
 // The single routing path (ADP-014). The keyspace is partitioned into
 // `kSlotCount` (16384) Redis-compatible slots; a data shard owns a contiguous
 // range of slots. Placement everywhere — hot striping, the cold key prefix, WAL
-// shard directories, resolver stripes, consumer routing — derives the shard
+// shard directories, consumer routing — derives the shard
 // from the slot via these pure, total, deterministic functions. xxHash is no
 // longer in the placement path.
 

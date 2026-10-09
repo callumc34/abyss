@@ -32,10 +32,6 @@ class NoopDispatcher : public abyss::core::CommandDispatcher {
     return abyss::core::RespValue::BulkString("v");
   }
   abyss::core::Result<abyss::core::RespValue> DispatchWrite(
-      std::string_view /*name*/, abyss::core::RespCommand /*cmd*/) override {
-    return abyss::core::RespValue::SimpleString("OK");
-  }
-  abyss::core::Result<abyss::core::RespValue> DispatchConditional(
       std::string_view /*name*/, abyss::core::RespCommand /*cmd*/,
       abyss::core::PredicateFlags /*flags*/) override {
     return abyss::core::RespValue::SimpleString("OK");
@@ -52,7 +48,7 @@ class NoopDispatcher : public abyss::core::CommandDispatcher {
 
 // Mirrors Connection's read cap: a frame that cannot complete inside it is a
 // fail-closed teardown, never an unbounded buffer.
-constexpr size_t kMaxReadBufferBytes = 64 * 1024;
+constexpr size_t kMaxReadBufferBytes = size_t{64} * 1024;
 constexpr size_t kMaxChunkBytes = 37;
 
 // Chunk widths come from the input itself, so libFuzzer steers the split with

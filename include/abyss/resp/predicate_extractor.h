@@ -6,8 +6,8 @@
 
 namespace abyss::resp {
 
-// kNone means unconditional (engine routes to DispatchWrite); any other
-// flags route through the resolver. Errors surface as -ERR syntax error
+// The predicates a write carries, kNone for none; the sequencer decides
+// the write against hot either way. Errors surface as -ERR syntax error
 // before any queue append.
 using PredicateExtractor = core::Result<core::PredicateFlags> (*)(const core::RespCommand&);
 

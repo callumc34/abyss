@@ -5,13 +5,14 @@
 namespace abyss::system_test {
 namespace {
 
-// Property: once a client receives +OK for a write, an immediately subsequent
-// read returns that write's value. Never stale. The write handler blocks on
-// both the queue fsync AND the hot consumer's apply before acking (ADP-006
-// §Write Path, invariant 4) — apply happens-before the ack, so any read issued
-// after OK observes the value. A single SET→GET almost always passes even if
-// that ordering were broken, because the window is tiny; these tests stress the
-// invariant where a regression would actually surface.
+// Property: once a client receives +OK for a write, an immediately
+// subsequent read returns that write's value. Never stale. The
+// sequencer applies a write to hot under its shard's lock before
+// publishing it, and replies only once it is durable (ADP-006 §Write
+// Path, invariant 4): apply happens-before the ack, so any read issued
+// after OK observes the value. A single SET→GET almost always passes
+// even if that ordering were broken, because the window is tiny; these
+// tests stress the invariant where a regression would surface.
 //
 // Per-test isolated server (the durability-test pattern for write-heavy
 // acceptance tests): a fresh empty server per test gives true isolation and
@@ -35,9 +36,9 @@ TEST_F(ReadAfterWriteFixture, OverwriteSameKeyNeverStale) {
 }
 
 TEST_F(ReadAfterWriteFixture, ReadAfterWriteAcrossManyKeysAndShards) {
-  // Distinct keys spread across every shard (and thus every per-shard hot
-  // consumer thread). Proves the apply→ack ordering holds on all shards, not
-  // just the one shard 0 happens to land on.
+  // Distinct keys spread across every shard. Proves the apply→ack
+  // ordering holds on all shards, not just the one shard 0 happens to
+  // land on.
   constexpr int kKeys = 1000;
 
   for (int i = 0; i < kKeys; ++i) {

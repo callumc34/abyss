@@ -305,21 +305,20 @@ TEST(MemoryWalkTest, PassesUndrainedKeysOnceAHorizon) {
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
-  // Undrained keys at the cold end, drained ones behind them.
-  store.SetReplayMode(true);
+  // Undrained keys at the cold end, drained ones behind them; written
+  // while nothing has drained, so the writes evict none.
   for (int i = 0; i < 100; ++i) {
     ASSERT_TRUE(store
                     .Apply(ops::WriteOp{ops::StringSet{.key = Key("u", 100 + i), .value = value}},
-                           kLongEviction, static_cast<core::SequenceId>(1000 + i))
+                           kLongEviction, static_cast<core::SequenceId>(1000 + i), 0)
                     .has_value());
   }
   for (int i = 0; i < 900; ++i) {
     ASSERT_TRUE(store
                     .Apply(ops::WriteOp{ops::StringSet{.key = Key("d", 100 + i), .value = value}},
-                           kLongEviction, static_cast<core::SequenceId>(1 + i))
+                           kLongEviction, static_cast<core::SequenceId>(1 + i), 0)
                     .has_value());
   }
-  store.SetReplayMode(false);
   const auto walk_to = [&store](size_t target) {
     size_t evicted = 0;
     for (;;) {

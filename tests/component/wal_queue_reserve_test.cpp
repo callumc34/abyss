@@ -20,7 +20,6 @@
 #include <variant>
 #include <vector>
 
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
@@ -38,6 +37,9 @@
 
 namespace abyss::queue {
 namespace {
+
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
 
 using namespace std::chrono_literals;
 using abyss::testing::Latch;
@@ -71,7 +73,7 @@ WalConfig ReserveConfig(const std::filesystem::path& dir, core::Durability durab
       .shard_count = 4,
       .durability = durability,
       .min_retention = 0s,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {kTestConsumer, core::kColdConsumer},
       .offset_fsync_interval = std::chrono::hours{1},
   };
 }

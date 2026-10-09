@@ -1,13 +1,14 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <queue>
 #include <random>
-#include <set>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -15,8 +16,6 @@
 #include "abyss/consumer/buffer_entry.h"
 #include "abyss/consumer/flush_strategy.h"
 #include "abyss/core/ops.h"
-#include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
 #include "abyss/core/string_hash.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
@@ -30,25 +29,14 @@ using FlushBatch = std::vector<std::reference_wrapper<const BufferEntry>>;
 class CompactionBuffer {
  public:
   CompactionBuffer(FlushStrategy strategy, core::SteadyClockFn clock,
-                   std::optional<uint64_t> rng_seed = std::nullopt,
-                   core::WallClockFn wall_clock = core::DefaultWallClock);
+                   std::optional<uint64_t> rng_seed = std::nullopt);
 
-  explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock,
-                            core::WallClockFn wall_clock = core::DefaultWallClock);
+  explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock);
 
-  // `position` is the seq replay must resume from to re-derive the effect;
-  // `carrier` is the seq of the entry that holds it (ADP-004), and
-  // `appended_at_ms` that entry's appended_at.
+  // `seq` and `appended_at_ms` are the log entry's, absorbed in seq
+  // order.
   void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction,
-              core::SequenceId position, core::SequenceId carrier, uint64_t appended_at_ms)
-      ABYSS_EXCLUDES(mutex_);
-
-  // EXISTS, GET, ZSCORE and HGET from the delta alone, for the resolver.
-  // kNotFound signals "fall through to next tier"; tombstones surface as
-  // RespValue::Null so the caller treats a buffered DEL as authoritative.
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const ABYSS_EXCLUDES(mutex_);
-
-  core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
+              core::SequenceId seq, uint64_t appended_at_ms) ABYSS_EXCLUDES(mutex_);
 
   // A copy of `key`'s compacted delta, TTL unjudged; nullopt if none.
   std::optional<CompactedState> Snapshot(std::string_view key) const ABYSS_EXCLUDES(mutex_);
@@ -73,16 +61,21 @@ class CompactionBuffer {
   uint64_t LogClockMs() const { return log_clock_ms_.load(std::memory_order_acquire); }
 
   // min(first_seen) over live entries; nullopt when empty. Backs the ADP-004
-  // oldest_unflushed_age lag signal (COLDC-5).
+  // oldest_unflushed_age lag signal (COLDC-5). O(1).
   std::optional<core::SteadyTime> OldestFirstSeen() const ABYSS_EXCLUDES(mutex_);
 
   // Drops every buffered entry without emitting to cold, and advances the
   // log clock to the Flush's appended_at. Used by FLUSHDB.
   void Clear(uint64_t flush_appended_at_ms) ABYSS_EXCLUDES(mutex_);
 
-  // Full scans that OldestPendingSeq and LogClockMs must agree with.
+  // Full scans that OldestPendingSeq, LogClockMs and OldestFirstSeen
+  // must agree with.
   std::optional<core::SequenceId> OldestPendingSeqScanForTesting() const ABYSS_EXCLUDES(mutex_);
   uint64_t LogClockScanForTesting() const ABYSS_EXCLUDES(mutex_);
+  std::optional<core::SteadyTime> OldestFirstSeenScanForTesting() const ABYSS_EXCLUDES(mutex_);
+  // Slots in the pending order, flushed ones not yet compacted away
+  // included.
+  size_t PendingSlotsForTesting() const ABYSS_EXCLUDES(mutex_);
 
   size_t Size() const ABYSS_EXCLUDES(mutex_);
   size_t BytesEstimate() const ABYSS_EXCLUDES(mutex_);
@@ -116,11 +109,14 @@ class CompactionBuffer {
   std::chrono::milliseconds ComputeJitter() ABYSS_REQUIRES(mutex_);
 
   void ErasePending(const BufferEntry& entry) ABYSS_REQUIRES(mutex_);
+  // Drops flushed slots off the front, and rebuilds the order once they
+  // outnumber the live ones, so it stays O(live).
+  void TrimPending() ABYSS_REQUIRES(mutex_);
+  const BufferEntry* OldestPending() const ABYSS_REQUIRES(mutex_);
   void PublishLogClock() ABYSS_REQUIRES(mutex_);
 
   const FlushStrategy strategy_;
   core::SteadyClockFn clock_;
-  core::WallClockFn wall_clock_;
   mutable std::shared_mutex mutex_;
   core::StringMap<BufferEntry> entries_ ABYSS_GUARDED_BY(mutex_);
   std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<>> flush_heap_
@@ -132,12 +128,15 @@ class CompactionBuffer {
   // Entries selected for a flush and not yet erased or rescheduled.
   size_t in_flight_ ABYSS_GUARDED_BY(mutex_) = 0;
   std::mt19937_64 rng_ ABYSS_GUARDED_BY(mutex_);
-  // One element per buffered entry: its first_seen_seq, and its
-  // first_appended_at_ms. They differ in order only while Resolved
-  // effects carry an older position than their entry.
-  std::multiset<core::SequenceId> pending_seqs_ ABYSS_GUARDED_BY(mutex_);
-  std::multiset<uint64_t> pending_times_ ABYSS_GUARDED_BY(mutex_);
+  // Buffered entries in absorb order, which orders their first_seen_seq,
+  // first_appended_at_ms and first_seen alike; a flushed one leaves a
+  // null slot. Slot i holds ticket pending_base_ + i.
+  std::deque<BufferEntry*> pending_ ABYSS_GUARDED_BY(mutex_);
+  uint64_t pending_base_ ABYSS_GUARDED_BY(mutex_) = 0;
+  size_t pending_dead_ ABYSS_GUARDED_BY(mutex_) = 0;
   uint64_t max_absorbed_ms_ ABYSS_GUARDED_BY(mutex_) = 0;
+  core::SequenceId max_absorbed_seq_ ABYSS_GUARDED_BY(mutex_) = 0;
+  core::SteadyTime last_first_seen_ ABYSS_GUARDED_BY(mutex_){};
   std::atomic<uint64_t> log_clock_ms_{0};
 };
 

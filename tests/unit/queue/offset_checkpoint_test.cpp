@@ -17,10 +17,14 @@
 namespace abyss::queue {
 namespace {
 
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
+constexpr core::ConsumerId kOtherConsumer = 2;
+
 namespace pfs = abyss::platform::fs;
 
 constexpr uint32_t kShards = 4;
-constexpr std::array<core::ConsumerId, 2> kConsumers{core::kColdConsumer, core::kResolverConsumer};
+constexpr std::array<core::ConsumerId, 2> kConsumers{core::kColdConsumer, kOtherConsumer};
 
 class OffsetCheckpointTest : public ::testing::Test {
  protected:
@@ -89,7 +93,7 @@ TEST_F(OffsetCheckpointTest, FreshDirectoryStartsWithNothingCommitted) {
   for (auto consumer : kConsumers) {
     for (uint32_t s = 0; s < kShards; ++s) EXPECT_FALSE(ckpt->Get(consumer, s).has_value());
   }
-  EXPECT_FALSE(ckpt->Get(core::kHotConsumer, 0).has_value());
+  EXPECT_FALSE(ckpt->Get(kTestConsumer, 0).has_value());
   EXPECT_FALSE(ckpt->Get(core::kColdConsumer, kShards).has_value());
 }
 
@@ -251,7 +255,7 @@ TEST_F(OffsetCheckpointTest, ConsumerOrderDoesNotMatter) {
     ASSERT_NE(ckpt, nullptr);
     ASSERT_TRUE(ckpt->Write(values).has_value());
   }
-  auto reordered = Open(kShards, {core::kResolverConsumer, core::kColdConsumer});
+  auto reordered = Open(kShards, {kOtherConsumer, core::kColdConsumer});
   ASSERT_TRUE(reordered.has_value()) << reordered.error().message();
   ExpectMatches(**reordered, values);
 }

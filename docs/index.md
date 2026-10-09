@@ -11,7 +11,7 @@ Many services need a fast key-value store with persistence guarantees that outli
 Abyss presents a single Redis-compatible interface. Clients connect with any standard Redis client library, there's no custom SDKs, no protocol changes. Behind that interface, Abyss manages data across two tiers:
 
 - **Hot tier** — in-memory, sub-millisecond reads. Data lives here while it's being actively accessed.
-- **Cold tier** — on-disk, durable. Data migrates here automatically when it hasn't been accessed recently, and is promoted back to hot on the next read.
+- **Cold tier** — on-disk, durable. Data migrates here automatically when it hasn't been accessed recently, and is brought back into hot when it is read again.
 
 The transition between tiers is transparent. Callers don't need to know which tier holds their data.
 
@@ -27,7 +27,7 @@ The cold consumer is the most interesting component. Rather than writing every u
 - **Durable** — writes are not acknowledged until they reach the configured durability class: surviving a process crash by default, or a power loss when configured. A failure within that class never loses an acknowledged write.
 - **Efficient** — the compaction buffer collapses intermediate writes. The cold store sees a fraction of the total write volume.
 - **Recoverable** — pod restart rebuilds state from the queue. No external coordination needed.
-- **Pluggable** — each component (queue, hot store, cold store) is behind an abstract interface. The embedded profile runs everything in-process with zero dependencies. The external profile delegates to Kafka, Redis, KVRocks, or similar systems.
+- **Pluggable** — the queue and the cold store are behind abstract interfaces. The embedded profile runs everything in-process with zero dependencies. A planned external profile would delegate the queue and cold store to Kafka, KVRocks or similar systems. The hot store is in-process, because the sequencer decides each write against it; whether an external hot tier survives is an open decision ([#187](https://github.com/callumc34/abyss/issues/187)).
 - **Kubernetes-native** — designed for StatefulSet deployment with PVCs.
 
 ## Documentation

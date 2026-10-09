@@ -360,11 +360,11 @@ class SingleShardStore {
   // every expired key it read. `appended_at` is only for the DCHECK
   // that no effect reading state meets a key expired at that time. A
   // SET's value is moved out of its effect. An unparsable effect is
-  // fatal.
-  std::vector<core::RespValue> ApplyEffects(std::span<core::Effect> effects,
-                                            core::SequenceId first_seq, core::WallTime appended_at,
-                                            const core::EvictionPolicy& policy,
-                                            core::SequenceId horizon);
+  // fatal. Written keys are linked at `linked_at`, else at the clock.
+  std::vector<core::RespValue> ApplyEffects(
+      std::span<core::Effect> effects, core::SequenceId first_seq, core::WallTime appended_at,
+      const core::EvictionPolicy& policy, core::SequenceId horizon,
+      std::optional<core::SteadyTime> linked_at = std::nullopt);
 
   // Existence verdict distinguishing a delete-tombstone (authoritatively
   // absent) from a true miss (consult the next tier). See core::HotKeyPresence.
@@ -419,18 +419,12 @@ class SingleShardStore {
   // write is applied, not evicted), then reports whether the store can fit.
   // Returns false (the caller surfaces kResourceExhausted) only when, after
   // evicting every other eligible key, the store would still exceed the
-  // budget. A no-op while replaying so recovery stays a deterministic queue
-  // replay (invariant 4). Other keys' undrained bytes are left out of that
-  // check.
+  // budget. Other keys' undrained bytes are left out of that check.
   bool EnsureCapacityFor(std::string_view protect_key, core::SequenceId horizon,
                          HoldBudget& budget);
   // Evicts, within one hold's budget, toward room for `key` holding
   // `entry_bytes` (a LoadedFull's bytes); true if it then fits.
   bool MakeRoom(std::string_view key, size_t entry_bytes, core::SequenceId horizon);
-
-  // Suppresses memory-pressure eviction during replay. Set by the hot consumer
-  // around ReplayUntil so the rebuilt hot view does not depend on memory timing.
-  void SetReplayMode(bool replaying) { replay_mode_ = replaying; }
 
   const Stub* FindStub(std::string_view key) const { return stubs_.Find(key); }
   bool DropStub(std::string_view key);
@@ -484,8 +478,16 @@ class SingleShardStore {
   // An entry, live, expired or a tombstone.
   bool HasEntry(std::string_view key) const { return FindEntry(key) != nullptr; }
   void RaiseAppendedAt(core::WallTime at);
+  uint64_t UsedBytes() const {
+    return entry_bytes_ + stubs_.bytes() + (ttl_index_.size() * kTtlBucketBytes);
+  }
   // Over max_memory_bytes times the backpressure ratio, as of now.
   bool OverBackpressure() const;
+  // That product in bytes; 0 when the shard has no budget.
+  uint64_t BackpressureLimit() const;
+  // Moves every live entry's link and read stamp by `shift`, capped at
+  // `now`. Monotone, so each list keeps its order.
+  void ShiftLinks(core::SteadyClock::duration shift, core::SteadyTime now);
 
   // Entries the LRU walk has examined.
   uint64_t LruVisitsForTesting() const { return lru_visits_; }
@@ -498,9 +500,10 @@ class SingleShardStore {
     bool reply_old_value = false;
   };
 
-  // Apply without the capacity check.
+  // Apply without the capacity check; written keys link at `linked_at`.
   core::Result<core::RespValue> Mutate(const core::ops::WriteOp& op, core::EvictionTTL eviction,
-                                       core::SequenceId seq, SetMove move);
+                                       core::SequenceId seq, SetMove move,
+                                       core::SteadyTime linked_at);
   core::Result<core::RespValue> ApplyStringSet(const core::ops::StringSet& op,
                                                core::EvictionTTL eviction, SetMove move);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
@@ -557,10 +560,10 @@ class SingleShardStore {
   // Converts a live entry into a tombstone: releases the value, drops it from
   // key_count, and stamps the delete seq. Idempotent on an existing tombstone.
   void TombstoneEntry(Entry& entry, std::string_view key, core::SequenceId seq);
-  // Stamps the key's entry with `seq`, relinks it as just written and
-  // drops its stub and any load in flight, which the write has made
-  // stale.
-  void MarkWritten(std::string_view key, core::SequenceId seq);
+  // Stamps the key's entry with `seq`, relinks it as written at
+  // `linked_at` and drops its stub and any load in flight, which the
+  // write has made stale.
+  void MarkWritten(std::string_view key, core::SequenceId seq, core::SteadyTime linked_at);
   // Removes a live entry, leaving a stub unless it expired by TTL.
   // Inserts `key`'s entry, timing it when the insert will rehash.
   EntryMap::iterator EmplaceEntry(std::string_view key);
@@ -592,9 +595,6 @@ class SingleShardStore {
   void NoteEvictable(core::SequenceId latest_seq);
   void TrackInsert(const Entry& entry, std::string_view key);
   void TrackRemove(const Entry& entry, std::string_view key);
-  uint64_t UsedBytes() const {
-    return entry_bytes_ + stubs_.bytes() + (ttl_index_.size() * kTtlBucketBytes);
-  }
   void UpdateBackpressure();
   // LRU make-room primitive: evicts least-recently-used live keys (never
   // `protect_key`, empty to protect none) until UsedBytes() <= target_bytes.
@@ -643,7 +643,6 @@ class SingleShardStore {
   // TTL-expiry deletions, distinct from tier evictions (HOT-7).
   uint64_t expired_count_ = 0;
   bool backpressured_ = false;
-  bool replay_mode_ = false;
 };
 
 }  // namespace abyss::hot

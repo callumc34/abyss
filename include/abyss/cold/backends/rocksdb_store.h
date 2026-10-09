@@ -33,8 +33,6 @@ struct RocksdbConfig {
   uint32_t max_write_buffer_number = 4;
   uint32_t bloom_filter_bits_per_key = 10;
   CompactionStyle compaction_style = CompactionStyle::kLevel;
-  // Judges reads only: a key expired by it reads as absent.
-  core::WallClockFn wall_clock = core::DefaultWallClock;
   // A shard's log clock in ms (ColdConsumerPool::LogClockMs). The TTL
   // scanner deletes a key only once its TTL is at or below its shard's
   // clock. Unset, nothing is deleted.
@@ -58,8 +56,6 @@ class RocksdbStore : public core::ColdStore {
   RocksdbStore(RocksdbStore&&) = delete;
   RocksdbStore& operator=(RocksdbStore&&) = delete;
 
-  core::Result<core::RespValue> Exec(
-      const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override;
   core::Result<void> Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq) override;
@@ -75,9 +71,6 @@ class RocksdbStore : public core::ColdStore {
   core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
       std::string_view key, core::KeyType type, std::span<const std::string_view> members,
       core::SteadyTime deadline) override;
-
-  // DEL returns the count of keys that existed before deletion.
-  core::Result<core::RespValue> ExecDel(const core::ops::Del& op);
 
   core::Result<void> Start() override;
   core::Result<void> Stop() override;

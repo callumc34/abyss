@@ -21,7 +21,6 @@
 #include "abyss/cold/ttl_scanner.h"
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
@@ -34,6 +33,8 @@
 
 namespace abyss::consumer {
 namespace {
+
+core::SteadyTime ReadDeadline() { return core::SteadyClock::now() + std::chrono::seconds(10); }
 
 using namespace std::chrono_literals;
 using ::testing::_;
@@ -79,7 +80,6 @@ class ColdShard {
     cold::backends::RocksdbConfig config{
         .data_path = dir_.Sub("cold").string(),
         .shard_count = 1,
-        .wall_clock = clock_.WallFn(),
         .log_clock = [this](core::ShardId) -> uint64_t {
           return consumer_ ? consumer_->LogClockMs() : 0;
         },
@@ -99,8 +99,8 @@ class ColdShard {
     cfg.quiet_threshold = 30s;
     cfg.jitter_fraction = 0.0;
     cfg.rng_seed = 1;
-    consumer_ = std::make_unique<ColdConsumer>(queue_, *cold_, kShard, cfg, policy_, rpc_,
-                                               clock_.SteadyFn(), clock_.WallFn());
+    consumer_ =
+        std::make_unique<ColdConsumer>(queue_, *cold_, kShard, cfg, policy_, clock_.SteadyFn());
   }
 
   ColdShard(const ColdShard&) = delete;
@@ -151,7 +151,6 @@ class ColdShard {
   std::vector<core::QueueEntry> log_;
   testing::TestClock clock_;
   core::EvictionPolicy policy_;
-  core::ConsumerRpc rpc_;
   NiceMock<testing::MockQueue> queue_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   std::unique_ptr<ColdConsumer> consumer_;
@@ -255,10 +254,9 @@ TEST_P(LogClockRaceTest, AWriteDecidedWhileItsKeyWasLiveLands) {
       }
       case Step::kRead: {
         const auto before = shard.Cold().RecordsForTesting();
-        const core::ops::ReadOp read = race.write == Write::kPersist
-                                           ? core::ops::ReadOp{core::ops::StringGet{.key = "k"}}
-                                           : core::ops::ReadOp{core::ops::SetCard{.key = "k"}};
-        ASSERT_TRUE(shard.Cold().Exec(read).has_value());
+        const auto type =
+            race.write == Write::kPersist ? core::KeyType::kString : core::KeyType::kSet;
+        ASSERT_TRUE(shard.Cold().LoadKeyAs("k", type, ReadDeadline()).has_value());
         EXPECT_EQ(shard.Cold().RecordsForTesting(), before) << "a read wrote";
         break;
       }
@@ -315,12 +313,9 @@ TEST(LogClockReplayTest, TheWallClockLeavesNoTraceInCold) {
     const auto read_all = [&shard, &keys] {
       const auto before = shard.Cold().RecordsForTesting();
       for (const auto& key : keys) {
-        core::ops::Exists exists;
-        exists.keys = {key};
-        EXPECT_TRUE(shard.Cold().Exec(exists).has_value());
-        EXPECT_TRUE(shard.Cold().Exec(core::ops::StringGet{.key = key}).has_value());
-        const auto card = shard.Cold().Exec(core::ops::SetCard{.key = key});
-        EXPECT_TRUE(card.has_value() || card.error().code() == core::ErrorCode::kWrongType);
+        EXPECT_TRUE(shard.Cold().ProbeKey(key, ReadDeadline()).has_value());
+        EXPECT_TRUE(shard.Cold().LoadKey(key, ReadDeadline()).has_value());
+        EXPECT_TRUE(shard.Cold().LoadKeyAs(key, core::KeyType::kSet, ReadDeadline()).has_value());
       }
       EXPECT_EQ(shard.Cold().RecordsForTesting(), before) << "a read wrote";
     };

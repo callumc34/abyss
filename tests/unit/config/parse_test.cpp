@@ -45,10 +45,6 @@ queue:
   durability_window_bytes: 2097152
   durability_window_ms: 500
 
-hot_consumer:
-  read_batch_size: 128
-  read_timeout_ms: 50
-
 cold_consumer:
   quiet_threshold_seconds: 30
   safety_margin_seconds: 300
@@ -68,8 +64,6 @@ cold_consumer:
 
 recovery:
   replay_parallelism: 4
-  hot_replay_batch_size: 10000
-  cold_replay_batch_size: 50000
 
 net:
   bind: 0.0.0.0
@@ -131,9 +125,6 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->queue.durability_window_bytes, 2097152U);
   EXPECT_EQ(cfg->queue.durability_window, std::chrono::milliseconds{500});
 
-  EXPECT_EQ(cfg->hot_consumer.read_batch_size, 128U);
-  EXPECT_EQ(cfg->hot_consumer.read_timeout, std::chrono::milliseconds{50});
-
   EXPECT_EQ(cfg->cold_consumer.quiet_threshold, std::chrono::seconds{30});
   EXPECT_EQ(cfg->cold_consumer.safety_margin, std::chrono::seconds{300});
   EXPECT_DOUBLE_EQ(cfg->cold_consumer.jitter_fraction, 0.25);
@@ -151,8 +142,6 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->cold_consumer.drain_grace, std::chrono::seconds{20});
 
   EXPECT_EQ(cfg->recovery.replay_parallelism, 4U);
-  EXPECT_EQ(cfg->recovery.hot_replay_batch_size, 10000U);
-  EXPECT_EQ(cfg->recovery.cold_replay_batch_size, 50000U);
 
   EXPECT_EQ(cfg->net.bind, "0.0.0.0");
   EXPECT_EQ(cfg->net.port, 6379);

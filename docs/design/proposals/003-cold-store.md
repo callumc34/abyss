@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
+**Updated:** 2026-10-09
 
 ## Context
 
@@ -11,9 +12,9 @@ The cold store is the durable on-disk tier of Abyss. It holds data that has been
 
 ### Interface
 
-Like the hot store, the cold store interface accepts typed operations. Reads arrive as a `ReadOp` variant, batch writes arrive as a span of `WriteOp` variants. The cold store never sees raw RESP commands — the typed operation layer centralises parsing in core, keeping storage backends free of protocol concerns.
+Like the hot store, the cold store interface accepts typed operations. Batch writes arrive as a span of `WriteOp` variants. The cold store never sees raw RESP commands — the typed operation layer centralises parsing in core, keeping storage backends free of protocol concerns.
 
-`Exec` handles reads that miss both hot and the compaction buffer. `ApplyBatch` is the only write path — the cold consumer always flushes compacted state in batches. `Stats` reports disk usage and key counts. `Compact` triggers manual RocksDB compaction.
+Reads are loads, and cold answers no command itself. `LoadKey` returns a key's whole state, `LoadKeyAs` reads members only when the key holds the asked-for type, `ProbeKey` returns a key's type and TTL without its members, and `LoadMembers` reads a batch of members or fields. Each reads one consistent view within a deadline, judges no TTL and deletes nothing. The engine merges what it loaded with the compaction buffer's delta and answers the read from that ([ADP-006](006-read-write-paths.md) §Read Path). `ApplyBatch` is the only write path — the cold consumer always flushes compacted state in batches. `Stats` reports disk usage and key counts. `Compact` triggers manual RocksDB compaction.
 
 See `include/abyss/core/cold_store.h` and `include/abyss/core/ops.h` for the current interface.
 
@@ -31,7 +32,7 @@ The Phase 1 cold store is backed by RocksDB on a PVC.
 
 The cold store applies the log as it was decided. It changes state only by the log's clock, never by the wall clock.
 
-**Reads:** a read checks the key's absolute TTL against the wall clock, and answers nil for an expired key. It never deletes, so a read never writes.
+**Reads:** a load returns an expired key with its TTL, and the engine, answering the read, checks that TTL against the wall clock and answers nil. Nothing deletes on a read, so a read never writes.
 
 **The log clock:** a shard's log clock is the `appended_at` of the oldest write its compaction buffer still holds unflushed. With nothing pending, it is the newest `appended_at` the buffer has absorbed. The cold consumer keeps it ([ADP-004](004-cold-consumer.md) §Expiry), and it never moves backwards.
 - **Why deletion by it is safe.** `appended_at` is monotonic per shard, so every write not yet in cold has an `appended_at` at or after the clock. The write path decides each write against the key's live state, and logs an observed expiry as a DEL ([ADP-015](015-write-path-and-durability.md)). Every TTL a pending write relied on is therefore later than the clock. Deleting a key whose TTL is at or below the clock can never race a write that needed it.
@@ -89,23 +90,23 @@ The contract does not hold by accident: every component that could delete an exp
 cold:
   backend: builtin_rocksdb
   data_path: /data/cold
-  compaction_style: level
   write_buffer_size_bytes: 67108864   # 64 MiB
-  max_write_buffer_number: 4
-  bloom_filter_bits_per_key: 10
-  ttl_expiry:
-    active_enabled: true
-    sample_size: 20
-    base_interval_ms: 1000
+  ttl_scanner:
+    enabled: true
+    base_sample_size: 20              # within min_sample_size..max_sample_size
+    base_interval_ms: 1000            # within min_interval_ms..max_interval_ms
     high_threshold: 0.25
     low_threshold: 0.05
     disk_pressure_threshold: 0.9      # Fraction of PVC capacity
-    max_cpu_percent: 10               # Cap CPU budget for active expiry
+    disk_pressure_release_threshold: 0.855
+    max_cpu_fraction: 0.10            # Cap CPU budget for active expiry
 ```
+
+The server's configuration does not expose RocksDB's compaction style, write buffer count or bloom filter bits: the backend uses level compaction, four write buffers and 10 bloom bits per key. [`config/abyss.example.yaml`](../../../config/abyss.example.yaml) lists every `ttl_scanner` key.
 
 ## Invariants
 
-1. `Exec` answers nil for a key expired by the wall clock, and never writes.
+1. A read of a key expired by the wall clock answers nil, and never writes: loads judge no TTL and delete nothing.
 2. `ApplyBatch` is the only write path. Individual writes do not occur; the cold consumer always flushes in batches. It applies each effect as logged and judges no TTL.
 3. The cold store is never read during recovery. Recovery is pure queue replay.
 4. Active expiry deletes a key only once its TTL is at or below its shard's log clock. The sampling is probabilistic (which keys are checked) but the expiry check itself is deterministic.

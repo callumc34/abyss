@@ -1,6 +1,7 @@
 #include <CLI/CLI.hpp>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
+#include "abyss/core/cold_store.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/result.h"
 #include "common.h"
@@ -127,8 +129,11 @@ int main(int argc, char** argv) {
   abyss::perf::OpFn op_fn = [&](int /*worker_id*/, std::string_view op_name, uint64_t key_index) {
     const auto key = KeyFor(key_index);
     if (op_name == kOpGet) {
-      abyss::core::ops::StringGet read{.key = key};
-      return cold.Exec(read).has_value();
+      // What a read that misses hot and the buffer costs: a typed load.
+      return cold
+          .LoadKeyAs(key, abyss::core::KeyType::kString,
+                     abyss::core::SteadyClock::now() + std::chrono::seconds(5))
+          .has_value();
     }
     abyss::core::ops::StringSet set_op{
         .key = key,

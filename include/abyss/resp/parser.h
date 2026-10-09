@@ -21,8 +21,6 @@ struct ParserLimits {
   int max_depth = 1024;
 
   static constexpr ParserLimits Default() { return {}; }
-  // Replay decodes a single resolved return value; the same envelope applies.
-  static constexpr ParserLimits ForWalReplay() { return {}; }
 };
 
 struct ParseResult {

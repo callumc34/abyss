@@ -9,11 +9,8 @@
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
-#include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
 namespace abyss::consumer {
@@ -44,17 +41,14 @@ class ColdConsumerPool : public CompactionBufferRouter {
   };
 
   ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
-                   const core::EvictionPolicy& eviction_policy, core::ConsumerRpc& rpc,
-                   const core::SteadyClockFn& steady_clock = core::DefaultSteadyClock,
-                   const core::WallClockFn& wall_clock = core::DefaultWallClock);
+                   const core::EvictionPolicy& eviction_policy,
+                   const core::SteadyClockFn& steady_clock = core::DefaultSteadyClock);
   ~ColdConsumerPool() override;
   ColdConsumerPool(const ColdConsumerPool&) = delete;
   ColdConsumerPool& operator=(const ColdConsumerPool&) = delete;
   ColdConsumerPool(ColdConsumerPool&&) = delete;
   ColdConsumerPool& operator=(ColdConsumerPool&&) = delete;
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override;
   std::optional<CompactedState> Snapshot(core::ShardId shard, std::string_view key) const override;
   bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                          std::chrono::milliseconds timeout) override;

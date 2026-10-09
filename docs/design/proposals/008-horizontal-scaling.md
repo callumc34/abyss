@@ -96,6 +96,8 @@ queue:
   retention_ms: 86400000
 ```
 
+This configuration is proposed, not implemented: the current parser rejects the `cluster` section and every external backend setting. Its `hot` section assumes an external hot tier, which is an open decision ([#187](https://github.com/callumc34/abyss/issues/187)): since [ADP-015](015-write-path-and-durability.md) the sequencer decides each write against an in-process hot store.
+
 ## Invariants
 
 1. Shard count is fixed at deployment. It never changes without a full redeployment.

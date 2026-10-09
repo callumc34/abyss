@@ -2,10 +2,10 @@
 
 **Status:** Accepted
 **Created:** 2026-10-01
-**Supersedes:** ADP-001 §Group Commit and §Offset persistence, ADP-011 §The Resolver, §Queue Entry Taxonomy (Conditional/Resolved) and §Consumer Block-and-Scan
-**Amends:** ADP-001 §Interface, ADP-002 §Hot Consumer and §Eviction, ADP-004 §Consumer Thread Loop, ADP-005 §TCP server implementation and §Write Acknowledgement, ADP-006 §Write Path, §Read Path, §Cold Hit Promotion and §Broadcast Write Path, ADP-007 §Recovery Process, ADP-008 §Resharding, ADP-009 §Read semantics, ADP-013 §Three substrates, `requirements.md` §Design Principles, §Performance Targets, §Durability Guarantees, §Concurrency Model and §Consumer Coordination
+**Supersedes:** ADP-001 §Group Commit and §Offset persistence, ADP-011 in full (the resolver, the `Conditional`/`Resolved` entry pair, block-and-scan and the consumer RPC)
+**Amends:** ADP-001 §Interface, ADP-002 §Hot Consumer (now §Applying Writes and §Residency) and §Eviction, ADP-004 §Consumer Thread Loop, ADP-005 §TCP server implementation and §Write Acknowledgement, ADP-006 §Write Path, §Read Path, §Cold Hit Promotion (now §Cache Fill) and §Broadcast Write Path, ADP-007 §Recovery Process, ADP-008 §Resharding, ADP-009 §Read semantics, ADP-013 §Three substrates, `requirements.md` §Design Principles, §Performance Targets, §Durability Guarantees, §Concurrency Model and §Consumer Coordination
 
-Delivery is phased (§Delivery) and tracked by epic #172. Each amended document keeps describing current behaviour, under a banner pointing here, until the phase that changes that behaviour lands and rewrites the section.
+Delivery is phased (§Delivery) and tracked by epic #172. Each amended document keeps describing current behaviour, under a banner pointing here, until the phase that changes that behaviour lands and rewrites the section. Phases 0 and 1 have landed, and Phase 2 through its fifth stage: the sections below describe them as current behaviour, and the documents they amend have been rewritten to match. Phase 2 completes with stage 6, which adds the three-way property test (§Delivery). Asynchronous request execution (Phase 3, #161) and the later rows are still to come, and their sections say so.
 
 ## Context
 
@@ -58,12 +58,12 @@ A configuration that still names a removed setting fails to load. The error name
 - **No persisted derived state runs ahead of the power-durable log.**
   - The cold consumer may absorb entries into its volatile compaction buffer at the acknowledgement class. It writes to the cold store, by flush or wipe, only effects whose entries are at or below the fdatasync watermark, whatever the acknowledgement class. Otherwise a power loss would leave cold holding writes the log no longer has.
   - Committed offsets are gated the same way.
-  - Gating absorption itself would make every collection read wait for a device flush (ADP-004 §Persisting at the power-durable log).
+  - Gating absorption itself would make every hot eviction, and with it memory backpressure on writes, wait for a device flush, because hot evicts only what cold has absorbed (ADP-004 §Persisting at the power-durable log).
   - What is absorbed but not yet persistable is bounded by the durability window below.
 - **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. It is set by `queue.durability_window_bytes` (default 64 MiB, volume-wide) and `queue.durability_window_ms` (default 1000, the age of a shard's oldest unflushed entry); an append over either bound waits, then is rejected after the write timeout.
 
 Two consequences follow from the persistence cap, and both are accepted:
-- Anything whose acknowledgement waits on cold applying an entry (FLUSHDB) pays `power_loss` latency in every class.
+- Cold applies a Flush's wipe only once the Flush is power-durable, in every class. FLUSHDB's reply does not wait for it: hot's flush floor answers reads as absent until the wipe lands (§Residency invariant).
 - A flush stall delays cold, which delays hot eviction (§Residency invariant). This surfaces as bounded memory backpressure on writes, never as unbounded hot growth.
 
 ### Log durability pipeline
@@ -102,7 +102,7 @@ There is no batch byte cap. A natural batch is limited by how long the previous 
 - Values above a threshold of 16–64 KiB, sized by the lock-hold budget, are copied into a separate blob lane before sequencing. The log frame carries a reference.
 - The main log then holds only frames filled inside the critical section, so one large write cannot stall the durable watermark for every shard. Precedent: WiscKey, RocksDB BlobDB, Badger.
 - Under `power_loss` the watermark is the minimum of the log and the blob lane. Orphaned blobs are reclaimed by retention.
-- Until the blob lane lands, frames above the threshold are filled after the critical section. Readers of those keys wait on the read fence, later frames wait on the contiguous watermark, and a head-of-line metric reports the stall. The maximum value size stays 64 MiB.
+- Until the blob lane lands, a reservation's frames are filled inside the critical section only until their total reaches 16 KiB; its later frames are filled after it. Readers of those keys wait on the read fence, later frames wait on the contiguous watermark, and a head-of-line metric reports the stall. The maximum value size stays 64 MiB.
 
 **Fail-stop after apply.** Failures split on whether the effect has been applied:
 - **Before the effect is applied, the write is rejected cleanly** and the process continues. This covers log space reservation, including a full disk when the next preallocated segment cannot be created. Writes fail, as `requirements.md` §Backpressure requires.
@@ -119,26 +119,26 @@ There is no batch byte cap. A natural batch is limited by how long the previous 
 - Frames are decoded straight from the mapping.
 
 **Positions below the oldest retained entry are an explicit out-of-range error, never a silent clamp.**
-- Hot resets to the oldest entry.
+- Hot keeps no read position: recovery rebuilds it from each shard's oldest retained entry.
 - For a retention consumer, out-of-range can only mean that data it had not committed was reclaimed. The process fail-stops, naming the consumer, shard and positions.
 
 **Committed offsets are persisted lazily**, on a fixed cadence and at shutdown, into one dual-slot checkpoint that covers every retention consumer and shard.
 - Each slot is a separately aligned block with an epoch and checksum. It is overwritten in place and flushed with one data sync: no rename and no directory sync, as with LMDB meta pages.
 - Retention reclaims only below *persisted* offsets.
-- After a crash, consumers resume from the last persisted offset and re-process entries at least once. Cold absorption and resolver replay are idempotent.
+- After a crash, consumers resume from the last persisted offset and re-process entries at least once. Cold absorption is idempotent.
 
 **Consumer reads stay bounded** under any acknowledgement policy, poison entries included. A poison entry pins the consumer's committed offset, and with it retention, visibly, while the consumer reads past it.
 
 ### Sequenced write path
 
-A single sequencer per shard executes every write under the shard's lock, on the calling thread, in four steps:
+A single sequencer per shard executes every write on the calling thread. Whatever the write must wait for (WAL admission, memory backpressure, loading a non-resident key) it waits for first, holding no lock. Then, under the exclusive lock of each shard the write touches, taken in ascending order:
 
 1. Evaluate the command against the key's complete current state, computing both the reply and the effect.
-2. Reserve log space. A failure here leaves nothing applied, and the write is rejected.
-3. Apply the effect to hot.
+2. Reserve log space. A failure here leaves nothing applied: the sequencer unlocks, waits, and evaluates again from the start, or rejects the write at its deadline.
+3. Apply the effect to hot, and unlock.
 4. Fill and publish the frame.
 
-The reply is sent when the frame reaches the configured durability class. Steps 3 and 4 cannot fail without terminating the process (§Fail-stop after apply).
+The reply is sent when the frame reaches the configured durability class. Steps 3 and 4 cannot fail without terminating the process (§Fail-stop after apply). ADP-006 §Write Path describes each step.
 
 **The log records decided effects, not intents** ("decide-then-log").
 - Conditional and read-modify-write commands (`SET NX`, `ZADD GT`, `INCR`, `SPOP`) are logged as the concrete operations they decided on.
@@ -146,24 +146,25 @@ The reply is sent when the frame reaches the configured durability class. Steps 
 - Precedent: Redis effects replication, which turns `SPOP` into `SREM` and `EXPIRE` into `PEXPIREAT`, and propagates lazy expiry as `DEL`.
 - The sequencer and recovery replay apply effects to hot through one function, so the two cannot interpret a frame differently.
 
-**What this removes.** The steady-state hot consumer thread, the resolver, the `Conditional` and `Resolved` entry types, block-and-scan, the apply notifier and the read-consistency wait are all removed.
-- Recovery no longer re-decides anything: replay applies effects.
+**What this removes.** The steady-state hot consumer thread, the resolver and its existence cache, the `Conditional` and `Resolved` entry types (their type bytes are reserved, [ADP-009](009-wal-format.md)), block-and-scan, the apply notifier, the consumer RPC registry, promotion through the queue and the read-consistency wait are all removed.
+- Recovery no longer re-decides anything: replay applies effects, and its resolver phase is gone.
 - ADP-011's determinism constraint on decisions no longer applies.
 - Read-modify-write commands become ordinary writes.
 
 **Why ADP-011's reasons for a separate resolver no longer hold:**
 - *Cold reads on the critical path.* The client waited for the resolver's cold lookup anyway.
-- *Transactions.* `MULTI`/`EXEC` executes on the sequencer like any multi-key command: its effects are logged as one batch frame. `WATCH` compares each watched key's latest sequence number at `EXEC`, loading a non-resident key first. An aborted transaction has no effects, so it logs nothing.
+- *Transactions.* `MULTI`/`EXEC`, when implemented, executes on the sequencer like any multi-key command: its effects are logged as one batch frame. `WATCH` compares each watched key's latest sequence number at `EXEC`, loading a non-resident key first. An aborted transaction has no effects, so it logs nothing.
 - *Cross-pod lookups.* The sequencer is per shard on the owning pod, exactly where the resolver ran.
 
 **Latency and portability.**
-- The critical section is constant-time: no system calls, allocation or logging inside it, and a spin-then-park lock.
-- Under skewed (zipfian) load one shard lock behaves like a global lock. Lock behaviour under skew is part of this phase's acceptance measurement.
+- The critical section holds no wait: decide, reserve, fill frames, and apply to hot. Loads, admission and backpressure waits come before it. The 16 KiB under-lock budget is cumulative per reservation: frames are filled under the lock until their total reaches 16 KiB, and the reservation's later frames are filled after it. Every frame is published after it. Decided values are moved into hot, never copied, and what an apply replaces is freed after the lock.
+- The hot apply still allocates, and the lock is the shard's reader-writer lock. Arena allocation, and a spin-then-park lock, are taken up only if measurement shows either is the limit. `abyss_sequencer_lock_hold_seconds` samples the hold.
+- Under skewed (zipfian) load one shard lock behaves like a global lock. Lock behaviour under skew, with concurrent readers, is part of the acceptance measurement for the sequenced write path.
 - The shard is reached through an executor boundary ("run this on shard S"), so moving to one owner thread per shard later is a scheduler change, not a rewrite.
 
 **Cross-shard atomic commands.**
-- In single-pod deployments, multi-key write commands spanning shards execute atomically. The sequencer takes the involved shard locks in a fixed order and writes one batch frame carrying every shard's effects; batch atomicity is already a property of the log format.
-- Until that lands, cross-shard conditional commands are rejected (#165).
+- In single-pod deployments, multi-key write commands spanning shards (`MSET`, multi-key `DEL` and `UNLINK`, `MSETNX`, `RENAMENX`, `COPY`) execute atomically (#165). The sequencer takes the involved shard locks in a fixed order, decides everything, makes one reservation and writes one batch carrying every shard's effects; batch atomicity is already a property of the log format. FLUSHDB is one `Flush` per shard in one batch.
+- Only within one log. With `queue.log_count` above 1, a multi-key write whose keys span logs is rejected with `-CROSSSLOT`, and FLUSHDB is one batch per log: atomic to readers, but a crash can leave some logs flushed and not others. The validator warns at start-up (#169). A two-phase commit across logs was rejected: it would add a recovery protocol, several logs are opt-in, and Redis Cluster rejects cross-slot multi-key writes anyway.
 - Multi-key reads (`MGET`, multi-key `EXISTS`) are not atomic across shards. They read each shard in turn and can observe a cross-shard write half-applied. #170 makes them atomic by taking the same locks shared, in the same order.
 - The client-facing identity that goes with these semantics (standalone or cluster) is decided separately (#169).
 
@@ -178,23 +179,30 @@ For every key, at least one of these holds:
 After cold drains a resident key, both hold.
 
 **Rules:**
-- **A write to a non-resident key loads the key first,** outside the lock. The loaded state is installed only if the key is still non-resident and nothing that could change it was evicted from that shard while the load ran; otherwise the load is retried. The validation mechanism (a per-shard eviction epoch, or a finer eviction filter that bounds retries under eviction pressure) is specified with #160. It must not depend on stubs, because stubs can be dropped.
-- **Hot evicts a key only after cold has drained past the key's latest write.**
-- **An evicted key may leave a stub** holding its type, absolute TTL and latest sequence number, so existence-only replies (`EXISTS`, `TYPE`, `DEL`, `EXPIRE`) need no full load.
-  - Stubs are a bounded cache, dropped under memory pressure. Hot memory must not grow with the total number of keys ever written.
+- **A write to a non-resident key loads the key first,** outside the lock. Under the lock the loader leaves a placeholder for the key carrying a load token, then loads with no lock held. The loaded state is installed only if that same token is still the key's placeholder; a blind write replaces the placeholder and the load is discarded, and a non-blind write waits for it. The check is exact, so retries stay bounded under eviction pressure, and it does not depend on stubs, because stubs can be dropped.
+- **Hot evicts a key only after cold has drained past the key's latest write** (#126). Each entry and tombstone carries its latest sequence number; cold's drained seq means absorbed into the compaction buffer, where the key is readable.
+- **An evicted key may leave a stub** holding its type, absolute TTL and latest sequence number, so existence-only replies (`EXISTS`, `TYPE`, `TTL`, and predicates such as `DEL`'s count or `SET NX`) need no full load.
+  - Stubs are a bounded cache (`hot.stub_memory_fraction` of hot memory, about 80 B each), dropped oldest first. Hot memory must not grow with the total number of keys ever written.
   - Without a stub, existence replies fall back to a cold probe, which bloom filters make cheap for absent keys.
-- **A cold read hit fills hot directly,** under the same validation, instead of appending a promotion entry. Reads no longer write to the log.
+  - A write's new state never lives only in a stub: a `DEL` of a non-resident key leaves a tombstone, and the `EXPIRE` family loads the key.
+- **A Flush sets the shard's flush floor.** It wipes the shard's entries, stubs and placeholders, and until cold's drained seq passes the Flush, a hot miss on that shard is absent with no cold read. That keeps the invariant without waiting for cold's wipe.
+- **Memory backpressure.** Hot may exceed `hot.max_memory_bytes` only by what cold has not drained. It is applied per shard: once a shard is over `hot.max_memory_bytes` ÷ `hot.shard_count` × `hot.backpressure_ratio` (default 1.25), a write to it that can grow memory waits for cold, then is rejected with `-OOM` before anything is reserved. Under skew one shard can reject writes while hot's total is under `hot.max_memory_bytes`.
+- **A cold read hit fills hot directly,** under a load token, instead of appending a promotion entry (#168). Reads no longer write to the log.
 
-A hot miss implies that buffer plus cold is current, so the read path needs no consistency wait.
+A hot miss implies that buffer plus cold is current, so the read path needs no consistency wait. [ADP-002](002-hot-store.md) §Residency describes the mechanisms.
 
 ### Read visibility
 
-No reply, to a read or a write, reflects a write that a failure in the configured class could lose. A command whose key's latest sequence number is above the class watermark waits for the watermark to pass, without blocking a thread. This includes replies that reveal prior state, such as `SET … GET`, `INCR` and a `DEL` count.
-- Under `process_crash`, frames are filled before the critical section ends, so the wait fires only for frames still being filled.
+No reply, to a read or a write, reflects a write that a failure in the configured class could lose. A command whose key's latest sequence number is above the class watermark waits for the watermark to pass. This includes replies that reveal prior state, such as `SET … GET`, `INCR` and a `DEL` count.
+- A read copies its answer under the shared lock, with the highest latest sequence number among the keys it touched, then unlocks and waits. Copying first gives a valid linearisation point and cannot starve on a key written continuously.
+- A write with effects is covered by its own durable wait, because its frames follow everything it observed in the same log. A decision with no effect (`SETNX` returning 0, for example) waits on what it observed.
+- Under `process_crash`, the watermark is the published end, so the wait fires only for frames still being filled or published.
 - The wait matters under `power_loss`.
-- Until the sequencer lands, hot is applied by its consumer. That consumer reads only entries durable at the acknowledgement class, which gives the same guarantee without a fence.
+- The wait blocks the calling thread until asynchronous execution lands (§Asynchronous request execution).
 
 ### Asynchronous request execution
+
+This section is still to come (#161). Until it lands, the calling reactor thread blocks on a command's durable wait, its fence and its cold reads.
 
 **Reactors never wait on durability or on cold reads.** Completions are delivered back to the reactor.
 
@@ -206,15 +214,23 @@ No reply, to a read or a write, reflects a write that a failure in the configure
 
 ### Execution resources
 
-**Pooled cold workers (#177)** move cold from one thread per shard to a pool sized to cores. They are sequenced after Phase 2, because Phase 2 changes cold's inputs and couples hot eviction to cold's drain progress.
+**Pooled cold workers (#177)** move cold from one thread per shard to a pool sized to cores. They follow the sequenced write path, which changed cold's inputs and coupled hot eviction to cold's drain progress.
 - One shard's drain-and-flush cycle stays on one thread, because the persistence gate's paused absorption and the buffer's node stability depend on it.
 - Pooled workers park on a volume-level publish signal. The log's single atomic tail is what that signal wraps.
 
 **Recovery is a single demultiplexing pass over each log.**
 - Hot rebuilds from each shard's first retained entry, and cold from its committed offset, which can trail by up to the buffer's deadline.
 - Per-shard reads over an interleaved log would read it once per wave of shard replays.
-- Instead, after the resolver phase, one scan per log feeds both. A header-only walker hands per-shard batches of positions to shard-affine decode workers, bounded so they stay inside the walker's page-cache window. Each batch is split between hot and cold by sequence.
+- Instead, one scan per log feeds both. A header-only walker hands per-shard batches of positions to shard-affine decode workers, bounded so they stay inside the walker's page-cache window. Each batch is split between hot and cold by sequence, and fed to cold first, so cold's drained seq covers it before hot applies it.
 - The retained log is read about once. `abyss_wal_scan_bytes_total` reports it.
+
+**The hot replayer rebuilds only complete state** ([ADP-007](007-recovery.md) §Hot replay).
+- It applies frames through the sequencer's own apply. A frame flagged `kReplacesState` ([ADP-009](009-wal-format.md)) makes its key resident, and a Flush wipes its shard and sets the flush floor; any other frame applies only to a key already resident in the rebuild, tombstones included. Otherwise the key stays non-resident, served from buffer plus cold, and its stub is dropped. Replaying a reclaimed key's tail would otherwise build a partial collection, the replay form of #163.
+- Replay reads no clock and judges no TTL. Eviction stays gated on cold's drain.
+- Replay memory normally stays within the backpressure ratio: cold is fed first in each batch, and drained means absorbed into cold's buffer, so everything hot holds is evictable. At most one scan batch's growth can take a shard over the ratio. A shard over it with nothing evictable makes cold flush through the current frame, as a fallback that never fires on a normal log, and eviction is retried with each new batch.
+- Past a hard ceiling of twice the ratio limit per shard, recovery fails loudly, with an error naming the shard, the seq and the likely cause: cold's drained seq pinned (by a parse-poison entry, for example), or one entry larger than the shard's budget. A forced flush that fails also fails recovery.
+- Every shard must get exactly its frames, in order, or recovery fails.
+- After the scan, a sweep reads the clocks once, maps each replayed key's write time onto the steady clock, and evicts what is past its TTL or eviction window, then down to the budget. It decides residency, never values.
 
 ## Invariants
 
@@ -237,16 +253,17 @@ No reply, to a read or a write, reflects a write that a failure in the configure
 | ADP-002 | Hot is applied by the sequencer. Residency invariant, droppable stubs, eviction gated on cold drain. | 2 |
 | ADP-004 | Consumer loop reads by position, and a poison entry pins the commit offset while reads pass it. Writes to the cold store are capped at the power-durable watermark. Recovery replay through the demultiplexing scan. Pooled workers. | 1a, 1b, 1c, #177 |
 | ADP-005 | Asynchronous completion. The blocking head-of-line trade-off is removed. Conditional dispatch becomes sequenced writes. | 2, 3 |
-| ADP-006 | Sequenced write path, read fence, cache-fill promotion, no read-consistency wait. The Flush acknowledgement no longer requires a persisted consumer offset: the Flush entry's own durability suffices, Wipe stays synced, and a replayed Flush is idempotent per shard. | 1a, 2 |
-| ADP-007 | Recovery syncs the log before replay. Hot and cold replay through one demultiplexing scan per log. Resolver phase removed. | 1b, 1c, 2 |
+| ADP-006 | Sequenced write path, read fence, cache fill in place of promotion, no read-consistency wait. The Flush acknowledgement no longer requires a persisted consumer offset: the Flush entry's own durability suffices, Wipe stays synced, and a replayed Flush is idempotent per shard. | 1a, 2 |
+| ADP-007 | Recovery syncs the log before replay. Hot and cold replay through one demultiplexing scan per log. Resolver phase removed; the hot replayer's residency rule and sweep. | 1b, 1c, 2 |
 | ADP-008 | A broker-backed log requires producer fencing so an outgoing shard owner cannot interleave effects during resharding. | 2 |
 | ADP-009 | Sparse in-memory index. Format 2: a physical log per volume with per-shard streams, recycled segments with per-frame generations, commit words, batch closure by position. Effect frames. | 1a, 1c, 2 |
-| ADP-011 | Resolver, entry pair and block-and-scan superseded. Consumer RPC is reduced to admin and flush use. | 2 |
+| ADP-011 | Superseded in full: the resolver, the entry pair, block-and-scan and the consumer RPC are removed. | 2 |
 | ADP-013 | Target-to-substrate map, write probe, comparative drivers and matrix, load-driver pipelining. | 0 |
 
 **Issues:**
 - Unblocked: #67 (by Phase 0), #142 (by Phase 2).
 - Absorbed or obsoleted: #125, #126, #127, #128, #137 and #88.
+- Fixed by Phase 2: #163, #165, #167 and #168.
 - Re-scoped: #59–#63 now trigger only if profiling shows the shard lock is the limit.
 
 ## Delivery
@@ -258,17 +275,17 @@ No reply, to a read or a write, reflects a write that a failure in the configure
 | 1b | #159 | Durability semantics on the existing per-shard segments: natural batching, durability classes, cold persistence ceiling, bounded durability window, fail-stop, recovery-time sync. |
 | 1c | #175 | Physical log: mapped, recycled segments in one log per volume with per-shard streams, a reserve/fill/commit tail and a filled-prefix watermark; offset rings and sparse indexes; per-segment, oldest-first retention; the demultiplexing recovery pass and scan-based hot and cold rebuild. Delivers W2 under concurrency and W3, which 1b's per-shard flushes cannot, because they serialise on the device. |
 | After 2 | #177 | Pooled cold workers, shard-affine. |
-| 2 | #160 | Sequenced write path, residency invariant, read visibility, cross-shard atomic commands, shard-lock measurement under skew; resolver removal. |
+| 2 | #160 | Sequenced write path, residency invariant, read visibility, cross-shard atomic commands, shard-lock measurement under skew; resolver removal. Completes with stage 6, the three-way property test. |
 | 3 | #161 | Asynchronous request execution and asynchronous cold I/O. |
 | Later | #162, #170, #88, #178 | Blob lane, atomic multi-key reads, io_uring with several flushes in flight (watermark at the contiguous completed prefix), per-segment index footers so open need not scan the retained log, hot-table and allocator work driven by profiles. |
 
-Every phase is measured against the Phase 0 baseline with the same instruments. A three-way property test checks hot, cold and a reference model against each other, replies included. It covers TTL boundaries, flushes at arbitrary points, Flush entries, eviction with loading, and multi-effect batches. It lands with Phase 2 and runs under the unit tier (seeded, bounded) and the fuzz harness (long).
+Every phase is measured against the Phase 0 baseline with the same instruments. A three-way property test checks hot, cold and a reference model against each other, replies included. It covers TTL boundaries, flushes at arbitrary points, Flush entries, eviction with loading, and multi-effect batches. It lands in Phase 2's stage 6, which completes the phase, and runs under the unit tier (seeded, bounded) and the fuzz harness (long).
 
 ## Trade-offs
 
 **Why not shorten the commit window or acknowledge before the write reaches the OS?** A shorter window still adds latency at low load. Acknowledging before the OS has the data loses acknowledged writes on any process crash, the most common failure on Kubernetes.
 
-**Why keep a separate hot consumer only for recovery?** Applying hot from a trailing consumer costs thread hops on every write. It is also the root of the conditional-reordering and partial-state defects. Applying hot as part of sequencing removes both.
+**Why apply hot in the sequencer, and keep a replayer only for recovery?** Applying hot from a trailing consumer costs thread hops on every write. It is also the root of the conditional-reordering and partial-state defects. Applying hot as part of sequencing removes both. Recovery still has to rebuild hot from the log, so a replayer remains, fed only by recovery's scan and applying through the sequencer's own apply.
 
 **Why locks on the calling thread rather than thread-per-core now?**
 - In a shared-nothing per-core runtime (Seastar, Dragonfly), most operations hop to another core.
@@ -285,5 +302,6 @@ The executor boundary keeps the option open.
 ## Open decisions
 
 - **Client-facing identity (#169).** Proposed: standalone in single-pod (with emulated cluster commands) and cluster in multi-pod.
+- **An external hot tier ([#187](https://github.com/callumc34/abyss/issues/187)).** The sequencer decides against hot under the shard lock, so hot is in-process, and the server builds only the built-in store. Whether an external hot tier survives in any profile is undecided.
 - **Maximum value size before the blob lane lands (#162).** Kept at 64 MiB; the head-of-line effect of large values is reported by a metric.
 - **Hardware for authoritative measurement.**

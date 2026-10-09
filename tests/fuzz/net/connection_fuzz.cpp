@@ -53,10 +53,6 @@ class NoopDispatcher : public abyss::core::CommandDispatcher {
     return abyss::core::RespValue::BulkString("v");
   }
   abyss::core::Result<abyss::core::RespValue> DispatchWrite(
-      std::string_view /*name*/, abyss::core::RespCommand /*cmd*/) override {
-    return abyss::core::RespValue::SimpleString("OK");
-  }
-  abyss::core::Result<abyss::core::RespValue> DispatchConditional(
       std::string_view /*name*/, abyss::core::RespCommand /*cmd*/,
       abyss::core::PredicateFlags /*flags*/) override {
     return abyss::core::RespValue::SimpleString("OK");

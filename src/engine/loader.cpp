@@ -472,48 +472,42 @@ core::Result<Loader::Filled> Loader::Install(std::string_view key, KeyType type,
                                              core::SteadyTime deadline) {
   const auto shard = core::ComputeShard(key, hot_.shard_count());
   using Status = hot::LoadStart::Status;
-  for (;;) {
-    const hot::LoadStart start = hot_.BeginLoad(key);
-    switch (start.status) {
-      case Status::kResident:
-        return Filled{.fill = Fill::kResident};
-      case Status::kFlushed:
-        return Filled{.fill = Fill::kFlushed};
-      case Status::kPending:
-        ++joins_;
-        if (!hot_.AwaitLoad(key, deadline)) {
-          return std::unexpected(
-              core::Error{core::ErrorCode::kTimeout, "timed out awaiting another load of the key"});
-        }
-        continue;
-      case Status::kStarted:
-        break;
-    }
-    Source source = Source::kBuffer;
-    std::optional<hot::LoadResult> owned;
-    auto flown = Fly(shard, key, type, deadline, &source, &owned);
-    if (!flown.has_value()) {
-      hot_.AbortLoad(key, start.token);
-      return std::unexpected(flown.error());
-    }
-    // A read loading it already lent its result: a copy to install.
-    std::optional<hot::LoadResult> loaded = std::move(owned);
-    if (!loaded.has_value()) loaded = **flown;
-    // Small enough to keep a copy of, so the caller need not re-read.
-    std::optional<hot::LoadResult> kept;
-    if (!std::holds_alternative<hot::LoadedFull>(*loaded)) kept = *loaded;
-    using Result = hot::ShardedHotStore::FillResult;
-    const Result filled = hot_.Fill(key, start.token, *std::move(loaded));
-    if (filled == Result::kInstalled) {
-      return Filled{.fill = Fill::kInstalled, .result = std::move(kept), .source = source};
-    }
-    Fill fill = Fill::kDiscarded;
-    if (filled == Result::kOverBackpressure) fill = Fill::kSkippedBackpressure;
-    if (filled == Result::kTooLarge) fill = Fill::kSkippedSize;
-    if (filled == Result::kNoRoom) fill = Fill::kSkippedEvictCap;
-    // NOLINTNEXTLINE(bugprone-use-after-move): moved only when installed.
-    return Filled{.fill = fill, .result = std::move(loaded), .source = source};
+  const hot::LoadStart start = hot_.BeginLoad(key);
+  switch (start.status) {
+    case Status::kResident:
+      return Filled{.fill = Fill::kResident};
+    case Status::kFlushed:
+      return Filled{.fill = Fill::kFlushed};
+    case Status::kPending:
+      // A write's full load can take far longer than a read's deadline.
+      return Filled{.fill = Fill::kPending};
+    case Status::kStarted:
+      break;
   }
+  Source source = Source::kBuffer;
+  std::optional<hot::LoadResult> owned;
+  auto flown = Fly(shard, key, type, deadline, &source, &owned);
+  if (!flown.has_value()) {
+    hot_.AbortLoad(key, start.token);
+    return std::unexpected(flown.error());
+  }
+  // A read loading it already lent its result: a copy to install.
+  std::optional<hot::LoadResult> loaded = std::move(owned);
+  if (!loaded.has_value()) loaded = **flown;
+  // Small enough to keep a copy of, so the caller need not re-read.
+  std::optional<hot::LoadResult> kept;
+  if (!std::holds_alternative<hot::LoadedFull>(*loaded)) kept = *loaded;
+  using Result = hot::ShardedHotStore::FillResult;
+  const Result filled = hot_.Fill(key, start.token, *std::move(loaded));
+  if (filled == Result::kInstalled) {
+    return Filled{.fill = Fill::kInstalled, .result = std::move(kept), .source = source};
+  }
+  Fill fill = Fill::kDiscarded;
+  if (filled == Result::kOverBackpressure) fill = Fill::kSkippedBackpressure;
+  if (filled == Result::kTooLarge) fill = Fill::kSkippedSize;
+  if (filled == Result::kNoRoom) fill = Fill::kSkippedEvictCap;
+  // NOLINTNEXTLINE(bugprone-use-after-move): moved only when installed.
+  return Filled{.fill = fill, .result = std::move(loaded), .source = source};
 }
 
 core::Result<Loader::Typed> Loader::MetaAs(core::ShardId shard, std::string_view key, KeyType type,

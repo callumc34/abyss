@@ -36,9 +36,6 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.queue.log_count, 1U);
   EXPECT_EQ(defaults.queue.ring_entries, 65536U);
 
-  EXPECT_GT(defaults.hot_consumer.read_batch_size, 0U);
-  EXPECT_GT(defaults.hot_consumer.read_timeout.count(), 0);
-
   EXPECT_GT(defaults.cold_consumer.quiet_threshold.count(), 0);
   // ADP-004 §Flush Machinery Design Decisions §3: default jitter_fraction = 0.1.
   // Regression guard: C1 fixed a bug where the default was 0.5 (5× the
@@ -59,8 +56,6 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.cold_consumer.loop_max_backoff, std::chrono::milliseconds{1000});
 
   EXPECT_GT(defaults.recovery.replay_parallelism, 0U);
-  EXPECT_GT(defaults.recovery.hot_replay_batch_size, 0U);
-  EXPECT_GT(defaults.recovery.cold_replay_batch_size, 0U);
 
   EXPECT_EQ(defaults.net.port, 6379);
   EXPECT_EQ(defaults.metrics.port, 9090);

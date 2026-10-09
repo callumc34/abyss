@@ -22,7 +22,6 @@
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/command_dispatcher.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
@@ -195,7 +194,6 @@ struct WritePath {
   std::unique_ptr<abyss::core::EvictionPolicy> eviction_policy;
   std::unique_ptr<abyss::hot::ShardedHotStore> hot_store;
   std::unique_ptr<abyss::queue::WalQueue> queue;
-  std::unique_ptr<abyss::core::ConsumerRpc> consumer_rpc;
   std::unique_ptr<abyss::core::ColdStore> cold_store;
   std::unique_ptr<abyss::consumer::ColdConsumerPool> cold_pool;
   std::unique_ptr<abyss::engine::Loader> loader;
@@ -253,8 +251,6 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   }
   wp->queue = std::move(*queue);
 
-  wp->consumer_rpc = std::make_unique<abyss::core::ConsumerRpc>(config.consumer_rpc);
-
   auto cold = abyss::cold::backends::RocksdbStore::Create(abyss::cold::backends::RocksdbConfig{
       .data_path = config.cold.data_path,
       .shard_count = shards,
@@ -281,7 +277,6 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
                   .buffer_low_water_bytes = cc.buffer_low_water_bytes,
                   .max_flush_batch_size = cc.max_flush_batch_size,
                   .queue_read_max_count = cc.queue_read_max_count,
-                  .replay_batch_size = config.recovery.cold_replay_batch_size,
                   .queue_read_timeout = cc.queue_read_timeout,
                   .retry_initial_backoff = cc.retry_initial_backoff,
                   .retry_max_backoff = cc.retry_max_backoff,
@@ -292,7 +287,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
                   .drain_grace = cc.drain_grace,
               },
       },
-      *wp->eviction_policy, *wp->consumer_rpc);
+      *wp->eviction_policy);
 
   wp->loader =
       std::make_unique<abyss::engine::Loader>(*wp->hot_store, *wp->cold_pool, *wp->cold_store);
@@ -518,7 +513,8 @@ int main(int argc, char** argv) {
   abyss::perf::OpFn op_fn = [&](int worker_id, std::string_view /*op_name*/, uint64_t key_index) {
     auto cmd = CanonicalSet(KeyFor(key_index), values[static_cast<size_t>(worker_id)]);
     if (!cmd.has_value()) return false;
-    auto reply = wp.engine->DispatchWrite("SET", std::move(*cmd));
+    auto reply =
+        wp.engine->DispatchWrite("SET", std::move(*cmd), abyss::core::PredicateFlags::kNone);
     return reply.has_value() && !reply->IsError();
   };
 
