@@ -5,6 +5,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "abyss/core/cold_store.h"
 
@@ -18,6 +19,12 @@ class MockColdStore : public core::ColdStore {
     using ::testing::_;
     using ::testing::Return;
     ON_CALL(*this, Checkpoint(_, _)).WillByDefault(Return(core::Result<void>{}));
+    // Unless a test says otherwise, cold holds no member asked for.
+    ON_CALL(*this, LoadMembers(_, _, _, _))
+        .WillByDefault([](std::string_view, core::KeyType,
+                          std::span<const std::string_view> members, core::SteadyTime) {
+          return core::Result<std::vector<std::optional<core::MemberValue>>>(members.size());
+        });
   }
 
   MOCK_METHOD(core::Result<core::RespValue>, Exec,
@@ -30,14 +37,14 @@ class MockColdStore : public core::ColdStore {
   MOCK_METHOD(core::Result<void>, Wipe, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::StorageStats>, Stats, (), (override));
   MOCK_METHOD(core::Result<void>, Compact, (), (override));
-  MOCK_METHOD((core::Result<std::optional<core::RespCommand>>), GetPromotionCommand,
-              (std::string_view key), (override));
   MOCK_METHOD((core::Result<std::optional<core::ColdKeyState>>), LoadKey,
               (std::string_view key, core::SteadyTime deadline), (override));
+  MOCK_METHOD((core::Result<std::optional<core::LoadedAs>>), LoadKeyAs,
+              (std::string_view key, core::KeyType type, core::SteadyTime deadline), (override));
   MOCK_METHOD((core::Result<std::optional<core::KeyMeta>>), ProbeKey,
               (std::string_view key, core::SteadyTime deadline), (override));
-  MOCK_METHOD((core::Result<std::optional<core::MemberValue>>), LoadMember,
-              (std::string_view key, core::KeyType type, std::string_view member,
+  MOCK_METHOD((core::Result<std::vector<std::optional<core::MemberValue>>>), LoadMembers,
+              (std::string_view key, core::KeyType type, std::span<const std::string_view> members,
                core::SteadyTime deadline),
               (override));
 };

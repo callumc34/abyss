@@ -22,6 +22,7 @@
 #include "abyss/core/topology_manifest.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
 #include "abyss/engine/recovery_coordinator.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
@@ -109,6 +110,7 @@ class Server {
   std::unique_ptr<consumer::ResolverPool> resolver_pool_;
   std::unique_ptr<engine::Loader> loader_;
   std::unique_ptr<engine::Sequencer> sequencer_;
+  std::unique_ptr<engine::ReadPath> read_path_;
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<engine::BoundedThreadShardScheduler> recovery_scheduler_;
   std::unique_ptr<engine::RecoveryCoordinator> recovery_coordinator_;

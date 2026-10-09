@@ -25,6 +25,7 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(std::mo
   SingleShardConfig shard_config{
       .max_memory_bytes = config_.max_memory_bytes / config_.shard_count,
       .stub_max_entries = static_cast<size_t>(stub_budget) / config_.shard_count,
+      .negative_max_entries = config_.negative_max_entries / config_.shard_count,
       .backpressure_ratio = config_.backpressure_ratio,
       .steady_clock = config_.steady_clock,
       .wall_clock = config_.wall_clock,
@@ -201,6 +202,7 @@ core::Result<core::MemoryStats> ShardedHotStore::Stats() ABYSS_NO_THREAD_SAFETY_
     total.expired_count += stats.expired_count;
     total.max_bytes += stats.max_bytes;
     total.stub_entries += stats.stub_entries;
+    total.negative_entries += stats.negative_entries;
     total.stub_bytes += stats.stub_bytes;
     total.stub_drops += stats.stub_drops;
     total.load_discards += stats.load_discards;
@@ -284,32 +286,51 @@ bool ShardedHotStore::EvictShardToTarget(core::ShardId shard) ABYSS_NO_THREAD_SA
 }
 
 LoadStart ShardedHotStore::BeginLoad(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  using Status = LoadStart::Status;
   const auto index = ShardIndex(key);
   auto& shard = *shards_[index];
   const std::unique_lock lock(shard.mutex);
   // An atomic read. Taken under the lock, it is no older than any
   // eviction behind the key's absence, as in ShardLocks.
-  if (shard.store.KnownAbsentAfterFlush(Horizon(index))) return {.status = Status::kFlushed};
-  if (const auto token = shard.store.BeginLoad(key); token.has_value()) {
-    return {.status = Status::kStarted, .token = *token};
-  }
-  return {.status = shard.store.LoadPending(key) ? Status::kPending : Status::kResident};
+  return shard.store.StartLoad(key, Horizon(index));
 }
 
-bool ShardedHotStore::CompleteLoad(std::string_view key, LoadToken token,
-                                   LoadResult&& result) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+bool ShardedHotStore::CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result) {
+  return Install(key, token, std::move(result), /*fill=*/false) == FillResult::kInstalled;
+}
+
+ShardedHotStore::FillResult ShardedHotStore::Fill(std::string_view key, LoadToken token,
+                                                  LoadResult&& result) {
+  return Install(key, token, std::move(result), /*fill=*/true);
+}
+
+ShardedHotStore::FillResult ShardedHotStore::Install(std::string_view key, LoadToken token,
+                                                     LoadResult&& result,
+                                                     bool fill) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const auto index = ShardIndex(key);
   const auto eviction = ResolveEviction(key);
-  const auto horizon = Horizon(index);
   auto& shard = *shards_[index];
-  bool installed = false;
+  const auto* full = std::get_if<LoadedFull>(&result);
+  const double budget =
+      static_cast<double>(config_.max_memory_bytes) / static_cast<double>(config_.shard_count);
+  const bool too_large = fill && full != nullptr && budget > 0 &&
+                         static_cast<double>(full->bytes) > budget * config_.fill_max_fraction;
+  Graveyard evicted;
+  FillResult outcome = FillResult::kDiscarded;
   {
     const std::unique_lock lock(shard.mutex);
-    installed = shard.store.CompleteLoad(key, token, std::move(result), eviction, horizon);
+    if (too_large || (fill && shard.store.OverBackpressure())) {
+      shard.store.AbortLoad(key, token);
+      outcome = too_large ? FillResult::kTooLarge : FillResult::kOverBackpressure;
+    } else {
+      shard.store.SetGraveyard(&evicted);
+      if (shard.store.CompleteLoad(key, token, std::move(result), eviction, Horizon(index))) {
+        outcome = FillResult::kInstalled;
+      }
+      shard.store.SetGraveyard(nullptr);
+    }
   }
   shard.load_cv.notify_all();
-  return installed;
+  return outcome;
 }
 
 size_t ShardedHotStore::CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads)
@@ -519,14 +540,8 @@ KeyView ShardLocks::View(std::string_view key, uint64_t now_ms) const {
 }
 
 LoadStart ShardLocks::BeginLoad(std::string_view key) {
-  using Status = LoadStart::Status;
   const core::ShardId shard = hot_->ShardIndex(key);
-  SingleShardStore& store = Store(shard);
-  if (store.KnownAbsentAfterFlush(horizons_[Slot(shard)])) return {.status = Status::kFlushed};
-  if (const auto token = store.BeginLoad(key); token.has_value()) {
-    return {.status = Status::kStarted, .token = *token};
-  }
-  return {.status = store.LoadPending(key) ? Status::kPending : Status::kResident};
+  return Store(shard).StartLoad(key, horizons_[Slot(shard)]);
 }
 
 size_t ShardLocks::CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads) {

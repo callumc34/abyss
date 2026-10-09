@@ -299,7 +299,7 @@ TEST_F(CompactedStateTest, HashMSetAndHashSetInterleave) {
   EXPECT_TRUE(saw_b);
 }
 
-TEST_F(CompactedStateTest, HashOverlayAccessorsReflectAbsorbs) {
+TEST_F(CompactedStateTest, HashDeltaAccessorsReflectAbsorbs) {
   state_.Absorb(WriteOp{HashSet{
       .key = "k", .fields = {{.field = "keep", .value = "v"}, {.field = "gone", .value = "v"}}}});
   state_.Absorb(WriteOp{HashDel{.key = "k", .fields = {"gone"}}});

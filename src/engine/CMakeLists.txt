@@ -1,6 +1,8 @@
 add_library(abyss_engine
   decide.cpp
+  doorkeeper.cpp
   loader.cpp
+  read_path.cpp
   sequencer.cpp
   tiering_engine.cpp
   recovery_coordinator.cpp

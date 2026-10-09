@@ -109,6 +109,10 @@ core::Result<void> ValidateHot(const HotConfig& hot) {
       hot.backpressure_ratio > 10.0) {
     return std::unexpected(InvalidArg("hot.backpressure_ratio", "must be in [1.0, 10.0]"));
   }
+  if (std::isnan(hot.fill_max_fraction) || hot.fill_max_fraction <= 0.0 ||
+      hot.fill_max_fraction > 1.0) {
+    return std::unexpected(InvalidArg("hot.fill_max_fraction", "must be in (0.0, 1.0]"));
+  }
 
   std::vector<core::EvictionRule> rules;
   rules.reserve(hot.eviction_overrides.size());

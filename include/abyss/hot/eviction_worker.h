@@ -63,6 +63,7 @@ class EvictionWorker {
   metrics::GaugeHandle hot_max_memory_bytes_;
   metrics::GaugeHandle hot_access_buffer_depth_;
   metrics::GaugeHandle hot_stub_entries_;
+  metrics::GaugeHandle hot_negative_entries_;
   metrics::GaugeHandle hot_unevictable_bytes_;
   // Last cumulative access-buffer drop count published, so each tick increments
   // the monotonic counter by only the new drops since the previous tick.

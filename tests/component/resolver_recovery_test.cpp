@@ -39,13 +39,6 @@ class EmptyBufferRouter : public CompactionBufferRouter {
                                      std::optional<core::Duration> /*deadline*/) override {
     return std::unexpected(core::Error(core::ErrorCode::kNotFound, "empty buffer (test)"));
   }
-  core::Result<core::RespValue> Read(std::string_view /*key*/) const override {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, "empty buffer (test)"));
-  }
-  BufferKeyPresence Probe(std::string_view /*key*/) const override {
-    return BufferKeyPresence::kAbsent;
-  }
-  HashOverlay HashOverlayFor(std::string_view /*key*/) const override { return HashOverlay{}; }
   std::optional<CompactedState> Snapshot(core::ShardId /*shard*/,
                                          std::string_view /*key*/) const override {
     return std::nullopt;

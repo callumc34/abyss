@@ -67,10 +67,6 @@ class CountingColdStore : public core::ColdStore {
   core::Result<void> Wipe(core::ShardId shard) override { return inner_.Wipe(shard); }
   core::Result<core::StorageStats> Stats() override { return inner_.Stats(); }
   core::Result<void> Compact() override { return inner_.Compact(); }
-  core::Result<std::optional<core::RespCommand>> GetPromotionCommand(
-      std::string_view key) override {
-    return inner_.GetPromotionCommand(key);
-  }
   core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
                                                           core::SteadyTime deadline) override {
     ++loads;
@@ -85,11 +81,19 @@ class CountingColdStore : public core::ColdStore {
     ++probes;
     return inner_.ProbeKey(key, deadline);
   }
-  core::Result<std::optional<core::MemberValue>> LoadMember(std::string_view key,
-                                                            core::KeyType type,
-                                                            std::string_view member,
-                                                            core::SteadyTime deadline) override {
-    return inner_.LoadMember(key, type, member, deadline);
+  core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
+                                                        core::SteadyTime deadline) override {
+    ++loads;
+    if (hold_loads_) {
+      entered.Open();
+      release.Wait();
+    }
+    return inner_.LoadKeyAs(key, type, deadline);
+  }
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override {
+    return inner_.LoadMembers(key, type, members, deadline);
   }
 
   void HoldLoads() { hold_loads_ = true; }
@@ -112,15 +116,6 @@ class OneBufferRouter : public consumer::CompactionBufferRouter {
   core::Result<core::RespValue> Exec(const ops::ReadOp& op,
                                      std::optional<core::Duration> /*deadline*/) override {
     return buffer_.Exec(op);
-  }
-  core::Result<core::RespValue> Read(std::string_view key) const override {
-    return buffer_.Read(std::string(key));
-  }
-  consumer::BufferKeyPresence Probe(std::string_view key) const override {
-    return buffer_.Probe(key);
-  }
-  consumer::HashOverlay HashOverlayFor(std::string_view key) const override {
-    return buffer_.HashOverlayFor(key);
   }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view key) const override {
@@ -215,7 +210,7 @@ TEST_F(LoaderComponentTest, AnUnflushedDeltaMergesOverAFlushedBase) {
   EXPECT_EQ(std::get<hot::SetValue>(Full(again).value).members, (Members{"a", "c", "d"}));
 }
 
-TEST_F(LoaderComponentTest, TheOldBufferScalarsAreWrongTheLoaderIsRight) {
+TEST_F(LoaderComponentTest, PointReadsMergeTheDeltaOverCold) {
   Flush({ops::SetAdd{.key = "set", .members = {"a", "b"}},
          ops::ZsetAdd{.key = "zset",
                       .entries = {{.score = 1, .member = "m"}, {.score = 2, .member = "n"}}}});
@@ -223,19 +218,6 @@ TEST_F(LoaderComponentTest, TheOldBufferScalarsAreWrongTheLoaderIsRight) {
   Buffer("set", ops::SetAdd{.key = "set", .members = {"c"}});
   Buffer("zset", ops::ZsetRem{.key = "zset", .members = {"n"}});
   Buffer("zset", ops::ZsetAdd{.key = "zset", .entries = {{.score = 3, .member = "o"}}});
-
-  // Today's path answers these from the delta alone (the code map's
-  // finding): {a, c} has a and two members; m still scores 1.
-  const auto old_member = buffer_.Exec(ops::ReadOp{ops::SetIsMember{.key = "set", .member = "a"}});
-  const auto old_card = buffer_.Exec(ops::ReadOp{ops::SetCard{.key = "set"}});
-  const auto old_score = buffer_.Exec(ops::ReadOp{ops::ZsetScore{.key = "zset", .member = "m"}});
-  const auto old_zcard = buffer_.Exec(ops::ReadOp{ops::ZsetCard{.key = "zset"}});
-  ASSERT_TRUE(old_member.has_value() && old_card.has_value() && old_score.has_value() &&
-              old_zcard.has_value());
-  EXPECT_EQ(old_member->AsInteger(), 0) << "wrong";
-  EXPECT_EQ(old_card->AsInteger(), 1) << "wrong";
-  EXPECT_TRUE(old_score->IsNull()) << "wrong";
-  EXPECT_EQ(old_zcard->AsInteger(), 1) << "wrong";
 
   const auto is_member = [&](std::string_view member) {
     auto r = loader_.IsMember(0, "set", member, Deadline());
@@ -270,7 +252,8 @@ TEST_F(LoaderComponentTest, TheDeadlineIsHonoured) {
 TEST_F(LoaderComponentTest, AnInstallRacedByABlindWriteDiscards) {
   Flush({ops::StringSet{.key = "k", .value = "cold"}});
   cold_.HoldLoads();
-  auto install = std::async(std::launch::async, [&] { return loader_.Install("k", Deadline()); });
+  auto install = std::async(
+      std::launch::async, [&] { return loader_.Install("k", core::KeyType::kString, Deadline()); });
   const abyss::testing::OnExit release([&] { cold_.release.Open(); });
   ASSERT_TRUE(cold_.entered.Wait());
 

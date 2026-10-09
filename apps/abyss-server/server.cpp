@@ -113,6 +113,8 @@ bool Server::Initialize() {
       .max_memory_bytes = config_.hot.max_memory_bytes,
       .shard_count = config_.hot.shard_count,
       .stub_memory_fraction = config_.hot.stub_memory_fraction,
+      .negative_max_entries = config_.hot.negative_max_entries,
+      .fill_max_fraction = config_.hot.fill_max_fraction,
       .backpressure_ratio = config_.hot.backpressure_ratio,
       // Eviction and tombstone GC wait for the shard's cold consumer to
       // drain a key. The pool is built below; until then nothing has.
@@ -224,12 +226,14 @@ bool Server::Initialize() {
                                           engine::SequencerConfig{
                                               .write_timeout = config_.engine.write_timeout,
                                           });
-  engine_ =
-      std::make_unique<engine::TieringEngine>(*hot_store_, *cold_store_, *cold_pool_, *sequencer_,
-                                              engine::TieringEngineConfig{
-                                                  .shard_count = hot_store_->shard_count(),
-                                                  .write_timeout = config_.engine.write_timeout,
-                                              });
+  read_path_ =
+      std::make_unique<engine::ReadPath>(*hot_store_, *loader_, *sequencer_,
+                                         engine::ReadPathConfig{
+                                             .write_timeout = config_.engine.write_timeout,
+                                             .fill_doorkeeper = config_.hot.fill_doorkeeper,
+                                             .fill_max_members = config_.hot.fill_max_members,
+                                         });
+  engine_ = std::make_unique<engine::TieringEngine>(*read_path_, *sequencer_);
 
   hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
       *hot_store_, hot::EvictionWorker::Config{.tick = config_.hot.eviction_tick});

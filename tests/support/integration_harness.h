@@ -16,6 +16,7 @@
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -85,14 +86,15 @@ class IntegrationHarness {
     sequencer_ =
         std::make_unique<engine::Sequencer>(*hot_, queue_, *loader_, *cold_pool_,
                                             engine::SequencerConfig{.wall_clock = clock_.WallFn()});
-    engine_ = std::make_unique<engine::TieringEngine>(
-        *hot_, *cold_, *cold_pool_, *sequencer_,
-        engine::TieringEngineConfig{.shard_count = kShardCount});
+    reads_ = std::make_unique<engine::ReadPath>(
+        *hot_, *loader_, *sequencer_, engine::ReadPathConfig{.wall_clock = clock_.WallFn()});
+    engine_ = std::make_unique<engine::TieringEngine>(*reads_, *sequencer_);
   }
 
   ~IntegrationHarness() {
     if (cold_pool_) cold_pool_->Stop();
     engine_.reset();
+    reads_.reset();
     sequencer_.reset();
     loader_.reset();
     cold_pool_.reset();
@@ -154,6 +156,7 @@ class IntegrationHarness {
   std::unique_ptr<core::ConsumerRpc> rpc_;
   std::unique_ptr<engine::Loader> loader_;
   std::unique_ptr<engine::Sequencer> sequencer_;
+  std::unique_ptr<engine::ReadPath> reads_;
   std::unique_ptr<engine::TieringEngine> engine_;
 };
 

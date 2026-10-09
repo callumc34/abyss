@@ -115,6 +115,11 @@ Result<ReadOp> ParseHkeys(const RespCommand& cmd) { return ReadOp{HashKeys{.key 
 Result<ReadOp> ParseHvals(const RespCommand& cmd) { return ReadOp{HashVals{.key = cmd.args[1]}}; }
 
 Result<ReadOp> ParseHlen(const RespCommand& cmd) { return ReadOp{HashLen{.key = cmd.args[1]}}; }
+Result<ReadOp> ParseTtl(const RespCommand& cmd) { return ReadOp{Ttl{.key = cmd.args[1]}}; }
+Result<ReadOp> ParsePttl(const RespCommand& cmd) {
+  return ReadOp{Ttl{.key = cmd.args[1], .millis = true}};
+}
+Result<ReadOp> ParseType(const RespCommand& cmd) { return ReadOp{Type{.key = cmd.args[1]}}; }
 
 // Parses the trailing `LIMIT offset count` clause starting at args[i]. On
 // success advances `i` past the clause and writes offset/count into `op`.
@@ -214,6 +219,9 @@ const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
       {"HKEYS", ParseHkeys},
       {"HVALS", ParseHvals},
       {"HLEN", ParseHlen},
+      {"TTL", ParseTtl},
+      {"PTTL", ParsePttl},
+      {"TYPE", ParseType},
       {"ZRANGE", ParseZrange},
       {"ZRANGEBYSCORE", ParseZrangeByScore},
       {"ZRANGEBYLEX", ParseZrangeByLex},

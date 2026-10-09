@@ -129,5 +129,30 @@ TEST_F(SequencerAllocTest, NothingAnApplyReplacesIsFreedUnderTheLock) {
   }
 }
 
+// A cache fill evicts to make room under the exclusive lock; what it
+// evicts is freed after the hold.
+TEST(FillAllocTest, WhatAFillEvictsIsFreedAfterTheHold) {
+  hot::SingleShardStore store{hot::SingleShardConfig{.max_memory_bytes = size_t{3} << 20}};
+  ASSERT_TRUE(store
+                  .Apply(core::ops::WriteOp{core::ops::StringSet{
+                             .key = "old", .value = std::string(size_t{1} << 20, 'o')}},
+                         core::EvictionTTL{3600}, core::kFirstSeq, hot::kAllDrained)
+                  .has_value());
+  hot::LoadResult fill = hot::MakeLoadedFull(std::string(size_t{5} << 19, 'n'), 0);
+  const auto token = store.BeginLoad("new");
+  ASSERT_TRUE(token.has_value());
+
+  const std::size_t before = BigFrees();
+  hot::Graveyard evicted;
+  store.SetGraveyard(&evicted);
+  ASSERT_TRUE(store.CompleteLoad("new", token.value_or(hot::LoadToken{}), std::move(fill),
+                                 core::EvictionTTL{3600}, hot::kAllDrained));
+  store.SetGraveyard(nullptr);
+  EXPECT_FALSE(store.HasEntry("old")) << "the fill made no room";
+  EXPECT_EQ(BigFrees(), before) << "freed under the lock";
+  evicted = {};
+  EXPECT_EQ(BigFrees(), before + 1);
+}
+
 }  // namespace
 }  // namespace abyss::engine

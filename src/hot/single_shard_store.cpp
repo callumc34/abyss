@@ -159,48 +159,6 @@ bool LexAtOrBelowMax(std::string_view member, const LexBound& max) {
   return max.exclusive ? member < max.value : member <= max.value;
 }
 
-// The single key a read op targets, or nullopt for the multi-key Exists probe
-// (which resolves presence per key rather than producing one shaped reply).
-std::optional<std::string_view> SingleKeyOf(const core::ops::ReadOp& op) {
-  return std::visit(
-      [](const auto& o) -> std::optional<std::string_view> {
-        using T = std::decay_t<decltype(o)>;
-        if constexpr (std::is_same_v<T, core::ops::Exists>) {
-          return std::nullopt;
-        } else {
-          return o.key;
-        }
-      },
-      op);
-}
-
-// The empty/nil reply a read op yields for a missing key, shaped per op — as a
-// success, so a tombstone hit answers authoritatively rather than falling through.
-core::RespValue EmptyReadResponse(const core::ops::ReadOp& op) {
-  return std::visit(
-      [](const auto& o) -> core::RespValue {
-        using T = std::decay_t<decltype(o)>;
-        if constexpr (std::is_same_v<T, core::ops::StringGet> ||
-                      std::is_same_v<T, core::ops::ZsetScore> ||
-                      std::is_same_v<T, core::ops::HashGet>) {
-          return core::RespValue::Null();
-        } else if constexpr (std::is_same_v<T, core::ops::SetIsMember> ||
-                             std::is_same_v<T, core::ops::SetCard> ||
-                             std::is_same_v<T, core::ops::ZsetCard> ||
-                             std::is_same_v<T, core::ops::HashFieldExists> ||
-                             std::is_same_v<T, core::ops::HashLen>) {
-          return core::RespValue::Integer(0);
-        } else if constexpr (std::is_same_v<T, core::ops::HashMultiGet>) {
-          return core::RespValue::Array(
-              std::vector<core::RespValue>(o.fields.size(), core::RespValue::Null()));
-        } else {
-          // SetMembers, ZsetRange, HashGetAll, HashKeys, HashVals.
-          return core::RespValue::Array({});
-        }
-      },
-      op);
-}
-
 }  // namespace
 
 size_t Entry::ApproximateBytes() const { return hot::ApproximateBytes(value); }
@@ -349,108 +307,50 @@ SingleShardStore::SingleShardStore(SingleShardConfig config)
 
 // --- Read operations (const) ---
 
-core::Result<core::RespValue> SingleShardStore::Exec(const core::ops::ReadOp& op) const {
-  // A tombstone is authoritative: the key was deleted.
-  if (const auto key = SingleKeyOf(op);
-      key.has_value() && Probe(*key) == core::HotKeyPresence::kTombstoned) {
-    return EmptyReadResponse(op);
-  }
-  return std::visit(
-      [this](const auto& o) -> core::Result<core::RespValue> {
-        using T = std::decay_t<decltype(o)>;
-        if constexpr (std::is_same_v<T, core::ops::StringGet>) {
-          return ExecStringGet(o);
-        } else if constexpr (std::is_same_v<T, core::ops::SetIsMember>) {
-          return ExecSetIsMember(o);
-        } else if constexpr (std::is_same_v<T, core::ops::SetMembers>) {
-          return ExecSetMembers(o);
-        } else if constexpr (std::is_same_v<T, core::ops::SetCard>) {
-          return ExecSetCard(o);
-        } else if constexpr (std::is_same_v<T, core::ops::ZsetScore>) {
-          return ExecZsetScore(o);
-        } else if constexpr (std::is_same_v<T, core::ops::ZsetCard>) {
-          return ExecZsetCard(o);
-        } else if constexpr (std::is_same_v<T, core::ops::ZsetRange>) {
-          return ExecZsetRange(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashGet>) {
-          return ExecHashGet(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashGetAll>) {
-          return ExecHashGetAll(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashMultiGet>) {
-          return ExecHashMultiGet(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashFieldExists>) {
-          return ExecHashFieldExists(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashKeys>) {
-          return ExecHashKeys(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashVals>) {
-          return ExecHashVals(o);
-        } else if constexpr (std::is_same_v<T, core::ops::HashLen>) {
-          return ExecHashLen(o);
-        } else if constexpr (std::is_same_v<T, core::ops::Exists>) {
-          return ExecExists(o);
-        } else {
-          return std::unexpected(
-              core::Error(core::ErrorCode::kInternal, "unsupported read operation"));
-        }
-      },
-      op);
+namespace {
+
+core::Error NotFound() { return {core::ErrorCode::kNotFound, ""}; }
+
+core::Error WrongType() {
+  return {core::ErrorCode::kWrongType, "Operation against a key holding the wrong kind of value"};
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecStringGet(
-    const core::ops::StringGet& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kString);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
+std::string_view TypeName(Entry::Type type) {
+  switch (type) {
+    case Entry::Type::kSet:
+      return "set";
+    case Entry::Type::kHash:
+      return "hash";
+    case Entry::Type::kZset:
+      return "zset";
+    case Entry::Type::kString:
+      break;
   }
-  return core::RespValue::BulkString(std::get<std::string>((*result)->value));
+  return "string";
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecSetIsMember(
-    const core::ops::SetIsMember& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kSet);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& members = std::get<SetValue>((*result)->value).members;
-  return core::RespValue::Integer(members.contains(std::string(op.member)) ? 1 : 0);
+core::RespValue ReadOf(const core::ops::StringGet& /*op*/, const std::string& value) {
+  return core::RespValue::BulkString(value);
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecSetMembers(
-    const core::ops::SetMembers& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kSet);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& members = std::get<SetValue>((*result)->value).members;
+core::RespValue ReadOf(const core::ops::SetIsMember& op, const SetValue& set) {
+  return core::RespValue::Integer(set.members.contains(std::string(op.member)) ? 1 : 0);
+}
+
+core::RespValue ReadOf(const core::ops::SetMembers& /*op*/, const SetValue& set) {
   std::vector<core::RespValue> elements;
-  elements.reserve(members.size());
-  for (const auto& m : members) {
+  elements.reserve(set.members.size());
+  for (const auto& m : set.members) {
     elements.push_back(core::RespValue::BulkString(m));
   }
   return core::RespValue::Array(std::move(elements));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecSetCard(const core::ops::SetCard& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kSet);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& members = std::get<SetValue>((*result)->value).members;
-  return core::RespValue::Integer(static_cast<int64_t>(members.size()));
+core::RespValue ReadOf(const core::ops::SetCard& /*op*/, const SetValue& set) {
+  return core::RespValue::Integer(static_cast<int64_t>(set.members.size()));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecZsetScore(
-    const core::ops::ZsetScore& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kZset);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& zset = std::get<ZsetValue>((*result)->value);
+core::RespValue ReadOf(const core::ops::ZsetScore& op, const ZsetValue& zset) {
   auto it = zset.member_scores.find(std::string(op.member));
   if (it == zset.member_scores.end()) {
     return core::RespValue::Null();
@@ -458,24 +358,11 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetScore(
   return core::RespValue::BulkString(core::FormatRespDouble(it->second));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecZsetCard(const core::ops::ZsetCard& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kZset);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& zset = std::get<ZsetValue>((*result)->value);
+core::RespValue ReadOf(const core::ops::ZsetCard& /*op*/, const ZsetValue& zset) {
   return core::RespValue::Integer(static_cast<int64_t>(zset.member_scores.size()));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
-    const core::ops::ZsetRange& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kZset);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& zset = std::get<ZsetValue>((*result)->value);
+core::Result<core::RespValue> ReadOf(const core::ops::ZsetRange& op, const ZsetValue& zset) {
   std::vector<core::RespValue> elements;
 
   if (op.by_lex) {
@@ -580,50 +467,30 @@ core::Result<core::RespValue> SingleShardStore::ExecZsetRange(
   return core::RespValue::Array(std::move(elements));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashGet(const core::ops::HashGet& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
-  auto it = fields.find(std::string(op.field));
-  if (it == fields.end()) {
+core::RespValue ReadOf(const core::ops::HashGet& op, const HashValue& hash) {
+  auto it = hash.fields.find(std::string(op.field));
+  if (it == hash.fields.end()) {
     return core::RespValue::Null();
   }
   return core::RespValue::BulkString(it->second);
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashGetAll(
-    const core::ops::HashGetAll& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
+core::RespValue ReadOf(const core::ops::HashGetAll& /*op*/, const HashValue& hash) {
   std::vector<core::RespValue> elements;
-  elements.reserve(fields.size() * 2);
-  for (const auto& [k, v] : fields) {
+  elements.reserve(hash.fields.size() * 2);
+  for (const auto& [k, v] : hash.fields) {
     elements.push_back(core::RespValue::BulkString(k));
     elements.push_back(core::RespValue::BulkString(v));
   }
   return core::RespValue::Array(std::move(elements));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashMultiGet(
-    const core::ops::HashMultiGet& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
+core::RespValue ReadOf(const core::ops::HashMultiGet& op, const HashValue& hash) {
   std::vector<core::RespValue> elements;
   elements.reserve(op.fields.size());
   for (auto field : op.fields) {
-    auto it = fields.find(std::string(field));
-    if (it == fields.end()) {
+    auto it = hash.fields.find(std::string(field));
+    if (it == hash.fields.end()) {
       elements.push_back(core::RespValue::Null());
     } else {
       elements.push_back(core::RespValue::BulkString(it->second));
@@ -632,65 +499,142 @@ core::Result<core::RespValue> SingleShardStore::ExecHashMultiGet(
   return core::RespValue::Array(std::move(elements));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashFieldExists(
-    const core::ops::HashFieldExists& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
-  return core::RespValue::Integer(fields.contains(std::string(op.field)) ? 1 : 0);
+core::RespValue ReadOf(const core::ops::HashFieldExists& op, const HashValue& hash) {
+  return core::RespValue::Integer(hash.fields.contains(std::string(op.field)) ? 1 : 0);
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashKeys(const core::ops::HashKeys& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
+core::RespValue ReadOf(const core::ops::HashKeys& /*op*/, const HashValue& hash) {
   std::vector<core::RespValue> elements;
-  elements.reserve(fields.size());
-  for (const auto& [k, _] : fields) {
+  elements.reserve(hash.fields.size());
+  for (const auto& [k, _] : hash.fields) {
     elements.push_back(core::RespValue::BulkString(k));
   }
   return core::RespValue::Array(std::move(elements));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashVals(const core::ops::HashVals& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
+core::RespValue ReadOf(const core::ops::HashVals& /*op*/, const HashValue& hash) {
   std::vector<core::RespValue> elements;
-  elements.reserve(fields.size());
-  for (const auto& [_, v] : fields) {
+  elements.reserve(hash.fields.size());
+  for (const auto& [_, v] : hash.fields) {
     elements.push_back(core::RespValue::BulkString(v));
   }
   return core::RespValue::Array(std::move(elements));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecHashLen(const core::ops::HashLen& op) const {
-  auto result = FindTypedEntry(op.key, Entry::Type::kHash);
-  if (!result.has_value()) return std::unexpected(result.error());
-  if (*result == nullptr) {
-    return std::unexpected(core::Error(core::ErrorCode::kNotFound, ""));
-  }
-  const auto& fields = std::get<HashValue>((*result)->value).fields;
-  return core::RespValue::Integer(static_cast<int64_t>(fields.size()));
+core::RespValue ReadOf(const core::ops::HashLen& /*op*/, const HashValue& hash) {
+  return core::RespValue::Integer(static_cast<int64_t>(hash.fields.size()));
 }
 
-core::Result<core::RespValue> SingleShardStore::ExecExists(const core::ops::Exists& op) const {
-  int64_t count = 0;
-  for (auto key : op.keys) {
-    if (FindLiveEntry(key) != nullptr) ++count;
+// The type a read of `Op` needs its key to hold.
+template <typename Op>
+constexpr Entry::Type ReadType() {
+  if constexpr (std::is_same_v<Op, core::ops::StringGet>) {
+    return Entry::Type::kString;
+  } else if constexpr (std::is_same_v<Op, core::ops::SetIsMember> ||
+                       std::is_same_v<Op, core::ops::SetMembers> ||
+                       std::is_same_v<Op, core::ops::SetCard>) {
+    return Entry::Type::kSet;
+  } else if constexpr (std::is_same_v<Op, core::ops::ZsetScore> ||
+                       std::is_same_v<Op, core::ops::ZsetCard> ||
+                       std::is_same_v<Op, core::ops::ZsetRange>) {
+    return Entry::Type::kZset;
+  } else {
+    return Entry::Type::kHash;
   }
-  return core::RespValue::Integer(count);
 }
 
+// `op` over `value`, which must hold a V.
+template <typename V, typename Op>
+core::Result<core::RespValue> ReadAs(const Op& op, const Value& value) {
+  const auto* typed = std::get_if<V>(&value);
+  if (typed == nullptr) return std::unexpected(WrongType());
+  return ReadOf(op, *typed);
+}
+
+}  // namespace
+
+bool IsMetaRead(const core::ops::ReadOp& op) {
+  return std::holds_alternative<core::ops::Exists>(op) ||
+         std::holds_alternative<core::ops::Ttl>(op) || std::holds_alternative<core::ops::Type>(op);
+}
+
+core::RespValue EmptyReadResponse(const core::ops::ReadOp& op) {
+  return std::visit(
+      [](const auto& o) -> core::RespValue {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, core::ops::StringGet> ||
+                      std::is_same_v<T, core::ops::ZsetScore> ||
+                      std::is_same_v<T, core::ops::HashGet>) {
+          return core::RespValue::Null();
+        } else if constexpr (std::is_same_v<T, core::ops::SetIsMember> ||
+                             std::is_same_v<T, core::ops::SetCard> ||
+                             std::is_same_v<T, core::ops::ZsetCard> ||
+                             std::is_same_v<T, core::ops::HashFieldExists> ||
+                             std::is_same_v<T, core::ops::HashLen> ||
+                             std::is_same_v<T, core::ops::Exists>) {
+          return core::RespValue::Integer(0);
+        } else if constexpr (std::is_same_v<T, core::ops::Ttl>) {
+          return core::RespValue::Integer(-2);
+        } else if constexpr (std::is_same_v<T, core::ops::Type>) {
+          return core::RespValue::SimpleString("none");
+        } else if constexpr (std::is_same_v<T, core::ops::HashMultiGet>) {
+          return core::RespValue::Array(
+              std::vector<core::RespValue>(o.fields.size(), core::RespValue::Null()));
+        } else {
+          // SetMembers, ZsetRange, HashGetAll, HashKeys, HashVals.
+          return core::RespValue::Array({});
+        }
+      },
+      op);
+}
+
+core::Result<core::RespValue> AnswerRead(const core::ops::ReadOp& op, Entry::Type type,
+                                         const Value* value, int64_t abs_ttl_ms, int64_t now_ms) {
+  return std::visit(
+      [&](const auto& o) -> core::Result<core::RespValue> {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, core::ops::Exists>) {
+          return core::RespValue::Integer(1);
+        } else if constexpr (std::is_same_v<T, core::ops::Type>) {
+          return core::RespValue::SimpleString(std::string(TypeName(type)));
+        } else if constexpr (std::is_same_v<T, core::ops::Ttl>) {
+          if (abs_ttl_ms == 0) return core::RespValue::Integer(-1);
+          const int64_t left = std::max<int64_t>(abs_ttl_ms - now_ms, 0);
+          // Redis rounds TTL to the nearest second.
+          return core::RespValue::Integer(o.millis ? left : (left + 500) / 1000);
+        } else {
+          constexpr Entry::Type kWant = ReadType<T>();
+          if (type != kWant) return std::unexpected(WrongType());
+          if (value == nullptr) return std::unexpected(NotFound());
+          if constexpr (kWant == Entry::Type::kString) {
+            return ReadAs<std::string>(o, *value);
+          } else if constexpr (kWant == Entry::Type::kSet) {
+            return ReadAs<SetValue>(o, *value);
+          } else if constexpr (kWant == Entry::Type::kZset) {
+            return ReadAs<ZsetValue>(o, *value);
+          } else {
+            return ReadAs<HashValue>(o, *value);
+          }
+        }
+      },
+      op);
+}
+
+core::Result<core::RespValue> SingleShardStore::Exec(const core::ops::ReadOp& op) const {
+  if (const auto* exists = std::get_if<core::ops::Exists>(&op)) {
+    int64_t count = 0;
+    for (auto key : exists->keys) {
+      if (FindLiveEntry(key) != nullptr) ++count;
+    }
+    return core::RespValue::Integer(count);
+  }
+  const std::string_view key = core::ops::PrimaryKey(op);
+  // A tombstone is authoritative: the key was deleted.
+  if (Probe(key) == core::HotKeyPresence::kTombstoned) return EmptyReadResponse(op);
+  const Entry* entry = FindLiveEntry(key);
+  if (entry == nullptr) return std::unexpected(NotFound());
+  return AnswerRead(op, entry->type, &entry->value, entry->abs_ttl_ms, WallMs(config_.wall_clock));
+}
 // --- Write operations ---
 
 core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& op,
@@ -1238,6 +1182,7 @@ core::MemoryStats SingleShardStore::Stats() const {
           .stub_entries = stubs_.size(),
           .stub_bytes = stubs_.bytes(),
           .stub_drops = stubs_.drops(),
+          .negative_entries = negative_entries_,
           .load_discards = load_discards_,
           .unevictable_bytes = lru_dry_ ? live_bytes_ : unevictable_bytes_,
           .backpressured = backpressured_};
@@ -1255,6 +1200,8 @@ void SingleShardStore::Wipe(core::SequenceId seq) {
   lru_dry_ = false;
   stubs_.Clear();
   loading_.clear();
+  negatives_.clear();
+  negative_entries_ = 0;
   entry_bytes_ = 0;
   live_bytes_ = 0;
   key_count_ = 0;
@@ -1271,6 +1218,18 @@ std::optional<LoadToken> SingleShardStore::BeginLoad(std::string_view key) {
   const LoadToken token{.id = ++next_load_id_};
   loading_.emplace(std::move(owned), token);
   return token;
+}
+
+LoadStart SingleShardStore::StartLoad(std::string_view key, core::SequenceId horizon) {
+  using Status = LoadStart::Status;
+  // Residency first: a key written after a Flush is resident, not
+  // absent by the floor.
+  if (HasEntry(key)) return {.status = Status::kResident};
+  if (KnownAbsentAfterFlush(horizon)) return {.status = Status::kFlushed};
+  if (const auto token = BeginLoad(key); token.has_value()) {
+    return {.status = Status::kStarted, .token = *token};
+  }
+  return {.status = Status::kPending};
 }
 
 bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result,
@@ -1301,8 +1260,10 @@ bool SingleShardStore::InstallLoad(std::string_view key, LoadToken token, LoadRe
   stubs_.Erase(key);
   auto* full = std::get_if<LoadedFull>(&installed);
   if (full == nullptr) {
-    // Drained by definition, so tombstone GC may take it.
     InsertTombstone(key, 0);
+    ++negative_entries_;
+    negatives_.emplace_back(key);
+    if (!in_batch) TrimNegatives();
     return true;
   }
 
@@ -1379,32 +1340,36 @@ KeyView SingleShardStore::View(std::string_view key, core::SequenceId horizon,
 
 SingleShardStore::ReadAnswer SingleShardStore::Read(const core::ops::ReadOp& op,
                                                     core::SequenceId horizon) const {
-  const auto* exists = std::get_if<core::ops::Exists>(&op);
-  std::string_view key;
-  if (exists != nullptr) {
+  if (const auto* exists = std::get_if<core::ops::Exists>(&op)) {
     ABYSS_DCHECK(exists->keys.size() == 1, "an existence read of more than one key");
-    key = exists->keys.front();
-  } else {
-    key = SingleKeyOf(op).value_or(std::string_view{});
   }
+  const std::string_view key = core::ops::PrimaryKey(op);
+  const int64_t now_ms = WallMs(config_.wall_clock);
+  const auto expired = [now_ms](int64_t abs_ttl_ms) {
+    return abs_ttl_ms != 0 && now_ms >= abs_ttl_ms;
+  };
   const Entry* entry = FindEntry(key);
   if (entry == nullptr) {
-    if (!KnownAbsentAfterFlush(horizon)) {
-      return {.result = std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))};
+    if (KnownAbsentAfterFlush(horizon)) {
+      return {.result = EmptyReadResponse(op), .fence = flush_seq_};
     }
-    return {.result = exists != nullptr ? core::RespValue::Integer(0) : EmptyReadResponse(op),
-            .fence = flush_seq_};
+    // A stub is current until a write or a Flush drops it.
+    if (const Stub* stub = stubs_.Find(key); stub != nullptr && IsMetaRead(op)) {
+      if (expired(stub->abs_ttl_ms)) {
+        return {.result = EmptyReadResponse(op), .fence = stub->latest_seq};
+      }
+      return {.result = AnswerRead(op, stub->type, nullptr, stub->abs_ttl_ms, now_ms),
+              .fence = stub->latest_seq};
+    }
+    return {.result = std::unexpected(NotFound())};
   }
   // A resident entry is the key's latest state, so one deleted or past
   // its TTL is absent, whatever older value buffer or cold still hold.
-  if (entry->tombstoned || IsExpiredByTtl(*entry, config_.wall_clock)) {
-    return {.result = exists != nullptr ? core::RespValue::Integer(0) : EmptyReadResponse(op),
-            .fence = entry->latest_seq};
+  if (entry->tombstoned || expired(entry->abs_ttl_ms)) {
+    return {.result = EmptyReadResponse(op), .fence = entry->latest_seq};
   }
-  if (exists != nullptr) {
-    return {.result = core::RespValue::Integer(1), .fence = entry->latest_seq};
-  }
-  return {.result = Exec(op), .fence = entry->latest_seq};
+  return {.result = AnswerRead(op, entry->type, &entry->value, entry->abs_ttl_ms, now_ms),
+          .fence = entry->latest_seq};
 }
 
 void SingleShardStore::RaiseAppendedAt(core::WallTime at) {
@@ -1453,6 +1418,7 @@ Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type
   // the slot is in the same state as a freshly inserted entry (the caller's
   // TrackInsert then accounts for the new value).
   if (!inserted && it->second.tombstoned) {
+    ForgetNegative(it->second);
     TrackRemove(it->second, key);
   }
   if (inserted || it->second.tombstoned) {
@@ -1488,20 +1454,10 @@ Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type
   return it->second;
 }
 
-core::Result<const Entry*> SingleShardStore::FindTypedEntry(std::string_view key,
-                                                            Entry::Type expected) const {
-  const auto* entry = FindLiveEntry(key);
-  if (entry == nullptr) return nullptr;
-  if (entry->type != expected) {
-    return std::unexpected(core::Error(core::ErrorCode::kWrongType,
-                                       "Operation against a key holding the wrong kind of value"));
-  }
-  return entry;
-}
-
 void SingleShardStore::RemoveEntry(const std::string& key) {
   auto it = entries_.find(key);
   if (it == entries_.end()) return;
+  ForgetNegative(it->second);
   if (!it->second.tombstoned) LruUnlink(it->second);
   TrackRemove(it->second, key);
   key_count_--;
@@ -1511,6 +1467,7 @@ void SingleShardStore::RemoveEntry(const std::string& key) {
 
 void SingleShardStore::TombstoneEntry(Entry& entry, std::string_view key, core::SequenceId seq) {
   if (entry.tombstoned) {
+    ForgetNegative(entry);
     entry.latest_seq = seq;
     return;
   }
@@ -1545,9 +1502,11 @@ core::HotKeyPresence SingleShardStore::Probe(std::string_view key) const {
 }
 
 size_t SingleShardStore::GcTombstones(core::SequenceId horizon) {
+  TrimNegatives();
   size_t reclaimed = 0;
   for (auto it = entries_.begin(); it != entries_.end();) {
-    if (it->second.tombstoned && it->second.latest_seq <= horizon) {
+    // Absent loads are the negative cache's to reclaim.
+    if (it->second.tombstoned && it->second.latest_seq != 0 && it->second.latest_seq <= horizon) {
       TrackRemove(it->second, it->first);
       it = entries_.erase(it);
       ++reclaimed;
@@ -1574,6 +1533,7 @@ void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq) {
   ABYSS_DCHECK(seq >= core::kFirstSeq, "a write applied at seq 0, which names no entry");
   const std::string owned(key);
   if (const auto it = entries_.find(owned); it != entries_.end()) {
+    ForgetNegative(it->second);
     it->second.latest_seq = seq;
     if (!it->second.tombstoned) {
       LruTouch(it->second);
@@ -1635,6 +1595,22 @@ void SingleShardStore::LruTouch(Entry& entry) {
   entry.lru_older = lru_newest_;
   lru_newest_->lru_newer = &entry;
   lru_newest_ = &entry;
+}
+
+void SingleShardStore::ForgetNegative(const Entry& entry) {
+  if (entry.tombstoned && entry.latest_seq == 0) --negative_entries_;
+}
+
+void SingleShardStore::TrimNegatives() {
+  while (negatives_.size() > config_.negative_max_entries) {
+    const auto it = entries_.find(negatives_.front());
+    negatives_.pop_front();
+    // Keys rewritten since are skipped.
+    if (it == entries_.end() || !it->second.tombstoned || it->second.latest_seq != 0) continue;
+    --negative_entries_;
+    TrackRemove(it->second, it->first);
+    entries_.erase(it);
+  }
 }
 
 void SingleShardStore::NoteEvictable(core::SequenceId latest_seq) {

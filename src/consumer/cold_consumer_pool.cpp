@@ -90,21 +90,6 @@ core::Result<core::RespValue> ColdConsumerPool::Exec(const core::ops::ReadOp& op
   return consumers_[ShardForKey(key)]->Buffer().Exec(op);
 }
 
-core::Result<core::RespValue> ColdConsumerPool::Read(std::string_view key) const {
-  const auto shard = ShardForKey(key);
-  return consumers_[shard]->Buffer().Read(std::string(key));
-}
-
-BufferKeyPresence ColdConsumerPool::Probe(std::string_view key) const {
-  const auto shard = ShardForKey(key);
-  return consumers_[shard]->Buffer().Probe(key);
-}
-
-HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {
-  const auto shard = ShardForKey(key);
-  return consumers_[shard]->Buffer().HashOverlayFor(key);
-}
-
 std::optional<CompactedState> ColdConsumerPool::Snapshot(core::ShardId shard,
                                                          std::string_view key) const {
   if (shard >= consumers_.size() || ShardForKey(key) != shard) {

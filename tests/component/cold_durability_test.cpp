@@ -129,8 +129,6 @@ std::optional<std::string> ReadCold(core::ColdStore& cold, const std::string& ke
 // assertions look like when the contract is broken.
 class NoCheckpointColdStore : public core::ColdStore {
  public:
-  using PromotionCommand = core::Result<std::optional<core::RespCommand> >;
-
   explicit NoCheckpointColdStore(core::ColdStore& inner) : inner_(inner) {}
 
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
@@ -148,9 +146,6 @@ class NoCheckpointColdStore : public core::ColdStore {
   core::Result<void> Wipe(core::ShardId shard) override { return inner_.Wipe(shard); }
   core::Result<core::StorageStats> Stats() override { return inner_.Stats(); }
   core::Result<void> Compact() override { return inner_.Compact(); }
-  PromotionCommand GetPromotionCommand(std::string_view key) override {
-    return inner_.GetPromotionCommand(key);
-  }
   core::Result<std::optional<core::ColdKeyState> > LoadKey(std::string_view key,
                                                            core::SteadyTime deadline) override {
     return inner_.LoadKey(key, deadline);
@@ -159,11 +154,14 @@ class NoCheckpointColdStore : public core::ColdStore {
                                                        core::SteadyTime deadline) override {
     return inner_.ProbeKey(key, deadline);
   }
-  core::Result<std::optional<core::MemberValue> > LoadMember(std::string_view key,
-                                                             core::KeyType type,
-                                                             std::string_view member,
-                                                             core::SteadyTime deadline) override {
-    return inner_.LoadMember(key, type, member, deadline);
+  core::Result<std::optional<core::LoadedAs> > LoadKeyAs(std::string_view key, core::KeyType type,
+                                                         core::SteadyTime deadline) override {
+    return inner_.LoadKeyAs(key, type, deadline);
+  }
+  core::Result<std::vector<std::optional<core::MemberValue> > > LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override {
+    return inner_.LoadMembers(key, type, members, deadline);
   }
 
  private:

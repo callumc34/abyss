@@ -23,38 +23,6 @@
 
 namespace abyss::consumer {
 
-// Type-agnostic verdict on a key's presence in the buffer. EXISTS-style fan-out
-// can't use Read/Exec for this — Read is string-typed (NotFound for a hash in
-// the buffer) and Exec(Exists) collapses tombstone and miss to the same zero.
-// kTombstoned must override cold so a not-yet-flushed DEL suppresses a stale
-// cold residual.
-enum class BufferKeyPresence : uint8_t {
-  kAbsent,
-  kTombstoned,
-  kPresent,
-};
-
-// Snapshot of a key's hash state in the buffer. Multi-field hash reads cannot
-// be answered from the buffer alone: the buffer represents the delta since
-// the last flush, while cold holds the prior committed state. The engine
-// pulls this overlay and merges it with cold's result for the full answer.
-struct HashOverlay {
-  enum class Kind : uint8_t {
-    // No buffer entry for this key — engine reads cold as-is.
-    kNotPresent,
-    // Buffer holds a DEL; key is dead regardless of cold's content.
-    kTombstone,
-    // Buffer holds a different type (e.g. a SET that re-typed the key);
-    // engine surfaces WRONGTYPE without consulting cold's hash records.
-    kWrongType,
-    // Buffer holds hash state; merge with cold.
-    kHash,
-  };
-  Kind kind = Kind::kNotPresent;
-  std::unordered_map<std::string, std::string> fields;
-  std::unordered_set<std::string> removed_fields;
-};
-
 // Entries selected for a flush. They stay buffered and readable until
 // EraseFlushed or Reschedule; nothing else may mutate the buffer meanwhile.
 using FlushBatch = std::vector<std::reference_wrapper<const BufferEntry>>;
@@ -75,15 +43,12 @@ class CompactionBuffer {
               core::SequenceId position, core::SequenceId carrier, uint64_t appended_at_ms)
       ABYSS_EXCLUDES(mutex_);
 
+  // EXISTS, GET, ZSCORE and HGET from the delta alone, for the resolver.
   // kNotFound signals "fall through to next tier"; tombstones surface as
   // RespValue::Null so the caller treats a buffered DEL as authoritative.
   core::Result<core::RespValue> Exec(const core::ops::ReadOp& op) const ABYSS_EXCLUDES(mutex_);
 
   core::Result<core::RespValue> Read(const std::string& key) const ABYSS_EXCLUDES(mutex_);
-
-  BufferKeyPresence Probe(std::string_view key) const ABYSS_EXCLUDES(mutex_);
-
-  HashOverlay HashOverlayFor(std::string_view key) const ABYSS_EXCLUDES(mutex_);
 
   // A copy of `key`'s compacted delta, TTL unjudged; nullopt if none.
   std::optional<CompactedState> Snapshot(std::string_view key) const ABYSS_EXCLUDES(mutex_);

@@ -30,6 +30,16 @@ struct HotConfig {
   double stub_memory_fraction = 0.02;
   // Over max_memory_bytes times this, hot reports backpressure.
   double backpressure_ratio = 1.25;
+  // A read miss fills hot only on the key's second miss in a window
+  // (TinyLFU's doorkeeper); off, every miss fills.
+  bool fill_doorkeeper = true;
+  // A member point read (SISMEMBER, HGET...) fills a collection only
+  // below this many members.
+  uint64_t fill_max_members = 1024;
+  // A fill larger than this share of a shard's budget is never made.
+  double fill_max_fraction = 0.0625;
+  // Keys held as loaded absent, a negative cache, across shards.
+  size_t negative_max_entries = 65536;
   // Queue and consumer pools are opened with the same count.
   uint32_t shard_count = 64;
   std::vector<EvictionOverride> eviction_overrides;

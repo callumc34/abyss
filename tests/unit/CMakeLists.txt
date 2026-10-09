@@ -235,6 +235,7 @@ add_executable(abyss_engine_tests
   engine/decide_multi_key_test.cpp
   engine/decide_equivalence_test.cpp
   engine/decide_registry_test.cpp
+  engine/doorkeeper_test.cpp
   engine/loader_merge_test.cpp
   engine/loader_test.cpp
   engine/sequencer_test.cpp

@@ -39,11 +39,10 @@ TEST_F(TieredReadBufferHitTest, ReadAfterHotEvictionFallsThroughToBuffer) {
   // Seed both hot and the compaction buffer for the same key. Hot serves the
   // first read; after EvictExpired() drops it from hot under a future steady
   // time, the next read falls through to the buffer and the buffer-tier hit
-  // counter advances. This exercises the buffer branch in
-  // tiering_engine.cpp::DispatchSingleKeyRead that is not naturally
-  // observable in steady-state production timing because cold's safety
-  // margin guarantees a flush before hot eviction (ADP-004 §Flush
-  // Strategy).
+  // counter advances: the buffer's delta is the whole string, so cold
+  // is never read. Not naturally observable in steady-state production
+  // timing because cold's safety margin guarantees a flush before hot
+  // eviction (ADP-004 §Flush Strategy).
   ASSERT_TRUE(harness_.SeedHot({"SET", "key_b", "v"}).has_value());
 
   // Drive cold to absorb the SET so the buffer holds it AND cold's

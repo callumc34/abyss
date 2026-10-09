@@ -30,6 +30,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
@@ -199,6 +200,7 @@ struct WritePath {
   std::unique_ptr<abyss::consumer::ColdConsumerPool> cold_pool;
   std::unique_ptr<abyss::engine::Loader> loader;
   std::unique_ptr<abyss::engine::Sequencer> sequencer;
+  std::unique_ptr<abyss::engine::ReadPath> reads;
   std::unique_ptr<abyss::engine::TieringEngine> engine;
   std::unique_ptr<abyss::hot::EvictionWorker> hot_eviction_worker;
 };
@@ -219,6 +221,8 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       .max_memory_bytes = config.hot.max_memory_bytes,
       .shard_count = config.hot.shard_count,
       .stub_memory_fraction = config.hot.stub_memory_fraction,
+      .negative_max_entries = config.hot.negative_max_entries,
+      .fill_max_fraction = config.hot.fill_max_fraction,
       .backpressure_ratio = config.hot.backpressure_ratio,
       // The cold pool is built later; until then nothing has drained.
       .drained = [path = wp.get()](abyss::core::ShardId shard) -> abyss::core::SequenceId {
@@ -297,12 +301,14 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       abyss::engine::SequencerConfig{
           .write_timeout = config.engine.write_timeout,
       });
-  wp->engine = std::make_unique<abyss::engine::TieringEngine>(
-      *wp->hot_store, *wp->cold_store, *wp->cold_pool, *wp->sequencer,
-      abyss::engine::TieringEngineConfig{
-          .shard_count = shards,
-          .write_timeout = config.engine.write_timeout,
-      });
+  wp->reads =
+      std::make_unique<abyss::engine::ReadPath>(*wp->hot_store, *wp->loader, *wp->sequencer,
+                                                abyss::engine::ReadPathConfig{
+                                                    .write_timeout = config.engine.write_timeout,
+                                                    .fill_doorkeeper = config.hot.fill_doorkeeper,
+                                                    .fill_max_members = config.hot.fill_max_members,
+                                                });
+  wp->engine = std::make_unique<abyss::engine::TieringEngine>(*wp->reads, *wp->sequencer);
 
   wp->hot_eviction_worker = std::make_unique<abyss::hot::EvictionWorker>(
       *wp->hot_store, abyss::hot::EvictionWorker::Config{.tick = config.hot.eviction_tick});

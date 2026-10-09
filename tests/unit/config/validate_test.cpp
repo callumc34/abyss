@@ -70,6 +70,19 @@ TEST(ConfigValidate, HotStubMemoryFractionRange) {
   }
 }
 
+TEST(ConfigValidate, HotFillMaxFractionRange) {
+  for (const char* bad : {"0", "-0.1", "1.5", ".nan"}) {
+    SCOPED_TRACE(bad);
+    auto cfg = Config::ParseFromYaml(std::string("hot:\n  fill_max_fraction: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value());
+    EXPECT_NE(cfg.error().message().find("hot.fill_max_fraction"), std::string::npos);
+  }
+  for (const char* good : {"0.001", "1"}) {
+    SCOPED_TRACE(good);
+    EXPECT_TRUE(Config::ParseFromYaml(std::string("hot:\n  fill_max_fraction: ") + good + "\n"));
+  }
+}
+
 TEST(ConfigValidate, HotBackpressureRatioRange) {
   for (const char* bad : {"0.99", "10.5", ".nan"}) {
     SCOPED_TRACE(bad);
