@@ -73,7 +73,7 @@ The sequencer applies every write to hot, on the calling thread, under the shard
 **Behaviour:**
 - Effects are applied by one function, which recovery's hot replayer also uses ([ADP-007](007-recovery.md) §Hot replay), so the write path and replay cannot interpret an effect differently.
 - Applying stamps each written key with its effect's seq, links it as just written with the eviction for its prefix, and drops its stub and any load in flight, which the write has made stale.
-- It judges no TTL: decide logged a `DEL` for every expired key it read.
+- It judges expiry only at the effects' own `appended_at`, the instant they were decided at, and reads no clock. A key past its TTL then is absent to them, so replay sees what the decision saw, including a key cold's sweep deleted with no `DEL` logged. Decide still logs a `DEL` for every expired key it read.
 - Decided values are moved into hot, not copied. What an apply replaces is freed after the lock is released.
 - Apply cannot fail once the effects are reserved. A decided effect that does not parse is fatal, because decide produced it. Errors such as `WRONGTYPE` are decided, replied, and logged as nothing.
 
@@ -118,7 +118,7 @@ The residency invariant ([ADP-015](015-write-path-and-durability.md) §Residency
 
 **The flush floor.** Applying a Flush wipes the shard's entries, stubs and placeholders, and records the Flush's seq. Until cold's drained seq passes it, a miss on that shard is absent, with no cold read. FLUSHDB therefore acknowledges without waiting for cold's wipe ([ADP-006](006-read-write-paths.md) §Broadcast Write Path).
 
-**Memory backpressure.** Hot may exceed `hot.max_memory_bytes` only by what cold has not drained. Backpressure is per shard: each shard's budget is `hot.max_memory_bytes` ÷ `hot.shard_count`, and once a shard is over its budget × `hot.backpressure_ratio` (default 1.25), a write to it that can grow memory waits, with every lock released, for cold to drain and hot to evict. At `engine.write_timeout_ms` it fails with `-OOM`, having logged and applied nothing. Under skew one hot shard can reject writes while hot's total memory is under `hot.max_memory_bytes`. `abyss_hot_backpressure_waits_total`, `abyss_hot_backpressure_rejections_total` and `abyss_hot_unevictable_bytes` report it.
+**Memory backpressure.** Hot may exceed `hot.max_memory_bytes` only by what cold has not drained. Backpressure is per shard: each shard's budget is `hot.max_memory_bytes` ÷ `hot.shard_count`, and once a shard is over its budget × `hot.backpressure_ratio` (default 1.25), a write to it that can grow memory waits, with every lock released, for cold to drain and hot to evict. At `engine.write_timeout_ms` it fails with `-OOM`, having logged and applied nothing. A write's memory is judged before the keys it loads go in: evicting those would only load them again, so an entry larger than a shard's limit does not refuse the writes that need it. Under skew one hot shard can reject writes while hot's total memory is under `hot.max_memory_bytes`. `abyss_hot_backpressure_waits_total`, `abyss_hot_backpressure_rejections_total` and `abyss_hot_unevictable_bytes` report it.
 
 **Cache fills.** A read miss may install the loaded key in hot ([ADP-006](006-read-write-paths.md) §Read Path), under the same token check. Hot refuses a fill larger than `hot.fill_max_fraction` of the shard's budget, any fill while the shard is over its backpressure limit, and any fill under the flush floor.
 

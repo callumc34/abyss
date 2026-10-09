@@ -50,18 +50,18 @@ bool Grows(const core::ops::WriteOp& op) {
          std::holds_alternative<core::ops::HashMSet>(op);
 }
 
-// Sets a flag for one scope, clearing it however the scope ends.
-class FlagScope {
+// Sets an instant for one scope, clearing it however the scope ends.
+class AtScope {
  public:
-  explicit FlagScope(bool& flag) : flag_(flag) { flag_ = true; }
-  FlagScope(const FlagScope&) = delete;
-  FlagScope& operator=(const FlagScope&) = delete;
-  FlagScope(FlagScope&&) = delete;
-  FlagScope& operator=(FlagScope&&) = delete;
-  ~FlagScope() { flag_ = false; }
+  AtScope(std::optional<int64_t>& at, int64_t ms) : at_(at) { at_ = ms; }
+  AtScope(const AtScope&) = delete;
+  AtScope& operator=(const AtScope&) = delete;
+  AtScope(AtScope&&) = delete;
+  AtScope& operator=(AtScope&&) = delete;
+  ~AtScope() { at_.reset(); }
 
  private:
-  bool& flag_;
+  std::optional<int64_t>& at_;
 };
 
 // One stored collection string, as ApproximateBytes counts it.
@@ -825,7 +825,7 @@ std::vector<core::RespValue> SingleShardStore::ApplyEffects(
   ABYSS_DCHECK(first_seq >= core::kFirstSeq, "effects applied from seq 0, which names no entry");
   const int64_t at_ms = WallMs(appended_at);
   const core::SteadyTime link = linked_at.has_value() ? *linked_at : config_.steady_clock();
-  const FlagScope applying(applying_effects_);
+  const AtScope applying(applying_at_ms_, at_ms);
   std::vector<core::RespValue> replies;
   replies.reserve(effects.size());
   // One hold's eviction for the whole call: an overshoot is the
@@ -851,7 +851,9 @@ std::vector<core::RespValue> SingleShardStore::ApplyEffects(
     // Decide ruled out every apply error and the effect is logged, so
     // an error here means hot and the log disagree.
     if (!result.has_value()) {
-      core::Fatal("a decided effect failed to apply: " + result.error().message());
+      core::Fatal("a decided effect failed to apply: " + result.error().message() + " (" +
+                  effect.cmd.Name() + " " + std::string(key) + " at seq " +
+                  std::to_string(first_seq + i) + ")");
     }
     replies.push_back(std::move(*result));
   }
@@ -932,7 +934,8 @@ core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& o
     const bool expired = ExpiredForApply(it->second);
     TombstoneEntry(it->second, key, seq);
     if (expired) {
-      ++expired_count_;
+      // An effect's is counted as its observed expiry.
+      if (!applying_at_ms_.has_value()) ++expired_count_;
     } else {
       ++removed;
     }
@@ -1288,10 +1291,31 @@ bool SingleShardStore::EvictLru(size_t target_bytes, core::SequenceId horizon, H
 
 bool SingleShardStore::EvictLru(size_t target_bytes, std::string_view protect_key,
                                 core::SequenceId horizon, HoldBudget& budget, size_t& evicted) {
-  if (UsedBytes() <= target_bytes || (lru_dry_ && horizon <= lru_dry_horizon_)) {
-    UpdateBackpressure();
-    return true;
+  // First what is due or dead: parked keys cold has since drained,
+  // which no list holds, then tombstones cold has absorbed.
+  if (UsedBytes() > target_bytes && parked_.size() > 0) {
+    EvictExpiredReport released;
+    const bool all = ReleaseParked(config_.steady_clock(), horizon, budget, released);
+    evicted += released.Total();
+    if (!all) return false;
   }
+  if (UsedBytes() > target_bytes) {
+    size_t reclaimed = 0;
+    if (!GcTombstones(horizon, budget, reclaimed)) return false;
+  }
+  bool done = true;
+  if (UsedBytes() > target_bytes && (!lru_dry_ || horizon > lru_dry_horizon_)) {
+    done = WalkLru(target_bytes, protect_key, horizon, budget, evicted);
+  }
+  // Keys loaded as absent go last: a full hot tier is the steady state,
+  // and trimming them first would empty the cache on every write.
+  if (done && UsedBytes() > target_bytes) done = TrimNegatives(budget, target_bytes);
+  UpdateBackpressure();
+  return done;
+}
+
+bool SingleShardStore::WalkLru(size_t target_bytes, std::string_view protect_key,
+                               core::SequenceId horizon, HoldBudget& budget, size_t& evicted) {
   lru_dry_ = false;
   // Off its list for the walk, and back at the warm end after.
   Entry* guarded = protect_key.empty() ? nullptr : FindEntry(protect_key);
@@ -1346,7 +1370,6 @@ bool SingleShardStore::EvictLru(size_t target_bytes, std::string_view protect_ke
     }
   }
   if (guarded != nullptr) LruLink(*guarded, guarded->linked_at);
-  UpdateBackpressure();
   return done;
 }
 
@@ -1632,8 +1655,9 @@ uint64_t SingleShardStore::BackpressureLimit() const {
 // --- Internal helpers ---
 
 bool SingleShardStore::ExpiredForApply(const Entry& entry) const {
-  if (applying_effects_ || entry.abs_ttl_ms == 0) return false;
-  return WallMs(config_.wall_clock) >= entry.abs_ttl_ms;
+  if (entry.abs_ttl_ms == 0) return false;
+  const int64_t now = applying_at_ms_.has_value() ? *applying_at_ms_ : WallMs(config_.wall_clock);
+  return now >= entry.abs_ttl_ms;
 }
 
 bool SingleShardStore::ExpiryIsLogged(const core::Effect& effect, std::string_view key,
@@ -1981,8 +2005,9 @@ void SingleShardStore::ForgetNegative(const Entry& entry) {
   if (entry.tombstoned && entry.latest_seq == 0) --negative_entries_;
 }
 
-bool SingleShardStore::TrimNegatives(HoldBudget& budget) {
-  while (negatives_.size() > config_.negative_max_entries) {
+bool SingleShardStore::TrimNegatives(HoldBudget& budget, size_t target) {
+  while (negatives_.size() > config_.negative_max_entries ||
+         (!negatives_.empty() && UsedBytes() > target)) {
     if (!budget.Take()) return false;
     const auto it = entries_.find(negatives_.front());
     negatives_.pop_front();

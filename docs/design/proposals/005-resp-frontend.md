@@ -311,6 +311,10 @@ Dispatch rule: every form is `kWritePath`. The predicate extractor reports `NX`,
 
 TTL option conflict detection (multiple TTL forms in one command) produces `ERR syntax error` at the frontend.
 
+An `EXAT` or `PXAT` at or before now deletes the key, as `EXPIRE` does: the sequencer logs a `DEL`, and the reply is unchanged (`OK`, or the prior value with `GET`).
+
+**Expiry boundary (deliberate deviation).** Every tier treats a key as expired once now ≥ its TTL, in milliseconds. Redis does so when it sets a TTL (`checkAlreadyExpired`), but on lookup it treats a key whose TTL equals now as live (`keyIsExpired`). Abyss uses one rule everywhere, so hot, buffer, cold and replay agree on the instant a key expires.
+
 ### Unknown Command Behaviour
 
 Two distinct layers of "unknown":

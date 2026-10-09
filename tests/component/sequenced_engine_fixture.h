@@ -53,6 +53,16 @@ struct Options {
   size_t hot_memory_bytes = size_t{64} << 20;
   size_t buffer_high_water_bytes = size_t{512} << 20;
   bool fill_doorkeeper = true;
+  double stub_memory_fraction = 0.02;
+  double backpressure_ratio = 1.25;
+  uint64_t fill_max_members = 1024;
+  std::chrono::milliseconds cold_read_deadline{5};
+  std::chrono::milliseconds cold_scan_deadline{50};
+  std::chrono::milliseconds write_timeout{5000};
+  // How often committed offsets persist, and so segments are reclaimed.
+  std::chrono::milliseconds offset_fsync_interval{std::chrono::hours{1}};
+  // Prefixes the store directories, so one test can open several.
+  std::string run;
 };
 
 // The clocks a restart's hot store and replayer read.
@@ -67,7 +77,7 @@ struct Clocks {
 class SequencedEngineTest : public ::testing::Test {
  protected:
   void Open(Options options = {}) {
-    options_ = options;
+    options_ = std::move(options);
     OpenStores();
     hot_ = NewHot();
     Rewire();
@@ -80,6 +90,9 @@ class SequencedEngineTest : public ::testing::Test {
   core::Result<void> Restart(Clocks clocks = {}, bool sample_peak = false) {
     CloseAll();
     OpenStores();
+    if (!queue_ || !cold_ || !pool_) {
+      return std::unexpected(core::Error{core::ErrorCode::kInternal, "the stores did not open"});
+    }
     hot_clocks_ = std::move(clocks);
     hot_ = NewHot();
     BoundedThreadShardScheduler scheduler(4);
@@ -111,19 +124,19 @@ class SequencedEngineTest : public ::testing::Test {
 
   void OpenStores() {
     auto queue = queue::WalQueue::Open(queue::WalConfig{
-        .wal_path = dir_.Sub("wal").string(),
+        .wal_path = dir_.Sub(options_.run + "wal").string(),
         .segment_size_bytes = options_.segment_size_bytes,
         .shard_count = options_.shards,
         .log_count = options_.log_count,
         .durability = options_.durability,
         .min_retention = 0s,
         .retention_consumers = {core::kColdConsumer},
-        .offset_fsync_interval = std::chrono::hours{1},
+        .offset_fsync_interval = options_.offset_fsync_interval,
     });
     ASSERT_TRUE(queue.has_value()) << queue.error().message();
     queue_ = std::move(*queue);
     auto cold = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
-        .data_path = dir_.Sub("cold").string(),
+        .data_path = dir_.Sub(options_.run + "cold").string(),
         .shard_count = options_.shards,
         .log_clock = [this](core::ShardId shard) -> uint64_t {
           return pool_ ? pool_->LogClockMs(shard) : 0;
@@ -148,6 +161,8 @@ class SequencedEngineTest : public ::testing::Test {
     return std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
         .max_memory_bytes = options_.hot_memory_bytes,
         .shard_count = options_.shards,
+        .stub_memory_fraction = options_.stub_memory_fraction,
+        .backpressure_ratio = options_.backpressure_ratio,
         .drained = [this](core::ShardId shard) -> core::SequenceId {
           return pool_ ? pool_->ConsumerFor(shard).LatestDrainedSeq() : 0;
         },
@@ -161,14 +176,20 @@ class SequencedEngineTest : public ::testing::Test {
     engine_.reset();
     reads_.reset();
     sequencer_.reset();
-    loader_ = std::make_unique<Loader>(*hot_, *pool_, *cold_);
     const auto wall = [this] { return wall_ ? wall_() : core::WallClock::now(); };
+    loader_ = std::make_unique<Loader>(*hot_, *pool_,
+                                       loader_cold_ != nullptr ? *loader_cold_ : *cold_, wall);
     sequencer_ = std::make_unique<Sequencer>(
-        *hot_, *queue_, *loader_, *pool_, SequencerConfig{.write_timeout = 5s, .wall_clock = wall});
-    reads_ = std::make_unique<ReadPath>(
-        *hot_, *loader_, *sequencer_,
-        ReadPathConfig{
-            .write_timeout = 5s, .fill_doorkeeper = options_.fill_doorkeeper, .wall_clock = wall});
+        *hot_, *queue_, *loader_, *pool_,
+        SequencerConfig{.write_timeout = options_.write_timeout, .wall_clock = wall});
+    reads_ =
+        std::make_unique<ReadPath>(*hot_, *loader_, *sequencer_,
+                                   ReadPathConfig{.write_timeout = options_.write_timeout,
+                                                  .cold_read_deadline = options_.cold_read_deadline,
+                                                  .cold_scan_deadline = options_.cold_scan_deadline,
+                                                  .fill_doorkeeper = options_.fill_doorkeeper,
+                                                  .fill_max_members = options_.fill_max_members,
+                                                  .wall_clock = wall});
     engine_ = std::make_unique<TieringEngine>(*reads_, *sequencer_);
   }
 
@@ -273,8 +294,10 @@ class SequencedEngineTest : public ::testing::Test {
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::TempDir dir_{"sequencer"};
-  // The sequencer's and read path's wall clock, when set.
+  // The sequencer's, read path's and loader's wall clock, when set.
   std::function<core::WallTime()> wall_;
+  // What the loader reads cold through, when set; else cold_.
+  core::ColdStore* loader_cold_ = nullptr;
   Clocks hot_clocks_;
   Options options_;
   core::EvictionPolicy policy_{core::EvictionTTL{3600}};

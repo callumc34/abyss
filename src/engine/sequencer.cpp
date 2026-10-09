@@ -210,6 +210,10 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       return (*hold)->View(key, now_ms);
     };
     Decision decision = Decide(cmd, flags, now_ms, lookup);
+    // Memory judged before this hold's loads went in: what they add is
+    // the decision's own keys, which an eviction would only send to
+    // load again.
+    bool judged = false;
 
     if (!decision.needs_load.empty()) {
       struct Owned {
@@ -263,8 +267,10 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       wall = config_.wall_clock();
       hold.reset();
       hold.emplace(*this, shards);
-      // A full load grows memory however the command reads.
-      if (full_load && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
+      // A full load grows memory however the command reads. A write
+      // that grows is judged here, before its own keys go in: a TTL
+      // load of a string brings its value too.
+      if ((full_load || grows) && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
             return (*hold)->OverBackpressure(shard);
           })) {
         for (const Owned& load : owned) (*hold)->AbortLoad(load.key, load.token);
@@ -273,6 +279,7 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
         await_memory = true;
         continue;
       }
+      judged = full_load || grows;
       for (const core::ShardId shard : shards) {
         std::vector<hot::LoadCompletion> mine;
         for (size_t i = 0; i < owned.size(); ++i) {
@@ -302,7 +309,7 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       ABYSS_DCHECK(decision.reply.has_value(), "a decision with no effect has no reply");
       return *std::move(decision.reply);
     }
-    if (grows && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
+    if (grows && !judged && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
           return (*hold)->OverBackpressure(shard);
         })) {
       Restore(std::move(decision), cmd);

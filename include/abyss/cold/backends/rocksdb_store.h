@@ -18,6 +18,10 @@
 #include "abyss/core/cold_store.h"
 #include "abyss/core/types.h"
 
+namespace rocksdb {
+class Env;
+}  // namespace rocksdb
+
 namespace abyss::cold::backends {
 
 enum class CompactionStyle : std::uint8_t {
@@ -42,6 +46,9 @@ struct RocksdbConfig {
   TtlScanner::Config ttl_scanner;
   std::optional<TtlScanner::Hooks> ttl_scanner_hooks;
   std::optional<TtlScanner::ExecutionMode> ttl_scanner_mode;
+  // The Env RocksDB runs on, borrowed; null for its default. Tests
+  // inject file-system faults through it.
+  rocksdb::Env* env = nullptr;
 };
 
 // RocksDB-backed cold store.

@@ -226,7 +226,7 @@ This section is still to come (#161). Until it lands, the calling reactor thread
 
 **The hot replayer rebuilds only complete state** ([ADP-007](007-recovery.md) §Hot replay).
 - It applies frames through the sequencer's own apply. A frame flagged `kReplacesState` ([ADP-009](009-wal-format.md)) makes its key resident, and a Flush wipes its shard and sets the flush floor; any other frame applies only to a key already resident in the rebuild, tombstones included. Otherwise the key stays non-resident, served from buffer plus cold, and its stub is dropped. Replaying a reclaimed key's tail would otherwise build a partial collection, the replay form of #163.
-- Replay reads no clock and judges no TTL. Eviction stays gated on cold's drain.
+- Replay reads no clock. Expiry is judged only at each frame's own `appended_at`, the instant its decision was made, exactly as the sequencer's apply judges it. Eviction stays gated on cold's drain.
 - Replay memory normally stays within the backpressure ratio: cold is fed first in each batch, and drained means absorbed into cold's buffer, so everything hot holds is evictable. At most one scan batch's growth can take a shard over the ratio. A shard over it with nothing evictable makes cold flush through the current frame, as a fallback that never fires on a normal log, and eviction is retried with each new batch.
 - Past a hard ceiling of twice the ratio limit per shard, recovery fails loudly, with an error naming the shard, the seq and the likely cause: cold's drained seq pinned (by a parse-poison entry, for example), or one entry larger than the shard's budget. A forced flush that fails also fails recovery.
 - Every shard must get exactly its frames, in order, or recovery fails.
