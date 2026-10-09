@@ -28,12 +28,6 @@ class CompactionBufferRouter : public core::Reader {
       const core::ops::ReadOp& op,
       std::optional<core::Duration> deadline = std::nullopt) override = 0;
 
-  virtual core::Result<core::RespValue> Read(std::string_view key) const = 0;
-
-  virtual BufferKeyPresence Probe(std::string_view key) const = 0;
-
-  virtual HashOverlay HashOverlayFor(std::string_view key) const = 0;
-
   // CompactionBuffer::Snapshot on `shard`'s buffer, which owns `key`.
   virtual std::optional<CompactedState> Snapshot(core::ShardId shard,
                                                  std::string_view key) const = 0;

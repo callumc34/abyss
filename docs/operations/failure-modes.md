@@ -230,10 +230,11 @@ both point reads and prefix scans — not just an ad-hoc wrapper.
 There are two knobs because the two access shapes have different latency budgets:
 
 - `cold_read_deadline` (default **5ms**) bounds cold **point reads** (GET/SISMEMBER/ZSCORE/HGET/
-  HMGET/HEXISTS/SCARD/ZCARD/EXISTS). This is the ADP-003 <5ms p99 cold-read SLA.
-- `cold_scan_deadline` (default **50ms**) bounds cold **collection scans** (SMEMBERS/ZRANGE/
-  HGETALL/HKEYS/HVALS), whose latency scales with cardinality. Set it generously enough to serve
-  your largest cold-resident collection.
+  HMGET/HEXISTS/EXISTS/TYPE/TTL/PTTL). This is the ADP-003 <5ms p99 cold-read SLA.
+- `cold_scan_deadline` (default **50ms**) bounds reads that load a **whole collection**
+  (SMEMBERS/ZRANGE/HGETALL/HKEYS/HVALS, and SCARD/ZCARD/HLEN, which count the merged key), whose
+  latency scales with cardinality. Set it generously enough to serve your largest cold-resident
+  collection.
 
 This is fail-closed, not best-effort truncation: a scan that overruns its deadline returns a
 timeout **error** to the client and increments `abyss_cold_scan_deadline_exceeded_total` — it

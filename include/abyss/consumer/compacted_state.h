@@ -46,17 +46,13 @@ class CompactedState {
 
   // nullopt when the buffer cannot answer (wrong type, member never seen).
   // Del-tombstones surface via IsTombstone(), not these.
-  bool HashHasField(std::string_view field) const;
   std::optional<std::string> HashFieldValue(std::string_view field) const;
-  // Snapshot accessors for multi-field hash reads
+  // The delta itself, for the loader's merge.
   const std::unordered_map<std::string, std::string>& HashFields() const { return hash_fields_; }
   const std::unordered_set<std::string>& HashRemovedFields() const { return hash_removed_fields_; }
-  bool SetHasMember(std::string_view member) const;
-  size_t SetCardinality() const { return set_members_.size(); }
   const std::unordered_set<std::string>& SetMembers() const { return set_members_; }
   const std::unordered_set<std::string>& SetRemovedMembers() const { return set_removed_members_; }
   std::optional<double> ZsetMemberScore(std::string_view member) const;
-  size_t ZsetCardinality() const { return zset_members_.size(); }
   const std::unordered_map<std::string, double>& ZsetMembers() const { return zset_members_; }
   const std::unordered_set<std::string>& ZsetRemovedMembers() const {
     return zset_removed_members_;

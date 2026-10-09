@@ -40,13 +40,6 @@ class DrainRouter : public consumer::CompactionBufferRouter {
                                      std::optional<core::Duration> /*deadline*/) override {
     return std::unexpected(core::Error{core::ErrorCode::kNotFound, ""});
   }
-  core::Result<core::RespValue> Read(std::string_view /*key*/) const override {
-    return std::unexpected(core::Error{core::ErrorCode::kNotFound, ""});
-  }
-  consumer::BufferKeyPresence Probe(std::string_view /*key*/) const override {
-    return consumer::BufferKeyPresence::kAbsent;
-  }
-  consumer::HashOverlay HashOverlayFor(std::string_view /*key*/) const override { return {}; }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view /*key*/) const override {
     return std::nullopt;

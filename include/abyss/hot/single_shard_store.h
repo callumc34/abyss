@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <list>
 #include <map>
@@ -33,6 +34,8 @@ struct SingleShardConfig {
   size_t max_memory_bytes = 0;
   // 0 disables stubs.
   size_t stub_max_entries = 0;
+  // Keys loaded as absent held as seq-0 tombstones, a negative cache.
+  size_t negative_max_entries = 1024;
   double backpressure_ratio = 1.25;
   core::SteadyClockFn steady_clock = core::DefaultSteadyClock;
   core::WallClockFn wall_clock = core::DefaultWallClock;
@@ -224,6 +227,16 @@ struct LoadedFull {
 // Measures `value`; call it off the lock.
 LoadedFull MakeLoadedFull(Value value, int64_t abs_ttl_ms);
 
+// EXISTS, TYPE, TTL or PTTL: answerable from a key's type and TTL.
+bool IsMetaRead(const core::ops::ReadOp& op);
+// The reply `op` gets for an absent key: nil, 0, -2, "none" or empty.
+core::RespValue EmptyReadResponse(const core::ops::ReadOp& op);
+// The reply `op` gets from a live key of `type`, TTL `abs_ttl_ms`,
+// holding `value`, at `now_ms`: kWrongType for a read of another type.
+// Without a value (a stub's), any other read is kNotFound.
+core::Result<core::RespValue> AnswerRead(const core::ops::ReadOp& op, Entry::Type type,
+                                         const Value* value, int64_t abs_ttl_ms, int64_t now_ms);
+
 using LoadResult = std::variant<LoadedAbsent, LoadedExists, LoadedFull>;
 
 struct LoadCompletion {
@@ -308,6 +321,9 @@ class SingleShardStore {
   // A placeholder for a load of a non-resident key, taken only when the
   // key has no entry and no load in flight. Readers see a miss.
   std::optional<LoadToken> BeginLoad(std::string_view key);
+  // BeginLoad, judged against the key's entry, then the flush floor at
+  // `horizon`, then a load in flight.
+  LoadStart StartLoad(std::string_view key, core::SequenceId horizon);
   // Installs `result` only if `token` is still the key's placeholder
   // and the key has no entry; otherwise discards it, leaving `result`
   // intact, and returns false. Absent installs a drained tombstone and
@@ -340,7 +356,7 @@ class SingleShardStore {
   // Exec of a single-key read, fenced on the answering entry's
   // latest_seq. An entry deleted or past its TTL answers absent for the
   // op's shape, as does a miss under the flush floor, fenced on the
-  // Flush. Only a key with no entry misses.
+  // Flush. A stub answers a meta read. Anything else misses.
   ReadAnswer Read(const core::ops::ReadOp& op, core::SequenceId horizon) const;
 
   // While set, applies move what they replace or remove into
@@ -358,22 +374,6 @@ class SingleShardStore {
   uint64_t LruVisitsForTesting() const { return lru_visits_; }
 
  private:
-  core::Result<core::RespValue> ExecStringGet(const core::ops::StringGet& op) const;
-  core::Result<core::RespValue> ExecSetIsMember(const core::ops::SetIsMember& op) const;
-  core::Result<core::RespValue> ExecSetMembers(const core::ops::SetMembers& op) const;
-  core::Result<core::RespValue> ExecSetCard(const core::ops::SetCard& op) const;
-  core::Result<core::RespValue> ExecZsetScore(const core::ops::ZsetScore& op) const;
-  core::Result<core::RespValue> ExecZsetCard(const core::ops::ZsetCard& op) const;
-  core::Result<core::RespValue> ExecZsetRange(const core::ops::ZsetRange& op) const;
-  core::Result<core::RespValue> ExecHashGet(const core::ops::HashGet& op) const;
-  core::Result<core::RespValue> ExecHashGetAll(const core::ops::HashGetAll& op) const;
-  core::Result<core::RespValue> ExecHashMultiGet(const core::ops::HashMultiGet& op) const;
-  core::Result<core::RespValue> ExecHashFieldExists(const core::ops::HashFieldExists& op) const;
-  core::Result<core::RespValue> ExecHashKeys(const core::ops::HashKeys& op) const;
-  core::Result<core::RespValue> ExecHashVals(const core::ops::HashVals& op) const;
-  core::Result<core::RespValue> ExecHashLen(const core::ops::HashLen& op) const;
-  core::Result<core::RespValue> ExecExists(const core::ops::Exists& op) const;
-
   // A SET's value to move in rather than copy, and whether the SET
   // replies with the string it replaces.
   struct SetMove {
@@ -408,6 +408,11 @@ class SingleShardStore {
   // Moves `value` to the graveyard, if one is set; it is then reassigned
   // or erased by the caller.
   void Bury(Value& value);
+  // Uncounts `entry` from the negative cache if it is in it: a seq-0
+  // tombstone about to be rewritten or removed.
+  void ForgetNegative(const Entry& entry);
+  // Drops the oldest absent loads past negative_max_entries.
+  void TrimNegatives();
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;
   // TTL expiry as writes see it: never while applying effects.
@@ -416,7 +421,6 @@ class SingleShardStore {
   // logs such an expiry as a DEL before the read.
   bool ExpiryIsLogged(const core::Effect& effect, std::string_view key, int64_t at_ms) const;
   Entry& GetOrCreateEntry(std::string_view key, Entry::Type type, core::EvictionTTL eviction);
-  core::Result<const Entry*> FindTypedEntry(std::string_view key, Entry::Type expected) const;
   void RemoveEntry(const std::string& key);
   // Converts a live entry into a tombstone: releases the value, drops it from
   // key_count, and stamps the delete seq. Idempotent on an existing tombstone.
@@ -455,6 +459,11 @@ class SingleShardStore {
   std::unordered_map<std::string, LoadToken> loading_;
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
+  // Keys installed as absent, oldest first, in their own FIFO so they
+  // never wait behind undrained DEL tombstones. A key rewritten since
+  // stays listed until popped.
+  std::deque<std::string> negatives_;
+  uint64_t negative_entries_ = 0;
   // The last Flush's seq; 0 for none.
   core::SequenceId flush_seq_ = 0;
   // Set while ApplyEffects runs.

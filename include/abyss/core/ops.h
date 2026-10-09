@@ -86,9 +86,19 @@ struct Exists {
   std::vector<std::string_view> keys;
 };
 
+// TTL, or PTTL when `millis`.
+struct Ttl {
+  std::string_view key;
+  bool millis = false;
+};
+
+struct Type {
+  std::string_view key;
+};
+
 using ReadOp = std::variant<StringGet, SetIsMember, SetMembers, SetCard, ZsetScore, ZsetCard,
                             ZsetRange, HashGet, HashGetAll, HashMultiGet, HashFieldExists, HashKeys,
-                            HashVals, HashLen, Exists>;
+                            HashVals, HashLen, Exists, Ttl, Type>;
 
 // --- Writes ---
 

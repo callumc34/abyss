@@ -25,6 +25,7 @@ EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
   hot_max_memory_bytes_ = reg.Gauge(metrics::names::kHotMaxMemoryBytes);
   hot_access_buffer_depth_ = reg.Gauge(metrics::names::kHotAccessBufferDepth);
   hot_stub_entries_ = reg.Gauge(metrics::names::kHotStubEntries);
+  hot_negative_entries_ = reg.Gauge(metrics::names::kHotNegativeEntries);
   hot_unevictable_bytes_ = reg.Gauge(metrics::names::kHotUnevictableBytes);
 }
 
@@ -81,6 +82,7 @@ void EvictionWorker::TickOnce() {
     hot_keys_.Set(static_cast<double>(stats->key_count));
     hot_max_memory_bytes_.Set(static_cast<double>(stats->max_bytes));
     hot_stub_entries_.Set(static_cast<double>(stats->stub_entries));
+    hot_negative_entries_.Set(static_cast<double>(stats->negative_entries));
     hot_unevictable_bytes_.Set(static_cast<double>(stats->unevictable_bytes));
     if (stats->stub_drops > reported_stub_drops_) {
       stub_drops_total_.Increment(static_cast<double>(stats->stub_drops - reported_stub_drops_));

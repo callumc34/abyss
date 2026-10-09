@@ -35,6 +35,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -107,8 +108,6 @@ class FlushStall {
 // Runs `on_apply` around every ApplyBatch: before it lands and after.
 class ApplyHookColdStore : public core::ColdStore {
  public:
-  using PromotionCommand = core::Result<std::optional<core::RespCommand>>;
-
   explicit ApplyHookColdStore(core::ColdStore& inner) : inner_(inner) {}
 
   void SetOnApply(std::function<void()> on_apply) { on_apply_ = std::move(on_apply); }
@@ -130,9 +129,6 @@ class ApplyHookColdStore : public core::ColdStore {
   core::Result<void> Wipe(core::ShardId shard) override { return inner_.Wipe(shard); }
   core::Result<core::StorageStats> Stats() override { return inner_.Stats(); }
   core::Result<void> Compact() override { return inner_.Compact(); }
-  PromotionCommand GetPromotionCommand(std::string_view key) override {
-    return inner_.GetPromotionCommand(key);
-  }
   core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
                                                           core::SteadyTime deadline) override {
     return inner_.LoadKey(key, deadline);
@@ -141,11 +137,14 @@ class ApplyHookColdStore : public core::ColdStore {
                                                       core::SteadyTime deadline) override {
     return inner_.ProbeKey(key, deadline);
   }
-  core::Result<std::optional<core::MemberValue>> LoadMember(std::string_view key,
-                                                            core::KeyType type,
-                                                            std::string_view member,
-                                                            core::SteadyTime deadline) override {
-    return inner_.LoadMember(key, type, member, deadline);
+  core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
+                                                        core::SteadyTime deadline) override {
+    return inner_.LoadKeyAs(key, type, deadline);
+  }
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override {
+    return inner_.LoadMembers(key, type, members, deadline);
   }
 
  private:
@@ -425,8 +424,8 @@ TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight)
   });
   engine::Loader loader(hot, pool, cold);
   engine::Sequencer sequencer(hot, *queue_, loader, pool, engine::SequencerConfig{});
-  engine::TieringEngine engine(hot, cold, pool, sequencer,
-                               engine::TieringEngineConfig{.shard_count = 1});
+  engine::ReadPath read_path(hot, loader, sequencer, engine::ReadPathConfig{});
+  engine::TieringEngine engine(read_path, sequencer);
   const auto get = [&engine] {
     auto read = engine.DispatchRead("GET", Cmd({"GET", "k"}));
     if (!read.has_value()) return std::string("<error>");

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -446,7 +447,8 @@ TEST_F(ResidencyTest, AbsentLoadInstallsADrainedTombstone) {
   EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
   EXPECT_EQ(store_.Stats().key_count, 0U);
   EXPECT_EQ(store_.Stats().load_discards, 0U);
-  EXPECT_EQ(store_.GcTombstones(0), 1U) << "latest_seq 0 is drained at any horizon";
+  EXPECT_EQ(store_.Stats().negative_entries, 1U);
+  EXPECT_EQ(store_.GcTombstones(core::kFirstSeq), 0U) << "the negative cache reclaims it";
 }
 
 TEST_F(ResidencyTest, BeginLoadNeedsNoEntryAndNoLoad) {
@@ -1123,6 +1125,176 @@ TEST_F(ShardedResidencyTest, AwaitLoadTimesOutWhileTheLoadIsPending) {
   EXPECT_FALSE(store_.AwaitLoad("k", start + 50ms));
   EXPECT_GE(core::SteadyClock::now() - start, 50ms);
   EXPECT_TRUE(store_.AwaitLoad("other", start)) << "no load pending";
+}
+
+// A key written after a Flush is resident: BeginLoad judges the entry
+// before the floor, in either hold.
+TEST_F(ShardedResidencyTest, AKeyWrittenAfterAFlushIsResidentNotFlushed) {
+  const core::ShardId shard = core::ComputeShard("k", store_.shard_count());
+  ASSERT_TRUE(store_.Wipe(shard, 10).has_value());
+  Set("k", 11);
+  EXPECT_EQ(store_.BeginLoad("k").status, LoadStart::Status::kResident);
+  const std::array<core::ShardId, 1> held{shard};
+  auto locks = store_.LockExclusive(held);
+  EXPECT_EQ(locks.BeginLoad("k").status, LoadStart::Status::kResident);
+}
+
+class NegativeCacheTest : public ::testing::Test {
+ protected:
+  void InstallAbsent(std::string_view key) {
+    const LoadToken token = MustBeginLoad(store_, key);
+    ASSERT_TRUE(store_.CompleteLoad(key, token, LoadedAbsent{}, kLongEviction, kAllDrained));
+  }
+  bool Negative(std::string_view key) const {
+    const KeyView view = store_.View(key, kAllDrained, 0);
+    return view.presence == KeyView::Presence::kTombstoned && view.latest_seq == 0;
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  SingleShardStore store_{SingleShardConfig{.negative_max_entries = 2}};
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+};
+
+TEST_F(NegativeCacheTest, AbsentLoadsAreAFifoBoundedByTheirCap) {
+  InstallAbsent("a");
+  InstallAbsent("b");
+  InstallAbsent("c");
+  EXPECT_FALSE(store_.HasEntry("a")) << "the oldest went first";
+  EXPECT_TRUE(Negative("b"));
+  EXPECT_TRUE(Negative("c"));
+  EXPECT_EQ(store_.Stats().negative_entries, 2U);
+}
+
+TEST_F(NegativeCacheTest, AbsentLoadsNeverWaitBehindAnUndrainedDel) {
+  ASSERT_TRUE(
+      store_.Apply(ops::WriteOp{ops::Del{.keys = {"deleted"}}}, kLongEviction, 9, 0).has_value());
+  InstallAbsent("a");
+  InstallAbsent("b");
+  InstallAbsent("c");
+  EXPECT_EQ(store_.GcTombstones(0), 0U) << "the DEL is undrained";
+  EXPECT_FALSE(store_.HasEntry("a"));
+  EXPECT_EQ(store_.Stats().negative_entries, 2U);
+  EXPECT_EQ(store_.View("deleted", 0, 0).latest_seq, 9U);
+}
+
+TEST_F(NegativeCacheTest, AWriteTakesAKeyOutOfTheCache) {
+  InstallAbsent("a");
+  ASSERT_TRUE(store_.Apply(ops::WriteOp{ops::StringSet{.key = "a", .value = "v"}}, kLongEviction, 3)
+                  .has_value());
+  InstallAbsent("b");
+  ASSERT_TRUE(store_.Apply(ops::WriteOp{ops::Del{.keys = {"b"}}}, kLongEviction, 4, 0).has_value());
+  EXPECT_EQ(store_.Stats().negative_entries, 0U);
+  InstallAbsent("c");
+  InstallAbsent("d");
+  InstallAbsent("e");
+  EXPECT_EQ(store_.Exec(ops::ReadOp{ops::StringGet{.key = "a"}})->AsString(), "v")
+      << "a rewritten key outlived its place in the FIFO";
+  EXPECT_EQ(store_.View("b", 0, 0).latest_seq, 4U) << "an undrained DEL is not the cache's";
+  EXPECT_EQ(store_.Stats().negative_entries, 2U);
+}
+
+TEST_F(NegativeCacheTest, ABatchKeepsItsAbsentLoadsUntilTheNextGc) {
+  std::vector<LoadCompletion> loads;
+  for (const auto* key : {"a", "b", "c"}) {
+    loads.push_back({.key = key, .token = MustBeginLoad(store_, key), .result = LoadedAbsent{}});
+  }
+  EXPECT_EQ(store_.CompleteLoads(loads, core::EvictionPolicy{}), 3U);
+  EXPECT_EQ(store_.Stats().negative_entries, 3U) << "decide reads every one";
+  EXPECT_EQ(store_.GcTombstones(kAllDrained), 0U);
+  EXPECT_EQ(store_.Stats().negative_entries, 2U);
+}
+
+TEST_F(ResidencyTest, AStubAnswersMetaReadsAndNothingElse) {
+  const LoadToken token = MustBeginLoad(store_, "h");
+  const int64_t ttl = WallMs(clock_) + 10'500;
+  ASSERT_TRUE(store_.CompleteLoad("h", token,
+                                  LoadedExists{.type = Entry::Type::kHash, .abs_ttl_ms = ttl},
+                                  kLongEviction, kAllDrained));
+  const auto read = [&](const ops::ReadOp& op) { return store_.Read(op, kAllDrained); };
+  const auto exists = read(ops::ReadOp{ops::Exists{.keys = {"h"}}});
+  ASSERT_TRUE(exists.result.has_value());
+  EXPECT_EQ(exists.result->AsInteger(), 1);
+  EXPECT_EQ(exists.fence, 0U);
+  EXPECT_EQ(read(ops::ReadOp{ops::Type{.key = "h"}}).result->AsString(), "hash");
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "h"}}).result->AsInteger(), 11);
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "h", .millis = true}}).result->AsInteger(), 10'500);
+  const auto field = read(ops::ReadOp{ops::HashGet{.key = "h", .field = "f"}});
+  ASSERT_FALSE(field.result.has_value());
+  EXPECT_EQ(field.result.error().code(), core::ErrorCode::kNotFound) << "a stub holds no value";
+
+  clock_.Advance(11s);
+  EXPECT_EQ(read(ops::ReadOp{ops::Exists{.keys = {"h"}}}).result->AsInteger(), 0);
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "h"}}).result->AsInteger(), -2);
+  EXPECT_EQ(read(ops::ReadOp{ops::Type{.key = "h"}}).result->AsString(), "none");
+}
+
+TEST_F(ResidencyTest, TtlAndTypeOfAResidentKey) {
+  Set("plain", core::kFirstSeq);
+  Set("timed", core::kFirstSeq + 1, static_cast<uint64_t>(WallMs(clock_) + 1'499));
+  const auto read = [&](const ops::ReadOp& op) { return store_.Read(op, kAllDrained); };
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "plain"}}).result->AsInteger(), -1);
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "timed"}}).result->AsInteger(), 1) << "rounded";
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "timed", .millis = true}}).result->AsInteger(), 1499);
+  EXPECT_EQ(read(ops::ReadOp{ops::Type{.key = "plain"}}).result->AsString(), "string");
+  EXPECT_EQ(read(ops::ReadOp{ops::Ttl{.key = "timed"}}).fence, core::kFirstSeq + 1);
+}
+
+TEST(ShardedFillTest, AFillPastTheBackpressureLimitIsDropped) {
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL * 1024,
+      .shard_count = 1,
+      .drained = [](core::ShardId) { return core::SequenceId{0}; },
+  }};
+  // Undrained, so nothing can be evicted to make room.
+  core::SequenceId seq = 0;
+  while (store.EvictShardToTarget(0)) {
+    ASSERT_LT(seq, 1000U);
+    const auto applied = store.Apply(ops::WriteOp{ops::StringSet{.key = "k" + std::to_string(seq),
+                                                                 .value = std::string(4096, 'x')}},
+                                     seq + 1);
+    EXPECT_TRUE(applied.has_value() ||
+                applied.error().code() == core::ErrorCode::kResourceExhausted);
+    ++seq;
+  }
+  const LoadToken token = MustBeginLoad(store, "fill");
+  EXPECT_EQ(store.Fill("fill", token, MakeLoadedFull(std::string("v"), 0)),
+            ShardedHotStore::FillResult::kOverBackpressure);
+  EXPECT_FALSE(store.LoadPending("fill"));
+  EXPECT_EQ(store.BeginLoad("fill").status, LoadStart::Status::kStarted) << "nothing installed";
+}
+
+TEST(ShardedFillTest, AFillOverItsShareOfTheBudgetIsNeverMade) {
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL * 1024, .shard_count = 1, .fill_max_fraction = 0.25}};
+  const LoadToken big = MustBeginLoad(store, "big");
+  EXPECT_EQ(store.Fill("big", big, MakeLoadedFull(std::string(20000, 'x'), 0)),
+            ShardedHotStore::FillResult::kTooLarge)
+      << "past a quarter of the shard's budget";
+  EXPECT_FALSE(store.LoadPending("big"));
+  const LoadToken small = MustBeginLoad(store, "small");
+  EXPECT_EQ(store.Fill("small", small, MakeLoadedFull(std::string(8000, 'x'), 0)),
+            ShardedHotStore::FillResult::kInstalled);
+  const LoadToken again = MustBeginLoad(store, "big");
+  EXPECT_TRUE(store.CompleteLoad("big", again, MakeLoadedFull(std::string(20000, 'x'), 0)))
+      << "a load decide asked for is no fill";
+}
+
+TEST(ShardedFillTest, AFillEvictsDrainedKeysToMakeRoom) {
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL * 1024, .shard_count = 1, .fill_max_fraction = 0.5}};
+  for (core::SequenceId seq = 1; seq <= 12; ++seq) {
+    EXPECT_TRUE(store
+                    .Apply(ops::WriteOp{ops::StringSet{.key = "k" + std::to_string(seq),
+                                                       .value = std::string(4096, 'x')}},
+                           seq)
+                    .has_value());
+  }
+  const auto before = store.Stats()->eviction_count;
+  const LoadToken token = MustBeginLoad(store, "fill");
+  ASSERT_EQ(store.Fill("fill", token, MakeLoadedFull(std::string(16384, 'y'), 0)),
+            ShardedHotStore::FillResult::kInstalled);
+  EXPECT_GT(store.Stats()->eviction_count, before);
+  EXPECT_LE(store.Stats()->used_bytes, 64UL * 1024);
 }
 
 }  // namespace

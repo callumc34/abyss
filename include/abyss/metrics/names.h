@@ -9,7 +9,17 @@
 namespace abyss::metrics {
 
 // Closed whitelist of permitted label keys.
-enum class LabelKey : uint8_t { kTier, kShard, kCmd, kReason, kStatus, kOp, kProto, kSubject };
+enum class LabelKey : uint8_t {
+  kTier,
+  kShard,
+  kCmd,
+  kReason,
+  kStatus,
+  kOp,
+  kProto,
+  kSubject,
+  kOutcome,
+};
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
   switch (k) {
@@ -29,6 +39,8 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "proto";
     case LabelKey::kSubject:
       return "subject";
+    case LabelKey::kOutcome:
+      return "outcome";
   }
   return {};
 }
@@ -187,6 +199,31 @@ constexpr std::string_view ToStringView(RedecideReason r) noexcept {
   return {};
 }
 
+// What became of a read's cache fill.
+enum class FillOutcome : uint8_t {
+  kInstalled,
+  kDiscarded,
+  kSkippedBackpressure,
+  kSkippedSize,
+  kFailed,
+};
+
+constexpr std::string_view ToStringView(FillOutcome o) noexcept {
+  switch (o) {
+    case FillOutcome::kInstalled:
+      return "installed";
+    case FillOutcome::kDiscarded:
+      return "discarded";
+    case FillOutcome::kSkippedBackpressure:
+      return "skipped_backpressure";
+    case FillOutcome::kSkippedSize:
+      return "skipped_size";
+    case FillOutcome::kFailed:
+      return "failed";
+  }
+  return {};
+}
+
 // Command-name label value. Values are expected to be views into the command
 // registry; never client-supplied strings.
 struct CmdLabel {
@@ -233,6 +270,10 @@ struct LabelKeyOf<RedecideReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<FillOutcome> {
+  static constexpr LabelKey value = LabelKey::kOutcome;
+};
+template <>
 struct LabelKeyOf<CmdLabel> {
   static constexpr LabelKey value = LabelKey::kCmd;
 };
@@ -262,6 +303,7 @@ inline std::string ToLabelString(BackoffReason r) { return std::string(ToStringV
 inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RedecideReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(FillOutcome o) { return std::string(ToStringView(o)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
@@ -499,6 +541,16 @@ inline constexpr GaugeDesc<> kHotAccessBufferDepth{
 inline constexpr GaugeDesc<> kHotStubEntries{
     .name = "abyss_hot_stub_entries",
     .help = "Stubs the hot store holds for evicted keys.",
+};
+
+inline constexpr CounterDesc<FillOutcome> kHotFillsTotal{
+    .name = "abyss_hot_fills_total",
+    .help = "Cache fills on read misses, by what became of each.",
+};
+
+inline constexpr GaugeDesc<> kHotNegativeEntries{
+    .name = "abyss_hot_negative_entries",
+    .help = "Keys the hot store holds as loaded absent, a negative cache.",
 };
 
 inline constexpr GaugeDesc<> kHotUnevictableBytes{

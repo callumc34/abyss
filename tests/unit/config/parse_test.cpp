@@ -18,6 +18,10 @@ hot:
   default_eviction_seconds: 86400
   stub_memory_fraction: 0.05
   backpressure_ratio: 1.5
+  fill_doorkeeper: false
+  fill_max_members: 64
+  fill_max_fraction: 0.25
+  negative_max_entries: 100
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
@@ -102,6 +106,10 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->hot.default_eviction, std::chrono::seconds{86400});
   EXPECT_DOUBLE_EQ(cfg->hot.stub_memory_fraction, 0.05);
   EXPECT_DOUBLE_EQ(cfg->hot.backpressure_ratio, 1.5);
+  EXPECT_FALSE(cfg->hot.fill_doorkeeper);
+  EXPECT_EQ(cfg->hot.fill_max_members, 64U);
+  EXPECT_DOUBLE_EQ(cfg->hot.fill_max_fraction, 0.25);
+  EXPECT_EQ(cfg->hot.negative_max_entries, 100U);
   ASSERT_EQ(cfg->hot.eviction_overrides.size(), 2U);
   EXPECT_EQ(cfg->hot.eviction_overrides[0].prefix, "session:");
   EXPECT_EQ(cfg->hot.eviction_overrides[0].eviction, std::chrono::seconds{3600});

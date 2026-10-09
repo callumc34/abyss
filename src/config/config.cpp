@@ -39,6 +39,10 @@ core::Result<void> ParseHot(const YamlCursor& cur, HotConfig& out) {
       .Optional("eviction_tick_ms", out.eviction_tick)
       .Optional("stub_memory_fraction", out.stub_memory_fraction)
       .Optional("backpressure_ratio", out.backpressure_ratio)
+      .Optional("fill_doorkeeper", out.fill_doorkeeper)
+      .Optional("fill_max_members", out.fill_max_members)
+      .Optional("fill_max_fraction", out.fill_max_fraction)
+      .Optional("negative_max_entries", out.negative_max_entries)
       .Optional("shard_count", out.shard_count)
       .OptionalSequence("eviction_overrides", out.eviction_overrides, ParseEvictionOverride)
       .Finish();

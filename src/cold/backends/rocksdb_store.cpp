@@ -26,8 +26,10 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -36,6 +38,7 @@
 
 #include "abyss/cold/format/key_codec.h"
 #include "abyss/cold/ttl_scanner.h"
+#include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_format.h"
 #include "abyss/core/resp_types.h"
@@ -322,14 +325,15 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 
   // --- Loads (ColdStore::LoadKey and friends) -----------------------------
 
-  core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
-                                                          core::SteadyTime deadline) const;
+  // Reads members only when the key holds `only`, or always without it.
+  core::Result<std::optional<core::LoadedAs>> LoadKey(std::string_view key,
+                                                      std::optional<core::KeyType> only,
+                                                      core::SteadyTime deadline) const;
   core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
                                                       core::SteadyTime deadline) const;
-  core::Result<std::optional<core::MemberValue>> LoadMember(std::string_view key,
-                                                            core::KeyType type,
-                                                            std::string_view member,
-                                                            core::SteadyTime deadline) const;
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) const;
   // kTimeout once `deadline` has passed.
   core::Result<rocksdb::ReadOptions> LoadOptions(core::SteadyTime deadline) const;
   // Fills `payload`, when given, with a string's value.
@@ -638,36 +642,18 @@ core::Result<void> RocksdbStore::Compact() {
   return {};
 }
 
-core::Result<std::optional<core::RespCommand>> RocksdbStore::GetPromotionCommand(
-    std::string_view key) {
-  // Strings only for now; collection promotion is additive here.
-  const auto encoded_key = fmt::EncodeStringKey(key, impl_->config.shard_count);
-  std::string raw;
-  auto status = impl_->db->Get(rocksdb::ReadOptions(), impl_->default_cf.get(), encoded_key, &raw);
-  if (status.IsNotFound()) return std::optional<core::RespCommand>{};
-  if (!status.ok()) return std::unexpected(FromStatus(status, "GetPromotionCommand"));
-
-  auto decoded = fmt::DecodeStringValue(raw);
-  if (!decoded.has_value()) return std::unexpected(decoded.error());
-  if (fmt::IsExpired(decoded->flags, decoded->abs_ttl_ms, impl_->NowMs())) {
-    return std::optional<core::RespCommand>{};
-  }
-
-  core::RespCommand cmd;
-  cmd.args.reserve(5);
-  cmd.args.emplace_back("SET");
-  cmd.args.emplace_back(key);
-  cmd.args.emplace_back(decoded->payload);
-  if ((decoded->flags & fmt::kFlagHasTtl) != 0) {
-    cmd.args.emplace_back("PXAT");
-    cmd.args.emplace_back(std::to_string(decoded->abs_ttl_ms));
-  }
-  return std::optional<core::RespCommand>{std::move(cmd)};
-}
-
 core::Result<std::optional<core::ColdKeyState>> RocksdbStore::LoadKey(std::string_view key,
                                                                       core::SteadyTime deadline) {
-  return impl_->LoadKey(key, deadline);
+  auto loaded = impl_->LoadKey(key, std::nullopt, deadline);
+  if (!loaded.has_value()) return std::unexpected(loaded.error());
+  if (!loaded->has_value()) return std::optional<core::ColdKeyState>{};
+  return std::optional<core::ColdKeyState>{std::get<core::ColdKeyState>(std::move(**loaded))};
+}
+
+core::Result<std::optional<core::LoadedAs>> RocksdbStore::LoadKeyAs(std::string_view key,
+                                                                    core::KeyType type,
+                                                                    core::SteadyTime deadline) {
+  return impl_->LoadKey(key, type, deadline);
 }
 
 core::Result<std::optional<core::KeyMeta>> RocksdbStore::ProbeKey(std::string_view key,
@@ -675,11 +661,10 @@ core::Result<std::optional<core::KeyMeta>> RocksdbStore::ProbeKey(std::string_vi
   return impl_->ProbeKey(key, deadline);
 }
 
-core::Result<std::optional<core::MemberValue>> RocksdbStore::LoadMember(std::string_view key,
-                                                                        core::KeyType type,
-                                                                        std::string_view member,
-                                                                        core::SteadyTime deadline) {
-  return impl_->LoadMember(key, type, member, deadline);
+core::Result<std::vector<std::optional<core::MemberValue>>> RocksdbStore::LoadMembers(
+    std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+    core::SteadyTime deadline) {
+  return impl_->LoadMembers(key, type, members, deadline);
 }
 
 core::Result<void> RocksdbStore::Start() {
@@ -728,7 +713,17 @@ core::Result<RespValue> RocksdbStore::Impl::Exec(const core::ops::ReadOp& op,
     return std::unexpected(
         core::Error(core::ErrorCode::kTimeout, "cold read deadline already elapsed"));
   }
-  return std::visit([this, &deadline](const auto& o) { return this->Handle(o, deadline); }, op);
+  return std::visit(
+      [this, &deadline](const auto& o) -> core::Result<RespValue> {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, core::ops::Ttl> || std::is_same_v<T, core::ops::Type>) {
+          // The read path answers these from ProbeKey.
+          return std::unexpected(Error(ErrorCode::kInternal, "unsupported cold read op"));
+        } else {
+          return this->Handle(o, deadline);
+        }
+      },
+      op);
 }
 
 rocksdb::ReadOptions RocksdbStore::Impl::MakeReadOptions(
@@ -752,6 +747,7 @@ core::Result<rocksdb::ReadOptions> RocksdbStore::Impl::LoadOptions(
   const auto now = config.steady_clock();
   if (now >= deadline) return std::unexpected(LoadTimeout());
   rocksdb::ReadOptions ro;
+  // RocksDB's deadline is wall-clock microseconds (Env time), by contract.
   const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::system_clock::now().time_since_epoch());
   ro.deadline = wall_us + std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
@@ -776,27 +772,31 @@ core::Result<std::optional<core::KeyMeta>> RocksdbStore::Impl::ReadKeyMeta(
   rocksdb::DB& base = *db;
   base.MultiGet(ro, default_cf.get(), kRecords, keys.data(), values.data(), statuses.data());
 
+  std::optional<core::KeyMeta> meta;
   for (size_t i = 0; i < kRecords; ++i) {
     const auto& status = statuses.at(i);
     if (status.IsNotFound()) continue;
     if (!status.ok()) return std::unexpected(FromStatus(status, "probe key"));
+    // A write of one type clears the others in the same batch.
+    ABYSS_DCHECK(!meta.has_value(), "a cold key holds records of two types");
     const auto type = static_cast<core::KeyType>(i);
     const std::string_view raw = ToSv(values.at(i));
     if (type == core::KeyType::kString) {
       auto decoded = fmt::DecodeStringValue(raw);
       if (!decoded.has_value()) return std::unexpected(decoded.error());
       if (payload != nullptr) payload->assign(decoded->payload);
-      return core::KeyMeta{.type = type,
+      meta = core::KeyMeta{.type = type,
                            .abs_ttl_ms = LoadedTtl(decoded->flags, decoded->abs_ttl_ms),
                            .cardinality = 1};
+      continue;
     }
     auto decoded = fmt::DecodeMetaValue(raw);
     if (!decoded.has_value()) return std::unexpected(decoded.error());
-    return core::KeyMeta{.type = type,
+    meta = core::KeyMeta{.type = type,
                          .abs_ttl_ms = LoadedTtl(decoded->flags, decoded->abs_ttl_ms),
                          .cardinality = decoded->cardinality};
   }
-  return std::optional<core::KeyMeta>{};
+  return meta;
 }
 
 core::Result<std::optional<core::KeyMeta>> RocksdbStore::Impl::ProbeKey(
@@ -826,8 +826,8 @@ core::Result<void> RocksdbStore::Impl::LoadPrefix(rocksdb::ReadOptions ro, std::
   return {};
 }
 
-core::Result<std::optional<core::ColdKeyState>> RocksdbStore::Impl::LoadKey(
-    std::string_view key, core::SteadyTime deadline) const {
+core::Result<std::optional<core::LoadedAs>> RocksdbStore::Impl::LoadKey(
+    std::string_view key, std::optional<core::KeyType> only, core::SteadyTime deadline) const {
   auto ro = LoadOptions(deadline);
   if (!ro.has_value()) return std::unexpected(ro.error());
   // One view across the meta read and the member scan.
@@ -837,7 +837,8 @@ core::Result<std::optional<core::ColdKeyState>> RocksdbStore::Impl::LoadKey(
   std::string payload;
   auto meta = ReadKeyMeta(*ro, key, &payload);
   if (!meta.has_value()) return std::unexpected(meta.error());
-  if (!meta->has_value()) return std::optional<core::ColdKeyState>{};
+  if (!meta->has_value()) return std::optional<core::LoadedAs>{};
+  if (only.has_value() && (*meta)->type != *only) return std::optional<core::LoadedAs>{**meta};
   core::ColdKeyState state{.type = (*meta)->type, .abs_ttl_ms = (*meta)->abs_ttl_ms};
   const auto cardinality = static_cast<size_t>((*meta)->cardinality);
 
@@ -882,42 +883,64 @@ core::Result<std::optional<core::ColdKeyState>> RocksdbStore::Impl::LoadKey(
     }
   }
   if (!scanned.has_value()) return std::unexpected(scanned.error());
-  return std::optional<core::ColdKeyState>{std::move(state)};
+  return std::optional<core::LoadedAs>{std::move(state)};
 }
 
-core::Result<std::optional<core::MemberValue>> RocksdbStore::Impl::LoadMember(
-    std::string_view key, core::KeyType type, std::string_view member,
+core::Result<std::vector<std::optional<core::MemberValue>>> RocksdbStore::Impl::LoadMembers(
+    std::string_view key, core::KeyType type, std::span<const std::string_view> members,
     core::SteadyTime deadline) const {
   if (type == core::KeyType::kString) {
     return std::unexpected(Error(ErrorCode::kInvalidArgument, "a string has no members"));
   }
   auto ro = LoadOptions(deadline);
   if (!ro.has_value()) return std::unexpected(ro.error());
-  std::string encoded;
-  switch (type) {
-    case core::KeyType::kSet:
-      encoded = fmt::EncodeSetMemberKey(key, member, config.shard_count);
-      break;
-    case core::KeyType::kHash:
-      encoded = fmt::EncodeHashFieldKey(key, member, config.shard_count);
-      break;
-    case core::KeyType::kZset:
-      encoded = fmt::EncodeZsetMemberKey(key, member, config.shard_count);
-      break;
-    case core::KeyType::kString:
-      break;
+  std::vector<std::string> encoded;
+  encoded.reserve(members.size());
+  for (const auto member : members) {
+    switch (type) {
+      case core::KeyType::kSet:
+        encoded.push_back(fmt::EncodeSetMemberKey(key, member, config.shard_count));
+        break;
+      case core::KeyType::kHash:
+        encoded.push_back(fmt::EncodeHashFieldKey(key, member, config.shard_count));
+        break;
+      case core::KeyType::kZset:
+        encoded.push_back(fmt::EncodeZsetMemberKey(key, member, config.shard_count));
+        break;
+      case core::KeyType::kString:
+        break;
+    }
   }
-  std::string raw;
-  const auto status = db->Get(*ro, default_cf.get(), encoded, &raw);
-  if (status.IsNotFound()) return std::optional<core::MemberValue>{};
-  if (!status.ok()) return std::unexpected(FromStatus(status, "load member"));
-  if (type == core::KeyType::kHash) return std::optional<core::MemberValue>{std::move(raw)};
-  if (type == core::KeyType::kZset) {
-    auto score = DecodeZsetMemberScore(raw);
-    if (!score.has_value()) return std::unexpected(score.error());
-    return std::optional<core::MemberValue>{*score};
+  std::vector<rocksdb::Slice> keys;
+  keys.reserve(encoded.size());
+  for (const auto& k : encoded) keys.push_back(ToSlice(k));
+  std::vector<rocksdb::PinnableSlice> values(keys.size());
+  std::vector<rocksdb::Status> statuses(keys.size());
+  rocksdb::DB& base = *db;
+  base.MultiGet(*ro, default_cf.get(), keys.size(), keys.data(), values.data(), statuses.data());
+
+  std::vector<std::optional<core::MemberValue>> out(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (statuses[i].IsNotFound()) continue;
+    if (!statuses[i].ok()) return std::unexpected(FromStatus(statuses[i], "load members"));
+    const std::string_view raw = ToSv(values[i]);
+    switch (type) {
+      case core::KeyType::kHash:
+        out[i] = std::string(raw);
+        break;
+      case core::KeyType::kZset: {
+        auto score = DecodeZsetMemberScore(raw);
+        if (!score.has_value()) return std::unexpected(score.error());
+        out[i] = *score;
+        break;
+      }
+      case core::KeyType::kSet:
+      case core::KeyType::kString:
+        out[i] = std::monostate{};
+        break;
+    }
   }
-  return std::optional<core::MemberValue>{std::monostate{}};
+  return out;
 }
 
 core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::WriteOp> ops,

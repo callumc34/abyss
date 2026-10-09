@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <random>
@@ -17,7 +16,6 @@ namespace {
 
 using namespace std::chrono_literals;
 using core::ops::Del;
-using core::ops::HashDel;
 using core::ops::HashSet;
 using core::ops::SetAdd;
 using core::ops::StringSet;
@@ -639,10 +637,9 @@ TEST_F(CompactionBufferTest, SelectedEntriesStayReadable) {
   auto read = buffer_.Read("s");
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "v");
-  const auto overlay = buffer_.HashOverlayFor("h");
-  ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
-  EXPECT_EQ(overlay.fields.at("f"), "1");
-  EXPECT_EQ(buffer_.Probe("s"), BufferKeyPresence::kPresent);
+  const auto hash = buffer_.Snapshot("h");
+  ASSERT_TRUE(hash.has_value());
+  EXPECT_EQ(hash.value_or(CompactedState{}).HashFields().at("f"), "1");
   EXPECT_EQ(buffer_.OldestPendingSeq(), std::optional<core::SequenceId>{2});
   EXPECT_GT(buffer_.BytesEstimate(), 0U);
 }
@@ -897,75 +894,6 @@ TEST_F(CompactionBufferTest, KeyWithTwoLiveHeapEntriesIsSelectedOnce) {
   EXPECT_EQ(buf.Size(), 0U);
 }
 
-// ---------------------------------------------------------------------------
-// HashOverlay: snapshot accessor consumed by the engine merge path
-// ---------------------------------------------------------------------------
-
-TEST_F(CompactionBufferTest, HashOverlayReturnsNotPresentForAbsentKey) {
-  EXPECT_EQ(buffer_.HashOverlayFor("missing").kind, HashOverlay::Kind::kNotPresent);
-}
-
-TEST_F(CompactionBufferTest, HashOverlayReturnsHashStateAfterHashSet) {
-  buffer_.Absorb(
-      "h",
-      WriteOp{HashSet{.key = "h",
-                      .fields = {{.field = "a", .value = "1"}, {.field = "b", .value = "2"}}}},
-      kDefaultEviction, 1, 1, 0);
-  const auto overlay = buffer_.HashOverlayFor("h");
-  ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
-  EXPECT_EQ(overlay.fields.size(), 2);
-  EXPECT_EQ(overlay.fields.at("a"), "1");
-  EXPECT_EQ(overlay.fields.at("b"), "2");
-  EXPECT_TRUE(overlay.removed_fields.empty());
-}
-
-TEST_F(CompactionBufferTest, HashOverlayTracksRemovedFields) {
-  buffer_.Absorb("h",
-                 WriteOp{HashSet{
-                     .key = "h",
-                     .fields = {{.field = "keep", .value = "v"}, {.field = "gone", .value = "v"}}}},
-                 kDefaultEviction, 1, 1, 0);
-  buffer_.Absorb("h", WriteOp{HashDel{.key = "h", .fields = {"gone"}}}, kDefaultEviction, 1, 1, 0);
-
-  const auto overlay = buffer_.HashOverlayFor("h");
-  ASSERT_EQ(overlay.kind, HashOverlay::Kind::kHash);
-  EXPECT_EQ(overlay.fields.size(), 1);
-  EXPECT_TRUE(overlay.fields.contains("keep"));
-  EXPECT_FALSE(overlay.fields.contains("gone"));
-  ASSERT_EQ(overlay.removed_fields.size(), 1);
-  EXPECT_TRUE(overlay.removed_fields.contains("gone"));
-}
-
-TEST_F(CompactionBufferTest, HashOverlayTombstoneAfterDel) {
-  buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "a", .value = "1"}}}},
-                 kDefaultEviction, 1, 1, 0);
-  AbsorbDel("h");
-  EXPECT_EQ(buffer_.HashOverlayFor("h").kind, HashOverlay::Kind::kTombstone);
-}
-
-TEST_F(CompactionBufferTest, HashOverlayWrongTypeWhenKeyIsString) {
-  AbsorbString("h", "scalar");
-  EXPECT_EQ(buffer_.HashOverlayFor("h").kind, HashOverlay::Kind::kWrongType);
-}
-
-TEST_F(CompactionBufferTest, MultiFieldHashReadsDeferToEngine) {
-  buffer_.Absorb("h", WriteOp{HashSet{.key = "h", .fields = {{.field = "a", .value = "1"}}}},
-                 kDefaultEviction, 1, 1, 0);
-  const std::array<core::ops::ReadOp, 6> ops{
-      core::ops::ReadOp{core::ops::HashGetAll{.key = "h"}},
-      core::ops::ReadOp{core::ops::HashKeys{.key = "h"}},
-      core::ops::ReadOp{core::ops::HashVals{.key = "h"}},
-      core::ops::ReadOp{core::ops::HashLen{.key = "h"}},
-      core::ops::ReadOp{core::ops::HashMultiGet{.key = "h", .fields = {"a"}}},
-      core::ops::ReadOp{core::ops::HashFieldExists{.key = "h", .field = "a"}},
-  };
-  for (const auto& op : ops) {
-    auto r = buffer_.Exec(op);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error().code(), core::ErrorCode::kNotFound);
-  }
-}
-
 TEST_F(CompactionBufferTest, ClearDropsEntriesAndHeap) {
   const auto eviction = core::EvictionTTL{3600};
   buffer_.Absorb("s", WriteOp{StringSet{.key = "s", .value = "v"}}, eviction, 1, 1, 0);
@@ -1076,7 +1004,8 @@ TEST_F(CompactionBufferTest, SnapshotCopiesTheDeltaWithItsTtlUnjudged) {
   EXPECT_EQ(state.SetRemovedMembers(), (std::unordered_set<std::string>{"b"}));
   EXPECT_EQ(state.Ttl(), CompactedState::TtlIntent::kSetTo);
   EXPECT_EQ(state.AbsTtlMs(), 1U);
-  EXPECT_EQ(buffer_.Probe("s"), BufferKeyPresence::kTombstoned) << "reads judge the TTL";
+  EXPECT_EQ(buffer_.Exec(core::ops::ReadOp{core::ops::Exists{.keys = {"s"}}})->AsInteger(), 0)
+      << "reads judge the TTL";
 
   buffer_.Absorb("s", WriteOp{SetAdd{.key = "s", .members = {"c"}}}, kDefaultEviction, 4, 4, 0);
   EXPECT_FALSE(state.SetMembers().contains("c")) << "a copy, not a view";

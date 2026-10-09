@@ -66,15 +66,15 @@ class RocksdbStore : public core::ColdStore {
   core::Result<void> Wipe(core::ShardId shard) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
-  core::Result<std::optional<core::RespCommand>> GetPromotionCommand(std::string_view key) override;
   core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
                                                           core::SteadyTime deadline) override;
+  core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
+                                                        core::SteadyTime deadline) override;
   core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
                                                       core::SteadyTime deadline) override;
-  core::Result<std::optional<core::MemberValue>> LoadMember(std::string_view key,
-                                                            core::KeyType type,
-                                                            std::string_view member,
-                                                            core::SteadyTime deadline) override;
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override;
 
   // DEL returns the count of keys that existed before deletion.
   core::Result<core::RespValue> ExecDel(const core::ops::Del& op);

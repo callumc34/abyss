@@ -27,7 +27,7 @@ using namespace std::chrono_literals;
 //           cold lazy-expiry bumps kTtlExpiredTotal{cold} on read.
 //   integration (this file) — the engine routes correctly through the queue,
 //           hot store, compaction buffer, and cold store for each scenario,
-//           for strings + every collection that has a promotion-or-read path.
+//           for strings + every collection.
 //   system — same scenarios end-to-end through the abyss-server binary.
 class TwoTtlIntegrationTest : public ::testing::Test {
  protected:
@@ -259,19 +259,15 @@ TEST_F(TwoTtlIntegrationTest, S3_StringEvictsThenTtlExpires) {
   ASSERT_TRUE(r2.has_value());
   EXPECT_EQ(r2->AsString(), "v") << "evicted key still readable from cold";
 
-  // Drain the promotion's queue entry through to cold so the next eviction
-  // pass can find any promoted hot residue. (Strings have a promotion path;
-  // collections currently do not — see RocksdbStore::GetPromotionCommand.)
   DrainAndFlushCold("ev_short:k");
 
   // Advance further. Total wall = 6s, past the 5s TTL. Total steady = 6s,
-  // past the eviction window (refreshed by the promotion-induced re-apply
-  // in hot, but TTL is unmoved).
+  // past the eviction window; a cache fill keeps the key's TTL.
   harness_.Clock().Advance(3s);
 
   auto r3 = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ev_short:k"}));
   ASSERT_TRUE(r3.has_value());
-  EXPECT_TRUE(r3->IsNull()) << "TTL must take the key entirely after promotion+TTL elapsed";
+  EXPECT_TRUE(r3->IsNull()) << "TTL must take the key entirely once it elapsed";
 }
 
 TEST_F(TwoTtlIntegrationTest, S3_SetEvictsThenTtlExpires) {

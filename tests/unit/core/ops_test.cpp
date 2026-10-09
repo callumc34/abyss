@@ -25,6 +25,24 @@ TEST(ParseReadOpTest, MgetNotRegistered) {
   EXPECT_FALSE(ParseReadOp("MGET", cmd).has_value());
 }
 
+TEST(ParseReadOpTest, ParsesTtlPttlAndType) {
+  const RespCommand ttl{{"TTL", "k"}};
+  const RespCommand pttl{{"PTTL", "k"}};
+  const RespCommand type{{"TYPE", "k"}};
+  auto ttl_op = ParseReadOp("TTL", ttl);
+  auto pttl_op = ParseReadOp("PTTL", pttl);
+  auto type_op = ParseReadOp("TYPE", type);
+  ASSERT_TRUE(ttl_op.has_value() && pttl_op.has_value() && type_op.has_value());
+  const auto* seconds = std::get_if<Ttl>(&*ttl_op);
+  const auto* millis = std::get_if<Ttl>(&*pttl_op);
+  ASSERT_NE(seconds, nullptr);
+  ASSERT_NE(millis, nullptr);
+  EXPECT_FALSE(seconds->millis);
+  EXPECT_TRUE(millis->millis);
+  EXPECT_EQ(PrimaryKey(*type_op), "k");
+  EXPECT_TRUE(std::holds_alternative<Type>(*type_op));
+}
+
 TEST(ParseReadOpTest, ParsesSismember) {
   RespCommand cmd{{"SISMEMBER", "myset", "member"}};
   auto op = ParseReadOp("SISMEMBER", cmd);

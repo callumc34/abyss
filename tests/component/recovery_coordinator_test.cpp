@@ -125,10 +125,6 @@ class MemoryColdStore : public core::ColdStore {
 
   core::Result<core::StorageStats> Stats() override { return core::StorageStats{}; }
   core::Result<void> Compact() override { return {}; }
-  core::Result<std::optional<core::RespCommand>> GetPromotionCommand(
-      std::string_view /*key*/) override {
-    return std::nullopt;
-  }
   // Every key held here loads as its last string.
   core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
                                                           core::SteadyTime /*deadline*/) override {
@@ -143,10 +139,19 @@ class MemoryColdStore : public core::ColdStore {
     if (!state_.contains(std::string(key))) return std::nullopt;
     return core::KeyMeta{.type = core::KeyType::kString, .cardinality = 1};
   }
-  core::Result<std::optional<core::MemberValue>> LoadMember(
-      std::string_view /*key*/, core::KeyType /*type*/, std::string_view /*member*/,
+  core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
+                                                        core::SteadyTime deadline) override {
+    auto loaded = LoadKey(key, deadline);
+    if (!loaded.has_value() || !loaded->has_value()) return std::nullopt;
+    if (type != core::KeyType::kString) {
+      return core::LoadedAs{core::KeyMeta{.type = core::KeyType::kString, .cardinality = 1}};
+    }
+    return core::LoadedAs{**std::move(loaded)};
+  }
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view /*key*/, core::KeyType /*type*/, std::span<const std::string_view> members,
       core::SteadyTime /*deadline*/) override {
-    return std::nullopt;
+    return std::vector<std::optional<core::MemberValue>>(members.size());
   }
 
   std::map<std::string, Value> State() const {

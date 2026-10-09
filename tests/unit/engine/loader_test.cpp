@@ -7,7 +7,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -45,7 +47,8 @@ using Presence = hot::KeyView::Presence;
 
 using ProbeResult = core::Result<std::optional<core::KeyMeta>>;
 using LoadKeyResult = core::Result<std::optional<core::ColdKeyState>>;
-using MemberResult = core::Result<std::optional<core::MemberValue>>;
+using LoadAsResult = core::Result<std::optional<core::LoadedAs>>;
+using MembersResult = core::Result<std::vector<std::optional<core::MemberValue>>>;
 
 constexpr core::EvictionTTL kEviction{3600};
 constexpr int64_t kNowMs = 1'000'000;
@@ -63,15 +66,6 @@ class OneBufferRouter : public consumer::CompactionBufferRouter {
   core::Result<core::RespValue> Exec(const ops::ReadOp& op,
                                      std::optional<core::Duration> /*deadline*/) override {
     return buffer_.Exec(op);
-  }
-  core::Result<core::RespValue> Read(std::string_view key) const override {
-    return buffer_.Read(std::string(key));
-  }
-  consumer::BufferKeyPresence Probe(std::string_view key) const override {
-    return buffer_.Probe(key);
-  }
-  consumer::HashOverlay HashOverlayFor(std::string_view key) const override {
-    return buffer_.HashOverlayFor(key);
   }
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view key) const override {
@@ -284,7 +278,7 @@ TEST_F(LoaderTest, APointReadTheDeltaDecidesReadsNoCold) {
   Buffer("h", ops::Del{.keys = {"h"}});
   Buffer("h", ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "1"}}});
   EXPECT_CALL(cold_, ProbeKey(_, _)).Times(0);
-  EXPECT_CALL(cold_, LoadMember(_, _, _, _)).Times(0);
+  EXPECT_CALL(cold_, LoadMembers(_, _, _, _)).Times(0);
 
   EXPECT_TRUE(Ok(loader_.IsMember(0, "s", "a", Deadline())));
   EXPECT_FALSE(Ok(loader_.IsMember(0, "gone", "a", Deadline())));
@@ -297,7 +291,7 @@ TEST_F(LoaderTest, ARemovedMemberIsAbsentWithoutAMemberRead) {
   Buffer("s", ops::SetRem{.key = "s", .members = {"a"}});
   EXPECT_CALL(cold_, ProbeKey(_, _))
       .WillOnce(Return(ProbeResult{core::KeyMeta{.type = KeyType::kSet, .cardinality = 5}}));
-  EXPECT_CALL(cold_, LoadMember(_, _, _, _)).Times(0);
+  EXPECT_CALL(cold_, LoadMembers(_, _, _, _)).Times(0);
   EXPECT_FALSE(Ok(loader_.IsMember(0, "s", "a", Deadline())));
 }
 
@@ -305,8 +299,12 @@ TEST_F(LoaderTest, ColdAnswersWhatTheDeltaDoesNot) {
   Buffer("z", ops::ZsetAdd{.key = "z", .entries = {{.score = 7, .member = "new"}}});
   EXPECT_CALL(cold_, ProbeKey(std::string_view{"z"}, _))
       .WillOnce(Return(ProbeResult{core::KeyMeta{.type = KeyType::kZset, .cardinality = 9}}));
-  EXPECT_CALL(cold_, LoadMember(std::string_view{"z"}, KeyType::kZset, std::string_view{"old"}, _))
-      .WillOnce(Return(MemberResult{core::MemberValue{2.5}}));
+  EXPECT_CALL(cold_, LoadMembers(std::string_view{"z"}, KeyType::kZset, _, _))
+      .WillOnce([](auto, auto, std::span<const std::string_view> members, auto) {
+        EXPECT_EQ(std::vector<std::string_view>(members.begin(), members.end()),
+                  std::vector<std::string_view>{"old"});
+        return MembersResult{std::vector<std::optional<core::MemberValue>>{2.5}};
+      });
   EXPECT_EQ(Ok(loader_.Score(0, "z", "old", Deadline())), 2.5);
 }
 
@@ -344,7 +342,7 @@ TEST_F(LoaderTest, APointReadOfAnExpiredKeyIsAbsent) {
   EXPECT_CALL(cold_, ProbeKey(_, _))
       .WillOnce(Return(ProbeResult{
           core::KeyMeta{.type = KeyType::kHash, .abs_ttl_ms = kNowMs, .cardinality = 1}}));
-  EXPECT_CALL(cold_, LoadMember(_, _, _, _)).Times(0);
+  EXPECT_CALL(cold_, LoadMembers(_, _, _, _)).Times(0);
   EXPECT_EQ(Ok(loader_.HashField(0, "h", "f", Deadline())), std::nullopt);
 }
 
@@ -352,23 +350,26 @@ TEST_F(LoaderTest, APointReadNeverWaitsOnAPlaceholder) {
   ASSERT_TRUE(hot_.BeginLoad("s").started());
   EXPECT_CALL(cold_, ProbeKey(_, _))
       .WillOnce(Return(ProbeResult{core::KeyMeta{.type = KeyType::kSet, .cardinality = 1}}));
-  EXPECT_CALL(cold_, LoadMember(_, _, _, _)).WillOnce(Return(MemberResult{core::MemberValue{}}));
+  EXPECT_CALL(cold_, LoadMembers(_, _, _, _))
+      .WillOnce(Return(
+          MembersResult{std::vector<std::optional<core::MemberValue>>{core::MemberValue{}}}));
   EXPECT_TRUE(Ok(loader_.IsMember(0, "s", "a", core::SteadyClock::now() + 1s)));
 }
 
 // --- Install, the read path's cache fill ---
 
 TEST_F(LoaderTest, InstallFillsHotOnceThenFindsItResident) {
-  EXPECT_CALL(cold_, LoadKey(std::string_view{"k"}, _))
-      .WillOnce(Return(LoadKeyResult{core::ColdKeyState{.type = KeyType::kString, .value = "v"}}));
-  auto first = loader_.Install("k", Deadline());
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kString, _))
+      .WillOnce(Return(LoadAsResult{
+          core::LoadedAs{core::ColdKeyState{.type = KeyType::kString, .value = "v"}}}));
+  auto first = loader_.Install("k", KeyType::kString, Deadline());
   ASSERT_TRUE(first.has_value());
   EXPECT_EQ(first->fill, Loader::Fill::kInstalled);
   auto get = hot_.Exec(ops::ReadOp{ops::StringGet{.key = "k"}});
   ASSERT_TRUE(get.has_value());
   EXPECT_EQ(get->AsString(), "v");
 
-  auto second = loader_.Install("k", Deadline());
+  auto second = loader_.Install("k", KeyType::kString, Deadline());
   ASSERT_TRUE(second.has_value());
   EXPECT_EQ(second->fill, Loader::Fill::kResident);
 }
@@ -381,22 +382,33 @@ TEST(LoaderFlushFloorTest, InstallUnderTheFlushFloorIsFlushed) {
       .shard_count = 1, .drained = [](core::ShardId) { return core::SequenceId{0}; }}};
   ASSERT_TRUE(hot.Wipe(0, 10).has_value());
   Loader loader{hot, router, cold};
-  EXPECT_CALL(cold, LoadKey(_, _)).Times(0);
-  auto filled = loader.Install("k", core::SteadyClock::now() + 10s);
+  EXPECT_CALL(cold, LoadKeyAs(_, _, _)).Times(0);
+  auto filled = loader.Install("k", KeyType::kString, core::SteadyClock::now() + 10s);
   ASSERT_TRUE(filled.has_value());
   EXPECT_EQ(filled->fill, Loader::Fill::kFlushed) << "cold may still hold what the Flush removed";
+}
+
+// Waits, bounded, until `n` calls have joined another's load.
+bool JoinedBy(const Loader& loader, uint64_t n) {
+  const auto until = core::SteadyClock::now() + 10s;
+  while (loader.JoinsForTesting() < n) {
+    if (core::SteadyClock::now() >= until) return false;
+    std::this_thread::sleep_for(1ms);
+  }
+  return true;
 }
 
 TEST_F(LoaderTest, ConcurrentInstallsShareOneColdRead) {
   constexpr int kReaders = 8;
   std::atomic<int> loads{0};
   abyss::testing::Latch release;
-  EXPECT_CALL(cold_, LoadKey(std::string_view{"set"}, _)).WillOnce([&](auto, auto) {
-    ++loads;
-    release.Wait();
-    return LoadKeyResult{core::ColdKeyState{.type = KeyType::kSet,
-                                            .value = std::unordered_set<std::string>{"a", "b"}}};
-  });
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"set"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        ++loads;
+        release.Wait();
+        return LoadAsResult{core::LoadedAs{core::ColdKeyState{
+            .type = KeyType::kSet, .value = std::unordered_set<std::string>{"a", "b"}}}};
+      });
 
   std::vector<Loader::Fill> fills(kReaders, Loader::Fill::kDiscarded);
   std::vector<std::thread> readers;
@@ -407,14 +419,13 @@ TEST_F(LoaderTest, ConcurrentInstallsShareOneColdRead) {
   });
   for (int i = 0; i < kReaders; ++i) {
     readers.emplace_back([&, i] {
-      auto filled = loader_.Install("set", Deadline());
+      auto filled = loader_.Install("set", KeyType::kSet, Deadline());
       ASSERT_TRUE(filled.has_value());
       fills[static_cast<size_t>(i)] = filled->fill;
     });
   }
-  // Every reader has either begun the load or found its placeholder.
-  for (int spins = 0; loads.load() == 0 && spins < 1000; ++spins) std::this_thread::sleep_for(1ms);
-  std::this_thread::sleep_for(20ms);
+  // Every other reader waits on the placeholder.
+  ASSERT_TRUE(JoinedBy(loader_, kReaders - 1)) << loader_.JoinsForTesting() << " joined";
   release.Open();
   for (auto& reader : readers) reader.join();
   readers.clear();
@@ -428,10 +439,10 @@ TEST_F(LoaderTest, ConcurrentInstallsShareOneColdRead) {
 }
 
 TEST_F(LoaderTest, AFailedInstallAbortsItsPlaceholder) {
-  EXPECT_CALL(cold_, LoadKey(_, _))
+  EXPECT_CALL(cold_, LoadKeyAs(_, _, _))
       .WillOnce(
-          Return(LoadKeyResult{std::unexpected(core::Error{core::ErrorCode::kUnavailable, "io"})}));
-  auto filled = loader_.Install("k", Deadline());
+          Return(LoadAsResult{std::unexpected(core::Error{core::ErrorCode::kUnavailable, "io"})}));
+  auto filled = loader_.Install("k", KeyType::kString, Deadline());
   ASSERT_FALSE(filled.has_value());
   EXPECT_EQ(filled.error().code(), core::ErrorCode::kUnavailable);
   EXPECT_FALSE(hot_.LoadPending("k"));
@@ -439,9 +450,41 @@ TEST_F(LoaderTest, AFailedInstallAbortsItsPlaceholder) {
 
 TEST_F(LoaderTest, InstallAwaitingAnotherLoadTimesOut) {
   ASSERT_TRUE(hot_.BeginLoad("k").started());
-  auto filled = loader_.Install("k", core::SteadyClock::now() + 20ms);
+  auto filled = loader_.Install("k", KeyType::kString, core::SteadyClock::now() + 20ms);
   ASSERT_FALSE(filled.has_value());
   EXPECT_EQ(filled.error().code(), core::ErrorCode::kTimeout);
+}
+
+// Concurrent misses share one cold load; a waiter gets the leader's
+// error, and the next miss loads afresh.
+TEST_F(LoaderTest, ConcurrentLoadsShareOneColdReadAndItsError) {
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        entered.Open();
+        release.Wait();
+        return LoadAsResult{std::unexpected(core::Error{core::ErrorCode::kUnavailable, "io"})};
+      })
+      .WillOnce(Return(LoadAsResult{core::LoadedAs{core::ColdKeyState{
+          .type = KeyType::kSet, .value = std::unordered_set<std::string>{"a"}}}}));
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  auto waiter = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(JoinedBy(loader_, 1)) << "the waiter never joined the load";
+  release.Open();
+  const auto led = leader.get();
+  const auto waited = waiter.get();
+  ASSERT_FALSE(led.has_value());
+  ASSERT_FALSE(waited.has_value()) << "the waiter loaded on its own";
+  EXPECT_EQ(waited.error().code(), core::ErrorCode::kUnavailable);
+
+  auto again = loader_.LoadAs(0, "k", KeyType::kSet, Deadline());
+  ASSERT_TRUE(again.has_value()) << "a completed load is not reused";
+  EXPECT_NE(std::get_if<hot::LoadedFull>(again.value().get()), nullptr);
 }
 
 }  // namespace

@@ -28,6 +28,8 @@ struct MemoryStats {
   uint64_t stub_entries = 0;
   uint64_t stub_bytes = 0;
   uint64_t stub_drops = 0;
+  // Keys held as loaded absent.
+  uint64_t negative_entries = 0;
   uint64_t load_discards = 0;
   // Live bytes cold had not drained, as of the last full eviction pass.
   uint64_t unevictable_bytes = 0;
@@ -37,7 +39,7 @@ struct MemoryStats {
 
 // Existence verdict for a key in the hot tier. kTombstoned is an authoritative
 // delete the caller must honour; kAbsent means hot is unaware and the caller
-// should fall through. Mirrors consumer::BufferKeyPresence.
+// should fall through.
 enum class HotKeyPresence : uint8_t { kAbsent, kTombstoned, kPresent };
 
 class HotStore : public Reader {

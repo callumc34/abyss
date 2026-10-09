@@ -35,6 +35,7 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/reservation.h"
@@ -108,19 +109,21 @@ class SequencedEngineTest : public ::testing::Test {
   // The loader, sequencer and engine over hot_.
   void Rewire() {
     engine_.reset();
+    reads_.reset();
     sequencer_.reset();
     loader_ = std::make_unique<Loader>(*hot_, *pool_, *cold_);
     sequencer_ = std::make_unique<Sequencer>(
         *hot_, *queue_, *loader_, *pool_,
         SequencerConfig{.write_timeout = 5s,
                         .wall_clock = [this] { return wall_ ? wall_() : core::WallClock::now(); }});
-    engine_ = std::make_unique<TieringEngine>(
-        *hot_, *cold_, *pool_, *sequencer_,
-        TieringEngineConfig{.shard_count = options_.shards, .write_timeout = 5s});
+    reads_ = std::make_unique<ReadPath>(*hot_, *loader_, *sequencer_,
+                                        ReadPathConfig{.write_timeout = 5s});
+    engine_ = std::make_unique<TieringEngine>(*reads_, *sequencer_);
   }
 
   void TearDown() override {
     engine_.reset();
+    reads_.reset();
     sequencer_.reset();
     loader_.reset();
     if (pool_) pool_->Stop(0ms);
@@ -214,6 +217,7 @@ class SequencedEngineTest : public ::testing::Test {
   std::unique_ptr<consumer::ColdConsumerPool> pool_;
   std::unique_ptr<Loader> loader_;
   std::unique_ptr<Sequencer> sequencer_;
+  std::unique_ptr<ReadPath> reads_;
   std::unique_ptr<TieringEngine> engine_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
@@ -461,6 +465,7 @@ TEST_F(SequencedEngineTest, ARestartPastTheEvictionWindowServesTheWholeKey) {
 
   // Restarted a minute past the window: a fresh hot store replayed.
   engine_.reset();
+  reads_.reset();
   sequencer_.reset();
   loader_.reset();
   hot_ = NewHot();

@@ -305,21 +305,11 @@ size_t CompactedState::EstimatedBytes() const {
   return 0;
 }
 
-bool CompactedState::HashHasField(std::string_view field) const {
-  if (type_ != DataType::kHash || is_tombstone_) return false;
-  return hash_fields_.contains(std::string(field));
-}
-
 std::optional<std::string> CompactedState::HashFieldValue(std::string_view field) const {
   if (type_ != DataType::kHash || is_tombstone_) return std::nullopt;
   auto it = hash_fields_.find(std::string(field));
   if (it == hash_fields_.end()) return std::nullopt;
   return it->second;
-}
-
-bool CompactedState::SetHasMember(std::string_view member) const {
-  if (type_ != DataType::kSet || is_tombstone_) return false;
-  return set_members_.contains(std::string(member));
 }
 
 std::optional<double> CompactedState::ZsetMemberScore(std::string_view member) const {

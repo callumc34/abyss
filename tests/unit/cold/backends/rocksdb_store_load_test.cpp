@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
@@ -158,25 +159,66 @@ TEST_F(RocksdbLoadTest, AProbeReadsNoMembers) {
   EXPECT_GE(load_nexts, 2000U) << "the counters see a full load's scan";
 }
 
-TEST_F(RocksdbLoadTest, LoadMemberReadsOneRecord) {
+TEST_F(RocksdbLoadTest, LoadMembersReadsTheAskedRecordsInOrder) {
   Apply({ops::SetAdd{.key = "set", .members = {"a"}},
-         ops::HashSet{.key = "hash", .fields = {{.field = "f", .value = "1"}}},
+         ops::HashSet{.key = "hash",
+                      .fields = {{.field = "f", .value = "1"}, {.field = "g", .value = "2"}}},
          ops::ZsetAdd{.key = "zset", .entries = {{.score = 2.5, .member = "m"}}},
          ops::StringSet{.key = "str", .value = "v"}});
-  const auto member = [&](std::string_view key, KeyType type, std::string_view name) {
-    auto value = store_->LoadMember(key, type, name, Later());
-    EXPECT_TRUE(value.has_value());
-    return value.has_value() ? *value : std::nullopt;
+  const auto members = [&](std::string_view key, KeyType type,
+                           std::vector<std::string_view> names) {
+    auto values = store_->LoadMembers(key, type, names, Later());
+    EXPECT_TRUE(values.has_value());
+    return values.has_value() ? *values : std::vector<std::optional<core::MemberValue>>{};
   };
-  EXPECT_EQ(member("set", KeyType::kSet, "a"), core::MemberValue{});
-  EXPECT_EQ(member("set", KeyType::kSet, "b"), std::nullopt);
-  EXPECT_EQ(member("hash", KeyType::kHash, "f"), core::MemberValue{std::string("1")});
-  EXPECT_EQ(member("zset", KeyType::kZset, "m"), core::MemberValue{2.5});
-  EXPECT_EQ(member("set", KeyType::kZset, "a"), std::nullopt) << "another type's records";
+  using Values = std::vector<std::optional<core::MemberValue>>;
+  EXPECT_EQ(members("set", KeyType::kSet, {"a", "b"}), (Values{core::MemberValue{}, std::nullopt}));
+  EXPECT_EQ(members("hash", KeyType::kHash, {"g", "x", "f"}),
+            (Values{core::MemberValue{std::string("2")}, std::nullopt,
+                    core::MemberValue{std::string("1")}}));
+  EXPECT_EQ(members("zset", KeyType::kZset, {"m"}), (Values{core::MemberValue{2.5}}));
+  EXPECT_EQ(members("set", KeyType::kZset, {"a"}), (Values{std::nullopt}))
+      << "another type's records";
+  EXPECT_EQ(members("hash", KeyType::kHash, {}), Values{});
 
-  auto of_string = store_->LoadMember("str", KeyType::kString, "v", Later());
+  const std::vector<std::string_view> v{"v"};
+  auto of_string = store_->LoadMembers("str", KeyType::kString, v, Later());
   ASSERT_FALSE(of_string.has_value());
   EXPECT_EQ(of_string.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+TEST_F(RocksdbLoadTest, LoadKeyAsReadsMembersOnlyOfTheAskedType) {
+  std::vector<std::string> members;
+  members.reserve(2000);
+  for (int i = 0; i < 2000; ++i) members.push_back("member-" + std::to_string(i));
+  Apply({ops::SetAdd{.key = "big", .members = {members.begin(), members.end()}},
+         ops::Expire{.key = "big", .abs_ttl_ms = kTtlMs},
+         ops::StringSet{.key = "str", .value = "v", .abs_ttl_ms = kTtlMs}});
+
+  rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableCount);
+  rocksdb::PerfContext& counters = *rocksdb::get_perf_context();
+  counters.Reset();
+  auto as_string = store_->LoadKeyAs("big", KeyType::kString, Later());
+  const uint64_t nexts = counters.iter_next_count;
+  const uint64_t seeks = counters.iter_seek_count;
+  rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
+  ASSERT_TRUE(as_string.has_value() && as_string->has_value());
+  EXPECT_EQ(std::get<core::KeyMeta>(as_string->value_or(core::KeyMeta{})),
+            (core::KeyMeta{.type = KeyType::kSet, .abs_ttl_ms = kTtlMs, .cardinality = 2000}));
+  EXPECT_EQ(nexts, 0U) << "a set read as a string reads none of its members";
+  EXPECT_EQ(seeks, 0U);
+
+  auto str = store_->LoadKeyAs("str", KeyType::kString, Later());
+  ASSERT_TRUE(str.has_value() && str->has_value());
+  EXPECT_EQ(std::get<core::ColdKeyState>(str->value_or(core::ColdKeyState{})),
+            (core::ColdKeyState{.type = KeyType::kString, .value = "v", .abs_ttl_ms = kTtlMs}));
+  auto set = store_->LoadKeyAs("big", KeyType::kSet, Later());
+  ASSERT_TRUE(set.has_value() && set->has_value());
+  const auto loaded_set = std::get<core::ColdKeyState>(set->value_or(core::ColdKeyState{}));
+  EXPECT_EQ(std::get<std::unordered_set<std::string>>(loaded_set.value).size(), 2000U);
+  auto absent = store_->LoadKeyAs("absent", KeyType::kHash, Later());
+  ASSERT_TRUE(absent.has_value());
+  EXPECT_FALSE(absent->has_value());
 }
 
 TEST_F(RocksdbLoadTest, APassedDeadlineIsATimeout) {
@@ -184,7 +226,8 @@ TEST_F(RocksdbLoadTest, APassedDeadlineIsATimeout) {
   const auto past = clock_.SteadyNow() - 1ms;
   auto load = store_->LoadKey("set", past);
   auto probe = store_->ProbeKey("set", past);
-  auto member = store_->LoadMember("set", KeyType::kSet, "a", past);
+  const std::vector<std::string_view> a{"a"};
+  auto member = store_->LoadMembers("set", KeyType::kSet, a, past);
   ASSERT_FALSE(load.has_value());
   ASSERT_FALSE(probe.has_value());
   ASSERT_FALSE(member.has_value());

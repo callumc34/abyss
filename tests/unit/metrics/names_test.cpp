@@ -15,6 +15,7 @@ TEST(Names, LabelKeyStringSpellings) {
   EXPECT_EQ(ToStringView(LabelKey::kReason), "reason");
   EXPECT_EQ(ToStringView(LabelKey::kStatus), "status");
   EXPECT_EQ(ToStringView(LabelKey::kOp), "op");
+  EXPECT_EQ(ToStringView(LabelKey::kOutcome), "outcome");
 }
 
 TEST(Names, TierEnumSpellings) {
@@ -40,6 +41,15 @@ TEST(Names, RedecideReasonSpellings) {
   EXPECT_EQ(ToStringView(RedecideReason::kLoad), "load");
   EXPECT_EQ(ToStringView(RedecideReason::kBackpressure), "backpressure");
   static_assert(LabelKeyOf<RedecideReason>::value == LabelKey::kReason);
+}
+
+TEST(Names, FillOutcomeSpellings) {
+  EXPECT_EQ(ToStringView(FillOutcome::kInstalled), "installed");
+  EXPECT_EQ(ToStringView(FillOutcome::kDiscarded), "discarded");
+  EXPECT_EQ(ToStringView(FillOutcome::kSkippedBackpressure), "skipped_backpressure");
+  EXPECT_EQ(ToStringView(FillOutcome::kSkippedSize), "skipped_size");
+  EXPECT_EQ(ToStringView(FillOutcome::kFailed), "failed");
+  static_assert(LabelKeyOf<FillOutcome>::value == LabelKey::kOutcome);
 }
 
 TEST(Names, LabelKeyOfMapping) {
@@ -81,6 +91,8 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kHotMemoryBytes.name,
       names::kHotKeys.name,
       names::kHotStubEntries.name,
+      names::kHotNegativeEntries.name,
+      names::kHotFillsTotal.name,
       names::kHotUnevictableBytes.name,
       names::kColdDiskBytes.name,
       names::kColdKeys.name,

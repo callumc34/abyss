@@ -14,7 +14,7 @@ struct ConsumerCounters {
   std::atomic<uint64_t> block_and_scan_timeouts{0};
   // Replay-only: increments when a hot replay entry is dropped because the
   // wall-clock eviction window from `appended_at` has elapsed. Per ADP-007,
-  // such keys re-enter hot via cold-hit promotion on first read.
+  // such keys re-enter hot through a cache fill on a later read.
   std::atomic<uint64_t> replay_skipped_eviction{0};
   // Replay-only: increments when a hot replay entry's parsed op carries an
   // absolute TTL (`SET ... EX/PX/EXAT/PXAT`, `EXPIRE...`) whose deadline has

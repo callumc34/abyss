@@ -30,6 +30,11 @@ struct ShardedHotStoreConfig {
   size_t access_buffer_high_water = 65536;
   // Share of max_memory_bytes for stubs, at kStubBytes each.
   double stub_memory_fraction = 0.02;
+  // Keys held as loaded absent, across shards.
+  size_t negative_max_entries = 65536;
+  // A cache fill larger than this share of a shard's budget is never
+  // installed, however often it is read.
+  double fill_max_fraction = 0.0625;
   // Over max_memory_bytes times this, the store reports backpressure.
   double backpressure_ratio = 1.25;
   // A shard's cold drained seq: nothing above it is removed from hot.
@@ -138,7 +143,14 @@ class ShardedHotStore : public core::HotStore {
   // Refused, as well, while the key's shard is under its flush floor:
   // cold may still hold what the Flush removed.
   LoadStart BeginLoad(std::string_view key);
+  // Installs `result` unless a write overtook it, evicting to make
+  // room; what it evicts is freed after the lock.
   bool CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result);
+  enum class FillResult : uint8_t { kInstalled, kDiscarded, kOverBackpressure, kTooLarge };
+  // A read's cache fill: CompleteLoad, unless the shard is over its
+  // backpressure limit or `result` is over fill_max_fraction of its
+  // budget, when the load is aborted. Only kInstalled moves `result`.
+  FillResult Fill(std::string_view key, LoadToken token, LoadResult&& result);
   // SingleShardStore::CompleteLoads on `shard`, in one exclusive hold.
   size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
   void AbortLoad(std::string_view key, LoadToken token);
@@ -205,6 +217,8 @@ class ShardedHotStore : public core::HotStore {
   core::Result<core::RespValue> ApplyToShard(core::ShardId index, const core::ops::WriteOp& op,
                                              core::EvictionTTL eviction, core::SequenceId seq);
 
+  // CompleteLoad, and as a fill, refused past the limits Fill names.
+  FillResult Install(std::string_view key, LoadToken token, LoadResult&& result, bool fill);
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
   // Queues `key` for a deferred LRU refresh after a read hit.

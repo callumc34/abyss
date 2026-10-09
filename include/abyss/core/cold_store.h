@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/reader.h"
@@ -51,6 +52,10 @@ struct ColdKeyState {
 // A set member's presence, a hash field's value or a zset score.
 using MemberValue = std::variant<std::monostate, std::string, double>;
 
+// A key loaded as one type: its whole state when it holds that type,
+// else only its meta.
+using LoadedAs = std::variant<KeyMeta, ColdKeyState>;
+
 class ColdStore : public Reader {
  public:
   ColdStore() = default;
@@ -84,11 +89,6 @@ class ColdStore : public Reader {
   virtual Result<StorageStats> Stats() = 0;
   virtual Result<void> Compact() = 0;
 
-  // Returns the RESP command that reconstructs `key`'s hot-side view from
-  // cold, or nullopt if the key does not exist or its type isn't promotable
-  // in this implementation. Preserves absolute TTL.
-  virtual Result<std::optional<RespCommand>> GetPromotionCommand(std::string_view key) = 0;
-
   // The loads below judge no TTL and delete nothing: an expired key is
   // returned with its TTL. Each reads one consistent view, and fails
   // kTimeout once `deadline` passes.
@@ -96,12 +96,17 @@ class ColdStore : public Reader {
   // `key`'s whole state, or nullopt when cold does not hold it.
   virtual Result<std::optional<ColdKeyState>> LoadKey(std::string_view key,
                                                       SteadyTime deadline) = 0;
+  // LoadKey, reading members only when `key` holds `type`. A string's
+  // value comes with its meta, in one read.
+  virtual Result<std::optional<LoadedAs>> LoadKeyAs(std::string_view key, KeyType type,
+                                                    SteadyTime deadline) = 0;
   // `key`'s type and TTL, reading none of its members.
   virtual Result<std::optional<KeyMeta>> ProbeKey(std::string_view key, SteadyTime deadline) = 0;
-  // One member or field of `key` as `type`; nullopt when absent.
-  virtual Result<std::optional<MemberValue>> LoadMember(std::string_view key, KeyType type,
-                                                        std::string_view member,
-                                                        SteadyTime deadline) = 0;
+  // Members or fields of `key` as `type`, in one batch, each nullopt
+  // when absent.
+  virtual Result<std::vector<std::optional<MemberValue>>> LoadMembers(
+      std::string_view key, KeyType type, std::span<const std::string_view> members,
+      SteadyTime deadline) = 0;
 
   // Server calls Start() once after recovery completes to enable any
   // backend-internal background work (TTL sweeping, prefetch, etc.). Stop()

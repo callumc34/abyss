@@ -109,6 +109,10 @@ hot:
   default_eviction_seconds: 86400
   eviction_tick_ms: 1000
   eviction_policy: lru
+  fill_doorkeeper: true        # a read miss fills hot on the key's second miss
+  fill_max_members: 1024       # SISMEMBER/HGET... fill only smaller collections
+  fill_max_fraction: 0.0625    # never fill a key over this share of a shard
+  negative_max_entries: 65536  # keys held as known absent, across shards
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
