@@ -4,6 +4,7 @@
 #include <optional>
 #include <string_view>
 
+#include "abyss/consumer/compacted_state.h"
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/reader.h"
@@ -32,6 +33,10 @@ class CompactionBufferRouter : public core::Reader {
   virtual BufferKeyPresence Probe(std::string_view key) const = 0;
 
   virtual HashOverlay HashOverlayFor(std::string_view key) const = 0;
+
+  // CompactionBuffer::Snapshot on `shard`'s buffer, which owns `key`.
+  virtual std::optional<CompactedState> Snapshot(core::ShardId shard,
+                                                 std::string_view key) const = 0;
 
   // Blocks until the shard's cold consumer has drained through `target_seq`,
   // or `timeout` elapses. Returns true on catch-up, false on timeout.

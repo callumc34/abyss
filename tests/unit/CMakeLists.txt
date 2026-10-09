@@ -57,6 +57,7 @@ add_executable(abyss_resp_tests
   resp/request_pipeline_test.cpp
   resp/node_identity_test.cpp
   resp/cluster_test.cpp
+  resp/predicate_extractor_test.cpp
 )
 
 target_link_libraries(abyss_resp_tests PRIVATE
@@ -70,6 +71,7 @@ add_executable(abyss_hot_tests
   hot/sharded_hot_store_test.cpp
   hot/eviction_worker_test.cpp
   hot/residency_test.cpp
+  hot/apply_effects_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE
@@ -98,6 +100,7 @@ if(ABYSS_WITH_ROCKSDB)
     cold/backends/rocksdb_store_ttl_test.cpp
     cold/backends/rocksdb_store_sweep_test.cpp
     cold/backends/rocksdb_store_wipe_test.cpp
+    cold/backends/rocksdb_store_load_test.cpp
   )
   target_include_directories(abyss_cold_tests SYSTEM PRIVATE
     $<TARGET_PROPERTY:RocksDB::rocksdb,INTERFACE_INCLUDE_DIRECTORIES>
@@ -226,11 +229,18 @@ target_link_libraries(abyss_admin_tests PRIVATE
 add_executable(abyss_engine_tests
   engine/shard_scheduler_test.cpp
   engine/recovery_coordinator_test.cpp
+  engine/decide_test.cpp
+  engine/decide_multi_key_test.cpp
+  engine/decide_equivalence_test.cpp
+  engine/decide_registry_test.cpp
+  engine/loader_merge_test.cpp
+  engine/loader_test.cpp
 )
 
 target_link_libraries(abyss_engine_tests PRIVATE
   abyss::engine
   abyss::queue
+  abyss::resp
   abyss::test_support
   GTest::gtest_main
 )

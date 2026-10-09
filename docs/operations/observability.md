@@ -43,7 +43,8 @@
 - `abyss_cold_flush_total{status="success|failure"}` — cold consumer flush operations
 - `abyss_cold_flush_reason_total{reason="quiet|deadline|pressure"}` — flush trigger reason
 - `abyss_cold_flush_batch_size` (histogram) — number of keys per flush batch
-- `abyss_ttl_expired_total{tier="hot|cold"}` — TTL expirations by tier
+- `abyss_ttl_expired_total{tier="hot|cold"}` — TTL expirations by tier. On cold, only the TTL scanner's deletes count: reads never delete.
+- `abyss_cold_apply_type_conflicts_total` — logged SADD, HSET or ZADD effects that found their key holding another type in cold. Any increase means the write path and cold disagree (see [failure-modes.md](failure-modes.md)).
 - `abyss_evicted_total` — keys evicted from hot (moved to cold-only)
 - `abyss_promotions_total` — cold hits promoted back to hot
 
@@ -51,8 +52,9 @@
 
 The cold-store backend owns an internal sweeper thread that proactively
 finds and deletes expired keys (see [ADP-003](../design/proposals/003-cold-store.md)
-§TTL Expiry). The scanner self-throttles based on observed expired ratio,
-disk pressure, and a CPU budget cap.
+§TTL Expiry). A key counts as expired once its TTL is at or below its
+shard's log clock, not the wall clock. The scanner self-throttles based on
+observed expired ratio, disk pressure, and a CPU budget cap.
 
 - `abyss_cold_ttl_samples_total{subject="string|collection"}` — random samples drawn per cycle
 - `abyss_cold_ttl_with_ttl_total{subject="string|collection"}` — sampled records that carried a TTL flag

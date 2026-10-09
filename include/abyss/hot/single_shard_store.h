@@ -13,7 +13,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 
+#include "abyss/core/effect.h"
+#include "abyss/core/eviction_policy.h"
 #include "abyss/core/hot_store.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
@@ -74,6 +77,9 @@ struct Entry {
   size_t ApproximateBytes() const;
 };
 
+// What an entry holding `value` counts, beyond its key.
+size_t ApproximateBytes(const Value& value);
+
 // What an evicted live key leaves behind.
 struct Stub {
   Entry::Type type = Entry::Type::kString;
@@ -83,6 +89,39 @@ struct Stub {
 
 // Accounted size of one stub beyond its key; also sizes the stub cap.
 inline constexpr size_t kStubBytes = 80;
+
+// One key's state, valid while the shard lock it was taken under is
+// held.
+struct KeyView {
+  enum class Presence : uint8_t {
+    kLive,
+    kTombstoned,
+    // Past its TTL: absent, but its entry or stub is still held.
+    kExpired,
+    // Not resident; its stub holds type, TTL and latest_seq.
+    kStub,
+    // Not resident and unknown: no entry or stub, or a load in flight.
+    kNonResident,
+  };
+
+  Presence presence = Presence::kNonResident;
+  // Absent by the shard's flush floor: kTombstoned, at the Flush's seq.
+  bool flush_floor = false;
+  Entry::Type type = Entry::Type::kString;
+  int64_t abs_ttl_ms = 0;
+  core::SequenceId latest_seq = 0;
+  // The whole value of a live or expired entry.
+  const Value* value = nullptr;
+
+  // Each is empty, false or 0 when the view holds no such value.
+  std::string_view string_value() const;
+  bool set_has(std::string_view member) const;
+  std::optional<double> zset_score(std::string_view member) const;
+  bool hash_has(std::string_view field) const;
+  std::optional<std::string_view> hash_get(std::string_view field) const;
+  // Members or fields.
+  size_t collection_size() const;
+};
 
 // Bounded stub cache that drops its oldest stub.
 class StubCache {
@@ -125,12 +164,59 @@ struct LoadToken {
   bool operator==(const LoadToken&) const = default;
 };
 
-// A non-resident key's state as read from buffer and cold.
-struct LoadedState {
-  bool exists = false;
+// An attempt to start a load, judged in one hold.
+struct LoadStart {
+  enum class Status : uint8_t {
+    kStarted,
+    // The key has an entry or tombstone: hot answers.
+    kResident,
+    // Another load is in flight: await it.
+    kPending,
+    // The flush floor makes the key absent.
+    kFlushed,
+  };
+  Status status = Status::kResident;
+  LoadToken token;
+
+  bool started() const { return status == Status::kStarted; }
+  std::optional<LoadToken> token_if_started() const {
+    return started() ? std::optional<LoadToken>(token) : std::nullopt;
+  }
+};
+
+// What a load of a non-resident key found in buffer and cold. Each is
+// installable, so a decide that asked for it never asks again.
+struct LoadedAbsent {
+  bool operator==(const LoadedAbsent&) const = default;
+};
+
+// An existence probe's answer.
+struct LoadedExists {
   Entry::Type type = Entry::Type::kString;
+  int64_t abs_ttl_ms = 0;
+
+  bool operator==(const LoadedExists&) const = default;
+};
+
+struct LoadedFull {
   Value value;
   int64_t abs_ttl_ms = 0;
+  // ApproximateBytes(value), measured off the lock.
+  size_t bytes = 0;
+
+  Entry::Type type() const { return static_cast<Entry::Type>(value.index()); }
+};
+
+// Measures `value`; call it off the lock.
+LoadedFull MakeLoadedFull(Value value, int64_t abs_ttl_ms);
+
+using LoadResult = std::variant<LoadedAbsent, LoadedExists, LoadedFull>;
+
+struct LoadCompletion {
+  std::string key;
+  LoadToken token;
+  // Moved from only when installed.
+  LoadResult result;
 };
 
 class SingleShardStore {
@@ -147,6 +233,21 @@ class SingleShardStore {
                                       core::SequenceId horizon = kAllDrained);
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops, core::EvictionTTL eviction,
                                 core::SequenceId seq = 0, core::SequenceId horizon = kAllDrained);
+
+  // `horizon` is the shard's cold drained seq, read under the lock;
+  // TTL expiry is judged at `now_ms`.
+  KeyView View(std::string_view key, core::SequenceId horizon, uint64_t now_ms) const;
+
+  // Applies decided effects in order, effect i at `first_seq + i`, and
+  // returns each one's reply. It judges no TTL: decide logged a DEL for
+  // every expired key it read. `appended_at` is only for the DCHECK
+  // that no effect reading state meets a key expired at that time. A
+  // SET's value is moved out of its effect. An unparsable effect is
+  // fatal.
+  std::vector<core::RespValue> ApplyEffects(std::span<core::Effect> effects,
+                                            core::SequenceId first_seq, core::WallTime appended_at,
+                                            const core::EvictionPolicy& policy,
+                                            core::SequenceId horizon);
 
   // Existence verdict distinguishing a delete-tombstone (authoritatively
   // absent) from a true miss (consult the next tier). See core::HotKeyPresence.
@@ -192,13 +293,20 @@ class SingleShardStore {
   // A placeholder for a load of a non-resident key, taken only when the
   // key has no entry and no load in flight. Readers see a miss.
   std::optional<LoadToken> BeginLoad(std::string_view key);
-  // Installs `state` only if `token` is still the key's placeholder and
-  // the key has no entry; otherwise discards it and returns false.
-  bool CompleteLoad(std::string_view key, LoadToken token, LoadedState state,
+  // Installs `result` only if `token` is still the key's placeholder
+  // and the key has no entry; otherwise discards it, leaving `result`
+  // intact, and returns false. Absent installs a drained tombstone and
+  // Exists a stub, replacing any stub.
+  bool CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result,
                     core::EvictionTTL eviction, core::SequenceId horizon);
+  // CompleteLoad of each, in one hold; returns how many installed.
+  size_t CompleteLoads(std::span<LoadCompletion> loads, const core::EvictionPolicy& policy,
+                       core::SequenceId horizon);
   void AbortLoad(std::string_view key, LoadToken token);
   bool LoadPending(std::string_view key) const;
   size_t PendingLoads() const { return loading_.size(); }
+  // Whether a stub, and so an existence load, can be held.
+  bool RetainsStubs() const { return config_.stub_max_entries > 0; }
 
   core::MemoryStats Stats() const;
   // Clears entries, stubs and placeholders for a Flush at `seq`.
@@ -226,8 +334,18 @@ class SingleShardStore {
   core::Result<core::RespValue> ExecHashLen(const core::ops::HashLen& op) const;
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op) const;
 
+  // A SET's value to move in rather than copy, and whether the SET
+  // replies with the string it replaces.
+  struct SetMove {
+    std::string* value = nullptr;
+    bool reply_old_value = false;
+  };
+
+  // Apply without the capacity check.
+  core::Result<core::RespValue> Mutate(const core::ops::WriteOp& op, core::EvictionTTL eviction,
+                                       core::SequenceId seq, SetMove move);
   core::Result<core::RespValue> ApplyStringSet(const core::ops::StringSet& op,
-                                               core::EvictionTTL eviction);
+                                               core::EvictionTTL eviction, SetMove move);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
   core::Result<core::RespValue> ApplySetAdd(const core::ops::SetAdd& op,
                                             core::EvictionTTL eviction);
@@ -247,6 +365,11 @@ class SingleShardStore {
 
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;
+  // TTL expiry as writes see it: never while applying effects.
+  bool ExpiredForApply(const Entry& entry) const;
+  // False when `effect` reads `key` past its TTL at `at_ms`: decide
+  // logs such an expiry as a DEL before the read.
+  bool ExpiryIsLogged(const core::Effect& effect, std::string_view key, int64_t at_ms) const;
   Entry& GetOrCreateEntry(std::string_view key, Entry::Type type, core::EvictionTTL eviction);
   core::Result<const Entry*> FindTypedEntry(std::string_view key, Entry::Type expected) const;
   void RemoveEntry(const std::string& key);
@@ -288,6 +411,8 @@ class SingleShardStore {
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
   core::SequenceId flush_seq_ = 0;
+  // Set while ApplyEffects runs.
+  bool applying_effects_ = false;
   uint64_t entry_bytes_ = 0;
   // The part of entry_bytes_ that is on the LRU list.
   uint64_t live_bytes_ = 0;

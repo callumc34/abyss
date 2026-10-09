@@ -4,6 +4,9 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -14,28 +17,18 @@ namespace abyss::core::ops {
 
 namespace {
 
+// NaN is rejected: it has no place in a zset's score order.
 Result<double> ParseDouble(std::string_view s) {
+  // from_chars takes no leading '+'; Redis (strtod) takes one.
+  if (s.size() > 1 && s[0] == '+' && s[1] != '+' && s[1] != '-') s.remove_prefix(1);
   double value = 0.0;
   const auto* begin = s.data();
   const auto* end = s.data() + s.size();
   const auto [ptr, ec] = std::from_chars(begin, end, value);
-  if (ec != std::errc{} || ptr != end) {
-    return std::unexpected(
-        Error(ErrorCode::kInvalidArgument, "not a valid float: '" + std::string(s) + "'"));
+  if (ec != std::errc{} || ptr != end || std::isnan(value)) {
+    return std::unexpected(Error(ErrorCode::kInvalidArgument, "value is not a valid float"));
   }
   // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
-  return value;
-}
-
-Result<uint64_t> ParseUint64(std::string_view s) {
-  uint64_t value = 0;
-  const auto* begin = s.data();
-  const auto* end = s.data() + s.size();
-  const auto [ptr, ec] = std::from_chars(begin, end, value);
-  if (ec != std::errc{} || ptr != end) {
-    return std::unexpected(
-        Error(ErrorCode::kInvalidArgument, "not a valid integer: '" + std::string(s) + "'"));
-  }
   return value;
 }
 
@@ -46,7 +39,7 @@ Result<int64_t> ParseInt64(std::string_view s) {
   const auto [ptr, ec] = std::from_chars(begin, end, value);
   if (ec != std::errc{} || ptr != end) {
     return std::unexpected(
-        Error(ErrorCode::kInvalidArgument, "not a valid integer: '" + std::string(s) + "'"));
+        Error(ErrorCode::kInvalidArgument, "value is not an integer or out of range"));
   }
   return value;
 }
@@ -127,7 +120,7 @@ Result<ReadOp> ParseHlen(const RespCommand& cmd) { return ReadOp{HashLen{.key = 
 // success advances `i` past the clause and writes offset/count into `op`.
 Result<void> ParseLimitClause(const RespCommand& cmd, size_t& i, ZsetRange& op) {
   if (i + 2 >= cmd.args.size()) {
-    return std::unexpected(SyntaxError("syntax error — LIMIT requires offset and count"));
+    return std::unexpected(SyntaxError("syntax error"));
   }
   auto offset = ParseInt64(cmd.args[i + 1]);
   if (!offset.has_value()) return std::unexpected(offset.error());
@@ -162,11 +155,11 @@ Result<ReadOp> ParseZrange(const RespCommand& cmd) {
       auto limit = ParseLimitClause(cmd, i, op);
       if (!limit.has_value()) return std::unexpected(limit.error());
     } else {
-      return std::unexpected(SyntaxError("syntax error — unknown ZRANGE option '" + opt + "'"));
+      return std::unexpected(SyntaxError("syntax error"));
     }
   }
   if (op.by_score && op.by_lex) {
-    return std::unexpected(SyntaxError("syntax error — BYSCORE and BYLEX are mutually exclusive"));
+    return std::unexpected(SyntaxError("syntax error"));
   }
   return ReadOp{op};
 }
@@ -183,8 +176,7 @@ Result<ReadOp> ParseZrangeByScore(const RespCommand& cmd) {
       auto limit = ParseLimitClause(cmd, i, op);
       if (!limit.has_value()) return std::unexpected(limit.error());
     } else {
-      return std::unexpected(
-          SyntaxError("syntax error — unknown ZRANGEBYSCORE option '" + opt + "'"));
+      return std::unexpected(SyntaxError("syntax error"));
     }
   }
   return ReadOp{op};
@@ -199,8 +191,7 @@ Result<ReadOp> ParseZrangeByLex(const RespCommand& cmd) {
       auto limit = ParseLimitClause(cmd, i, op);
       if (!limit.has_value()) return std::unexpected(limit.error());
     } else {
-      return std::unexpected(
-          SyntaxError("syntax error — unknown ZRANGEBYLEX option '" + opt + "'"));
+      return std::unexpected(SyntaxError("syntax error"));
     }
   }
   return ReadOp{op};
@@ -234,51 +225,90 @@ const std::unordered_map<std::string_view, ReadParserFn>& ReadParsers() {
 
 using WriteParserFn = Result<WriteOp> (*)(const RespCommand&, uint64_t);
 
-// Options the resolver interprets before materialising a plain SET. They carry
-// no meaning here, but must stay legal so both SET parse paths agree on the
-// accepted token set.
-bool IsResolverSetOption(std::string_view opt) {
-  return opt == "NX" || opt == "XX" || opt == "GET" || opt == "KEEPTTL";
+enum class TtlBase : uint8_t { kRelative, kAbsolute };
+
+struct TtlSpec {
+  int64_t unit_ms;
+  TtlBase base;
+  // SET's family rejects a time of zero or less; EXPIRE's deletes.
+  bool positive = false;
+  std::string_view command;
+};
+
+// Redis's expiry checks. The result is never 0, which means no TTL:
+// a time already past is 1, the earliest one.
+Result<uint64_t> ParseTtl(std::string_view arg, const TtlSpec& spec, uint64_t now_ms) {
+  auto value = ParseInt64(arg);
+  if (!value.has_value()) return std::unexpected(value.error());
+  const auto invalid = [&spec] {
+    return std::unexpected(
+        SyntaxError("invalid expire time in '" + std::string(spec.command) + "' command"));
+  };
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+  if (spec.positive && *value <= 0) return invalid();
+  if (*value > kMax / spec.unit_ms || *value < kMin / spec.unit_ms) return invalid();
+  int64_t ms = *value * spec.unit_ms;
+  if (spec.base == TtlBase::kRelative) {
+    const auto now = static_cast<int64_t>(now_ms);
+    if (ms > kMax - now) return invalid();
+    ms += now;
+  }
+  return static_cast<uint64_t>(std::max<int64_t>(ms, 1));
 }
 
+// NX, XX and GET are the engine's predicates; they are legal here so
+// every SET parse agrees on the accepted tokens.
 Result<WriteOp> ParseSet(const RespCommand& cmd, uint64_t wall_now_ms) {
   uint64_t abs_ttl_ms = 0;
+  bool expiry = false;
+  bool keep_ttl = false;
+  bool nx = false;
+  bool xx = false;
   for (size_t i = 3; i < cmd.args.size(); ++i) {
     const auto opt = AsciiUpper(cmd.args[i]);
-    if (opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") {
-      if (i + 1 >= cmd.args.size()) {
-        return std::unexpected(SyntaxError("syntax error — expected value after '" + opt + "'"));
+    const bool relative = opt == "EX" || opt == "PX";
+    if (relative || opt == "EXAT" || opt == "PXAT") {
+      if (expiry || keep_ttl || i + 1 >= cmd.args.size()) {
+        return std::unexpected(SyntaxError("syntax error"));
       }
-      auto ttl_arg = ParseUint64(cmd.args[++i]);
-      if (!ttl_arg.has_value()) return std::unexpected(ttl_arg.error());
-      if (opt == "EX") {
-        abs_ttl_ms = wall_now_ms + (*ttl_arg * 1000);
-      } else if (opt == "PX") {
-        abs_ttl_ms = wall_now_ms + *ttl_arg;
-      } else if (opt == "EXAT") {
-        abs_ttl_ms = *ttl_arg * 1000;
-      } else {
-        abs_ttl_ms = *ttl_arg;
-      }
-    } else if (!IsResolverSetOption(opt)) {
-      return std::unexpected(SyntaxError("syntax error — unknown SET option '" + opt + "'"));
+      const TtlSpec spec{
+          .unit_ms = opt == "EX" || opt == "EXAT" ? 1000 : 1,
+          .base = relative ? TtlBase::kRelative : TtlBase::kAbsolute,
+          .positive = true,
+          .command = "set",
+      };
+      auto ttl = ParseTtl(cmd.args[++i], spec, wall_now_ms);
+      if (!ttl.has_value()) return std::unexpected(ttl.error());
+      abs_ttl_ms = *ttl;
+      expiry = true;
+    } else if (opt == "KEEPTTL") {
+      if (expiry) return std::unexpected(SyntaxError("syntax error"));
+      keep_ttl = true;
+    } else if (opt == "NX" || opt == "XX") {
+      (opt == "NX" ? nx : xx) = true;
+      if (nx && xx) return std::unexpected(SyntaxError("syntax error"));
+    } else if (opt != "GET") {
+      return std::unexpected(SyntaxError("syntax error"));
     }
   }
   return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[2], .abs_ttl_ms = abs_ttl_ms}};
 }
 
 Result<WriteOp> ParseSetex(const RespCommand& cmd, uint64_t wall_now_ms) {
-  auto ttl = ParseUint64(cmd.args[2]);
+  const TtlSpec spec{
+      .unit_ms = 1000, .base = TtlBase::kRelative, .positive = true, .command = "setex"};
+  auto ttl = ParseTtl(cmd.args[2], spec, wall_now_ms);
   if (!ttl.has_value()) return std::unexpected(ttl.error());
-  return WriteOp{StringSet{
-      .key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = wall_now_ms + (*ttl * 1000)}};
+  return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = *ttl}};
 }
 
 Result<WriteOp> ParsePsetex(const RespCommand& cmd, uint64_t wall_now_ms) {
-  auto ttl = ParseUint64(cmd.args[2]);
+  const TtlSpec spec{
+      .unit_ms = 1, .base = TtlBase::kRelative, .positive = true, .command = "psetex"};
+  auto ttl = ParseTtl(cmd.args[2], spec, wall_now_ms);
   if (!ttl.has_value()) return std::unexpected(ttl.error());
-  return WriteOp{
-      StringSet{.key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = wall_now_ms + *ttl}};
+  return WriteOp{StringSet{.key = cmd.args[1], .value = cmd.args[3], .abs_ttl_ms = *ttl}};
 }
 
 Result<WriteOp> ParseDel(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
@@ -301,10 +331,11 @@ Result<WriteOp> ParseZadd(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
       ++i;
       continue;
     }
+    if (opt == "INCR") return std::unexpected(SyntaxError("ZADD INCR is not supported"));
     break;
   }
   if ((cmd.args.size() - i) < 2 || (cmd.args.size() - i) % 2 != 0) {
-    return std::unexpected(SyntaxError("ZADD requires score-member pairs after flags"));
+    return std::unexpected(SyntaxError("syntax error"));
   }
   std::vector<ZsetAdd::Entry> entries;
   entries.reserve((cmd.args.size() - i) / 2);
@@ -322,7 +353,7 @@ Result<WriteOp> ParseZrem(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
 
 Result<WriteOp> ParseHset(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   if (cmd.args.size() % 2 != 0) {
-    return std::unexpected(SyntaxError("HSET requires field-value pairs"));
+    return std::unexpected(SyntaxError("wrong number of arguments for 'hset' command"));
   }
   std::vector<HashSet::FieldValue> fields;
   fields.reserve((cmd.args.size() - 2) / 2);
@@ -334,7 +365,7 @@ Result<WriteOp> ParseHset(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
 
 Result<WriteOp> ParseHmset(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   if (cmd.args.size() % 2 != 0) {
-    return std::unexpected(SyntaxError("HMSET requires field-value pairs"));
+    return std::unexpected(SyntaxError("wrong number of arguments for 'hmset' command"));
   }
   std::vector<HashSet::FieldValue> fields;
   fields.reserve((cmd.args.size() - 2) / 2);
@@ -348,30 +379,38 @@ Result<WriteOp> ParseHdel(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
   return WriteOp{HashDel{.key = cmd.args[1], .fields = CollectArgs(cmd, 2)}};
 }
 
-// All four EXPIRE forms collapse to abs_ttl_ms; NX/XX/GT/LT are stripped
-// by the predicate extractor before this runs.
+// All four EXPIRE forms collapse to abs_ttl_ms. NX/XX/GT/LT are the
+// engine's predicates, so they are only checked for legality here.
+Result<WriteOp> ParseExpire(const RespCommand& cmd, uint64_t wall_now_ms, const TtlSpec& spec) {
+  for (size_t i = 3; i < cmd.args.size(); ++i) {
+    const auto opt = AsciiUpper(cmd.args[i]);
+    if (opt != "NX" && opt != "XX" && opt != "GT" && opt != "LT") {
+      return std::unexpected(SyntaxError("Unsupported option " + std::string(cmd.args[i])));
+    }
+  }
+  auto ttl = ParseTtl(cmd.args[2], spec, wall_now_ms);
+  if (!ttl.has_value()) return std::unexpected(ttl.error());
+  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ttl}};
+}
+
 Result<WriteOp> ParseExpireSeconds(const RespCommand& cmd, uint64_t wall_now_ms) {
-  auto secs = ParseUint64(cmd.args[2]);
-  if (!secs.has_value()) return std::unexpected(secs.error());
-  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = wall_now_ms + (*secs * 1000)}};
+  return ParseExpire(cmd, wall_now_ms,
+                     {.unit_ms = 1000, .base = TtlBase::kRelative, .command = "expire"});
 }
 
 Result<WriteOp> ParseExpireMs(const RespCommand& cmd, uint64_t wall_now_ms) {
-  auto ms = ParseUint64(cmd.args[2]);
-  if (!ms.has_value()) return std::unexpected(ms.error());
-  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = wall_now_ms + *ms}};
+  return ParseExpire(cmd, wall_now_ms,
+                     {.unit_ms = 1, .base = TtlBase::kRelative, .command = "pexpire"});
 }
 
-Result<WriteOp> ParseExpireAt(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
-  auto ts = ParseUint64(cmd.args[2]);
-  if (!ts.has_value()) return std::unexpected(ts.error());
-  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ts * 1000}};
+Result<WriteOp> ParseExpireAt(const RespCommand& cmd, uint64_t wall_now_ms) {
+  return ParseExpire(cmd, wall_now_ms,
+                     {.unit_ms = 1000, .base = TtlBase::kAbsolute, .command = "expireat"});
 }
 
-Result<WriteOp> ParsePexpireAt(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
-  auto ts = ParseUint64(cmd.args[2]);
-  if (!ts.has_value()) return std::unexpected(ts.error());
-  return WriteOp{Expire{.key = cmd.args[1], .abs_ttl_ms = *ts}};
+Result<WriteOp> ParsePexpireAt(const RespCommand& cmd, uint64_t wall_now_ms) {
+  return ParseExpire(cmd, wall_now_ms,
+                     {.unit_ms = 1, .base = TtlBase::kAbsolute, .command = "pexpireat"});
 }
 
 Result<WriteOp> ParsePersist(const RespCommand& cmd, uint64_t /*wall_now_ms*/) {
@@ -429,16 +468,16 @@ Result<WriteOp> ParseWriteOp(std::string_view name, const RespCommand& cmd, uint
 
 bool HasWriteParser(std::string_view name) { return WriteParsers().contains(name); }
 
-namespace {
-
-// Shortest representation that from_chars reproduces bit-for-bit. std::to_string
-// would round to 6 decimals and silently change scores on the way to the WAL.
+// std::to_string would round to 6 decimals and silently change scores on
+// the way to the WAL.
 std::string ScoreToString(double score) {
   std::array<char, 40> buf{};
   const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), score);
   if (ec != std::errc{}) return "0";
   return {buf.data(), ptr};
 }
+
+namespace {
 
 // Sized up front and filled by emplace: an initializer_list would copy every
 // argument (its elements are const, so they cannot be moved from) and an

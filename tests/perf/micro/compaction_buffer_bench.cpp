@@ -32,7 +32,7 @@ struct BufferFixture {
       const core::ops::StringSet set_op{.key = key, .value = value, .abs_ttl_ms = 0};
       const core::ops::WriteOp op = set_op;
       const auto seq = static_cast<core::SequenceId>(i);
-      buffer.Absorb(key, op, core::EvictionTTL{86400}, seq, seq);
+      buffer.Absorb(key, op, core::EvictionTTL{86400}, seq, seq, 0);
     }
   }
 };

@@ -6,6 +6,7 @@ add_executable(abyss_bench
   hot_store_bench.cpp
   compaction_buffer_bench.cpp
   write_validation_bench.cpp
+  loader_bench.cpp
 )
 
 target_link_libraries(abyss_bench PRIVATE

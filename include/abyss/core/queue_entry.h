@@ -40,6 +40,8 @@ struct QueueEntry {
   SequenceId seq = 0;
   WallTime appended_at;
   std::variant<entry::Write, entry::Conditional, entry::Resolved, entry::Flush> payload;
+  // The entry's effect alone determines its key's state.
+  bool replaces_state = false;
 };
 
 }  // namespace abyss::core

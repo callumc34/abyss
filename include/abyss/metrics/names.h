@@ -606,6 +606,14 @@ inline constexpr CounterDesc<> kColdParsePoisonTotal{
         "retention below the poison seq for the shard until operator intervention (fail-closed).",
 };
 
+inline constexpr CounterDesc<> kColdApplyTypeConflictsTotal{
+    .name = "abyss_cold_apply_type_conflicts_total",
+    .help =
+        "Logged SADD, HSET or ZADD effects that found the key holding another type in cold. The "
+        "write path decides against the key's full state, so this means it and cold disagree. "
+        "Cold drops the other type and applies the effect as logged.",
+};
+
 // Tier domain for this metric is limited to {kHot, kCold}; kBuffer is invalid.
 inline constexpr CounterDesc<Tier> kTtlExpiredTotal{
     .name = "abyss_ttl_expired_total",

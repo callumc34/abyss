@@ -12,13 +12,18 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/cold/format/key_codec.h"
+#include "abyss/core/cold_store.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
@@ -77,13 +82,25 @@ class TtlFixture : public ::testing::Test {
     config.data_path = path_.string();
     config.shard_count = kFixtureShardCount;
     config.wall_clock = clock_.Fn();
+    config.log_clock = [clock = log_clock_ms_](core::ShardId) { return clock->load(); };
     auto store = RocksdbStore::Create(config);
     EXPECT_TRUE(store.has_value()) << (store.has_value() ? "" : store.error().message());
     return std::move(*store);
   }
 
+  // `key`'s state, failing the test when cold does not hold it.
+  static core::ColdKeyState MustLoad(RocksdbStore& store, std::string_view key) {
+    auto loaded = store.LoadKey(key, core::SteadyClock::now() + std::chrono::seconds(5));
+    EXPECT_TRUE(loaded.has_value() && loaded->has_value()) << key << " is missing";
+    return loaded.value_or(std::nullopt).value_or(core::ColdKeyState{});
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   TestClock clock_;
+  // Behind the wall clock, as the log's is while a shard is idle.
+  std::shared_ptr<std::atomic<uint64_t>> log_clock_ms_ = std::make_shared<std::atomic<uint64_t>>(0);
   std::filesystem::path path_;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
 // --- String TTL -------------------------------------------------------------
@@ -129,11 +146,9 @@ TEST_F(TtlFixture, ZeroTtlNeverExpires) {
   EXPECT_EQ(r->AsString(), "v");
 }
 
-TEST_F(TtlFixture, LazyStringExpiryBumpsTtlExpiredMetric) {
-  // Lazy expiry on read funnels through ExpireStringIfStillExpired, which is
-  // the chokepoint for cold-tier kTtlExpiredTotal. Without the increment the
-  // operator can't tell scanner-driven deletes apart from lazy deletes — and
-  // the acceptance suite has no metric to pin the cold side of the property.
+// Reads judge expiry by the wall clock but never write: only the TTL
+// scanner, by the log clock, deletes.
+TEST_F(TtlFixture, ReadOfAWallExpiredStringLeavesItsRecord) {
   abyss::metrics::testing::Reset();
   auto store = OpenStore();
   const auto baseline =
@@ -146,50 +161,50 @@ TEST_F(TtlFixture, LazyStringExpiryBumpsTtlExpiredMetric) {
       .abs_ttl_ms = clock_.Now() + 100,
   };
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
+  const auto before = store->RecordsForTesting();
+  ASSERT_EQ(before.size(), 2U) << "the format version and k";
   clock_.Advance(200);
 
-  auto r = store->Exec(core::ops::StringGet{.key = "k"});
-  ASSERT_TRUE(r.has_value());
-  EXPECT_TRUE(r->IsNull());
+  for (int i = 0; i < 2; ++i) {
+    auto r = store->Exec(core::ops::StringGet{.key = "k"});
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->IsNull());
+  }
+  core::ops::Exists exists;
+  exists.keys = {"k"};
+  EXPECT_EQ(store->Exec(exists)->AsInteger(), 0);
 
-  const auto after =
+  EXPECT_EQ(store->RecordsForTesting(), before);
+  EXPECT_EQ(
       metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
-          .value_or(0.0);
-  EXPECT_EQ(after, baseline + 1.0) << "lazy expiry should bump kTtlExpiredTotal{tier=cold} once";
+          .value_or(0.0),
+      baseline);
 }
 
-TEST_F(TtlFixture, StringExpiryDeletesBackingRecord) {
+// The apply path judges no TTL: a PERSIST logged while the key was live
+// lands even once the wall clock has passed the TTL.
+TEST_F(TtlFixture, PersistOfAKeyPastItsTtlOnlyByTheWallClockClearsIt) {
   auto store = OpenStore();
-  std::string k = "k";
-  std::string v = "v";
-  core::ops::WriteOp op =
-      core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 100};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
+  const uint64_t ttl = clock_.Now() + 100;
+  core::ops::WriteOp set = core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = ttl};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&set, 1}, 0).has_value());
+  log_clock_ms_->store(ttl - 1);
+  clock_.Advance(10'000);
+  EXPECT_TRUE(store->Exec(core::ops::StringGet{.key = "k"})->IsNull());
 
-  clock_.Advance(200);
+  core::ops::WriteOp persist = core::ops::Persist{.key = "k"};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&persist, 1}, 0).has_value());
 
-  auto r1 = store->Exec(core::ops::StringGet{.key = k});
-  EXPECT_TRUE(r1->IsNull());
-
-  // Second read without an intervening write must also be Null and must not
-  // re-surface the value — the first read should have deleted the record.
-  auto r2 = store->Exec(core::ops::StringGet{.key = k});
-  EXPECT_TRUE(r2->IsNull());
-
-  // A DEL after lazy expiry must report 0 — the key is already gone.
-  core::ops::Del del;
-  del.keys = {"k"};
-  auto dr = store->ExecDel(del);
-  ASSERT_TRUE(dr.has_value());
-  EXPECT_EQ(dr->AsInteger(), 0);
+  const auto k = MustLoad(*store, "k");
+  EXPECT_EQ(k.value, core::ColdValue{std::string("v")});
+  EXPECT_EQ(k.abs_ttl_ms, 0);
+  EXPECT_EQ(store->Exec(core::ops::StringGet{.key = "k"})->AsString(), "v");
 }
 
 // --- Collection TTL ---------------------------------------------------------
 
-// No EXPIRE-family op exists yet, so collection TTL is exercised by opening
-// the raw RocksDB handle and rewriting the meta record with `kFlagHasTtl` and
-// a past timestamp. This simulates what would happen if an expiry op landed
-// and aged past `now`.
+// Rewrites the meta record with `kFlagHasTtl` and a timestamp long past
+// under any clock, through the raw RocksDB handle while the store is shut.
 void InjectExpiredMeta(const std::string& path, uint8_t inner_type, std::string_view key,
                        uint64_t cardinality) {
   rocksdb::Options opts;
@@ -231,114 +246,128 @@ TEST_F(TtlFixture, CollectionWithoutTtlSurvivesTimeAdvance) {
   EXPECT_EQ(card->AsInteger(), 1);
 }
 
-TEST_F(TtlFixture, LazyCollectionExpiryBumpsTtlExpiredMetric) {
-  // Mirrors the string case: collection lazy expiry funnels through
-  // ExpireCollectionIfStillExpired, which must increment the same metric so
-  // the acceptance test can observe TTL-driven collection deletion at the
-  // cold tier.
+TEST_F(TtlFixture, ReadsOfAWallExpiredCollectionLeaveItsRecords) {
   abyss::metrics::testing::Reset();
-
-  const std::string key = "s";
-  std::vector<std::string> members = {"a", "b"};
-  std::vector<std::string_view> views(members.begin(), members.end());
-  std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
-  {
-    auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
-  }
-
-  InjectExpiredMeta(path_.string(), format::kTypeSetMember, key, members.size());
-
-  // Re-open the store to force the lazy-expiry path on the first read.
   auto store = OpenStore();
   const auto baseline =
       metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
           .value_or(0.0);
 
-  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = key})->AsInteger(), 0);
+  std::vector<std::string_view> members = {"a", "b"};
+  std::vector<core::ops::WriteOp> ops = {
+      core::ops::SetAdd{.key = "s", .members = members},
+      core::ops::Expire{.key = "s", .abs_ttl_ms = clock_.Now() + 100},
+  };
+  ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
+  const auto before = store->RecordsForTesting();
+  ASSERT_EQ(before.size(), 4U) << "the format version, s's meta and two members";
+  clock_.Advance(200);
 
-  const auto after =
+  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "s"})->AsInteger(), 0);
+  EXPECT_TRUE(store->Exec(core::ops::SetMembers{.key = "s"})->AsArray().empty());
+  EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = "s", .member = "a"})->AsInteger(), 0);
+  // A hash read of s checks s for another type, and finds it expired.
+  EXPECT_TRUE(store->Exec(core::ops::HashGet{.key = "s", .field = "f"})->IsNull());
+  core::ops::Exists exists;
+  exists.keys = {"s"};
+  EXPECT_EQ(store->Exec(exists)->AsInteger(), 0);
+
+  EXPECT_EQ(store->RecordsForTesting(), before);
+  EXPECT_EQ(
       metrics::testing::GetCounterValue(metrics::names::kTtlExpiredTotal, metrics::Tier::kCold)
-          .value_or(0.0);
-  EXPECT_EQ(after, baseline + 1.0)
-      << "lazy collection expiry should bump kTtlExpiredTotal{tier=cold} once";
+          .value_or(0.0),
+      baseline);
 }
 
-TEST_F(TtlFixture, SetReadOnExpiredCollectionReturnsEmptyAndPurges) {
-  std::string key = "s";
-  std::vector<std::string> members = {"a", "b"};
-  std::vector<std::string_view> views(members.begin(), members.end());
-  std::vector<core::ops::WriteOp> ops = {core::ops::SetAdd{.key = key, .members = views}};
-  {
-    auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
-  }
-
-  InjectExpiredMeta(path_.string(), format::kTypeSetMember, key, members.size());
-
+// An SADD logged while the set was live merges into it, even once the
+// wall clock has passed the set's TTL.
+TEST_F(TtlFixture, SaddToASetPastItsTtlOnlyByTheWallClockMerges) {
   auto store = OpenStore();
-  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = key})->AsInteger(), 0);
-  EXPECT_TRUE(store->Exec(core::ops::SetMembers{.key = key})->AsArray().empty());
-  EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = key, .member = "a"})->AsInteger(), 0);
+  const uint64_t ttl = clock_.Now() + 100;
+  std::vector<std::string_view> old_members = {"a", "b"};
+  std::vector<core::ops::WriteOp> seed = {
+      core::ops::SetAdd{.key = "s", .members = old_members},
+      core::ops::Expire{.key = "s", .abs_ttl_ms = ttl},
+  };
+  ASSERT_TRUE(store->ApplyBatch(seed, 0).has_value());
+  log_clock_ms_->store(ttl - 1);
+  clock_.Advance(10'000);
 
-  // After the first read lazily purged the collection, a follow-up SADD must
-  // start from a clean slate rather than inherit the expired meta's TTL or
-  // cardinality.
-  std::vector<std::string> fresh = {"c"};
-  std::vector<std::string_view> fresh_views(fresh.begin(), fresh.end());
-  std::vector<core::ops::WriteOp> add = {core::ops::SetAdd{.key = key, .members = fresh_views}};
-  ASSERT_TRUE(store->ApplyBatch(add, 0).has_value());
-  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = key})->AsInteger(), 1);
-  EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = key, .member = "c"})->AsInteger(), 1);
-  EXPECT_EQ(store->Exec(core::ops::SetIsMember{.key = key, .member = "a"})->AsInteger(), 0);
+  std::vector<std::string_view> new_members = {"c"};
+  core::ops::WriteOp add = core::ops::SetAdd{.key = "s", .members = new_members};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&add, 1}, 0).has_value());
+
+  const auto s = MustLoad(*store, "s");
+  EXPECT_EQ(s.value, (core::ColdValue{std::unordered_set<std::string>{"a", "b", "c"}}));
+  EXPECT_EQ(s.abs_ttl_ms, static_cast<int64_t>(ttl));
 }
 
-TEST_F(TtlFixture, WriteOnExpiredCollectionPurgesOldMembersFirst) {
-  std::string key = "h";
-  std::vector<core::ops::HashSet::FieldValue> fvs = {{.field = "old", .value = "v"}};
-  std::vector<core::ops::WriteOp> ops = {core::ops::HashSet{.key = key, .fields = fvs}};
-  {
-    auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
-  }
-
-  InjectExpiredMeta(path_.string(), format::kTypeHashField, key, 1);
-
+TEST_F(TtlFixture, PersistOfASetPastItsTtlOnlyByTheWallClockClearsIt) {
   auto store = OpenStore();
-  // Write into the expired key — the purge must happen atomically with the
-  // new add, so the caller never observes a mixed state.
-  std::vector<core::ops::HashSet::FieldValue> new_fvs = {{.field = "new", .value = "v"}};
-  std::vector<core::ops::WriteOp> add = {core::ops::HashSet{.key = key, .fields = new_fvs}};
-  ASSERT_TRUE(store->ApplyBatch(add, 0).has_value());
+  const uint64_t ttl = clock_.Now() + 100;
+  std::vector<std::string_view> members = {"a"};
+  std::vector<core::ops::WriteOp> seed = {
+      core::ops::SetAdd{.key = "s", .members = members},
+      core::ops::Expire{.key = "s", .abs_ttl_ms = ttl},
+  };
+  ASSERT_TRUE(store->ApplyBatch(seed, 0).has_value());
+  clock_.Advance(10'000);
 
-  auto all = store->Exec(core::ops::HashGetAll{.key = key});
-  ASSERT_EQ(all->AsArray().size(), 2U);
-  EXPECT_EQ(all->AsArray()[0].AsString(), "new");
-  EXPECT_TRUE(store->Exec(core::ops::HashGet{.key = key, .field = "old"})->IsNull());
+  core::ops::WriteOp persist = core::ops::Persist{.key = "s"};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&persist, 1}, 0).has_value());
+  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "s"})->AsInteger(), 1);
 }
 
-TEST_F(TtlFixture, RemOnExpiredCollectionIsNoop) {
-  std::string key = "z";
-  std::vector<core::ops::ZsetAdd::Entry> entries = {{.score = 1.0, .member = "m"}};
-  std::vector<core::ops::WriteOp> ops = {core::ops::ZsetAdd{.key = key, .entries = entries}};
-  {
-    auto store = OpenStore();
-    ASSERT_TRUE(store->ApplyBatch(ops, 0).has_value());
-  }
-
-  InjectExpiredMeta(path_.string(), format::kTypeZsetMember, key, 1);
-
+TEST_F(TtlFixture, RemOnAWallExpiredZsetAppliesAsLogged) {
   auto store = OpenStore();
+  std::vector<core::ops::ZsetAdd::Entry> entries = {{.score = 1.0, .member = "m"},
+                                                    {.score = 2.0, .member = "n"}};
+  std::vector<core::ops::WriteOp> seed = {
+      core::ops::ZsetAdd{.key = "z", .entries = entries},
+      core::ops::Expire{.key = "z", .abs_ttl_ms = clock_.Now() + 100},
+  };
+  ASSERT_TRUE(store->ApplyBatch(seed, 0).has_value());
+  clock_.Advance(10'000);
+
   std::vector<std::string_view> rem = {"m"};
-  std::vector<core::ops::WriteOp> rem_ops = {core::ops::ZsetRem{.key = key, .members = rem}};
-  ASSERT_TRUE(store->ApplyBatch(rem_ops, 0).has_value());
+  core::ops::WriteOp rem_op = core::ops::ZsetRem{.key = "z", .members = rem};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&rem_op, 1}, 0).has_value());
 
-  // After the no-op REM, the collection must be fully purged — no score index
-  // orphans, no stale member records.
-  EXPECT_EQ(store->Exec(core::ops::ZsetCard{.key = key})->AsInteger(), 0);
-  auto range =
-      store->Exec(core::ops::ZsetRange{.key = key, .min = "-inf", .max = "+inf", .by_score = true});
-  EXPECT_TRUE(range->AsArray().empty());
+  EXPECT_EQ(MustLoad(*store, "z").value,
+            (core::ColdValue{std::unordered_map<std::string, double>{{"n", 2.0}}}));
+  // n's member record and score index entry, z's meta, the format version.
+  EXPECT_EQ(store->RecordsForTesting().size(), 4U);
+}
+
+// The write path logs a DEL before an add that changes a key's type, so
+// an add finding another type, live or expired, is a disagreement: it
+// is counted, and the add still applies as logged.
+TEST_F(TtlFixture, AnAddOverAnotherTypeIsReportedAndApplied) {
+  abyss::metrics::testing::Reset();
+  auto store = OpenStore();
+  std::vector<core::ops::WriteOp> strings = {
+      core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = clock_.Now() - 1},
+      core::ops::StringSet{.key = "j", .value = "v"},
+  };
+  ASSERT_TRUE(store->ApplyBatch(strings, 0).has_value());
+  const auto conflicts = [] {
+    return metrics::testing::GetCounterValue(metrics::names::kColdApplyTypeConflictsTotal)
+        .value_or(0.0);
+  };
+
+  std::vector<std::string_view> members = {"a"};
+  std::vector<core::ops::WriteOp> retype_j = {
+      core::ops::Del{.keys = {"j"}},
+      core::ops::SetAdd{.key = "j", .members = members},
+  };
+  ASSERT_TRUE(store->ApplyBatch(retype_j, 0).has_value());
+  EXPECT_EQ(conflicts(), 0.0);
+
+  core::ops::WriteOp add = core::ops::SetAdd{.key = "k", .members = members};
+  ASSERT_TRUE(store->ApplyBatch(std::span{&add, 1}, 0).has_value());
+  EXPECT_EQ(conflicts(), 1.0);
+  EXPECT_EQ(store->Exec(core::ops::SetCard{.key = "k"})->AsInteger(), 1);
+  EXPECT_TRUE(store->Exec(core::ops::StringGet{.key = "k"})->IsNull());
 }
 
 TEST_F(TtlFixture, ExistsDoesNotCountExpiredCollection) {
@@ -358,20 +387,19 @@ TEST_F(TtlFixture, ExistsDoesNotCountExpiredCollection) {
   EXPECT_EQ(store->Exec(op)->AsInteger(), 0);
 }
 
-// --- Concurrent lazy expiry -------------------------------------------------
+// --- Concurrent reads ---------------------------------------------------
 
-TEST_F(TtlFixture, ConcurrentReadsOnExpiredKeyAreSafe) {
+TEST_F(TtlFixture, ConcurrentReadsOfAnExpiredKeyNeverWrite) {
   auto store = OpenStore();
   std::string k = "k";
   std::string v = "v";
   core::ops::WriteOp op =
       core::ops::StringSet{.key = k, .value = v, .abs_ttl_ms = clock_.Now() + 10};
   ASSERT_TRUE(store->ApplyBatch(std::span{&op, 1}, 0).has_value());
+  const auto before = store->RecordsForTesting();
 
   clock_.Advance(1'000);
 
-  // Fan several threads onto the same expired key. Each must return Null;
-  // lazy-delete is idempotent so no corruption is possible.
   constexpr int kThreads = 8;
   std::vector<std::thread> threads;
   std::atomic<int> null_count{0};
@@ -386,55 +414,7 @@ TEST_F(TtlFixture, ConcurrentReadsOnExpiredKeyAreSafe) {
   }
   for (auto& t : threads) t.join();
   EXPECT_EQ(null_count.load(), kThreads * 64);
-}
-
-// CAS-safety: a writer racing with a lazy-expiry read must never lose its
-// value. The lazy delete uses an OptimisticTransaction that aborts when the
-// concurrent rewrite has overlapping write set.
-TEST_F(TtlFixture, LazyExpiryDoesNotClobberConcurrentWrite) {
-  auto store = OpenStore();
-  std::string k = "k";
-
-  // Write an expired value as the starting state.
-  core::ops::WriteOp expired =
-      core::ops::StringSet{.key = k, .value = "old", .abs_ttl_ms = clock_.Now() - 1};
-  ASSERT_TRUE(store->ApplyBatch(std::span{&expired, 1}, 0).has_value());
-
-  std::atomic<bool> stop_writer{false};
-  std::thread writer([&]() {
-    while (!stop_writer.load(std::memory_order_acquire)) {
-      core::ops::WriteOp rewrite = core::ops::StringSet{
-          .key = k,
-          .value = "fresh",
-          .abs_ttl_ms = clock_.Now() + 60'000,
-      };
-      auto r = store->ApplyBatch(std::span{&rewrite, 1}, 0);
-      (void)r;
-    }
-  });
-
-  // Many lazy reads in parallel. Some will observe the expired old value and
-  // try to delete it; the OCC commit aborts whenever the writer rewrote
-  // concurrently, so "fresh" is never wiped.
-  constexpr int kReaders = 4;
-  std::vector<std::thread> readers;
-  readers.reserve(kReaders);
-  for (int i = 0; i < kReaders; ++i) {
-    readers.emplace_back([&] {
-      for (int j = 0; j < 200; ++j) {
-        auto r = store->Exec(core::ops::StringGet{.key = k});
-        EXPECT_TRUE(r.has_value());
-      }
-    });
-  }
-  for (auto& t : readers) t.join();
-  stop_writer.store(true, std::memory_order_release);
-  writer.join();
-
-  // After the dust settles the writer's last value must still be readable.
-  auto final_read = store->Exec(core::ops::StringGet{.key = k});
-  ASSERT_TRUE(final_read.has_value());
-  EXPECT_EQ(final_read->AsString(), "fresh");
+  EXPECT_EQ(store->RecordsForTesting(), before);
 }
 
 }  // namespace

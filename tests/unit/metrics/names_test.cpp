@@ -86,6 +86,7 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kColdFlushTotal.name,
       names::kColdFlushReasonTotal.name,
       names::kTtlExpiredTotal.name,
+      names::kColdApplyTypeConflictsTotal.name,
       names::kEvictedTotal.name,
       names::kHotStubDropsTotal.name,
       names::kHotLoadDiscardsTotal.name,

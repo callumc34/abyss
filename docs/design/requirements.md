@@ -116,7 +116,7 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 - Built-in append-only WAL with segment rotation and offset persistence
 - Durability classes (`process_crash`, `power_loss`) with natural-batching group commit
 - Built-in hash map hot store with LRU eviction, eviction refresh on read, absolute TTL
-- Built-in RocksDB cold store with dual TTL expiry (lazy + active)
+- Built-in RocksDB cold store with TTL expiry: reads answer nil for expired keys, and an active scanner deletes them by the log's clock
 - Hot consumer (eager, real-time, promise-based write ACK)
 - Cold consumer with compaction buffer (quiet-window + deadline + jitter flush)
 - Compaction: scalar last-write-wins, set/sorted-set merge-accumulate

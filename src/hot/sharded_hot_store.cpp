@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/thread_annotations.h"
@@ -45,10 +46,12 @@ core::SequenceId ShardedHotStore::Horizon(core::ShardId shard) const {
   return config_.drained ? config_.drained(shard) : kAllDrained;
 }
 
+const core::EvictionPolicy& ShardedHotStore::Policy() const {
+  return config_.eviction_policy != nullptr ? *config_.eviction_policy : default_policy_;
+}
+
 core::EvictionTTL ShardedHotStore::ResolveEviction(std::string_view key) const {
-  const auto& policy =
-      config_.eviction_policy != nullptr ? *config_.eviction_policy : default_policy_;
-  return policy.Resolve(key);
+  return Policy().Resolve(key);
 }
 
 core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op,
@@ -202,15 +205,21 @@ core::Result<void> ShardedHotStore::Wipe(core::ShardId shard,
   return {};
 }
 
-std::optional<LoadToken> ShardedHotStore::BeginLoad(std::string_view key)
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  auto& shard = ShardFor(key);
+LoadStart ShardedHotStore::BeginLoad(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  using Status = LoadStart::Status;
+  const auto index = ShardIndex(key);
+  const auto horizon = Horizon(index);
+  auto& shard = *shards_[index];
   const std::unique_lock lock(shard.mutex);
-  return shard.store.BeginLoad(key);
+  if (shard.store.KnownAbsentAfterFlush(horizon)) return {.status = Status::kFlushed};
+  if (const auto token = shard.store.BeginLoad(key); token.has_value()) {
+    return {.status = Status::kStarted, .token = *token};
+  }
+  return {.status = shard.store.LoadPending(key) ? Status::kPending : Status::kResident};
 }
 
 bool ShardedHotStore::CompleteLoad(std::string_view key, LoadToken token,
-                                   LoadedState state) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+                                   LoadResult&& result) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const auto index = ShardIndex(key);
   const auto eviction = ResolveEviction(key);
   const auto horizon = Horizon(index);
@@ -218,9 +227,25 @@ bool ShardedHotStore::CompleteLoad(std::string_view key, LoadToken token,
   bool installed = false;
   {
     const std::unique_lock lock(shard.mutex);
-    installed = shard.store.CompleteLoad(key, token, std::move(state), eviction, horizon);
+    installed = shard.store.CompleteLoad(key, token, std::move(result), eviction, horizon);
   }
   shard.load_cv.notify_all();
+  return installed;
+}
+
+size_t ShardedHotStore::CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads)
+    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  for (const auto& load : loads) {
+    if (ShardIndex(load.key) != shard) core::Fatal("a load completes on another key's shard");
+  }
+  const auto horizon = Horizon(shard);
+  auto& target = *shards_.at(shard);
+  size_t installed = 0;
+  {
+    const std::unique_lock lock(target.mutex);
+    installed = target.store.CompleteLoads(loads, Policy(), horizon);
+  }
+  target.load_cv.notify_all();
   return installed;
 }
 
@@ -240,6 +265,12 @@ bool ShardedHotStore::AwaitLoad(std::string_view key,
   std::shared_lock lock(shard.mutex);
   return shard.load_cv.wait_until(lock, deadline,
                                   [&shard, key] { return !shard.store.LoadPending(key); });
+}
+
+bool ShardedHotStore::LoadPending(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  auto& shard = ShardFor(key);
+  const std::shared_lock lock(shard.mutex);
+  return shard.store.LoadPending(key);
 }
 
 std::optional<Stub> ShardedHotStore::FindStub(std::string_view key)

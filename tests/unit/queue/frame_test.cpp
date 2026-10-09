@@ -115,6 +115,35 @@ TEST(FrameTest, RoundTripsEveryEntryType) {
             core::PredicateFlags::kNx);
 }
 
+TEST(FrameTest, CarriesReplacesState) {
+  for (const bool replaces : {false, true}) {
+    core::QueueEntry entry = WriteEntry(7, "v");
+    entry.replaces_state = replaces;
+    std::vector<std::byte> bytes = Closed(entry);
+    Seal(bytes, kGen);
+    const View view = InspectAt(bytes, kGen);
+    ASSERT_EQ(view.state, State::kFilled);
+    EXPECT_EQ(view.header.flags, replaces ? kReplacesState : 0U);
+    auto decoded = DecodeEntry(view);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+    EXPECT_EQ(decoded->replaces_state, replaces);
+  }
+}
+
+TEST(FrameTest, AnUnknownFlagUnderAValidCrcIsCorruption) {
+  std::vector<std::byte> bytes;
+  EncodeEntry(WriteEntry(1, "v"), 0, bytes);
+  // The flags word, after kind, type and shard.
+  binary::StoreLE<uint32_t>(bytes.data() + kBodyAt + 4, kReplacesState | (1U << 1));
+  CloseBatch(bytes);
+  Seal(bytes, kGen);
+  const View view = InspectAt(bytes, kGen);
+  ASSERT_EQ(view.state, State::kFilled);
+  auto decoded = DecodeEntry(view);
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
+}
+
 TEST(FrameTest, BatchRestCountsTheBytesLeftInTheBatch) {
   std::vector<std::byte> batch;
   std::vector<std::size_t> sizes;

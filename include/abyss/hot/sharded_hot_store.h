@@ -61,11 +61,17 @@ class ShardedHotStore : public core::HotStore {
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Wipe(core::ShardId shard, core::SequenceId seq) override;
 
-  std::optional<LoadToken> BeginLoad(std::string_view key);
-  bool CompleteLoad(std::string_view key, LoadToken token, LoadedState state);
+  // Refused, as well, while the key's shard is under its flush floor:
+  // cold may still hold what the Flush removed.
+  LoadStart BeginLoad(std::string_view key);
+  bool CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result);
+  // SingleShardStore::CompleteLoads on `shard`, in one exclusive hold.
+  size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
   void AbortLoad(std::string_view key, LoadToken token);
   // Waits until `key` has no load in flight; false at the deadline.
   bool AwaitLoad(std::string_view key, core::SteadyTime deadline);
+  bool LoadPending(std::string_view key);
+  bool RetainsStubs() const { return shards_.front()->store.RetainsStubs(); }
 
   std::optional<Stub> FindStub(std::string_view key);
   bool DropStub(std::string_view key);
@@ -118,6 +124,7 @@ class ShardedHotStore : public core::HotStore {
   core::ShardId ShardIndex(std::string_view key) const;
   Shard& ShardFor(std::string_view key);
   core::SequenceId Horizon(core::ShardId shard) const;
+  const core::EvictionPolicy& Policy() const;
   core::EvictionTTL ResolveEviction(std::string_view key) const;
   core::Result<core::RespValue> ApplyToShard(core::ShardId index, const core::ops::WriteOp& op,
                                              core::EvictionTTL eviction, core::SequenceId seq);

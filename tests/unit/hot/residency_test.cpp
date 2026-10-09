@@ -8,6 +8,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/core/eviction_policy.h"
@@ -33,11 +34,16 @@ int64_t WallMs(const abyss::testing::TestClock& clock) {
 }
 
 // A load token, failing the test if none is granted.
-template <typename Store>
-LoadToken MustBeginLoad(Store& store, std::string_view key) {
+LoadToken MustBeginLoad(SingleShardStore& store, std::string_view key) {
   const auto token = store.BeginLoad(key);
   EXPECT_TRUE(token.has_value()) << "no load token for " << key;
   return token.value_or(LoadToken{});
+}
+
+LoadToken MustBeginLoad(ShardedHotStore& store, std::string_view key) {
+  const LoadStart start = store.BeginLoad(key);
+  EXPECT_TRUE(start.started()) << "no load token for " << key;
+  return start.token_if_started().value_or(LoadToken{});
 }
 
 class ResidencyTest : public ::testing::Test {
@@ -72,9 +78,7 @@ class ResidencyTest : public ::testing::Test {
     return store_.EvictExpired(clock_.SteadyNow(), horizon);
   }
 
-  static LoadedState LoadedString(std::string value) {
-    return LoadedState{.exists = true, .type = Entry::Type::kString, .value = std::move(value)};
-  }
+  static LoadResult LoadedString(std::string value) { return MakeLoadedFull(std::move(value), 0); }
 };
 
 // --- latest_seq ---
@@ -189,10 +193,14 @@ TEST_F(ResidencyTest, ApplyOnExpiredKeyKeepsItUntilDrained) {
   Write(ops::Del{.keys = {"a"}}, 4);
   Write(ops::Expire{.key = "b", .abs_ttl_ms = uint64_t{1} << 50}, 4);
   Write(ops::Persist{.key = "c"}, 4);
-  EXPECT_EQ(store_.Stats().key_count, 3U);
+  EXPECT_EQ(store_.Probe("a"), core::HotKeyPresence::kTombstoned) << "a DEL tombstones it";
+  EXPECT_EQ(store_.Stats().key_count, 2U);
+  EXPECT_EQ(store_.Stats().expired_count, 1U);
 
   EXPECT_EQ(store_.EvictExpired(clock_.SteadyNow(), 3).Total(), 0U);
-  EXPECT_EQ(store_.EvictExpired(clock_.SteadyNow(), 4).by_ttl, 3U);
+  EXPECT_EQ(store_.GcTombstones(3), 0U);
+  EXPECT_EQ(store_.EvictExpired(clock_.SteadyNow(), 4).by_ttl, 2U);
+  EXPECT_EQ(store_.GcTombstones(4), 1U);
 }
 
 TEST_F(ResidencyTest, LruEvictionWaitsForDrain) {
@@ -394,9 +402,8 @@ TEST_F(ResidencyTest, LoadWithExactTokenInstalls) {
   EXPECT_TRUE(store_.LoadPending("s"));
   SetValue members;
   members.members = {"a", "b"};
-  ASSERT_TRUE(store_.CompleteLoad(
-      "s", token, LoadedState{.exists = true, .type = Entry::Type::kSet, .value = members},
-      kLongEviction, kAllDrained));
+  ASSERT_TRUE(
+      store_.CompleteLoad("s", token, MakeLoadedFull(members, 0), kLongEviction, kAllDrained));
 
   EXPECT_FALSE(store_.LoadPending("s"));
   auto card = store_.Exec(ops::ReadOp{ops::SetCard{.key = "s"}});
@@ -412,13 +419,14 @@ TEST_F(ResidencyTest, InstalledStateIsAlreadyDrained) {
   EXPECT_EQ(EvictAfterDeadline(0).by_deadline, 1U) << "latest_seq 0 is evictable at any horizon";
 }
 
-TEST_F(ResidencyTest, AbsentLoadInstallsNothing) {
+TEST_F(ResidencyTest, AbsentLoadInstallsADrainedTombstone) {
   const LoadToken token = MustBeginLoad(store_, "k");
-  EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedState{}, kLongEviction, kAllDrained));
+  EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedAbsent{}, kLongEviction, kAllDrained));
   EXPECT_FALSE(store_.LoadPending("k"));
-  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
+  EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
   EXPECT_EQ(store_.Stats().key_count, 0U);
   EXPECT_EQ(store_.Stats().load_discards, 0U);
+  EXPECT_EQ(store_.GcTombstones(0), 1U) << "latest_seq 0 is drained at any horizon";
 }
 
 TEST_F(ResidencyTest, BeginLoadNeedsNoEntryAndNoLoad) {
@@ -475,6 +483,110 @@ TEST_F(ResidencyTest, AbortNeedsTheMatchingToken) {
   store_.AbortLoad("k", token);
   EXPECT_FALSE(store_.LoadPending("k"));
   EXPECT_EQ(store_.Stats().load_discards, 0U);
+}
+
+// --- Load results ---
+
+TEST_F(ResidencyTest, ExistsInstallsAStubReplacingAnyStub) {
+  Set("k", 1);
+  EvictAfterDeadline(kAllDrained);
+  ASSERT_NE(store_.FindStub("k"), nullptr);
+  const LoadToken token = MustBeginLoad(store_, "k");
+  ASSERT_TRUE(store_.CompleteLoad("k", token,
+                                  LoadedExists{.type = Entry::Type::kSet, .abs_ttl_ms = 77},
+                                  kLongEviction, kAllDrained));
+
+  const Stub* stub = store_.FindStub("k");
+  ASSERT_NE(stub, nullptr);
+  EXPECT_EQ(stub->type, Entry::Type::kSet);
+  EXPECT_EQ(stub->abs_ttl_ms, 77);
+  EXPECT_EQ(stub->latest_seq, 0U);
+  EXPECT_EQ(store_.View("k", kAllDrained, 0).presence, KeyView::Presence::kStub);
+  EXPECT_EQ(store_.Stats().key_count, 0U);
+}
+
+TEST(ResidencyNoStubsTest, ExistsIsNotHeldWithoutStubs) {
+  SingleShardStore store{SingleShardConfig{}};
+  EXPECT_FALSE(store.RetainsStubs());
+  const LoadToken token = MustBeginLoad(store, "k");
+  EXPECT_FALSE(store.CompleteLoad("k", token, LoadedExists{}, kLongEviction, kAllDrained));
+  EXPECT_FALSE(store.LoadPending("k"));
+  EXPECT_EQ(store.View("k", kAllDrained, 0).presence, KeyView::Presence::kNonResident);
+}
+
+TEST(ResidencyOvertakenLoadTest, EveryResultDiscardsWhenOvertaken) {
+  using Overtake = std::function<void(SingleShardStore&, LoadToken)>;
+  const std::vector<std::pair<std::string, LoadResult>> results = {
+      {"absent", LoadedAbsent{}},
+      {"exists", LoadedExists{.type = Entry::Type::kHash}},
+      {"full", MakeLoadedFull(std::string("stale"), 0)},
+  };
+  const std::vector<std::pair<std::string, Overtake>> overtakes = {
+      {"a stale token",
+       [](SingleShardStore& store, LoadToken token) {
+         store.AbortLoad("k", token);
+         ASSERT_TRUE(store.BeginLoad("k").has_value());
+       }},
+      {"an apply",
+       [](SingleShardStore& store, LoadToken /*token*/) {
+         ASSERT_TRUE(store
+                         .Apply(ops::WriteOp{ops::StringSet{.key = "k", .value = "written"}},
+                                kLongEviction, 2)
+                         .has_value());
+       }},
+      {"a wipe", [](SingleShardStore& store, LoadToken /*token*/) { store.Wipe(5); }},
+  };
+  for (const auto& [result_name, result] : results) {
+    for (const auto& [overtake_name, overtake] : overtakes) {
+      SCOPED_TRACE(::testing::Message() << result_name << " overtaken by " << overtake_name);
+      SingleShardStore store{SingleShardConfig{.stub_max_entries = 4}};
+      const LoadToken token = MustBeginLoad(store, "k");
+      overtake(store, token);
+      const auto keys = store.Stats().key_count;
+
+      LoadResult late = result;
+      EXPECT_FALSE(store.CompleteLoad("k", token, std::move(late), kLongEviction, kAllDrained));
+      EXPECT_EQ(store.Stats().load_discards, 1U);
+      EXPECT_EQ(store.Stats().key_count, keys);
+      EXPECT_EQ(store.FindStub("k"), nullptr);
+      EXPECT_NE(store.Probe("k"), core::HotKeyPresence::kTombstoned);
+    }
+  }
+}
+
+TEST_F(ResidencyTest, CompleteLoadsInstallsABatchInOneCall) {
+  std::vector<LoadCompletion> loads;
+  loads.push_back({.key = "a", .token = MustBeginLoad(store_, "a"), .result = LoadedAbsent{}});
+  loads.push_back({.key = "b",
+                   .token = MustBeginLoad(store_, "b"),
+                   .result = LoadedExists{.type = Entry::Type::kZset}});
+  loads.push_back({.key = "c", .token = MustBeginLoad(store_, "c"), .result = LoadedString("v")});
+  loads.push_back({.key = "d", .token = LoadToken{.id = 999}, .result = LoadedString("stale")});
+
+  const core::EvictionPolicy policy{kLongEviction};
+  EXPECT_EQ(store_.CompleteLoads(loads, policy, kAllDrained), 3U);
+  EXPECT_EQ(store_.View("a", kAllDrained, 0).presence, KeyView::Presence::kTombstoned);
+  EXPECT_EQ(store_.View("b", kAllDrained, 0).presence, KeyView::Presence::kStub);
+  const KeyView c = store_.View("c", kAllDrained, 0);
+  EXPECT_EQ(c.presence, KeyView::Presence::kLive);
+  EXPECT_EQ(c.string_value(), "v");
+  EXPECT_EQ(store_.View("d", kAllDrained, 0).presence, KeyView::Presence::kNonResident);
+  EXPECT_TRUE(std::holds_alternative<LoadedFull>(loads.back().result))
+      << "a discard leaves its result";
+}
+
+TEST_F(ResidencyTest, InstallUsesTheFootprintMeasuredOffTheLock) {
+  SetValue members;
+  members.members = {"a", "b", "c"};
+  LoadedFull full = MakeLoadedFull(members, 0);
+  EXPECT_EQ(full.bytes, ApproximateBytes(Value{members}));
+  full.bytes += 1000;
+  const LoadToken token = MustBeginLoad(store_, "s");
+  const auto before = store_.Stats().used_bytes;
+  ASSERT_TRUE(store_.CompleteLoad("s", token, std::move(full), kLongEviction, kAllDrained));
+  EXPECT_EQ(store_.Stats().used_bytes - before,
+            ApproximateBytes(Value{members}) + 1000 + sizeof(std::string) + 1)
+      << "CompleteLoad takes the given footprint and measures nothing";
 }
 
 TEST_F(ResidencyTest, ReadersSeePlaceholderAsMiss) {
@@ -689,16 +801,15 @@ TEST(ResidencyMemoryTest, CachedFootprintMatchesAFullRecount) {
   zset.member_scores = {{"m", 3}, {"o", 2}};
   zset.score_members = {{2, {"o"}}, {3, {"m"}}};
   SingleShardStore loaded{SingleShardConfig{}};
-  const auto install = [&](std::string_view key, Entry::Type type, Value value) {
+  const auto install = [&](std::string_view key, Value value) {
     const LoadToken token = MustBeginLoad(loaded, key);
-    ASSERT_TRUE(loaded.CompleteLoad(
-        key, token, LoadedState{.exists = true, .type = type, .value = std::move(value)},
-        kLongEviction, kAllDrained));
+    ASSERT_TRUE(loaded.CompleteLoad(key, token, MakeLoadedFull(std::move(value), 0), kLongEviction,
+                                    kAllDrained));
   };
-  install("s", Entry::Type::kSet, set);
-  install("h", Entry::Type::kHash, hash);
-  install("z", Entry::Type::kZset, zset);
-  install("str", Entry::Type::kString, long_value);
+  install("s", set);
+  install("h", hash);
+  install("z", zset);
+  install("str", long_value);
 
   EXPECT_EQ(built.Stats().used_bytes, loaded.Stats().used_bytes);
 }
@@ -834,16 +945,16 @@ TEST_F(ShardedResidencyTest, StubCapComesFromTheMemoryFraction) {
 
 TEST_F(ShardedResidencyTest, LoadForwardsInstallUnderTheShardLock) {
   const LoadToken token = MustBeginLoad(store_, "k");
-  EXPECT_FALSE(store_.BeginLoad("k").has_value());
-  ASSERT_TRUE(store_.CompleteLoad(
-      "k", token, LoadedState{.exists = true, .type = Entry::Type::kString, .value = "v"}));
+  EXPECT_EQ(store_.BeginLoad("k").status, LoadStart::Status::kPending);
+  ASSERT_TRUE(store_.CompleteLoad("k", token, MakeLoadedFull(std::string("v"), 0)));
+  EXPECT_EQ(store_.BeginLoad("k").status, LoadStart::Status::kResident);
   auto get = store_.Exec(ops::ReadOp{ops::StringGet{.key = "k"}});
   ASSERT_TRUE(get.has_value());
   EXPECT_EQ(get->AsString(), "v");
 
   const LoadToken stale = MustBeginLoad(store_, "j");
   Set("j", 3);
-  EXPECT_FALSE(store_.CompleteLoad("j", stale, LoadedState{}));
+  EXPECT_FALSE(store_.CompleteLoad("j", stale, LoadedAbsent{}));
   EXPECT_EQ(store_.Stats()->load_discards, 1U);
 }
 
@@ -875,9 +986,45 @@ TEST_F(ShardedResidencyTest, FlushFloorIsPerShard) {
   EXPECT_FALSE(store_.KnownAbsentAfterFlush("k"));
 }
 
+TEST_F(ShardedResidencyTest, NoLoadBeginsUnderTheFlushFloor) {
+  // Cold may still hold what the Flush removed.
+  ASSERT_TRUE(store_.Wipe(core::ComputeShard("k", store_.shard_count()), 10).has_value());
+  horizon_ = 9;
+  EXPECT_EQ(store_.BeginLoad("k").status, LoadStart::Status::kFlushed);
+  EXPECT_FALSE(store_.LoadPending("k"));
+  horizon_ = 10;
+  EXPECT_TRUE(store_.BeginLoad("k").started());
+  EXPECT_TRUE(store_.LoadPending("k"));
+}
+
+TEST_F(ShardedResidencyTest, CompleteLoadsForwardsInOneHold) {
+  const auto shard = core::ComputeShard("k", store_.shard_count());
+  std::string other = "j";
+  while (core::ComputeShard(other, store_.shard_count()) != shard) other += "j";
+  std::vector<LoadCompletion> loads;
+  loads.push_back({.key = "k",
+                   .token = MustBeginLoad(store_, "k"),
+                   .result = MakeLoadedFull(std::string("v"), 0)});
+  loads.push_back({.key = other, .token = MustBeginLoad(store_, other), .result = LoadedAbsent{}});
+
+  EXPECT_EQ(store_.CompleteLoads(shard, loads), 2U);
+  EXPECT_FALSE(store_.LoadPending("k"));
+  EXPECT_FALSE(store_.LoadPending(other));
+  auto get = store_.Exec(ops::ReadOp{ops::StringGet{.key = "k"}});
+  ASSERT_TRUE(get.has_value());
+  EXPECT_EQ(get->AsString(), "v");
+  EXPECT_EQ(store_.Probe(other), core::HotKeyPresence::kTombstoned);
+}
+
+TEST(ShardedResidencyStubsTest, RetainsStubsFollowsTheStubBudget) {
+  EXPECT_TRUE(ShardedHotStore(ShardedHotStoreConfig{.shard_count = 2}).RetainsStubs());
+  EXPECT_FALSE(ShardedHotStore(ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 2})
+                   .RetainsStubs());
+}
+
 TEST_F(ShardedResidencyTest, AwaitLoadWakesOnComplete) {
   const LoadToken token = MustBeginLoad(store_, "k");
-  ExpectAwaitWakes("k", [&] { EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedState{})); });
+  ExpectAwaitWakes("k", [&] { EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedAbsent{})); });
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadWakesOnAbort) {
@@ -886,25 +1033,25 @@ TEST_F(ShardedResidencyTest, AwaitLoadWakesOnAbort) {
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadWakesOnApply) {
-  ASSERT_TRUE(store_.BeginLoad("k").has_value());
+  ASSERT_TRUE(store_.BeginLoad("k").started());
   ExpectAwaitWakes("k", [&] { Set("k", 4); });
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadWakesOnDel) {
-  ASSERT_TRUE(store_.BeginLoad("k").has_value());
+  ASSERT_TRUE(store_.BeginLoad("k").started());
   ExpectAwaitWakes("k", [&] {
     EXPECT_TRUE(store_.Apply(ops::WriteOp{ops::Del{.keys = {"k"}}}, 4).has_value());
   });
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadWakesOnWipe) {
-  ASSERT_TRUE(store_.BeginLoad("k").has_value());
+  ASSERT_TRUE(store_.BeginLoad("k").started());
   const auto shard = core::ComputeShard("k", store_.shard_count());
   ExpectAwaitWakes("k", [&] { EXPECT_TRUE(store_.Wipe(shard, 4).has_value()); });
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadTimesOutWhileTheLoadIsPending) {
-  ASSERT_TRUE(store_.BeginLoad("k").has_value());
+  ASSERT_TRUE(store_.BeginLoad("k").started());
   const auto start = core::SteadyClock::now();
   EXPECT_FALSE(store_.AwaitLoad("k", start + 50ms));
   EXPECT_GE(core::SteadyClock::now() - start, 50ms);

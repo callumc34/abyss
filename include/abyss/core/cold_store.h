@@ -3,7 +3,11 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/reader.h"
@@ -17,6 +21,35 @@ struct StorageStats {
   uint64_t disk_bytes = 0;
   uint64_t key_count = 0;
 };
+
+// In the order of ColdValue's alternatives.
+enum class KeyType : uint8_t { kString, kSet, kHash, kZset };
+
+// A key's type and TTL (0: none), without its value.
+struct KeyMeta {
+  KeyType type = KeyType::kString;
+  int64_t abs_ttl_ms = 0;
+  // Members or fields; 1 for a string.
+  uint64_t cardinality = 0;
+
+  bool operator==(const KeyMeta&) const = default;
+};
+
+// A string, a set's members, a hash's fields, or a zset's scores.
+using ColdValue = std::variant<std::string, std::unordered_set<std::string>,
+                               std::unordered_map<std::string, std::string>,
+                               std::unordered_map<std::string, double>>;
+
+struct ColdKeyState {
+  KeyType type = KeyType::kString;
+  ColdValue value;
+  int64_t abs_ttl_ms = 0;
+
+  bool operator==(const ColdKeyState&) const = default;
+};
+
+// A set member's presence, a hash field's value or a zset score.
+using MemberValue = std::variant<std::monostate, std::string, double>;
 
 class ColdStore : public Reader {
  public:
@@ -55,6 +88,20 @@ class ColdStore : public Reader {
   // cold, or nullopt if the key does not exist or its type isn't promotable
   // in this implementation. Preserves absolute TTL.
   virtual Result<std::optional<RespCommand>> GetPromotionCommand(std::string_view key) = 0;
+
+  // The loads below judge no TTL and delete nothing: an expired key is
+  // returned with its TTL. Each reads one consistent view, and fails
+  // kTimeout once `deadline` passes.
+
+  // `key`'s whole state, or nullopt when cold does not hold it.
+  virtual Result<std::optional<ColdKeyState>> LoadKey(std::string_view key,
+                                                      SteadyTime deadline) = 0;
+  // `key`'s type and TTL, reading none of its members.
+  virtual Result<std::optional<KeyMeta>> ProbeKey(std::string_view key, SteadyTime deadline) = 0;
+  // One member or field of `key` as `type`; nullopt when absent.
+  virtual Result<std::optional<MemberValue>> LoadMember(std::string_view key, KeyType type,
+                                                        std::string_view member,
+                                                        SteadyTime deadline) = 0;
 
   // Server calls Start() once after recovery completes to enable any
   // backend-internal background work (TTL sweeping, prefetch, etc.). Stop()

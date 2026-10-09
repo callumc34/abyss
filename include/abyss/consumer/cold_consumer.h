@@ -105,7 +105,7 @@ class ColdConsumer {
   };
 
   // `eviction_policy` is borrowed; the server owns the single instance and
-  // outlives every consumer.
+  // outlives every consumer. `wall_clock` judges buffer reads only.
   ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard, Config config,
                const core::EvictionPolicy& eviction_policy, core::ConsumerRpc& rpc,
                core::SteadyClockFn steady_clock = core::DefaultSteadyClock,
@@ -187,6 +187,9 @@ class ColdConsumer {
     return latest_drained_seq_.load(std::memory_order_acquire);
   }
 
+  // The shard's log clock (CompactionBuffer::LogClockMs). Any thread.
+  uint64_t LogClockMs() const { return buffer_.LogClockMs(); }
+
   // Blocks until this consumer drains through `target` (true) or `timeout`
   // elapses (false). Signal-driven by the drain loop, not a poll.
   bool WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout);
@@ -219,11 +222,11 @@ class ColdConsumer {
   // False if the wipe failed: the Flush is retried, never passed.
   bool HandleFlush(const core::QueueEntry& entry);
 
-  // `wall_now_ms` must be the entry's appended_at so hot and cold materialise
-  // identical absolute TTLs from PX/EX args. See CompactionBuffer::Absorb for
-  // `position` and `carrier`.
+  // `appended_at_ms` is the carrier's appended_at, so hot and cold
+  // materialise identical absolute TTLs from PX/EX args. See
+  // CompactionBuffer::Absorb for `position` and `carrier`.
   void AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId position,
-                        core::SequenceId carrier, uint64_t wall_now_ms);
+                        core::SequenceId carrier, uint64_t appended_at_ms);
 
   // True once `seq` is power-durable, waiting up to queue_read_timeout.
   bool AwaitPowerDurable(core::SequenceId seq);
@@ -239,7 +242,7 @@ class ColdConsumer {
   // retries after a backoff. kProgress on success, kPoisoned on a terminal
   // error, kBackpressure on a retriable one.
   FlushOutcome ApplyBatchWithRetry(const FlushBatch& entries, core::SequenceId highest_wal_seq,
-                                   core::WallTime wall_now);
+                                   uint64_t log_now_ms);
 
   // Shared implementation between Flush() and FlushUnscheduled() — once a
   // batch has been selected from the buffer, the apply path is identical.
@@ -264,9 +267,10 @@ class ColdConsumer {
 
   std::vector<core::ops::WriteOp> BuildBatchOps(const FlushBatch& entries,
                                                 std::vector<core::ops::Del>& del_storage,
-                                                core::WallTime wall_now) const;
+                                                uint64_t log_now_ms) const;
 
-  bool AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const;
+  // By the log clock, never the wall clock: see LogClockMs.
+  static bool AbsTtlExpired(const BufferEntry& entry, uint64_t log_now_ms);
   size_t LowWaterBytes() const;
   void UpdateMode(size_t current_bytes);
   // `force_checkpoint` bypasses the bounded cadence so the post-recovery /
@@ -282,7 +286,6 @@ class ColdConsumer {
   Config config_;
   const core::EvictionPolicy& eviction_policy_;
   core::SteadyClockFn steady_clock_;
-  core::WallClockFn wall_clock_;
   FlushStrategy strategy_;
   CompactionBuffer buffer_;
 

@@ -191,6 +191,19 @@ TEST(ParseWriteOpTest, ZaddRejectsUnpairedScoreMember) {
   ASSERT_FALSE(op.has_value());
 }
 
+// A NaN score would break the zset's score order.
+TEST(ParseWriteOpTest, ZaddRejectsANanScore) {
+  for (const char* score : {"nan", "NaN", "-nan", "NAN"}) {
+    RespCommand cmd{{"ZADD", "zset", "1", "a", score, "m"}};
+    auto op = ParseWriteOp("ZADD", cmd);
+    ASSERT_FALSE(op.has_value()) << score;
+    EXPECT_EQ(op.error().code(), ErrorCode::kInvalidArgument);
+    EXPECT_EQ(op.error().message(), "value is not a valid float");
+  }
+  RespCommand inf{{"ZADD", "zset", "inf", "a", "-inf", "b"}};
+  EXPECT_TRUE(ParseWriteOp("ZADD", inf).has_value()) << "infinities still parse";
+}
+
 TEST(ParseWriteOpTest, HsetRejectsOddFieldValues) {
   RespCommand cmd{{"HSET", "h", "f1", "v1", "f2"}};
   auto op = ParseWriteOp("HSET", cmd);
@@ -400,6 +413,104 @@ TEST(CanonicalCommandTest, ExpireZeroIsDistinctFromPersist) {
   auto reparsed = ParseWriteOp(expire_now.Name(), expire_now, kNow);
   ASSERT_TRUE(reparsed.has_value());
   EXPECT_TRUE(std::holds_alternative<Expire>(*reparsed));
+}
+
+uint64_t ParsedTtl(const RespCommand& cmd) {
+  auto op = ParseWriteOp(cmd.Name(), cmd, kNow);
+  if (!op.has_value()) {
+    ADD_FAILURE() << cmd.Name() << ": " << op.error().message();
+    return 0;
+  }
+  if (const auto* expire = std::get_if<Expire>(&*op)) return expire->abs_ttl_ms;
+  return std::get<StringSet>(*op).abs_ttl_ms;
+}
+
+std::string ParseError(const RespCommand& cmd) {
+  auto op = ParseWriteOp(cmd.Name(), cmd, kNow);
+  return op.has_value() ? "" : op.error().message();
+}
+
+TEST(ParseWriteOpTest, SetFamilyRejectsAnExpiryOfZeroOrLess) {
+  for (const std::string ttl : {"0", "-1"}) {
+    for (const std::string opt : {"EX", "PX", "EXAT", "PXAT"}) {
+      EXPECT_EQ(ParseError(RespCommand{{"SET", "k", "v", opt, ttl}}),
+                "invalid expire time in 'set' command")
+          << opt << " " << ttl;
+    }
+  }
+  EXPECT_EQ(ParseError(RespCommand{{"SETEX", "k", "0", "v"}}),
+            "invalid expire time in 'setex' command");
+  EXPECT_EQ(ParseError(RespCommand{{"PSETEX", "k", "-5", "v"}}),
+            "invalid expire time in 'psetex' command");
+}
+
+TEST(ParseWriteOpTest, SetRejectsConflictingOptions) {
+  const std::vector<RespCommand> cases{
+      RespCommand{{"SET", "k", "v", "EX", "1", "PX", "1"}},
+      RespCommand{{"SET", "k", "v", "EX", "1", "KEEPTTL"}},
+      RespCommand{{"SET", "k", "v", "KEEPTTL", "PXAT", "1"}},
+      RespCommand{{"SET", "k", "v", "NX", "XX"}},
+      RespCommand{{"SET", "k", "v", "EX"}},
+  };
+  for (const auto& cmd : cases) {
+    EXPECT_EQ(ParseError(cmd), "syntax error") << cmd.args.size();
+  }
+  EXPECT_EQ(ParsedTtl(RespCommand{{"SET", "k", "v", "NX", "GET", "KEEPTTL"}}), 0U);
+}
+
+// A past time stays a time (0 would mean no TTL), so the key expires
+// rather than persisting.
+TEST(ParseWriteOpTest, ExpireAtOrBeforeNowIsPast) {
+  EXPECT_EQ(ParsedTtl(RespCommand{{"EXPIREAT", "k", "0"}}), 1U);
+  EXPECT_EQ(ParsedTtl(RespCommand{{"PEXPIREAT", "k", "-1"}}), 1U);
+  EXPECT_EQ(ParsedTtl(RespCommand{{"PEXPIRE", "k", "0"}}), kNow);
+  EXPECT_EQ(ParsedTtl(RespCommand{{"EXPIRE", "k", "-5"}}), kNow - 5000);
+  EXPECT_EQ(ParsedTtl(RespCommand{{"EXPIRE", "k", "-9223372036854775"}}), 1U);
+}
+
+TEST(ParseWriteOpTest, ExpiryOverflowIsRejected) {
+  const std::string max = "9223372036854775807";
+  EXPECT_EQ(ParseError(RespCommand{{"EXPIRE", "k", max}}),
+            "invalid expire time in 'expire' command");
+  EXPECT_EQ(ParseError(RespCommand{{"PEXPIRE", "k", max}}),
+            "invalid expire time in 'pexpire' command");
+  EXPECT_EQ(ParseError(RespCommand{{"EXPIREAT", "k", "-9223372036854775807"}}),
+            "invalid expire time in 'expireat' command");
+  EXPECT_EQ(ParseError(RespCommand{{"SET", "k", "v", "EX", max}}),
+            "invalid expire time in 'set' command");
+  EXPECT_EQ(ParsedTtl(RespCommand{{"PEXPIREAT", "k", max}}), 9223372036854775807U);
+}
+
+// Redis 7's texts.
+TEST(ParseWriteOpTest, ErrorsUseRedisTexts) {
+  EXPECT_EQ(ParseError(RespCommand{{"SET", "k", "v", "BOGUS"}}), "syntax error");
+  EXPECT_EQ(ParseError(RespCommand{{"ZADD", "z", "1"}}), "syntax error");
+  EXPECT_EQ(ParseError(RespCommand{{"ZADD", "z", "NX", "1", "a", "2"}}), "syntax error");
+  EXPECT_EQ(ParseError(RespCommand{{"HSET", "h", "f", "v", "g"}}),
+            "wrong number of arguments for 'hset' command");
+  EXPECT_EQ(ParseError(RespCommand{{"HMSET", "h", "f", "v", "g"}}),
+            "wrong number of arguments for 'hmset' command");
+  for (const auto& cmd :
+       {RespCommand{{"EXPIRE", "k", "ten"}}, RespCommand{{"PEXPIREAT", "k", "1.5"}},
+        RespCommand{{"SET", "k", "v", "PX", "x"}}, RespCommand{{"SETEX", "k", "", "v"}}}) {
+    EXPECT_EQ(ParseError(cmd), "value is not an integer or out of range") << cmd.Name();
+  }
+}
+
+TEST(ParseReadOpTest, ErrorsAreAscii) {
+  const auto error = [](const RespCommand& cmd) {
+    auto op = ParseReadOp(cmd.Name(), cmd);
+    return op.has_value() ? "" : op.error().message();
+  };
+  for (const auto& cmd : {RespCommand{{"ZRANGE", "z", "0", "1", "BYSCORE", "BYLEX"}},
+                          RespCommand{{"ZRANGE", "z", "0", "1", "LIMIT", "5"}},
+                          RespCommand{{"ZRANGE", "z", "0", "1", "BOGUS"}},
+                          RespCommand{{"ZRANGEBYSCORE", "z", "0", "1", "BOGUS"}},
+                          RespCommand{{"ZRANGEBYLEX", "z", "a", "b", "WITHSCORES"}}}) {
+    EXPECT_EQ(error(cmd), "syntax error") << cmd.Name();
+  }
+  EXPECT_EQ(error(RespCommand{{"ZRANGE", "z", "0", "1", "BYSCORE", "LIMIT", "x", "1"}}),
+            "value is not an integer or out of range");
 }
 
 }  // namespace

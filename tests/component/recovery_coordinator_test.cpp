@@ -129,6 +129,25 @@ class MemoryColdStore : public core::ColdStore {
       std::string_view /*key*/) override {
     return std::nullopt;
   }
+  // Every key held here loads as its last string.
+  core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
+                                                          core::SteadyTime /*deadline*/) override {
+    const std::scoped_lock lock(mu_);
+    const auto it = state_.find(std::string(key));
+    if (it == state_.end()) return std::nullopt;
+    return core::ColdKeyState{.type = core::KeyType::kString, .value = it->second.text};
+  }
+  core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
+                                                      core::SteadyTime /*deadline*/) override {
+    const std::scoped_lock lock(mu_);
+    if (!state_.contains(std::string(key))) return std::nullopt;
+    return core::KeyMeta{.type = core::KeyType::kString, .cardinality = 1};
+  }
+  core::Result<std::optional<core::MemberValue>> LoadMember(
+      std::string_view /*key*/, core::KeyType /*type*/, std::string_view /*member*/,
+      core::SteadyTime /*deadline*/) override {
+    return std::nullopt;
+  }
 
   std::map<std::string, Value> State() const {
     const std::scoped_lock lock(mu_);

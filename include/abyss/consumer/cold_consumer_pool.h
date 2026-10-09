@@ -58,6 +58,7 @@ class ColdConsumerPool : public CompactionBufferRouter {
   core::Result<core::RespValue> Read(std::string_view key) const override;
   BufferKeyPresence Probe(std::string_view key) const override;
   HashOverlay HashOverlayFor(std::string_view key) const override;
+  std::optional<CompactedState> Snapshot(core::ShardId shard, std::string_view key) const override;
   bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                          std::chrono::milliseconds timeout) override;
 
@@ -78,6 +79,9 @@ class ColdConsumerPool : public CompactionBufferRouter {
 
   ColdConsumer& ConsumerFor(core::ShardId shard) { return *consumers_[shard]; }
   const ColdConsumer& ConsumerFor(core::ShardId shard) const { return *consumers_[shard]; }
+
+  // `shard`'s log clock, by which cold expires its keys. Any thread.
+  uint64_t LogClockMs(core::ShardId shard) const { return consumers_[shard]->LogClockMs(); }
 
   AggregateMetrics Snapshot() const;
 

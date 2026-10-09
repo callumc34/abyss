@@ -5,6 +5,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -44,6 +45,10 @@ class SingleBufferRouter : public consumer::CompactionBufferRouter {
   }
   consumer::HashOverlay HashOverlayFor(std::string_view key) const override {
     return buffer_.HashOverlayFor(key);
+  }
+  std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
+                                                   std::string_view key) const override {
+    return buffer_.Snapshot(key);
   }
   // Component-level engine tests run without a cold consumer thread, so the
   // wait is a structural no-op: there is no producer to advance the seq.
@@ -123,7 +128,7 @@ TEST_F(TieringEngineTest, ReadHotMissBufferHitReturnsBufferValue) {
   auto engine = MakeEngine();
 
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "buffered"}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -201,9 +206,9 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
   auto engine = MakeEngine();
 
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "v"}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::Del{.keys = {"key"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -247,9 +252,9 @@ TEST_F(TieringEngineTest, HashGetAllMergesColdAndBufferOverlay) {
       "h",
       core::ops::WriteOp{core::ops::HashSet{
           .key = "h", .fields = {{.field = "a", .value = "buf"}, {.field = "b", .value = "new"}}}},
-      core::EvictionTTL{86400}, 0, 0);
+      core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -273,9 +278,9 @@ TEST_F(TieringEngineTest, HashGetAllTombstoneShortCircuitsCold) {
   buffer_.Absorb(
       "h",
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "a", .value = "v"}}}},
-      core::EvictionTTL{86400}, 0, 0);
+      core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::Del{.keys = {"h"}}}, core::EvictionTTL{86400},
-                 0, 0);
+                 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -292,7 +297,7 @@ TEST_F(TieringEngineTest, HashGetAllWrongTypeOverlayReturnsError) {
   auto engine = MakeEngine();
   // Buffer was re-typed to a string after a prior hash.
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "now_a_string"}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -324,9 +329,9 @@ TEST_F(TieringEngineTest, HashLenMergedCardinality) {
       "h",
       core::ops::WriteOp{core::ops::HashSet{
           .key = "h", .fields = {{.field = "a", .value = "buf"}, {.field = "b", .value = "new"}}}},
-      core::EvictionTTL{86400}, 0, 0);
+      core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -344,7 +349,7 @@ TEST_F(TieringEngineTest, HashKeysAndValsProjectMergedSet) {
   buffer_.Absorb("h",
                  core::ops::WriteOp{core::ops::HashSet{
                      .key = "h", .fields = {{.field = "buf_only", .value = "x"}}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .Times(2)
@@ -371,9 +376,9 @@ TEST_F(TieringEngineTest, HmgetMixedBufferAndColdFields) {
   buffer_.Absorb("h",
                  core::ops::WriteOp{core::ops::HashSet{
                      .key = "h", .fields = {{.field = "buf_known", .value = "from_buf"}}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"buf_removed"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -396,7 +401,7 @@ TEST_F(TieringEngineTest, HexistsBufferKnownDoesNotCallCold) {
   buffer_.Absorb(
       "h",
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
-      core::EvictionTTL{86400}, 0, 0);
+      core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -412,9 +417,9 @@ TEST_F(TieringEngineTest, HexistsBufferRemovedFieldReturnsZero) {
   buffer_.Absorb(
       "h",
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
-      core::EvictionTTL{86400}, 0, 0);
+      core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"f"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -432,9 +437,9 @@ TEST_F(TieringEngineTest, ScardReadsBufferDeltaNotStaleCold) {
   // The set was flushed to cold with {a,b,c}; a partial SREM landed only in the
   // buffer. The buffer overlay must win: SCARD reflects 2, not cold's 3.
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"a", "b", "c"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -449,9 +454,9 @@ TEST_F(TieringEngineTest, ScardReadsBufferDeltaNotStaleCold) {
 TEST_F(TieringEngineTest, SismemberReflectsBufferedRemoval) {
   auto engine = MakeEngine();
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"a", "b"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .Times(2)
@@ -472,9 +477,9 @@ TEST_F(TieringEngineTest, ZsetScalarBufferOverridesColdResidual) {
   buffer_.Absorb("z",
                  core::ops::WriteOp{
                      core::ops::ZsetAdd{.key = "z", .entries = {{.score = 1.0, .member = "m"}}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("z", core::ops::WriteOp{core::ops::ZsetRem{.key = "z", .members = {"m"}}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .Times(2)
@@ -511,7 +516,7 @@ TEST_F(TieringEngineTest, CollectionScalarWrongTypeFromBufferShortCircuits) {
   auto engine = MakeEngine();
   // Buffer holds a string for "k"; SCARD must surface WRONGTYPE without cold.
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -686,7 +691,7 @@ TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
 TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
   auto engine = MakeEngine();
   buffer_.Absorb("b", core::ops::WriteOp{core::ops::StringSet{.key = "b", .value = "from_buf"}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(core::RespValue::BulkString("from_hot")))                        // a
@@ -736,9 +741,9 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
   auto engine = MakeEngine();
   // Buffer holds a SET then a DEL — tombstone state for "k".
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                 core::EvictionTTL{86400}, 0, 0);
+                 core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, core::EvictionTTL{86400},
-                 0, 0);
+                 0, 0, 0);
 
   // Hot has no record; cold is never consulted because the buffer probe is
   // authoritative on the tombstone.
