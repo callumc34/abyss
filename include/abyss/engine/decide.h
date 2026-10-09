@@ -34,6 +34,14 @@ struct KeyLoad {
   bool operator==(const KeyLoad&) const = default;
 };
 
+// The highest latest_seq a decision read on one shard.
+struct ShardSeq {
+  core::ShardId shard = 0;
+  core::SequenceId seq = 0;
+
+  bool operator==(const ShardSeq&) const = default;
+};
+
 // An effect argument moved out of the request.
 struct Moved {
   uint32_t effect;
@@ -52,9 +60,11 @@ struct Decision {
   // Keys whose state hot does not hold. When set, nothing else is:
   // load them and decide again.
   std::vector<KeyLoad> needs_load;
-  // Every key read, with its latest_seq, for the fence.
-  std::vector<std::pair<std::string, core::SequenceId>> observed;
-  // A syntax error or WRONGTYPE: replied with nothing logged.
+  // For the fence: per shard read, the highest latest_seq, at most one
+  // entry each.
+  std::vector<ShardSeq> observed;
+  // A syntax error or WRONGTYPE: replied with nothing logged. A
+  // WRONGTYPE keeps `observed`: the reply shows the key's state.
   std::optional<core::Error> error;
   // Every effect argument taken from the request, for Restore.
   std::vector<Moved> moved;
@@ -72,5 +82,12 @@ Decision Decide(core::RespCommand& cmd, core::PredicateFlags flags, uint64_t now
 // Gives the decision's moved arguments back to `cmd`, the request it
 // was decided from, so it can be decided again.
 void Restore(Decision&& decision, core::RespCommand& cmd);
+
+// The keys Decide would read or write for `cmd`, with the error it
+// would reply for an unknown command or a wrong argument count.
+core::Result<std::vector<std::string_view>> WriteKeys(const core::RespCommand& cmd);
+
+// Whether `cmd` can add to hot memory: what waits on backpressure.
+bool GrowsMemory(const core::RespCommand& cmd);
 
 }  // namespace abyss::engine

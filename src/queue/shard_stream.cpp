@@ -294,20 +294,72 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
   }
 }
 
-core::Result<Reservation> ShardStream::Reserve(std::span<ShardStream* const> streams,
-                                               std::span<const ShardEntries> parts,
-                                               std::span<const uint32_t> sizes) {
-  std::vector<std::unique_lock<std::mutex>> locks;
-  locks.reserve(streams.size());
-  for (ShardStream* stream : streams) {
-    locks.emplace_back(stream->append_mu_);
-    if (stream->stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
+// A reservation over several logs: each log's filler, in log order.
+class ShardStream::MultiFiller final : public ReservationFiller {
+ public:
+  explicit MultiFiller(std::vector<std::unique_ptr<ReservationFiller>> fillers)
+      : fillers_(std::move(fillers)) {}
+
+  void Fill() noexcept override {
+    for (const auto& filler : fillers_) filler->Fill();
   }
-  ShardStream& lead = *streams.front();
+
+ private:
+  std::vector<std::unique_ptr<ReservationFiller>> fillers_;
+};
+
+core::Result<Reservation> ShardStream::Reserve(std::span<const LogParts> logs) {
+  std::vector<std::unique_lock<std::mutex>> locks;
+  for (const LogParts& group : logs) {
+    for (ShardStream* stream : group.streams) {
+      locks.emplace_back(stream->append_mu_);
+      if (stream->stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
+    }
+  }
+  std::vector<uint64_t> totals;
+  totals.reserve(logs.size());
+  for (const LogParts& group : logs) {
+    uint64_t total = 0;
+    for (const uint32_t size : group.sizes) total += size;
+    totals.push_back(total);
+  }
+  // With every stream of each log locked nothing else reserves there,
+  // so a check of all first leaves no log reserved when one refuses.
+  if (logs.size() > 1) {
+    for (std::size_t g = 0; g < logs.size(); ++g) {
+      if (!logs[g].streams.front()->log().CanReserve(static_cast<uint32_t>(totals[g]))) {
+        return std::unexpected(core::Error{
+            core::ErrorCode::kUnavailable,
+            "no spare WAL segment ready: the disk is full or the segment preparer is behind"});
+      }
+    }
+  }
+
+  std::vector<ReservedRange> ranges;
+  DurableFutures durable;
+  std::vector<std::unique_ptr<ReservationFiller>> fillers;
+  // Bytes encoded under the caller's locks, across the reservation.
+  std::size_t locked = 0;
+  for (std::size_t g = 0; g < logs.size(); ++g) {
+    auto filler = ReserveLocked(logs[g], totals[g], locked, ranges, durable);
+    if (!filler.has_value()) {
+      if (g > 0) core::Fatal("a WAL log refused space it was checked to have");
+      return std::unexpected(filler.error());
+    }
+    fillers.push_back(*std::move(filler));
+  }
+  std::unique_ptr<ReservationFiller> filler =
+      fillers.size() == 1 ? std::move(fillers.front())
+                          : std::make_unique<MultiFiller>(std::move(fillers));
+  return Reservation(std::move(ranges), std::move(durable), std::move(filler));
+}
+
+core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
+    const LogParts& group, uint64_t total, std::size_t& locked, std::vector<ReservedRange>& ranges,
+    DurableFutures& durable) {
+  ShardStream& lead = *group.streams.front();
   LogUnit& unit = *lead.config_.unit;
   Log& log = *unit.log;
-  uint64_t total = 0;
-  for (const uint32_t size : sizes) total += size;
   // Sizes do not depend on seqs, so space comes first and a refusal
   // leaves nothing to undo.
   auto at = log.Reserve(static_cast<uint32_t>(total));
@@ -328,32 +380,31 @@ core::Result<Reservation> ShardStream::Reserve(std::span<ShardStream* const> str
   if (lead.config_.window != nullptr) lead.config_.window->Add(total);
   unit.age.Start(DurabilityWindow::Clock::now());
   const std::function<void(std::size_t)>& hook = lead.batch_commit_hook_;
-  std::vector<ReservedRange> ranges;
-  ranges.reserve(parts.size());
-  DurableFutures durable;
-  durable.reserve(parts.size());
   std::vector<Filler::Part> publish;
-  publish.reserve(parts.size());
+  publish.reserve(group.parts.size());
   std::vector<Filler::Deferred> deferred;
   std::size_t committed = 0;
   std::size_t k = 0;
   uint64_t off = 0;
-  for (std::size_t p = 0; p < parts.size(); ++p) {
-    ShardStream& stream = *streams[p];
-    const ShardEntries& part = parts[p];
+  for (std::size_t p = 0; p < group.parts.size(); ++p) {
+    ShardStream& stream = *group.streams[p];
+    const ShardEntries& part = group.parts[p];
     const core::SequenceId first = stream.next_seq_;
     for (std::size_t i = 0; i < part.entries.size(); ++i, ++k) {
       core::QueueEntry& entry = part.entries[i];
       const core::SequenceId seq = first + i;
       entry.seq = seq;
       const Log::Reservation slice{.pos = at->pos + off,
-                                   .size = sizes[k],
+                                   .size = group.sizes[k],
                                    .gen = at->gen,
                                    .salt = at->salt,
                                    .dst = at->dst + off};
-      if (slice.size <= core::kLockHoldFrameBytes) {
+      // Encoded under the locks only while the reservation's total stays
+      // within the budget; every later frame is left to Complete.
+      if (deferred.empty() && locked + slice.size <= core::kLockHoldFrameBytes) {
+        locked += slice.size;
         CommitEncoded(log, entry, part.shard, slice, total - off);
-        if (hook && ++committed < sizes.size()) hook(committed);
+        if (hook && ++committed < group.sizes.size()) hook(committed);
       } else {
         deferred.push_back(Filler::Deferred{.entry = std::move(entry),
                                             .shard = part.shard,
@@ -377,10 +428,8 @@ core::Result<Reservation> ShardStream::Reserve(std::span<ShardStream* const> str
   std::function<void(std::size_t)> fill_hook;
   if (hook && !deferred.empty()) fill_hook = hook;
   unit.ready_to_complete.fetch_add(1, std::memory_order_acq_rel);
-  auto filler =
-      std::make_unique<Filler>(unit, std::move(publish), at->pos + total, std::move(deferred),
-                               std::move(fill_hook), committed, sizes.size());
-  return Reservation(std::move(ranges), std::move(durable), std::move(filler));
+  return std::make_unique<Filler>(unit, std::move(publish), at->pos + total, std::move(deferred),
+                                  std::move(fill_hook), committed, group.sizes.size());
 }
 
 DurabilityFuture ShardStream::WhenPowerDurable(core::SequenceId seq) {

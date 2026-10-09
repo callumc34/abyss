@@ -15,13 +15,14 @@
 
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
-#include "abyss/consumer/hot_consumer_progress.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/loader.h"
+#include "abyss/engine/sequencer.h"
+#include "abyss/hot/sharded_hot_store.h"
 #include "mock_cold_store.h"
-#include "mock_hot_store.h"
 #include "mock_queue.h"
+#include "on_exit.h"
 
 namespace abyss::engine {
 namespace {
@@ -63,34 +64,29 @@ class SingleBufferRouter : public consumer::CompactionBufferRouter {
   consumer::CompactionBuffer& buffer_;
 };
 
-// Engine has no live HotConsumerPool in these tests; report 0 ("nothing
-// settled yet") so DispatchHashRead skips the wait entirely.
-class NullHotProgress : public consumer::HotConsumerProgress {
- public:
-  core::SequenceId HighestSettledSeq(core::ShardId /*shard*/) const override { return 0; }
-};
-
+// A real hot store, buffer and loader over a mock cold store and an
+// in-memory queue: what the engine dispatches, end to end.
 class TieringEngineTest : public ::testing::Test {
  protected:
-  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
-  testing::MockQueue queue_;
-  testing::MockHotStore hot_;
-  testing::MockColdStore cold_;
-  consumer::CompactionBuffer buffer_;
-  SingleBufferRouter router_{buffer_};
-  NullHotProgress hot_progress_;
-  core::ConsumerRpc rpc_;
-  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr uint32_t kShardCount = 16;
   static constexpr std::chrono::milliseconds kWriteTimeout = 1s;
 
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  ::testing::NiceMock<testing::MockQueue> queue_;
+  hot::ShardedHotStore hot_{hot::ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL << 20,
+      .shard_count = kShardCount,
+  }};
+  ::testing::NiceMock<testing::MockColdStore> cold_;
+  consumer::CompactionBuffer buffer_;
+  SingleBufferRouter router_{buffer_};
+  Loader loader_{hot_, router_, cold_};
+  Sequencer sequencer_{hot_, queue_, loader_, router_,
+                       SequencerConfig{.write_timeout = kWriteTimeout}};
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+
   TieringEngine MakeEngine() {
-    return {queue_,
-            hot_,
-            cold_,
-            router_,
-            hot_progress_,
-            rpc_,
+    return {hot_, cold_, router_, sequencer_,
             TieringEngineConfig{.shard_count = kShardCount, .write_timeout = kWriteTimeout}};
   }
 
@@ -98,25 +94,22 @@ class TieringEngineTest : public ::testing::Test {
     return core::RespCommand{.args = std::vector<std::string>(args)};
   }
 
-  static queue::PendingAppend MakePending(core::SequenceId seq, bool fsync_ok) {
-    std::promise<core::Result<void>> p;
-    if (fsync_ok) {
-      p.set_value(core::Result<void>{});
-    } else {
-      p.set_value(std::unexpected(core::Error{core::ErrorCode::kInternal, "fsync failed"}));
-    }
-    return queue::PendingAppend{seq, p.get_future(),
-                                std::make_unique<testing::NoopAppendPublisher>()};
+  // Writes through the engine, so hot holds the key as decided.
+  void Seed(TieringEngine& engine, std::initializer_list<std::string> args) {
+    auto written = engine.DispatchWrite(*args.begin(), MakeCmd(args));
+    ASSERT_TRUE(written.has_value()) << written.error().message();
+    ASSERT_FALSE(written->IsError()) << written->AsString();
   }
+
+  core::ShardId ShardOf(std::string_view key) const { return core::ComputeShard(key, kShardCount); }
 };
 
 // --- Read path ---
 
 TEST_F(TieringEngineTest, ReadHotHitReturnsValue) {
   auto engine = MakeEngine();
-  auto expected = core::RespValue::BulkString("value");
-
-  EXPECT_CALL(hot_, Exec(_, _)).WillOnce(Return(expected));
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "key", "value"}));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
@@ -130,9 +123,6 @@ TEST_F(TieringEngineTest, ReadHotMissBufferHitReturnsBufferValue) {
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "buffered"}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
-
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "buffered");
@@ -142,8 +132,6 @@ TEST_F(TieringEngineTest, ReadHotMissBufferMissColdHitReturnsColdValue) {
   auto engine = MakeEngine();
   auto cold_value = core::RespValue::BulkString("cold_value");
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(cold_value));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
@@ -151,38 +139,9 @@ TEST_F(TieringEngineTest, ReadHotMissBufferMissColdHitReturnsColdValue) {
   EXPECT_EQ(result->AsString(), "cold_value");
 }
 
-// A promotion is best-effort: with the durability window full it is
-// skipped at once, never waited for on the read path.
-TEST_F(TieringEngineTest, PromotionNeverWaitsForTheDurabilityWindow) {
-  auto engine = MakeEngine();
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
-  EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(core::RespValue::BulkString("cold_value")));
-  EXPECT_CALL(cold_, GetPromotionCommand(std::string_view{"key"}))
-      .WillOnce(Return(std::optional<core::RespCommand>{MakeCmd({"SET", "key", "cold_value"})}));
-  core::SteadyTime admit_by{};
-  core::SteadyTime called_at{};
-  EXPECT_CALL(queue_, Append(_, _, _))
-      .WillOnce([&](core::ShardId, const core::QueueEntry&,
-                    core::SteadyTime deadline) -> core::Result<queue::AppendResult> {
-        called_at = core::SteadyClock::now();
-        admit_by = deadline;
-        return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"});
-      });
-
-  auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->AsString(), "cold_value");
-  EXPECT_LE(admit_by, called_at) << "a promotion must not wait for admission";
-  EXPECT_EQ(engine.Snapshot().promotions_skipped, 1U);
-  EXPECT_EQ(engine.Snapshot().promotion_append_failures, 0U);
-}
-
 TEST_F(TieringEngineTest, ReadAllTiersMissReturnsColdError) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
 
@@ -193,9 +152,7 @@ TEST_F(TieringEngineTest, ReadAllTiersMissReturnsColdError) {
 
 TEST_F(TieringEngineTest, ReadHotErrorPropagates) {
   auto engine = MakeEngine();
-
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kWrongType, "wrong type"))));
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SADD", "key", "m"}));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_FALSE(result.has_value());
@@ -209,9 +166,6 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
                  core::EvictionTTL{86400}, 0, 0, 0);
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::Del{.keys = {"key"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
-
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
 
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
@@ -256,8 +210,6 @@ TEST_F(TieringEngineTest, HashGetAllMergesColdAndBufferOverlay) {
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // Cold has prior fields including 'c' (which the buffer has removed).
   EXPECT_CALL(cold_, Exec(_, _))
       .WillOnce(Return(MakeHashGetAllResponse({{"a", "cold"}, {"c", "stale"}, {"d", "kept"}})));
@@ -282,8 +234,6 @@ TEST_F(TieringEngineTest, HashGetAllTombstoneShortCircuitsCold) {
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::Del{.keys = {"h"}}}, core::EvictionTTL{86400},
                  0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // Tombstone must not consult cold.
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
@@ -299,8 +249,6 @@ TEST_F(TieringEngineTest, HashGetAllWrongTypeOverlayReturnsError) {
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "now_a_string"}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchRead("HGETALL", MakeCmd({"HGETALL", "k"}));
@@ -311,8 +259,6 @@ TEST_F(TieringEngineTest, HashGetAllWrongTypeOverlayReturnsError) {
 
 TEST_F(TieringEngineTest, HashGetAllNotPresentDelegatesToCold) {
   auto engine = MakeEngine();
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(MakeHashGetAllResponse({{"x", "1"}, {"y", "2"}})));
 
   auto result = engine.DispatchRead("HGETALL", MakeCmd({"HGETALL", "h"}));
@@ -333,8 +279,6 @@ TEST_F(TieringEngineTest, HashLenMergedCardinality) {
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _))
       .WillOnce(Return(MakeHashGetAllResponse({{"a", "cold"}, {"c", "stale"}, {"d", "kept"}})));
 
@@ -351,9 +295,6 @@ TEST_F(TieringEngineTest, HashKeysAndValsProjectMergedSet) {
                      .key = "h", .fields = {{.field = "buf_only", .value = "x"}}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .Times(2)
-      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _))
       .Times(2)
       .WillRepeatedly(Return(MakeHashGetAllResponse({{"cold_only", "y"}})));
@@ -380,8 +321,6 @@ TEST_F(TieringEngineTest, HmgetMixedBufferAndColdFields) {
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"buf_removed"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // Cold gets one per-field HGet for the unknown-from-buffer field.
   EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(core::RespValue::BulkString("from_cold")));
 
@@ -403,8 +342,6 @@ TEST_F(TieringEngineTest, HexistsBufferKnownDoesNotCallCold) {
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
       core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchRead("HEXISTS", MakeCmd({"HEXISTS", "h", "f"}));
@@ -421,8 +358,6 @@ TEST_F(TieringEngineTest, HexistsBufferRemovedFieldReturnsZero) {
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"f"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchRead("HEXISTS", MakeCmd({"HEXISTS", "h", "f"}));
@@ -441,8 +376,6 @@ TEST_F(TieringEngineTest, ScardReadsBufferDeltaNotStaleCold) {
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // Cold must NOT be consulted: the buffer answers authoritatively.
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
@@ -458,9 +391,6 @@ TEST_F(TieringEngineTest, SismemberReflectsBufferedRemoval) {
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .Times(2)
-      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto present = engine.DispatchRead("SISMEMBER", MakeCmd({"SISMEMBER", "s", "a"}));
@@ -481,9 +411,6 @@ TEST_F(TieringEngineTest, ZsetScalarBufferOverridesColdResidual) {
   buffer_.Absorb("z", core::ops::WriteOp{core::ops::ZsetRem{.key = "z", .members = {"m"}}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .Times(2)
-      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto score = engine.DispatchRead("ZSCORE", MakeCmd({"ZSCORE", "z", "m"}));
@@ -497,9 +424,6 @@ TEST_F(TieringEngineTest, ZsetScalarBufferOverridesColdResidual) {
 TEST_F(TieringEngineTest, CollectionScalarBufferMissFallsThroughToCold) {
   auto engine = MakeEngine();
   // No buffer entry for the key: each scalar shape falls through to cold.
-  EXPECT_CALL(hot_, Exec(_, _))
-      .Times(4)
-      .WillRepeatedly(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _))
       .WillOnce(Return(core::RespValue::Integer(3)))         // SCARD
       .WillOnce(Return(core::RespValue::Integer(1)))         // SISMEMBER
@@ -518,8 +442,6 @@ TEST_F(TieringEngineTest, CollectionScalarWrongTypeFromBufferShortCircuits) {
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchRead("SCARD", MakeCmd({"SCARD", "k"}));
@@ -534,10 +456,8 @@ TEST_F(TieringEngineTest, CollectionScalarColdReadCarriesPointReadDeadline) {
                           .write_timeout = kWriteTimeout,
                           .cold_read_deadline = 5ms,
                           .cold_scan_deadline = 50ms};
-  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
+  TieringEngine engine(hot_, cold_, router_, sequencer_, cfg);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // The scalar read routed to cold must carry the point-read deadline (COLD-2):
   // a deadline-bounded read, never an unbounded one.
   EXPECT_CALL(cold_, Exec(_, std::optional<core::Duration>(5ms)))
@@ -553,10 +473,8 @@ TEST_F(TieringEngineTest, CollectionScanColdReadCarriesScanDeadline) {
                           .write_timeout = kWriteTimeout,
                           .cold_read_deadline = 5ms,
                           .cold_scan_deadline = 50ms};
-  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
+  TieringEngine engine(hot_, cold_, router_, sequencer_, cfg);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // A full-collection scan (SMEMBERS) gets the larger scan deadline.
   EXPECT_CALL(cold_, Exec(_, std::optional<core::Duration>(50ms)))
       .WillOnce(Return(core::RespValue::Array(
@@ -573,10 +491,8 @@ TEST_F(TieringEngineTest, ColdScanDeadlineExceededSurfacesErrorNotPartial) {
                           .write_timeout = kWriteTimeout,
                           .cold_read_deadline = 5ms,
                           .cold_scan_deadline = 50ms};
-  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
+  TieringEngine engine(hot_, cold_, router_, sequencer_, cfg);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
   // Cold fails closed with a timeout on a large scan. The engine surfaces the
   // error to the client, never a silently truncated array (decision 4).
   EXPECT_CALL(cold_, Exec(_, std::optional<core::Duration>(50ms)))
@@ -589,129 +505,80 @@ TEST_F(TieringEngineTest, ColdScanDeadlineExceededSurfacesErrorNotPartial) {
 
 // --- Write path ---
 
-TEST_F(TieringEngineTest, WriteSuccessReturnsConsumerResult) {
+TEST_F(TieringEngineTest, WriteGoesThroughTheSequencer) {
   auto engine = MakeEngine();
-
-  constexpr core::SequenceId kSeq = 42;
-  const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry, core::SteadyTime) {
-        return MakePending(kSeq, true);
-      });
-
-  std::thread fulfiller([this, kRpcId]() {
-    while (rpc_.PendingCount() == 0) std::this_thread::yield();
-    EXPECT_TRUE(rpc_.Fulfill(kRpcId, core::RespValue::SimpleString("OK")));
-  });
-
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
-  fulfiller.join();
-
-  ASSERT_TRUE(result.has_value());
-  EXPECT_TRUE(result->IsSimpleString());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
+
+  const auto published = queue_.Published(ShardOf("key"));
+  ASSERT_EQ(published.size(), 1U);
+  EXPECT_EQ(std::get<core::entry::Write>(published[0].payload).cmd.args,
+            (std::vector<std::string>{"SET", "key", "value"}));
+  EXPECT_CALL(cold_, Exec(_, _)).Times(0);
+  auto read = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->AsString(), "value");
 }
 
-TEST_F(TieringEngineTest, WriteConsumerErrorPropagates) {
+TEST_F(TieringEngineTest, WriteDecideErrorLogsNothing) {
   auto engine = MakeEngine();
-
-  constexpr core::SequenceId kSeq = 43;
-  const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry, core::SteadyTime) {
-        return MakePending(kSeq, true);
-      });
-
-  std::thread fulfiller([this, kRpcId]() {
-    while (rpc_.PendingCount() == 0) std::this_thread::yield();
-    EXPECT_TRUE(rpc_.Fulfill(kRpcId, core::RespValue::Error(core::ErrorPrefix::kWrongType,
-                                                            "operation against wrong type")));
-  });
-
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "key", "v"}));
   auto result = engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}));
-  fulfiller.join();
-
-  ASSERT_TRUE(result.has_value());
-  EXPECT_TRUE(result->IsError());
-  EXPECT_EQ(result->AsString(), "WRONGTYPE operation against wrong type");
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
-}
-
-TEST_F(TieringEngineTest, WriteQueueFailureReturnsError) {
-  auto engine = MakeEngine();
-
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kResourceExhausted, "full"))));
-
-  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kWrongType);
+  EXPECT_EQ(queue_.Published(ShardOf("key")).size(), 1U);
 }
 
-TEST_F(TieringEngineTest, WriteFsyncFailureCancelsRpcAndPropagates) {
+TEST_F(TieringEngineTest, WriteReserveFailureAppliesNothing) {
   auto engine = MakeEngine();
-
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .WillOnce([](core::ShardId, const core::QueueEntry&, core::SteadyTime) {
-        return MakePending(99, false);
-      });
-
+  queue_.SetReserveFault([](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
+    return core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"};
+  });
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
+  EXPECT_TRUE(queue_.Published(ShardOf("key")).empty());
+  auto read = hot_.Read(core::ops::ReadOp{core::ops::StringGet{.key = "key"}});
+  ASSERT_FALSE(read.result.has_value());
+  EXPECT_EQ(read.result.error().code(), core::ErrorCode::kNotFound);
 }
 
-TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
-  TieringEngineConfig fast{.shard_count = kShardCount, .write_timeout = 50ms};
-  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, fast);
-
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .WillOnce([](core::ShardId, const core::QueueEntry&, core::SteadyTime) {
-        return MakePending(100, true);
-      });
-
+TEST_F(TieringEngineTest, WriteDurableFailurePropagates) {
+  auto engine = MakeEngine();
+  queue_.FailDurable(core::Error{core::ErrorCode::kInternal, "fsync failed"});
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
-  ASSERT_TRUE(result.has_value());
-  EXPECT_TRUE(result->IsError());
-  EXPECT_TRUE(result->AsString().starts_with("ERR "));
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
+}
+
+TEST_F(TieringEngineTest, WriteDurableTimeoutRepliesWithTheTimeoutText) {
+  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.write_timeout = 50ms});
+  TieringEngine engine(hot_, cold_, router_, fast, TieringEngineConfig{.shard_count = kShardCount});
+  queue_.HoldDurable();
+  const testing::OnExit release([this] { queue_.ReleaseDurable(); });
+  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
+  EXPECT_TRUE(result.error().message().starts_with("write durable wait exceeded server timeout"))
+      << result.error().message();
 }
 
 // --- Fan-out (MGET, EXISTS, MSET, DEL) ---
 //
-// Coverage focuses on what unit tests can't reach: per-shard WAL placement on
-// MSET/DEL, per-tier aggregation for MGET/EXISTS, and partial-failure surfacing
-// when one sub-command's BeginAppend rejects.
+// Reads stay per key (#170); MSET and DEL are one decision and one
+// reservation across their shards.
 
 TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
   auto engine = MakeEngine();
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "a", "from_hot"}));
   buffer_.Absorb("b", core::ops::WriteOp{core::ops::StringSet{.key = "b", .value = "from_buf"}},
                  core::EvictionTTL{86400}, 0, 0, 0);
 
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(core::RespValue::BulkString("from_hot")))                        // a
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))))   // b
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))))   // c
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));  // d
-  // Only c falls through to cold (a hit hot, b hit buffer, d misses cold).
+  // Only c and d fall through to cold (a hit hot, b hit buffer).
   EXPECT_CALL(cold_, Exec(_, _))
       .WillOnce(Return(core::RespValue::BulkString("from_cold")))                       // c
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));  // d
-
-  // c's cold hit must promote through queue on c's shard, not on the MGET first-key shard.
-  const core::ShardId c_shard = core::ComputeShard("c", kShardCount);
-  EXPECT_CALL(cold_, GetPromotionCommand(std::string_view{"c"}))
-      .WillOnce(Return(std::optional<core::RespCommand>{MakeCmd({"SET", "c", "from_cold"})}));
-  EXPECT_CALL(queue_, Append(c_shard, _, _))
-      .WillOnce([](core::ShardId, const core::QueueEntry&,
-                   core::SteadyTime) -> core::Result<queue::AppendResult> {
-        return queue::AppendResult{.seq = 1};
-      });
 
   auto result =
       engine.DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "a", "b", "c", "d"}));
@@ -727,8 +594,7 @@ TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
 
 TEST_F(TieringEngineTest, MgetWrongTypeInHotCollapsesToNil) {
   auto engine = MakeEngine();
-  EXPECT_CALL(hot_, Exec(_, _))
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kWrongType, "wrong type"))));
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SADD", "k", "m"}));
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "k"}));
   ASSERT_TRUE(result.has_value());
@@ -747,7 +613,6 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
 
   // Hot has no record; cold is never consulted because the buffer probe is
   // authoritative on the tombstone.
-  EXPECT_CALL(hot_, Probe(_)).WillOnce(Return(core::HotKeyPresence::kAbsent));
   EXPECT_CALL(cold_, Exec(_, _)).Times(0);
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
@@ -757,230 +622,164 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
 
 TEST_F(TieringEngineTest, ExistsCountsDuplicatesRedisStyle) {
   auto engine = MakeEngine();
-  EXPECT_CALL(hot_, Probe(_)).Times(2).WillRepeatedly(Return(core::HotKeyPresence::kPresent));
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "k", "v"}));
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k", "k"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsInteger(), 2);
 }
 
-TEST_F(TieringEngineTest, MsetAppendsOneEntryPerKeyToOwningShard) {
+TEST_F(TieringEngineTest, MsetReservesOneBatchAcrossItsShards) {
   auto engine = MakeEngine();
-
-  std::vector<core::ShardId> appended_shards;
-  std::vector<std::string> appended_keys;
-  std::vector<core::RpcId> rpc_ids;
-  std::mutex mu;
-  auto seq = std::make_shared<std::atomic<core::SequenceId>>(500);
-
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .Times(3)
-      .WillRepeatedly([&, seq](core::ShardId shard, core::QueueEntry entry, core::SteadyTime) {
-        const auto next = seq->fetch_add(1);
-        std::string key;
-        const auto* write = std::get_if<core::entry::Write>(&entry.payload);
-        EXPECT_NE(write, nullptr);
-        if (write != nullptr) {
-          EXPECT_EQ(write->cmd.args[0], "SET");
-          key = write->cmd.args[1];
-        }
-        {
-          std::scoped_lock lock(mu);
-          appended_shards.push_back(shard);
-          appended_keys.push_back(key);
-          rpc_ids.push_back(core::MakeRpcId(shard, next));
-        }
-        return MakePending(next, true);
+  int reserves = 0;
+  queue_.SetReserveFault(
+      [&reserves](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
+        ++reserves;
+        return std::nullopt;
       });
-
-  // The mock records rpc_ids inside BeginAppend's lambda, before the engine
-  // proceeds to rpc_.Register(). In production, Register strictly precedes
-  // Publish — the consumer can't see the entry yet, so Fulfill can't race.
-  // This fulfiller models that ordering by retrying when Fulfill reports the
-  // id isn't yet registered.
-  std::thread fulfiller([&]() {
-    size_t fulfilled = 0;
-    while (fulfilled < 3) {
-      std::vector<core::RpcId> pending;
-      {
-        std::scoped_lock lock(mu);
-        pending = rpc_ids;
-      }
-      bool made_progress = false;
-      for (size_t i = fulfilled; i < pending.size(); ++i) {
-        if (rpc_.Fulfill(pending[i], core::RespValue::SimpleString("OK"))) {
-          ++fulfilled;
-          made_progress = true;
-        } else {
-          break;
-        }
-      }
-      if (!made_progress) std::this_thread::yield();
-    }
-  });
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kMset,
                                       MakeCmd({"MSET", "a", "1", "b", "2", "c", "3"}));
-  fulfiller.join();
-
-  ASSERT_TRUE(result.has_value());
-  EXPECT_TRUE(result->IsSimpleString());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
-
-  // Each key's WAL entry lands on its own shard.
-  ASSERT_EQ(appended_keys.size(), 3U);
-  for (size_t i = 0; i < appended_keys.size(); ++i) {
-    EXPECT_EQ(appended_shards[i], core::ComputeShard(appended_keys[i], kShardCount))
-        << "key '" << appended_keys[i] << "' appended to shard " << appended_shards[i];
+  EXPECT_EQ(reserves, 1);
+  for (const auto& [key, value] : {std::pair{"a", "1"}, std::pair{"b", "2"}, std::pair{"c", "3"}}) {
+    bool found = false;
+    for (const auto& entry : queue_.Published(ShardOf(key))) {
+      const auto& args = std::get<core::entry::Write>(entry.payload).cmd.args;
+      found = found || args == std::vector<std::string>{"SET", key, value};
+    }
+    EXPECT_TRUE(found) << "key '" << key << "' is not on its own shard";
   }
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
 }
 
-TEST_F(TieringEngineTest, DelFanOutSumsPerKeyIntegerReplies) {
+TEST_F(TieringEngineTest, DelCountsLiveKeysInOneDecision) {
   auto engine = MakeEngine();
-  std::vector<core::RpcId> rpc_ids;
-  std::mutex mu;
-  auto seq = std::make_shared<std::atomic<core::SequenceId>>(700);
-  std::vector<core::SteadyTime> deadlines;
-
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .Times(3)
-      .WillRepeatedly(
-          [&, seq](core::ShardId shard, const core::QueueEntry&, core::SteadyTime admit_by) {
-            const auto next = seq->fetch_add(1);
-            {
-              std::scoped_lock lock(mu);
-              rpc_ids.push_back(core::MakeRpcId(shard, next));
-              deadlines.push_back(admit_by);
-            }
-            return MakePending(next, true);
-          });
-  const auto start = core::SteadyClock::now();
-
-  // Two keys existed, one didn't; the per-key hot consumer fulfils with 1/0.
-  std::thread fulfiller([&]() {
-    const std::vector<int64_t> replies{1, 0, 1};
-    size_t fulfilled = 0;
-    while (fulfilled < replies.size()) {
-      std::vector<core::RpcId> pending;
-      {
-        std::scoped_lock lock(mu);
-        pending = rpc_ids;
-      }
-      bool made_progress = false;
-      for (size_t i = fulfilled; i < pending.size(); ++i) {
-        if (rpc_.Fulfill(pending[i], core::RespValue::Integer(replies[i]))) {
-          ++fulfilled;
-          made_progress = true;
-        } else {
-          break;
-        }
-      }
-      if (!made_progress) std::this_thread::yield();
-    }
-  });
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "a", "1"}));
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "c", "3"}));
+  // b is not resident: its existence is probed, never loaded in full.
+  EXPECT_CALL(cold_, ProbeKey(std::string_view{"b"}, _))
+      .WillOnce(Return(core::Result<std::optional<core::KeyMeta>>(std::nullopt)));
+  EXPECT_CALL(cold_, LoadKey(_, _)).Times(0);
 
   auto result = engine.DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c"}));
-  fulfiller.join();
-
-  ASSERT_TRUE(result.has_value());
-  ASSERT_TRUE(result->IsInteger());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsInteger(), 2);
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
-  // One admission deadline for the whole command, not one per sub.
-  ASSERT_EQ(deadlines.size(), 3U);
-  EXPECT_EQ(deadlines[0], deadlines[1]);
-  EXPECT_EQ(deadlines[1], deadlines[2]);
-  EXPECT_GE(deadlines[0], start + kWriteTimeout);
-  EXPECT_LT(deadlines[0], start + kWriteTimeout + 1s);
 }
 
 TEST_F(TieringEngineTest, FlushAdmitsEveryShardWithinOneDeadline) {
   auto engine = MakeEngine();
   std::vector<core::SteadyTime> deadlines;
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .WillOnce([&](core::ShardId, const core::QueueEntry&, core::SteadyTime admit_by) {
+  EXPECT_CALL(queue_, Admit(_, _))
+      .Times(kShardCount)
+      .WillRepeatedly([&deadlines](core::ShardId, core::SteadyTime admit_by) {
         deadlines.push_back(admit_by);
-        return MakePending(1, true);
-      })
-      .WillOnce([&](core::ShardId, const core::QueueEntry&,
-                    core::SteadyTime admit_by) -> core::Result<queue::PendingAppend> {
-        deadlines.push_back(admit_by);
-        return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"});
+        return core::Result<void>{};
       });
 
   auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
-  ASSERT_EQ(deadlines.size(), 2U);
-  EXPECT_EQ(deadlines[0], deadlines[1]);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->AsString(), "OK");
+  ASSERT_EQ(deadlines.size(), kShardCount);
+  EXPECT_TRUE(std::ranges::all_of(deadlines, [&](auto d) { return d == deadlines.front(); }));
+  for (core::ShardId shard = 0; shard < kShardCount; ++shard) {
+    const auto published = queue_.Published(shard);
+    ASSERT_EQ(published.size(), 1U) << shard;
+    EXPECT_TRUE(std::holds_alternative<core::entry::Flush>(published[0].payload));
+  }
 }
 
-TEST_F(TieringEngineTest, FanOutPartialBeginAppendFailureSurfacesError) {
+TEST_F(TieringEngineTest, FlushAdmissionFailureWipesNothing) {
   auto engine = MakeEngine();
-  // First sub succeeds (auto-publishes on scope exit), second fails. Per
-  // ADP-005 the partially-published sub may still apply — we cancel its RPC
-  // registration and return the error to the client.
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      .WillOnce([](core::ShardId, const core::QueueEntry&, core::SteadyTime) {
-        return MakePending(900, true);
-      })
-      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kResourceExhausted, "full"))));
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "k", "v"}));
+  std::vector<core::SteadyTime> deadlines;
+  ON_CALL(queue_, Admit(_, _))
+      .WillByDefault([&deadlines](core::ShardId shard,
+                                  core::SteadyTime admit_by) -> core::Result<void> {
+        deadlines.push_back(admit_by);
+        if (shard == kShardCount - 1) {
+          return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"});
+        }
+        return {};
+      });
+  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
+  ASSERT_EQ(deadlines.size(), kShardCount);
+  EXPECT_TRUE(std::ranges::all_of(deadlines, [&](auto d) { return d == deadlines.front(); }));
+  for (core::ShardId shard = 0; shard < kShardCount; ++shard) {
+    EXPECT_EQ(queue_.Published(shard).size(), shard == ShardOf("k") ? 1U : 0U) << shard;
+  }
+  EXPECT_EQ(engine.DispatchRead("GET", MakeCmd({"GET", "k"}))->AsString(), "v");
+}
+
+TEST_F(TieringEngineTest, FlushReserveFailureWipesNothing) {
+  auto engine = MakeEngine();
+  ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "k", "v"}));
+  queue_.SetReserveFault([](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
+    return core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"};
+  });
+  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
+  EXPECT_EQ(queue_.Published(ShardOf("k")).size(), 1U);
+  EXPECT_EQ(engine.DispatchRead("GET", MakeCmd({"GET", "k"}))->AsString(), "v");
+}
+
+TEST_F(TieringEngineTest, FlushDurableTimeoutRepliesWithTheTimeoutText) {
+  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.write_timeout = 50ms});
+  TieringEngine engine(hot_, cold_, router_, fast, TieringEngineConfig{.shard_count = kShardCount});
+  queue_.HoldDurable();
+  const testing::OnExit release([this] { queue_.ReleaseDurable(); });
+  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
+  EXPECT_TRUE(result.error().message().starts_with("flush durable wait exceeded server timeout"))
+      << result.error().message();
+}
+
+TEST_F(TieringEngineTest, FlushDurableFailurePropagates) {
+  auto engine = MakeEngine();
+  queue_.FailDurable(core::Error{core::ErrorCode::kInternal, "fsync failed"});
+  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
+}
+
+// A multi-key DEL admits every shard against one deadline, the write's.
+TEST_F(TieringEngineTest, DelAdmitsEveryShardWithinOneDeadline) {
+  auto engine = MakeEngine();
+  std::vector<core::SteadyTime> deadlines;
+  ON_CALL(queue_, Admit(_, _))
+      .WillByDefault([&deadlines](core::ShardId, core::SteadyTime admit_by) {
+        deadlines.push_back(admit_by);
+        return core::Result<void>{};
+      });
+  const auto start = core::SteadyClock::now();
+  auto result =
+      engine.DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c", "d", "e"}));
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_GE(deadlines.size(), 2U);
+  EXPECT_TRUE(std::ranges::all_of(deadlines, [&](auto d) { return d == deadlines.front(); }));
+  EXPECT_GE(deadlines.front(), start + kWriteTimeout);
+  EXPECT_LT(deadlines.front(), start + kWriteTimeout + 1s);
+}
+
+// One reservation: a refused MSET applies none of its keys.
+TEST_F(TieringEngineTest, MultiKeyReserveFailureAppliesNothing) {
+  auto engine = MakeEngine();
+  queue_.SetReserveFault([](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
+    return core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"};
+  });
 
   auto result =
       engine.DispatchFanOut(core::MultiKeyKind::kMset, MakeCmd({"MSET", "a", "1", "b", "2"}));
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
-}
-
-// C5: a slow durable wait must not leave the RPC wait starved. The guaranteed
-// min RPC budget is write_timeout * min_rpc_wait_fraction. Without C5, a
-// durable completion near the original deadline would give the RPC ~0 budget.
-TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
-  // Real-time test of deadline math. Timings chosen so durable fires past the
-  // T*(1-fraction) boundary where the floor actually extends the deadline,
-  // and with CI jitter margin at each step:
-  //   write_timeout=100ms, fraction=0.5
-  //   durable@75ms   — 25ms below T, 25ms above T*(1-f)=50ms
-  //   rpc@115ms      — 15ms past T, 10ms inside the extended floor 75+50=125ms
-  TieringEngineConfig cfg{
-      .shard_count = kShardCount,
-      .write_timeout = 100ms,
-      .min_rpc_wait_fraction = 0.5,
-  };
-  TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, cfg);
-
-  constexpr core::SequenceId kSeq = 201;
-  const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
-  std::promise<core::Result<void>> durable_p;
-  auto durable_fut = durable_p.get_future();
-  EXPECT_CALL(queue_, BeginAppend(_, _, _))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([&durable_fut](core::ShardId, core::QueueEntry, core::SteadyTime) {
-        return queue::PendingAppend{kSeq, std::move(durable_fut),
-                                    std::make_unique<testing::NoopAppendPublisher>()};
-      });
-
-  std::thread durable_releaser([&durable_p]() {
-    std::this_thread::sleep_for(75ms);
-    durable_p.set_value(core::Result<void>{});
-  });
-  std::thread rpc_releaser([this, kRpcId]() {
-    std::this_thread::sleep_for(115ms);
-    // Fulfill either succeeds (promise is still pending) or fails because the
-    // RPC was cancelled on a timeout path — either way, no retry loop.
-    (void)rpc_.Fulfill(kRpcId, core::RespValue::SimpleString("OK"));
-  });
-
-  auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
-  durable_releaser.join();
-  rpc_releaser.join();
-
-  ASSERT_TRUE(result.has_value());
-  EXPECT_TRUE(result->IsSimpleString());
-  EXPECT_EQ(result->AsString(), "OK");
-  EXPECT_EQ(rpc_.PendingCount(), 0U);
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
+  for (const char* key : {"a", "b"}) {
+    auto read = hot_.Read(core::ops::ReadOp{core::ops::StringGet{.key = key}});
+    EXPECT_FALSE(read.result.has_value()) << key;
+  }
 }
 
 }  // namespace

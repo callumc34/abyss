@@ -41,7 +41,6 @@ class MetricsSnapshotter {
   metrics::GaugeHandle cold_buffer_entries_;
   metrics::GaugeHandle cold_buffer_bytes_;
   metrics::GaugeHandle cold_buffer_oldest_entry_age_seconds_;
-  metrics::GaugeHandle hot_consumer_lag_entries_;
   metrics::GaugeHandle cold_consumer_lag_entries_;
   metrics::GaugeHandle net_read_buffer_high_water_bytes_;
 };

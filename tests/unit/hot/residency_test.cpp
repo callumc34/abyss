@@ -564,7 +564,7 @@ TEST_F(ResidencyTest, CompleteLoadsInstallsABatchInOneCall) {
   loads.push_back({.key = "d", .token = LoadToken{.id = 999}, .result = LoadedString("stale")});
 
   const core::EvictionPolicy policy{kLongEviction};
-  EXPECT_EQ(store_.CompleteLoads(loads, policy, kAllDrained), 3U);
+  EXPECT_EQ(store_.CompleteLoads(loads, policy), 3U);
   EXPECT_EQ(store_.View("a", kAllDrained, 0).presence, KeyView::Presence::kTombstoned);
   EXPECT_EQ(store_.View("b", kAllDrained, 0).presence, KeyView::Presence::kStub);
   const KeyView c = store_.View("c", kAllDrained, 0);

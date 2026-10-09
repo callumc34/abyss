@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "abyss/core/ops.h"
+#include "abyss/core/queue_entry.h"
 #include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
@@ -73,6 +74,14 @@ class HotStore : public Reader {
   // stream, and each shard's consumer wipes only its own, so one shard's
   // Flush never drops another's later writes.
   virtual Result<void> Wipe(ShardId shard, SequenceId seq) = 0;
+  // Applies a logged Write as decided, judging no TTL, or a Flush; the
+  // entry's appended_at raises the shard's clock. A Write not flagged
+  // replaces_state applies only to a key hot holds, an entry or a
+  // tombstone, so replay never builds a key from part of its history;
+  // nullopt when it did not apply.
+  virtual std::optional<RespValue> ApplyLogged(ShardId shard, QueueEntry& entry) = 0;
+  // Raises the shard's clock to `at`, for a logged entry not applied.
+  virtual void RaiseAppendedAt(ShardId shard, WallTime at) = 0;
 };
 
 }  // namespace abyss::core

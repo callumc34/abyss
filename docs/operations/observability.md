@@ -13,6 +13,7 @@
 - `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. A failed flush terminates the process, so both histograms record successful flushes only.
 - `abyss_wal_fill_wait_seconds` — time an append waited for earlier reservations in its log to be filled before it could be acknowledged. Recorded only when the wait outlasted a short spin (about 2 µs), so it counts the waits behind a large value or a preempted filler (the head-of-line effect the blob lane, #162, removes), not a neighbour mid-copy.
 - `abyss_wal_publish_wait_seconds` — time a shard's publish waited for an earlier reservation on the same shard to publish, since publishes go in seq order. Recorded only past the same short spin. Behind a large value's fill it rises together with the fill wait.
+- `abyss_sequencer_lock_hold_seconds` — how long a write held its hot shard locks for one decision: deciding, reserving its log space and applying to hot. One hold in 64 is sampled. Its tail under skewed load is what a single hot shard costs.
 
 ### RESP Frontend
 
@@ -22,7 +23,6 @@
 
 ### Consumer Lag
 
-- `abyss_hot_consumer_lag_entries` — entries between hot consumer position and queue head
 - `abyss_cold_consumer_lag_entries` — entries between cold consumer position and queue head
 - `abyss_cold_buffer_oldest_entry_age_seconds` — age of the oldest un-flushed buffer entry. **This is the most critical metric.** It directly indicates cold gap risk.
 - `abyss_hot_consumer_seq` — hot consumer's current sequence position
@@ -47,7 +47,10 @@
 - `abyss_ttl_expired_total{tier="hot|cold"}` — TTL expirations by tier. On cold, only the TTL scanner's deletes count: reads never delete.
 - `abyss_cold_apply_type_conflicts_total` — logged SADD, HSET or ZADD effects that found their key holding another type in cold. Any increase means the write path and cold disagree (see [failure-modes.md](failure-modes.md)).
 - `abyss_evicted_total` — keys evicted from hot (moved to cold-only)
-- `abyss_promotions_total` — cold hits promoted back to hot
+- `abyss_hot_backpressure_waits_total` — writes that waited for cold to drain because a hot shard was over `hot.max_memory_bytes` × `hot.backpressure_ratio`
+- `abyss_hot_backpressure_rejections_total` — writes rejected with `-OOM` after waiting `engine.write_timeout` for cold to drain (see [failure-modes.md](failure-modes.md))
+- `abyss_sequencer_redecides_total{reason="admission|spare|load|backpressure"}` — writes decided again: the durability window was full, no spare WAL segment was ready, a load was overtaken by a write, or a shard was over its memory limit. Each is bounded by `engine.write_timeout`.
+- `abyss_sequencer_locked_copy_bytes_total` — bytes of written values (string values, members, fields) copied into log entries while hot shard locks were held. Arguments over 16 KiB, or every argument of a request over 16 KiB, are copied before the locks, so large writes add nothing; `COPY` and `RENAMENX` of a large key do, since they rebuild it from hot.
 
 ### Cold-store active TTL expiry
 
@@ -146,7 +149,7 @@ Returns a JSON document with the live operational state of the process. Content-
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "abyss":   { "version": "0.1.0", "build": { "commit": "abc1234", "date": "2026-05-03T12:34:56Z" } },
   "server":  { "node_id": "...", "started_at_unix_ms": 1714742400000,
                "uptime_seconds": 3600, "process_id": 12345,
@@ -171,8 +174,7 @@ Returns a JSON document with the live operational state of the process. Content-
     "resolver": { "last_commit_seq_min": 0, "last_commit_seq_max": 0,
                   "cache_entries": 0, "cache_bytes": 0 }
   },
-  "lag":     { "hot_max_entries": 0, "cold_max_entries": 0,
-               "resolver_max_entries": 0 },
+  "lag":     { "cold_max_entries": 0 },
   "connections": { "active": 0 },
   "cluster": null
 }
@@ -190,7 +192,8 @@ These invariants govern any change to the `/status` payload across releases. Bum
 
 #### Field semantics
 
-- `schema_version` — bumps only when an invariant above is broken. Today: `3`.
+- `schema_version` — bumps only when an invariant above is broken. Today: `4`.
+  - Version 4 removed `lag.hot_max_entries` and `lag.resolver_max_entries`: hot and the resolver consume only during recovery, so behind the tail they grew without bound.
   - Version 3 replaced `config.fsync_policy` with `config.durability` (`process_crash` or `power_loss`).
   - Version 2 renamed `queue.tail_seq` to `queue.first_seq`, which now reports the lowest readable sequence across shards. It also renamed `consumers.{cold,resolver}.last_ack_seq_{min,max}` to `last_commit_seq_{min,max}`, following the queue's move from acknowledgements to committed offsets.
 - `queue.unflushed_bytes` / `queue.durability_lag_ms` — the same values as `abyss_wal_unflushed_bytes` and `abyss_wal_durability_lag_seconds`, at snapshot time.

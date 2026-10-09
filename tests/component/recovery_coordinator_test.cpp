@@ -255,10 +255,12 @@ struct Node {
   std::unique_ptr<consumer::ResolverPool> resolver_pool;
 };
 
+// A SET replaces its key's state, so the sequencer flags it.
 core::QueueEntry WriteEntry(const std::string& key, const std::string& value) {
   return core::QueueEntry{
       .appended_at = core::WallClock::now(),
       .payload = core::entry::Write{.cmd = core::RespCommand{{"SET", key, value}}},
+      .replaces_state = true,
   };
 }
 

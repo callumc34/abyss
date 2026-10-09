@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/consumer/cold_consumer_pool.h"
@@ -149,12 +150,12 @@ class RecoveryCoordinatorTest : public ::testing::Test {
         });
     ON_CALL(queue_, CommitOffset(_, _, _)).WillByDefault(Return(core::Result<void>{}));
 
-    ON_CALL(hot_, Apply(_, _))
-        .WillByDefault([this](const core::ops::WriteOp& op, core::SequenceId) {
-          hot_applied_.Add(core::ops::PrimaryKey(op));
-          return core::Result<core::RespValue>(core::RespValue::SimpleString("OK"));
-        });
-    ON_CALL(hot_, Wipe(_, _)).WillByDefault(Return(core::Result<void>{}));
+    ON_CALL(hot_, ApplyLogged(_, _)).WillByDefault([this](core::ShardId, core::QueueEntry& entry) {
+      if (const auto* write = std::get_if<core::entry::Write>(&entry.payload)) {
+        hot_applied_.Add(write->cmd.args.at(1));
+      }
+      return std::optional<core::RespValue>(core::RespValue::SimpleString("OK"));
+    });
     ON_CALL(cold_, ApplyBatch(_, _))
         .WillByDefault([this](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
           for (const auto& op : ops) cold_applied_.Add(core::ops::PrimaryKey(op));

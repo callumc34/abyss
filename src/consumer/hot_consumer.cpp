@@ -18,17 +18,6 @@ namespace abyss::consumer {
 
 namespace {
 
-core::RespValue MapApplyError(const core::Error& err) {
-  switch (err.code()) {
-    case core::ErrorCode::kWrongType:
-      return core::RespValue::Error(core::ErrorPrefix::kWrongType, err.message());
-    case core::ErrorCode::kResourceExhausted:
-      return core::RespValue::Error(core::ErrorPrefix::kOom, err.message());
-    default:
-      return core::RespValue::Error(core::ErrorPrefix::kErr, err.message());
-  }
-}
-
 uint64_t WallMs(core::WallTime t) {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count());
@@ -144,7 +133,7 @@ void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {
         [this, &entry](auto& payload) {
           using T = std::decay_t<decltype(payload)>;
           if constexpr (std::is_same_v<T, core::entry::Write>) {
-            HandleWrite(entry, payload);
+            HandleWrite(entry);
           } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
             HandleConditional(std::move(entry), payload);
           } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
@@ -237,48 +226,21 @@ core::Result<uint64_t> HotConsumer::ReplayUntil(core::SequenceId target,
   return replayed;
 }
 
-void HotConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
-  const core::RespCommand& cmd = write.cmd;
-  core::RespValue result;
-  if (cmd.args.empty()) {
-    counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_ERROR("queue entry has empty command payload",
-                    {"shard", static_cast<int64_t>(config_.shard)});
-    result =
-        core::RespValue::Error(core::ErrorPrefix::kErr, "empty command payload in queue entry");
-  } else {
-    auto op = core::ops::ParseWriteOp(cmd.args[0], cmd, WallMs(entry.appended_at));
-    if (!op.has_value()) {
-      counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
-      ABYSS_LOG_ERROR("queue entry parse failed", {"shard", static_cast<int64_t>(config_.shard)},
-                      {"cmd", std::string_view{cmd.args[0]}},
-                      {"err", std::string_view{op.error().message()}});
-      result = core::RespValue::Error(core::ErrorPrefix::kErr, op.error().message());
-    } else {
-      const auto key = core::ops::PrimaryKey(*op);
-      const bool replaying = replay_mode_.load(std::memory_order_acquire);
-      const auto wall_now = config_.wall_clock();
-
-      if (replaying && ShouldSkipForEvictionElapsed(entry.appended_at, key, wall_now)) {
-        counters_.replay_skipped_eviction.fetch_add(1, std::memory_order_relaxed);
-      } else if (replaying && ShouldSkipForAbsTtlElapsed(AbsTtlMs(*op), wall_now)) {
-        counters_.replay_skipped_abs_ttl.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        auto applied = store_.Apply(*op, entry.seq);
-        if (!applied.has_value()) {
-          counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-          if (applied.error().code() != core::ErrorCode::kWrongType) {
-            ABYSS_LOG_ERROR("hot apply failed", {"shard", static_cast<int64_t>(config_.shard)},
-                            {"cmd", std::string_view{cmd.args[0]}},
-                            {"err", std::string_view{applied.error().message()}});
-          }
-          result = MapApplyError(applied.error());
-        } else {
-          counters_.applied.fetch_add(1, std::memory_order_relaxed);
-          result = std::move(*applied);
-        }
-      }
-    }
+// Applied as logged: the decision judged every expiry the write met,
+// so replay with the wall clock past a TTL changes nothing.
+void HotConsumer::HandleWrite(core::QueueEntry& entry) {
+  const core::RespCommand& cmd = std::get<core::entry::Write>(entry.payload).cmd;
+  const bool replaying = replay_mode_.load(std::memory_order_acquire);
+  core::RespValue result = core::RespValue::Null();
+  if (replaying && cmd.args.size() > 1 &&
+      ShouldSkipForEvictionElapsed(entry.appended_at, cmd.args[1], config_.wall_clock())) {
+    // It only decides what is resident: a later write to the key
+    // applies only once one replaces its state.
+    store_.RaiseAppendedAt(config_.shard, entry.appended_at);
+    counters_.replay_skipped_eviction.fetch_add(1, std::memory_order_relaxed);
+  } else if (auto applied = store_.ApplyLogged(config_.shard, entry); applied.has_value()) {
+    result = *std::move(applied);
+    counters_.applied.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Publish settled-seq BEFORE fulfilling the RPC to avoid preempt issues.
@@ -301,7 +263,7 @@ void HotConsumer::HandleConditional(core::QueueEntry entry,
   apply_notifier_.NotifyApplied(config_.shard, seq);
 }
 
-void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
+void HotConsumer::HandleFlush(core::QueueEntry& entry) {
   ABYSS_LOG_DEBUG("hot HandleFlush", {"shard", static_cast<int64_t>(config_.shard)},
                   {"seq", static_cast<uint64_t>(entry.seq)});
   // Cancel pre-Flush pending Conditionals; the awaiting client sees a broken_promise.
@@ -323,20 +285,7 @@ void HotConsumer::HandleFlush(const core::QueueEntry& entry) {
     apply_notifier_.NotifyApplied(config_.shard, seq);
   }
 
-  auto wiped = store_.Wipe(config_.shard, entry.seq);
-  if (!wiped.has_value()) {
-    counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_ERROR("hot wipe failed", {"shard", static_cast<int64_t>(config_.shard)},
-                    {"seq", static_cast<uint64_t>(entry.seq)},
-                    {"err", std::string_view{wiped.error().message()}});
-    // Fulfil the RPC with the error so the engine surfaces it instead of timing out.
-    rpc_.Fulfill(core::MakeFlushRpcId(core::kHotConsumer, config_.shard, entry.seq),
-                 core::RespValue::Error(core::ErrorPrefix::kErr,
-                                        "hot store wipe failed: " + wiped.error().message()));
-    apply_notifier_.NotifyApplied(config_.shard, entry.seq);
-    MarkSettled(entry.seq);
-    return;
-  }
+  (void)store_.ApplyLogged(config_.shard, entry);
 
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
 

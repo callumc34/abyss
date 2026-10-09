@@ -201,12 +201,8 @@ std::string Render(const StatusSnapshot& s) {
   w.Key("lag");
   {
     w.BeginObject();
-    w.Key("hot_max_entries");
-    w.UInt(s.lag.hot_max_entries);
     w.Key("cold_max_entries");
     w.UInt(s.lag.cold_max_entries);
-    w.Key("resolver_max_entries");
-    w.UInt(s.lag.resolver_max_entries);
     w.EndObject();
   }
 

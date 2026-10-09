@@ -104,11 +104,6 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
   ASSERT_TRUE(before.has_value());
   EXPECT_EQ(before->AsString(), "expiring");
 
-  // Drive cold to absorb-and-flush the SET so the buffer is empty for k1 and
-  // cold's latest_drained_seq matches hot's settled seq. The engine's
-  // buffer-consistency gate on hot-miss reads (ADP-006) requires this in
-  // production where the cold consumer runs continuously; the harness's
-  // cold pool is intentionally idle, so the test drives the drain itself.
   const auto shard = core::ComputeShard("k1", testing::IntegrationHarness::kShardCount);
   auto& cold_consumer = harness_.ColdPool().ConsumerFor(shard);
   cold_consumer.Drain();
@@ -120,84 +115,24 @@ TEST_F(TieringIntegrationTest, AbsoluteTtlExpiresInHot) {
   auto apply_cold = harness_.Cold().ApplyBatch(std::span{&cold_op, 1}, 0);
   ASSERT_TRUE(apply_cold.has_value());
 
+  // Hot still holds k1, past its TTL: its latest state is absent,
+  // whatever cold holds.
   auto after = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "k1"}));
   ASSERT_TRUE(after.has_value());
-  EXPECT_EQ(after->AsString(), "cold_fallback");
+  EXPECT_TRUE(after->IsNull());
 }
 
-TEST_F(TieringIntegrationTest, WritePathAwaitsConsumerAck) {
-  // The real HotConsumerPool in the harness fulfils the RPC.
+TEST_F(TieringIntegrationTest, WriteIsInHotWhenItReplies) {
   auto result = harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "k1", "v1"}));
 
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->IsSimpleString());
   EXPECT_EQ(result->AsString(), "OK");
-  EXPECT_EQ(harness_.Rpc().PendingCount(), 0U);
 
-  // Value is observable in the hot store after the consumer applied it.
+  // The sequencer applied it before replying.
   auto read = harness_.Hot().Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k1"}});
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "v1");
-}
-
-TEST_F(TieringIntegrationTest, ColdHitStringTriggersPromotion) {
-  core::ops::WriteOp set_op{core::ops::StringSet{.key = "cold_only", .value = "cv"}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0).has_value());
-
-  bool promote_appended = false;
-  ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_, ::testing::_))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillByDefault([&promote_appended](core::ShardId, core::QueueEntry entry, core::SteadyTime) {
-        if (std::holds_alternative<core::entry::Write>(entry.payload)) {
-          const auto& cmd = std::get<core::entry::Write>(entry.payload).cmd;
-          if (cmd.args.size() >= 3 && cmd.args[0] == "SET" && cmd.args[1] == "cold_only") {
-            promote_appended = true;
-          }
-        }
-        std::promise<core::Result<void>> p;
-        p.set_value(core::Result<void>{});
-        return queue::AppendResult{.seq = 99, .durable = p.get_future()};
-      });
-
-  auto read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "cold_only"}));
-  ASSERT_TRUE(read.has_value());
-  EXPECT_EQ(read->AsString(), "cv");
-  EXPECT_TRUE(promote_appended);
-}
-
-TEST_F(TieringIntegrationTest, ColdHitTtlPreservedInPromotionCommand) {
-  auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          harness_.Clock().WallNow().time_since_epoch())
-                                          .count());
-  const uint64_t abs_ttl_ms = now_ms + 3600000;
-
-  core::ops::WriteOp set_op{
-      core::ops::StringSet{.key = "ttl_key", .value = "v", .abs_ttl_ms = abs_ttl_ms}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0).has_value());
-
-  std::optional<core::RespCommand> promoted;
-  ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_, ::testing::_))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillByDefault([&promoted](core::ShardId, core::QueueEntry entry, core::SteadyTime) {
-        if (std::holds_alternative<core::entry::Write>(entry.payload)) {
-          promoted = std::get<core::entry::Write>(entry.payload).cmd;
-        }
-        std::promise<core::Result<void>> p;
-        p.set_value(core::Result<void>{});
-        return queue::AppendResult{.seq = 99, .durable = p.get_future()};
-      });
-
-  auto read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ttl_key"}));
-  ASSERT_TRUE(read.has_value());
-  ASSERT_TRUE(promoted.has_value());
-  // NOLINTBEGIN(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
-  ASSERT_GE(promoted->args.size(), 5U);
-  EXPECT_EQ(promoted->args[0], "SET");
-  EXPECT_EQ(promoted->args[1], "ttl_key");
-  EXPECT_EQ(promoted->args[2], "v");
-  EXPECT_EQ(promoted->args[3], "PXAT");
-  EXPECT_EQ(promoted->args[4], std::to_string(abs_ttl_ms));
-  // NOLINTEND(bugprone-unchecked-optional-access)
 }
 
 TEST_F(TieringIntegrationTest, ColdDeleteRemovesKey) {
@@ -217,10 +152,6 @@ TEST_F(TieringIntegrationTest, ColdDeleteRemovesKey) {
 // Synchronous Drain()/Flush() — running the thread would race the test clock.
 
 TEST_F(TieringIntegrationTest, DrainFlushPersistsWriteToColdStoreAfterQuietWindow) {
-  // Test drives the cold consumer synchronously; stop the hot pool so its
-  // background Reads don't race our EXPECT_CALL.
-  harness_.HotPool().Stop();
-
   constexpr core::ShardId kShard = 0;
   const std::string key = "drain_key";
 
@@ -254,10 +185,6 @@ TEST_F(TieringIntegrationTest, DrainFlushPersistsWriteToColdStoreAfterQuietWindo
 }
 
 TEST_F(TieringIntegrationTest, TenThousandWritesToSameKeyProduceOneColdWrite) {
-  // Test drives the cold consumer synchronously; stop the hot pool so its
-  // background Reads don't race our EXPECT_CALL.
-  harness_.HotPool().Stop();
-
   constexpr core::ShardId kShard = 0;
   const std::string key = "burst_key";
   constexpr int kWrites = 10000;
@@ -320,31 +247,11 @@ TEST_F(TieringIntegrationTest, MultipleKeysTieredAcrossStores) {
   EXPECT_EQ(r3->AsString(), "bv");
 }
 
-// C6: a failed promotion Append must not silently disappear.
-TEST_F(TieringIntegrationTest, PromotionQueueFailureIncrementsCounter) {
-  core::ops::WriteOp set_op{core::ops::StringSet{.key = "cold_only", .value = "cv"}};
-  ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&set_op, 1}, 0).has_value());
-
-  ON_CALL(harness_.Queue(), Append(::testing::_, ::testing::_, ::testing::_))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillByDefault([](core::ShardId, core::QueueEntry, core::SteadyTime) {
-        return core::Result<queue::AppendResult>(
-            std::unexpected(core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"}));
-      });
-
-  auto read = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "cold_only"}));
-  ASSERT_TRUE(read.has_value());
-  EXPECT_EQ(read->AsString(), "cv");
-  EXPECT_EQ(harness_.Engine().Snapshot().promotion_append_failures, 1U);
-  // A full durability window skips a promotion; it is not a failure.
-  EXPECT_EQ(harness_.Engine().Snapshot().promotions_skipped, 0U);
-}
-
 // A recent delete becomes an authoritative hot tombstone, so reads of a deleted
 // key answer from hot without consulting — or waiting on — the lagging overlay.
 
-// Helper: a finds a key on the same shard as `key` so a primer write can
-// advance hot's settled seq for that shard without touching `key` itself.
+// A key on the same shard as `key`, for a write that leaves the shard's
+// cold consumer behind without touching `key` itself.
 namespace {
 std::string SameShardPrimer(std::string_view key) {
   const auto shard = core::ComputeShard(key, testing::IntegrationHarness::kShardCount);
@@ -370,7 +277,6 @@ TEST_F(TieringIntegrationTest, DeletedScalarReadsNilGateFree) {
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_TRUE(result->IsNull());
   EXPECT_LT(elapsed, 500ms) << "tombstone read must not wait on the cold consumer";
-  EXPECT_EQ(harness_.Engine().Snapshot().read_buffer_wait_timeouts, 0U);
 }
 
 TEST_F(TieringIntegrationTest, DeletedKeyExistsReturnsZeroGateFree) {
@@ -407,51 +313,21 @@ TEST_F(TieringIntegrationTest, EmptiedHashReadsEmptyGateFree) {
       << "emptied-collection tombstone read must not wait on the cold consumer";
 }
 
-// The residual gate still applies to a collection key hot has NEVER held: such
-// a read must consult the overlay, so it waits for cold to catch up to hot's
-// settled seq. Here the consumer catches up mid-wait and the read then succeeds.
-TEST_F(TieringIntegrationTest, HotAbsentCollectionReadWaitsThenSucceeds) {
+// A collection hot has never held is wholly in buffer plus cold, so a
+// read of it needs no wait, even with the cold consumer behind hot.
+TEST_F(TieringIntegrationTest, HotAbsentCollectionReadNeedsNoWait) {
   core::ops::WriteOp h{core::ops::HashSet{.key = "ch", .fields = {{.field = "a", .value = "1"}}}};
   ASSERT_TRUE(harness_.Cold().ApplyBatch(std::span{&h, 1}, 0).has_value());
-
-  const auto shard = core::ComputeShard("ch", testing::IntegrationHarness::kShardCount);
   ASSERT_TRUE(harness_.SeedHot({"SET", SameShardPrimer("ch"), "v"}).has_value());
 
-  std::thread advancer([&] {
-    std::this_thread::sleep_for(20ms);
-    harness_.ColdPool().ConsumerFor(shard).Drain();
-  });
-  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "ch"}));
-  advancer.join();
-
-  ASSERT_TRUE(result.has_value()) << result.error().message();
-  ASSERT_TRUE(result->IsArray());
-  EXPECT_EQ(result->AsArray().size(), 2U) << "cold's {a:1} surfaces after the gate succeeds";
-}
-
-// When the cold consumer is wedged behind hot and a collection read must
-// consult the overlay (hot has never held the key), the engine fails closed
-// with a timeout rather than serving a stale merge.
-TEST(TieringIntegrationTimeoutTest, CollectionReadTimesOutWhenColdConsumerWedged) {
-  constexpr auto kTimeout = std::chrono::milliseconds{100};
-  testing::IntegrationHarness harness{
-      testing::IntegrationHarness::Config{.buffer_consistency_wait_timeout = kTimeout}};
-  const auto cmd = [](std::initializer_list<std::string> args) {
-    return core::RespCommand{.args = std::vector<std::string>(args)};
-  };
-
-  // Advance hot's settled seq on the read key's shard via a colliding primer,
-  // and never drain cold — so the gate on a hot-absent collection read fires.
-  ASSERT_TRUE(harness.SeedHot({"SET", SameShardPrimer("ch"), "v"}).has_value());
-
   const auto t0 = std::chrono::steady_clock::now();
-  auto result = harness.Engine().DispatchRead("HGETALL", cmd({"HGETALL", "ch"}));
+  auto result = harness_.Engine().DispatchRead("HGETALL", MakeCmd({"HGETALL", "ch"}));
   const auto elapsed = std::chrono::steady_clock::now() - t0;
 
   ASSERT_TRUE(result.has_value()) << result.error().message();
-  ASSERT_TRUE(result->IsError());
-  EXPECT_GE(elapsed, kTimeout);
-  EXPECT_EQ(harness.Engine().Snapshot().read_buffer_wait_timeouts, 1U);
+  ASSERT_TRUE(result->IsArray());
+  EXPECT_EQ(result->AsArray().size(), 2U);
+  EXPECT_LT(elapsed, 500ms) << "a miss must not wait on the cold consumer";
 }
 
 // COLD-3 coupling: ZRANGEBYLEX must return byte-identical results whether the

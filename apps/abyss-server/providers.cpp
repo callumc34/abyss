@@ -244,6 +244,9 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
     lag_out = lag_v;
   };
 
+  // Hot and the resolver consume only during recovery, so their
+  // positions freeze after it; a lag behind the tail means nothing.
+  uint64_t frozen_lag = 0;
   if (deps_.hot_pool != nullptr) {
     collect_lag(
         deps_.hot_pool->ShardCount(),
@@ -251,7 +254,7 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
           return deps_.hot_pool->ConsumerFor(shard).HighestSettledSeq();
         },
         s.consumers.hot.highest_settled_seq_min, s.consumers.hot.highest_settled_seq_max,
-        s.lag.hot_max_entries);
+        frozen_lag);
   }
 
   if (deps_.cold_pool != nullptr) {
@@ -275,7 +278,7 @@ admin::StatusSnapshot StatusProviderImpl::Snapshot() const {
           return deps_.resolver_pool->ConsumerFor(shard).GetSnapshot().last_commit_seq;
         },
         s.consumers.resolver.last_commit_seq_min, s.consumers.resolver.last_commit_seq_max,
-        s.lag.resolver_max_entries);
+        frozen_lag);
   }
 
   s.connections.active = deps_.connection_count ? deps_.connection_count() : 0;

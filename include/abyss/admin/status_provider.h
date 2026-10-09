@@ -103,9 +103,7 @@ struct StatusConsumersInfo {
 };
 
 struct StatusLagInfo {
-  uint64_t hot_max_entries = 0;
   uint64_t cold_max_entries = 0;
-  uint64_t resolver_max_entries = 0;
 };
 
 struct StatusConnectionsInfo {
@@ -140,7 +138,7 @@ struct StatusRecoveryInfo {
 // schema_version bump. Unset/inapplicable fields render as JSON null or as
 // the type's neutral value (0, "", false), never as missing keys.
 struct StatusSnapshot {
-  uint32_t schema_version = 3;
+  uint32_t schema_version = 4;
   StatusBuildInfo build;
   StatusServerInfo server;
   StatusConfigInfo config;

@@ -793,18 +793,18 @@ TEST_F(LogClockTest, AnEntryAbsorbedAfterItsFlushStartsFresh) {
   EXPECT_EQ(buf_.LogClockMs(), 500U);
 }
 
-TEST_F(LogClockTest, NeverMovesBackwards) {
+#ifndef NDEBUG
+using LogClockDeathTest = LogClockTest;
+
+// The sequencer stamps a shard's writes in seq order, so a stamp below
+// one absorbed already is a bug: caught at absorb, never absorbed.
+TEST_F(LogClockDeathTest, AStampBelowOneAbsorbedIsFatal) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   Absorb("k", 1, 300);
   clock_.Advance(5s);
-  // Stamped before k's write but appended after it.
-  Absorb("j", 2, 200);
-  EXPECT_EQ(buf_.LogClockMs(), 300U);
-
-  auto k = SelectOne();
-  ASSERT_EQ(k[0].get().key, "k");
-  buf_.EraseFlushed(k);
-  EXPECT_EQ(buf_.LogClockMs(), 300U);
+  EXPECT_DEATH(Absorb("j", 2, 200), "appended_at went backwards");
 }
+#endif
 
 TEST_F(LogClockTest, AFlushAdvancesIt) {
   Absorb("k", 1, 100);
@@ -812,13 +812,13 @@ TEST_F(LogClockTest, AFlushAdvancesIt) {
   EXPECT_EQ(buf_.LogClockMs(), 400U);
   buf_.Clear(50);
   EXPECT_EQ(buf_.LogClockMs(), 400U);
-  Absorb("k", 2, 350);
-  EXPECT_EQ(buf_.LogClockMs(), 400U);
+  Absorb("k", 2, 450);
+  EXPECT_EQ(buf_.LogClockMs(), 450U);
 }
 
 // OldestPendingSeq and LogClockMs keep ordered indexes; a full scan of
 // the entries is the oracle. Positions sometimes run behind their
-// carriers, as a Resolved's do, and appended_at sometimes runs back.
+// carriers, as a Resolved's do.
 TEST_F(CompactionBufferTest, PendingIndexesAgreeWithAFullScan) {
   std::mt19937_64 rng(kTestSeed);  // NOLINT(bugprone-random-generator-seed): reproducible.
   CompactionBuffer buf{strategy_, clock_.SteadyFn(), kTestSeed};
@@ -838,7 +838,6 @@ TEST_F(CompactionBufferTest, PendingIndexesAgreeWithAFullScan) {
     } else if (roll < 60) {
       ++seq;
       appended_at_ms += rng() % 50;
-      if (rng() % 10 == 0) appended_at_ms -= std::min<uint64_t>(appended_at_ms, rng() % 40);
       const core::SequenceId position = (seq > 8 && rng() % 8 == 0) ? seq - 1 - (rng() % 6) : seq;
       const std::string key = "k" + std::to_string(rng() % 32);
       buf.Absorb(key, WriteOp{StringSet{.key = key, .value = "v"}}, kDefaultEviction, position, seq,

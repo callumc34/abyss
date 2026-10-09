@@ -86,6 +86,13 @@ class Queue {
   //   kValueTooLarge: an entry or the batch exceeds what a frame or a
   //     segment holds.
   virtual Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) = 0;
+  // Reserve of one Flush per shard, every shard in order, across every
+  // log: one batch per log, in one Reservation that Complete fills log
+  // by log. Atomic to readers holding the hot locks, but not across a
+  // crash: each log's batch survives or not on its own.
+  virtual Result<queue::Reservation> ReserveFlush(std::span<const queue::ShardEntries> parts) = 0;
+  // The log `shard`'s stream is on; a Reserve stays within one.
+  virtual uint32_t LogOf(ShardId shard) const = 0;
   // Fills what Reserve left, then publishes each shard once its earlier
   // seqs are published.
   virtual queue::DurableFutures Complete(queue::Reservation&& reservation) = 0;

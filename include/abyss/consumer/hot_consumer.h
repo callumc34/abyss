@@ -105,10 +105,10 @@ class HotConsumer {
   // Processes `batch` and advances next_read_seq_ past it.
   void ProcessBatch(std::vector<core::QueueEntry>& batch);
 
-  void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
+  void HandleWrite(core::QueueEntry& entry);
   void HandleConditional(core::QueueEntry entry, const core::entry::Conditional& cond);
   void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
-  void HandleFlush(const core::QueueEntry& entry);
+  void HandleFlush(core::QueueEntry& entry);
 
   // Applies materialised ops from a Resolved entry. `reference_at` is the
   // Conditional's appended_at, used for the eviction-window skip-stale check

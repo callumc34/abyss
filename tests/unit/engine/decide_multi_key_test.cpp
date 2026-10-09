@@ -147,9 +147,8 @@ TEST(DecideMultiKeyTest, DelCountsOnlyLiveKeys) {
       EXPECT_EQ(effect.observed_expiry, expired) << effect.key;
     }
     EXPECT_EQ(Describe(d.reply), ":2");
-    ASSERT_EQ(d.observed.size(), 6U);
-    EXPECT_EQ(d.observed[0], (std::pair<std::string, core::SequenceId>{"live", 3}));
-    EXPECT_EQ(d.observed[3], (std::pair<std::string, core::SequenceId>{"flushed", 9}));
+    // Every key is on shard 0: one entry, the highest seq read.
+    EXPECT_EQ(d.observed, (std::vector<ShardSeq>{{.shard = 0, .seq = 9}}));
   }
 }
 
@@ -176,8 +175,22 @@ TEST(DecideMultiKeyTest, RenamenxMovesTheSourceWithItsTtl) {
                             {.args = {"SET", "dst", "v", "PXAT", std::to_string(kTtl)},
                              .replaces_state = true}});
   EXPECT_EQ(Describe(d.reply), ":1");
-  EXPECT_EQ(d.observed,
-            (std::vector<std::pair<std::string, core::SequenceId>>{{"src", 5}, {"dst", 8}}));
+  EXPECT_EQ(d.observed, (std::vector<ShardSeq>{{.shard = 0, .seq = 8}}));
+}
+
+// The fence needs each shard's highest seq, not each key's.
+TEST(DecideMultiKeyTest, ObservedKeepsTheHighestSeqPerShard) {
+  FakeKey a = Str("v", 0, 5);
+  FakeKey b = Str("v", 0, 3);
+  b.shard = 2;
+  FakeKey c = Str("v", 0, 7);
+  c.shard = 2;
+  FakeKey d = Str("v", 0, 2);
+  const Decision decided = DecideOn(Keys{{"a", a}, {"b", b}, {"c", c}, {"d", d}},
+                                    {"MSETNX", "a", "1", "b", "1", "c", "1", "d", "1"});
+  EXPECT_EQ(Describe(decided.reply), ":0");
+  EXPECT_EQ(decided.observed,
+            (std::vector<ShardSeq>{{.shard = 0, .seq = 5}, {.shard = 2, .seq = 7}}));
 }
 
 TEST(DecideMultiKeyTest, RenamenxOfAMissingSourceIsAnError) {

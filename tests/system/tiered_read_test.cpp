@@ -111,12 +111,12 @@ class TieredReadTest : public IsolatedDataServerTest {
   }
 };
 
-TEST_F(TieredReadTest, NaturalFlowHotEvictsThenColdPromotesBackToHot) {
+TEST_F(TieredReadTest, NaturalFlowHotEvictsThenColdServes) {
   const uint16_t mport = Server().MetricsPort();
 
   // Drain the fixture probe: if its flush satisfies the quiet-flush wait below
   // while `k` is still buffered, the post-eviction read is served from the
-  // buffer and the cold-hit and promotion waits both time out.
+  // buffer and the cold-hit wait times out.
   ASSERT_FALSE(AwaitColdQuiescence(mport).empty())
       << "compaction buffer did not quiesce before baseline";
 
@@ -124,8 +124,6 @@ TEST_F(TieredReadTest, NaturalFlowHotEvictsThenColdPromotesBackToHot) {
       ParseCounter(Scrape(mport), "abyss_hits_total", {{"tier", "hot"}}).value_or(0.0);
   const double baseline_cold =
       ParseCounter(Scrape(mport), "abyss_hits_total", {{"tier", "cold"}}).value_or(0.0);
-  const double baseline_promotions =
-      ParseCounter(Scrape(mport), "abyss_promotions_total").value_or(0.0);
   const double baseline_quiet_flush =
       ParseCounter(Scrape(mport), "abyss_cold_flush_reason_total", {{"reason", "quiet"}})
           .value_or(0.0);
@@ -158,34 +156,8 @@ TEST_F(TieredReadTest, NaturalFlowHotEvictsThenColdPromotesBackToHot) {
       << "cold hit metric did not increment within 2s; last scrape:\n"
       << scrape_body;
 
-  ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_promotions_total", {}, baseline_promotions + 1.0, 2s,
-                                 &scrape_body))
-      << "promotion metric did not increment within 2s; last scrape:\n"
-      << scrape_body;
-
-  // The promotion is async: a queue Append followed by hot-consumer apply.
-  // Issue GETs in a poll loop and look for the hot-hit counter to advance past
-  // the post-eviction baseline. The first GET that hits hot is the one served
-  // after the promotion has been applied.
-  const double after_eviction_hot =
-      ParseCounter(Scrape(mport), "abyss_hits_total", {{"tier", "hot"}}).value_or(0.0);
-  bool observed_promotion_to_hot = false;
-  const auto deadline = std::chrono::steady_clock::now() + 3s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    auto r = Client().Command({"GET", "k"});
-    ASSERT_TRUE(r.IsBulk()) << "GET k post-promotion did not return a value: " << r;
-    EXPECT_EQ(r.String(), "v");
-    const auto cur =
-        ParseCounter(Scrape(mport), "abyss_hits_total", {{"tier", "hot"}}).value_or(0.0);
-    if (cur > after_eviction_hot) {
-      observed_promotion_to_hot = true;
-      break;
-    }
-    std::this_thread::sleep_for(50ms);
-  }
-  EXPECT_TRUE(observed_promotion_to_hot)
-      << "promotion did not land in hot within 3s; last scrape:\n"
-      << Scrape(mport);
+  // Cold keeps answering; filling hot from a cold hit is not done here.
+  ASSERT_EQ(Client().Command({"GET", "k"}).String(), "v");
 }
 
 TEST_F(TieredReadTest, MissReturnsNilAndIncrementsMisses) {

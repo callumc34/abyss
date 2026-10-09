@@ -73,6 +73,7 @@ add_executable(abyss_hot_tests
   hot/eviction_worker_test.cpp
   hot/residency_test.cpp
   hot/apply_effects_test.cpp
+  hot/shard_locks_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE
@@ -236,12 +237,27 @@ add_executable(abyss_engine_tests
   engine/decide_registry_test.cpp
   engine/loader_merge_test.cpp
   engine/loader_test.cpp
+  engine/sequencer_test.cpp
 )
 
 target_link_libraries(abyss_engine_tests PRIVATE
   abyss::engine
   abyss::queue
   abyss::resp
+  abyss::test_support
+  GTest::gtest_main
+)
+
+# Replaces the global allocator to count copies and frees, so it is a
+# binary of its own.
+add_executable(abyss_sequencer_alloc_tests
+  engine/alloc_counter.cpp
+  engine/sequencer_alloc_test.cpp
+)
+
+target_link_libraries(abyss_sequencer_alloc_tests PRIVATE
+  abyss::engine
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )
@@ -281,5 +297,6 @@ abyss_discover_tests(abyss_metrics_tests  "unit\;unit-metrics")
 abyss_discover_tests(abyss_net_tests      "unit\;unit-net")
 abyss_discover_tests(abyss_admin_tests    "unit\;unit-admin")
 abyss_discover_tests(abyss_engine_tests   "unit\;unit-engine")
+abyss_discover_tests(abyss_sequencer_alloc_tests "unit\;unit-engine")
 abyss_discover_tests(abyss_branding_tests "unit\;unit-branding")
 abyss_discover_tests(abyss_platform_tests "unit\;unit-platform")

@@ -42,6 +42,59 @@ struct ShardedHotStoreConfig {
   core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
+class ShardedHotStore;
+
+// An exclusive hold on a set of hot shards, and everything the
+// sequencer may do under it. Ending the hold (Unlock or destruction)
+// releases the locks, then wakes load waiters; what its applies
+// replaced is freed after the locks too, by Unlock's caller.
+class ShardLocks {
+ public:
+  ShardLocks(ShardLocks&& other) noexcept;
+  ShardLocks& operator=(ShardLocks&&) = delete;
+  ShardLocks(const ShardLocks&) = delete;
+  ShardLocks& operator=(const ShardLocks&) = delete;
+  ~ShardLocks();
+
+  // `key`'s shard must be held. Expiry is judged at `now_ms`.
+  KeyView View(std::string_view key, uint64_t now_ms) const;
+  LoadStart BeginLoad(std::string_view key);
+  // SingleShardStore::CompleteLoads: no eviction, no stub drop.
+  size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
+  void AbortLoad(std::string_view key, LoadToken token);
+  std::vector<core::RespValue> ApplyEffects(core::ShardId shard, std::span<core::Effect> effects,
+                                            core::SequenceId first_seq, core::WallTime appended_at);
+  void Wipe(core::ShardId shard, core::SequenceId seq);
+  bool OverBackpressure(core::ShardId shard) const;
+  core::WallTime LastAppendedAt(core::ShardId shard) const;
+  void RaiseAppendedAt(core::ShardId shard, core::WallTime at);
+  std::optional<core::SequenceId> FenceFor(core::ShardId shard, core::SequenceId seq) const;
+
+  // Ends the hold, handing back what its applies replaced so the caller
+  // can free it once it has published; dropped, it is freed at once.
+  Graveyard Unlock();
+  bool held() const { return held_; }
+
+ private:
+  friend class ShardedHotStore;
+  ShardLocks(ShardedHotStore& hot, std::span<const core::ShardId> shards);
+  void Lock();
+
+  // The held shard's position in shards_.
+  size_t Slot(core::ShardId shard) const;
+  SingleShardStore& Store(core::ShardId shard) const;
+  // Marks `shard` for a load-cv wake if its loads changed.
+  void NoteLoads(core::ShardId shard, size_t before);
+
+  ShardedHotStore* hot_;
+  std::vector<core::ShardId> shards_;
+  // Each shard's cold drained seq, read once the locks were held.
+  std::vector<core::SequenceId> horizons_;
+  std::vector<bool> wake_;
+  Graveyard graveyard_;
+  bool held_ = false;
+};
+
 class ShardedHotStore : public core::HotStore {
  public:
   explicit ShardedHotStore(ShardedHotStoreConfig config);
@@ -60,6 +113,27 @@ class ShardedHotStore : public core::HotStore {
   void SetReplayMode(bool replaying) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Wipe(core::ShardId shard, core::SequenceId seq) override;
+  std::optional<core::RespValue> ApplyLogged(core::ShardId shard, core::QueueEntry& entry) override;
+  void RaiseAppendedAt(core::ShardId shard, core::WallTime at) override;
+
+  // Takes each of `shards`, sorted and distinct, exclusively and in
+  // ascending order. The thread must hold no queue reservation.
+  ShardLocks LockExclusive(std::span<const core::ShardId> shards);
+
+  struct HotRead {
+    core::Result<core::RespValue> result;
+    // What the reply must be durable through; nullopt on a miss.
+    std::optional<core::SequenceId> fence;
+  };
+  // SingleShardStore::Read under one shared hold: the result is a copy,
+  // so the caller can wait on the fence after the lock is released.
+  HotRead Read(const core::ops::ReadOp& op);
+
+  // Evicts `shard`'s drained keys down to its budget; true if it is
+  // then no longer over its backpressure limit.
+  bool EvictShardToTarget(core::ShardId shard);
+  core::SequenceId Drained(core::ShardId shard) const { return Horizon(shard); }
+  core::ShardId ShardOf(std::string_view key) const { return ShardIndex(key); }
 
   // Refused, as well, while the key's shard is under its flush floor:
   // cold may still hold what the Flush removed.
@@ -105,6 +179,8 @@ class ShardedHotStore : public core::HotStore {
   uint32_t shard_count() const { return config_.shard_count; }
 
  private:
+  friend class ShardLocks;
+
   struct Shard {
     mutable std::shared_mutex mutex;
     SingleShardStore store;
@@ -131,6 +207,8 @@ class ShardedHotStore : public core::HotStore {
 
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
+  // Queues `key` for a deferred LRU refresh after a read hit.
+  void RecordAccess(Shard& shard, std::string_view key) const;
 
   ShardedHotStoreConfig config_;
   // Fallback when config_.eviction_policy is null; keeps Resolve() infallible.

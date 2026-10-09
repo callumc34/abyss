@@ -112,6 +112,7 @@ struct KeyView {
   core::SequenceId latest_seq = 0;
   // The whole value of a live or expired entry.
   const Value* value = nullptr;
+  core::ShardId shard = 0;
 
   // Each is empty, false or 0 when the view holds no such value.
   std::string_view string_value() const;
@@ -134,9 +135,13 @@ class StubCache {
   ~StubCache() = default;
 
   const Stub* Find(std::string_view key) const;
-  void Put(std::string_view key, const Stub& stub);
+  // Drops the oldest stubs past the cap, unless `trim` is false: a load
+  // batch keeps its own stubs, and the next Put trims.
+  void Put(std::string_view key, const Stub& stub, bool trim = true);
   bool Erase(std::string_view key);
   void Clear();
+  // Moves every stub out, keeping the cap and the drop count.
+  StubCache Release();
 
   size_t size() const { return index_.size(); }
   uint64_t bytes() const { return bytes_; }
@@ -157,6 +162,14 @@ class StubCache {
   std::unordered_map<std::string_view, Order::iterator> index_;
   uint64_t bytes_ = 0;
   uint64_t drops_ = 0;
+};
+
+// What applies under an exclusive hold replaced or removed, freed once
+// the hold ends, so no large free runs under the lock.
+struct Graveyard {
+  std::vector<Value> values;
+  std::vector<std::unordered_map<std::string, Entry>> entries;
+  std::vector<StubCache> stubs;
 };
 
 struct LoadToken {
@@ -299,9 +312,10 @@ class SingleShardStore {
   // Exists a stub, replacing any stub.
   bool CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result,
                     core::EvictionTTL eviction, core::SequenceId horizon);
-  // CompleteLoad of each, in one hold; returns how many installed.
-  size_t CompleteLoads(std::span<LoadCompletion> loads, const core::EvictionPolicy& policy,
-                       core::SequenceId horizon);
+  // CompleteLoad of each, in one hold; returns how many installed. It
+  // neither evicts nor drops stubs, so the batch keeps every install
+  // even past the budget or the stub cap; the next eviction trims.
+  size_t CompleteLoads(std::span<LoadCompletion> loads, const core::EvictionPolicy& policy);
   void AbortLoad(std::string_view key, LoadToken token);
   bool LoadPending(std::string_view key) const;
   size_t PendingLoads() const { return loading_.size(); }
@@ -313,6 +327,31 @@ class SingleShardStore {
   void Wipe(core::SequenceId seq);
   // A miss is absent until cold drains the last Flush.
   bool KnownAbsentAfterFlush(core::SequenceId horizon) const { return horizon < flush_seq_; }
+
+  struct ReadAnswer {
+    core::Result<core::RespValue> result;
+    // What the reply must be durable through; nullopt on a miss.
+    std::optional<core::SequenceId> fence;
+  };
+  // Exec of a single-key read, fenced on the answering entry's
+  // latest_seq. An entry deleted or past its TTL answers absent for the
+  // op's shape, as does a miss under the flush floor, fenced on the
+  // Flush. Only a key with no entry misses.
+  ReadAnswer Read(const core::ops::ReadOp& op, core::SequenceId horizon) const;
+  // What a reply that observed `seq` waits for: loaded state carries 0
+  // too, so a 0 needs no wait unless a write here was at seq 0.
+  std::optional<core::SequenceId> FenceFor(core::SequenceId seq) const;
+
+  // While set, applies move what they replace or remove into
+  // `graveyard` instead of freeing it.
+  void SetGraveyard(Graveyard* graveyard) { graveyard_ = graveyard; }
+  // The highest appended_at given to the shard's writes.
+  core::WallTime LastAppendedAt() const { return last_appended_at_; }
+  // An entry, live, expired or a tombstone.
+  bool HasEntry(std::string_view key) const { return FindEntry(key) != nullptr; }
+  void RaiseAppendedAt(core::WallTime at);
+  // Over max_memory_bytes times the backpressure ratio, as of now.
+  bool OverBackpressure() const;
 
   // Entries the LRU walk has examined.
   uint64_t LruVisitsForTesting() const { return lru_visits_; }
@@ -363,6 +402,11 @@ class SingleShardStore {
 
   using EntryMap = std::unordered_map<std::string, Entry>;
 
+  bool InstallLoad(std::string_view key, LoadToken token, LoadResult&& result,
+                   core::EvictionTTL eviction, core::SequenceId horizon, bool in_batch);
+  // Moves `value` to the graveyard, if one is set; it is then reassigned
+  // or erased by the caller.
+  void Bury(Value& value);
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;
   // TTL expiry as writes see it: never while applying effects.
@@ -413,6 +457,9 @@ class SingleShardStore {
   core::SequenceId flush_seq_ = 0;
   // Set while ApplyEffects runs.
   bool applying_effects_ = false;
+  bool applied_seq_zero_ = false;
+  core::WallTime last_appended_at_{};
+  Graveyard* graveyard_ = nullptr;
   uint64_t entry_bytes_ = 0;
   // The part of entry_bytes_ that is on the LRU list.
   uint64_t live_bytes_ = 0;

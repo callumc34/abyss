@@ -75,9 +75,11 @@ core::Result<void> RecoveryCoordinator::Run(const std::atomic<bool>& cancel) {
         core::Error{core::ErrorCode::kUnavailable, "recovery cancelled before start"});
   }
 
-  if (auto r = RunResolverPhase(cancel); !r.has_value()) {
-    TransitionPhase(RecoverySnapshot::Phase::kComplete);
-    return r;
+  if (config_.replay_resolver) {
+    if (auto r = RunResolverPhase(cancel); !r.has_value()) {
+      TransitionPhase(RecoverySnapshot::Phase::kComplete);
+      return r;
+    }
   }
 
   if (auto r = RunColdHotPhase(cancel); !r.has_value()) {

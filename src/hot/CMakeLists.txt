@@ -7,5 +7,5 @@ add_library(abyss::hot ALIAS abyss_hot)
 
 target_link_libraries(abyss_hot
   PUBLIC abyss::core abyss::metrics
-  PRIVATE abyss::log
+  PRIVATE abyss::log abyss::queue
 )

@@ -140,8 +140,10 @@ core::Result<void> ParseConsumerRpc(const YamlCursor& cur, ConsumerRpcConfig& ou
 core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
   return SectionDecoder(cur)
       .Optional("write_timeout_ms", out.write_timeout)
-      .Optional("min_rpc_wait_fraction", out.min_rpc_wait_fraction)
-      .Optional("buffer_consistency_wait_timeout_ms", out.buffer_consistency_wait_timeout)
+      .Removed("min_rpc_wait_fraction",
+               "removed; a write replies once durable, with no consumer apply to wait for")
+      .Removed("buffer_consistency_wait_timeout_ms",
+               "removed; a read that misses hot no longer waits for the cold consumer")
       .Finish();
 }
 

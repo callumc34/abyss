@@ -37,6 +37,7 @@ struct FakeKey {
   int64_t abs_ttl_ms = 0;
   core::SequenceId latest_seq = 1;
   bool flush_floor = false;
+  core::ShardId shard = 0;
 };
 
 inline FakeKey Str(std::string value, int64_t abs_ttl_ms = 0, core::SequenceId seq = 1) {
@@ -101,7 +102,8 @@ inline hot::KeyView ViewOf(const FakeKey& key) {
           .type = key.type,
           .abs_ttl_ms = key.abs_ttl_ms,
           .latest_seq = key.latest_seq,
-          .value = key.value.has_value() ? &*key.value : nullptr};
+          .value = key.value.has_value() ? &*key.value : nullptr,
+          .shard = key.shard};
 }
 
 // A key missing from `keys` is non-resident.

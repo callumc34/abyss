@@ -91,12 +91,18 @@ class ShardStream {
   core::Result<PendingAppend> BeginAppend(core::QueueEntry entry, core::SteadyTime admit_by);
   core::Result<PendingBatchAppend> BeginAppendBatch(std::span<const core::QueueEntry> entries,
                                                     core::SteadyTime admit_by);
-  // WalQueue::Reserve once its checks pass, never waiting. `streams`
-  // are the parts' streams, all on one log; `sizes` every entry's frame
-  // size, in order.
-  static core::Result<Reservation> Reserve(
-      std::span<ShardStream* const> streams, std::span<const ShardEntries> parts,
-      std::span<const uint32_t> sizes) ABYSS_NO_THREAD_SAFETY_ANALYSIS;
+  // One log's share of a reservation: the parts' streams, the parts,
+  // and every entry's frame size, in order.
+  struct LogParts {
+    std::span<ShardStream* const> streams;
+    std::span<const ShardEntries> parts;
+    std::span<const uint32_t> sizes;
+  };
+  // WalQueue::Reserve and ReserveFlush once their checks pass, never
+  // waiting: every stream locked in (log, shard) order, then one batch
+  // per log, as one Reservation that Complete fills in log order.
+  static core::Result<Reservation> Reserve(std::span<const LogParts> logs)
+      ABYSS_NO_THREAD_SAFETY_ANALYSIS;
   core::Result<std::vector<core::QueueEntry>> Read(core::SequenceId from, std::size_t max_count,
                                                    core::Duration timeout,
                                                    core::Durability visible);
@@ -165,6 +171,13 @@ class ShardStream {
   };
   class Publisher;
   class Filler;
+  class MultiFiller;
+
+  // Reserve's batch on one log, under every stream's append lock.
+  // `locked` counts the bytes encoded under the caller's locks so far.
+  static core::Result<std::unique_ptr<ReservationFiller>> ReserveLocked(
+      const LogParts& group, uint64_t total, std::size_t& locked,
+      std::vector<ReservedRange>& ranges, DurableFutures& durable) ABYSS_NO_THREAD_SAFETY_ANALYSIS;
 
   Log& log() const noexcept { return *config_.unit->log; }
 

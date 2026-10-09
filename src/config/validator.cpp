@@ -356,13 +356,6 @@ core::Result<void> ValidateEngine(const EngineConfig& e) {
   if (e.write_timeout.count() <= 0) {
     return std::unexpected(InvalidArg("engine.write_timeout_ms", "must be > 0 milliseconds"));
   }
-  if (e.min_rpc_wait_fraction <= 0.0 || e.min_rpc_wait_fraction >= 1.0) {
-    return std::unexpected(InvalidArg("engine.min_rpc_wait_fraction", "must be in (0.0, 1.0)"));
-  }
-  if (e.buffer_consistency_wait_timeout.count() <= 0) {
-    return std::unexpected(
-        InvalidArg("engine.buffer_consistency_wait_timeout_ms", "must be > 0 milliseconds"));
-  }
   return {};
 }
 
@@ -472,19 +465,6 @@ core::Result<void> ValidateRetentionVsEviction(const Config& c) {
   return {};
 }
 
-// Cold pauses absorption while it waits for a batch to become power
-// durable, which freezes the frontier buffer-consistency reads wait on.
-// Half leaves room for the apply and the next drain.
-core::Result<void> ValidateColdReadVsConsistencyWait(const Config& c) {
-  if (c.cold_consumer.queue_read_timeout * 2 > c.engine.buffer_consistency_wait_timeout) {
-    return std::unexpected(
-        InvalidArg("cold_consumer.queue_read_timeout_ms",
-                   "must be at most half of engine.buffer_consistency_wait_timeout_ms (" +
-                       std::to_string(c.engine.buffer_consistency_wait_timeout.count()) + " ms)"));
-  }
-  return {};
-}
-
 // Every log carries at least one shard's stream.
 core::Result<void> ValidateLogCountVsShards(const Config& c) {
   if (c.queue.log_count > c.hot.shard_count) {
@@ -536,7 +516,6 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateLog(config.log); !r) return r;
   if (auto r = ValidatePortCollisions(config); !r) return r;
   if (auto r = ValidateRetentionVsEviction(config); !r) return r;
-  if (auto r = ValidateColdReadVsConsistencyWait(config); !r) return r;
   if (auto r = ValidateLogCountVsShards(config); !r) return r;
   return {};
 }
