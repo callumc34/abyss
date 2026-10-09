@@ -135,10 +135,11 @@ bool Server::Initialize() {
       // A write that cannot be admitted within the client's budget fails.
       .admission_timeout = config_.engine.write_timeout,
       .min_retention = config_.queue.min_retention,
-      // Cold and resolver commit offsets and gate retention; hot commits none
+      // Only cold commits offsets and gates retention; hot commits none
       // and rebuilds from the queue on restart (ADP-002 §"Eviction refresh vs
-      // queue retention").
-      .retention_consumers = {core::kColdConsumer, core::kResolverConsumer},
+      // queue retention"). The resolver no longer runs, and a frozen
+      // offset of its would pin retention forever.
+      .retention_consumers = {core::kColdConsumer},
       .offset_fsync_interval = config_.queue.offset_fsync_interval,
   });
   if (!queue_result.has_value()) {
@@ -217,14 +218,18 @@ bool Server::Initialize() {
       },
       *eviction_policy_);
 
-  engine_ = std::make_unique<engine::TieringEngine>(
-      *queue_, *hot_store_, *cold_store_, *cold_pool_, *hot_pool_, *consumer_rpc_,
-      engine::TieringEngineConfig{
-          .shard_count = hot_store_->shard_count(),
-          .write_timeout = config_.engine.write_timeout,
-          .min_rpc_wait_fraction = config_.engine.min_rpc_wait_fraction,
-          .buffer_consistency_wait_timeout = config_.engine.buffer_consistency_wait_timeout,
-      });
+  loader_ = std::make_unique<engine::Loader>(*hot_store_, *cold_pool_, *cold_store_);
+  sequencer_ =
+      std::make_unique<engine::Sequencer>(*hot_store_, *queue_, *loader_, *cold_pool_,
+                                          engine::SequencerConfig{
+                                              .write_timeout = config_.engine.write_timeout,
+                                          });
+  engine_ =
+      std::make_unique<engine::TieringEngine>(*hot_store_, *cold_store_, *cold_pool_, *sequencer_,
+                                              engine::TieringEngineConfig{
+                                                  .shard_count = hot_store_->shard_count(),
+                                                  .write_timeout = config_.engine.write_timeout,
+                                              });
 
   hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
       *hot_store_, hot::EvictionWorker::Config{.tick = config_.hot.eviction_tick});
@@ -247,6 +252,7 @@ bool Server::Initialize() {
           .hot_replay_batch_size = config_.recovery.hot_replay_batch_size,
           .cold_replay_batch_size = config_.recovery.cold_replay_batch_size,
           .resolver_replay_batch_size = config_.recovery.resolver_replay_batch_size,
+          .replay_resolver = false,
       });
 
   auto identity = resp::NodeIdentity::Open(config_.queue.wal_path);
@@ -262,12 +268,13 @@ bool Server::Initialize() {
       /*advertise_address=*/std::string{}, /*mode=*/"standalone", config_.net.port,
       hot_store_->shard_count());
   config_provider_ = std::make_unique<ConfigProviderImpl>(config_);
-  // The LOADING gate derives from the single lifecycle atomic: data commands
-  // are gated until the state machine reaches kServing, which Server::Run
-  // asserts ONLY after recovery completes AND every consumer pool is live. This
-  // closes the ENGINE-1 window where the gate lifted on coordinator completion
-  // alone, before the pools could fulfil an RPC. The gate is also re-asserted in
-  // kDraining (>kServing is false) so shutdown stops accepting data writes.
+  // The LOADING gate derives from the single lifecycle atomic: data
+  // commands are gated until the state machine reaches kServing, which
+  // Server::Run asserts ONLY after recovery completes AND the cold
+  // consumers are live. This closes the ENGINE-1 window where the gate
+  // lifted on coordinator completion alone, before the pools had started.
+  // The gate is also re-asserted in kDraining (>kServing is false) so
+  // shutdown stops accepting data writes.
   loading_ = std::make_unique<LoadingStateImpl>([this] { return !IsServing(); });
   resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
 
@@ -446,15 +453,14 @@ core::Result<void> Server::Run(const std::atomic<bool>& stop) {
     }
   }
 
-  // Recovery is complete; start the per-shard consumer threads for steady-
-  // state tailing, plus the eviction maintenance worker. The LOADING gate is
-  // STILL asserted here — it lifts only at the single kServing edge below,
-  // strictly after a hot consumer thread exists to fulfil write/conditional
-  // RPC promises (ENGINE-1: never serve with no consumer).
+  // Recovery is complete; start the cold consumers' steady-state tailing,
+  // plus the eviction maintenance worker. The sequencer applies every
+  // write to hot itself, so neither the hot consumers nor the resolvers
+  // run past recovery: nothing else consumes the queue. The LOADING gate
+  // is STILL asserted here; it lifts only at the single kServing edge
+  // below.
   if (hot_eviction_worker_) hot_eviction_worker_->Start();
-  if (resolver_pool_) resolver_pool_->Start();
   if (cold_pool_) cold_pool_->Start();
-  if (hot_pool_) hot_pool_->Start();
 
   // Cold-store background work (TTL scanner). Deliberately deferred until
   // after recovery so it doesn't contend with replay on disk I/O.

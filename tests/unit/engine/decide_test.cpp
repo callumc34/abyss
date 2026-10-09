@@ -670,7 +670,7 @@ TEST_P(DecideStateTest, StatesAgree) {
     EXPECT_EQ(flushed.error.has_value(), tombstoned.error.has_value());
     if (!blind && !flushed.error.has_value()) {
       ASSERT_EQ(flushed.observed.size(), 1U);
-      EXPECT_EQ(flushed.observed[0].second, 9U);
+      EXPECT_EQ(flushed.observed[0].seq, 9U);
     }
   }
   for (const FakeKey& expired : {Expired(c.key), ExpiredStub(c.key.type)}) {
@@ -734,7 +734,7 @@ TEST_P(DecideStateTest, StatesAgree) {
     const Decision d = RunOn(live, c);
     if (!blind && !d.error.has_value()) {
       ASSERT_EQ(d.observed.size(), 1U);
-      EXPECT_EQ(d.observed[0], (std::pair<std::string, core::SequenceId>{"k", 7}));
+      EXPECT_EQ(d.observed[0], (ShardSeq{.shard = 0, .seq = 7}));
     }
   }
 }
@@ -770,6 +770,22 @@ TEST(DecideTest, CollectionWritesThatChangeNothingLogNothing) {
 TEST(DecideTest, ZaddIncrIsRefused) {
   const Decision d = DecideOn(Keys{{"k", ZsetOf({{"a", 1}})}}, {"ZADD", "k", "INCR", "1", "a"});
   EXPECT_EQ(d.error.has_value() ? d.error->message() : "", "ZADD INCR is not supported");
+}
+
+// A WRONGTYPE shows the key's state, so it keeps what was read for
+// the fence; a syntax error read nothing.
+TEST(DecideTest, AWrongTypeKeepsWhatItObserved) {
+  for (const auto& cmd : std::vector<std::vector<std::string>>{
+           {"SADD", "k", "m"}, {"ZADD", "k", "1", "m"}, {"HSETNX", "k", "f", "v"}}) {
+    SCOPED_TRACE(cmd.front());
+    const Decision d = DecideOn(Keys{{"k", Str("v", 0, 7)}}, cmd);
+    EXPECT_EQ(d.error.value_or(core::Error{core::ErrorCode::kInternal, ""}).code(),
+              core::ErrorCode::kWrongType);
+    EXPECT_EQ(d.observed, (std::vector<ShardSeq>{{.shard = 0, .seq = 7}}));
+  }
+  const Decision syntax = DecideOn(Keys{{"k", Str("v", 0, 7)}}, {"ZADD", "k", "x", "m"});
+  ASSERT_TRUE(syntax.error.has_value());
+  EXPECT_TRUE(syntax.observed.empty());
 }
 
 TEST(DecideTest, PlainSetNeedsNoState) {

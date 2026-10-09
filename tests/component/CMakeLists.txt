@@ -11,6 +11,7 @@ add_executable(abyss_component_tests
   resolver_recovery_test.cpp
   recovery_coordinator_test.cpp
   loader_test.cpp
+  sequencer_test.cpp
 )
 
 target_link_libraries(abyss_component_tests PRIVATE

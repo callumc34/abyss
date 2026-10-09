@@ -94,6 +94,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by) override;
   bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline) override;
   core::Result<Reservation> Reserve(std::span<const ShardEntries> parts) override;
+  core::Result<Reservation> ReserveFlush(std::span<const ShardEntries> parts) override;
+  uint32_t LogOf(core::ShardId shard) const override { return shard % config_.log_count; }
   DurableFutures Complete(Reservation&& reservation) override;
 
   // As above, admitting within WalConfig::admission_timeout.

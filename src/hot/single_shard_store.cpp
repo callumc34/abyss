@@ -297,20 +297,29 @@ const Stub* StubCache::Find(std::string_view key) const {
   return it == index_.end() ? nullptr : &it->second->stub;
 }
 
-void StubCache::Put(std::string_view key, const Stub& stub) {
+void StubCache::Put(std::string_view key, const Stub& stub, bool trim) {
   if (max_entries_ == 0) return;
   if (const auto it = index_.find(key); it != index_.end()) {
     it->second->stub = stub;
     order_.splice(order_.begin(), order_, it->second);
-    return;
+  } else {
+    order_.push_front(Node{.key = std::string(key), .stub = stub});
+    index_.emplace(order_.front().key, order_.begin());
+    bytes_ += kStubBytes + key.size();
   }
-  order_.push_front(Node{.key = std::string(key), .stub = stub});
-  index_.emplace(order_.front().key, order_.begin());
-  bytes_ += kStubBytes + key.size();
-  if (index_.size() > max_entries_) {
+  while (trim && index_.size() > max_entries_) {
     EraseNode(std::prev(order_.end()));
     ++drops_;
   }
+}
+
+StubCache StubCache::Release() {
+  StubCache released(max_entries_);
+  released.order_.swap(order_);
+  released.index_.swap(index_);
+  released.bytes_ = bytes_;
+  bytes_ = 0;
+  return released;
 }
 
 bool StubCache::Erase(std::string_view key) {
@@ -807,6 +816,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
     if (it->second.type != Entry::Type::kString) {
       TrackRemove(it->second, op.key);
       it->second.type = Entry::Type::kString;
+      Bury(it->second.value);
       it->second.value = take_value();
       it->second.bytes = it->second.ApproximateBytes();
       it->second.eviction = eviction;
@@ -820,7 +830,8 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
     if (move.reply_old_value && !ExpiredForApply(it->second)) {
       reply = core::RespValue::BulkString(std::move(value));
     }
-    value = take_value();
+    Bury(it->second.value);
+    it->second.value = take_value();
     it->second.bytes = it->second.ApproximateBytes();
     it->second.eviction = eviction;
     it->second.eviction_deadline = config_.steady_clock() + eviction;
@@ -1232,12 +1243,17 @@ core::MemoryStats SingleShardStore::Stats() const {
 }
 
 void SingleShardStore::Wipe(core::SequenceId seq) {
+  if (graveyard_ != nullptr) {
+    graveyard_->entries.push_back(std::move(entries_));
+    graveyard_->stubs.push_back(stubs_.Release());
+  }
   entries_.clear();
   lru_newest_ = nullptr;
   lru_oldest_ = nullptr;
   lru_dry_ = false;
   stubs_.Clear();
   loading_.clear();
+  if (seq == 0) applied_seq_zero_ = true;
   entry_bytes_ = 0;
   live_bytes_ = 0;
   key_count_ = 0;
@@ -1258,6 +1274,12 @@ std::optional<LoadToken> SingleShardStore::BeginLoad(std::string_view key) {
 
 bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadResult&& result,
                                     core::EvictionTTL eviction, core::SequenceId horizon) {
+  return InstallLoad(key, token, std::move(result), eviction, horizon, /*in_batch=*/false);
+}
+
+bool SingleShardStore::InstallLoad(std::string_view key, LoadToken token, LoadResult&& result,
+                                   core::EvictionTTL eviction, core::SequenceId horizon,
+                                   bool in_batch) {
   const std::string owned(key);
   const auto pending = loading_.find(owned);
   if (pending == loading_.end() || pending->second != token) {
@@ -1271,7 +1293,8 @@ bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadR
   }
   LoadResult installed = std::move(result);
   if (const auto* exists = std::get_if<LoadedExists>(&installed)) {
-    stubs_.Put(key, Stub{.type = exists->type, .abs_ttl_ms = exists->abs_ttl_ms});
+    stubs_.Put(key, Stub{.type = exists->type, .abs_ttl_ms = exists->abs_ttl_ms},
+               /*trim=*/!in_batch);
     return stubs_.Find(key) != nullptr;
   }
   stubs_.Erase(key);
@@ -1296,17 +1319,16 @@ bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadR
   NoteEvictable(entry.latest_seq);
   key_count_++;
   TrackInsert(entry, key);
-  EnsureCapacityFor(key, horizon);
+  if (!in_batch) EnsureCapacityFor(key, horizon);
   return true;
 }
 
 size_t SingleShardStore::CompleteLoads(std::span<LoadCompletion> loads,
-                                       const core::EvictionPolicy& policy,
-                                       core::SequenceId horizon) {
+                                       const core::EvictionPolicy& policy) {
   size_t installed = 0;
   for (auto& load : loads) {
-    if (CompleteLoad(load.key, load.token, std::move(load.result), policy.Resolve(load.key),
-                     horizon)) {
+    if (InstallLoad(load.key, load.token, std::move(load.result), policy.Resolve(load.key),
+                    kAllDrained, /*in_batch=*/true)) {
       ++installed;
     }
   }
@@ -1352,6 +1374,51 @@ KeyView SingleShardStore::View(std::string_view key, core::SequenceId horizon,
                    .latest_seq = stub->latest_seq};
   }
   return KeyView{};
+}
+
+SingleShardStore::ReadAnswer SingleShardStore::Read(const core::ops::ReadOp& op,
+                                                    core::SequenceId horizon) const {
+  const auto* exists = std::get_if<core::ops::Exists>(&op);
+  std::string_view key;
+  if (exists != nullptr) {
+    ABYSS_DCHECK(exists->keys.size() == 1, "an existence read of more than one key");
+    key = exists->keys.front();
+  } else {
+    key = SingleKeyOf(op).value_or(std::string_view{});
+  }
+  const Entry* entry = FindEntry(key);
+  if (entry == nullptr) {
+    if (!KnownAbsentAfterFlush(horizon)) {
+      return {.result = std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))};
+    }
+    return {.result = exists != nullptr ? core::RespValue::Integer(0) : EmptyReadResponse(op),
+            .fence = FenceFor(flush_seq_)};
+  }
+  // A resident entry is the key's latest state, so one deleted or past
+  // its TTL is absent, whatever older value buffer or cold still hold.
+  if (entry->tombstoned || IsExpiredByTtl(*entry, config_.wall_clock)) {
+    return {.result = exists != nullptr ? core::RespValue::Integer(0) : EmptyReadResponse(op),
+            .fence = FenceFor(entry->latest_seq)};
+  }
+  if (exists != nullptr) {
+    return {.result = core::RespValue::Integer(1), .fence = FenceFor(entry->latest_seq)};
+  }
+  return {.result = Exec(op), .fence = FenceFor(entry->latest_seq)};
+}
+
+std::optional<core::SequenceId> SingleShardStore::FenceFor(core::SequenceId seq) const {
+  if (seq == 0 && !applied_seq_zero_) return std::nullopt;
+  return seq;
+}
+
+void SingleShardStore::RaiseAppendedAt(core::WallTime at) {
+  last_appended_at_ = std::max(last_appended_at_, at);
+}
+
+bool SingleShardStore::OverBackpressure() const {
+  return governor_.Enabled() &&
+         static_cast<double>(UsedBytes()) >
+             static_cast<double>(governor_.max_bytes()) * config_.backpressure_ratio;
 }
 
 // --- Internal helpers ---
@@ -1442,6 +1509,7 @@ void SingleShardStore::RemoveEntry(const std::string& key) {
   if (!it->second.tombstoned) LruUnlink(it->second);
   TrackRemove(it->second, key);
   key_count_--;
+  Bury(it->second.value);
   entries_.erase(it);
 }
 
@@ -1452,6 +1520,7 @@ void SingleShardStore::TombstoneEntry(Entry& entry, std::string_view key, core::
   }
   TrackRemove(entry, key);
   LruUnlink(entry);
+  Bury(entry.value);
   entry.value = std::string{};
   entry.bytes = entry.ApproximateBytes();
   entry.abs_ttl_ms = 0;
@@ -1506,6 +1575,7 @@ void SingleShardStore::TrackRemove(const Entry& entry, std::string_view key) {
 }
 
 void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq) {
+  if (seq == 0) applied_seq_zero_ = true;
   const std::string owned(key);
   if (const auto it = entries_.find(owned); it != entries_.end()) {
     it->second.latest_seq = seq;
@@ -1528,7 +1598,12 @@ SingleShardStore::EntryMap::iterator SingleShardStore::Evict(EntryMap::iterator 
   LruUnlink(it->second);
   TrackRemove(it->second, it->first);
   key_count_--;
+  Bury(it->second.value);
   return entries_.erase(it);
+}
+
+void SingleShardStore::Bury(Value& value) {
+  if (graveyard_ != nullptr) graveyard_->values.push_back(std::move(value));
 }
 
 void SingleShardStore::LruLink(EntryMap::iterator it) {

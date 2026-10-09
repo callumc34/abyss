@@ -1265,6 +1265,18 @@ core::Result<Log::Reservation> Log::Reserve(uint32_t size) {
   }
 }
 
+bool Log::CanReserve(uint32_t size) const {
+  const Impl& impl = *impl_;
+  const uint64_t space = impl.frame_space;
+  if (size < frame::kMinFrameBytes || size % frame::kAlign != 0) return false;
+  if (size > space || (size < space && space - size < frame::kMinFrameBytes)) return false;
+  const LogPosition at = impl.tail.load(std::memory_order_seq_cst);
+  const uint64_t ordinal = at / space;
+  const uint64_t room = space - (at - impl.Start(ordinal));
+  const bool fits = size == room || size + frame::kMinFrameBytes <= room;
+  return impl.published_end.load(std::memory_order_acquire) > (fits ? ordinal : ordinal + 1);
+}
+
 bool Log::WaitForSpare(core::SteadyTime deadline) {
   Impl& impl = *impl_;
   impl.spare_waits.Increment();

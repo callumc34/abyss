@@ -134,7 +134,7 @@ For a `Write` the two are the same. For a `Resolved`, the position is its `Condi
 - **Skipping entries instead of waiting would starve keys.** A key written faster than one flush would never become eligible, and its `first_seen_seq` would pin the commit and WAL retention.
 - **On timeout,** the batch stays buffered and rescheduled. Nothing is counted as a failure, and the loop retries after the next drain. A stalled device then shows up as WAL durability lag.
 - **The gate sits at `ApplyBatch`, not at the cold checkpoint,** because the cold store can persist an applied batch in the background before any checkpoint.
-- **The wait is shorter than the read-consistency timeout.** While the consumer waits, its drained position is frozen, and collection reads on keys hot has evicted wait on it. The configuration validator therefore requires `cold_consumer.queue_read_timeout` < `engine.buffer_consistency_wait_timeout`.
+- **Reads do not wait on it.** While the consumer waits, its drained position is frozen. That holds back hot's eviction and so, at worst, writes under hot memory backpressure; a read that misses hot reads buffer plus cold without waiting for the drain.
 
 **Wipes.** A `Flush` entry's wipe waits for that entry to be power-durable, through the same hold-and-retry as a failed wipe. FLUSHDB therefore pays `power_loss` latency in every class.
 

@@ -328,27 +328,19 @@ TEST(ConfigValidate, SegmentSizeHoldsTheHeaderAndOneMaxSizeFrame) {
   EXPECT_TRUE(fits.has_value()) << fits.error().message();
 }
 
-// Cold's pause for power durability freezes the frontier that buffer
-// consistency waits on, so it must end well before that wait does.
-TEST(ConfigValidate, ColdReadTimeoutIsAtMostHalfTheConsistencyWait) {
-  auto over = Config::ParseFromYaml(R"YAML(
-cold_consumer:
-  queue_read_timeout_ms: 51
-engine:
-  buffer_consistency_wait_timeout_ms: 100
-)YAML");
-  ASSERT_FALSE(over.has_value());
-  EXPECT_NE(over.error().message().find("cold_consumer.queue_read_timeout_ms"), std::string::npos);
-  EXPECT_NE(over.error().message().find("engine.buffer_consistency_wait_timeout_ms"),
-            std::string::npos);
-
-  auto half = Config::ParseFromYaml(R"YAML(
-cold_consumer:
-  queue_read_timeout_ms: 50
-engine:
-  buffer_consistency_wait_timeout_ms: 100
-)YAML");
-  EXPECT_TRUE(half.has_value()) << half.error().message();
+TEST(ConfigValidate, RemovedEngineKeysNameTheirReason) {
+  const std::array<std::pair<const char*, const char*>, 2> removed = {{
+      {"min_rpc_wait_fraction: 0.5", "no consumer apply to wait for"},
+      {"buffer_consistency_wait_timeout_ms: 100", "no longer waits for the cold consumer"},
+  }};
+  for (const auto& [line, reason] : removed) {
+    auto cfg = Config::ParseFromYaml(std::string("engine:\n  ") + line + "\n");
+    ASSERT_FALSE(cfg.has_value()) << line;
+    const std::string key(line, std::string_view(line).find(':'));
+    EXPECT_NE(cfg.error().message().find("engine." + key), std::string::npos)
+        << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find(reason), std::string::npos) << cfg.error().message();
+  }
 }
 
 TEST(ConfigValidate, RejectsEmptyDataPath) {

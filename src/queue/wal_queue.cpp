@@ -12,6 +12,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
+#include <vector>
 
 #include "abyss/core/fatal.h"
 #include "abyss/log/log.h"
@@ -619,7 +621,45 @@ core::Result<Reservation> WalQueue::Reserve(std::span<const ShardEntries> parts)
   if (auto admitted = window_.Admit(logs_[log]->age, core::SteadyTime{}); !admitted) {
     return std::unexpected(admitted.error());
   }
-  return ShardStream::Reserve(streams, parts, sizes);
+  const ShardStream::LogParts group{.streams = streams, .parts = parts, .sizes = sizes};
+  return ShardStream::Reserve(std::span(&group, 1));
+}
+
+core::Result<Reservation> WalQueue::ReserveFlush(std::span<const ShardEntries> parts) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL reservation by a thread holding one");
+  if (parts.size() != config_.shard_count) {
+    return std::unexpected(Invalid("a flush reservation covers every shard"));
+  }
+  // Grouped by log, then shard: the order Reserve locks streams in.
+  std::vector<std::vector<ShardEntries>> by_log(config_.log_count);
+  std::vector<std::vector<ShardStream*>> streams(config_.log_count);
+  std::vector<std::vector<uint32_t>> sizes(config_.log_count);
+  for (std::size_t p = 0; p < parts.size(); ++p) {
+    const ShardEntries& part = parts[p];
+    if (part.shard != p) {
+      return std::unexpected(Invalid("flush reservation parts must be every shard, in order"));
+    }
+    for (const core::QueueEntry& entry : part.entries) {
+      if (!std::holds_alternative<core::entry::Flush>(entry.payload)) {
+        return std::unexpected(Invalid("a flush reservation holds only Flush entries"));
+      }
+      sizes[part.shard % config_.log_count].push_back(
+          static_cast<uint32_t>(frame::EntryFrameSize(entry)));
+    }
+    by_log[part.shard % config_.log_count].push_back(part);
+    streams[part.shard % config_.log_count].push_back(streams_[part.shard].get());
+  }
+  std::vector<ShardStream::LogParts> groups;
+  groups.reserve(config_.log_count);
+  for (uint32_t log = 0; log < config_.log_count; ++log) {
+    if (by_log[log].empty()) continue;
+    if (auto admitted = window_.Admit(logs_[log]->age, core::SteadyTime{}); !admitted) {
+      return std::unexpected(admitted.error());
+    }
+    groups.push_back(
+        ShardStream::LogParts{.streams = streams[log], .parts = by_log[log], .sizes = sizes[log]});
+  }
+  return ShardStream::Reserve(groups);
 }
 
 DurableFutures WalQueue::Complete(Reservation&& reservation) {

@@ -185,41 +185,26 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         flags = *extracted;
       }
       // Arity alone is a weaker check than the parser: `HSET k f v f` and
-      // `SET k v BOGUS` both satisfy the registry and are still malformed.
-      // Queueing either would durably record a command no tier can materialise,
-      // so the parser decides before anything reaches the queue. Commands with
-      // no parser are exempt: that is a capability gap, not malformed input, and
-      // the registry stays the sole authority for them.
+      // `SET k v BOGUS` both satisfy the registry and are still malformed,
+      // so the parser replies before dispatch. Commands with no parser are
+      // exempt: that is a capability gap, not malformed input, and the
+      // registry stays the sole authority for them.
       const bool unconditional =
           flags == core::PredicateFlags::kNone && parent.dispatch == Dispatch::kWritePath;
-      const bool parseable = core::ops::HasWriteParser(parent.name);
-
-      std::optional<RespCommand> canonical;
-      if (parseable) {
+      if (core::ops::HasWriteParser(parent.name)) {
         auto parsed = core::ops::ParseWriteOp(parent.name, cmd);
         if (!parsed.has_value()) {
           return finish(RespValue::Error(MapErrorCode(parsed.error().code()),
                                          std::string{parsed.error().message()}));
         }
-        // Unconditional writes are logged in canonical form -- aliases collapsed,
-        // TTLs already absolute -- so hot, cold and recovery all read one
-        // spelling and cannot derive different meanings from it. Conditionals
-        // keep the client's spelling: the resolver reads its predicate from the
-        // command text, not from the entry's flags.
-        if (unconditional) canonical = core::ops::CanonicalCommand(*parsed);
       }
 
-      core::Result<RespValue> result;
-      if (unconditional) {
-        // parent.name, not the canonical name: it is registry-owned and stable,
-        // and no dispatcher reads it -- passing canonical.Name() here would race
-        // the move below on unspecified argument evaluation order.
-        result = canonical.has_value()
-                     ? deps_.dispatcher->DispatchWrite(parent.name, *std::move(canonical))
-                     : deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
-      } else {
-        result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
-      }
+      // The client's spelling: the engine logs the canonical effect it
+      // decides, its TTLs made absolute at the instant it decides at.
+      core::Result<RespValue> result =
+          unconditional
+              ? deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd))
+              : deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
       if (!result.has_value()) {
         ABYSS_LOG_WARN("engine write error", {"client_id", state_.client_id},
                        {"cmd", std::string_view{parent.name}},

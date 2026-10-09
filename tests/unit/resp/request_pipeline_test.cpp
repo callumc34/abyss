@@ -271,22 +271,17 @@ TEST(RequestPipelineTest, SetNxDispatchesConditionallyUncanonicalised) {
   EXPECT_EQ(dispatcher.last_conditional.args, (std::vector<std::string>{"SET", "k", "v", "NX"}));
 }
 
-// Unconditional writes reach the queue canonicalised: SETEX and SET..EX are the
-// same op, so the WAL carries one spelling with the TTL already absolute.
-TEST(RequestPipelineTest, UnconditionalWriteIsCanonicalisedBeforeDispatch) {
+// Unconditional writes reach the engine as the client sent them: the
+// engine logs the canonical effect, its TTL absolute at the instant it
+// decides at.
+TEST(RequestPipelineTest, UnconditionalWriteReachesTheEngineAsSent) {
   StubDispatcher dispatcher;
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
   pipeline.Process(Bytes("*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"), output);
   ASSERT_EQ(dispatcher.write_calls, 1);
-  const auto& args = dispatcher.last_write.args;
-  ASSERT_EQ(args.size(), 5U);
-  EXPECT_EQ(args[0], "SET");
-  EXPECT_EQ(args[1], "k");
-  EXPECT_EQ(args[2], "v");
-  EXPECT_EQ(args[3], "PXAT");
-  EXPECT_GT(std::stoull(args[4]), 0U);
+  EXPECT_EQ(dispatcher.last_write.args, (std::vector<std::string>{"SETEX", "k", "60", "v"}));
 }
 
 TEST(RequestPipelineTest, SetWithTtlOptionStillDispatches) {

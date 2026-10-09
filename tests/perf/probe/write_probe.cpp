@@ -20,18 +20,17 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_pool.h"
-#include "abyss/consumer/resolver_pool.h"
-#include "abyss/core/apply_notifier.h"
 #include "abyss/core/cold_store.h"
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
-#include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/loader.h"
+#include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -167,12 +166,14 @@ Result<FlushCalibration> FlushFilesConcurrently(const std::filesystem::path& dir
   return out;
 }
 
-// The RESP pipeline's unconditional SET, minus the wire codec.
+// The RESP pipeline's SET, minus the wire codec: parsed to validate it,
+// then dispatched as sent.
 Result<abyss::core::RespCommand> CanonicalSet(std::string key, const std::string& value) {
-  const abyss::core::RespCommand cmd{.args = {"SET", std::move(key), value}};
-  auto parsed = abyss::core::ops::ParseWriteOp("SET", cmd);
-  if (!parsed.has_value()) return std::unexpected(parsed.error());
-  return abyss::core::ops::CanonicalCommand(*parsed);
+  abyss::core::RespCommand cmd{.args = {"SET", std::move(key), value}};
+  if (auto parsed = abyss::core::ops::ParseWriteOp("SET", cmd); !parsed.has_value()) {
+    return std::unexpected(parsed.error());
+  }
+  return cmd;
 }
 
 abyss::perf::WorkloadTargets DeriveTargets(abyss::core::Durability durability,
@@ -194,13 +195,12 @@ struct WritePath {
   std::unique_ptr<abyss::hot::ShardedHotStore> hot_store;
   std::unique_ptr<abyss::queue::WalQueue> queue;
   std::unique_ptr<abyss::core::ConsumerRpc> consumer_rpc;
-  std::unique_ptr<abyss::core::ApplyNotifier> apply_notifier;
   std::unique_ptr<abyss::core::ColdStore> cold_store;
   std::unique_ptr<abyss::consumer::ColdConsumerPool> cold_pool;
-  std::unique_ptr<abyss::consumer::HotConsumerPool> hot_pool;
+  std::unique_ptr<abyss::engine::Loader> loader;
+  std::unique_ptr<abyss::engine::Sequencer> sequencer;
   std::unique_ptr<abyss::engine::TieringEngine> engine;
   std::unique_ptr<abyss::hot::EvictionWorker> hot_eviction_worker;
-  std::unique_ptr<abyss::consumer::ResolverPool> resolver_pool;
 };
 
 Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& config) {
@@ -240,7 +240,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       .durability_window = config.queue.durability_window,
       .admission_timeout = config.engine.write_timeout,
       .min_retention = config.queue.min_retention,
-      .retention_consumers = {abyss::core::kColdConsumer, abyss::core::kResolverConsumer},
+      .retention_consumers = {abyss::core::kColdConsumer},
       .offset_fsync_interval = config.queue.offset_fsync_interval,
   });
   if (!queue.has_value()) return std::unexpected(queue.error());
@@ -250,8 +250,6 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   wp->queue = std::move(*queue);
 
   wp->consumer_rpc = std::make_unique<abyss::core::ConsumerRpc>(config.consumer_rpc);
-  wp->apply_notifier = std::make_unique<abyss::core::ApplyNotifier>(
-      abyss::core::AppliedSeqNotifierConfig{.shard_count = shards});
 
   auto cold = abyss::cold::backends::RocksdbStore::Create(abyss::cold::backends::RocksdbConfig{
       .data_path = config.cold.data_path,
@@ -292,49 +290,30 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       },
       *wp->eviction_policy, *wp->consumer_rpc);
 
-  wp->hot_pool = std::make_unique<consumer::HotConsumerPool>(
-      *wp->queue, *wp->hot_store, *wp->consumer_rpc, *wp->apply_notifier,
-      consumer::HotConsumerPool::Config{
-          .shard_count = shards,
-          .consumer =
-              consumer::HotConsumer::Config{
-                  .read_batch_size = config.hot_consumer.read_batch_size,
-                  .replay_batch_size = config.recovery.hot_replay_batch_size,
-                  .read_timeout = config.hot_consumer.read_timeout,
-              },
-      },
-      *wp->eviction_policy);
-
+  wp->loader =
+      std::make_unique<abyss::engine::Loader>(*wp->hot_store, *wp->cold_pool, *wp->cold_store);
+  wp->sequencer = std::make_unique<abyss::engine::Sequencer>(
+      *wp->hot_store, *wp->queue, *wp->loader, *wp->cold_pool,
+      abyss::engine::SequencerConfig{
+          .write_timeout = config.engine.write_timeout,
+      });
   wp->engine = std::make_unique<abyss::engine::TieringEngine>(
-      *wp->queue, *wp->hot_store, *wp->cold_store, *wp->cold_pool, *wp->hot_pool, *wp->consumer_rpc,
+      *wp->hot_store, *wp->cold_store, *wp->cold_pool, *wp->sequencer,
       abyss::engine::TieringEngineConfig{
           .shard_count = shards,
           .write_timeout = config.engine.write_timeout,
-          .min_rpc_wait_fraction = config.engine.min_rpc_wait_fraction,
-          .buffer_consistency_wait_timeout = config.engine.buffer_consistency_wait_timeout,
       });
 
   wp->hot_eviction_worker = std::make_unique<abyss::hot::EvictionWorker>(
       *wp->hot_store, abyss::hot::EvictionWorker::Config{.tick = config.hot.eviction_tick});
 
-  wp->resolver_pool = std::make_unique<consumer::ResolverPool>(
-      *wp->queue, *wp->cold_store, *wp->cold_pool, *wp->consumer_rpc, *wp->apply_notifier,
-      consumer::ResolverPool::Config{
-          .shard_count = shards,
-          .consumer =
-              consumer::Resolver::Config{
-                  .replay_batch_size = config.recovery.resolver_replay_batch_size,
-              },
-      });
   return wp;
 }
 
 // Server::Run's start order once recovery has completed.
 void StartWritePath(WritePath& wp) {
   wp.hot_eviction_worker->Start();
-  wp.resolver_pool->Start();
   wp.cold_pool->Start();
-  wp.hot_pool->Start();
   if (auto rc = wp.cold_store->Start(); !rc.has_value()) {
     std::cerr << "write_probe: cold store start failed: " << rc.error().message() << '\n';
   }
@@ -344,42 +323,42 @@ void StartWritePath(WritePath& wp) {
 void StopWritePath(WritePath& wp, std::chrono::seconds drain_grace) {
   wp.hot_eviction_worker->Stop();
   wp.cold_pool->Stop(std::chrono::duration_cast<std::chrono::milliseconds>(drain_grace));
-  wp.hot_pool->Stop();
-  wp.resolver_pool->Stop();
   if (auto rc = wp.cold_store->Stop(); !rc.has_value()) {
     std::cerr << "write_probe: cold store stop failed: " << rc.error().message() << '\n';
   }
 }
 
-// Appends `entries` canonical SETs straight to the WAL in batches, the
-// layout acknowledged writes would leave, then waits until every
-// consumer has drained them so the measured window has no backlog.
+// Writes `entries` SETs through the engine, one MSET of a shard's keys
+// at a time, then waits until cold has drained them so the measured
+// window has no backlog.
 Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
                      const std::string& value) {
   const uint32_t shards = wp.hot_store->shard_count();
-  std::vector<std::vector<abyss::core::QueueEntry>> pending(shards);
-  const auto append = [&](uint32_t shard) -> Result<void> {
-    auto& batch = pending[shard];
-    if (batch.empty()) return {};
-    auto appended = wp.queue->AppendBatch(shard, batch);
-    batch.clear();
-    if (!appended.has_value()) return std::unexpected(appended.error());
-    return appended->durable.get();
+  std::vector<abyss::core::RespCommand> pending(shards);
+  const auto write = [&](uint32_t shard) -> Result<void> {
+    auto& mset = pending[shard];
+    if (mset.args.empty()) return {};
+    auto reply = wp.engine->DispatchFanOut(abyss::core::MultiKeyKind::kMset, std::move(mset));
+    mset = {};
+    if (!reply.has_value()) return std::unexpected(reply.error());
+    if (reply->IsError()) {
+      return std::unexpected(Error(ErrorCode::kInternal, std::string(reply->ErrorMessage())));
+    }
+    return {};
   };
   for (uint64_t i = 0; i < entries; ++i) {
-    auto cmd = CanonicalSet(KeyFor(i % key_count), value);
-    if (!cmd.has_value()) return std::unexpected(cmd.error());
-    const auto shard = abyss::core::ComputeShard(cmd->args[1], shards);
-    pending[shard].push_back({
-        .appended_at = abyss::core::WallClock::now(),
-        .payload = abyss::core::entry::Write{.cmd = std::move(*cmd)},
-    });
-    if (pending[shard].size() == kPrefillBatch) {
-      if (auto r = append(shard); !r.has_value()) return r;
+    std::string key = KeyFor(i % key_count);
+    const auto shard = abyss::core::ComputeShard(key, shards);
+    auto& mset = pending[shard];
+    if (mset.args.empty()) mset.args.emplace_back("MSET");
+    mset.args.push_back(std::move(key));
+    mset.args.push_back(value);
+    if ((mset.args.size() - 1) / 2 == kPrefillBatch) {
+      if (auto r = write(shard); !r.has_value()) return r;
     }
   }
   for (uint32_t shard = 0; shard < shards; ++shard) {
-    if (auto r = append(shard); !r.has_value()) return r;
+    if (auto r = write(shard); !r.has_value()) return r;
   }
 
   const auto deadline = Clock::now() + kPrefillDrainTimeout;
@@ -387,9 +366,7 @@ Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
     const auto tail = wp.queue->TailSeq(shard);
     if (!tail.has_value()) return std::unexpected(tail.error());
     const auto drained = [&] {
-      return wp.hot_pool->HighestSettledSeq(shard) >= *tail &&
-             wp.cold_pool->ConsumerFor(shard).LatestDrainedSeq() >= *tail &&
-             wp.resolver_pool->ConsumerFor(shard).GetSnapshot().latest_drained_seq >= *tail;
+      return wp.cold_pool->ConsumerFor(shard).LatestDrainedSeq() >= *tail;
     };
     while (!drained()) {
       if (Clock::now() > deadline) {

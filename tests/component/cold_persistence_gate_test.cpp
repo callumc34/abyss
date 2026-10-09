@@ -26,7 +26,6 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_progress.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
@@ -35,6 +34,8 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/loader.h"
+#include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/names.h"
@@ -149,11 +150,6 @@ class ApplyHookColdStore : public core::ColdStore {
  private:
   core::ColdStore& inner_;
   std::function<void()> on_apply_;
-};
-
-class NullHotProgress : public HotConsumerProgress {
- public:
-  core::SequenceId HighestSettledSeq(core::ShardId /*shard*/) const override { return 0; }
 };
 
 core::RespCommand Cmd(std::vector<std::string> args) {
@@ -426,8 +422,9 @@ TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight)
       .max_memory_bytes = 16UL * 1024UL * 1024UL,
       .shard_count = 1,
   });
-  NullHotProgress hot_progress;
-  engine::TieringEngine engine(*queue_, hot, cold, pool, hot_progress, rpc_,
+  engine::Loader loader(hot, pool, cold);
+  engine::Sequencer sequencer(hot, *queue_, loader, pool, engine::SequencerConfig{});
+  engine::TieringEngine engine(hot, cold, pool, sequencer,
                                engine::TieringEngineConfig{.shard_count = 1});
   const auto get = [&engine] {
     auto read = engine.DispatchRead("GET", Cmd({"GET", "k"}));

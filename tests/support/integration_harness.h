@@ -1,24 +1,22 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_pool.h"
-#include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
-#include "abyss/core/thread_annotations.h"
+#include "abyss/engine/loader.h"
+#include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/platform/fs.h"
@@ -32,14 +30,7 @@ class IntegrationHarness {
   static constexpr uint32_t kShardCount = 4;
   static constexpr size_t kHotMemory = 4UL * 1024UL * 1024UL;
 
-  // Test-side defaults for engine knobs. The production default for the
-  // buffer-consistency wait is 100 ms ([ADP-006]); the harness widens it
-  // because the Stale-buffer tests want to assert logical correctness, not
-  // race the production timeout. Tests that exercise the timeout path
-  // (HashReadTimesOutWhenColdConsumerWedged) construct a harness with a
-  // short timeout explicitly.
   struct Config {
-    std::chrono::milliseconds buffer_consistency_wait_timeout{2000};
     std::optional<core::EvictionPolicy> eviction_policy;
   };
 
@@ -59,8 +50,8 @@ class IntegrationHarness {
     tmp_dir_ = std::filesystem::temp_directory_path() / ("abyss_test_" + unique);
     std::filesystem::create_directories(tmp_dir_);
 
-    // The engine stamps appended_at by the real clock, and cold expires
-    // by appended_at: TTLs taken from the test clock must share its epoch.
+    // The sequencer stamps appended_at by this clock, and cold expires by
+    // appended_at: start it at the real time so its TTLs look real.
     clock_.SetWall(core::WallClock::now());
 
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
@@ -83,9 +74,6 @@ class IntegrationHarness {
     cold_ = std::move(cold_result).value();
 
     rpc_ = std::make_unique<core::ConsumerRpc>();
-    apply_notifier_ = std::make_unique<core::AppliedSeqNotifier>(core::AppliedSeqNotifierConfig{
-        .shard_count = kShardCount,
-    });
 
     InstallQueueMocks();
 
@@ -93,33 +81,20 @@ class IntegrationHarness {
         queue_, *cold_, consumer::ColdConsumerPool::Config{.shard_count = kShardCount},
         eviction_policy_, *rpc_, clock_.SteadyFn(), clock_.WallFn());
 
-    hot_pool_ =
-        std::make_unique<consumer::HotConsumerPool>(queue_, *hot_, *rpc_, *apply_notifier_,
-                                                    consumer::HotConsumerPool::Config{
-                                                        .shard_count = kShardCount,
-                                                        .consumer =
-                                                            consumer::HotConsumer::Config{
-                                                                .read_batch_size = 32,
-                                                                .read_timeout = core::Duration{10},
-                                                            },
-                                                    },
-                                                    eviction_policy_);
-
+    loader_ = std::make_unique<engine::Loader>(*hot_, *cold_pool_, *cold_, clock_.WallFn());
+    sequencer_ =
+        std::make_unique<engine::Sequencer>(*hot_, queue_, *loader_, *cold_pool_,
+                                            engine::SequencerConfig{.wall_clock = clock_.WallFn()});
     engine_ = std::make_unique<engine::TieringEngine>(
-        queue_, *hot_, *cold_, *cold_pool_, *hot_pool_, *rpc_,
-        engine::TieringEngineConfig{
-            .shard_count = kShardCount,
-            .buffer_consistency_wait_timeout = cfg.buffer_consistency_wait_timeout,
-        });
-
-    hot_pool_->Start();
+        *hot_, *cold_, *cold_pool_, *sequencer_,
+        engine::TieringEngineConfig{.shard_count = kShardCount});
   }
 
   ~IntegrationHarness() {
-    if (hot_pool_) hot_pool_->Stop();
     if (cold_pool_) cold_pool_->Stop();
     engine_.reset();
-    hot_pool_.reset();
+    sequencer_.reset();
+    loader_.reset();
     cold_pool_.reset();
     cold_.reset();
     hot_.reset();
@@ -143,7 +118,7 @@ class IntegrationHarness {
                                   std::move(cmd));
   }
   consumer::ColdConsumerPool& ColdPool() { return *cold_pool_; }
-  consumer::HotConsumerPool& HotPool() { return *hot_pool_; }
+  engine::Sequencer& Sequencer() { return *sequencer_; }
   consumer::CompactionBuffer& BufferFor(std::string_view key) {
     auto shard = core::ComputeShard(key, kShardCount);
     return cold_pool_->ConsumerFor(shard).Buffer();
@@ -156,37 +131,15 @@ class IntegrationHarness {
   void InstallQueueMocks() {
     // NOLINTBEGIN(performance-unnecessary-value-param) — gmock forces by-value
     // lambda params to match the MOCK_METHOD signature.
-    ON_CALL(queue_, BeginAppend(::testing::_, ::testing::_, ::testing::_))
-        .WillByDefault([this](core::ShardId shard, core::QueueEntry entry, core::SteadyTime) {
-          std::promise<core::Result<void>> p;
-          p.set_value(core::Result<void>{});
-          const auto seq = AppendToLog(shard, std::move(entry));
-          return queue::PendingAppend{seq, p.get_future(), std::make_unique<NoopAppendPublisher>()};
-        });
-    ON_CALL(queue_, Append(::testing::_, ::testing::_, ::testing::_))
-        .WillByDefault([this](core::ShardId shard, core::QueueEntry entry, core::SteadyTime) {
-          std::promise<core::Result<void>> p;
-          p.set_value(core::Result<void>{});
-          const auto seq = AppendToLog(shard, std::move(entry));
-          return queue::AppendResult{.seq = seq, .durable = p.get_future()};
-        });
     ON_CALL(queue_, Read(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
         .WillByDefault([this](core::ShardId shard, core::SequenceId from_seq, size_t max_count,
                               core::Duration,
                               core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
-          const std::scoped_lock lock(queue_mutex_);
-          return ReadFromLog(log_.at(shard), from_seq, max_count);
+          return queue_.ReadPublished(shard, from_seq, max_count);
         });
     ON_CALL(queue_, CommitOffset(::testing::_, ::testing::_, ::testing::_))
         .WillByDefault(::testing::Return(core::Result<void>{}));
     // NOLINTEND(performance-unnecessary-value-param)
-  }
-
-  core::SequenceId AppendToLog(core::ShardId shard, core::QueueEntry entry) {
-    const std::scoped_lock lock(queue_mutex_);
-    entry.seq = next_seq_++;
-    log_.at(shard).push_back(std::move(entry));
-    return log_.at(shard).back().seq;
   }
 
   std::filesystem::path tmp_dir_;
@@ -194,18 +147,14 @@ class IntegrationHarness {
   core::EvictionPolicy eviction_policy_{std::chrono::seconds{86400}};
 
   ::testing::NiceMock<MockQueue> queue_;
-  std::mutex queue_mutex_;
-  // Seqs are global across shards, so each shard's log is sorted but sparse.
-  uint64_t next_seq_ ABYSS_GUARDED_BY(queue_mutex_) = 1;
-  std::array<std::vector<core::QueueEntry>, kShardCount> log_ ABYSS_GUARDED_BY(queue_mutex_);
 
   std::unique_ptr<hot::ShardedHotStore> hot_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<core::ConsumerRpc> rpc_;
-  std::unique_ptr<core::AppliedSeqNotifier> apply_notifier_;
+  std::unique_ptr<engine::Loader> loader_;
+  std::unique_ptr<engine::Sequencer> sequencer_;
   std::unique_ptr<engine::TieringEngine> engine_;
-  std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
 };
 
 }  // namespace abyss::testing

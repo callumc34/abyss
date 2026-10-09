@@ -58,37 +58,54 @@ enum class Kind : uint8_t {
   kCopy,
 };
 
+// Where a command's keys are.
+enum class Keys : uint8_t {
+  kFirst,
+  // Arguments 1 and 2.
+  kFirstTwo,
+  // Every argument after the name.
+  kAll,
+  // Every other argument from 1: key-value pairs.
+  kPairs,
+};
+
 struct Command {
   std::string_view name;
   // As the registry's: exact if positive, a minimum if negative.
   int arity;
   Kind kind;
+  Keys keys = Keys::kFirst;
+  bool grows = false;
 };
 
 constexpr auto kCommands = std::to_array<Command>({
-    {.name = "SET", .arity = -3, .kind = Kind::kSet},
-    {.name = "SETEX", .arity = 4, .kind = Kind::kSet},
-    {.name = "PSETEX", .arity = 4, .kind = Kind::kSet},
-    {.name = "SETNX", .arity = 3, .kind = Kind::kSetNx},
-    {.name = "MSET", .arity = -3, .kind = Kind::kMSet},
-    {.name = "MSETNX", .arity = -3, .kind = Kind::kMSetNx},
-    {.name = "DEL", .arity = -2, .kind = Kind::kDel},
-    {.name = "UNLINK", .arity = -2, .kind = Kind::kDel},
-    {.name = "SADD", .arity = -3, .kind = Kind::kSAdd},
+    {.name = "SET", .arity = -3, .kind = Kind::kSet, .grows = true},
+    {.name = "SETEX", .arity = 4, .kind = Kind::kSet, .grows = true},
+    {.name = "PSETEX", .arity = 4, .kind = Kind::kSet, .grows = true},
+    {.name = "SETNX", .arity = 3, .kind = Kind::kSetNx, .grows = true},
+    {.name = "MSET", .arity = -3, .kind = Kind::kMSet, .keys = Keys::kPairs, .grows = true},
+    {.name = "MSETNX", .arity = -3, .kind = Kind::kMSetNx, .keys = Keys::kPairs, .grows = true},
+    {.name = "DEL", .arity = -2, .kind = Kind::kDel, .keys = Keys::kAll},
+    {.name = "UNLINK", .arity = -2, .kind = Kind::kDel, .keys = Keys::kAll},
+    {.name = "SADD", .arity = -3, .kind = Kind::kSAdd, .grows = true},
     {.name = "SREM", .arity = -3, .kind = Kind::kSRem},
-    {.name = "ZADD", .arity = -4, .kind = Kind::kZAdd},
+    {.name = "ZADD", .arity = -4, .kind = Kind::kZAdd, .grows = true},
     {.name = "ZREM", .arity = -3, .kind = Kind::kZRem},
-    {.name = "HSET", .arity = -4, .kind = Kind::kHSet},
-    {.name = "HMSET", .arity = -4, .kind = Kind::kHSet},
+    {.name = "HSET", .arity = -4, .kind = Kind::kHSet, .grows = true},
+    {.name = "HMSET", .arity = -4, .kind = Kind::kHSet, .grows = true},
     {.name = "HDEL", .arity = -3, .kind = Kind::kHDel},
-    {.name = "HSETNX", .arity = 4, .kind = Kind::kHSetNx},
+    {.name = "HSETNX", .arity = 4, .kind = Kind::kHSetNx, .grows = true},
     {.name = "EXPIRE", .arity = -3, .kind = Kind::kExpire},
     {.name = "PEXPIRE", .arity = -3, .kind = Kind::kExpire},
     {.name = "EXPIREAT", .arity = -3, .kind = Kind::kExpire},
     {.name = "PEXPIREAT", .arity = -3, .kind = Kind::kExpire},
     {.name = "PERSIST", .arity = 2, .kind = Kind::kPersist},
-    {.name = "RENAMENX", .arity = 3, .kind = Kind::kRenameNx},
-    {.name = "COPY", .arity = -3, .kind = Kind::kCopy},
+    {.name = "RENAMENX",
+     .arity = 3,
+     .kind = Kind::kRenameNx,
+     .keys = Keys::kFirstTwo,
+     .grows = true},
+    {.name = "COPY", .arity = -3, .kind = Kind::kCopy, .keys = Keys::kFirstTwo, .grows = true},
 });
 
 const Command* FindCommand(std::string_view name) {
@@ -159,6 +176,7 @@ class Decider {
   std::string_view Arg(size_t i) const { return cmd_.args[i]; }
 
   KeyRead Read(std::string_view key, Need need);
+  void Observe(core::ShardId shard, core::SequenceId seq);
   // A small effect, built in canonical form from `op`.
   void Emit(const ops::WriteOp& op, bool replaces_state);
   // Starts an effect for Append and Take to fill.
@@ -179,6 +197,9 @@ class Decider {
   // The effects that rebuild `src`'s value and TTL at `dst`.
   void Recreate(std::string_view dst, const hot::KeyView& src);
   void Reply(RespValue reply) { decision_.reply = std::move(reply); }
+  // WRONGTYPE for a key read: it reveals that key's state, so the reply
+  // keeps what was observed for the fence.
+  Decision WrongTypeOf();
   Decision Finish();
 
   core::RespCommand& cmd_;
@@ -220,9 +241,18 @@ KeyRead Decider::Read(std::string_view key, Need need) {
     }
     return read;
   }
-  decision_.observed.emplace_back(key, read.view.latest_seq);
+  Observe(read.view.shard, read.view.latest_seq);
   if (deleted_.contains(key)) read.state = KeyRead::State::kAbsent;
   return read;
+}
+
+void Decider::Observe(core::ShardId shard, core::SequenceId seq) {
+  const auto it = std::ranges::find(decision_.observed, shard, &ShardSeq::shard);
+  if (it == decision_.observed.end()) {
+    decision_.observed.push_back({.shard = shard, .seq = seq});
+  } else {
+    it->seq = std::max(it->seq, seq);
+  }
 }
 
 void Decider::Emit(const ops::WriteOp& op, bool replaces_state) {
@@ -326,6 +356,12 @@ void Decider::Recreate(std::string_view dst, const hot::KeyView& src) {
   }
 }
 
+Decision Decider::WrongTypeOf() {
+  ABYSS_DCHECK(decision_.effects.empty() && decision_.moved.empty(),
+               "WRONGTYPE after an effect was emitted");
+  return Decision{.observed = std::move(decision_.observed), .error = WrongType()};
+}
+
 Decision Decider::Finish() {
   ABYSS_DCHECK(decision_.needs_load.empty() || decision_.moved.empty(),
                "a decision that needs a load moved request arguments");
@@ -352,7 +388,7 @@ Decision Decider::Set(std::string_view name) {
   // Only GET needs the value; a stub's type and TTL answer the rest.
   const KeyRead key = Read(set.key, get ? Need::kState : Need::kExistence);
   if (key.unknown()) return Finish();
-  if (get && key.present() && key.view.type != Type::kString) return Fail(WrongType());
+  if (get && key.present() && key.view.type != Type::kString) return WrongTypeOf();
   if (nx && key.present()) {
     Reply(get ? RespValue::BulkString(std::string(key.view.string_value())) : RespValue::Null());
     return Finish();
@@ -419,7 +455,7 @@ Decision Decider::Collection(std::string_view name, Type type, bool removes) {
   if (!op.has_value()) return Fail(op.error());
   const KeyRead key = Read(ops::PrimaryKey(*op), Need::kState);
   if (key.unknown()) return Finish();
-  if (key.present() && key.view.type != type) return Fail(WrongType());
+  if (key.present() && key.view.type != type) return WrongTypeOf();
   // As Redis propagates nothing for a write that changes nothing,
   // nothing is logged; the reply fences on what was read.
   if (!key.present() ? removes : !Changes(*op, key.view)) {
@@ -446,7 +482,7 @@ Decision Decider::ZAdd() {
 
   const KeyRead key = Read(zadd.key, Need::kState);
   if (key.unknown()) return Finish();
-  if (key.present() && key.view.type != Type::kZset) return Fail(WrongType());
+  if (key.present() && key.view.type != Type::kZset) return WrongTypeOf();
 
   // Pair by pair, as Redis does, so a repeated member sees its own
   // earlier pair. GT and LT only gate updates; new members are added.
@@ -533,7 +569,7 @@ Decision Decider::Persist() {
 Decision Decider::HSetNx() {
   const KeyRead key = Read(Arg(1), Need::kState);
   if (key.unknown()) return Finish();
-  if (key.present() && key.view.type != Type::kHash) return Fail(WrongType());
+  if (key.present() && key.view.type != Type::kHash) return WrongTypeOf();
   if (key.present() && key.view.hash_has(Arg(2))) {
     Reply(RespValue::Integer(0));
     return Finish();
@@ -599,19 +635,55 @@ Decision Decider::Copy() {
   return Finish();
 }
 
-}  // namespace
-
-Decision Decide(core::RespCommand& cmd, PredicateFlags flags, uint64_t now_ms,
-                const KeyLookup& lookup) {
-  if (cmd.args.empty()) return Fail(Syntax("empty command"));
+core::Result<const Command*> Recognise(const core::RespCommand& cmd) {
+  if (cmd.args.empty()) return std::unexpected(Syntax("empty command"));
   const std::string name = core::AsciiUpper(cmd.args[0]);
   const Command* command = FindCommand(name);
   if (command == nullptr) {
-    return Fail(Syntax("unsupported write command '" + name + "'"));
+    return std::unexpected(Syntax("unsupported write command '" + name + "'"));
   }
   if (!ArityHolds(*command, cmd.args.size())) {
-    return Fail(Syntax("wrong number of arguments for '" + core::AsciiLower(name) + "' command"));
+    return std::unexpected(
+        Syntax("wrong number of arguments for '" + core::AsciiLower(name) + "' command"));
   }
+  return command;
+}
+
+}  // namespace
+
+core::Result<std::vector<std::string_view>> WriteKeys(const core::RespCommand& cmd) {
+  auto command = Recognise(cmd);
+  if (!command.has_value()) return std::unexpected(command.error());
+  std::vector<std::string_view> keys;
+  switch ((*command)->keys) {
+    case Keys::kFirst:
+      keys.emplace_back(cmd.args[1]);
+      break;
+    case Keys::kFirstTwo:
+      keys.emplace_back(cmd.args[1]);
+      keys.emplace_back(cmd.args[2]);
+      break;
+    case Keys::kAll:
+      keys.assign(cmd.args.begin() + 1, cmd.args.end());
+      break;
+    case Keys::kPairs:
+      for (size_t i = 1; i < cmd.args.size(); i += 2) keys.emplace_back(cmd.args[i]);
+      break;
+  }
+  return keys;
+}
+
+bool GrowsMemory(const core::RespCommand& cmd) {
+  auto command = Recognise(cmd);
+  return command.has_value() && (*command)->grows;
+}
+
+Decision Decide(core::RespCommand& cmd, PredicateFlags flags, uint64_t now_ms,
+                const KeyLookup& lookup) {
+  auto recognised = Recognise(cmd);
+  if (!recognised.has_value()) return Fail(recognised.error());
+  const Command* command = *recognised;
+  const std::string name(command->name);
 
   Decider decider(cmd, flags, now_ms, lookup);
   switch (command->kind) {

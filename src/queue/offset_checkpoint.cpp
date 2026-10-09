@@ -300,9 +300,14 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
   auto chosen_sorted = chosen.consumers;
   std::ranges::sort(chosen_sorted);
   if (chosen_sorted != sorted_consumers) {
-    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
-                                       "offset checkpoint '" + path.string() +
-                                           "' was written for a different retention consumer set"});
+    // Only builds before a release change the set, and the WAL format
+    // is unreleased, so wiping is the remedy, not a migration.
+    return std::unexpected(core::Error{
+        core::ErrorCode::kFailedPrecondition,
+        "offset checkpoint '" + path.string() +
+            "' was written for a different retention consumer set, by an earlier build of an "
+            "unreleased WAL format: delete the data directory (queue.wal_path and "
+            "cold.data_path) and start empty"});
   }
   if (slot_bytes != expected_slot_bytes) {
     return std::unexpected(

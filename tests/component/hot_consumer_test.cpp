@@ -99,10 +99,13 @@ class HotConsumerTest : public ::testing::Test {
     return tail;
   }
 
-  core::QueueEntry MakeWrite(std::vector<std::string> args) {
+  // Flagged as replacing its key's state unless `replaces_state` says
+  // otherwise, as the sequencer flags a write to an absent key.
+  core::QueueEntry MakeWrite(std::vector<std::string> args, bool replaces_state = true) {
     core::QueueEntry e;
     e.appended_at = core::WallClock::now();
     e.payload = core::entry::Write{.cmd = core::RespCommand{std::move(args)}};
+    e.replaces_state = replaces_state;
     return e;
   }
 
@@ -411,23 +414,6 @@ TEST_F(HotConsumerTest, HighestSettledSeqClampedBehindPendingConditional) {
       << "floor must advance past N once the Conditional at M resolves";
 }
 
-TEST_F(HotConsumerTest, WrongTypeFlowsThroughRpcAndAcks) {
-  StartConsumer();
-  auto f1 = AppendWithRpc({"SET", "k", "v"});
-  EXPECT_EQ(f1.get().AsString(), "OK");
-
-  // SADD against a string key → WRONGTYPE from the hot store.
-  auto f2 = AppendWithRpc({"SADD", "k", "m"});
-  auto value = f2.get();
-  EXPECT_TRUE(value.IsError());
-  EXPECT_EQ(value.AsString(), "WRONGTYPE Operation against a key holding the wrong kind of value");
-
-  // Subsequent entries must still apply — a poison entry mustn't wedge the
-  // consumer.
-  auto f3 = AppendWithRpc({"SET", "k2", "v2"});
-  EXPECT_EQ(f3.get().AsString(), "OK");
-}
-
 TEST_F(HotConsumerTest, StopIsIdempotentAndSafeAfterWrites) {
   StartConsumer();
   auto f = AppendWithRpc({"SET", "k", "v"});
@@ -442,12 +428,12 @@ TEST_F(HotConsumerTest, MetricsAdvanceOnApply) {
   StartConsumer();
   auto f_ok = AppendWithRpc({"SET", "k", "v"});
   EXPECT_EQ(f_ok.get().AsString(), "OK");
-  auto f_wrong = AppendWithRpc({"SADD", "k", "m"});
-  EXPECT_TRUE(f_wrong.get().IsError());
+  auto f_add = AppendWithRpc({"SADD", "s", "m"});
+  EXPECT_EQ(f_add.get().AsInteger(), 1);
 
   const auto snap = consumer_->Snapshot();
-  EXPECT_EQ(snap.applied, 1U);
-  EXPECT_EQ(snap.apply_failures, 1U);
+  EXPECT_EQ(snap.applied, 2U);
+  EXPECT_EQ(snap.apply_failures, 0U);
   EXPECT_EQ(snap.parse_failures, 0U);
   EXPECT_EQ(snap.queue_read_failures, 0U);
   EXPECT_EQ(snap.commit_failures, 0U);
@@ -484,19 +470,12 @@ TEST_F(HotConsumerTest, ConcurrentWritersAlwaysSeeRegisteredEntries) {
 }
 
 TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesPastEvictionWindow) {
-  // Append two entries via direct queue Append (no client-side RPC). One
-  // entry's appended_at sits 25h in the past (> default 24h eviction); the
-  // second is fresh. Replay must skip the stale one but apply the fresh one.
-  const auto stale_at = core::WallClock::now() - std::chrono::hours{25};
-  const auto fresh_at = core::WallClock::now();
-
+  // A stale SET (appended 25h ago, past the default 24h eviction) is
+  // skipped; a fresh one is applied.
   auto stale_entry = MakeWrite({"SET", "stale", "v"});
-  stale_entry.appended_at = stale_at;
+  stale_entry.appended_at = core::WallClock::now() - std::chrono::hours{25};
   ASSERT_TRUE(queue_->Append(0, stale_entry).has_value());
-
-  auto fresh_entry = MakeWrite({"SET", "fresh", "v"});
-  fresh_entry.appended_at = fresh_at;
-  ASSERT_TRUE(queue_->Append(0, fresh_entry).has_value());
+  ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "fresh", "v"})).has_value());
 
   BuildConsumerWithClock([] { return core::WallClock::now(); });
   std::atomic<bool> cancel{false};
@@ -506,21 +485,57 @@ TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesPastEvictionWindow) {
   auto fresh = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "fresh"}});
   ASSERT_TRUE(fresh.has_value());
   EXPECT_EQ(fresh->AsString(), "v");
-
   EXPECT_EQ(consumer_->Snapshot().replay_skipped_eviction, 1U);
   EXPECT_EQ(consumer_->Snapshot().applied, 1U);
 }
 
-TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesWithExpiredAbsoluteTtl) {
-  // PXAT carries an absolute Unix-ms deadline that the parser preserves
-  // verbatim (unlike EX/PX which currently anchor to parse time). A deadline
-  // already in the past at replay time should fire the abs-TTL skip even
-  // when the eviction window from appended_at has not elapsed.
+// A skipped entry leaves its key non-resident, and a later write that
+// does not replace the key's state stays unapplied: replay never builds
+// a key from the suffix of its history. Buffer and cold hold it whole.
+TEST_F(HotConsumerTest, ReplayNeverBuildsAKeyFromPartOfItsHistory) {
+  auto created = MakeWrite({"SADD", "k", "a"});
+  created.appended_at = core::WallClock::now() - std::chrono::hours{25};
+  ASSERT_TRUE(queue_->Append(0, created).has_value());
+  ASSERT_TRUE(
+      queue_->Append(0, MakeWrite({"SADD", "k", "b"}, /*replaces_state=*/false)).has_value());
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
+
+  const auto card = hot_->Exec(core::ops::ReadOp{core::ops::SetCard{.key = "k"}});
+  ASSERT_FALSE(card.has_value()) << "hot rebuilt k from part of its history";
+  EXPECT_EQ(card.error().code(), core::ErrorCode::kNotFound);
+  EXPECT_EQ(consumer_->Snapshot().applied, 0U);
+}
+
+// The stamp of a frame replay skips still raises its shard's clock, so a
+// shard idle past its eviction window keeps its last appended_at.
+TEST_F(HotConsumerTest, ASkippedFrameStillRestoresItsShardsStamp) {
+  auto stale = MakeWrite({"SET", "stale", "v"});
+  stale.appended_at = core::WallClock::now() - std::chrono::hours{25};
+  ASSERT_TRUE(queue_->Append(0, stale).has_value());
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
+  EXPECT_EQ(consumer_->Snapshot().replay_skipped_eviction, 1U);
+  auto locks = hot_->LockExclusive(std::vector<core::ShardId>{0});
+  // Frames keep whole microseconds.
+  EXPECT_EQ(std::chrono::floor<std::chrono::microseconds>(locks.LastAppendedAt(0)),
+            std::chrono::floor<std::chrono::microseconds>(stale.appended_at));
+}
+
+// Replay applies the log as decided and judges no TTL: a SET whose
+// PXAT has passed is applied, and reads find the key expired.
+TEST_F(HotConsumerTest, ReplayAppliesAnEntryPastItsTtlAsLogged) {
   const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           core::WallClock::now().time_since_epoch())
                           .count();
   const auto past_ms = now_ms - 5000;
   auto entry = MakeWrite({"SET", "k", "v", "PXAT", std::to_string(past_ms)});
+  entry.appended_at = core::WallClock::now() - 10s;
+  entry.replaces_state = true;
   ASSERT_TRUE(queue_->Append(0, entry).has_value());
 
   BuildConsumerWithClock([] { return core::WallClock::now(); });
@@ -528,8 +543,56 @@ TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesWithExpiredAbsoluteTtl) {
   ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
 
   EXPECT_FALSE(hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k"}}).has_value());
-  EXPECT_EQ(consumer_->Snapshot().replay_skipped_abs_ttl, 1U);
-  EXPECT_EQ(consumer_->Snapshot().applied, 0U);
+  EXPECT_EQ(consumer_->Snapshot().replay_skipped_abs_ttl, 0U);
+  EXPECT_EQ(consumer_->Snapshot().applied, 1U);
+}
+
+// A write decided while its key was live is replayed as one, however
+// late the restart: an SADD to a set with a TTL merges into the set and
+// keeps its TTL, so past the TTL the key is absent, not a fresh {m}.
+TEST_F(HotConsumerTest, ReplayNeverRedecidesAnExpiry) {
+  const core::WallTime written = core::WallClock::now();
+  const auto written_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(written.time_since_epoch()).count();
+  const auto ttl_ms = written_ms + 60'000;
+  const auto append = [&](std::vector<std::string> args, bool replaces_state, int64_t at_ms) {
+    auto entry = MakeWrite(std::move(args));
+    entry.appended_at = core::WallTime{std::chrono::milliseconds{at_ms}};
+    entry.replaces_state = replaces_state;
+    ASSERT_TRUE(queue_->Append(0, entry).has_value());
+  };
+  ASSERT_NO_FATAL_FAILURE(append({"SADD", "k", "a"}, true, written_ms));
+  ASSERT_NO_FATAL_FAILURE(append({"PEXPIREAT", "k", std::to_string(ttl_ms)}, false, written_ms));
+  ASSERT_NO_FATAL_FAILURE(append({"SADD", "k", "m"}, false, written_ms + 1));
+  const core::SequenceId tail = DurableTail();
+
+  for (const bool past_ttl : {false, true}) {
+    SCOPED_TRACE(past_ttl ? "restarted past the TTL" : "restarted before the TTL");
+    core::WallTime now = past_ttl ? core::WallTime{std::chrono::milliseconds{ttl_ms + 3'600'000}}
+                                  : core::WallTime{std::chrono::milliseconds{written_ms + 1000}};
+    hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+        .max_memory_bytes = 16UL * 1024UL * 1024UL,
+        .shard_count = 1,
+        .wall_clock = [&now] { return now; },
+    });
+    BuildConsumerWithClock([&now] { return now; });
+    std::atomic<bool> cancel{false};
+    ASSERT_TRUE(consumer_->ReplayUntil(tail, cancel).has_value());
+
+    const auto card = hot_->Exec(core::ops::ReadOp{core::ops::SetCard{.key = "k"}});
+    if (past_ttl) {
+      EXPECT_FALSE(card.has_value()) << "k came back without its TTL";
+    } else {
+      ASSERT_TRUE(card.has_value());
+      EXPECT_EQ(card->AsInteger(), 2) << "the SADD did not merge into the set";
+    }
+    // Still within the TTL as hot holds it, whatever the wall clock.
+    now = core::WallTime{std::chrono::milliseconds{written_ms + 2000}};
+    const auto members = hot_->Exec(core::ops::ReadOp{core::ops::SetCard{.key = "k"}});
+    ASSERT_TRUE(members.has_value());
+    EXPECT_EQ(members->AsInteger(), 2);
+    consumer_.reset();
+  }
 }
 
 TEST_F(HotConsumerTest, SteadyStateAppliesEvenWhenAppendedAtIsAncient) {
@@ -734,33 +797,25 @@ TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
   EXPECT_LE(hot_->Stats()->used_bytes, hot_->Stats()->max_bytes);
 }
 
-TEST_F(HotConsumerTest, OverBudgetWriteSurfacesOomButStaysDurable) {
-  // A live steady-state write that cannot be admitted yields -OOM to the client
-  // (MapApplyError path) while the queue entry remains durable and the seq is
-  // settled/NotifyApplied — the consumer does not wedge (invariant 1/2).
+// A logged write is decided, so it always applies: over the budget it
+// overshoots, which Stats reports, and the consumer does not wedge.
+TEST_F(HotConsumerTest, OverBudgetWriteStillApplies) {
   hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
   ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "small", .value = "v"}}, 0)
                   .has_value());
   const uint64_t small_entry = probe.Stats()->used_bytes;
 
   hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
-      // Holds a handful of small entries, but a single 1500-char value is far
-      // larger than the whole budget — so "big" can never be admitted.
+      // A single 1500-char value is far larger than the whole budget.
       .max_memory_bytes = small_entry * 4,
       .shard_count = 1,
   });
 
   StartConsumer();
-  // Large enough to dwarf the budget but within the WAL segment size.
   auto fut = AppendWithRpc({"SET", "big", std::string(1500, 'x')});
-  auto reply = fut.get();
-  // The -OOM reply itself proves the entry was durably queued and applied (the
-  // consumer read it from the WAL and produced an apply result); the write is
-  // not lost — it stays in the queue/cold (invariant 2).
-  ASSERT_TRUE(reply.IsError());
-  EXPECT_EQ(reply.ErrorPrefixOf(), core::ErrorPrefix::kOom);
+  EXPECT_EQ(fut.get().AsString(), "OK");
+  EXPECT_GT(hot_->Stats()->used_bytes, hot_->Stats()->max_bytes);
 
-  // The seq still settled (no wedge); a follow-up write is fulfilled normally.
   auto ok = AppendWithRpc({"SET", "small", "v"});
   EXPECT_FALSE(ok.get().IsError());
   EXPECT_EQ(consumer_->PendingConditionalCount(), 0U);

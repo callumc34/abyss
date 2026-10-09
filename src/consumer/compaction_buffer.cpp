@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include "abyss/core/fatal.h"
@@ -45,8 +46,12 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
 
   size_t old_entry_bytes = is_new ? 0 : EntryBytes(entry);
 
-  // The engine stamps appended_at before it appends, so it may run
-  // behind an earlier seq's; the running max keeps the clock monotonic.
+  // The sequencer stamps a shard's writes in seq order, so a stamp
+  // below one absorbed already is a regression, not a race. Absorbed,
+  // it would let the log clock pass a write it understates.
+  ABYSS_DCHECK(appended_at_ms >= max_absorbed_ms_,
+               "a shard's appended_at went backwards: " + std::to_string(appended_at_ms) + " < " +
+                   std::to_string(max_absorbed_ms_));
   max_absorbed_ms_ = std::max(max_absorbed_ms_, appended_at_ms);
   if (is_new) {
     entry.key = key;

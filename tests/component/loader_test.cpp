@@ -319,7 +319,7 @@ TEST_F(LoaderComponentTest, DelOfAColdOnlyKeyCountsItWithoutAFullLoad) {
   std::vector<hot::LoadCompletion> completions;
   completions.push_back(
       {.key = "k", .token = token.value_or(hot::LoadToken{}), .result = *std::move(loaded)});
-  ASSERT_EQ(shard.CompleteLoads(completions, policy, hot::kAllDrained), 1U);
+  ASSERT_EQ(shard.CompleteLoads(completions, policy), 1U);
   Decision second = decide();
   ASSERT_TRUE(second.needs_load.empty());
   ASSERT_TRUE(second.reply.has_value());

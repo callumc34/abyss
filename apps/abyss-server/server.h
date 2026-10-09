@@ -21,7 +21,9 @@
 #include "abyss/core/result.h"
 #include "abyss/core/topology_manifest.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
+#include "abyss/engine/loader.h"
 #include "abyss/engine/recovery_coordinator.h"
+#include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -39,8 +41,8 @@ class Server {
   // The single source of truth for the process lifecycle. The client-visible
   // serving predicate (the RESP LOADING gate and /ready) is derived ONLY from
   // this value reaching kServing, which happens strictly after recovery
-  // completes AND every consumer pool has started — so there is no state in
-  // which the data plane is open with no consumer to fulfil an RPC (ENGINE-1).
+  // completes AND the cold consumers have started — so the data plane never
+  // opens over a half-rebuilt hot store or an idle cold tier (ENGINE-1).
   // Monotonic forward order; never moves backward.
   enum class LifecycleState : uint8_t {
     kInitializing = 0,  // signal handling armed, topology validated, stores opening
@@ -105,6 +107,8 @@ class Server {
   std::unique_ptr<hot::EvictionWorker> hot_eviction_worker_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
   std::unique_ptr<consumer::ResolverPool> resolver_pool_;
+  std::unique_ptr<engine::Loader> loader_;
+  std::unique_ptr<engine::Sequencer> sequencer_;
   std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<engine::BoundedThreadShardScheduler> recovery_scheduler_;
   std::unique_ptr<engine::RecoveryCoordinator> recovery_coordinator_;

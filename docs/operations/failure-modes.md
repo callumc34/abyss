@@ -70,11 +70,11 @@ A write rejected before it is published returns a Redis error to the client: dis
 
 A failed WAL flush or segment seal after publication terminates the process instead (see "WAL flush or segment seal fails" above); there is no error reply for it.
 
-A write that is published but whose hot consumer promise times out returns a Redis error to the client. The write is in the queue and WILL be applied on catch-up. Under `power_loss` it is also power-durable; under `process_crash` it is only process-crash durable, so a power loss before the next flush can still drop it. The client received an error, so it may retry. The retry is a duplicate write, which is safe because last-write-wins is the default semantic.
+A write that is published but not durable at the acknowledgement class within `engine.write_timeout` returns a Redis error to the client. It is already in the queue and applied to hot, and becomes durable when the WAL flush catches up. Under `process_crash` a power loss before that flush can still drop it. The client received an error, so it may retry. The retry is a duplicate write, which is safe because last-write-wins is the default semantic.
 
-A multi-key write (`MSET`, multi-key `DEL`) appends one entry per key, all within one deadline. Under backpressure, key *k* can be rejected after keys 0 to *k*−1 were published, so the command fails with those keys applied. This used to need an I/O error, but is now an ordinary backpressure outcome. It ends when cross-shard commands log one batch frame (ADP-015 §Cross-shard atomic commands).
+A multi-key write (`MSET`, `MSETNX`, multi-key `DEL` and `UNLINK`, `RENAMENX`, `COPY`) is one decision and one reservation in the log, so a refused one applies none of its keys. Its keys must share a WAL log: with `queue.log_count` above 1, one whose keys span logs is rejected with `-CROSSSLOT` and nothing is logged (#169). One whose frames cannot fit a single segment fails whole with a "batch exceeds the segment frame space" error; raise `queue.segment_size_bytes`.
 
-FLUSHDB behaves the same way. It appends one `Flush` entry per shard, so under backpressure shards 0 to *k*−1 can be wiped before shard *k* is rejected and the command returns an error. Retrying completes it, because each shard's wipe is idempotent.
+FLUSHDB locks every shard and reserves one `Flush` per shard as a single reservation, so a refused FLUSHDB wipes nothing and readers see it whole. With one log the Flushes are one batch, atomic across a crash too. With several logs each log's Flushes are a batch of their own: a crash can keep one log's and lose another's, leaving the flush applied to some shards only. Retrying completes it, because a wipe is idempotent.
 
 ## Recovery After Crash
 
@@ -246,13 +246,11 @@ never returns a partial/silently-capped array that the client would mistake for 
   deadline is best-effort at iterator-step granularity, so a single very large SST block read can
   overshoot slightly; size the deadline with margin rather than at the exact p99.
 
-## Hot Consumer Stall
+## Hot Memory Over Its Limit
 
-If the hot consumer stalls:
+Hot may exceed `hot.max_memory_bytes` only by what cold has not drained: eviction takes only keys cold has absorbed.
 
-- Write promises time out. Clients receive Redis errors.
-- Writes are still durable in the queue and will be applied when the consumer recovers.
-- This is self-regulating: as promises time out, clients back off, reducing write pressure.
-- **Metric to watch:** `abyss_hot_consumer_lag_entries`.
-
-Hot consumer stalls have immediate client impact (write errors), which makes them easy to detect and respond to.
+- Past `hot.max_memory_bytes` × `hot.backpressure_ratio` on a shard, a write that can grow memory (the `SET` family, `SADD`, `ZADD`, `HSET`, `HMSET`, `HSETNX`, `MSET`, `MSETNX`, `RENAMENX`, `COPY`, or one that must load a whole key) evicts what cold has drained, then waits for cold to drain more.
+- At `engine.write_timeout` it is rejected with `-OOM command not allowed when hot memory is over its limit and cold is behind`, having applied and logged nothing.
+- Deletes, removals, expiry changes and FLUSHDB never wait, unless one must first load a whole key from cold.
+- **Metrics to watch:** `abyss_hot_backpressure_waits_total`, `abyss_hot_backpressure_rejections_total`, `abyss_hot_unevictable_bytes`, and the cold consumer's lag, which is the usual cause.

@@ -23,6 +23,9 @@ struct RecoveryConfig {
   size_t hot_replay_batch_size = 10000;
   size_t cold_replay_batch_size = 50000;
   size_t resolver_replay_batch_size = 5000;
+  // False once the resolver no longer commits offsets: its replay seeds
+  // from them, and no conditional reaches the log to resolve.
+  bool replay_resolver = true;
 };
 
 struct RecoverySnapshot {

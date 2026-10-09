@@ -42,7 +42,7 @@ Test a single function or class in isolation. No file I/O, no network, no thread
 Test one real component with its immediate dependencies mocked or stubbed. Validates that a component correctly implements its contract against its neighbours' interfaces.
 
 **What belongs here:**
-- `TieringEngine` with `MockQueue`, `MockHotStore`, `MockColdStore`, real `CompactionBuffer` — validates read-path tiering logic and write-path dispatch.
+- `TieringEngine` with a real `ShardedHotStore`, `Sequencer` and `CompactionBuffer` over `MockQueue` and `MockColdStore` — validates read-path tiering logic and write-path dispatch.
 - `RequestPipeline` with a real `TieringEngine` backed by mock stores — validates end-to-end command processing from RESP bytes to RESP bytes.
 - `CompactionBuffer` with a test clock — validates absorb/read/flush lifecycle.
 
@@ -54,7 +54,7 @@ Test multiple real components wired together, in-process. Uses real file-backed 
 
 **What belongs here:**
 - Full write path: `TieringEngine` → `WalQueue` → `HotStore` → verify state.
-- Full read path: hot miss → buffer hit, hot miss → cold hit with promotion.
+- Full read path: hot miss → buffer hit, hot miss → cold hit.
 - Recovery: write entries, destroy stores, replay queue, verify identical state.
 - TTL expiry through the full pipeline.
 

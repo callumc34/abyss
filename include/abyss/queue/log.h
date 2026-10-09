@@ -97,6 +97,9 @@ class Log {
   // changed, when the frame needs a segment that is not ready yet: wait
   // with WaitForSpare outside any lock and retry.
   core::Result<Reservation> Reserve(uint32_t size);
+  // Whether Reserve(size) would succeed now. Exact only while no one
+  // else can reserve, as when every stream of the log is locked.
+  bool CanReserve(uint32_t size) const;
   // False at the deadline, or once the log is shutting down.
   bool WaitForSpare(core::SteadyTime deadline);
 

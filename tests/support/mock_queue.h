@@ -75,7 +75,8 @@ class MockQueue : public core::Queue {
   MOCK_METHOD(bool, WaitForSpare, (core::ShardId shard, core::SteadyTime deadline), (override));
 
   // In memory: seqs per shard from 0, each shard published in seq
-  // order, durable futures ready unless HoldDurable.
+  // order, durable futures ready unless HoldDurable. It takes every
+  // entry, as a queue may the ones it fills in Complete.
   core::Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) override {
     ABYSS_DCHECK(queue::ReservationsHeld() == 0, "reservation by a thread holding one");
     const std::scoped_lock lock(fake_->mu);
@@ -90,13 +91,15 @@ class MockQueue : public core::Queue {
       const core::SequenceId first = shard.next;
       for (core::QueueEntry& entry : part.entries) {
         entry.seq = shard.next++;
-        filler->entries.emplace_back(part.shard, entry);
+        filler->entries.emplace_back(part.shard, std::move(entry));
       }
       ranges.push_back({.shard = part.shard, .first = first, .last = shard.next - 1});
       filler->parts.push_back(ranges.back());
       std::promise<core::Result<void>> promise;
       durable.push_back({.shard = part.shard, .durable = promise.get_future()});
-      if (fake_->hold_durable) {
+      if (fake_->durable_error.has_value()) {
+        promise.set_value(std::unexpected(*fake_->durable_error));
+      } else if (fake_->hold_durable) {
         fake_->held.push_back(std::move(promise));
       } else {
         promise.set_value({});
@@ -105,9 +108,31 @@ class MockQueue : public core::Queue {
     return queue::Reservation(std::move(ranges), std::move(durable), std::move(filler));
   }
 
+  uint32_t LogOf(core::ShardId shard) const override { return shard % log_count_; }
+  // Shards on different logs are CROSSSLOT to the sequencer; the fake
+  // itself reserves across them.
+  void SetLogCount(uint32_t log_count) { log_count_ = log_count; }
+
+  // As Reserve: the fake is one log.
+  core::Result<queue::Reservation> ReserveFlush(
+      std::span<const queue::ShardEntries> parts) override {
+    return Reserve(parts);
+  }
+
   queue::DurableFutures Complete(queue::Reservation&& reservation) override {
     queue::Reservation owned = std::move(reservation);
+    std::function<void()> hook;
+    {
+      const std::scoped_lock lock(fake_->mu);
+      hook = fake_->on_complete;
+    }
+    if (hook) hook();
     return owned.Finish();
+  }
+  // Runs as each Complete starts.
+  void OnComplete(std::function<void()> hook) {
+    const std::scoped_lock lock(fake_->mu);
+    fake_->on_complete = std::move(hook);
   }
 
   // Fails Reserve with the error it returns, if any.
@@ -115,6 +140,11 @@ class MockQueue : public core::Queue {
       std::function<std::optional<core::Error>(std::span<const queue::ShardEntries>)> fault) {
     const std::scoped_lock lock(fake_->mu);
     fake_->reserve_fault = std::move(fault);
+  }
+  // Durable futures of later reservations resolve with `error`.
+  void FailDurable(core::Error error) {
+    const std::scoped_lock lock(fake_->mu);
+    fake_->durable_error = std::move(error);
   }
   // Durable futures of later reservations stay pending until released.
   void HoldDurable() {
@@ -136,6 +166,19 @@ class MockQueue : public core::Queue {
     const auto it = fake_->shards.find(shard);
     return it == fake_->shards.end() ? std::vector<core::QueueEntry>{} : it->second.published;
   }
+  // The Read contract over what Complete published on `shard`.
+  std::vector<core::QueueEntry> ReadPublished(core::ShardId shard, core::SequenceId from_seq,
+                                              size_t max_count) const {
+    const std::scoped_lock lock(fake_->mu);
+    std::vector<core::QueueEntry> out;
+    const auto it = fake_->shards.find(shard);
+    if (it == fake_->shards.end()) return out;
+    const auto& log = it->second.published;
+    for (auto seq = from_seq; seq < log.size() && out.size() < max_count; ++seq) {
+      out.push_back(log[seq]);
+    }
+    return out;
+  }
 
  private:
   struct FakeShard {
@@ -147,6 +190,8 @@ class MockQueue : public core::Queue {
     std::condition_variable published_cv;
     std::map<core::ShardId, FakeShard> shards;
     bool hold_durable = false;
+    std::optional<core::Error> durable_error;
+    std::function<void()> on_complete;
     std::vector<std::promise<core::Result<void>>> held;
     std::function<std::optional<core::Error>(std::span<const queue::ShardEntries>)> reserve_fault;
   };
@@ -177,6 +222,7 @@ class MockQueue : public core::Queue {
   };
 
   std::shared_ptr<FakeLog> fake_ = std::make_shared<FakeLog>();
+  uint32_t log_count_ = 1;
 };
 
 // The Read contract over an in-memory log sorted by seq: up to `max_count`

@@ -34,6 +34,14 @@ TEST(Names, FlushReasonSpellings) {
   EXPECT_EQ(ToStringView(FlushReason::kPressure), "pressure");
 }
 
+TEST(Names, RedecideReasonSpellings) {
+  EXPECT_EQ(ToStringView(RedecideReason::kAdmission), "admission");
+  EXPECT_EQ(ToStringView(RedecideReason::kSpare), "spare");
+  EXPECT_EQ(ToStringView(RedecideReason::kLoad), "load");
+  EXPECT_EQ(ToStringView(RedecideReason::kBackpressure), "backpressure");
+  static_assert(LabelKeyOf<RedecideReason>::value == LabelKey::kReason);
+}
+
 TEST(Names, LabelKeyOfMapping) {
   static_assert(LabelKeyOf<Tier>::value == LabelKey::kTier);
   static_assert(LabelKeyOf<FlushStatus>::value == LabelKey::kStatus);
@@ -66,7 +74,6 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kWalScanBytesTotal.name,
       names::kQueueOffsetPersistDurationSeconds.name,
       names::kColdFlushBatchSize.name,
-      names::kHotConsumerLagEntries.name,
       names::kColdConsumerLagEntries.name,
       names::kColdBufferOldestEntryAgeSeconds.name,
       names::kHotConsumerSeq.name,
@@ -91,7 +98,11 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kEvictedTotal.name,
       names::kHotStubDropsTotal.name,
       names::kHotLoadDiscardsTotal.name,
-      names::kPromotionsTotal.name,
+      names::kHotBackpressureWaitsTotal.name,
+      names::kHotBackpressureRejectionsTotal.name,
+      names::kSequencerLockedCopyBytesTotal.name,
+      names::kSequencerRedecidesTotal.name,
+      names::kSequencerLockHoldSeconds.name,
       names::kQueueOffsetPersistFailuresTotal.name,
       names::kQueueReadOutOfRangeTotal.name,
   };

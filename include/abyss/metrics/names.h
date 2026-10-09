@@ -170,6 +170,23 @@ constexpr std::string_view ToStringView(TtlSubject s) noexcept {
   return {};
 }
 
+// Why the sequencer decided a write again.
+enum class RedecideReason : uint8_t { kAdmission, kSpare, kLoad, kBackpressure };
+
+constexpr std::string_view ToStringView(RedecideReason r) noexcept {
+  switch (r) {
+    case RedecideReason::kAdmission:
+      return "admission";
+    case RedecideReason::kSpare:
+      return "spare";
+    case RedecideReason::kLoad:
+      return "load";
+    case RedecideReason::kBackpressure:
+      return "backpressure";
+  }
+  return {};
+}
+
 // Command-name label value. Values are expected to be views into the command
 // registry; never client-supplied strings.
 struct CmdLabel {
@@ -212,6 +229,10 @@ struct LabelKeyOf<RejectReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<RedecideReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
 struct LabelKeyOf<CmdLabel> {
   static constexpr LabelKey value = LabelKey::kCmd;
 };
@@ -240,6 +261,7 @@ inline std::string ToLabelString(FlushReason r) { return std::string(ToStringVie
 inline std::string ToLabelString(BackoffReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(RedecideReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
@@ -283,6 +305,11 @@ inline constexpr std::array<double, 14> kLatencySeconds{0.00001, 0.000025, 0.000
 // Durable flushes: 50us (NVMe) to a second (a stalled volume).
 inline constexpr std::array<double, 13> kFlushLatencySeconds{
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0};
+
+// Exclusive lock holds: 1us to 10ms, where W1's budget lies.
+inline constexpr std::array<double, 12> kLockHoldSeconds{0.000001, 0.0000025, 0.000005, 0.00001,
+                                                         0.000025, 0.00005,   0.0001,   0.00025,
+                                                         0.0005,   0.001,     0.0025,   0.01};
 
 // Power-of-ten buckets for batch sizes.
 inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
@@ -427,11 +454,6 @@ inline constexpr GaugeDesc<> kFsDurableDirSupported{
     .help =
         "1 if the data volume can make directory entries durable (fsync), else 0. A 0 refuses "
         "to start the WAL under either durability class.",
-};
-
-inline constexpr GaugeDesc<> kHotConsumerLagEntries{
-    .name = "abyss_hot_consumer_lag_entries",
-    .help = "Entries between hot consumer position and queue head.",
 };
 
 inline constexpr GaugeDesc<> kColdConsumerLagEntries{
@@ -653,14 +675,35 @@ inline constexpr CounterDesc<> kHotStubDropsTotal{
     .help = "Stubs dropped, least recently written first, past the stub cap.",
 };
 
+inline constexpr CounterDesc<> kHotBackpressureWaitsTotal{
+    .name = "abyss_hot_backpressure_waits_total",
+    .help = "Writes that waited for cold to drain because hot memory was over its limit.",
+};
+
+inline constexpr CounterDesc<> kHotBackpressureRejectionsTotal{
+    .name = "abyss_hot_backpressure_rejections_total",
+    .help = "Writes rejected with OOM after waiting the write timeout for cold to drain.",
+};
+
+inline constexpr CounterDesc<> kSequencerLockedCopyBytesTotal{
+    .name = "abyss_sequencer_locked_copy_bytes_total",
+    .help = "Bytes of written values the sequencer copied into log entries under hot locks.",
+};
+
+inline constexpr CounterDesc<RedecideReason> kSequencerRedecidesTotal{
+    .name = "abyss_sequencer_redecides_total",
+    .help = "Writes the sequencer decided again, by what sent it back.",
+};
+
+inline constexpr HistogramDesc<> kSequencerLockHoldSeconds{
+    .name = "abyss_sequencer_lock_hold_seconds",
+    .help = "Time the sequencer held a write's hot shard locks; one hold in 64 is sampled.",
+    .buckets = buckets::kLockHoldSeconds,
+};
+
 inline constexpr CounterDesc<> kHotLoadDiscardsTotal{
     .name = "abyss_hot_load_discards_total",
     .help = "Key loads discarded because a write or flush superseded them.",
-};
-
-inline constexpr CounterDesc<> kPromotionsTotal{
-    .name = "abyss_promotions_total",
-    .help = "Cold hits promoted back to the hot store.",
 };
 
 // A cold collection scan (SMEMBERS/ZRANGE/HGETALL/HKEYS/HVALS) exceeded the

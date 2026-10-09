@@ -145,16 +145,9 @@ struct NetConfig {
 using ConsumerRpcConfig = core::ConsumerRpcConfig;
 
 struct EngineConfig {
+  // A write's whole budget: admission, loads, backpressure and its
+  // durable wait. Also bounds a read's wait for what it saw.
   std::chrono::milliseconds write_timeout{5000};
-
-  // Lower bound on the consumer-apply budget after the durable wait completes.
-  // Prevents a slow fsync from starving the RPC wait to ~0ms. The total write
-  // latency is therefore bounded by `write_timeout * (1 + min_rpc_wait_fraction)`.
-  double min_rpc_wait_fraction = 0.5;
-
-  // Bounds how long DispatchHashRead waits for the cold consumer to catch up
-  // to hot's settled seq before snapshotting the buffer overlay.
-  std::chrono::milliseconds buffer_consistency_wait_timeout{100};
 };
 
 struct MetricsConfig {

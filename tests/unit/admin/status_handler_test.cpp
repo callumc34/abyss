@@ -79,18 +79,21 @@ TEST(StatusHandlerTest, BodyHasAllTopLevelKeys) {
 }
 
 // Renaming queue.tail_seq, consumers.*.last_ack_seq_* and
-// config.fsync_policy broke the schema: no aliases for the old keys.
-TEST(StatusHandlerTest, SchemaVersionThreeHasOnlyRenamedKeys) {
+// config.fsync_policy, and dropping the hot and resolver lags, broke
+// the schema: no aliases for the old keys.
+TEST(StatusHandlerTest, SchemaVersionFourHasOnlyRenamedKeys) {
   FakeProvider provider(MakeMinimalSnapshot());
   StatusHandler handler(&provider);
   HttpRequest request;
   const auto response = handler.Handle(request);
   EXPECT_TRUE(ContainsAll(response.body,
-                          {"\"schema_version\":3", "\"durability\":\"power_loss\"", "\"first_seq\"",
+                          {"\"schema_version\":4", "\"durability\":\"power_loss\"", "\"first_seq\"",
                            "\"last_commit_seq_min\"", "\"last_commit_seq_max\""}));
   EXPECT_FALSE(response.body.contains("\"tail_seq\""));
   EXPECT_FALSE(response.body.contains("last_ack_seq"));
   EXPECT_FALSE(response.body.contains("fsync_policy"));
+  EXPECT_FALSE(response.body.contains("hot_max_entries"));
+  EXPECT_FALSE(response.body.contains("resolver_max_entries"));
 }
 
 TEST(StatusHandlerTest, QueueReportsTheDurabilityWindow) {

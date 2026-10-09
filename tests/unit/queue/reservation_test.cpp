@@ -440,6 +440,84 @@ TEST_F(ReservationTest, ALargeFrameIsFilledInComplete) {
   for (const auto& entry : read) EXPECT_EQ(entry.appended_at, kStamp) << KeyOf(entry);
 }
 
+// The bytes encoded under the caller's locks are bounded per
+// reservation: frames each under the threshold are left to Complete
+// once their total would pass it.
+TEST_F(ReservationTest, ABatchEncodesNoMoreThanTheBudgetUnderTheLock) {
+  OpenWith(Config(1));
+  constexpr std::size_t kMid = std::size_t{10} << 10;
+  std::vector<core::QueueEntry> entries{Write("a", kMid), Write("b", kMid), Write("c", 8),
+                                        Write("d", kMid)};
+  for (const auto& entry : entries) {
+    ASSERT_LE(frame::EntryFrameSize(entry), core::kLockHoldFrameBytes);
+  }
+  auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
+  ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
+  std::vector<LogPosition> at;
+  for (core::SequenceId seq = 0; seq < 4; ++seq) {
+    at.push_back(queue_->StreamForTesting(0).RingPositionForTesting(seq).value_or(kNoPosition));
+    ASSERT_NE(at.back(), kNoPosition);
+  }
+  EXPECT_TRUE(HeaderAt(at[0]).has_value()) << "the first frame fits the budget";
+  for (std::size_t i = 1; i < at.size(); ++i) {
+    EXPECT_FALSE(HeaderAt(at[i]).has_value()) << "frame " << i << " encoded under the lock";
+  }
+
+  queue_->Complete(std::move(*reserved));
+  for (const LogPosition pos : at) EXPECT_TRUE(HeaderAt(pos).has_value());
+  const auto read = ReadAll(0);
+  ASSERT_EQ(read.size(), 4U);
+  EXPECT_EQ(KeyOf(read[3]), "d");
+}
+
+// FLUSHDB over several logs is one reservation: each log's Flushes are
+// one batch, the thread holds one reservation, and Complete publishes
+// every shard.
+TEST_F(ReservationTest, AFlushOverSeveralLogsIsOneReservation) {
+  auto config = Config(4);
+  config.log_count = 2;
+  OpenWith(config);
+  ASSERT_TRUE(queue_->Append(1, Write("before")).has_value());
+  std::vector<core::QueueEntry> flushes(4);
+  std::vector<ShardEntries> parts;
+  for (core::ShardId shard = 0; shard < 4; ++shard) {
+    flushes[shard] = core::QueueEntry{.appended_at = kStamp, .payload = core::entry::Flush{}};
+    parts.push_back({.shard = shard, .entries = std::span(&flushes[shard], 1)});
+  }
+  auto reserved = queue_->ReserveFlush(parts);
+  ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
+  EXPECT_EQ(ReservationsHeld(), 1U);
+  EXPECT_EQ(queue_->ReadyToComplete(0), 1U);
+  EXPECT_EQ(queue_->ReadyToComplete(1), 1U);
+  ASSERT_EQ(reserved->ranges().size(), 4U);
+  for (const ReservedRange& range : reserved->ranges()) {
+    EXPECT_EQ(range.first, range.shard == 1 ? 1U : 0U) << range.shard;
+  }
+
+  queue_->Complete(std::move(*reserved));
+  EXPECT_EQ(ReservationsHeld(), 0U);
+  for (core::ShardId shard = 0; shard < 4; ++shard) {
+    const auto read = ReadAll(shard);
+    ASSERT_FALSE(read.empty()) << shard;
+    EXPECT_TRUE(std::holds_alternative<core::entry::Flush>(read.back().payload)) << shard;
+  }
+}
+
+TEST_F(ReservationTest, AFlushReservationTakesOnlyFlushesOfEveryShard) {
+  OpenWith(Config(2));
+  std::vector<core::QueueEntry> flush{
+      core::QueueEntry{.appended_at = kStamp, .payload = core::entry::Flush{}}};
+  std::vector<core::QueueEntry> write{Write("a")};
+  const auto refused = [this](std::span<const ShardEntries> parts) {
+    auto reserved = queue_->ReserveFlush(parts);
+    return !reserved.has_value() && reserved.error().code() == core::ErrorCode::kInvalidArgument;
+  };
+  EXPECT_TRUE(refused(std::array{ShardEntries{.shard = 0, .entries = flush}}));
+  EXPECT_TRUE(refused(std::array{ShardEntries{.shard = 0, .entries = flush},
+                                 ShardEntries{.shard = 1, .entries = write}}));
+  EXPECT_EQ(PublishedEnd(0), 0U);
+}
+
 // Two reservations on one shard, completed in reverse order, publish in
 // seq order: the later one's Complete waits for the earlier one.
 TEST_F(ReservationTest, ReservationsPublishInSeqOrderWhenCompletedInReverse) {
