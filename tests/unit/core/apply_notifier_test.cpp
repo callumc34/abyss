@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/core/types.h"
+
 namespace abyss::core {
 namespace {
 
@@ -27,23 +29,24 @@ TEST(AppliedSeqNotifierTest, LateAwaitAfterManyNotifiesStillReady) {
   EXPECT_EQ(notifier.PendingCount(), 0U);
 }
 
-// ENGINE-6: seq 0 is a real value distinct from the kNoSeqApplied sentinel. On a
-// fresh notifier, AwaitApplied(0, 0) is NOT ready; only a genuine
-// NotifyApplied(0, 0) makes it ready. No zero-seed false-ready.
-TEST(AppliedSeqNotifierTest, SeqZeroNotReadyUntilNotified) {
+// ENGINE-6: nothing applied reads as 0, which names no entry, so an
+// await of 0 is ready at once and one of the first seq waits for its
+// notify. No zero-seed false-ready.
+TEST(AppliedSeqNotifierTest, TheFirstSeqIsNotReadyUntilNotified) {
   AppliedSeqNotifier notifier(AppliedSeqNotifierConfig{.shard_count = 1});
-  EXPECT_EQ(notifier.AppliedSeq(0), kNoSeqApplied);
+  EXPECT_EQ(notifier.AppliedSeq(0), 0U);
+  EXPECT_EQ(notifier.AwaitApplied(0, 0).wait_for(0ms), std::future_status::ready);
 
-  auto fut = notifier.AwaitApplied(0, 0);
+  auto fut = notifier.AwaitApplied(0, kFirstSeq);
   EXPECT_EQ(fut.wait_for(0ms), std::future_status::timeout);
   EXPECT_EQ(notifier.PendingCount(), 1U);
 
-  notifier.NotifyApplied(0, 0);
+  notifier.NotifyApplied(0, kFirstSeq);
   EXPECT_EQ(fut.wait_for(1s), std::future_status::ready);
-  EXPECT_EQ(notifier.AppliedSeq(0), 0U);
+  EXPECT_EQ(notifier.AppliedSeq(0), kFirstSeq);
 
-  // A subsequent await at seq 0 is now immediately ready.
-  auto again = notifier.AwaitApplied(0, 0);
+  // A later await at the first seq is now immediately ready.
+  auto again = notifier.AwaitApplied(0, kFirstSeq);
   EXPECT_EQ(again.wait_for(0ms), std::future_status::ready);
 }
 

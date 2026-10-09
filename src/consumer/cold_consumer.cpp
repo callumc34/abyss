@@ -275,6 +275,7 @@ core::Result<void> ColdConsumer::SeedCursor() {
 size_t ColdConsumer::ConsumeBatch(std::span<const core::QueueEntry> batch) {
   size_t consumed = 0;
   for (const auto& entry : batch) {
+    ABYSS_DCHECK(entry.seq >= core::kFirstSeq, "cold consumed an entry at seq 0");
     // Handlers see the cursor past the entry they are applying.
     next_read_seq_ = entry.seq + 1;
     const bool applied = std::visit(
@@ -306,7 +307,7 @@ size_t ColdConsumer::ConsumeBatch(std::span<const core::QueueEntry> batch) {
     // pinned below it, so the commit (and WAL retention) does too (XERR-5).
     const core::SequenceId poison = oldest_poison_seq_.load(std::memory_order_acquire);
     core::SequenceId frontier = entry.seq;
-    if (poison != kNoPoison) frontier = poison == 0 ? 0 : std::min(entry.seq, poison - 1);
+    if (poison != kNoPoison) frontier = std::min(entry.seq, poison - 1);
     latest_drained_seq_.store(frontier, std::memory_order_release);
     ++consumed;
   }
@@ -510,8 +511,7 @@ void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
     pending_conditionals_.erase(resolved.ref);
   }
   // Drop if the Conditional ref lives on the wiped side of a Flush.
-  const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
-  if (flush_high > 0 && resolved.ref < flush_high) return;
+  if (resolved.ref < latest_flush_seq_.load(std::memory_order_acquire)) return;
   if (resolved.decision != core::Decision::kApply) return;
   const uint64_t appended_at_ms = AppendedAtMs(entry);
   for (const auto& cmd : resolved.materialised_ops) {
@@ -982,21 +982,10 @@ bool ColdConsumer::MaybeCheckpoint(core::SequenceId up_to, bool force) {
 }
 
 void ColdConsumer::TryAdvanceCommit(bool force_checkpoint) {
-  // Nothing consumed and nothing committed: there is no seq to commit.
-  if (next_read_seq_ == 0) return;
-
   const auto oldest_unflushed = buffer_.OldestPendingSeq();
   const auto oldest_pending_cond = OldestPendingConditional();
   const auto poison = oldest_poison_seq_.load(std::memory_order_acquire);
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
-
-  // Unsigned seq space has no "before 0": a commit below seq 0 cannot be
-  // expressed, so an unfinished entry at seq 0 holds the commit back.
-  if (oldest_unflushed.has_value() && *oldest_unflushed == 0) return;
-  if (oldest_pending_cond.has_value() && *oldest_pending_cond == 0) return;
-  // A poison at seq 0 pins the whole shard at the floor: nothing can be
-  // committed without passing the un-materialised entry (XERR-5).
-  if (poison == 0) return;
 
   // Low-water target: every seq <= this has been flushed to cold's memtable
   // (entries still in the buffer pin `oldest_unflushed`; a failed apply is
@@ -1034,16 +1023,11 @@ void ColdConsumer::TryAdvanceCommit(bool force_checkpoint) {
     counters_.commit_failures.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (*durable_end == 0) return;
+  ABYSS_DCHECK(*durable_end >= core::kFirstSeq, "a durable end below the first seq");
   target = std::min(target, *durable_end - 1);
 
-  if (committed_.has_value() && target <= *committed_) return;
-  // The checkpoint frontier's 0 is ambiguous ("seq 0" or "nothing yet").
-  // With nothing committed, wait for a checkpoint above 0 to commit seq 0.
-  if (!committed_.has_value() && target == 0 &&
-      last_checkpointed_seq_.load(std::memory_order_acquire) == 0) {
-    return;
-  }
+  // A clamp leaves 0, "none", when nothing below it is done.
+  if (target == 0 || (committed_.has_value() && target <= *committed_)) return;
 
   if (auto commit = queue_.CommitOffset(core::kColdConsumer, shard_, target); !commit.has_value()) {
     counters_.commit_failures.fetch_add(1, std::memory_order_relaxed);

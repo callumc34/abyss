@@ -65,7 +65,8 @@ struct Entry {
 
   // Marks a deleted key whose delete cold may not have absorbed yet.
   bool tombstoned = false;
-  // Seq of the last write applied to the key; loaded state carries 0.
+  // Seq of the last write applied to the key; loaded state carries 0,
+  // which every drain horizon covers.
   core::SequenceId latest_seq = 0;
   // ApproximateBytes(), kept current as the value changes.
   size_t bytes = 0;
@@ -242,10 +243,11 @@ class SingleShardStore {
   // keys cold has drained (latest_seq <= `horizon`) are evicted to make
   // room.
   core::Result<core::RespValue> Apply(const core::ops::WriteOp& op, core::EvictionTTL eviction,
-                                      core::SequenceId seq = 0,
+                                      core::SequenceId seq = core::kFirstSeq,
                                       core::SequenceId horizon = kAllDrained);
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops, core::EvictionTTL eviction,
-                                core::SequenceId seq = 0, core::SequenceId horizon = kAllDrained);
+                                core::SequenceId seq = core::kFirstSeq,
+                                core::SequenceId horizon = kAllDrained);
 
   // `horizon` is the shard's cold drained seq, read under the lock;
   // TTL expiry is judged at `now_ms`.
@@ -325,12 +327,14 @@ class SingleShardStore {
   core::MemoryStats Stats() const;
   // Clears entries, stubs and placeholders for a Flush at `seq`.
   void Wipe(core::SequenceId seq);
-  // A miss is absent until cold drains the last Flush.
+  // A miss is absent until cold drains the last Flush; with none,
+  // flush_seq_ is 0 and no horizon is below it.
   bool KnownAbsentAfterFlush(core::SequenceId horizon) const { return horizon < flush_seq_; }
 
   struct ReadAnswer {
     core::Result<core::RespValue> result;
-    // What the reply must be durable through; nullopt on a miss.
+    // What the reply must be durable through; nullopt on a miss. Loaded
+    // state's 0 is durable already.
     std::optional<core::SequenceId> fence;
   };
   // Exec of a single-key read, fenced on the answering entry's
@@ -338,9 +342,6 @@ class SingleShardStore {
   // op's shape, as does a miss under the flush floor, fenced on the
   // Flush. Only a key with no entry misses.
   ReadAnswer Read(const core::ops::ReadOp& op, core::SequenceId horizon) const;
-  // What a reply that observed `seq` waits for: loaded state carries 0
-  // too, so a 0 needs no wait unless a write here was at seq 0.
-  std::optional<core::SequenceId> FenceFor(core::SequenceId seq) const;
 
   // While set, applies move what they replace or remove into
   // `graveyard` instead of freeing it.
@@ -454,10 +455,10 @@ class SingleShardStore {
   std::unordered_map<std::string, LoadToken> loading_;
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
+  // The last Flush's seq; 0 for none.
   core::SequenceId flush_seq_ = 0;
   // Set while ApplyEffects runs.
   bool applying_effects_ = false;
-  bool applied_seq_zero_ = false;
   core::WallTime last_appended_at_{};
   Graveyard* graveyard_ = nullptr;
   uint64_t entry_bytes_ = 0;

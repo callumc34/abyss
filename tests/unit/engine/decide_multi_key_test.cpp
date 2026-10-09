@@ -14,6 +14,7 @@
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/predicate.h"
+#include "abyss/core/types.h"
 #include "abyss/engine/decide.h"
 #include "abyss/hot/single_shard_store.h"
 #include "decide_fixture.h"
@@ -441,7 +442,7 @@ TEST_F(DecideApplyTest, RenamenxAndCopyRecreateEveryType) {
     for (const uint64_t ttl : {uint64_t{0}, static_cast<uint64_t>(kTtl)}) {
       for (const std::string_view mode : {"RENAMENX", "COPY", "COPY REPLACE"}) {
         SCOPED_TRACE(source.name + (ttl > 0 ? " with TTL, " : ", ") + std::string(mode));
-        store_.Wipe(0);
+        store_.Wipe(core::kFirstSeq);
         Seed(source.op);
         if (ttl > 0) Seed(ops::Expire{.key = "src", .abs_ttl_ms = ttl});
         const bool replace = mode == "COPY REPLACE";

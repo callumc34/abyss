@@ -52,7 +52,8 @@ class Sequencer {
   // FLUSHDB: a Flush per shard, every shard wiped under its lock.
   core::Result<core::RespValue> Flush();
   // Waits until each shard's seq is durable at the ack class: a reply
-  // that observed it may otherwise show a write not yet published.
+  // that observed it may otherwise show a write not yet published. A 0,
+  // loaded state's, is below every durable end, so returns at once.
   core::Result<void> Fence(std::span<const ShardSeq> fences, core::SteadyTime deadline);
 
   SequencerStats Snapshot() const;

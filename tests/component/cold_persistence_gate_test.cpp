@@ -55,6 +55,7 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr auto kWait = 5s;
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 
 // Holds every WAL flush until released, but for those allowed through.
 class FlushStall {
@@ -308,7 +309,7 @@ TEST_F(ColdPersistenceGateTest, StalledFlushKeepsAbsorbedWritesOutOfCold) {
     return consumer.Snapshot().durability_waits_timed_out >= 2;
   })) << "the aggressive flush never reached the persistence gate";
 
-  EXPECT_EQ(PowerEnd(0), 0U);
+  EXPECT_EQ(PowerEnd(0), kFirst);
   EXPECT_EQ(consumer.Buffer().Size(), static_cast<size_t>(kKeys));
   for (int i = 0; i < kKeys; ++i) {
     EXPECT_EQ(ReadCold(*cold_, "k" + std::to_string(i)), std::nullopt)
@@ -541,7 +542,7 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
   ASSERT_NO_FATAL_FAILURE(OpenCold(kShards));
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     EXPECT_EQ(PowerEnd(shard), durable_end[shard]) << "shard " << shard;
-    auto recovered = queue_->Read(shard, 0, 16, 0ms, core::Durability::kPowerLoss);
+    auto recovered = queue_->Read(shard, kFirst, 16, 0ms, core::Durability::kPowerLoss);
     ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
     EXPECT_EQ(recovered->size(), 2U) << "shard " << shard;
     EXPECT_EQ(ReadCold(*cold_, key("a", shard)), "a");
@@ -595,7 +596,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     return "k" + std::to_string(shard) + "_" + std::to_string(seq % kKeys);
   };
   const auto next_entry = [&](core::ShardId shard, char tag) {
-    const core::SequenceId seq = written[shard].size();
+    const core::SequenceId seq = kFirst + written[shard].size();
     const std::string digits = std::to_string(values++);
     std::string value = tag + std::string(8 - digits.size(), '0') + digits;
     written[shard].push_back(value);
@@ -604,12 +605,12 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   const auto append_rows = [&](size_t rows) {
     for (size_t r = 0; r < rows; ++r) {
       for (core::ShardId shard = 0; shard < kShards; ++shard) {
-        const core::SequenceId seq = written[shard].size();
+        const core::SequenceId seq = kFirst + written[shard].size();
         ASSERT_EQ(Append(shard, next_entry(shard, 'w')), seq);
       }
     }
     for (core::ShardId shard = 0; shard < kShards; ++shard) {
-      ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, written[shard].size() - 1));
+      ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, kFirst + written[shard].size() - 1));
     }
   };
   // Cold takes in and commits everything durable; retention then
@@ -618,7 +619,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     for (auto& consumer : consumers_) {
       consumer->Drain();
       EXPECT_EQ(consumer->Flush(), ColdConsumer::FlushOutcome::kProgress);
-      ASSERT_EQ(ColdCommit(consumer->Shard()), written[consumer->Shard()].size() - 1);
+      ASSERT_EQ(ColdCommit(consumer->Shard()), kFirst + written[consumer->Shard()].size() - 1);
     }
     ASSERT_TRUE(queue_->FlushOffsets().has_value());
     ASSERT_TRUE(queue_->FlushOffsets().has_value());
@@ -635,7 +636,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     ASSERT_NO_FATAL_FAILURE(append_rows(step));
   }
   ASSERT_NO_FATAL_FAILURE(absorb_and_reclaim());
-  ASSERT_GT(queue_->FirstSeq(0).value(), 0U) << "retention reclaimed nothing";
+  ASSERT_GT(queue_->FirstSeq(0).value(), kFirst) << "retention reclaimed nothing";
 
   // Each segment end crossed from here is reclaimed at once, so the
   // pool never runs dry and every spare prepared is a recycled file.
@@ -662,7 +663,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   const core::SequenceId x = Append(1, next_entry(1, 'w'));
   ASSERT_TRUE(stall_.AwaitEntered(1));
   const core::SequenceId y = Append(2, next_entry(2, 'w'));
-  const core::SequenceId batch_first = written[0].size();
+  const core::SequenceId batch_first = kFirst + written[0].size();
   std::vector<core::QueueEntry> batch_entries;
   batch_entries.reserve(5);
   for (int i = 0; i < 5; ++i) batch_entries.push_back(next_entry(0, 'w'));
@@ -688,7 +689,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   ASSERT_EQ(extent.offset, before.offset + (3 * frame_bytes)) << "D is not inside the batch";
   std::vector<core::SequenceId> durable_end(kShards);
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
-    durable_end[shard] = shard == 0 ? batch_first : written[shard].size();
+    durable_end[shard] = shard == 0 ? batch_first : kFirst + written[shard].size();
   }
 
   // Everything past D is a frame of an earlier generation, lined up
@@ -763,17 +764,20 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     for (const auto& entry : *recovered) {
       const auto* write = std::get_if<core::entry::Write>(&entry.payload);
       ASSERT_NE(write, nullptr) << "seq " << entry.seq;
-      const std::vector<std::string> want{"SET", key(shard, entry.seq), written[shard][entry.seq]};
+      const std::vector<std::string> want{"SET", key(shard, entry.seq),
+                                          written[shard][entry.seq - kFirst]};
       EXPECT_EQ(write->cmd.args, want) << "seq " << entry.seq;
     }
 
     auto& consumer = AddConsumer(shard, AggressiveConfig());
     auto replayed = consumer.ReplayUntil(end - 1, cancel);
     ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+    std::vector<std::optional<std::string>> want(kKeys);
+    for (core::SequenceId seq = kFirst; seq < end; ++seq) {
+      want[seq % kKeys] = written[shard][seq - kFirst];
+    }
     for (core::SequenceId k = 0; k < kKeys; ++k) {
-      std::optional<std::string> want;
-      for (core::SequenceId seq = k; seq < end; seq += kKeys) want = written[shard][seq];
-      EXPECT_EQ(ReadCold(*cold_, key(shard, k)), want) << key(shard, k);
+      EXPECT_EQ(ReadCold(*cold_, key(shard, k)), want[k]) << key(shard, k);
     }
     const auto committed = ColdCommit(shard);
     EXPECT_TRUE(committed.has_value() && *committed < end);

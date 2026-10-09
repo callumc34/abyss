@@ -12,7 +12,9 @@
 #include <vector>
 
 #include "abyss/core/durability.h"
+#include "abyss/core/fatal.h"
 #include "abyss/core/queue_entry.h"
+#include "abyss/core/types.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
@@ -157,7 +159,9 @@ core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>&
     auto durable = queue_.DurableEnd(s, core::Durability::kProcessCrash);
     if (!durable.has_value()) return std::unexpected(durable.error());
     end[s] = *durable;
-    target[s] = end[s] > 0 ? end[s] - 1 : 0;
+    ABYSS_DCHECK(end[s] >= core::kFirstSeq, "a durable end below the first seq");
+    // The last seq to replay; 0 for none.
+    target[s] = end[s] - 1;
     auto retained = queue_.FirstSeq(s);
     if (!retained.has_value()) return std::unexpected(retained.error());
     first[s] = *retained;
@@ -214,7 +218,7 @@ core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>&
   };
 
   for (uint32_t s = 0; s < shards; ++s) {
-    const bool empty = end[s] == 0;
+    const bool empty = end[s] == core::kFirstSeq;
     submit_replay(s, [this, s, empty, &cancel, &expect_none]() -> core::Result<void> {
       consumer::ColdConsumer& cold = cold_pool_.ConsumerFor(s);
       if (auto finished = cold.FinishReplay(cancel); !finished.has_value()) return finished;

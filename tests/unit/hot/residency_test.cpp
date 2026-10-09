@@ -13,6 +13,7 @@
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
 #include "latch.h"
@@ -134,7 +135,7 @@ std::vector<ApplyKindCase> ApplyKindCases() {
 TEST_F(ResidencyTest, EveryApplyKindStampsLatestSeq) {
   for (const auto& c : ApplyKindCases()) {
     SCOPED_TRACE(c.name);
-    store_.Wipe(0);
+    store_.Wipe(core::kFirstSeq);
     for (const auto& op : c.setup) Write(op, 1);
     Write(c.op, 5);
     if (c.tombstones) {
@@ -417,6 +418,25 @@ TEST_F(ResidencyTest, InstalledStateIsAlreadyDrained) {
   const LoadToken token = MustBeginLoad(store_, "k");
   ASSERT_TRUE(store_.CompleteLoad("k", token, LoadedString("v"), kShortEviction, kAllDrained));
   EXPECT_EQ(EvictAfterDeadline(0).by_deadline, 1U) << "latest_seq 0 is evictable at any horizon";
+}
+
+// Seqs start at kFirstSeq, so a horizon of 0 drains nothing: a shard's
+// first write stays through every eviction pass until cold drains it,
+// while loaded state, at 0, is evictable at once.
+TEST_F(ResidencyTest, AFirstWriteWaitsForItsDrainWhileLoadedStateDoesNot) {
+  constexpr core::SequenceId kNothingDrained = 0;
+  const LoadToken token = MustBeginLoad(store_, "loaded");
+  ASSERT_TRUE(store_.CompleteLoad("loaded", token, LoadedString("v"), kShortEviction, kAllDrained));
+  Set("first", core::kFirstSeq);
+
+  EXPECT_EQ(store_.EvictLru(0, kNothingDrained), 1U);
+  EXPECT_FALSE(Resident("loaded"));
+  EXPECT_TRUE(Resident("first"));
+  EXPECT_EQ(EvictAfterDeadline(kNothingDrained).Total(), 0U);
+  EXPECT_TRUE(Resident("first"));
+
+  EXPECT_EQ(store_.EvictExpired(clock_.SteadyNow(), core::kFirstSeq).by_deadline, 1U);
+  EXPECT_FALSE(Resident("first"));
 }
 
 TEST_F(ResidencyTest, AbsentLoadInstallsADrainedTombstone) {
@@ -995,6 +1015,53 @@ TEST_F(ShardedResidencyTest, NoLoadBeginsUnderTheFlushFloor) {
   horizon_ = 10;
   EXPECT_TRUE(store_.BeginLoad("k").started());
   EXPECT_TRUE(store_.LoadPending("k"));
+}
+
+// BeginLoad reads the drain horizon under the shard lock, so a Flush
+// racing it lands wholly before (no load begins under the floor) or
+// wholly after (its Wipe drops the placeholder): the load's pre-Flush
+// state is never installed.
+TEST(ShardedResidencyFloorTest, ALoadRacingAFlushNeverInstallsPreFlushState) {
+  constexpr core::SequenceId kFlushSeq = 10;
+  abyss::testing::TestClock clock;
+  std::function<void()> on_horizon;
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 1024UL * 1024,
+      .shard_count = 1,
+      .drained = [&on_horizon](core::ShardId) -> core::SequenceId {
+        if (on_horizon) std::exchange(on_horizon, nullptr)();
+        return 0;
+      },
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  std::atomic<bool> flushed{false};
+  std::thread flusher;
+  const abyss::testing::OnExit join([&flusher] {
+    if (flusher.joinable()) flusher.join();
+  });
+  on_horizon = [&] {
+    flusher = std::thread([&] {
+      EXPECT_TRUE(store.Wipe(0, kFlushSeq).has_value());
+      flushed = true;
+    });
+    const auto until = core::SteadyClock::now() + 100ms;
+    while (!flushed && core::SteadyClock::now() < until) std::this_thread::sleep_for(1ms);
+    EXPECT_FALSE(flushed) << "the horizon was read outside the shard lock";
+  };
+
+  const LoadStart start = store.BeginLoad("k");
+  flusher.join();
+  ASSERT_TRUE(flushed);
+  if (start.started()) {
+    EXPECT_FALSE(store.CompleteLoad("k", start.token, MakeLoadedFull(std::string("old"), 0)));
+  } else {
+    EXPECT_EQ(start.status, LoadStart::Status::kFlushed);
+  }
+  const auto read = store.Read(ops::ReadOp{ops::StringGet{.key = "k"}});
+  ASSERT_TRUE(read.result.has_value());
+  EXPECT_TRUE(read.result->IsNull()) << "pre-Flush state was installed";
+  EXPECT_EQ(read.fence, kFlushSeq);
 }
 
 TEST_F(ShardedResidencyTest, CompleteLoadsForwardsInOneHold) {

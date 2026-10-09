@@ -162,7 +162,7 @@ class Resolver {
   // Replay or Run thread state, never both at once: the next seq to read and
   // the last committed offset.
   bool cursor_seeded_ = false;
-  core::SequenceId next_read_seq_ = 0;
+  core::SequenceId next_read_seq_ = core::kFirstSeq;
   std::optional<core::SequenceId> committed_;
 
   std::atomic<core::SequenceId> latest_drained_seq_{0};

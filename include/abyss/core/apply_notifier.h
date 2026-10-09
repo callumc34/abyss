@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -14,10 +13,6 @@
 #include "abyss/core/types.h"
 
 namespace abyss::core {
-
-// "Nothing applied yet" sentinel. Distinct from a real applied seq of 0 so
-// AwaitApplied(shard, 0) is ready only after a genuine NotifyApplied(shard, 0).
-inline constexpr SequenceId kNoSeqApplied = std::numeric_limits<SequenceId>::max();
 
 struct AppliedSeqNotifierConfig {
   uint32_t shard_count = 1;
@@ -41,8 +36,9 @@ class AppliedSeqNotifier {
   AppliedSeqNotifier(AppliedSeqNotifier&&) = delete;
   AppliedSeqNotifier& operator=(AppliedSeqNotifier&&) = delete;
 
-  // Ready iff applied_seq != kNoSeqApplied && applied_seq >= seq, else returns a
-  // future fulfilled by a later NotifyApplied(shard, s) with s >= seq.
+  // Ready iff applied_seq >= seq, else returns a future fulfilled by a
+  // later NotifyApplied(shard, s) with s >= seq. applied_seq is 0 until
+  // something applies, so an await of 0, which names no entry, is ready.
   std::future<void> AwaitApplied(ShardId shard, SequenceId seq);
   void NotifyApplied(ShardId shard, SequenceId seq);
   bool Cancel(ShardId shard, SequenceId seq);
@@ -52,7 +48,7 @@ class AppliedSeqNotifier {
 
  private:
   struct Shard {
-    std::atomic<SequenceId> applied_seq{kNoSeqApplied};
+    std::atomic<SequenceId> applied_seq{0};
     mutable std::mutex mu;
     std::multimap<SequenceId, std::promise<void>> waiters ABYSS_GUARDED_BY(mu);
   };

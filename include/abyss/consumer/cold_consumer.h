@@ -317,9 +317,10 @@ class ColdConsumer {
   bool wipe_awaits_durability_ = false;
   // Set by the first timed-out durability wait of a run of them.
   bool durability_wait_logged_ = false;
-  core::SequenceId next_read_seq_ = 0;
+  core::SequenceId next_read_seq_ = core::kFirstSeq;
   std::optional<core::SequenceId> committed_;
 
+  // 0 until something drains.
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   // Mirror of committed_ for Snapshot(); 0 when nothing is committed.
   std::atomic<core::SequenceId> last_commit_seq_{0};

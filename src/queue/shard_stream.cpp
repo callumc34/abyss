@@ -56,6 +56,7 @@ class ShardStream::Publisher final : public AppendPublisher {
     if (!lock_.owns_lock()) return;
     // A reservation before this append may not have completed.
     stream_.AwaitPublished(first_);
+    ABYSS_DCHECK(first_ >= core::kFirstSeq, "a publish from seq 0");
     stream_.published_end_.store(end_, std::memory_order_seq_cst);
     lock_.unlock();
     // A flush may have covered these frames before they were published.
@@ -149,6 +150,16 @@ ShardStream::~ShardStream() {
 
 core::Result<void> ShardStream::Recover(const RecoveredFrame& frame) {
   const core::SequenceId seq = frame.header.seq;
+  if (seq < core::kFirstSeq) {
+    // Only builds of the unreleased format before seqs started at 1
+    // wrote one, so wiping is the remedy, not a migration.
+    return std::unexpected(core::Error{
+        core::ErrorCode::kCorruption,
+        "WAL log " + std::to_string(config_.unit->id) + ": shard " + std::to_string(config_.shard) +
+            " has a frame with seq 0 at position " + std::to_string(frame.pos) +
+            ", written by an earlier build of an unreleased WAL format: delete the data "
+            "directory (queue.wal_path and cold.data_path) and start empty"});
+  }
   if (recovered_next_.has_value() && seq != *recovered_next_) {
     return std::unexpected(core::Error{
         core::ErrorCode::kCorruption,
@@ -164,6 +175,7 @@ core::Result<void> ShardStream::Recover(const RecoveredFrame& frame) {
 }
 
 void ShardStream::FinishRecovery(core::SequenceId next) {
+  ABYSS_DCHECK(next >= core::kFirstSeq, "a shard's next seq is 0");
   const std::scoped_lock lock(append_mu_);
   next_seq_ = next;
   first_seq_.store(recovered_first_.value_or(next), std::memory_order_release);
@@ -264,6 +276,7 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
     if (config_.window != nullptr) config_.window->Add(total);
     config_.unit->age.Start(DurabilityWindow::Clock::now());
     const core::SequenceId first = next_seq_;
+    ABYSS_DCHECK(first >= core::kFirstSeq, "a frame assigned seq 0");
     uint64_t off = 0;
     for (std::size_t i = 0; i < entries.size(); ++i) {
       entries[i].seq = first + i;
@@ -390,6 +403,7 @@ core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
     ShardStream& stream = *group.streams[p];
     const ShardEntries& part = group.parts[p];
     const core::SequenceId first = stream.next_seq_;
+    ABYSS_DCHECK(first >= core::kFirstSeq, "a frame assigned seq 0");
     for (std::size_t i = 0; i < part.entries.size(); ++i, ++k) {
       core::QueueEntry& entry = part.entries[i];
       const core::SequenceId seq = first + i;
@@ -474,6 +488,7 @@ void ShardStream::AwaitPublished(core::SequenceId first) noexcept {
 // As the Publisher's, only allocation can throw here.
 // NOLINTNEXTLINE(bugprone-exception-escape)
 void ShardStream::PublishInOrder(core::SequenceId first, core::SequenceId end) noexcept {
+  ABYSS_DCHECK(first >= core::kFirstSeq, "a publish from seq 0");
   AwaitPublished(first);
   // Only the publisher of `first` stores now, so the end never regresses.
   published_end_.store(end, std::memory_order_seq_cst);
@@ -537,6 +552,7 @@ bool ShardStream::AwaitDurable(core::SequenceId seq, core::Durability durability
 }
 
 bool ShardStream::Durable(core::SequenceId end) noexcept {
+  ABYSS_DCHECK(end > core::kFirstSeq, "a durable batch ends at seq 0");
   flushed_end_.store(end, std::memory_order_seq_cst);
   return RaisePowerEnd();
 }

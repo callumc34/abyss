@@ -81,7 +81,8 @@ loop:
     1. Drain: queue.Read(shard, next_read_seq, max_count, short_timeout,
                          ack durability class)
        - next_read_seq is the consumer's own position: committed offset + 1
-         on start, then one past the last entry read
+         on start (the first seq, 1, with nothing committed), then one past
+         the last entry read
        - Decode each QueueEntry (Write / Conditional / Resolved-apply)
        - Parse its RESP command into a typed WriteOp
        - Expand multi-key ops (DEL, MSET) into per-key absorbs

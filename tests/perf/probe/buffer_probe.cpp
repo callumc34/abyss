@@ -10,6 +10,7 @@
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/result.h"
+#include "abyss/core/types.h"
 #include "common.h"
 #include "workload.h"
 
@@ -69,7 +70,7 @@ int main(int argc, char** argv) {
         .abs_ttl_ms = 0,
     };
     abyss::core::ops::WriteOp op = set_op;
-    const auto seq = static_cast<abyss::core::SequenceId>(i);
+    const auto seq = abyss::core::kFirstSeq + static_cast<abyss::core::SequenceId>(i);
     buffer.Absorb(key, op, abyss::core::EvictionTTL{86400}, seq, seq, 0);
   }
 

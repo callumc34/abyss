@@ -31,6 +31,7 @@
 #include "abyss/metrics/testing.h"
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/frame.h"
+#include "abyss/queue/log.h"
 #include "abyss/queue/offset_checkpoint.h"
 #include "abyss/queue/wal_queue.h"
 #include "latch.h"
@@ -46,6 +47,7 @@ using abyss::testing::Latch;
 // A few small frames per segment, past its 4 KiB header.
 constexpr size_t kTinySegment = 4096 + 512;
 constexpr auto kAck = core::Durability::kProcessCrash;
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 
 core::QueueEntry MakeWrite(const std::string& key, const std::string& value = "v") {
   return core::QueueEntry{
@@ -181,7 +183,7 @@ TEST_F(WalQueueStreamsTest, FourLogsRouteReopenAndReclaimPerLog) {
   for (int round = 0; round < 12; ++round) {
     for (core::ShardId shard = 0; shard < kShards; ++shard) Append(shard, std::to_string(round));
   }
-  for (core::ShardId shard = 0; shard < kShards; ++shard) AwaitPowerDurable(shard, 11);
+  for (core::ShardId shard = 0; shard < kShards; ++shard) AwaitPowerDurable(shard, kFirst + 11);
   for (uint32_t log = 0; log < 4; ++log) {
     EXPECT_TRUE(std::filesystem::exists(dir_.Path() / ("log-000" + std::to_string(log))));
     const auto sealed = queue_->ListSealedSegments(log, 1000);
@@ -193,15 +195,15 @@ TEST_F(WalQueueStreamsTest, FourLogsRouteReopenAndReclaimPerLog) {
 
   OpenWith(config);
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
-    const auto entries = ReadAll(shard, 0);
+    const auto entries = ReadAll(shard, kFirst);
     ASSERT_EQ(entries.size(), 12U) << "shard " << shard;
-    for (size_t i = 0; i < entries.size(); ++i) EXPECT_EQ(entries[i].seq, i);
+    for (size_t i = 0; i < entries.size(); ++i) EXPECT_EQ(entries[i].seq, kFirst + i);
   }
 
   // Log 1's shards stay pinned; the other logs reclaim everything
   // sealed.
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
-    if (shard % 4 != 1) CommitBoth(shard, 11);
+    if (shard % 4 != 1) CommitBoth(shard, kFirst + 11);
   }
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
   for (uint32_t log = 0; log < 4; ++log) {
@@ -210,12 +212,12 @@ TEST_F(WalQueueStreamsTest, FourLogsRouteReopenAndReclaimPerLog) {
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     const core::SequenceId first = queue_->FirstSeq(shard).value();
     if (shard % 4 == 1) {
-      EXPECT_EQ(first, 0U);
+      EXPECT_EQ(first, kFirst);
     } else {
-      EXPECT_GT(first, 0U) << "shard " << shard;
+      EXPECT_GT(first, kFirst) << "shard " << shard;
     }
     const auto entries = ReadAll(shard, first);
-    EXPECT_EQ(entries.size(), 12 - first) << "shard " << shard;
+    EXPECT_EQ(entries.size(), kFirst + 12 - first) << "shard " << shard;
   }
 }
 
@@ -225,23 +227,23 @@ TEST_F(WalQueueStreamsTest, AShardAbsentFromTheOldestSegmentKeepsItsFirstSeq) {
   OpenWith(Config(2));
   for (int i = 0; i < 12; ++i) Append(0);
   for (int i = 0; i < 3; ++i) Append(1);
-  AwaitPowerDurable(1, 2);
+  AwaitPowerDurable(1, kFirst + 2);
   const auto sealed = queue_->ListSealedSegments(0, 1);
   ASSERT_FALSE(sealed.empty());
   ASSERT_TRUE(
       std::ranges::none_of(sealed.front().shards, [](const auto& r) { return r.shard == 1; }));
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 0U);
-  EXPECT_EQ(ReadAll(1, 0).size(), 3U);
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst);
+  EXPECT_EQ(ReadAll(1, kFirst).size(), 3U);
 
-  CommitBoth(0, 11);
+  CommitBoth(0, kFirst + 11);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
-  EXPECT_GT(queue_->FirstSeq(0).value(), 0U);
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 0U);
-  EXPECT_EQ(ReadAll(1, 0).size(), 3U);
+  EXPECT_GT(queue_->FirstSeq(0).value(), kFirst);
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst);
+  EXPECT_EQ(ReadAll(1, kFirst).size(), 3U);
 
   OpenWith(Config(2));
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 0U);
-  EXPECT_EQ(ReadAll(1, 0).size(), 3U);
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst);
+  EXPECT_EQ(ReadAll(1, kFirst).size(), 3U);
 }
 
 // A2: shard 1 pins segment 0, so the later segments only shard 0 wrote
@@ -254,25 +256,25 @@ TEST_F(WalQueueStreamsTest, AStuckShardPinsTheLaterSegmentsAndFirstSeqStaysExact
   OpenWith(config);
   Append(1);
   for (int i = 0; i < 30; ++i) Append(0);
-  CommitBoth(0, 29);
+  CommitBoth(0, kFirst + 29);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
 
   const size_t sealed = queue_->ListSealedSegments().size();
   ASSERT_GE(sealed, 3U);
-  EXPECT_EQ(queue_->FirstSeq(0).value(), 0U);
-  EXPECT_EQ(ReadAll(0, 0).size(), 30U);
+  EXPECT_EQ(queue_->FirstSeq(0).value(), kFirst);
+  EXPECT_EQ(ReadAll(0, kFirst).size(), 30U);
   EXPECT_TRUE(queue_->OldestEligibleUnreapedAge().has_value())
       << "the held-back segments are reported";
 
-  CommitBoth(1, 0);
+  CommitBoth(1, kFirst);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
   EXPECT_TRUE(queue_->ListSealedSegments().empty());
   EXPECT_FALSE(queue_->OldestEligibleUnreapedAge().has_value());
   const core::SequenceId first = queue_->FirstSeq(0).value();
-  EXPECT_GT(first, 0U);
-  EXPECT_EQ(ReadAll(0, first).size(), 30 - first);
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 1U);
-  EXPECT_TRUE(ReadAll(1, 1).empty());
+  EXPECT_GT(first, kFirst);
+  EXPECT_EQ(ReadAll(0, first).size(), kFirst + 30 - first);
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst + 1);
+  EXPECT_TRUE(ReadAll(1, kFirst + 1).empty());
 }
 
 // Past a reclaim, the first retained frames have no index point of
@@ -283,7 +285,7 @@ TEST_F(WalQueueStreamsTest, AReadJustPastAReclaimStartsFromTheMovedFloor) {
   config.ring_entries = 4;
   OpenWith(config);
   for (int i = 0; i < 40; ++i) Append(0);
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, 39));
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, kFirst + 39));
   const auto oldest = queue_->ListSealedSegments(0, 2);
   ASSERT_EQ(oldest.size(), 2U);
   const core::SequenceId released = oldest[1].shards.front().max_seq;
@@ -322,15 +324,15 @@ TEST_F(WalQueueStreamsTest, ARingOverflowBetweenFlushesStillMovesThePowerEndExac
     futures.push_back(std::move(appended->durable));
   }
   ASSERT_TRUE(entered->Wait());
-  EXPECT_LT(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 100U);
+  EXPECT_LT(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 100);
 
   held->Open();
   for (auto& future : futures) {
     ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
     EXPECT_TRUE(future.get().has_value());
   }
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 100U);
-  auto read = queue_->Read(0, 0, 1000, 0ms, core::Durability::kPowerLoss);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 100);
+  auto read = queue_->Read(0, kFirst, 1000, 0ms, core::Durability::kPowerLoss);
   ASSERT_TRUE(read.has_value()) << read.error().message();
   EXPECT_EQ(read->size(), 100U);
 }
@@ -378,15 +380,15 @@ TEST_F(WalQueueStreamsTest, ABatchStraddlingAFlushIsHiddenUntilItsLastFrameIsDur
 
   // The next flush snapshots shard 2's frame and the batch's first.
   first_flush->Open();
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(2, 0));
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
-  EXPECT_FALSE(queue_->AwaitDurable(0, 0, core::Durability::kPowerLoss, 20ms).value());
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(2, kFirst));
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
+  EXPECT_FALSE(queue_->AwaitDurable(0, kFirst, core::Durability::kPowerLoss, 20ms).value());
 
   finish_batch->Open();
   auto appended = batch.get();
   ASSERT_TRUE(appended.has_value()) << appended.error().message();
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, 1));
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 2U);
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, kFirst + 1));
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 2);
 }
 
 // Must-fix 5: with the preparer stopped, appends that need a new
@@ -408,14 +410,14 @@ TEST_F(WalQueueStreamsTest, AnUnpublishedAppendIsHiddenAtPowerLossEvenOnceFlushe
   ASSERT_EQ(later->durable.wait_for(5s), std::future_status::ready);
   ASSERT_TRUE(later->durable.get().has_value());
 
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
   EXPECT_EQ(held->durable().wait_for(0s), std::future_status::timeout);
-  auto hidden = queue_->Read(0, 0, 8, 0ms, core::Durability::kPowerLoss);
+  auto hidden = queue_->Read(0, kFirst, 8, 0ms, core::Durability::kPowerLoss);
   ASSERT_TRUE(hidden.has_value()) << hidden.error().message();
   EXPECT_TRUE(hidden->empty());
 
   held->Publish();
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 1U)
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 1)
       << "a publish after the flush raises the power end itself";
   ASSERT_EQ(held->durable().wait_for(5s), std::future_status::ready);
   EXPECT_TRUE(held->durable().get().has_value());
@@ -453,8 +455,8 @@ TEST_F(WalQueueStreamsTest, NoSpareSegmentWaitsThenRejectsCleanly) {
   EXPECT_GE(metrics::testing::GetCounterValue(metrics::names::kWalSpareWaitsTotal).value_or(0),
             1.0);
   // Nothing of the refused append was assigned or written.
-  EXPECT_EQ(queue_->TailSeq(0).value(), accepted - 1);
-  EXPECT_EQ(queue_->DurableEnd(0, kAck).value(), accepted);
+  EXPECT_EQ(queue_->TailSeq(0).value(), kFirst + accepted - 1);
+  EXPECT_EQ(queue_->DurableEnd(0, kAck).value(), kFirst + accepted);
 
   waiting = std::async(std::launch::async, [this] {
     return queue_->Append(0, MakeWrite("k", "after"), std::chrono::steady_clock::now() + 10s);
@@ -464,8 +466,8 @@ TEST_F(WalQueueStreamsTest, NoSpareSegmentWaitsThenRejectsCleanly) {
   ASSERT_EQ(waiting.wait_for(10s), std::future_status::ready);
   auto after = waiting.get();
   ASSERT_TRUE(after.has_value()) << after.error().message();
-  EXPECT_EQ(after->seq, accepted);
-  const auto entries = ReadAll(0, 0);
+  EXPECT_EQ(after->seq, kFirst + accepted);
+  const auto entries = ReadAll(0, kFirst);
   ASSERT_EQ(entries.size(), accepted + 1);
 }
 
@@ -476,25 +478,25 @@ TEST_F(WalQueueStreamsTest, AFullyReclaimedShardKeepsItsNextSeqAcrossReopen) {
   OpenWith(Config(2));
   for (int i = 0; i < 3; ++i) Append(1);
   for (int i = 0; i < 30; ++i) Append(0);
-  CommitBoth(0, 29);
-  CommitBoth(1, 2);
+  CommitBoth(0, kFirst + 29);
+  CommitBoth(1, kFirst + 2);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
-  ASSERT_EQ(queue_->FirstSeq(1).value(), 3U) << "shard 1's frames were not reclaimed";
+  ASSERT_EQ(queue_->FirstSeq(1).value(), kFirst + 3) << "shard 1's frames were not reclaimed";
 
   OpenWith(Config(2));
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 3U);
-  EXPECT_EQ(queue_->TailSeq(1).value(), 2U);
-  EXPECT_EQ(Append(1), 3U);
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst + 3);
+  EXPECT_EQ(queue_->TailSeq(1).value(), kFirst + 2);
+  EXPECT_EQ(Append(1), kFirst + 3);
 
   // A later commit, persisted only at close, and that write tears.
-  CommitBoth(0, 29);
-  CommitBoth(1, 3);
+  CommitBoth(0, kFirst + 29);
+  CommitBoth(1, kFirst + 3);
   queue_.reset();
   ASSERT_NO_FATAL_FAILURE(TearNewestCheckpointSlot(2));
   OpenWith(Config(2));
   EXPECT_EQ(queue_->CommittedOffset(core::kColdConsumer, 1).value(),
-            std::optional<core::SequenceId>{2});
-  EXPECT_EQ(Append(1), 4U) << "the retained seq 3 still counts";
+            std::optional<core::SequenceId>{kFirst + 2});
+  EXPECT_EQ(Append(1), kFirst + 4) << "the retained seq still counts";
 }
 
 // A reclaim waits until both checkpoint slots hold the offsets it
@@ -504,18 +506,18 @@ TEST_F(WalQueueStreamsTest, ADamagedNewestSlotAfterAReclaimReusesNoSeq) {
   OpenWith(Config(2));
   for (int i = 0; i < 3; ++i) Append(1);
   for (int i = 0; i < 30; ++i) Append(0);
-  CommitBoth(0, 29);
-  CommitBoth(1, 2);
+  CommitBoth(0, kFirst + 29);
+  CommitBoth(1, kFirst + 2);
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 0U) << "reclaimed on one slot's word";
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst) << "reclaimed on one slot's word";
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
-  ASSERT_EQ(queue_->FirstSeq(1).value(), 3U) << "shard 1's frames were not reclaimed";
+  ASSERT_EQ(queue_->FirstSeq(1).value(), kFirst + 3) << "shard 1's frames were not reclaimed";
   queue_.reset();
   ASSERT_NO_FATAL_FAILURE(TearNewestCheckpointSlot(2));
 
   OpenWith(Config(2));
-  EXPECT_EQ(queue_->FirstSeq(1).value(), 3U);
-  EXPECT_GT(Append(1), 2U) << "a reclaimed seq was reused";
+  EXPECT_EQ(queue_->FirstSeq(1).value(), kFirst + 3);
+  EXPECT_GT(Append(1), kFirst + 2) << "a reclaimed seq was reused";
 }
 
 // A1 gap: the oldest retained frame lies above what a consumer
@@ -523,9 +525,9 @@ TEST_F(WalQueueStreamsTest, ADamagedNewestSlotAfterAReclaimReusesNoSeq) {
 TEST_F(WalQueueStreamsTest, AGapBelowTheFirstRetainedFrameIsCorruption) {
   OpenWith(Config(1));
   for (int i = 0; i < 30; ++i) Append(0);
-  CommitBoth(0, 29);
+  CommitBoth(0, kFirst + 29);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
-  ASSERT_GT(queue_->FirstSeq(0).value(), 1U);
+  ASSERT_GT(queue_->FirstSeq(0).value(), kFirst + 1);
   queue_.reset();
 
   // Both slots lose the offsets the reclaim relied on.
@@ -536,7 +538,8 @@ TEST_F(WalQueueStreamsTest, AGapBelowTheFirstRetainedFrameIsCorruption) {
         .consumers = {core::kHotConsumer, core::kColdConsumer},
     });
     ASSERT_TRUE(checkpoint.has_value()) << checkpoint.error().message();
-    const std::vector<uint64_t> low{OffsetCheckpoint::Encode(0), OffsetCheckpoint::Encode(0)};
+    const std::vector<uint64_t> low{OffsetCheckpoint::Encode(kFirst),
+                                    OffsetCheckpoint::Encode(kFirst)};
     ASSERT_TRUE((*checkpoint)->Write(low).has_value());
     ASSERT_TRUE((*checkpoint)->Write(low).has_value());
   }
@@ -545,6 +548,44 @@ TEST_F(WalQueueStreamsTest, AGapBelowTheFirstRetainedFrameIsCorruption) {
   ASSERT_FALSE(opened.has_value());
   EXPECT_EQ(opened.error().code(), core::ErrorCode::kCorruption);
   EXPECT_NE(opened.error().message().find("lost"), std::string::npos) << opened.error().message();
+}
+
+// Seqs start at kFirstSeq, so a frame with seq 0 comes only from an
+// earlier build of the unreleased format: Open refuses it, naming the
+// remedy.
+TEST_F(WalQueueStreamsTest, AFrameWithSeqZeroIsCorruption) {
+  const WalConfig config = Config(1);
+  OpenWith(config);
+  queue_.reset();
+  {
+    auto log = Log::Open(LogConfig{.dir = dir_.Path() / "log-0000",
+                                   .log_id = 0,
+                                   .shard_count = 1,
+                                   .segment_size_bytes = config.segment_size_bytes,
+                                   .durability_window_bytes = config.durability_window_bytes},
+                         {});
+    ASSERT_TRUE(log.has_value()) << log.error().message();
+    std::vector<std::byte> bytes;
+    frame::EncodeEntry(MakeWrite("k0"), 0, bytes);
+    frame::CloseBatch(bytes);
+    const auto size = static_cast<uint32_t>(bytes.size());
+    auto reserved = (*log)->Reserve(size);
+    if (!reserved.has_value() && reserved.error().code() == core::ErrorCode::kUnavailable) {
+      ASSERT_TRUE((*log)->WaitForSpare(std::chrono::steady_clock::now() + 5s));
+      reserved = (*log)->Reserve(size);
+    }
+    ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
+    (*log)->Commit(*reserved, bytes);
+    auto flushed = (*log)->Flush({});
+    ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
+  }
+
+  auto opened = WalQueue::Open(config);
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error().code(), core::ErrorCode::kCorruption);
+  const std::string& message = opened.error().message();
+  EXPECT_NE(message.find("seq 0"), std::string::npos) << message;
+  EXPECT_NE(message.find("queue.wal_path"), std::string::npos) << message;
 }
 
 std::string ReadBytes(const std::filesystem::path& path, uint64_t from) {
@@ -573,14 +614,14 @@ TEST_F(WalQueueStreamsTest, ANewCommitWordOverAStaleFrameIsACleanTornTail) {
   // One frame size throughout, so every life puts frames at one offset.
   const std::string value = "uniform";
   for (int i = 0; i < 40; ++i) Append(0, value);
-  CommitBoth(0, 39);
+  CommitBoth(0, kFirst + 39);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
-  ASSERT_GT(queue_->FirstSeq(0).value(), 0U);
+  ASSERT_GT(queue_->FirstSeq(0).value(), kFirst);
   const uint64_t active = OrdinalOf(queue_->DurableExtentForTesting(0).path);
 
   // Once the tail is two segments on, the next spare is a recycled
   // file.
-  core::SequenceId tail = 39;
+  core::SequenceId tail = kFirst + 39;
   for (int i = 0; i < 200 && OrdinalOf(queue_->DurableExtentForTesting(0).path) < active + 2; ++i) {
     tail = Append(0, value);
     ASSERT_FALSE(HasFatalFailure());
@@ -655,12 +696,12 @@ TEST_F(WalQueueStreamsTest, ARotationAddsNoSyncToTheAppendPath) {
   const core::SequenceId count = (4 * per_segment) + 1;
   for (core::SequenceId seq = 1; seq < count; ++seq) Append(0);
   ASSERT_FALSE(HasFatalFailure());
-  EXPECT_EQ(queue_->DurableEnd(0, kAck).value(), count) << "an append did not publish";
+  EXPECT_EQ(queue_->DurableEnd(0, kAck).value(), kFirst + count) << "an append did not publish";
   EXPECT_EQ(queue_->SyncCountForTesting(0), syncs) << "the append path synced";
-  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
+  EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
 
   held->Open();
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, count - 1));
+  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, kFirst + count - 1));
   const uint64_t to = OrdinalOf(queue_->DurableExtentForTesting(0).path);
   EXPECT_GE(to - from, 4U);
   EXPECT_GE(queue_->SyncCountForTesting(0) - syncs, to - from) << "a held segment was not synced";
@@ -806,19 +847,19 @@ TEST_F(WalQueueScanTest, ASinkErrorStopsTheScanAndIsReturned) {
   EXPECT_EQ(scanned.error().message(), "sink refused shard 7");
 
   // Retention ran on through the scan's end.
-  CommitBoth(0, 0);
+  CommitBoth(0, kFirst);
   EXPECT_TRUE(queue_->FlushOffsets().has_value());
 }
 
 TEST_F(WalQueueScanTest, ARangeBelowTheFirstRetainedSeqIsOutOfRange) {
   OpenWith(Config(1));
   for (int i = 0; i < 30; ++i) Append(0);
-  CommitBoth(0, 29);
+  CommitBoth(0, kFirst + 29);
   ASSERT_NO_FATAL_FAILURE(PersistAndReclaim());
   const core::SequenceId first = queue_->FirstSeq(0).value();
-  ASSERT_GT(first, 0U);
+  ASSERT_GT(first, kFirst);
   const std::vector<core::SequenceId> from{first - 1};
-  const std::vector<core::SequenceId> end{30};
+  const std::vector<core::SequenceId> end{kFirst + 30};
   const std::atomic<bool> cancel{false};
   auto scanned = queue_->Scan(
       from, end, 1,
@@ -853,14 +894,14 @@ class WalQueueStressTest : public WalQueueStreamsTest {
 
   // One reader's progress; the shard's other reader reads `next`.
   struct Follower {
-    std::atomic<core::SequenceId> next{0};
+    std::atomic<core::SequenceId> next{kFirst};
     std::vector<uint64_t> ids;
   };
 
   // A shard's commits, capped while the Scan holds a range.
   struct CommitGate {
     std::mutex mu;
-    core::SequenceId committed_end = 0;
+    core::SequenceId committed_end = kFirst;
     core::SequenceId cap = kNoCap;
   };
 
@@ -984,7 +1025,7 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
 
   const auto follow = [&](core::ShardId shard, core::Durability visible) {
     Follower& self = visible == kAck ? ack[shard] : power[shard];
-    core::SequenceId next = 0;
+    core::SequenceId next = kFirst;
     const auto give_up = deadline + kCatchUpFor;
     while (!stop.load(std::memory_order_relaxed)) {
       if (appended_all.load(std::memory_order_acquire) && next >= final_end[shard]) return;
@@ -1086,12 +1127,12 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
 
   std::vector<std::vector<uint64_t>> expected(kShards);
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
-    expected[shard].assign(final_end[shard], kNoId);
+    expected[shard].assign(final_end[shard] - kFirst, kNoId);
   }
   for (const auto& records : appended) {
     for (const auto& record : records) {
       ASSERT_LT(record.seq, final_end[record.shard]);
-      expected[record.shard][record.seq] = record.id;
+      expected[record.shard][record.seq - kFirst] = record.id;
     }
   }
   uint64_t scanned_total = 0;
@@ -1100,8 +1141,9 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
     EXPECT_EQ(ack[shard].ids, expected[shard]) << "shard " << shard;
     EXPECT_EQ(power[shard].ids, expected[shard]) << "shard " << shard;
     ASSERT_EQ(scanned[shard].size(), end[shard] - from[shard]) << "shard " << shard;
-    EXPECT_TRUE(std::equal(scanned[shard].begin(), scanned[shard].end(),
-                           expected[shard].begin() + static_cast<std::ptrdiff_t>(from[shard])))
+    EXPECT_TRUE(
+        std::equal(scanned[shard].begin(), scanned[shard].end(),
+                   expected[shard].begin() + static_cast<std::ptrdiff_t>(from[shard] - kFirst)))
         << "shard " << shard;
     scanned_total += scanned[shard].size();
   }
@@ -1122,7 +1164,7 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
     const auto entries = ReadAll(shard, first);
     ASSERT_EQ(entries.size(), final_end[shard] - first);
     for (const auto& entry : entries) {
-      EXPECT_EQ(IdOf(shard, entry), std::optional<uint64_t>{expected[shard][entry.seq]})
+      EXPECT_EQ(IdOf(shard, entry), std::optional<uint64_t>{expected[shard][entry.seq - kFirst]})
           << "seq " << entry.seq;
     }
   }

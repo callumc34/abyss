@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "abyss/core/types.h"
 #include "test_clock.h"
 
 namespace abyss::hot {
@@ -569,7 +570,7 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
 TEST_F(SingleShardStoreTest, WipeClearsAll) {
   SetString("a", "1");
   SetString("b", "2");
-  store_.Wipe(0);
+  store_.Wipe(core::kFirstSeq);
 
   EXPECT_EQ(store_.Stats().key_count, 0U);
   auto result = GetString("a");

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "abyss/core/eviction_policy.h"
+#include "abyss/core/types.h"
 #include "test_clock.h"
 
 namespace abyss::hot {
@@ -30,7 +31,7 @@ class ShardedHotStoreTest : public ::testing::Test {
 
   void SetString(std::string_view key, std::string_view value) {
     core::ops::StringSet op{.key = key, .value = value};
-    auto result = store_.Apply(core::ops::WriteOp{op}, /*seq=*/0);
+    auto result = store_.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq);
     ASSERT_TRUE(result.has_value()) << result.error().message();
   }
 
@@ -125,14 +126,14 @@ TEST_F(ShardedHotStoreTest, WipeClearsOnlyItsShard) {
   for (int i = 0; i < 100; ++i) {
     SetString("key:" + std::to_string(i), "val");
   }
-  ASSERT_TRUE(store_.Wipe(0, 0).has_value());
+  ASSERT_TRUE(store_.Wipe(0, core::kFirstSeq).has_value());
   const auto after_one = store_.Stats();
   ASSERT_TRUE(after_one.has_value());
   EXPECT_LT(after_one->key_count, 100U);
   EXPECT_GT(after_one->key_count, 0U) << "one shard's wipe cleared the others";
 
   for (core::ShardId shard = 1; shard < store_.shard_count(); ++shard) {
-    ASSERT_TRUE(store_.Wipe(shard, 0).has_value());
+    ASSERT_TRUE(store_.Wipe(shard, core::kFirstSeq).has_value());
   }
   const auto after_all = store_.Stats();
   ASSERT_TRUE(after_all.has_value());
@@ -153,7 +154,7 @@ TEST_F(ShardedHotStoreTest, EvictExpiredAcrossShards) {
   }};
 
   core::ops::StringSet op{.key = "temp", .value = "v"};
-  ASSERT_TRUE(short_store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+  ASSERT_TRUE(short_store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
 
   clock_.Advance(1100ms);
   auto evicted = short_store.EvictExpired(clock_.SteadyNow());
@@ -186,7 +187,7 @@ TEST_F(ShardedHotStoreTest, ConcurrentWriteAndRead) {
       auto key = "w:" + std::to_string(i);
       auto value = std::to_string(i);
       core::ops::StringSet op{.key = key, .value = value};
-      EXPECT_TRUE(store_.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+      EXPECT_TRUE(store_.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
     }
   });
 
@@ -237,7 +238,7 @@ TEST(ShardedHotStoreAccessBufferTest, AccessBufferBoundedUnderReadStorm) {
   for (int i = 0; i < 100; ++i) {
     const std::string key = "k" + std::to_string(i);
     core::ops::StringSet op{.key = key, .value = "v"};
-    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
   }
   for (int i = 0; i < 100; ++i) {
     const std::string key = "k" + std::to_string(i);
@@ -269,7 +270,7 @@ TEST(ShardedHotStoreAccessBufferTest, AccessBufferDedupsWithinTick) {
       .wall_clock = clock.WallFn(),
   }};
   core::ops::StringSet op{.key = "hot", .value = "v"};
-  ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+  ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
 
   // 1000 reads of the same key collapse to a single buffered refresh per tick.
   for (int i = 0; i < 1000; ++i) {
@@ -303,7 +304,7 @@ TEST(ShardedHotStorePrefixEvictionTest, MixedPrefixesResolvePerEntry) {
   for (const auto& [k, v] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
            {"session:a", "1"}, {"ephemeral:b", "2"}, {"other:c", "3"}}) {
     core::ops::StringSet op{.key = k, .value = v};
-    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/0).has_value());
+    ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
   }
 
   // session:a expires at 1s — visible after advancing past 1s.
@@ -338,7 +339,7 @@ TEST(ShardedHotStorePrefixEvictionTest, RefreshUsesPerKeyEvictionFromEntry) {
   }};
 
   core::ops::StringSet write_op{.key = "session:k", .value = "v"};
-  ASSERT_TRUE(store.Apply(core::ops::WriteOp{write_op}, /*seq=*/0).has_value());
+  ASSERT_TRUE(store.Apply(core::ops::WriteOp{write_op}, /*seq=*/core::kFirstSeq).has_value());
 
   // Read after 1s — buffered as an access — then drain to refresh.
   clock.Advance(1s);

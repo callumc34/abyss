@@ -286,10 +286,11 @@ bool ShardedHotStore::EvictShardToTarget(core::ShardId shard) ABYSS_NO_THREAD_SA
 LoadStart ShardedHotStore::BeginLoad(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   using Status = LoadStart::Status;
   const auto index = ShardIndex(key);
-  const auto horizon = Horizon(index);
   auto& shard = *shards_[index];
   const std::unique_lock lock(shard.mutex);
-  if (shard.store.KnownAbsentAfterFlush(horizon)) return {.status = Status::kFlushed};
+  // An atomic read. Taken under the lock, it is no older than any
+  // eviction behind the key's absence, as in ShardLocks.
+  if (shard.store.KnownAbsentAfterFlush(Horizon(index))) return {.status = Status::kFlushed};
   if (const auto token = shard.store.BeginLoad(key); token.has_value()) {
     return {.status = Status::kStarted, .token = *token};
   }
@@ -576,11 +577,6 @@ core::WallTime ShardLocks::LastAppendedAt(core::ShardId shard) const {
 
 void ShardLocks::RaiseAppendedAt(core::ShardId shard, core::WallTime at) {
   Store(shard).RaiseAppendedAt(at);
-}
-
-std::optional<core::SequenceId> ShardLocks::FenceFor(core::ShardId shard,
-                                                     core::SequenceId seq) const {
-  return Store(shard).FenceFor(seq);
 }
 
 }  // namespace abyss::hot

@@ -158,10 +158,10 @@ TEST_F(ResolverRecoveryTest, ReplayCommitsPastRecoveredConditionalAndResolved) {
   ASSERT_TRUE(replay.has_value()) << replay.error().message();
 
   EXPECT_EQ(queue.CommittedOffset(core::kResolverConsumer, 0).value(),
-            std::optional<core::SequenceId>{1});
-  EXPECT_EQ(queue.DurableEnd(0, core::Durability::kPowerLoss).value(), 2U)
+            std::optional<core::SequenceId>{core::kFirstSeq + 1});
+  EXPECT_EQ(queue.DurableEnd(0, core::Durability::kPowerLoss).value(), core::kFirstSeq + 2)
       << "the recovered Resolved is not power-durable";
-  EXPECT_EQ(queue.TailSeq(0).value(), 1U) << "replay re-emitted a Resolved";
+  EXPECT_EQ(queue.TailSeq(0).value(), core::kFirstSeq + 1) << "replay re-emitted a Resolved";
   EXPECT_EQ(resolver.GetSnapshot().commit_failures, 0U);
 }
 
@@ -178,7 +178,8 @@ TEST_F(ResolverRecoveryTest, PowerLossDropsAnUnflushedConditionalAndResolvedToge
     auto x = (*crashed)->Append(0, Conditional());
     ASSERT_TRUE(x.has_value());
     ASSERT_TRUE((*crashed)->Append(0, ResolvedFor(x->seq)).has_value());
-    ASSERT_FALSE((*crashed)->AwaitDurable(0, 0, core::Durability::kPowerLoss, 0ms).value());
+    ASSERT_FALSE(
+        (*crashed)->AwaitDurable(0, core::kFirstSeq, core::Durability::kPowerLoss, 0ms).value());
     flushed = (*crashed)->DurableExtentForTesting(0);
     (*crashed)->SkipFinalFlushForTesting();
     stall.Release();
@@ -188,7 +189,7 @@ TEST_F(ResolverRecoveryTest, PowerLossDropsAnUnflushedConditionalAndResolvedToge
   auto reopened = queue::WalQueue::Open(Config());
   ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
   auto& queue = **reopened;
-  ASSERT_EQ(queue.DurableEnd(0, core::Durability::kPowerLoss).value(), 0U);
+  ASSERT_EQ(queue.DurableEnd(0, core::Durability::kPowerLoss).value(), core::kFirstSeq);
 
   Resolver::Config cfg;
   cfg.shard = 0;
@@ -199,7 +200,7 @@ TEST_F(ResolverRecoveryTest, PowerLossDropsAnUnflushedConditionalAndResolvedToge
   ASSERT_TRUE(replay.has_value()) << replay.error().message();
 
   EXPECT_EQ(queue.CommittedOffset(core::kResolverConsumer, 0).value(), std::nullopt);
-  EXPECT_EQ(queue.DurableEnd(0, core::Durability::kProcessCrash).value(), 0U);
+  EXPECT_EQ(queue.DurableEnd(0, core::Durability::kProcessCrash).value(), core::kFirstSeq);
   EXPECT_EQ(resolver.GetSnapshot().commit_failures, 0U);
 }
 

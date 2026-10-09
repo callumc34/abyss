@@ -17,6 +17,7 @@
 
 #include "abyss/core/fatal.h"
 #include "abyss/core/queue.h"
+#include "abyss/core/types.h"
 #include "abyss/queue/reservation.h"
 
 namespace abyss::testing {
@@ -74,7 +75,7 @@ class MockQueue : public core::Queue {
               (override));
   MOCK_METHOD(bool, WaitForSpare, (core::ShardId shard, core::SteadyTime deadline), (override));
 
-  // In memory: seqs per shard from 0, each shard published in seq
+  // In memory: seqs per shard from kFirstSeq, each shard published in seq
   // order, durable futures ready unless HoldDurable. It takes every
   // entry, as a queue may the ones it fills in Complete.
   core::Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) override {
@@ -169,20 +170,23 @@ class MockQueue : public core::Queue {
   // The Read contract over what Complete published on `shard`.
   std::vector<core::QueueEntry> ReadPublished(core::ShardId shard, core::SequenceId from_seq,
                                               size_t max_count) const {
+    // A real queue answers kOutOfRange: no entry has seq 0.
+    ABYSS_DCHECK(from_seq >= core::kFirstSeq, "a read from seq 0");
     const std::scoped_lock lock(fake_->mu);
     std::vector<core::QueueEntry> out;
     const auto it = fake_->shards.find(shard);
     if (it == fake_->shards.end()) return out;
     const auto& log = it->second.published;
-    for (auto seq = from_seq; seq < log.size() && out.size() < max_count; ++seq) {
-      out.push_back(log[seq]);
+    for (auto i = from_seq - core::kFirstSeq; i < log.size() && out.size() < max_count; ++i) {
+      out.push_back(log[i]);
     }
     return out;
   }
 
  private:
   struct FakeShard {
-    core::SequenceId next = 0;
+    core::SequenceId next = core::kFirstSeq;
+    // The entry at seq s is at s - kFirstSeq.
     std::vector<core::QueueEntry> published;
   };
   struct FakeLog {
@@ -204,7 +208,8 @@ class MockQueue : public core::Queue {
       std::size_t next = 0;
       for (const queue::ReservedRange& part : parts) {
         FakeShard& shard = log_->shards[part.shard];
-        log_->published_cv.wait(lock, [&] { return shard.published.size() == part.first; });
+        log_->published_cv.wait(
+            lock, [&] { return shard.published.size() + core::kFirstSeq == part.first; });
         for (core::SequenceId seq = part.first; seq <= part.last; ++seq) {
           shard.published.push_back(std::move(entries[next++].second));
         }
@@ -229,6 +234,7 @@ class MockQueue : public core::Queue {
 // entries with seq >= `from_seq`.
 inline std::vector<core::QueueEntry> ReadFromLog(const std::vector<core::QueueEntry>& log,
                                                  core::SequenceId from_seq, size_t max_count) {
+  ABYSS_DCHECK(from_seq >= core::kFirstSeq, "a read from seq 0");
   auto it = std::ranges::lower_bound(log, from_seq, std::ranges::less{},
                                      [](const core::QueueEntry& e) { return e.seq; });
   std::vector<core::QueueEntry> out;

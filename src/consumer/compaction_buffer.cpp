@@ -37,6 +37,8 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
                               core::EvictionTTL eviction, core::SequenceId position,
                               core::SequenceId carrier,
                               uint64_t appended_at_ms) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  ABYSS_DCHECK(std::min(position, carrier) >= core::kFirstSeq,
+               "absorbed an effect at seq 0, which names no entry");
   const std::unique_lock lock(mutex_);
   // A selected batch is applied by reference; changing it would let
   // EraseFlushed drop state that never reached cold.
