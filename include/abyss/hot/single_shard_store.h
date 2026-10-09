@@ -1,8 +1,11 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <list>
 #include <map>
@@ -12,7 +15,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -22,6 +24,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/memory_governor.h"
 
@@ -42,16 +45,16 @@ struct SingleShardConfig {
 };
 
 struct SetValue {
-  std::unordered_set<std::string> members;
+  core::StringSet members;
 };
 
 struct HashValue {
-  std::unordered_map<std::string, std::string> fields;
+  core::StringMap<std::string> fields;
 };
 
 struct ZsetValue {
-  std::unordered_map<std::string, double> member_scores;
-  std::map<double, std::set<std::string>> score_members;
+  core::StringMap<double> member_scores;
+  std::map<double, std::set<std::string, std::less<>>> score_members;
 };
 
 using Value = std::variant<std::string, SetValue, HashValue, ZsetValue>;
@@ -59,27 +62,62 @@ using Value = std::variant<std::string, SetValue, HashValue, ZsetValue>;
 struct Entry {
   enum class Type : uint8_t { kString, kSet, kHash, kZset };
 
-  Type type;
+  static constexpr uint32_t kNoSlot = std::numeric_limits<uint32_t>::max();
+  static constexpr int64_t kNoBucket = -1;
+
+  Type type = Type::kString;
+  // Marks a deleted key whose delete cold may not have absorbed yet.
+  bool tombstoned = false;
+  // Its eviction class's LRU list, while linked.
+  uint16_t lru_list = 0;
+  // Its place in the tombstone heap, or the parked heap while live.
+  uint32_t heap_slot = kNoSlot;
   Value value;
-  core::SteadyTime eviction_deadline;
   // Resolved per-prefix eviction for this key.
   core::EvictionTTL eviction{};
   int64_t abs_ttl_ms = 0;
-
-  // Marks a deleted key whose delete cold may not have absorbed yet.
-  bool tombstoned = false;
   // Seq of the last write applied to the key; loaded state carries 0,
   // which every drain horizon covers.
   core::SequenceId latest_seq = 0;
   // ApproximateBytes(), kept current as the value changes.
   size_t bytes = 0;
-  // Live entries form the shard's LRU list; tombstones are not on it.
+  // When it last joined its LRU list's warm end, never before the
+  // entry ahead of it, so the list is in linked_at order.
+  core::SteadyTime linked_at{};
+  // The coarse time of its last read, as SteadyTime ticks. Hits store
+  // it under the shared lock, so it is accessed through atomic_ref.
+  // Not Caffeine's striped read buffers: a stamp needs no lock,
+  // allocation or key copy, and second chance over the intrusive list
+  // is SIEVE's result.
+  mutable core::SteadyTime::rep accessed = 0;
+  // The map node's key.
+  const std::string* key = nullptr;
+  // Live entries form their class's LRU list; tombstones are not on it.
   Entry* lru_newer = nullptr;
   Entry* lru_older = nullptr;
-  const std::string* lru_key = nullptr;
+  // Live entries with a TTL form their TTL bucket's list.
+  int64_t ttl_bucket = kNoBucket;
+  Entry* ttl_prev = nullptr;
+  Entry* ttl_next = nullptr;
 
   size_t ApproximateBytes() const;
+  // Its deadline: last access, or link, plus its eviction.
+  core::SteadyTime Deadline() const;
 };
+
+using EntryMap = core::StringMap<Entry>;
+
+// Live entries whose TTL falls in one bucket, oldest index first.
+struct TtlBucket {
+  Entry* head = nullptr;
+  Entry* tail = nullptr;
+  size_t size = 0;
+};
+// By abs_ttl_ms / kTtlBucketMs.
+using TtlIndex = std::map<int64_t, TtlBucket>;
+inline constexpr int64_t kTtlBucketMs = 1000;
+// What one TTL bucket costs beyond its entries: a map node.
+inline constexpr size_t kTtlBucketBytes = sizeof(TtlIndex::value_type) + (4 * sizeof(void*));
 
 // What an entry holding `value` counts, beyond its key.
 size_t ApproximateBytes(const Value& value);
@@ -172,8 +210,53 @@ class StubCache {
 // the hold ends, so no large free runs under the lock.
 struct Graveyard {
   std::vector<Value> values;
-  std::vector<std::unordered_map<std::string, Entry>> entries;
+  // Removed entries' map nodes.
+  std::vector<EntryMap::node_type> nodes;
+  std::vector<EntryMap> entries;
   std::vector<StubCache> stubs;
+  std::vector<TtlIndex> ttl_indexes;
+};
+
+// Caps the maintenance one exclusive hold may do: kHoldEntries entries
+// examined or kHoldTime of real time, whichever comes first.
+class HoldBudget {
+ public:
+  static constexpr size_t kHoldEntries = 64;
+  static constexpr std::chrono::microseconds kHoldTime{1000};
+
+  static HoldBudget Capped() { return HoldBudget(kHoldEntries); }
+  static HoldBudget Unbounded();
+  // At most `max_entries`, and kHoldTime from the first.
+  explicit HoldBudget(size_t max_entries);
+
+  // Takes one entry's examination; false once the hold must end.
+  bool Take();
+  size_t examined() const { return examined_; }
+
+ private:
+  size_t max_entries_;
+  bool timed_ = true;
+  core::SteadyTime until_{};
+  size_t examined_ = 0;
+};
+
+// A min-heap of entries by latest_seq, each knowing its slot.
+class SeqHeap {
+ public:
+  void Push(Entry& entry);
+  void Erase(Entry& entry);
+  // After `entry`'s latest_seq changed.
+  void Update(Entry& entry);
+  Entry* Top() const { return heap_.empty() ? nullptr : heap_.front(); }
+  void Clear() { heap_.clear(); }
+  size_t size() const { return heap_.size(); }
+
+ private:
+  void Place(size_t slot, Entry* entry);
+  void SiftUp(size_t slot);
+  void SiftDown(size_t slot);
+
+  std::vector<Entry*> heap_;
 };
 
 struct LoadToken {
@@ -263,7 +346,8 @@ class SingleShardStore {
                                 core::SequenceId horizon = kAllDrained);
 
   // `horizon` is the shard's cold drained seq, read under the lock;
-  // TTL expiry is judged at `now_ms`.
+  // TTL expiry is judged at `now_ms`. A live key's view is a use, as a
+  // read hit is, whatever the decision then does.
   KeyView View(std::string_view key, core::SequenceId horizon, uint64_t now_ms) const;
 
   // Applies decided effects in order, effect i at `first_seq + i`, and
@@ -283,33 +367,61 @@ class SingleShardStore {
 
   // Reclaims tombstones whose delete seq is <= `horizon` — cold has absorbed
   // those deletes, so the buffer/cold view now reflects them. Live keys remain.
+  // Lowest seq first, within `budget`; true once none is left to reclaim.
+  bool GcTombstones(core::SequenceId horizon, HoldBudget& budget, size_t& reclaimed);
   size_t GcTombstones(core::SequenceId horizon);
 
-  // Extends the eviction deadline using the per-key cached eviction recorded
-  // at Apply time, and makes the key most recently used. No-op if the key
-  // is absent.
-  void RefreshAccess(std::string_view key, core::SteadyTime now);
+  // What a read hit stamps until the next call: the coarse current time,
+  // set once a maintenance tick.
+  void SetAccessTime(core::SteadyTime now);
+
   // by_deadline is a tier transition (data still in queue/cold) counted as an
   // eviction; by_ttl is a true deletion counted separately (HOT-7).
   struct EvictExpiredReport {
     size_t by_deadline = 0;
     size_t by_ttl = 0;
+    // Due, but held until cold drains them.
+    size_t parked = 0;
     size_t Total() const { return by_deadline + by_ttl; }
   };
   // Every eviction below skips a key whose latest_seq is above
-  // `horizon`, the shard's cold drained seq, TTL-expired keys included.
+  // `horizon`, the shard's cold drained seq, TTL-expired keys included:
+  // a due key cold has not drained is parked until it has. Each pass
+  // works within `budget` and is true once nothing more is due.
+  //
+  // Parked keys the horizon now covers, lowest seq first.
+  bool ReleaseParked(core::SteadyTime now, core::SequenceId horizon, HoldBudget& budget,
+                     EvictExpiredReport& report);
+  // Keys past their TTL. A bucket wholly past is taken whole; the one
+  // `now` falls in is checked key by key, so none goes early.
+  bool ExpireTtl(core::SteadyTime now, core::SequenceId horizon, HoldBudget& budget,
+                 EvictExpiredReport& report);
+  // Keys idle past their eviction: each class's LRU list from its cold
+  // end, to the first key not due by when it was linked. A key read
+  // since then gets a second chance, relinked at its read.
+  bool EvictPastDeadline(core::SteadyTime now, core::SequenceId horizon, HoldBudget& budget,
+                         EvictExpiredReport& report);
+  // All three, unbounded.
   EvictExpiredReport EvictExpired(core::SteadyTime now, core::SequenceId horizon);
-  // Evicts least-recently-accessed live keys until used bytes <= target_bytes.
-  // Eviction is a tier transition: the key stays durable in queue/cold.
+  // Evicts least-recently-used live keys until used bytes <= target_bytes,
+  // giving a key read since it was linked a second chance. Eviction is a
+  // tier transition: the key stays durable in queue/cold. Within
+  // `budget`; true once at the target or nothing more can be evicted.
+  bool EvictLru(size_t target_bytes, core::SequenceId horizon, HoldBudget& budget, size_t& evicted);
   size_t EvictLru(size_t target_bytes, core::SequenceId horizon);
-  // Evicts down to the governor's budget, protecting `protect_key` (the entry a
-  // write just created — it must survive so the write is applied, not evicted),
-  // then reports whether the store now fits. Returns false (the caller surfaces
-  // kResourceExhausted) only when, after evicting every other eligible key, the
-  // store still exceeds the budget. A no-op while replaying so recovery stays a
-  // deterministic queue replay (invariant 4).
-  // Other keys' undrained bytes are left out of that check.
-  bool EnsureCapacityFor(std::string_view protect_key, core::SequenceId horizon);
+  // Evicts, within one hold's budget, toward the budget, protecting
+  // `protect_key` (the entry a write just created — it must survive so the
+  // write is applied, not evicted), then reports whether the store can fit.
+  // Returns false (the caller surfaces kResourceExhausted) only when, after
+  // evicting every other eligible key, the store would still exceed the
+  // budget. A no-op while replaying so recovery stays a deterministic queue
+  // replay (invariant 4). Other keys' undrained bytes are left out of that
+  // check.
+  bool EnsureCapacityFor(std::string_view protect_key, core::SequenceId horizon,
+                         HoldBudget& budget);
+  // Evicts, within one hold's budget, toward room for `key` holding
+  // `entry_bytes` (a LoadedFull's bytes); true if it then fits.
+  bool MakeRoom(std::string_view key, size_t entry_bytes, core::SequenceId horizon);
 
   // Suppresses memory-pressure eviction during replay. Set by the hot consumer
   // around ReplayUntil so the rebuilt hot view does not depend on memory timing.
@@ -401,7 +513,19 @@ class SingleShardStore {
   core::Result<core::RespValue> ApplyExpire(const core::ops::Expire& op);
   core::Result<core::RespValue> ApplyPersist(const core::ops::Persist& op);
 
-  using EntryMap = std::unordered_map<std::string, Entry>;
+  // One eviction class's live entries, oldest link at the cold end.
+  struct LruList {
+    core::EvictionTTL eviction{};
+    Entry* newest = nullptr;
+    Entry* oldest = nullptr;
+    // Where the memory walk resumes, when set: every entry before it
+    // was undrained at cursor_horizon. Null when it passed them all.
+    bool cursor_set = false;
+    Entry* cursor = nullptr;
+    core::SequenceId cursor_horizon = 0;
+  };
+  // The next entry the memory walk examines in `list`.
+  static Entry* Front(const LruList& list) { return list.cursor_set ? list.cursor : list.oldest; }
 
   bool InstallLoad(std::string_view key, LoadToken token, LoadResult&& result,
                    core::EvictionTTL eviction, core::SequenceId horizon, bool in_batch);
@@ -412,7 +536,8 @@ class SingleShardStore {
   // tombstone about to be rewritten or removed.
   void ForgetNegative(const Entry& entry);
   // Drops the oldest absent loads past negative_max_entries.
-  void TrimNegatives();
+  bool TrimNegatives(HoldBudget& budget);
+  Entry* FindEntry(std::string_view key);
   const Entry* FindEntry(std::string_view key) const;
   const Entry* FindLiveEntry(std::string_view key) const;
   // TTL expiry as writes see it: never while applying effects.
@@ -420,43 +545,75 @@ class SingleShardStore {
   // False when `effect` reads `key` past its TTL at `at_ms`: decide
   // logs such an expiry as a DEL before the read.
   bool ExpiryIsLogged(const core::Effect& effect, std::string_view key, int64_t at_ms) const;
+  // Stamps a read of a live entry, unless it is stamped this tick.
+  void NoteAccess(const Entry& entry) const;
   Entry& GetOrCreateEntry(std::string_view key, Entry::Type type, core::EvictionTTL eviction);
-  void RemoveEntry(const std::string& key);
+  void RemoveEntry(std::string_view key);
   // Converts a live entry into a tombstone: releases the value, drops it from
   // key_count, and stamps the delete seq. Idempotent on an existing tombstone.
   void TombstoneEntry(Entry& entry, std::string_view key, core::SequenceId seq);
-  // Stamps the key's entry with `seq` and drops its stub and any load in
-  // flight, which the write has made stale.
+  // Stamps the key's entry with `seq`, relinks it as just written and
+  // drops its stub and any load in flight, which the write has made
+  // stale.
   void MarkWritten(std::string_view key, core::SequenceId seq);
   // Removes a live entry, leaving a stub unless it expired by TTL.
-  EntryMap::iterator Evict(EntryMap::iterator it, bool leave_stub);
+  void Evict(EntryMap::iterator it, bool leave_stub);
+  // Into the graveyard, if one is set: a free can stall.
+  void Erase(EntryMap::iterator it);
+  // Evicts a due entry cold has drained, or parks it until it has.
+  void EvictDue(Entry& entry, core::SequenceId horizon, int64_t now_ms, EvictExpiredReport& report);
+  // Takes `entry` off every list and heap, before it is erased.
+  void Detach(Entry& entry);
   // A DEL of a key with no entry leaves it resident as absent.
   void InsertTombstone(std::string_view key, core::SequenceId seq);
-  void LruLink(EntryMap::iterator it);
+  LruList& ListFor(core::EvictionTTL eviction);
+  // Links a live entry at its class's warm end, at `at` or the newest
+  // link if later.
+  void LruLink(Entry& entry, core::SteadyTime at);
   void LruUnlink(Entry& entry);
-  void LruTouch(Entry& entry);
+  bool Linked(const Entry& entry) const;
+  // Indexes a live, unparked entry by its TTL, or unindexes it.
+  void IndexTtl(Entry& entry);
+  void UnindexTtl(Entry& entry);
+  // Takes a due, undrained live entry off its list until cold drains it.
+  void Park(Entry& entry);
+  void Unpark(Entry& entry);
+  bool Parked(const Entry& entry) const {
+    return !entry.tombstoned && entry.heap_slot != Entry::kNoSlot;
+  }
   // An entry cold has drained may be evictable again.
   void NoteEvictable(core::SequenceId latest_seq);
   void TrackInsert(const Entry& entry, std::string_view key);
   void TrackRemove(const Entry& entry, std::string_view key);
-  uint64_t UsedBytes() const { return entry_bytes_ + stubs_.bytes(); }
+  uint64_t UsedBytes() const {
+    return entry_bytes_ + stubs_.bytes() + (ttl_index_.size() * kTtlBucketBytes);
+  }
   void UpdateBackpressure();
-  // LRU make-room primitive: evicts least-recently-accessed live keys (never
+  // LRU make-room primitive: evicts least-recently-used live keys (never
   // `protect_key`, empty to protect none) until UsedBytes() <= target_bytes.
-  size_t EvictLru(size_t target_bytes, std::string_view protect_key, core::SequenceId horizon);
+  bool EvictLru(size_t target_bytes, std::string_view protect_key, core::SequenceId horizon,
+                HoldBudget& budget, size_t& evicted);
 
   SingleShardConfig config_;
   MemoryGovernor governor_;
   EntryMap entries_;
   StubCache stubs_;
-  Entry* lru_newest_ = nullptr;
-  Entry* lru_oldest_ = nullptr;
+  // One per eviction class; few. A deque, so a list never moves.
+  std::deque<LruList> lru_lists_;
   // Set when an LRU walk at lru_dry_horizon_ found nothing more to evict,
   // so later writes skip the walk until something can be.
   bool lru_dry_ = false;
   core::SequenceId lru_dry_horizon_ = 0;
   uint64_t lru_visits_ = 0;
-  std::unordered_map<std::string, LoadToken> loading_;
+  TtlIndex ttl_index_;
+  // Tombstones of a logged delete, for GC.
+  SeqHeap tombstones_;
+  // Live entries due but not yet drained.
+  SeqHeap parked_;
+  uint64_t parked_bytes_ = 0;
+  // What a read hit stamps, as SteadyTime ticks.
+  std::atomic<core::SteadyTime::rep> access_now_{0};
+  core::StringMap<LoadToken> loading_;
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
   // Keys installed as absent, oldest first, in their own FIFO so they
@@ -471,15 +628,13 @@ class SingleShardStore {
   core::WallTime last_appended_at_{};
   Graveyard* graveyard_ = nullptr;
   uint64_t entry_bytes_ = 0;
-  // The part of entry_bytes_ that is on the LRU list.
+  // The part of entry_bytes_ that is live, not tombstones.
   uint64_t live_bytes_ = 0;
   uint64_t key_count_ = 0;
   // Tier transitions: deadline eviction + memory-pressure eviction (HOT-7).
   uint64_t eviction_count_ = 0;
   // TTL-expiry deletions, distinct from tier evictions (HOT-7).
   uint64_t expired_count_ = 0;
-  // Both as of the last full eviction pass that took a horizon.
-  uint64_t unevictable_bytes_ = 0;
   bool backpressured_ = false;
   bool replay_mode_ = false;
 };

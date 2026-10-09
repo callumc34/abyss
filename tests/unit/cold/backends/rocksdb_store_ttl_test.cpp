@@ -17,8 +17,6 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
@@ -27,6 +25,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
@@ -298,7 +297,7 @@ TEST_F(TtlFixture, SaddToASetPastItsTtlOnlyByTheWallClockMerges) {
   ASSERT_TRUE(store->ApplyBatch(std::span{&add, 1}, 0).has_value());
 
   const auto s = MustLoad(*store, "s");
-  EXPECT_EQ(s.value, (core::ColdValue{std::unordered_set<std::string>{"a", "b", "c"}}));
+  EXPECT_EQ(s.value, (core::ColdValue{core::StringSet{"a", "b", "c"}}));
   EXPECT_EQ(s.abs_ttl_ms, static_cast<int64_t>(ttl));
 }
 
@@ -333,8 +332,7 @@ TEST_F(TtlFixture, RemOnAWallExpiredZsetAppliesAsLogged) {
   core::ops::WriteOp rem_op = core::ops::ZsetRem{.key = "z", .members = rem};
   ASSERT_TRUE(store->ApplyBatch(std::span{&rem_op, 1}, 0).has_value());
 
-  EXPECT_EQ(MustLoad(*store, "z").value,
-            (core::ColdValue{std::unordered_map<std::string, double>{{"n", 2.0}}}));
+  EXPECT_EQ(MustLoad(*store, "z").value, (core::ColdValue{core::StringMap<double>{{"n", 2.0}}}));
   // n's member record and score index entry, z's meta, the format version.
   EXPECT_EQ(store->RecordsForTesting().size(), 4U);
 }

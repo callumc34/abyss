@@ -12,6 +12,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
@@ -178,9 +179,9 @@ BENCHMARK(BM_ColdCardinality)
     ->Unit(benchmark::kMicrosecond);
 
 // A store at its budget of small drained strings takes a 1M-member
-// fill, evicting to make room under the lock. What it evicts goes to
-// a graveyard, freed after the hold, as ShardedHotStore::CompleteLoad
-// does.
+// fill as ShardedHotStore::Fill does: one hold's eviction at most, the
+// fill skipped if that leaves no room. What it evicts goes to a
+// graveyard, freed after the hold.
 void BM_FillHoldUnderMemoryPressure(benchmark::State& state) {
   constexpr size_t kBudget = size_t{128} << 20;
   const std::string key = KeyOf(state.range(0));
@@ -188,10 +189,14 @@ void BM_FillHoldUnderMemoryPressure(benchmark::State& state) {
   double hold_ms = 0;
   double free_ms = 0;
   double evicted = 0;
+  double installed = 0;
   for ([[maybe_unused]] auto _ : state) {
     auto loaded = fixture.loader->Load(0, key, Need::kState,
                                        std::chrono::steady_clock::now() + std::chrono::minutes(5));
     if (!loaded.has_value()) std::abort();
+    const auto* full = std::get_if<hot::LoadedFull>(&*loaded);
+    if (full == nullptr) std::abort();
+    const size_t bytes = full->bytes;
     hot::SingleShardStore shard{hot::SingleShardConfig{.max_memory_bytes = kBudget}};
     const std::string value(64, 'v');
     for (uint64_t i = 0; shard.Stats().used_bytes < kBudget - (kBudget / 50); ++i) {
@@ -206,22 +211,28 @@ void BM_FillHoldUnderMemoryPressure(benchmark::State& state) {
     hot::Graveyard graveyard;
     const auto hold_start = std::chrono::steady_clock::now();
     shard.SetGraveyard(&graveyard);
-    const bool installed = shard.CompleteLoad(key, *token, *std::move(loaded),
-                                              core::EvictionTTL{3600}, hot::kAllDrained);
+    bool filled = false;
+    if (shard.MakeRoom(key, bytes, hot::kAllDrained)) {
+      filled = shard.CompleteLoad(key, *token, *std::move(loaded), core::EvictionTTL{3600},
+                                  hot::kAllDrained);
+    } else {
+      shard.AbortLoad(key, *token);
+    }
     shard.SetGraveyard(nullptr);
     const auto hold_end = std::chrono::steady_clock::now();
     graveyard = {};
     const auto freed = std::chrono::steady_clock::now();
-    if (!installed) std::abort();
     hold_ms += Ms(hold_end - hold_start);
     free_ms += Ms(freed - hold_end);
     evicted += static_cast<double>(shard.Stats().eviction_count - before);
+    installed += filled ? 1 : 0;
     state.SetIterationTime(std::chrono::duration<double>(hold_end - hold_start).count());
   }
   const auto n = static_cast<double>(state.iterations());
   state.counters["install_hold_ms"] = hold_ms / n;
   state.counters["graveyard_free_ms"] = free_ms / n;
   state.counters["evicted"] = evicted / n;
+  state.counters["installed"] = installed / n;
 }
 BENCHMARK(BM_FillHoldUnderMemoryPressure)
     ->ArgName("set0_hash1_zset2")

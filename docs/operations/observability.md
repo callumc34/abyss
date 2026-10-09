@@ -47,7 +47,9 @@
 - `abyss_ttl_expired_total{tier="hot|cold"}` — TTL expirations by tier. On cold, only the TTL scanner's deletes count: reads never delete.
 - `abyss_cold_apply_type_conflicts_total` — logged SADD, HSET or ZADD effects that found their key holding another type in cold. Any increase means the write path and cold disagree (see [failure-modes.md](failure-modes.md)).
 - `abyss_evicted_total` — keys evicted from hot (moved to cold-only)
-- `abyss_hot_fills_total{outcome="installed|discarded|skipped_backpressure|skipped_size|failed"}` — cache fills on read misses: installed; discarded because a write overtook the load; skipped because the shard was over its backpressure limit or the key is over `hot.fill_max_fraction` of a shard's budget; or failed to load from cold
+- `abyss_hot_fills_total{outcome="installed|discarded|skipped_backpressure|skipped_size|skipped_evict_cap|failed"}` — cache fills on read misses: installed; discarded because a write overtook the load; skipped because the shard was over its backpressure limit, the key is over `hot.fill_max_fraction` of a shard's budget, or evicting one maintenance hold's worth (64 keys or 1 ms) did not make room for it; or failed to load from cold
+- `abyss_hot_maintenance_hold_seconds{pass="tombstones|parked|ttl|deadline|memory"}` (histogram) — how long one hold of a hot maintenance pass kept a shard exclusively. Every pass examines at most 64 keys or runs for about 1 ms per hold, then lets writers and readers in, so this should stay near or below 1 ms whatever the keyspace size. `parked` releases keys that were due but waited for cold to drain them.
+- `abyss_hot_expiry_sweep_seconds` (histogram) — time for the TTL pass to reach every key that was past its TTL when its sweep began. The pass gets a quarter of each `hot.eviction_tick_ms`; a sweep longer than a tick means expired keys are accumulating faster than they are reclaimed.
 - `abyss_hot_backpressure_waits_total` — writes that waited for cold to drain because a hot shard was over `hot.max_memory_bytes` × `hot.backpressure_ratio`
 - `abyss_hot_backpressure_rejections_total` — writes rejected with `-OOM` after waiting `engine.write_timeout` for cold to drain (see [failure-modes.md](failure-modes.md))
 - `abyss_sequencer_redecides_total{reason="admission|spare|load|backpressure"}` — writes decided again: the durability window was full, no spare WAL segment was ready, a load was overtaken by a write, or a shard was over its memory limit. Each is bounded by `engine.write_timeout`.
@@ -81,6 +83,7 @@ Gauges:
 - `abyss_hot_memory_bytes` — hot store memory usage
 - `abyss_hot_keys` — number of keys in hot store
 - `abyss_hot_negative_entries` — keys hot holds as known absent after a read found them in neither buffer nor cold, a negative cache bounded by `hot.negative_max_entries`
+- `abyss_hot_unevictable_bytes` — hot bytes held for cold: keys due for TTL or idle eviction that cold has not yet drained, or every live byte once a memory-pressure walk found nothing it could evict
 - `abyss_cold_disk_bytes` — cold store disk usage
 - `abyss_cold_keys` — number of keys in cold store
 - `abyss_queue_depth` — number of entries in queue

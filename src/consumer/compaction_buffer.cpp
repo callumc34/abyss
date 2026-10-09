@@ -138,7 +138,7 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
         if constexpr (std::is_same_v<T, core::ops::Exists>) {
           int64_t count = 0;
           for (auto key : read.keys) {
-            auto it = entries_.find(std::string(key));
+            auto it = entries_.find(key);
             if (it == entries_.end()) continue;
             if (it->second.state.IsTombstone()) continue;
             if (is_expired(it->second.state)) continue;
@@ -148,7 +148,7 @@ core::Result<core::RespValue> CompactionBuffer::Exec(const core::ops::ReadOp& op
         }
 
         auto key = core::ops::PrimaryKey(core::ops::ReadOp{read});
-        auto it = entries_.find(std::string(key));
+        auto it = entries_.find(key);
         if (it == entries_.end()) {
           return std::unexpected(
               core::Error(core::ErrorCode::kNotFound, std::string{kBufferMissMsg}));
@@ -192,7 +192,7 @@ core::Result<core::RespValue> CompactionBuffer::Read(const std::string& key) con
 std::optional<CompactedState> CompactionBuffer::Snapshot(std::string_view key) const
     ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   const std::shared_lock lock(mutex_);
-  const auto it = entries_.find(std::string(key));
+  const auto it = entries_.find(key);
   if (it == entries_.end()) return std::nullopt;
   return it->second.state;
 }

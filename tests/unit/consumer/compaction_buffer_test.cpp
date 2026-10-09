@@ -7,8 +7,8 @@
 #include <optional>
 #include <random>
 #include <string>
-#include <unordered_set>
 
+#include "abyss/core/string_hash.h"
 #include "test_clock.h"
 
 namespace abyss::consumer {
@@ -1000,8 +1000,8 @@ TEST_F(CompactionBufferTest, SnapshotCopiesTheDeltaWithItsTtlUnjudged) {
   const auto snapshot = buffer_.Snapshot("s");
   ASSERT_TRUE(snapshot.has_value());
   const CompactedState state = snapshot.value_or(CompactedState{});
-  EXPECT_EQ(state.SetMembers(), (std::unordered_set<std::string>{"a"}));
-  EXPECT_EQ(state.SetRemovedMembers(), (std::unordered_set<std::string>{"b"}));
+  EXPECT_EQ(state.SetMembers(), (core::StringSet{"a"}));
+  EXPECT_EQ(state.SetRemovedMembers(), (core::StringSet{"b"}));
   EXPECT_EQ(state.Ttl(), CompactedState::TtlIntent::kSetTo);
   EXPECT_EQ(state.AbsTtlMs(), 1U);
   EXPECT_EQ(buffer_.Exec(core::ops::ReadOp{core::ops::Exists{.keys = {"s"}}})->AsInteger(), 0)

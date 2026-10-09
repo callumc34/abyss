@@ -6,12 +6,11 @@
 #include <span>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 
 #include "abyss/core/shard_router.h"
+#include "abyss/core/string_hash.h"
 
 namespace abyss::engine {
 
@@ -22,9 +21,9 @@ using core::KeyType;
 using DataType = CompactedState::DataType;
 using TtlIntent = CompactedState::TtlIntent;
 
-using Members = std::unordered_set<std::string>;
-using Fields = std::unordered_map<std::string, std::string>;
-using Scores = std::unordered_map<std::string, double>;
+using Members = core::StringSet;
+using Fields = core::StringMap<std::string>;
+using Scores = core::StringMap<double>;
 
 core::Error WrongType() {
   return {core::ErrorCode::kWrongType, "Operation against a key holding the wrong kind of value"};
@@ -511,6 +510,7 @@ core::Result<Loader::Filled> Loader::Install(std::string_view key, KeyType type,
     Fill fill = Fill::kDiscarded;
     if (filled == Result::kOverBackpressure) fill = Fill::kSkippedBackpressure;
     if (filled == Result::kTooLarge) fill = Fill::kSkippedSize;
+    if (filled == Result::kNoRoom) fill = Fill::kSkippedEvictCap;
     // NOLINTNEXTLINE(bugprone-use-after-move): moved only when installed.
     return Filled{.fill = fill, .result = std::move(loaded), .source = source};
   }

@@ -34,6 +34,15 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(std::mo
   for (uint32_t i = 0; i < config_.shard_count; ++i) {
     shards_.push_back(std::make_unique<Shard>(shard_config));
   }
+  auto& reg = metrics::Registry::Instance();
+  using metrics::MaintenancePass;
+  for (const MaintenancePass pass :
+       {MaintenancePass::kTombstones, MaintenancePass::kParked, MaintenancePass::kTtl,
+        MaintenancePass::kDeadline, MaintenancePass::kMemory}) {
+    hold_seconds_.at(static_cast<size_t>(pass)) =
+        reg.Histogram(metrics::names::kHotMaintenanceHoldSeconds, pass);
+  }
+  expiry_sweep_seconds_ = reg.Histogram(metrics::names::kHotExpirySweepSeconds);
   ABYSS_LOG_INFO("hot store opened", {"shards", static_cast<int64_t>(config_.shard_count)},
                  {"max_memory_bytes", static_cast<uint64_t>(config_.max_memory_bytes)});
 }
@@ -69,30 +78,12 @@ core::Result<core::RespValue> ShardedHotStore::Exec(const core::ops::ReadOp& op,
         if constexpr (std::is_same_v<T, core::ops::Exists>) {
           return ExecExists(o);
         } else {
-          auto key = o.key;
-          auto& shard = ShardFor(key);
-          std::shared_lock lock(shard.mutex);
-          auto result = shard.store.Exec(op);
-          if (result.has_value()) RecordAccess(shard, key);
-          return result;
+          auto& shard = ShardFor(o.key);
+          const std::shared_lock lock(shard.mutex);
+          return shard.store.Exec(op);
         }
       },
       op);
-}
-
-void ShardedHotStore::RecordAccess(Shard& shard, std::string_view key) const {
-  std::scoped_lock access_lock(shard.access_mutex);
-  // De-dup within a drain interval and bound the queue: a hot key is
-  // buffered once per tick, and once the cap is hit further refreshes
-  // are dropped (a dropped refresh only shortens a key's deadline,
-  // which is safe — the key is still durable in queue/cold). Drops
-  // are counted so backlog/pressure is observable (XRES-2).
-  const size_t high_water = config_.access_buffer_high_water;
-  if (high_water != 0 && shard.access_buffer.size() >= high_water) {
-    ++shard.access_dropped;
-  } else if (shard.access_seen.insert(std::string(key)).second) {
-    shard.access_buffer.emplace_back(key);
-  }
 }
 
 ShardedHotStore::HotRead ShardedHotStore::Read(const core::ops::ReadOp& op)
@@ -104,7 +95,6 @@ ShardedHotStore::HotRead ShardedHotStore::Read(const core::ops::ReadOp& op)
   const std::shared_lock lock(shard.mutex);
   // After locking, so it is no older than any eviction behind a miss.
   auto answer = shard.store.Read(op, Horizon(index));
-  if (answer.result.has_value() && exists == nullptr) RecordAccess(shard, key);
   return {.result = std::move(answer.result), .fence = answer.fence};
 }
 
@@ -115,7 +105,7 @@ core::Result<core::RespValue> ShardedHotStore::ExecExists(const core::ops::Exist
   int64_t total = 0;
   for (auto key : op.keys) {
     auto& shard = ShardFor(key);
-    std::shared_lock lock(shard.mutex);
+    const std::shared_lock lock(shard.mutex);
     core::ops::Exists shard_op{.keys = {key}};
     auto result = shard.store.Exec(core::ops::ReadOp{shard_op});
     if (result.has_value()) total += result->AsInteger();
@@ -275,14 +265,19 @@ ShardLocks ShardedHotStore::LockExclusive(std::span<const core::ShardId> shards)
   return {*this, shards};
 }
 
-bool ShardedHotStore::EvictShardToTarget(core::ShardId shard) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  const auto horizon = Horizon(shard);
-  Shard& target = *shards_.at(shard);
-  const std::unique_lock lock(target.mutex);
-  if (config_.max_memory_bytes != 0) {
-    target.store.EvictLru(config_.max_memory_bytes / config_.shard_count, horizon);
-  }
-  return !target.store.OverBackpressure();
+bool ShardedHotStore::EvictShardToTarget(core::ShardId shard) {
+  bool over = false;
+  size_t evicted = 0;
+  RunHolds(shard, metrics::MaintenancePass::kMemory,
+           [this, &over, &evicted](SingleShardStore& store, core::SequenceId horizon,
+                                   HoldBudget& budget) {
+             const bool done = config_.max_memory_bytes == 0 ||
+                               store.EvictLru(config_.max_memory_bytes / config_.shard_count,
+                                              horizon, budget, evicted);
+             over = store.OverBackpressure();
+             return done;
+           });
+  return !over;
 }
 
 LoadStart ShardedHotStore::BeginLoad(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
@@ -318,12 +313,19 @@ ShardedHotStore::FillResult ShardedHotStore::Install(std::string_view key, LoadT
   FillResult outcome = FillResult::kDiscarded;
   {
     const std::unique_lock lock(shard.mutex);
+    const auto horizon = Horizon(index);
     if (too_large || (fill && shard.store.OverBackpressure())) {
       shard.store.AbortLoad(key, token);
       outcome = too_large ? FillResult::kTooLarge : FillResult::kOverBackpressure;
     } else {
       shard.store.SetGraveyard(&evicted);
-      if (shard.store.CompleteLoad(key, token, std::move(result), eviction, Horizon(index))) {
+      // A fill is optional: it evicts one hold's worth at most, and is
+      // skipped if that is not enough.
+      if (fill && full != nullptr && shard.store.LoadPending(key) &&
+          !shard.store.MakeRoom(key, full->bytes, horizon)) {
+        shard.store.AbortLoad(key, token);
+        outcome = FillResult::kNoRoom;
+      } else if (shard.store.CompleteLoad(key, token, std::move(result), eviction, horizon)) {
         outcome = FillResult::kInstalled;
       }
       shard.store.SetGraveyard(nullptr);
@@ -395,38 +397,103 @@ bool ShardedHotStore::KnownAbsentAfterFlush(std::string_view key) ABYSS_NO_THREA
   return shard.store.KnownAbsentAfterFlush(horizon);
 }
 
-void ShardedHotStore::DrainAccessBuffers(core::SteadyTime now) {
-  for (auto& shard : shards_) {
-    std::vector<std::string> keys;
+void ShardedHotStore::SetAccessTime(core::SteadyTime now) {
+  for (auto& shard : shards_) shard->store.SetAccessTime(now);
+}
+
+template <typename Step, typename More>
+void ShardedHotStore::RunHolds(core::ShardId index, metrics::MaintenancePass pass, Step step,
+                               More more) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+  Shard& shard = *shards_.at(index);
+  for (;;) {
+    // Read before the lock: never a cold call under a shard lock, and
+    // an older horizon only holds back more.
+    const auto horizon = Horizon(index);
+    HoldBudget budget = HoldBudget::Capped();
+    // Freed after the lock.
+    Graveyard removed;
+    bool done = false;
+    core::SteadyClock::duration held{};
     {
-      std::scoped_lock access_lock(shard->access_mutex);
-      keys.swap(shard->access_buffer);
-      // Reset the per-tick de-dup set so the next interval starts fresh.
-      shard->access_seen.clear();
+      const std::unique_lock lock(shard.mutex);
+      const auto start = core::SteadyClock::now();
+      shard.store.SetGraveyard(&removed);
+      done = step(shard.store, horizon, budget);
+      shard.store.SetGraveyard(nullptr);
+      held = core::SteadyClock::now() - start;
     }
-    if (keys.empty()) continue;
-    std::unique_lock lock(shard->mutex);
-    for (const auto& key : keys) {
-      shard->store.RefreshAccess(key, now);
-    }
+    hold_seconds_.at(static_cast<size_t>(pass))
+        .Observe(std::chrono::duration<double>(held).count());
+    if (hold_observer_) hold_observer_(pass, held, budget.examined());
+    if (done || !more(budget)) return;
   }
 }
 
-SingleShardStore::EvictExpiredReport ShardedHotStore::EvictExpired(core::SteadyTime now)
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  SingleShardStore::EvictExpiredReport total;
+template <typename Step>
+void ShardedHotStore::RunHolds(core::ShardId index, metrics::MaintenancePass pass, Step step) {
+  RunHolds(index, pass, std::move(step), [](const HoldBudget& /*budget*/) { return true; });
+}
+
+SingleShardStore::EvictExpiredReport ShardedHotStore::EvictExpired(
+    core::SteadyTime now, std::optional<core::Duration> ttl_budget) {
+  EvictExpiredReport total;
   for (core::ShardId index = 0; index < config_.shard_count; ++index) {
-    const auto horizon = Horizon(index);
-    auto& shard = shards_[index];
-    std::unique_lock lock(shard->mutex);
-    const auto r = shard->store.EvictExpired(now, horizon);
-    total.by_deadline += r.by_deadline;
-    total.by_ttl += r.by_ttl;
+    RunHolds(index, metrics::MaintenancePass::kParked,
+             [now, &total](SingleShardStore& store, core::SequenceId horizon, HoldBudget& budget) {
+               return store.ReleaseParked(now, horizon, budget, total);
+             });
+  }
+  ExpireByTtl(now, ttl_budget, total);
+  for (core::ShardId index = 0; index < config_.shard_count; ++index) {
+    RunHolds(index, metrics::MaintenancePass::kDeadline,
+             [now, &total](SingleShardStore& store, core::SequenceId horizon, HoldBudget& budget) {
+               return store.EvictPastDeadline(now, horizon, budget, total);
+             });
   }
   return total;
 }
 
-size_t ShardedHotStore::EvictToMemoryTarget() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+void ShardedHotStore::ExpireByTtl(core::SteadyTime now, std::optional<core::Duration> budget,
+                                  EvictExpiredReport& total) {
+  const std::scoped_lock sweep(ttl_mu_);
+  const auto started = core::SteadyClock::now();
+  if (!sweep_started_.has_value()) sweep_started_ = started;
+  const auto out_of_time = [budget, started] {
+    return budget.has_value() && core::SteadyClock::now() - started >= *budget;
+  };
+  while (ttl_swept_ < config_.shard_count) {
+    if (out_of_time()) return;
+    size_t expired = 0;
+    bool stopped_for_time = false;
+    RunHolds(
+        ttl_next_shard_, metrics::MaintenancePass::kTtl,
+        [now, &total, &expired](SingleShardStore& store, core::SequenceId horizon,
+                                HoldBudget& hold) {
+          const size_t before = total.Total() + total.parked;
+          const bool done = store.ExpireTtl(now, horizon, hold, total);
+          expired = total.Total() + total.parked - before;
+          return done;
+        },
+        [&expired, &stopped_for_time, &out_of_time](const HoldBudget& hold) {
+          // Valkey's rule: another hold only while more than a quarter
+          // of what one examined had expired.
+          if (expired * 4 <= hold.examined()) return false;
+          stopped_for_time = out_of_time();
+          return !stopped_for_time;
+        });
+    // Resumed next time.
+    if (stopped_for_time) return;
+    ++ttl_swept_;
+    ttl_next_shard_ = (ttl_next_shard_ + 1) % config_.shard_count;
+  }
+  expiry_sweep_seconds_.Observe(
+      std::chrono::duration<double>(core::SteadyClock::now() - sweep_started_.value_or(started))
+          .count());
+  sweep_started_.reset();
+  ttl_swept_ = 0;
+}
+
+size_t ShardedHotStore::EvictToMemoryTarget() {
   // A budget of 0 means unlimited — never evict for memory pressure. (Guarded
   // here too because EvictLru(0) would otherwise evict every key.)
   if (config_.max_memory_bytes == 0) return 0;
@@ -436,31 +503,22 @@ size_t ShardedHotStore::EvictToMemoryTarget() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   // queue/cold (invariant 2).
   const size_t per_shard = config_.max_memory_bytes / config_.shard_count;
   for (core::ShardId index = 0; index < config_.shard_count; ++index) {
-    const auto horizon = Horizon(index);
-    auto& shard = shards_[index];
-    std::unique_lock lock(shard->mutex);
-    evicted += shard->store.EvictLru(per_shard, horizon);
+    RunHolds(index, metrics::MaintenancePass::kMemory,
+             [per_shard, &evicted](SingleShardStore& store, core::SequenceId horizon,
+                                   HoldBudget& budget) {
+               return store.EvictLru(per_shard, horizon, budget, evicted);
+             });
   }
   return evicted;
 }
 
-ShardedHotStore::AccessBufferStats ShardedHotStore::AccessBufferSnapshot() const {
-  AccessBufferStats stats;
-  for (const auto& shard : shards_) {
-    std::scoped_lock access_lock(shard->access_mutex);
-    stats.depth += shard->access_buffer.size();
-    stats.dropped += shard->access_dropped;
-  }
-  return stats;
-}
-
-size_t ShardedHotStore::GcTombstones() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+size_t ShardedHotStore::GcTombstones() {
   size_t reclaimed = 0;
-  for (core::ShardId shard = 0; shard < config_.shard_count; ++shard) {
-    const auto horizon = Horizon(shard);
-    auto& s = *shards_[shard];
-    std::unique_lock lock(s.mutex);
-    reclaimed += s.store.GcTombstones(horizon);
+  for (core::ShardId index = 0; index < config_.shard_count; ++index) {
+    RunHolds(index, metrics::MaintenancePass::kTombstones,
+             [&reclaimed](SingleShardStore& store, core::SequenceId horizon, HoldBudget& budget) {
+               return store.GcTombstones(horizon, budget, reclaimed);
+             });
   }
   return reclaimed;
 }

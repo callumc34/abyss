@@ -17,13 +17,11 @@ EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
   ttl_expired_total_ = reg.Counter(metrics::names::kTtlExpiredTotal, metrics::Tier::kHot);
   tombstones_reclaimed_total_ = reg.Counter(metrics::names::kHotTombstonesReclaimedTotal);
   memory_evicted_total_ = reg.Counter(metrics::names::kHotMemoryEvictedTotal);
-  access_buffer_dropped_total_ = reg.Counter(metrics::names::kHotAccessBufferDroppedTotal);
   stub_drops_total_ = reg.Counter(metrics::names::kHotStubDropsTotal);
   load_discards_total_ = reg.Counter(metrics::names::kHotLoadDiscardsTotal);
   hot_memory_bytes_ = reg.Gauge(metrics::names::kHotMemoryBytes);
   hot_keys_ = reg.Gauge(metrics::names::kHotKeys);
   hot_max_memory_bytes_ = reg.Gauge(metrics::names::kHotMaxMemoryBytes);
-  hot_access_buffer_depth_ = reg.Gauge(metrics::names::kHotAccessBufferDepth);
   hot_stub_entries_ = reg.Gauge(metrics::names::kHotStubEntries);
   hot_negative_entries_ = reg.Gauge(metrics::names::kHotNegativeEntries);
   hot_unevictable_bytes_ = reg.Gauge(metrics::names::kHotUnevictableBytes);
@@ -49,8 +47,10 @@ void EvictionWorker::Stop() {
 
 void EvictionWorker::TickOnce() {
   const auto now = steady_clock_();
-  store_.DrainAccessBuffers(now);
-  const auto report = store_.EvictExpired(now);
+  // What reads stamp until the next tick.
+  store_.SetAccessTime(now);
+  // TTL expiry gets a quarter of the tick, as Valkey's slow cycle does.
+  const auto report = store_.EvictExpired(now, config_.tick / 4);
   if (report.by_deadline > 0) {
     evicted_total_.Increment(static_cast<double>(report.by_deadline));
   }
@@ -93,13 +93,6 @@ void EvictionWorker::TickOnce() {
           static_cast<double>(stats->load_discards - reported_load_discards_));
       reported_load_discards_ = stats->load_discards;
     }
-  }
-  const auto access = store_.AccessBufferSnapshot();
-  hot_access_buffer_depth_.Set(static_cast<double>(access.depth));
-  if (access.dropped > reported_access_dropped_) {
-    access_buffer_dropped_total_.Increment(
-        static_cast<double>(access.dropped - reported_access_dropped_));
-    reported_access_dropped_ = access.dropped;
   }
 }
 

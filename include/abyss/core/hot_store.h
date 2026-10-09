@@ -31,8 +31,11 @@ struct MemoryStats {
   // Keys held as loaded absent.
   uint64_t negative_entries = 0;
   uint64_t load_discards = 0;
-  // Live bytes cold had not drained, as of the last full eviction pass.
+  // Live bytes held for cold: every live byte once an LRU walk found
+  // nothing to evict, else those of keys due but not yet drained.
   uint64_t unevictable_bytes = 0;
+  // The TTL index's own bytes, part of used_bytes.
+  uint64_t ttl_index_bytes = 0;
   // Over the backpressure ratio of max_bytes after an eviction pass.
   bool backpressured = false;
 };

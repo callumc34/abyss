@@ -27,6 +27,19 @@ target_link_libraries(abyss_component_tests PRIVATE
 
 abyss_discover_tests(abyss_component_tests "component")
 
+# A million keys in one shard; its own binary so it can carry its own label.
+add_executable(abyss_hot_hold_cap_tests
+  hot_hold_cap_test.cpp
+)
+
+target_link_libraries(abyss_hot_hold_cap_tests PRIVATE
+  abyss::hot
+  abyss::test_support
+  GTest::gtest_main
+)
+
+abyss_discover_tests(abyss_hot_hold_cap_tests "component")
+
 add_executable(abyss_component_net_tests
   net/tcp_server_test.cpp
   net/sync_redis_client.cpp

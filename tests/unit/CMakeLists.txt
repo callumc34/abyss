@@ -74,6 +74,7 @@ add_executable(abyss_hot_tests
   hot/residency_test.cpp
   hot/apply_effects_test.cpp
   hot/shard_locks_test.cpp
+  hot/maintenance_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE
@@ -254,10 +255,13 @@ target_link_libraries(abyss_engine_tests PRIVATE
 add_executable(abyss_sequencer_alloc_tests
   engine/alloc_counter.cpp
   engine/sequencer_alloc_test.cpp
+  engine/lookup_alloc_test.cpp
 )
 
 target_link_libraries(abyss_sequencer_alloc_tests PRIVATE
+  abyss::consumer
   abyss::engine
+  abyss::hot
   abyss::queue
   abyss::test_support
   GTest::gtest_main

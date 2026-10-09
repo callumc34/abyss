@@ -4,7 +4,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
@@ -55,7 +60,7 @@ void BM_HotStringGet(benchmark::State& state) {
   const auto value_size = static_cast<size_t>(state.range(1));
   HotFixture fixture{key_count, value_size};
   int64_t i = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     const auto key = KeyFor(i % key_count);
     const core::ops::StringGet op{.key = key};
     benchmark::DoNotOptimize(fixture.store.Exec(op));
@@ -70,7 +75,7 @@ void BM_HotStringSet(benchmark::State& state) {
   const auto value_size = static_cast<size_t>(state.range(1));
   HotFixture fixture{key_count, value_size};
   int64_t i = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     const auto key = KeyFor(i % key_count);
     const core::ops::StringSet set_op{.key = key, .value = fixture.value, .abs_ttl_ms = 0};
     const core::ops::WriteOp op = set_op;
@@ -80,6 +85,57 @@ void BM_HotStringSet(benchmark::State& state) {
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
 }
 BENCHMARK(BM_HotStringSet)->Args({100000, 64})->Args({100000, 1024})->Unit(benchmark::kNanosecond);
+
+// Read hits from 1 and 8 threads over one store, keys formatted up
+// front: whether readers of one shard, or of one key, serialise.
+struct ReadScaling {
+  core::EvictionPolicy eviction{core::EvictionTTL{86400}};
+  ShardedHotStore store;
+  std::vector<std::string> keys;
+
+  explicit ReadScaling(uint32_t shards)
+      : store(ShardedHotStoreConfig{
+            .max_memory_bytes = kMaxMemoryBytes,
+            .shard_count = shards,
+            .eviction_policy = &eviction,
+        }) {
+    constexpr int64_t kKeys = 100000;
+    keys.reserve(kKeys);
+    for (int64_t i = 0; i < kKeys; ++i) {
+      keys.push_back(KeyFor(i));
+      const core::ops::StringSet set_op{.key = keys.back(), .value = "v"};
+      if (!store.Apply(core::ops::WriteOp{set_op}, core::kFirstSeq).has_value()) std::abort();
+    }
+  }
+
+  static ReadScaling& Get(uint32_t shards) {
+    static std::mutex mu;
+    static std::map<uint32_t, std::unique_ptr<ReadScaling>> fixtures;
+    const std::scoped_lock lock(mu);
+    auto& fixture = fixtures[shards];
+    if (fixture == nullptr) fixture = std::make_unique<ReadScaling>(shards);
+    return *fixture;
+  }
+};
+
+void BM_HotReadScaling(benchmark::State& state) {
+  ReadScaling& fixture = ReadScaling::Get(static_cast<uint32_t>(state.range(0)));
+  const bool one_key = state.range(1) != 0;
+  uint64_t x = static_cast<uint64_t>(state.thread_index()) + 1;
+  for ([[maybe_unused]] auto _ : state) {
+    x = (x * 6364136223846793005ULL) + 1442695040888963407ULL;
+    const std::string& key = fixture.keys[one_key ? 0 : (x >> 33) % fixture.keys.size()];
+    benchmark::DoNotOptimize(
+        fixture.store.Read(core::ops::ReadOp{core::ops::StringGet{.key = key}}));
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+}
+BENCHMARK(BM_HotReadScaling)
+    ->ArgNames({"shards", "one_key"})
+    ->ArgsProduct({{1, 64}, {0, 1}})
+    ->Threads(1)
+    ->Threads(8)
+    ->UseRealTime();
 
 }  // namespace
 }  // namespace abyss::hot

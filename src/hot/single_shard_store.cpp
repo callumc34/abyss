@@ -1,8 +1,10 @@
 #include "abyss/hot/single_shard_store.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -65,7 +67,16 @@ class FlagScope {
 size_t StringBytes(const std::string& s) { return sizeof(std::string) + s.capacity(); }
 
 // A zset score bucket's own cost, as ApproximateBytes counts it.
-constexpr size_t kScoreBucketBytes = sizeof(double) + sizeof(std::set<std::string>);
+constexpr size_t kScoreBucketBytes = sizeof(double) + sizeof(std::set<std::string, std::less<>>);
+
+core::SteadyTime AccessedAt(const Entry& entry) {
+  const std::atomic_ref<core::SteadyTime::rep> stamp(entry.accessed);
+  return core::SteadyTime{core::SteadyTime::duration{stamp.load(std::memory_order_relaxed)}};
+}
+
+bool TtlPassed(int64_t abs_ttl_ms, int64_t now_ms) {
+  return abs_ttl_ms != 0 && now_ms >= abs_ttl_ms;
+}
 
 // Drops `member` from its score bucket, and the bucket once empty. Both
 // finds are checked: a NaN score breaks the map's ordering.
@@ -163,6 +174,87 @@ bool LexAtOrBelowMax(std::string_view member, const LexBound& max) {
 
 size_t Entry::ApproximateBytes() const { return hot::ApproximateBytes(value); }
 
+core::SteadyTime Entry::Deadline() const {
+  return std::max(linked_at, AccessedAt(*this)) + eviction;
+}
+
+HoldBudget::HoldBudget(size_t max_entries) : max_entries_(max_entries) {}
+
+HoldBudget HoldBudget::Unbounded() {
+  HoldBudget budget(std::numeric_limits<size_t>::max());
+  budget.timed_ = false;
+  return budget;
+}
+
+bool HoldBudget::Take() {
+  if (examined_ >= max_entries_) return false;
+  if (timed_) {
+    // From the first entry, so a hold with nothing to do reads no clock;
+    // then every eighth, as one entry's work is far below it.
+    if (examined_ == 0) {
+      until_ = core::SteadyClock::now() + kHoldTime;
+    } else if ((examined_ % 8) == 0 && core::SteadyClock::now() >= until_) {
+      max_entries_ = examined_;
+      return false;
+    }
+  }
+  ++examined_;
+  return true;
+}
+
+void SeqHeap::Push(Entry& entry) {
+  heap_.push_back(&entry);
+  entry.heap_slot = static_cast<uint32_t>(heap_.size() - 1);
+  SiftUp(heap_.size() - 1);
+}
+
+void SeqHeap::Erase(Entry& entry) {
+  const size_t slot = entry.heap_slot;
+  entry.heap_slot = Entry::kNoSlot;
+  Entry* last = heap_.back();
+  heap_.pop_back();
+  if (slot == heap_.size()) return;
+  Place(slot, last);
+  SiftUp(slot);
+  SiftDown(last->heap_slot);
+}
+
+void SeqHeap::Update(Entry& entry) {
+  SiftUp(entry.heap_slot);
+  SiftDown(entry.heap_slot);
+}
+
+void SeqHeap::Place(size_t slot, Entry* entry) {
+  heap_[slot] = entry;
+  entry->heap_slot = static_cast<uint32_t>(slot);
+}
+
+void SeqHeap::SiftUp(size_t slot) {
+  Entry* entry = heap_[slot];
+  while (slot > 0) {
+    const size_t parent = (slot - 1) / 2;
+    if (heap_[parent]->latest_seq <= entry->latest_seq) break;
+    Place(slot, heap_[parent]);
+    slot = parent;
+  }
+  Place(slot, entry);
+}
+
+void SeqHeap::SiftDown(size_t slot) {
+  Entry* entry = heap_[slot];
+  for (;;) {
+    size_t child = (2 * slot) + 1;
+    if (child >= heap_.size()) break;
+    if (child + 1 < heap_.size() && heap_[child + 1]->latest_seq < heap_[child]->latest_seq) {
+      ++child;
+    }
+    if (entry->latest_seq <= heap_[child]->latest_seq) break;
+    Place(slot, heap_[child]);
+    slot = child;
+  }
+  Place(slot, entry);
+}
+
 size_t ApproximateBytes(const Value& value) {
   size_t bytes = sizeof(Entry);
   std::visit(
@@ -210,13 +302,13 @@ std::string_view KeyView::string_value() const {
 
 bool KeyView::set_has(std::string_view member) const {
   const auto* set = value != nullptr ? std::get_if<SetValue>(value) : nullptr;
-  return set != nullptr && set->members.contains(std::string(member));
+  return set != nullptr && set->members.contains(member);
 }
 
 std::optional<double> KeyView::zset_score(std::string_view member) const {
   const auto* zset = value != nullptr ? std::get_if<ZsetValue>(value) : nullptr;
   if (zset == nullptr) return std::nullopt;
-  const auto it = zset->member_scores.find(std::string(member));
+  const auto it = zset->member_scores.find(member);
   if (it == zset->member_scores.end()) return std::nullopt;
   return it->second;
 }
@@ -226,7 +318,7 @@ bool KeyView::hash_has(std::string_view field) const { return hash_get(field).ha
 std::optional<std::string_view> KeyView::hash_get(std::string_view field) const {
   const auto* hash = value != nullptr ? std::get_if<HashValue>(value) : nullptr;
   if (hash == nullptr) return std::nullopt;
-  const auto it = hash->fields.find(std::string(field));
+  const auto it = hash->fields.find(field);
   if (it == hash->fields.end()) return std::nullopt;
   return std::string_view(it->second);
 }
@@ -334,7 +426,7 @@ core::RespValue ReadOf(const core::ops::StringGet& /*op*/, const std::string& va
 }
 
 core::RespValue ReadOf(const core::ops::SetIsMember& op, const SetValue& set) {
-  return core::RespValue::Integer(set.members.contains(std::string(op.member)) ? 1 : 0);
+  return core::RespValue::Integer(set.members.contains(op.member) ? 1 : 0);
 }
 
 core::RespValue ReadOf(const core::ops::SetMembers& /*op*/, const SetValue& set) {
@@ -351,7 +443,7 @@ core::RespValue ReadOf(const core::ops::SetCard& /*op*/, const SetValue& set) {
 }
 
 core::RespValue ReadOf(const core::ops::ZsetScore& op, const ZsetValue& zset) {
-  auto it = zset.member_scores.find(std::string(op.member));
+  auto it = zset.member_scores.find(op.member);
   if (it == zset.member_scores.end()) {
     return core::RespValue::Null();
   }
@@ -468,7 +560,7 @@ core::Result<core::RespValue> ReadOf(const core::ops::ZsetRange& op, const ZsetV
 }
 
 core::RespValue ReadOf(const core::ops::HashGet& op, const HashValue& hash) {
-  auto it = hash.fields.find(std::string(op.field));
+  auto it = hash.fields.find(op.field);
   if (it == hash.fields.end()) {
     return core::RespValue::Null();
   }
@@ -489,7 +581,7 @@ core::RespValue ReadOf(const core::ops::HashMultiGet& op, const HashValue& hash)
   std::vector<core::RespValue> elements;
   elements.reserve(op.fields.size());
   for (auto field : op.fields) {
-    auto it = hash.fields.find(std::string(field));
+    auto it = hash.fields.find(field);
     if (it == hash.fields.end()) {
       elements.push_back(core::RespValue::Null());
     } else {
@@ -500,7 +592,7 @@ core::RespValue ReadOf(const core::ops::HashMultiGet& op, const HashValue& hash)
 }
 
 core::RespValue ReadOf(const core::ops::HashFieldExists& op, const HashValue& hash) {
-  return core::RespValue::Integer(hash.fields.contains(std::string(op.field)) ? 1 : 0);
+  return core::RespValue::Integer(hash.fields.contains(op.field) ? 1 : 0);
 }
 
 core::RespValue ReadOf(const core::ops::HashKeys& /*op*/, const HashValue& hash) {
@@ -628,12 +720,13 @@ core::Result<core::RespValue> SingleShardStore::Exec(const core::ops::ReadOp& op
     }
     return core::RespValue::Integer(count);
   }
-  const std::string_view key = core::ops::PrimaryKey(op);
+  const Entry* entry = FindEntry(core::ops::PrimaryKey(op));
   // A tombstone is authoritative: the key was deleted.
-  if (Probe(key) == core::HotKeyPresence::kTombstoned) return EmptyReadResponse(op);
-  const Entry* entry = FindLiveEntry(key);
-  if (entry == nullptr) return std::unexpected(NotFound());
-  return AnswerRead(op, entry->type, &entry->value, entry->abs_ttl_ms, WallMs(config_.wall_clock));
+  if (entry != nullptr && entry->tombstoned) return EmptyReadResponse(op);
+  const int64_t now_ms = WallMs(config_.wall_clock);
+  if (entry == nullptr || TtlPassed(entry->abs_ttl_ms, now_ms)) return std::unexpected(NotFound());
+  if (!IsMetaRead(op)) NoteAccess(*entry);
+  return AnswerRead(op, entry->type, &entry->value, entry->abs_ttl_ms, now_ms);
 }
 // --- Write operations ---
 
@@ -642,13 +735,15 @@ core::Result<core::RespValue> SingleShardStore::Apply(const core::ops::WriteOp& 
                                                       core::SequenceId seq,
                                                       core::SequenceId horizon) {
   auto result = Mutate(op, eviction, seq, SetMove{});
+  HoldBudget budget = HoldBudget::Capped();
   // The write has already applied (and is durable in the queue). Make room by
   // evicting OTHER LRU victims down to the budget, protecting the just-written
   // key. If even then the entry cannot fit (a single value larger than the
   // whole budget, no other victims), surface kResourceExhausted as an admission
   // signal — the entry is NOT lost, it stays durable in the queue/cold
   // (invariant 2). Suppressed during replay.
-  if (Grows(op) && result.has_value() && !EnsureCapacityFor(core::ops::PrimaryKey(op), horizon)) {
+  if (Grows(op) && result.has_value() &&
+      !EnsureCapacityFor(core::ops::PrimaryKey(op), horizon, budget)) {
     return std::unexpected(
         core::Error(core::ErrorCode::kResourceExhausted, "hot store memory budget exhausted"));
   }
@@ -708,6 +803,9 @@ std::vector<core::RespValue> SingleShardStore::ApplyEffects(std::span<core::Effe
   const FlagScope applying(applying_effects_);
   std::vector<core::RespValue> replies;
   replies.reserve(effects.size());
+  // One hold's eviction for the whole call: an overshoot is the
+  // eviction worker's and backpressure's to bound.
+  HoldBudget budget = HoldBudget::Capped();
   for (size_t i = 0; i < effects.size(); ++i) {
     core::Effect& effect = effects[i];
     auto op = core::ops::ParseWriteOp(effect.cmd.Name(), effect.cmd, static_cast<uint64_t>(at_ms));
@@ -724,7 +822,7 @@ std::vector<core::RespValue> SingleShardStore::ApplyEffects(std::span<core::Effe
     auto result = Mutate(*op, policy.Resolve(key), first_seq + i, move);
     if (effect.observed_expiry) ++expired_count_;
     // Decided effects always apply: an overshoot shows in Stats.
-    if (Grows(*op)) EnsureCapacityFor(key, horizon);
+    if (Grows(*op)) EnsureCapacityFor(key, horizon, budget);
     // Decide ruled out every apply error and the effect is logged, so
     // an error here means hot and the log disagree.
     if (!result.has_value()) {
@@ -754,7 +852,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
   };
   core::RespValue reply =
       move.reply_old_value ? core::RespValue::Null() : core::RespValue::SimpleString("OK");
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   // A tombstone is treated as absent: fall to the create path so the key is
   // resurrected as a live string (with the key_count increment that implies).
   if (it != entries_.end() && !it->second.tombstoned) {
@@ -765,7 +863,6 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
       it->second.value = take_value();
       it->second.bytes = it->second.ApproximateBytes();
       it->second.eviction = eviction;
-      it->second.eviction_deadline = config_.steady_clock() + eviction;
       it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
       TrackInsert(it->second, op.key);
       return reply;
@@ -779,7 +876,6 @@ core::Result<core::RespValue> SingleShardStore::ApplyStringSet(const core::ops::
     it->second.value = take_value();
     it->second.bytes = it->second.ApproximateBytes();
     it->second.eviction = eviction;
-    it->second.eviction_deadline = config_.steady_clock() + eviction;
     it->second.abs_ttl_ms = static_cast<int64_t>(op.abs_ttl_ms);
     TrackInsert(it->second, op.key);
     return reply;
@@ -800,7 +896,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& o
                                                          core::SequenceId seq) {
   int64_t removed = 0;
   for (auto key : op.keys) {
-    auto it = entries_.find(std::string(key));
+    auto it = entries_.find(key);
     if (it == entries_.end()) {
       InsertTombstone(key, seq);
       continue;
@@ -821,14 +917,14 @@ core::Result<core::RespValue> SingleShardStore::ApplyDel(const core::ops::Del& o
 
 core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::SetAdd& op,
                                                             core::EvictionTTL eviction) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it != entries_.end() && !it->second.tombstoned && !ExpiredForApply(it->second) &&
       it->second.type != Entry::Type::kSet) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
   if (it != entries_.end() && !it->second.tombstoned && ExpiredForApply(it->second)) {
-    RemoveEntry(std::string(op.key));
+    RemoveEntry(op.key);
   }
 
   // GetOrCreateEntry establishes a tracked empty-entry baseline on create or
@@ -846,14 +942,13 @@ core::Result<core::RespValue> SingleShardStore::ApplySetAdd(const core::ops::Set
     ++added;
   }
   entry.eviction = eviction;
-  entry.eviction_deadline = config_.steady_clock() + eviction;
   TrackInsert(entry, op.key);
   return core::RespValue::Integer(added);
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplySetRem(const core::ops::SetRem& op,
                                                             core::SequenceId seq) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it == entries_.end() || it->second.tombstoned || ExpiredForApply(it->second)) {
     return core::RespValue::Integer(0);
   }
@@ -865,7 +960,7 @@ core::Result<core::RespValue> SingleShardStore::ApplySetRem(const core::ops::Set
   auto& members = std::get<SetValue>(it->second.value).members;
   int64_t removed = 0;
   for (auto member : op.members) {
-    const auto pos = members.find(std::string(member));
+    const auto pos = members.find(member);
     if (pos == members.end()) continue;
     it->second.bytes -= StringBytes(*pos);
     members.erase(pos);
@@ -882,14 +977,14 @@ core::Result<core::RespValue> SingleShardStore::ApplySetRem(const core::ops::Set
 
 core::Result<core::RespValue> SingleShardStore::ApplyZsetAdd(const core::ops::ZsetAdd& op,
                                                              core::EvictionTTL eviction) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it != entries_.end() && !it->second.tombstoned && !ExpiredForApply(it->second) &&
       it->second.type != Entry::Type::kZset) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
   if (it != entries_.end() && !it->second.tombstoned && ExpiredForApply(it->second)) {
-    RemoveEntry(std::string(op.key));
+    RemoveEntry(op.key);
   }
 
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kZset, eviction);
@@ -913,14 +1008,13 @@ core::Result<core::RespValue> SingleShardStore::ApplyZsetAdd(const core::ops::Zs
   }
 
   entry.eviction = eviction;
-  entry.eviction_deadline = config_.steady_clock() + eviction;
   TrackInsert(entry, op.key);
   return core::RespValue::Integer(added);
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyZsetRem(const core::ops::ZsetRem& op,
                                                              core::SequenceId seq) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it == entries_.end() || it->second.tombstoned || ExpiredForApply(it->second)) {
     return core::RespValue::Integer(0);
   }
@@ -933,7 +1027,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyZsetRem(const core::ops::Zs
 
   int64_t removed = 0;
   for (auto member : op.members) {
-    const auto scored = zset.member_scores.find(std::string(member));
+    const auto scored = zset.member_scores.find(member);
     if (scored == zset.member_scores.end()) continue;
     UnindexScore(zset, it->second.bytes, scored->second, scored->first);
     it->second.bytes -= StringBytes(scored->first) + sizeof(double);
@@ -950,14 +1044,14 @@ core::Result<core::RespValue> SingleShardStore::ApplyZsetRem(const core::ops::Zs
 
 core::Result<core::RespValue> SingleShardStore::ApplyHashSet(const core::ops::HashSet& op,
                                                              core::EvictionTTL eviction) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it != entries_.end() && !it->second.tombstoned && !ExpiredForApply(it->second) &&
       it->second.type != Entry::Type::kHash) {
     return std::unexpected(core::Error(core::ErrorCode::kWrongType,
                                        "Operation against a key holding the wrong kind of value"));
   }
   if (it != entries_.end() && !it->second.tombstoned && ExpiredForApply(it->second)) {
-    RemoveEntry(std::string(op.key));
+    RemoveEntry(op.key);
   }
 
   auto& entry = GetOrCreateEntry(op.key, Entry::Type::kHash, eviction);
@@ -976,7 +1070,6 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashSet(const core::ops::Ha
     }
   }
   entry.eviction = eviction;
-  entry.eviction_deadline = config_.steady_clock() + eviction;
   TrackInsert(entry, op.key);
   return core::RespValue::Integer(new_fields);
 }
@@ -994,7 +1087,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashMSet(const core::ops::H
 
 core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::HashDel& op,
                                                              core::SequenceId seq) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it == entries_.end() || it->second.tombstoned || ExpiredForApply(it->second)) {
     return core::RespValue::Integer(0);
   }
@@ -1006,7 +1099,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::Ha
   auto& fields = std::get<HashValue>(it->second.value).fields;
   int64_t removed = 0;
   for (auto field : op.fields) {
-    const auto pos = fields.find(std::string(field));
+    const auto pos = fields.find(field);
     if (pos == fields.end()) continue;
     it->second.bytes -= StringBytes(pos->first) + StringBytes(pos->second);
     fields.erase(pos);
@@ -1020,7 +1113,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyHashDel(const core::ops::Ha
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Expire& op) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it == entries_.end()) return core::RespValue::Integer(0);
   // A tombstone is logically absent (mirrors FindLiveEntry/Probe). EXPIRE on a
   // deleted-but-not-yet-GC'd key returns 0 and must not resurrect or mutate the
@@ -1035,7 +1128,7 @@ core::Result<core::RespValue> SingleShardStore::ApplyExpire(const core::ops::Exp
 }
 
 core::Result<core::RespValue> SingleShardStore::ApplyPersist(const core::ops::Persist& op) {
-  auto it = entries_.find(std::string(op.key));
+  auto it = entries_.find(op.key);
   if (it == entries_.end()) return core::RespValue::Integer(0);
   // A tombstone is logically absent: PERSIST returns 0 and leaves it untouched.
   if (it->second.tombstoned) return core::RespValue::Integer(0);
@@ -1051,104 +1144,192 @@ core::Result<core::RespValue> SingleShardStore::ApplyPersist(const core::ops::Pe
 
 // --- Maintenance ---
 
-void SingleShardStore::RefreshAccess(std::string_view key, core::SteadyTime now) {
-  auto it = entries_.find(std::string(key));
-  if (it == entries_.end()) return;
-  if (!it->second.tombstoned) LruTouch(it->second);
-  it->second.eviction_deadline = now + it->second.eviction;
+void SingleShardStore::SetAccessTime(core::SteadyTime now) {
+  access_now_.store(now.time_since_epoch().count(), std::memory_order_relaxed);
+}
+
+void SingleShardStore::NoteAccess(const Entry& entry) const {
+  const auto now = access_now_.load(std::memory_order_relaxed);
+  const std::atomic_ref<core::SteadyTime::rep> stamp(entry.accessed);
+  // Once a tick, so a hot key's line is not written on every read.
+  if (stamp.load(std::memory_order_relaxed) < now) stamp.store(now, std::memory_order_relaxed);
+}
+
+void SingleShardStore::EvictDue(Entry& entry, core::SequenceId horizon, int64_t now_ms,
+                                EvictExpiredReport& report) {
+  // Undrained, even if expired: a miss would read an older value from
+  // buffer or cold.
+  if (entry.latest_seq > horizon) {
+    Park(entry);
+    ++report.parked;
+    return;
+  }
+  const bool ttl_expired = TtlPassed(entry.abs_ttl_ms, now_ms);
+  // TTL is a deletion, deadline a tier transition; TTL wins when both
+  // fire, since the key is gone either way.
+  Evict(entries_.find(*entry.key), /*leave_stub=*/!ttl_expired);
+  if (ttl_expired) {
+    ++expired_count_;
+    ++report.by_ttl;
+  } else {
+    ++eviction_count_;
+    ++report.by_deadline;
+  }
+}
+
+bool SingleShardStore::ReleaseParked(core::SteadyTime now, core::SequenceId horizon,
+                                     HoldBudget& budget, EvictExpiredReport& report) {
+  const int64_t now_ms = WallMs(config_.wall_clock);
+  while (Entry* entry = parked_.Top()) {
+    if (entry->latest_seq > horizon) break;
+    if (!budget.Take()) return false;
+    Unpark(*entry);
+    if (!TtlPassed(entry->abs_ttl_ms, now_ms) && entry->Deadline() > now) {
+      // Read since it parked.
+      LruLink(*entry, std::max(entry->linked_at, AccessedAt(*entry)));
+      IndexTtl(*entry);
+      continue;
+    }
+    EvictDue(*entry, horizon, now_ms, report);
+  }
+  UpdateBackpressure();
+  return true;
+}
+
+bool SingleShardStore::ExpireTtl(core::SteadyTime /*now*/, core::SequenceId horizon,
+                                 HoldBudget& budget, EvictExpiredReport& report) {
+  const int64_t now_ms = WallMs(config_.wall_clock);
+  while (!ttl_index_.empty()) {
+    const auto [bucket, keys] = *ttl_index_.begin();
+    if (bucket * kTtlBucketMs > now_ms) break;
+    Entry* entry = keys.head;
+    while (entry != nullptr) {
+      if (!budget.Take()) return false;
+      // Taken before entry leaves the bucket.
+      Entry* const next = entry->ttl_next;
+      if (TtlPassed(entry->abs_ttl_ms, now_ms)) EvictDue(*entry, horizon, now_ms, report);
+      entry = next;
+    }
+    // What the bucket still holds is not yet due: it is now's.
+    if (!ttl_index_.empty() && ttl_index_.begin()->first == bucket) break;
+  }
+  UpdateBackpressure();
+  return true;
+}
+
+bool SingleShardStore::EvictPastDeadline(core::SteadyTime now, core::SequenceId horizon,
+                                         HoldBudget& budget, EvictExpiredReport& report) {
+  const int64_t now_ms = WallMs(config_.wall_clock);
+  for (LruList& list : lru_lists_) {
+    // In linked_at order, so the first not due by its link ends the
+    // list: a read only moves a deadline later.
+    while (list.oldest != nullptr && list.oldest->linked_at + list.eviction <= now) {
+      if (!budget.Take()) return false;
+      Entry& entry = *list.oldest;
+      const core::SteadyTime accessed = AccessedAt(entry);
+      if (accessed > entry.linked_at && accessed + list.eviction > now) {
+        LruUnlink(entry);
+        LruLink(entry, accessed);
+        continue;
+      }
+      EvictDue(entry, horizon, now_ms, report);
+    }
+  }
+  UpdateBackpressure();
+  return true;
 }
 
 SingleShardStore::EvictExpiredReport SingleShardStore::EvictExpired(core::SteadyTime now,
                                                                     core::SequenceId horizon) {
   EvictExpiredReport report;
-  uint64_t unevictable = 0;
-  for (auto it = entries_.begin(); it != entries_.end();) {
-    // Tombstones are reclaimed by GcTombstones once cold catches up, never by
-    // the eviction deadline — removing one early could expose a stale overlay.
-    if (it->second.tombstoned) {
-      ++it;
-      continue;
-    }
-    // Undrained, even if expired: a miss would read an older value from
-    // buffer or cold.
-    if (it->second.latest_seq > horizon) {
-      unevictable += Footprint(it->second, it->first);
-      ++it;
-      continue;
-    }
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    const bool ttl_expired = IsExpiredByTtl(it->second, config_.wall_clock);
-    const bool deadline_elapsed = it->second.eviction_deadline <= now;
-    if (ttl_expired || deadline_elapsed) {
-      it = Evict(it, /*leave_stub=*/!ttl_expired);
-      // Bucket by the entry's actual disposition, not raw iteration: TTL is a
-      // deletion (expired_count_), deadline is a tier transition
-      // (eviction_count_). TTL wins when both fire (the semantic outcome is
-      // "deleted entirely"). Tombstones are already skipped above, so C8's
-      // HOT-4 tombstone-handling change cannot mis-bucket a tombstoned entry
-      // here — only live entries reach this branch.
-      if (ttl_expired) {
-        expired_count_++;
-        ++report.by_ttl;
-      } else {
-        eviction_count_++;
-        ++report.by_deadline;
-      }
-    } else {
-      ++it;
-    }
-  }
-  unevictable_bytes_ = unevictable;
-  UpdateBackpressure();
+  HoldBudget budget = HoldBudget::Unbounded();
+  ReleaseParked(now, horizon, budget, report);
+  ExpireTtl(now, horizon, budget, report);
+  EvictPastDeadline(now, horizon, budget, report);
   return report;
 }
 
 size_t SingleShardStore::EvictLru(size_t target_bytes, core::SequenceId horizon) {
-  return EvictLru(target_bytes, std::string_view{}, horizon);
-}
-
-size_t SingleShardStore::EvictLru(size_t target_bytes, std::string_view protect_key,
-                                  core::SequenceId horizon) {
-  if (UsedBytes() <= target_bytes || (lru_dry_ && horizon <= lru_dry_horizon_)) {
-    UpdateBackpressure();
-    return 0;
-  }
-
-  // Walk from the cold end. Undrained and protected entries were written
-  // last, so they sit near the hot end and the skip over them is short.
-  lru_dry_ = false;
+  HoldBudget budget = HoldBudget::Unbounded();
   size_t evicted = 0;
-  bool skipped_evictable = false;
-  Entry* entry = lru_oldest_;
-  while (entry != nullptr && UsedBytes() > target_bytes) {
-    Entry* const newer = entry->lru_newer;
-    ++lru_visits_;
-    const bool drained = entry->latest_seq <= horizon;
-    if (drained && !protect_key.empty() && *entry->lru_key == protect_key) {
-      skipped_evictable = true;
-    } else if (drained) {
-      const bool expired = IsExpiredByTtl(*entry, config_.wall_clock);
-      Evict(entries_.find(*entry->lru_key), /*leave_stub=*/!expired);
-      eviction_count_++;
-      ++evicted;
-    }
-    entry = newer;
-  }
-  // Nothing left to evict: every live entry is undrained until cold
-  // passes this horizon.
-  if (UsedBytes() > target_bytes && !skipped_evictable) {
-    lru_dry_ = true;
-    lru_dry_horizon_ = horizon;
-    unevictable_bytes_ = live_bytes_;
-  }
-  UpdateBackpressure();
+  EvictLru(target_bytes, std::string_view{}, horizon, budget, evicted);
   return evicted;
 }
 
-bool SingleShardStore::EnsureCapacityFor(std::string_view protect_key, core::SequenceId horizon) {
+bool SingleShardStore::EvictLru(size_t target_bytes, core::SequenceId horizon, HoldBudget& budget,
+                                size_t& evicted) {
+  return EvictLru(target_bytes, std::string_view{}, horizon, budget, evicted);
+}
+
+bool SingleShardStore::EvictLru(size_t target_bytes, std::string_view protect_key,
+                                core::SequenceId horizon, HoldBudget& budget, size_t& evicted) {
+  if (UsedBytes() <= target_bytes || (lru_dry_ && horizon <= lru_dry_horizon_)) {
+    UpdateBackpressure();
+    return true;
+  }
+  lru_dry_ = false;
+  // Off its list for the walk, and back at the warm end after.
+  Entry* guarded = protect_key.empty() ? nullptr : FindEntry(protect_key);
+  if (guarded != nullptr && !Linked(*guarded)) guarded = nullptr;
+  if (guarded != nullptr) LruUnlink(*guarded);
+  const bool skipped_evictable = guarded != nullptr && guarded->latest_seq <= horizon;
+  for (LruList& list : lru_lists_) {
+    if (list.cursor_set && list.cursor_horizon != horizon) list.cursor_set = false;
+  }
+  bool done = false;
+  for (;;) {
+    if (UsedBytes() <= target_bytes) {
+      done = true;
+      break;
+    }
+    // The least recently linked of the lists' next entries.
+    LruList* from = nullptr;
+    for (LruList& list : lru_lists_) {
+      Entry* next = list.cursor_set ? list.cursor : list.oldest;
+      if (next != nullptr && (from == nullptr || next->linked_at < Front(*from)->linked_at)) {
+        from = &list;
+      }
+    }
+    if (from == nullptr) {
+      // Nothing left to evict: every live entry is undrained until
+      // cold passes this horizon.
+      if (!skipped_evictable) {
+        lru_dry_ = true;
+        lru_dry_horizon_ = horizon;
+      }
+      done = true;
+      break;
+    }
+    if (!budget.Take()) break;
+    Entry& entry = *Front(*from);
+    ++lru_visits_;
+    const core::SteadyTime accessed = AccessedAt(entry);
+    if (accessed > entry.linked_at) {
+      LruUnlink(entry);
+      LruLink(entry, accessed);
+    } else if (entry.latest_seq <= horizon) {
+      const bool expired = IsExpiredByTtl(entry, config_.wall_clock);
+      Evict(entries_.find(*entry.key), /*leave_stub=*/!expired);
+      eviction_count_++;
+      ++evicted;
+    } else {
+      // Written last, so undrained entries sit near the warm end and
+      // the walk passes each once a horizon.
+      from->cursor_set = true;
+      from->cursor = entry.lru_newer;
+      from->cursor_horizon = horizon;
+    }
+  }
+  if (guarded != nullptr) LruLink(*guarded, guarded->linked_at);
+  UpdateBackpressure();
+  return done;
+}
+
+bool SingleShardStore::EnsureCapacityFor(std::string_view protect_key, core::SequenceId horizon,
+                                         HoldBudget& budget) {
   // Called post-write: the just-written entry (protect_key) is already counted
   // in used bytes and must survive, so make room by evicting OTHER LRU keys
-  // down to the budget. Suppressed during replay: evicting mid-replay would
+  // toward the budget. Suppressed during replay: evicting mid-replay would
   // make the rebuilt hot view depend on memory timing, breaking deterministic
   // queue replay (invariant 4). The eviction worker reconverges after replay.
   if (replay_mode_ || !governor_.Enabled()) return true;
@@ -1157,20 +1338,31 @@ bool SingleShardStore::EnsureCapacityFor(std::string_view protect_key, core::Seq
     return true;
   }
   // Down to 95% of the budget, so the next writes do not trigger again.
-  const size_t budget = governor_.Target(0);
-  EvictLru(budget - (budget / 20), protect_key, horizon);
-  // After evicting every other eligible key, the protected entry may still not
-  // fit (a single value larger than the whole budget). It is already durable in
-  // the queue, so the caller surfaces kResourceExhausted as an admission signal
-  // — not a lost write (invariant 2).
-  // Other live keys leave once cold drains them, so only tombstones,
-  // stubs and this entry count.
+  const size_t target = governor_.Target(0);
+  size_t evicted = 0;
+  EvictLru(target - (target / 20), protect_key, horizon, budget, evicted);
+  // The protected entry may never fit (a single value larger than the whole
+  // budget). It is already durable in the queue, so the caller surfaces
+  // kResourceExhausted as an admission signal — not a lost write
+  // (invariant 2). Other live keys leave once cold drains them, so only
+  // tombstones, stubs, the TTL index and this entry count.
   uint64_t floor = UsedBytes() - live_bytes_;
-  if (const auto it = entries_.find(std::string(protect_key));
-      it != entries_.end() && !it->second.tombstoned) {
-    floor += Footprint(it->second, protect_key);
+  if (const Entry* entry = FindEntry(protect_key); entry != nullptr && !entry->tombstoned) {
+    floor += Footprint(*entry, protect_key);
   }
   return !governor_.WouldExceed(floor, 0);
+}
+
+bool SingleShardStore::MakeRoom(std::string_view key, size_t entry_bytes,
+                                core::SequenceId horizon) {
+  const size_t bytes = entry_bytes + sizeof(std::string) + key.size();
+  if (!governor_.WouldExceed(UsedBytes(), bytes)) return true;
+  const size_t target = governor_.Target(bytes);
+  const size_t slack = governor_.max_bytes() / 20;
+  HoldBudget budget = HoldBudget::Capped();
+  size_t evicted = 0;
+  EvictLru(target > slack ? target - slack : 0, std::string_view{}, horizon, budget, evicted);
+  return !governor_.WouldExceed(UsedBytes(), bytes);
 }
 
 core::MemoryStats SingleShardStore::Stats() const {
@@ -1184,7 +1376,8 @@ core::MemoryStats SingleShardStore::Stats() const {
           .stub_drops = stubs_.drops(),
           .negative_entries = negative_entries_,
           .load_discards = load_discards_,
-          .unevictable_bytes = lru_dry_ ? live_bytes_ : unevictable_bytes_,
+          .unevictable_bytes = lru_dry_ ? live_bytes_ : parked_bytes_,
+          .ttl_index_bytes = ttl_index_.size() * kTtlBucketBytes,
           .backpressured = backpressured_};
 }
 
@@ -1193,10 +1386,14 @@ void SingleShardStore::Wipe(core::SequenceId seq) {
   if (graveyard_ != nullptr) {
     graveyard_->entries.push_back(std::move(entries_));
     graveyard_->stubs.push_back(stubs_.Release());
+    graveyard_->ttl_indexes.push_back(std::move(ttl_index_));
   }
   entries_.clear();
-  lru_newest_ = nullptr;
-  lru_oldest_ = nullptr;
+  ttl_index_.clear();
+  lru_lists_.clear();
+  tombstones_.Clear();
+  parked_.Clear();
+  parked_bytes_ = 0;
   lru_dry_ = false;
   stubs_.Clear();
   loading_.clear();
@@ -1205,7 +1402,6 @@ void SingleShardStore::Wipe(core::SequenceId seq) {
   entry_bytes_ = 0;
   live_bytes_ = 0;
   key_count_ = 0;
-  unevictable_bytes_ = 0;
   backpressured_ = false;
   flush_seq_ = std::max(flush_seq_, seq);
 }
@@ -1213,10 +1409,9 @@ void SingleShardStore::Wipe(core::SequenceId seq) {
 bool SingleShardStore::DropStub(std::string_view key) { return stubs_.Erase(key); }
 
 std::optional<LoadToken> SingleShardStore::BeginLoad(std::string_view key) {
-  std::string owned(key);
-  if (entries_.contains(owned) || loading_.contains(owned)) return std::nullopt;
+  if (entries_.contains(key) || loading_.contains(key)) return std::nullopt;
   const LoadToken token{.id = ++next_load_id_};
-  loading_.emplace(std::move(owned), token);
+  loading_.emplace(std::string(key), token);
   return token;
 }
 
@@ -1240,14 +1435,13 @@ bool SingleShardStore::CompleteLoad(std::string_view key, LoadToken token, LoadR
 bool SingleShardStore::InstallLoad(std::string_view key, LoadToken token, LoadResult&& result,
                                    core::EvictionTTL eviction, core::SequenceId horizon,
                                    bool in_batch) {
-  const std::string owned(key);
-  const auto pending = loading_.find(owned);
+  const auto pending = loading_.find(key);
   if (pending == loading_.end() || pending->second != token) {
     ++load_discards_;
     return false;
   }
   loading_.erase(pending);
-  if (entries_.contains(owned)) {
+  if (entries_.contains(key)) {
     ++load_discards_;
     return false;
   }
@@ -1263,25 +1457,32 @@ bool SingleShardStore::InstallLoad(std::string_view key, LoadToken token, LoadRe
     InsertTombstone(key, 0);
     ++negative_entries_;
     negatives_.emplace_back(key);
-    if (!in_batch) TrimNegatives();
+    if (!in_batch) {
+      HoldBudget budget = HoldBudget::Unbounded();
+      TrimNegatives(budget);
+    }
     return true;
   }
 
-  const auto it = entries_.try_emplace(owned).first;
+  const auto it = entries_.try_emplace(std::string(key)).first;
   Entry& entry = it->second;
+  entry.key = &it->first;
   entry.type = full->type();
   entry.value = std::move(full->value);
   entry.bytes = full->bytes;
   entry.abs_ttl_ms = full->abs_ttl_ms;
   entry.eviction = eviction;
-  entry.eviction_deadline = config_.steady_clock() + eviction;
   // Loaded state is already drained.
   entry.latest_seq = 0;
-  LruLink(it);
+  LruLink(entry, config_.steady_clock());
+  IndexTtl(entry);
   NoteEvictable(entry.latest_seq);
   key_count_++;
   TrackInsert(entry, key);
-  if (!in_batch) EnsureCapacityFor(key, horizon);
+  if (!in_batch) {
+    HoldBudget budget = HoldBudget::Capped();
+    EnsureCapacityFor(key, horizon, budget);
+  }
   return true;
 }
 
@@ -1298,12 +1499,12 @@ size_t SingleShardStore::CompleteLoads(std::span<LoadCompletion> loads,
 }
 
 void SingleShardStore::AbortLoad(std::string_view key, LoadToken token) {
-  const auto pending = loading_.find(std::string(key));
+  const auto pending = loading_.find(key);
   if (pending != loading_.end() && pending->second == token) loading_.erase(pending);
 }
 
 bool SingleShardStore::LoadPending(std::string_view key) const {
-  return !loading_.empty() && loading_.contains(std::string(key));
+  return !loading_.empty() && loading_.contains(key);
 }
 
 KeyView SingleShardStore::View(std::string_view key, core::SequenceId horizon,
@@ -1321,6 +1522,8 @@ KeyView SingleShardStore::View(std::string_view key, core::SequenceId horizon,
     }
     view.presence = expired(entry->abs_ttl_ms) ? Presence::kExpired : Presence::kLive;
     view.value = &entry->value;
+    // A decision that changes nothing still read the key.
+    if (view.presence == Presence::kLive) NoteAccess(*entry);
     return view;
   }
   // The floor first: a stub older than the Flush is dead.
@@ -1345,17 +1548,15 @@ SingleShardStore::ReadAnswer SingleShardStore::Read(const core::ops::ReadOp& op,
   }
   const std::string_view key = core::ops::PrimaryKey(op);
   const int64_t now_ms = WallMs(config_.wall_clock);
-  const auto expired = [now_ms](int64_t abs_ttl_ms) {
-    return abs_ttl_ms != 0 && now_ms >= abs_ttl_ms;
-  };
   const Entry* entry = FindEntry(key);
   if (entry == nullptr) {
     if (KnownAbsentAfterFlush(horizon)) {
       return {.result = EmptyReadResponse(op), .fence = flush_seq_};
     }
-    // A stub is current until a write or a Flush drops it.
+    // A stub is current until a write or a Flush drops it. It keeps no
+    // access: stubs are dropped oldest written first.
     if (const Stub* stub = stubs_.Find(key); stub != nullptr && IsMetaRead(op)) {
-      if (expired(stub->abs_ttl_ms)) {
+      if (TtlPassed(stub->abs_ttl_ms, now_ms)) {
         return {.result = EmptyReadResponse(op), .fence = stub->latest_seq};
       }
       return {.result = AnswerRead(op, stub->type, nullptr, stub->abs_ttl_ms, now_ms),
@@ -1365,9 +1566,11 @@ SingleShardStore::ReadAnswer SingleShardStore::Read(const core::ops::ReadOp& op,
   }
   // A resident entry is the key's latest state, so one deleted or past
   // its TTL is absent, whatever older value buffer or cold still hold.
-  if (entry->tombstoned || expired(entry->abs_ttl_ms)) {
+  if (entry->tombstoned || TtlPassed(entry->abs_ttl_ms, now_ms)) {
     return {.result = EmptyReadResponse(op), .fence = entry->latest_seq};
   }
+  // Meta reads do not count as use, as in Redis.
+  if (!IsMetaRead(op)) NoteAccess(*entry);
   return {.result = AnswerRead(op, entry->type, &entry->value, entry->abs_ttl_ms, now_ms),
           .fence = entry->latest_seq};
 }
@@ -1397,10 +1600,14 @@ bool SingleShardStore::ExpiryIsLogged(const core::Effect& effect, std::string_vi
          at_ms < entry->abs_ttl_ms;
 }
 
+Entry* SingleShardStore::FindEntry(std::string_view key) {
+  const auto it = entries_.find(key);
+  return it == entries_.end() ? nullptr : &it->second;
+}
+
 const Entry* SingleShardStore::FindEntry(std::string_view key) const {
-  auto it = entries_.find(std::string(key));
-  if (it == entries_.end()) return nullptr;
-  return &it->second;
+  const auto it = entries_.find(key);
+  return it == entries_.end() ? nullptr : &it->second;
 }
 
 const Entry* SingleShardStore::FindLiveEntry(std::string_view key) const {
@@ -1413,66 +1620,75 @@ const Entry* SingleShardStore::FindLiveEntry(std::string_view key) const {
 
 Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type,
                                           core::EvictionTTL eviction) {
-  auto [it, inserted] = entries_.try_emplace(std::string(key));
+  auto it = entries_.find(key);
+  const bool inserted = it == entries_.end();
+  if (inserted) it = entries_.try_emplace(std::string(key)).first;
+  Entry& entry = it->second;
+  entry.key = &it->first;
   // A tombstone is reborn as a fresh live key. Untrack its footprint first so
   // the slot is in the same state as a freshly inserted entry (the caller's
   // TrackInsert then accounts for the new value).
-  if (!inserted && it->second.tombstoned) {
-    ForgetNegative(it->second);
-    TrackRemove(it->second, key);
+  if (!inserted && entry.tombstoned) {
+    ForgetNegative(entry);
+    Detach(entry);
+    TrackRemove(entry, key);
   }
-  if (inserted || it->second.tombstoned) {
-    it->second.type = type;
-    it->second.tombstoned = false;
-    it->second.latest_seq = 0;
-    it->second.abs_ttl_ms = 0;
-    it->second.eviction = eviction;
-    it->second.eviction_deadline = config_.steady_clock() + eviction;
+  if (inserted || entry.tombstoned) {
+    entry.type = type;
+    entry.tombstoned = false;
+    entry.latest_seq = 0;
+    entry.abs_ttl_ms = 0;
+    entry.eviction = eviction;
     switch (type) {
       case Entry::Type::kString:
-        it->second.value = std::string{};
+        entry.value = std::string{};
         break;
       case Entry::Type::kSet:
-        it->second.value = SetValue{};
+        entry.value = SetValue{};
         break;
       case Entry::Type::kHash:
-        it->second.value = HashValue{};
+        entry.value = HashValue{};
         break;
       case Entry::Type::kZset:
-        it->second.value = ZsetValue{};
+        entry.value = ZsetValue{};
         break;
     }
-    it->second.bytes = it->second.ApproximateBytes();
-    LruLink(it);
+    entry.bytes = entry.ApproximateBytes();
     key_count_++;
     // Track the empty-entry baseline so the collection apply paths' balanced
     // TrackRemove/mutate/TrackInsert pattern has a matching prior insert. The
     // string-create path (ApplyStringSet) does its own TrackInsert after
-    // setting the value, so it does not go through this baseline.
-    TrackInsert(it->second, key);
+    // setting the value, so it does not go through this baseline. The
+    // write's MarkWritten links it.
+    TrackInsert(entry, key);
   }
-  return it->second;
+  return entry;
 }
 
-void SingleShardStore::RemoveEntry(const std::string& key) {
+void SingleShardStore::RemoveEntry(std::string_view key) {
   auto it = entries_.find(key);
   if (it == entries_.end()) return;
   ForgetNegative(it->second);
-  if (!it->second.tombstoned) LruUnlink(it->second);
+  Detach(it->second);
   TrackRemove(it->second, key);
   key_count_--;
   Bury(it->second.value);
-  entries_.erase(it);
+  Erase(it);
 }
 
 void SingleShardStore::TombstoneEntry(Entry& entry, std::string_view key, core::SequenceId seq) {
   if (entry.tombstoned) {
     ForgetNegative(entry);
     entry.latest_seq = seq;
+    if (entry.heap_slot != Entry::kNoSlot) {
+      tombstones_.Update(entry);
+    } else if (seq != 0) {
+      tombstones_.Push(entry);
+    }
     return;
   }
+  Detach(entry);
   TrackRemove(entry, key);
-  LruUnlink(entry);
   Bury(entry.value);
   entry.value = std::string{};
   entry.bytes = entry.ApproximateBytes();
@@ -1480,16 +1696,21 @@ void SingleShardStore::TombstoneEntry(Entry& entry, std::string_view key, core::
   entry.tombstoned = true;
   entry.latest_seq = seq;
   key_count_--;
+  if (seq != 0) tombstones_.Push(entry);
   TrackInsert(entry, key);
 }
 
 void SingleShardStore::InsertTombstone(std::string_view key, core::SequenceId seq) {
-  Entry& entry = entries_[std::string(key)];
+  const auto it = entries_.try_emplace(std::string(key)).first;
+  Entry& entry = it->second;
+  entry.key = &it->first;
   entry.type = Entry::Type::kString;
   entry.value = std::string{};
   entry.bytes = entry.ApproximateBytes();
   entry.tombstoned = true;
   entry.latest_seq = seq;
+  // Seq 0 is a load's absent answer: the negative cache reclaims it.
+  if (seq != 0) tombstones_.Push(entry);
   TrackInsert(entry, key);
 }
 
@@ -1501,19 +1722,26 @@ core::HotKeyPresence SingleShardStore::Probe(std::string_view key) const {
   return core::HotKeyPresence::kPresent;
 }
 
-size_t SingleShardStore::GcTombstones(core::SequenceId horizon) {
-  TrimNegatives();
-  size_t reclaimed = 0;
-  for (auto it = entries_.begin(); it != entries_.end();) {
-    // Absent loads are the negative cache's to reclaim.
-    if (it->second.tombstoned && it->second.latest_seq != 0 && it->second.latest_seq <= horizon) {
-      TrackRemove(it->second, it->first);
-      it = entries_.erase(it);
-      ++reclaimed;
-    } else {
-      ++it;
-    }
+bool SingleShardStore::GcTombstones(core::SequenceId horizon, HoldBudget& budget,
+                                    size_t& reclaimed) {
+  if (!TrimNegatives(budget)) return false;
+  // Rewritten tombstones left the heap or moved in it when rewritten.
+  while (Entry* entry = tombstones_.Top()) {
+    if (entry->latest_seq > horizon) break;
+    if (!budget.Take()) return false;
+    tombstones_.Erase(*entry);
+    const auto it = entries_.find(*entry->key);
+    TrackRemove(it->second, it->first);
+    Erase(it);
+    ++reclaimed;
   }
+  return true;
+}
+
+size_t SingleShardStore::GcTombstones(core::SequenceId horizon) {
+  HoldBudget budget = HoldBudget::Unbounded();
+  size_t reclaimed = 0;
+  GcTombstones(horizon, budget, reclaimed);
   return reclaimed;
 }
 
@@ -1521,96 +1749,193 @@ void SingleShardStore::TrackInsert(const Entry& entry, std::string_view key) {
   const auto bytes = Footprint(entry, key);
   entry_bytes_ += bytes;
   if (!entry.tombstoned) live_bytes_ += bytes;
+  if (Parked(entry)) parked_bytes_ += bytes;
 }
 
 void SingleShardStore::TrackRemove(const Entry& entry, std::string_view key) {
   const auto bytes = Footprint(entry, key);
   entry_bytes_ = (entry_bytes_ >= bytes) ? entry_bytes_ - bytes : 0;
   if (!entry.tombstoned) live_bytes_ = (live_bytes_ >= bytes) ? live_bytes_ - bytes : 0;
+  if (Parked(entry)) parked_bytes_ = (parked_bytes_ >= bytes) ? parked_bytes_ - bytes : 0;
 }
 
 void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq) {
   ABYSS_DCHECK(seq >= core::kFirstSeq, "a write applied at seq 0, which names no entry");
-  const std::string owned(key);
-  if (const auto it = entries_.find(owned); it != entries_.end()) {
-    ForgetNegative(it->second);
-    it->second.latest_seq = seq;
-    if (!it->second.tombstoned) {
-      LruTouch(it->second);
+  if (Entry* entry = FindEntry(key); entry != nullptr) {
+    ForgetNegative(*entry);
+    entry->latest_seq = seq;
+    if (entry->tombstoned) {
+      if (entry->heap_slot != Entry::kNoSlot) {
+        tombstones_.Update(*entry);
+      } else {
+        tombstones_.Push(*entry);
+      }
+    } else {
+      if (Parked(*entry)) Unpark(*entry);
+      if (Linked(*entry)) LruUnlink(*entry);
+      LruLink(*entry, config_.steady_clock());
+      IndexTtl(*entry);
       NoteEvictable(seq);
     }
   }
-  if (!loading_.empty()) loading_.erase(owned);
+  if (!loading_.empty()) {
+    if (const auto pending = loading_.find(key); pending != loading_.end()) loading_.erase(pending);
+  }
   stubs_.Erase(key);
 }
 
-SingleShardStore::EntryMap::iterator SingleShardStore::Evict(EntryMap::iterator it,
-                                                             bool leave_stub) {
+void SingleShardStore::Evict(EntryMap::iterator it, bool leave_stub) {
   if (leave_stub) {
     stubs_.Put(it->first, Stub{.type = it->second.type,
                                .abs_ttl_ms = it->second.abs_ttl_ms,
                                .latest_seq = it->second.latest_seq});
   }
-  LruUnlink(it->second);
+  Detach(it->second);
   TrackRemove(it->second, it->first);
   key_count_--;
   Bury(it->second.value);
-  return entries_.erase(it);
+  Erase(it);
+}
+
+void SingleShardStore::Erase(EntryMap::iterator it) {
+  if (graveyard_ == nullptr) {
+    entries_.erase(it);
+  } else {
+    graveyard_->nodes.push_back(entries_.extract(it));
+  }
+}
+
+void SingleShardStore::Detach(Entry& entry) {
+  if (entry.heap_slot != Entry::kNoSlot) {
+    if (entry.tombstoned) {
+      tombstones_.Erase(entry);
+    } else {
+      Unpark(entry);
+    }
+  }
+  if (Linked(entry)) LruUnlink(entry);
+  UnindexTtl(entry);
 }
 
 void SingleShardStore::Bury(Value& value) {
   if (graveyard_ != nullptr) graveyard_->values.push_back(std::move(value));
 }
 
-void SingleShardStore::LruLink(EntryMap::iterator it) {
-  it->second.lru_key = &it->first;
-  it->second.lru_older = lru_newest_;
-  it->second.lru_newer = nullptr;
-  if (lru_newest_ != nullptr) {
-    lru_newest_->lru_newer = &it->second;
-  } else {
-    lru_oldest_ = &it->second;
+SingleShardStore::LruList& SingleShardStore::ListFor(core::EvictionTTL eviction) {
+  for (LruList& list : lru_lists_) {
+    if (list.eviction == eviction) return list;
   }
-  lru_newest_ = &it->second;
+  if (lru_lists_.size() > std::numeric_limits<uint16_t>::max()) {
+    core::Fatal("more eviction classes than a hot shard can list");
+  }
+  return lru_lists_.emplace_back(LruList{.eviction = eviction});
+}
+
+void SingleShardStore::LruLink(Entry& entry, core::SteadyTime at) {
+  LruList& list = ListFor(entry.eviction);
+  entry.lru_list = static_cast<uint16_t>(&list - &lru_lists_.front());
+  entry.linked_at = list.newest != nullptr ? std::max(at, list.newest->linked_at) : at;
+  entry.lru_older = list.newest;
+  entry.lru_newer = nullptr;
+  if (list.newest != nullptr) {
+    list.newest->lru_newer = &entry;
+  } else {
+    list.oldest = &entry;
+  }
+  list.newest = &entry;
+  if (list.cursor_set && list.cursor == nullptr) list.cursor = &entry;
 }
 
 void SingleShardStore::LruUnlink(Entry& entry) {
+  LruList& list = lru_lists_[entry.lru_list];
+  if (list.cursor_set && list.cursor == &entry) list.cursor = entry.lru_newer;
   if (entry.lru_newer != nullptr) {
     entry.lru_newer->lru_older = entry.lru_older;
   } else {
-    lru_newest_ = entry.lru_older;
+    list.newest = entry.lru_older;
   }
   if (entry.lru_older != nullptr) {
     entry.lru_older->lru_newer = entry.lru_newer;
   } else {
-    lru_oldest_ = entry.lru_newer;
+    list.oldest = entry.lru_newer;
   }
   entry.lru_newer = nullptr;
   entry.lru_older = nullptr;
 }
 
-void SingleShardStore::LruTouch(Entry& entry) {
-  if (lru_newest_ == &entry) return;
+bool SingleShardStore::Linked(const Entry& entry) const {
+  if (entry.lru_newer != nullptr || entry.lru_older != nullptr) return true;
+  return entry.lru_list < lru_lists_.size() && lru_lists_[entry.lru_list].oldest == &entry;
+}
+
+void SingleShardStore::IndexTtl(Entry& entry) {
+  const bool indexed = !entry.tombstoned && !Parked(entry) && entry.abs_ttl_ms != 0;
+  const int64_t bucket = indexed ? entry.abs_ttl_ms / kTtlBucketMs : Entry::kNoBucket;
+  if (entry.ttl_bucket == bucket) return;
+  UnindexTtl(entry);
+  if (!indexed) return;
+  TtlBucket& keys = ttl_index_[bucket];
+  entry.ttl_bucket = bucket;
+  entry.ttl_prev = keys.tail;
+  entry.ttl_next = nullptr;
+  if (keys.tail != nullptr) {
+    keys.tail->ttl_next = &entry;
+  } else {
+    keys.head = &entry;
+  }
+  keys.tail = &entry;
+  ++keys.size;
+}
+
+void SingleShardStore::UnindexTtl(Entry& entry) {
+  if (entry.ttl_bucket == Entry::kNoBucket) return;
+  const auto it = ttl_index_.find(entry.ttl_bucket);
+  TtlBucket& keys = it->second;
+  if (entry.ttl_prev != nullptr) {
+    entry.ttl_prev->ttl_next = entry.ttl_next;
+  } else {
+    keys.head = entry.ttl_next;
+  }
+  if (entry.ttl_next != nullptr) {
+    entry.ttl_next->ttl_prev = entry.ttl_prev;
+  } else {
+    keys.tail = entry.ttl_prev;
+  }
+  if (--keys.size == 0) ttl_index_.erase(it);
+  entry.ttl_bucket = Entry::kNoBucket;
+  entry.ttl_prev = nullptr;
+  entry.ttl_next = nullptr;
+}
+
+void SingleShardStore::Park(Entry& entry) {
   LruUnlink(entry);
-  entry.lru_older = lru_newest_;
-  lru_newest_->lru_newer = &entry;
-  lru_newest_ = &entry;
+  UnindexTtl(entry);
+  parked_.Push(entry);
+  parked_bytes_ += Footprint(entry, *entry.key);
+}
+
+void SingleShardStore::Unpark(Entry& entry) {
+  const auto bytes = Footprint(entry, *entry.key);
+  parked_bytes_ = (parked_bytes_ >= bytes) ? parked_bytes_ - bytes : 0;
+  parked_.Erase(entry);
 }
 
 void SingleShardStore::ForgetNegative(const Entry& entry) {
   if (entry.tombstoned && entry.latest_seq == 0) --negative_entries_;
 }
 
-void SingleShardStore::TrimNegatives() {
+bool SingleShardStore::TrimNegatives(HoldBudget& budget) {
   while (negatives_.size() > config_.negative_max_entries) {
+    if (!budget.Take()) return false;
     const auto it = entries_.find(negatives_.front());
     negatives_.pop_front();
     // Keys rewritten since are skipped.
     if (it == entries_.end() || !it->second.tombstoned || it->second.latest_seq != 0) continue;
     --negative_entries_;
     TrackRemove(it->second, it->first);
-    entries_.erase(it);
+    Erase(it);
   }
+  return true;
 }
 
 void SingleShardStore::NoteEvictable(core::SequenceId latest_seq) {

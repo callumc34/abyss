@@ -4,11 +4,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "abyss/core/ops.h"
+#include "abyss/core/string_hash.h"
 
 namespace abyss::consumer {
 
@@ -48,15 +47,13 @@ class CompactedState {
   // Del-tombstones surface via IsTombstone(), not these.
   std::optional<std::string> HashFieldValue(std::string_view field) const;
   // The delta itself, for the loader's merge.
-  const std::unordered_map<std::string, std::string>& HashFields() const { return hash_fields_; }
-  const std::unordered_set<std::string>& HashRemovedFields() const { return hash_removed_fields_; }
-  const std::unordered_set<std::string>& SetMembers() const { return set_members_; }
-  const std::unordered_set<std::string>& SetRemovedMembers() const { return set_removed_members_; }
+  const core::StringMap<std::string>& HashFields() const { return hash_fields_; }
+  const core::StringSet& HashRemovedFields() const { return hash_removed_fields_; }
+  const core::StringSet& SetMembers() const { return set_members_; }
+  const core::StringSet& SetRemovedMembers() const { return set_removed_members_; }
   std::optional<double> ZsetMemberScore(std::string_view member) const;
-  const std::unordered_map<std::string, double>& ZsetMembers() const { return zset_members_; }
-  const std::unordered_set<std::string>& ZsetRemovedMembers() const {
-    return zset_removed_members_;
-  }
+  const core::StringMap<double>& ZsetMembers() const { return zset_members_; }
+  const core::StringSet& ZsetRemovedMembers() const { return zset_removed_members_; }
 
  private:
   static const std::string kEmpty;
@@ -66,14 +63,14 @@ class CompactedState {
   std::optional<std::string> string_value_;
   uint64_t abs_ttl_ms_ = 0;
 
-  std::unordered_map<std::string, std::string> hash_fields_;
-  std::unordered_set<std::string> hash_removed_fields_;
+  core::StringMap<std::string> hash_fields_;
+  core::StringSet hash_removed_fields_;
 
-  std::unordered_set<std::string> set_members_;
-  std::unordered_set<std::string> set_removed_members_;
+  core::StringSet set_members_;
+  core::StringSet set_removed_members_;
 
-  std::unordered_map<std::string, double> zset_members_;
-  std::unordered_set<std::string> zset_removed_members_;
+  core::StringMap<double> zset_members_;
+  core::StringSet zset_removed_members_;
 
   bool is_tombstone_ = false;
 

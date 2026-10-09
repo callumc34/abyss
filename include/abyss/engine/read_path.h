@@ -101,7 +101,7 @@ class ReadPath {
   metrics::CounterHandle misses_;
   metrics::CounterHandle cold_scan_deadline_exceeded_;
   // By metrics::FillOutcome.
-  std::array<metrics::CounterHandle, 5> fills_;
+  std::array<metrics::CounterHandle, 6> fills_;
 };
 
 }  // namespace abyss::engine

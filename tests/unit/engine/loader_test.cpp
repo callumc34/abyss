@@ -13,7 +13,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -27,6 +26,7 @@
 #include "abyss/core/predicate.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/engine/decide.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
@@ -161,8 +161,8 @@ TEST_F(LoaderTest, RemovalsThatMayEmptyTheKeyLoadItInFull) {
   EXPECT_CALL(cold_, ProbeKey(std::string_view{"small"}, _))
       .WillOnce(Return(ProbeResult{core::KeyMeta{.type = KeyType::kSet, .cardinality = 2}}));
   EXPECT_CALL(cold_, LoadKey(std::string_view{"small"}, _))
-      .WillOnce(Return(LoadKeyResult{core::ColdKeyState{
-          .type = KeyType::kSet, .value = std::unordered_set<std::string>{"a", "b"}}}));
+      .WillOnce(Return(LoadKeyResult{
+          core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a", "b"}}}));
   EXPECT_CALL(cold_, ProbeKey(std::string_view{"large"}, _))
       .WillOnce(Return(ProbeResult{core::KeyMeta{.type = KeyType::kSet, .cardinality = 3}}));
 
@@ -192,7 +192,7 @@ TEST_F(LoaderTest, AFullLoadReadsNoColdAfterADelAll) {
   ASSERT_TRUE(loaded.has_value());
   const auto* full = std::get_if<hot::LoadedFull>(&*loaded);
   ASSERT_NE(full, nullptr);
-  EXPECT_EQ(std::get<hot::SetValue>(full->value).members, (std::unordered_set<std::string>{"c"}));
+  EXPECT_EQ(std::get<hot::SetValue>(full->value).members, (core::StringSet{"c"}));
 }
 
 TEST_F(LoaderTest, AColdErrorIsReturned) {
@@ -323,8 +323,8 @@ TEST_F(LoaderTest, AnEmptiedKeyOfAnotherTypeIsAbsentNotWrongType) {
   EXPECT_CALL(cold_, ProbeKey(std::string_view{"s"}, _))
       .WillRepeatedly(Return(ProbeResult{core::KeyMeta{.type = KeyType::kSet, .cardinality = 2}}));
   EXPECT_CALL(cold_, LoadKey(std::string_view{"s"}, _))
-      .WillOnce(Return(LoadKeyResult{core::ColdKeyState{
-          .type = KeyType::kSet, .value = std::unordered_set<std::string>{"a", "b"}}}));
+      .WillOnce(Return(LoadKeyResult{
+          core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a", "b"}}}));
   EXPECT_EQ(Ok(loader_.HashField(0, "s", "f", Deadline())), std::nullopt);
 }
 
@@ -406,8 +406,8 @@ TEST_F(LoaderTest, ConcurrentInstallsShareOneColdRead) {
       .WillOnce([&](auto, auto, auto) {
         ++loads;
         release.Wait();
-        return LoadAsResult{core::LoadedAs{core::ColdKeyState{
-            .type = KeyType::kSet, .value = std::unordered_set<std::string>{"a", "b"}}}};
+        return LoadAsResult{core::LoadedAs{
+            core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a", "b"}}}};
       });
 
   std::vector<Loader::Fill> fills(kReaders, Loader::Fill::kDiscarded);
@@ -466,8 +466,8 @@ TEST_F(LoaderTest, ConcurrentLoadsShareOneColdReadAndItsError) {
         release.Wait();
         return LoadAsResult{std::unexpected(core::Error{core::ErrorCode::kUnavailable, "io"})};
       })
-      .WillOnce(Return(LoadAsResult{core::LoadedAs{core::ColdKeyState{
-          .type = KeyType::kSet, .value = std::unordered_set<std::string>{"a"}}}}));
+      .WillOnce(Return(LoadAsResult{core::LoadedAs{
+          core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}}));
   const abyss::testing::OnExit unblock([&] { release.Open(); });
   auto leader = std::async(std::launch::async,
                            [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });

@@ -60,7 +60,7 @@ ReadPath::ReadPath(hot::ShardedHotStore& hot, Loader& loader, Sequencer& sequenc
   using metrics::FillOutcome;
   for (const FillOutcome outcome :
        {FillOutcome::kInstalled, FillOutcome::kDiscarded, FillOutcome::kSkippedBackpressure,
-        FillOutcome::kSkippedSize, FillOutcome::kFailed}) {
+        FillOutcome::kSkippedSize, FillOutcome::kSkippedEvictCap, FillOutcome::kFailed}) {
     fills_.at(static_cast<size_t>(outcome)) = reg.Counter(metrics::names::kHotFillsTotal, outcome);
   }
 }
@@ -224,6 +224,9 @@ void ReadPath::CountFill(const core::Result<Loader::Filled>& filled) {
       break;
     case Loader::Fill::kSkippedSize:
       fills_.at(static_cast<size_t>(FillOutcome::kSkippedSize)).Increment();
+      break;
+    case Loader::Fill::kSkippedEvictCap:
+      fills_.at(static_cast<size_t>(FillOutcome::kSkippedEvictCap)).Increment();
       break;
     case Loader::Fill::kResident:
     case Loader::Fill::kFlushed:

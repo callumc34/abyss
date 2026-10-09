@@ -2,12 +2,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/types.h"
+#include "latch.h"
 #include "test_clock.h"
 
 namespace abyss::hot {
@@ -201,7 +204,7 @@ TEST_F(ShardedHotStoreTest, ConcurrentWriteAndRead) {
   reader.join();
 }
 
-TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
+TEST_F(ShardedHotStoreTest, ReadsStampWhileMaintenanceRuns) {
   for (int i = 0; i < 50; ++i) {
     SetString("d:" + std::to_string(i), "val");
   }
@@ -212,71 +215,126 @@ TEST_F(ShardedHotStoreTest, DrainAccessBuffersConcurrency) {
     }
   });
 
-  std::thread drainer([this]() { store_.DrainAccessBuffers(clock_.SteadyNow()); });
+  std::thread maintainer([this]() {
+    for (int i = 0; i < 10; ++i) {
+      store_.SetAccessTime(clock_.SteadyNow() + std::chrono::seconds{i});
+      [[maybe_unused]] const auto report = store_.EvictExpired(clock_.SteadyNow());
+    }
+  });
 
   reader.join();
-  drainer.join();
+  maintainer.join();
 }
 
-// --- Bounded access buffer (XRES-2) ---
-
-TEST(ShardedHotStoreAccessBufferTest, AccessBufferBoundedUnderReadStorm) {
+// Eight readers of one key while another read holds its shard and a
+// writer holds another shard: a hit needs only a shared hold, and
+// takes no other lock a reader could wait on.
+TEST(ShardedHotStoreReadLockTest, HitsOfOneKeyNeedOnlyASharedHold) {
   abyss::testing::TestClock clock;
-  core::EvictionPolicy policy{core::EvictionTTL{86400}};
-  constexpr size_t kCap = 8;
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .max_memory_bytes = 64UL * 1024 * 1024,
+      .shard_count = 2,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  const std::string hot = "hot";
+  const core::ShardId shard = store.ShardOf(hot);
+  const core::ShardId other = 1 - shard;
+  core::ops::StringSet op{.key = hot, .value = "v"};
+  ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
+  store.SetAccessTime(clock.SteadyNow() + 1s);
+
+  auto reading = store.LockSharedForTesting(shard);
+  abyss::testing::Latch writing;
+  abyss::testing::Latch read;
+  std::thread writer([&store, other, &writing, &read] {
+    ShardLocks held = store.LockExclusive(std::span(&other, 1));
+    writing.Open();
+    read.Wait();
+  });
+  ASSERT_TRUE(writing.Wait());
+  constexpr int kReaders = 8;
+  constexpr int kReads = 1000;
+  std::atomic<int> hits{0};
+  std::atomic<int> finished{0};
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      for (int i = 0; i < kReads; ++i) {
+        if (store.Read(core::ops::ReadOp{core::ops::StringGet{.key = hot}}).result.has_value()) {
+          hits.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      if (finished.fetch_add(1) + 1 == kReaders) read.Open();
+    });
+  }
+  const bool all_read = read.Wait();
+  // Released either way, so a failed run still ends.
+  read.Open();
+  reading.unlock();
+  for (auto& reader : readers) reader.join();
+  writer.join();
+  EXPECT_TRUE(all_read) << "a hit waited on something the held shard blocks";
+  EXPECT_EQ(hits.load(), kReaders * kReads);
+}
+
+// --- Access stamps ---
+
+TEST(ShardedHotStoreAccessTest, AReadStampsTheTimeLastSet) {
+  abyss::testing::TestClock clock;
+  core::EvictionPolicy policy{core::EvictionTTL{2}};
   ShardedHotStore store{ShardedHotStoreConfig{
       .max_memory_bytes = 64UL * 1024 * 1024,
       .shard_count = 1,
-      .access_buffer_high_water = kCap,
       .eviction_policy = &policy,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
-
-  // Seed many distinct keys, then read them all between drains. Distinct keys
-  // defeat de-dup, so the buffer fills to the cap and then drops.
-  for (int i = 0; i < 100; ++i) {
-    const std::string key = "k" + std::to_string(i);
+  for (const std::string_view key : {"read", "idle"}) {
     core::ops::StringSet op{.key = key, .value = "v"};
     ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
   }
-  for (int i = 0; i < 100; ++i) {
-    const std::string key = "k" + std::to_string(i);
-    auto r = store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
-    EXPECT_TRUE(r.has_value());
+
+  clock.Advance(1s);
+  // Reads before it stamp the older time: nothing new.
+  ASSERT_TRUE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "idle"}}).has_value());
+  store.SetAccessTime(clock.SteadyNow());
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_TRUE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "read"}}).has_value());
   }
 
-  auto snap = store.AccessBufferSnapshot();
-  EXPECT_LE(snap.depth, kCap) << "buffer must be bounded by the high-water cap";
-  EXPECT_GT(snap.dropped, 0U) << "over-cap refreshes must be counted as drops";
+  clock.Advance(1100ms);
+  const auto report = store.EvictExpired(clock.SteadyNow());
+  EXPECT_EQ(report.by_deadline, 1U) << "idle is past its 2s; read is 1.1s past its read";
+  EXPECT_FALSE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "idle"}}).has_value());
+  EXPECT_TRUE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "read"}}).has_value());
 
-  // Drain resets the buffer and the per-tick de-dup set; reads still serve.
-  store.DrainAccessBuffers(clock.SteadyNow());
-  EXPECT_EQ(store.AccessBufferSnapshot().depth, 0U);
-  auto after = store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k0"}});
-  ASSERT_TRUE(after.has_value());
-  EXPECT_EQ(after->AsString(), "v");
+  clock.Advance(1s);
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).by_deadline, 1U);
 }
 
-TEST(ShardedHotStoreAccessBufferTest, AccessBufferDedupsWithinTick) {
+TEST(ShardedHotStoreAccessTest, MetaReadsAreNotUse) {
   abyss::testing::TestClock clock;
-  core::EvictionPolicy policy{core::EvictionTTL{86400}};
+  core::EvictionPolicy policy{core::EvictionTTL{2}};
   ShardedHotStore store{ShardedHotStoreConfig{
       .max_memory_bytes = 64UL * 1024 * 1024,
       .shard_count = 1,
-      .access_buffer_high_water = 1024,
       .eviction_policy = &policy,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
-  core::ops::StringSet op{.key = "hot", .value = "v"};
+  core::ops::StringSet op{.key = "k", .value = "v"};
   ASSERT_TRUE(store.Apply(core::ops::WriteOp{op}, /*seq=*/core::kFirstSeq).has_value());
 
-  // 1000 reads of the same key collapse to a single buffered refresh per tick.
-  for (int i = 0; i < 1000; ++i) {
-    ASSERT_TRUE(store.Exec(core::ops::ReadOp{core::ops::StringGet{.key = "hot"}}).has_value());
-  }
-  EXPECT_EQ(store.AccessBufferSnapshot().depth, 1U) << "repeated reads de-dup within a tick";
+  clock.Advance(1s);
+  store.SetAccessTime(clock.SteadyNow());
+  ASSERT_TRUE(store.Read(core::ops::ReadOp{core::ops::Exists{.keys = {"k"}}}).result.has_value());
+  ASSERT_TRUE(store.Read(core::ops::ReadOp{core::ops::Type{.key = "k"}}).result.has_value());
+  ASSERT_TRUE(store.Read(core::ops::ReadOp{core::ops::Ttl{.key = "k"}}).result.has_value());
+
+  clock.Advance(1100ms);
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).by_deadline, 1U);
 }
 
 // --- Per-prefix eviction (issue #84) ---
@@ -322,8 +380,8 @@ TEST(ShardedHotStorePrefixEvictionTest, MixedPrefixesResolvePerEntry) {
   EXPECT_TRUE(store.Exec(core::ops::ReadOp{get_other}).has_value());
 }
 
-// Regression for the access-refresh bug: DrainAccessBuffers must extend the
-// deadline by the per-key cached eviction, not by a single global value.
+// Regression for the access-refresh bug: a read must extend the deadline
+// by the per-key cached eviction, not by a single global value.
 TEST(ShardedHotStorePrefixEvictionTest, RefreshUsesPerKeyEvictionFromEntry) {
   abyss::testing::TestClock clock;
   core::EvictionPolicy policy{
@@ -341,11 +399,11 @@ TEST(ShardedHotStorePrefixEvictionTest, RefreshUsesPerKeyEvictionFromEntry) {
   core::ops::StringSet write_op{.key = "session:k", .value = "v"};
   ASSERT_TRUE(store.Apply(core::ops::WriteOp{write_op}, /*seq=*/core::kFirstSeq).has_value());
 
-  // Read after 1s — buffered as an access — then drain to refresh.
+  // Read after 1s, stamped with the time then.
   clock.Advance(1s);
+  store.SetAccessTime(clock.SteadyNow());
   core::ops::StringGet read_op{.key = "session:k"};
   ASSERT_TRUE(store.Exec(core::ops::ReadOp{read_op}).has_value());
-  store.DrainAccessBuffers(clock.SteadyNow());
 
   // 1.5s after the refresh, total elapsed = 2.5s. If refresh had used the
   // default (24h), the key would survive trivially. The contract under test
