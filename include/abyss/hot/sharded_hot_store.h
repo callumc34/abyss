@@ -26,6 +26,10 @@ namespace abyss::hot {
 struct ShardedHotStoreConfig {
   size_t max_memory_bytes = 4294967296;
   uint32_t shard_count = 64;
+  // Sizes each shard's entry map for max_memory_bytes at this many bytes
+  // per key, so steady state never rehashes it under the lock. 0 sizes
+  // nothing; the server sets it, tests leave it.
+  size_t reserve_bytes_per_key = 0;
   // Share of max_memory_bytes for stubs, at kStubBytes each.
   double stub_memory_fraction = 0.02;
   // Keys held as loaded absent, across shards.
@@ -245,6 +249,7 @@ class ShardedHotStore : public core::HotStore {
   // By metrics::MaintenancePass.
   std::array<metrics::HistogramHandle, 5> hold_seconds_;
   metrics::HistogramHandle expiry_sweep_seconds_;
+  metrics::HistogramHandle rehash_seconds_;
   HoldObserver hold_observer_;
   // The TTL pass's place in its sweep of the shards.
   std::mutex ttl_mu_;

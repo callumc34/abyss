@@ -42,6 +42,11 @@ struct SingleShardConfig {
   double backpressure_ratio = 1.25;
   core::SteadyClockFn steady_clock = core::DefaultSteadyClock;
   core::WallClockFn wall_clock = core::DefaultWallClock;
+  // Keys the entry map is sized for up front, so steady state never
+  // rehashes all of it under the exclusive lock. 0 sizes nothing.
+  size_t reserve_keys = 0;
+  // Called with the seconds an insert spent rehashing the entry map.
+  std::function<void(double)> on_rehash;
 };
 
 struct SetValue {
@@ -557,6 +562,8 @@ class SingleShardStore {
   // stale.
   void MarkWritten(std::string_view key, core::SequenceId seq);
   // Removes a live entry, leaving a stub unless it expired by TTL.
+  // Inserts `key`'s entry, timing it when the insert will rehash.
+  EntryMap::iterator EmplaceEntry(std::string_view key);
   void Evict(EntryMap::iterator it, bool leave_stub);
   // Into the graveyard, if one is set: a free can stall.
   void Erase(EntryMap::iterator it);

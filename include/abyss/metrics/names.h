@@ -590,6 +590,14 @@ inline constexpr HistogramDesc<> kHotExpirySweepSeconds{
     .buckets = buckets::kLatencySeconds,
 };
 
+inline constexpr HistogramDesc<> kHotRehashSeconds{
+    .name = "abyss_hot_rehash_seconds",
+    .help =
+        "Time an insert spent rehashing a hot shard's entry map under the shard's exclusive "
+        "lock; its count is the number of rehashes.",
+    .buckets = buckets::kLatencySeconds,
+};
+
 inline constexpr GaugeDesc<> kHotUnevictableBytes{
     .name = "abyss_hot_unevictable_bytes",
     .help = "Hot store bytes held because cold has not drained their latest write.",

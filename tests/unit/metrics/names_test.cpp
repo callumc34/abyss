@@ -107,6 +107,7 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kHotUnevictableBytes.name,
       names::kHotMaintenanceHoldSeconds.name,
       names::kHotExpirySweepSeconds.name,
+      names::kHotRehashSeconds.name,
       names::kColdDiskBytes.name,
       names::kColdKeys.name,
       names::kQueueDepth.name,

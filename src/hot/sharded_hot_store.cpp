@@ -29,6 +29,11 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(std::mo
       .backpressure_ratio = config_.backpressure_ratio,
       .steady_clock = config_.steady_clock,
       .wall_clock = config_.wall_clock,
+      .reserve_keys =
+          config_.reserve_bytes_per_key == 0
+              ? 0
+              : config_.max_memory_bytes / config_.shard_count / config_.reserve_bytes_per_key,
+      .on_rehash = [this](double seconds) { rehash_seconds_.Observe(seconds); },
   };
   shards_.reserve(config_.shard_count);
   for (uint32_t i = 0; i < config_.shard_count; ++i) {
@@ -43,6 +48,7 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(std::mo
         reg.Histogram(metrics::names::kHotMaintenanceHoldSeconds, pass);
   }
   expiry_sweep_seconds_ = reg.Histogram(metrics::names::kHotExpirySweepSeconds);
+  rehash_seconds_ = reg.Histogram(metrics::names::kHotRehashSeconds);
   ABYSS_LOG_INFO("hot store opened", {"shards", static_cast<int64_t>(config_.shard_count)},
                  {"max_memory_bytes", static_cast<uint64_t>(config_.max_memory_bytes)});
 }

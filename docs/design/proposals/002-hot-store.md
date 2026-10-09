@@ -83,6 +83,7 @@ The hot consumer runs as a dedicated thread **per shard owned by this pod**. Eac
 
 **Bounded maintenance:** Every pass holds a shard exclusively for at most 64 keys examined or 1 ms, whichever comes first, then releases it and resumes. No pass scans the keyspace:
 - Idle eviction walks each eviction class's LRU list from its cold end. A write relinks its key at the warm end; a read only stamps it, so a key read since it was linked gets a second chance (CLOCK, as SIEVE) and is relinked at its read. The walk stops at the first key not due by its link time.
+- Because a read relinks its key only when the walk reaches it, deadline eviction is lazy in one direction: a key leaves hot within `[deadline, deadline + eviction]`, never early. Memory-pressure eviction bounds memory either way.
 - TTL expiry takes keys from an index of one-second buckets holding the entries themselves, earliest first; the current second's bucket is checked key by key, so no key expires early. The pass gets a quarter of the tick and takes another hold while more than a quarter of the keys it examined had expired.
 - A key that is due but not yet drained by cold waits in a heap ordered by its last write's seq, with delete tombstones in one of their own, and is taken when the drain horizon passes it. Nothing is examined twice per horizon.
 - What a pass removes is freed after the hold.

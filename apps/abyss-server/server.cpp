@@ -32,6 +32,11 @@ ABYSS_LOG_COMPONENT("abyss.server")
 namespace abyss::server {
 
 namespace {
+
+// The hot entry map is sized for max_memory_bytes at this many bytes
+// per key: about 1.6% of the budget in buckets, against a rehash of a
+// whole shard under its lock (#186 removes the need).
+constexpr size_t kMapReserveBytesPerKey = 512;
 constexpr std::chrono::milliseconds kStopPollInterval{100};
 }  // namespace
 
@@ -112,6 +117,7 @@ bool Server::Initialize() {
   hot_store_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = config_.hot.max_memory_bytes,
       .shard_count = config_.hot.shard_count,
+      .reserve_bytes_per_key = kMapReserveBytesPerKey,
       .stub_memory_fraction = config_.hot.stub_memory_fraction,
       .negative_max_entries = config_.hot.negative_max_entries,
       .fill_max_fraction = config_.hot.fill_max_fraction,
