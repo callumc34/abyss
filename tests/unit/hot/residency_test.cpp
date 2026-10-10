@@ -1273,8 +1273,8 @@ TEST(ShardedFillTest, AFillOverItsShareOfTheBudgetIsNeverMade) {
             ShardedHotStore::FillResult::kTooLarge)
       << "past a quarter of the shard's budget";
   EXPECT_FALSE(store.LoadPending("big"));
-  const LoadToken small = MustBeginLoad(store, "small");
-  EXPECT_EQ(store.Fill("small", small, MakeLoadedFull(std::string(8000, 'x'), 0)),
+  const LoadToken small_token = MustBeginLoad(store, "small");
+  EXPECT_EQ(store.Fill("small", small_token, MakeLoadedFull(std::string(8000, 'x'), 0)),
             ShardedHotStore::FillResult::kInstalled);
   const LoadToken again = MustBeginLoad(store, "big");
   EXPECT_TRUE(store.CompleteLoad("big", again, MakeLoadedFull(std::string(20000, 'x'), 0)))
