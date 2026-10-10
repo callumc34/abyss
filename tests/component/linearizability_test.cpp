@@ -215,10 +215,10 @@ class LinearizabilityTest : public PropertyHarness {
     std::cout << "[linearizability] seed=" << seed << " threads=" << threads
               << " ops/thread=" << ops_per_thread << " " << swarm.text << '\n'
               << std::flush;
-    const auto start = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           core::WallClock::now().time_since_epoch())
-                           .count();
-    OpenAt(swarm.options, start - (start % 1000));
+    const auto opened_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               core::WallClock::now().time_since_epoch())
+                               .count();
+    OpenAt(swarm.options, opened_ms - (opened_ms % 1000));
     PickGroups();
     for (const auto& group : groups_) {
       std::set<core::ShardId> shards;

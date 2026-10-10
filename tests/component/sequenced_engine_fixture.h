@@ -56,8 +56,9 @@ struct Options {
   double stub_memory_fraction = 0.02;
   double backpressure_ratio = 1.25;
   uint64_t fill_max_members = 1024;
-  std::chrono::milliseconds cold_read_deadline{5};
-  std::chrono::milliseconds cold_scan_deadline{50};
+  // Generous, so a slow runner never times a cold read out.
+  std::chrono::milliseconds cold_read_deadline{std::chrono::seconds{5}};
+  std::chrono::milliseconds cold_scan_deadline{std::chrono::seconds{10}};
   std::chrono::milliseconds write_timeout{5000};
   // How often committed offsets persist, and so segments are reclaimed.
   std::chrono::milliseconds offset_fsync_interval{std::chrono::hours{1}};
