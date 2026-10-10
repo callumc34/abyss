@@ -50,10 +50,13 @@ class TwoTtlIntegrationTest : public ::testing::Test {
   // settled seq and flushes the compaction buffer to RocksDB. Without the
   // flush, the post-eviction read could be served from the buffer instead of
   // cold; with the flush, only cold's RocksDB-backed path can answer.
+  // Drains every entry the key's shard has, then flushes, so a read's
+  // buffer-consistency wait never waits on the test.
   void DrainAndFlushCold(std::string_view key) {
     const auto shard = core::ComputeShard(key, testing::IntegrationHarness::kShardCount);
     auto& c = harness_.ColdPool().ConsumerFor(shard);
-    c.Drain();
+    while (c.Drain() > 0) {
+    }
     c.FlushUnscheduled();
   }
 
@@ -401,6 +404,9 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}));
   ASSERT_TRUE(getv.has_value());
   EXPECT_EQ(getv->AsString(), "now-a-string");
+  // The cold hit promoted the key through the queue; cold drains that
+  // too, or HLEN's consistency wait times out.
+  DrainAndFlushCold("c3t");
 
   // The prior hash fields must not survive the type change. The key is now a
   // string, so HLEN is EITHER WRONGTYPE (an error Result, when a type-aware tier
@@ -410,6 +416,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
   // positive field count, which would mean the stale hash slices survived.
   auto hlen = harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c3t"}));
   if (hlen.has_value()) {
+    ASSERT_FALSE(hlen->IsError()) << hlen->ErrorMessage();
     EXPECT_TRUE(hlen->IsInteger() && hlen->AsInteger() == 0)
         << "stale hash fields survived the type change";
   } else {
@@ -446,6 +453,9 @@ TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c6t"}));
   ASSERT_TRUE(getv.has_value());
   EXPECT_EQ(getv->AsString(), "now-a-string");
+  // The cold hit promoted the key through the queue; cold drains that
+  // too, or HLEN's consistency wait times out.
+  DrainAndFlushCold("c6t");
 
   // The prior hash fields must not survive the cross-window type change. The key
   // is now a string, so HLEN is EITHER WRONGTYPE (a type-aware tier resolves it)
@@ -453,6 +463,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
   // is the failure — it means the stale hash slices survived (the COLDC-6 bug).
   auto hlen = harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c6t"}));
   if (hlen.has_value()) {
+    ASSERT_FALSE(hlen->IsError()) << hlen->ErrorMessage();
     EXPECT_TRUE(hlen->IsInteger() && hlen->AsInteger() == 0)
         << "stale hash fields survived the cross-window type change (COLDC-6)";
   } else {
