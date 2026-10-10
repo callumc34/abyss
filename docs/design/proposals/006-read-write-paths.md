@@ -173,7 +173,7 @@ Conditional writes are validated the same way but are appended in the client's o
 1. Reads check tiers in order: hot → buffer → cold. No tier is skipped.
 2. Hot hits refresh the eviction timer. Buffer and cold hits do not.
 3. Buffer hits do not promote. Cold hits do promote (via queue append).
-4. A write is never acknowledged until both the queue fsync and hot consumer apply are complete.
+4. A write is never acknowledged until it is durable at the configured durability class (`process_crash`: its entry is in the OS page cache; `power_loss`: the fdatasync covering it has completed) and the hot consumer has applied it.
 5. The promise registry is bounded: entries are removed on fulfillment or timeout. A stalled consumer causes promise timeouts, not unbounded registry growth.
 6. A recent delete is an authoritative hot tombstone: reads of a deleted key (`GET`, `EXISTS`, emptied-collection reads) return `nil`/empty from hot without consulting the lagging overlay or waiting. A read that genuinely misses hot **and** must merge a collection overlay waits — signal-driven, not polling — for the per-shard cold consumer to reach hot's settled seq; if the wait exceeds `engine.buffer_consistency_wait_timeout_ms` the engine returns a Redis error rather than serving a stale overlay. Because entering the wait also wakes the cold consumer out of any idle backoff, that timeout indicates a genuinely wedged consumer rather than a merely sleeping one. Tombstones are reclaimed once cold has drained past the delete and do not count toward `DBSIZE`.
 

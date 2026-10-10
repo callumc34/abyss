@@ -54,7 +54,7 @@ Pod starts
   │       flushing if the buffer crosses high-water, then drains the buffer
   │       to disk before declaring its shard done. Block-and-scan handles
   │       Conditional/Resolved pairs (ADP-011). Entries whose absolute TTL
-  │       has expired are dropped pre-flush.
+  │       has expired flush as deletes.
   │     - Hot applies entries in seq order. Skip-stale rules are active
   │       under replay_mode_:
   │       (a) entries whose appended_at + EvictionFor(key) < wall_now are
