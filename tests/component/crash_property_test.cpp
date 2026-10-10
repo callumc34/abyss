@@ -778,7 +778,7 @@ TEST_F(CrashTest, PowerLossRecoversAPrefixThatExplainsEveryReply) {
   } else if (const auto count = EnvNumber("ABYSS_CRASH_POWER_LOSSES")) {
     // The long tier, opt-in.
     for (uint64_t s = 100; s < 100 + *count; ++s) seeds.push_back(s);
-  } else if (kSanitizerDivisor > 1) {
+  } else if (kReducedDivisor > 1) {
     // One of each class: seed 4 runs at process_crash.
     seeds = {1, 4};
   } else {
@@ -812,7 +812,7 @@ TEST_F(CrashTest, PowerLossRecoversAPrefixThatExplainsEveryReply) {
   ExpectServed(total);
 #ifndef _WIN32
   // Windows has no inodes to find a recycled file's old bytes by.
-  if (kSanitizerDivisor == 1 && seeds.size() > 1) {
+  if (kReducedDivisor == 1 && seeds.size() > 1) {
     EXPECT_GT(total.recycled, 0U) << "no lost page of a recycled segment reverted";
   }
 #endif
@@ -933,7 +933,7 @@ TEST_F(CrashTest, KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply) {
   (void)abyss::testing::VictimDirFromEnv(kVictimEnv, &is_victim);
   if (is_victim) GTEST_SKIP();
   std::vector<uint64_t> seeds = {1, 2};
-  if (kSanitizerDivisor > 1) seeds = {1};
+  if (kReducedDivisor > 1) seeds = {1};
   if (const auto count = EnvNumber("ABYSS_CRASH_KILLS")) {
     seeds.clear();
     for (uint64_t seed = 100; seed < 100 + *count; ++seed) seeds.push_back(seed);
@@ -1021,8 +1021,8 @@ TEST_F(CrashTest, ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame) {
        .args = {"FLUSHDB"},
        .applied = [](uint32_t) { return std::string("nil"); }},
   };
-  // Under a sanitizer, one batch kind keeps the test inside its timeout.
-  if (kSanitizerDivisor > 1) batches.resize(1);
+  // In a reduced build, one batch kind keeps the test in its timeout.
+  if (kReducedDivisor > 1) batches.resize(1);
   uint64_t cuts = 0;
   for (auto& batch : batches) {
     options.run = "batch-" + batch.name + "-";

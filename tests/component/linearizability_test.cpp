@@ -481,7 +481,7 @@ void Report(const std::string& tier, uint64_t seeds, const Outcome& total,
 TEST_F(LinearizabilityTest, ConcurrentClientsAreLinearizablePerKeyGroup) {
   const int threads = static_cast<int>(EnvNumber("ABYSS_LINEARIZABILITY_THREADS").value_or(4));
   const int ops =
-      static_cast<int>(EnvNumber("ABYSS_LINEARIZABILITY_OPS").value_or(200 / kSanitizerDivisor));
+      static_cast<int>(EnvNumber("ABYSS_LINEARIZABILITY_OPS").value_or(200 / kReducedDivisor));
   const auto started = std::chrono::steady_clock::now();
   Outcome total;
   std::vector<uint64_t> seeds;
@@ -489,7 +489,7 @@ TEST_F(LinearizabilityTest, ConcurrentClientsAreLinearizablePerKeyGroup) {
     seeds = {*seed};
   } else {
     seeds = {1, 2, 3};
-    if (kSanitizerDivisor > 1) seeds = {3};
+    if (kReducedDivisor > 1) seeds = {3};
   }
   for (const uint64_t seed : seeds) {
     // Seed 3 runs on two logs, so groups exercise CROSSSLOT-free
@@ -500,9 +500,9 @@ TEST_F(LinearizabilityTest, ConcurrentClientsAreLinearizablePerKeyGroup) {
   }
   Report("bounded tier", seeds.size(), total, std::chrono::steady_clock::now() - started);
   // Clients that ran one at a time overlap almost nothing; on a loaded
-  // machine about half still overlap. A sanitizer's few ops vary too
-  // much to judge.
-  if (!HasFailure() && kSanitizerDivisor == 1) {
+  // machine about half still overlap. A reduced build's few ops vary
+  // too much to judge.
+  if (!HasFailure() && kReducedDivisor == 1) {
     EXPECT_GE(total.concurrent * 4, total.ops) << "too few ops overlapped to test concurrency";
   }
 }

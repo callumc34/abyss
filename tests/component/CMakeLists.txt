@@ -47,13 +47,14 @@ target_link_libraries(abyss_property_tests PRIVATE
   GTest::gtest_main
 )
 
-# ASan and TSan slow every step 5 to 15 times, so the bounded tiers
-# shrink; under any sanitizer the tests take the slow timeout.
-if(ABYSS_SANITIZER MATCHES "^(address|thread)")
-  target_compile_definitions(abyss_property_tests PRIVATE ABYSS_PROPERTY_SANITIZED=1)
+# ASan and TSan slow every step 5 to 15 times, and Windows pays a real
+# FlushFileBuffers per power_loss ack, so there the bounded tiers shrink
+# and take the slow timeout; UBSan only takes the slow timeout.
+if(ABYSS_SANITIZER MATCHES "^(address|thread)" OR WIN32)
+  target_compile_definitions(abyss_property_tests PRIVATE ABYSS_PROPERTY_REDUCED=1)
 endif()
 
-if(ABYSS_SANITIZER_ACTIVE)
+if(ABYSS_SANITIZER_ACTIVE OR WIN32)
   abyss_discover_slow_tests(abyss_property_tests "component")
 else()
   abyss_discover_tests(abyss_property_tests "component")

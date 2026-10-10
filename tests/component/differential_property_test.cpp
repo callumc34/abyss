@@ -47,10 +47,10 @@ namespace {
 constexpr int kKeys = 300;
 constexpr int kHotKeys = 24;
 constexpr int kMembers = 12;
-// The bounded tier: these seeds, this many steps each; fewer under a
-// sanitizer, which skips the sometimes-counter checks.
-constexpr uint64_t kBoundedSeeds = kSanitizerDivisor > 1 ? 2 : 6;
-constexpr int kBoundedOps = kSanitizerDivisor > 1 ? 150 : 450;
+// The bounded tier: these seeds, this many steps each; fewer in a
+// reduced build, which skips the sometimes-counter checks.
+constexpr uint64_t kBoundedSeeds = kReducedDivisor > 1 ? 2 : 6;
+constexpr int kBoundedOps = kReducedDivisor > 1 ? 150 : 450;
 
 // The rare interleavings each run must reach.
 // Indexes Counts.
@@ -1053,7 +1053,7 @@ TEST_F(DifferentialTest, SeededStreamsAgreeWithTheModelInEveryTier) {
                    std::chrono::steady_clock::now() - started)
                    .count()
             << " ms\n";
-  if (HasFailure() || kSanitizerDivisor > 1) return;
+  if (HasFailure() || kReducedDivisor > 1) return;
   for (size_t i = 0; i < counts.size(); ++i) {
     EXPECT_GT(counts.at(i), 0U) << "no run reached: " << kSometimesNames.at(i);
   }
