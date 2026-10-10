@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Created:** 2026-04-15
 
+> **Superseded in part by [ADP-015](015-write-path-and-durability.md).** The resolver, the `Conditional`/`Resolved` entry pair and block-and-scan are replaced by decide-then-log on the per-shard sequencer, and Consumer RPC is reduced to admin and flush use (Phase 2). This document describes current behaviour until then.
+
 ## Context
 
 The RESP frontend must support Redis commands with conditional semantics — `SET NX`, `SET XX`, `SETNX`, `MSETNX`, `ZADD NX|XX|GT|LT`, `SET KEEPTTL`, `SET GET`, `RENAMENX`, `COPY`, `EXPIRE NX|XX|GT|LT`, and future transactional constructs (`MULTI/EXEC`, `WATCH`). A conditional op's outcome depends on the current state of one or more keys, which raises a problem unique to Kappa architectures: **the queue is the single source of truth, but the decision depends on materialised state, and different consumers hold different views**.

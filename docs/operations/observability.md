@@ -8,7 +8,9 @@
 - `abyss_cold_op_duration_seconds{cmd="..."}` — cold store operation latency per command
 - `abyss_buffer_op_duration_seconds{cmd="..."}` — compaction buffer read latency per command
 - `abyss_resp_request_duration_seconds{cmd="..."}` — end-to-end request latency per command
-- `abyss_queue_append_duration_seconds` — queue append latency (includes fsync for group commit)
+- `abyss_wal_flush_duration_seconds` — duration of one group-commit or per-write WAL durability flush (fsync, fdatasync or `F_FULLFSYNC`). This is the device floor that durable acknowledgements wait on. Segment create and seal flushes and offset persists are not included.
+- `abyss_queue_offset_persist_duration_seconds` — duration of one durable persist of committed consumer offsets. The rate of persists (`_count`) shows how much flush capacity offset bookkeeping consumes.
+- `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. Both flush histograms include failed flushes, and stay empty under `fsync_none`.
 
 ### RESP Frontend
 

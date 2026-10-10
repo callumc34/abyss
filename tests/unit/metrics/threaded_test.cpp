@@ -37,8 +37,7 @@ TEST_F(ThreadedMetricsTest, ConcurrentCounterIncrements) {
   for (auto& t : threads) t.join();
 
   const auto value = testing::GetCounterValue(names::kMissesTotal);
-  ASSERT_TRUE(value.has_value());
-  EXPECT_DOUBLE_EQ(*value, static_cast<double>(kThreads * kOpsPerThread));
+  EXPECT_EQ(value, static_cast<double>(kThreads * kOpsPerThread));
 }
 
 TEST_F(ThreadedMetricsTest, ConcurrentRegistrationOfSameSeriesIsSafe) {
@@ -58,13 +57,12 @@ TEST_F(ThreadedMetricsTest, ConcurrentRegistrationOfSameSeriesIsSafe) {
   for (auto& t : threads) t.join();
 
   const auto value = testing::GetCounterValue(names::kHitsTotal, Tier::kHot);
-  ASSERT_TRUE(value.has_value());
-  EXPECT_DOUBLE_EQ(*value, static_cast<double>(kThreads * 500));
+  EXPECT_EQ(value, static_cast<double>(kThreads * 500));
 }
 
 TEST_F(ThreadedMetricsTest, ConcurrentHistogramObservations) {
   auto& reg = Registry::Instance();
-  auto h = reg.Histogram(names::kQueueAppendDurationSeconds);
+  auto h = reg.Histogram(names::kWalFlushDurationSeconds);
 
   std::atomic<bool> go{false};
   std::vector<std::thread> threads;
@@ -78,9 +76,8 @@ TEST_F(ThreadedMetricsTest, ConcurrentHistogramObservations) {
   go.store(true);
   for (auto& t : threads) t.join();
 
-  const auto count = testing::GetHistogramCount(names::kQueueAppendDurationSeconds);
-  ASSERT_TRUE(count.has_value());
-  EXPECT_EQ(*count, static_cast<uint64_t>(kThreads * kOpsPerThread));
+  const auto count = testing::GetHistogramCount(names::kWalFlushDurationSeconds);
+  EXPECT_EQ(count, static_cast<uint64_t>(kThreads * kOpsPerThread));
 }
 
 }  // namespace

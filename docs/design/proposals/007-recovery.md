@@ -4,6 +4,8 @@
 **Created:** 2026-04-09
 **Updated:** 2026-05-03
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** The resolver replay phase is removed, because the log records decided effects that replay applies without re-deciding (Phase 2). Recovery flushes the retained log before replay so the power-durable watermark is known (Phase 1b). The process below describes current behaviour until then.
+
 ## Context
 
 When an Abyss pod restarts, the hot store is empty (it was in-memory) and the cold store may be stale (the cold consumer had buffered writes that weren't yet flushed). The queue is the source of truth. Recovery rebuilds all consumers' state from the queue.

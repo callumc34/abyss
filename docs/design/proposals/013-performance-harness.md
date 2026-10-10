@@ -45,24 +45,59 @@ Targets are assigned to the substrate that can answer them honestly. Where a tar
 
 | Target | Authoritative substrate | Cross-check |
 |---|---|---|
-| Hot read p99 < 100µs | probe | load |
-| Hot write (queue append + hot apply + ACK) p99 < 50µs | probe | load |
-| Buffer read p99 < 50µs | probe | — |
-| Cold read p99 < 5ms | probe | load |
-| Write throughput > 100 000 ops/s (embedded) | load | — |
-| Recovery < 60s for 24h / 1M entries | micro | — |
+| H1 hot apply | probe (hot probe, `hot_apply`) | micro |
+| R1 hot read | probe (hot probe, `hot_get`) | load |
+| W1 write overhead (`process_crash`) | probe (write probe, `write_ack`) | — |
+| W1-L write over loopback | load (pipelined SET workload, against Valkey in the same run) | memtier |
+| R1-L read under writes | load (90/10 mixed workload, against Valkey in the same run) | memtier |
+| W2 durable write (`power_loss`) | probe (write probe, `write_ack`, against the calibrated `device_flush` floor) | load |
+| W3 durable write throughput | load | — |
+| X1 comparative | load (same driver against every server) | memtier |
+| B1 buffer read | probe | — |
+| C1 cold read | probe | load |
+| RC1 recovery | micro | — |
+
+> **Amended by [ADP-015](015-write-path-and-durability.md) (2026-10-01).** §Coordinated omission now records each request from its intended time without added synthetic samples; the earlier implementation did both, which counted every stall twice. The original "hot write (queue append + hot apply + ACK) < 50µs" row was assigned to a hot-store-only probe, so it would have passed while measuring neither the queue, the flush nor the acknowledgement. Write targets are now per durability class. They are measured by the write probe, which drives the real in-process write path: the engine dispatch, the WAL on the volume under test, and all three consumer pools. Before measuring, the write probe records the device's flush floor with the same primitive the WAL uses, so the power-loss target is evaluated against the floor of the device it ran on. See §Comparative baselines for the drivers.
 
 The reason for splitting hot read into both an authoritative probe and a cross-check load is that the probe-measured number is the engine-true latency and the load-measured number includes everything between the engine and the client. The PRD target is stated in engine-internal terms ("hot read"), so the probe is authoritative; but a wildly larger load number diagnoses real client-visible regression in RESP, the request pipeline, or TCP path, none of which the probe will catch. Reporting both keeps the harness honest in both directions.
+
+## Comparative baselines
+
+The X1 target compares Abyss with other servers on the same host, using the same load driver and workload for each durability class. The load generator speaks RESP, so it drives Valkey, Redis and Dragonfly unchanged. Every report records which server it measured: the load generator reads the server's identity from `HELLO` and `INFO`, and stores it in the report, so a baseline can never be mistaken for an Abyss run.
+
+The load generator pipelines requests on each connection up to the workload's configured depth. Coordinated-omission correction still applies per request: each request has its own intended send time.
+
+**Matrix.** Each comparison runs the full cross product of:
+- workload: SET-only, GET-only, and 90/10 GET/SET;
+- value size: 64 B and 1 KiB;
+- pipeline depth: 1 and 16;
+- connections: 64 and 256.
+
+Each Abyss durability class is paired with its equivalent: `power_loss` with Valkey `appendfsync always`, and `process_crash` with Valkey `appendfsync everysec` and with Dragonfly (labelled no-AOF).
+
+**What counts as better.**
+- *Lower p99* compares p99 at the same offered load, at most 50% of the slower server's saturation. p99 at saturation is not comparable.
+- *Higher throughput* compares the maximum sustainable rate within the same latency SLO.
+
+**Tuning parity.** Valkey I/O threads and Dragonfly proactor threads are set for the host, CPU pinning is the same for every server, and the client runs on separate cores or a separate host.
+
+`memtier_benchmark` is admitted as a cross-check driver only, never the authoritative one. It makes Abyss numbers comparable with published Redis, Valkey, Dragonfly and Garnet figures, which use it, and it sweeps pipeline depth. Its numbers are not corrected for coordinated omission and do not feed target evaluation.
 
 ## Coordinated omission
 
 Coordinated omission is the most common reason that published benchmark numbers are dishonest. The trap is well-known: a closed-loop driver that issues a request, waits for the response, then issues the next, will systematically under-report tail latency when the system stalls. If the target rate is 100 000 ops/s (one request every 10µs) and the system stalls for 100 ms, a naive driver records one slow request and then races to catch up; the 9 999 requests that *should* have been issued during the stall are not recorded at all. p99 in that scenario looks fine while the user experience is a disaster.
 
-The harness rejects this. The load driver runs an open-loop schedule under wrk2 discipline: per worker, the driver maintains a sequence of intended send times spaced by the inverse of the target rate. When a response returns at wall-clock time `t_actual`, the recorded latency is `t_actual - t_intended`, not `t_actual - t_sent`. When the driver could not send at the intended time because a previous operation was still in flight, synthetic samples are recorded at every intended-send slot the driver missed, each with the latency it would have had if the driver had sent at that slot and the response had returned at `t_actual`. This is identical to the wrk2 algorithm.
+The harness rejects this. The load driver runs an open-loop schedule under wrk2 discipline: per worker, the driver maintains a sequence of intended send times spaced by the inverse of the target rate. When a response returns at wall-clock time `t_actual`, the recorded latency is `t_actual - t_intended`, not `t_actual - t_sent`. Every intended slot is still issued. If a previous operation was still in flight, the slot is issued late, and its recorded latency carries the time it spent waiting to be sent. A stall therefore shows up in the latency of every request scheduled during it, which is the wrk2 algorithm. Synthetic samples are not added on top: measuring from the intended time already accounts for the missed slots, and adding samples as well would count the stall twice. With pipelining, each request in a connection's window has its own intended time, and the same rule applies per request.
 
 For the closed-loop case — target rate of zero, meaning "drive the system as hard as it will go" — coordinated omission does not apply because there are no missed slots. The harness records per-request latency directly and reports throughput as the primary number. The JSON output flags the run as closed-loop so downstream tooling does not compare its latency numbers to open-loop runs.
 
-The coordinated-omission corrector is a load-bearing piece of code that is invisible in normal operation. A test pins its behaviour: a synthetic worker is asked to drive at 10 000 ops/s with a 100 ms stall injected, and the harness verifies that approximately 1 000 synthetic samples are recorded at decreasing pseudo-latencies, that the resulting p99 reflects the stall, and that omitting the corrector would not produce those numbers. Without this test the algorithm can regress silently.
+The coordinated-omission corrector is a load-bearing piece of code that is invisible in normal operation. A test pins its behaviour by driving an open-loop schedule with a stall injected. It checks four things:
+- exactly one sample is recorded per scheduled request, so nothing is omitted and nothing is double counted;
+- the maximum covers the stall;
+- requests scheduled during the stall show the backlog draining;
+- p99 reflects the stall.
+
+The same properties are pinned for the pipelined driver. Without this test the algorithm can regress silently.
 
 ## Latency recording
 

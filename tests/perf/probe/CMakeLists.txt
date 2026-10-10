@@ -45,6 +45,24 @@ if(ABYSS_WITH_ROCKSDB)
     abyss::test_support
     CLI11::CLI11
   )
+
+  add_executable(abyss_write_probe write_probe.cpp)
+  target_link_libraries(abyss_write_probe PRIVATE
+    abyss::compiler_options
+    abyss::cold
+    abyss::config
+    abyss::consumer
+    abyss::core
+    abyss::engine
+    abyss::hot
+    abyss::metrics
+    abyss::perf_framework
+    abyss::perf_probe_common
+    abyss::platform
+    abyss::queue
+    abyss::test_support
+    CLI11::CLI11
+  )
 endif()
 
 if(ABYSS_BUILD_TESTS)

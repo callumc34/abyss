@@ -26,5 +26,3 @@ targets:
   per_op:
     GET:
       p99_us: 100
-    SET:
-      p99_us: 50

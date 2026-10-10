@@ -114,6 +114,115 @@ TEST(ReporterTest, JsonContainsSchemaVersionAndRequiredFields) {
   EXPECT_NE(json.find("\"pass\""), std::string::npos);
 }
 
+TEST(ReporterTest, JsonRecordsServerIdentityAndPipelineDepth) {
+  auto report = MakeFixtureReport();
+  report.workload.pipeline_depth = 16;
+  report.server = ServerIdentity{.kind = "valkey", .version = "8.0.1"};
+
+  std::ostringstream out;
+  WriteReportJson(report, out);
+  const auto json = out.str();
+  EXPECT_NE(json.find(R"("server":{"kind":"valkey","version":"8.0.1"})"), std::string::npos);
+  EXPECT_NE(json.find(R"("pipeline_depth":16)"), std::string::npos);
+  EXPECT_NE(json.find(R"("schema_version":1)"), std::string::npos);
+}
+
+TEST(ReporterTest, JsonRecordsErrorsConfigAndDriver) {
+  auto report = MakeFixtureReport();
+  OperationStats set_stats;
+  set_stats.count = 10;
+  set_stats.errors = 3;
+  report.operations["SET"] = set_stats;
+  report.config["appendfsync"] = "always";
+  Histogram lag;
+  lag.Record(80'000);
+  report.driver = MakeDriverStats(lag, true, std::chrono::seconds{1}, std::chrono::seconds{2},
+                                  report.workload.targets);
+
+  std::ostringstream out;
+  WriteReportJson(report, out);
+  const auto json = out.str();
+  EXPECT_NE(json.find(R"("errors":3)"), std::string::npos);
+  EXPECT_NE(json.find(R"("config":{"appendfsync":"always"})"), std::string::npos);
+  EXPECT_NE(json.find(R"("lagging":true)"), std::string::npos);
+  EXPECT_NE(json.find(R"("send_lag_us":{"count":1)"), std::string::npos);
+}
+
+TEST(ReporterTest, DriverLagIsJudgedAgainstTargets) {
+  WorkloadTargets targets;
+  targets.per_op["SET"].p99_us = 100;
+  Histogram lag;
+  lag.Record(20'000);  // under 50us, but over 10% of the 100us target
+  const std::chrono::nanoseconds cpu{0};
+  const std::chrono::nanoseconds wall{std::chrono::seconds{1}};
+  EXPECT_TRUE(MakeDriverStats(lag, true, cpu, wall, targets).lagging);
+  EXPECT_FALSE(MakeDriverStats(lag, true, cpu, wall, WorkloadTargets{}).lagging);
+  EXPECT_FALSE(MakeDriverStats(Histogram{}, false, cpu, wall, targets).lagging);
+}
+
+// The overload threshold is the larger of one core and 10% of the host.
+TEST(ReporterTest, DriverOverloadIsJudgedAgainstTheHost) {
+  const std::chrono::nanoseconds wall{std::chrono::seconds{10}};
+  const auto idle = MakeDriverStats(Histogram{}, true, std::chrono::seconds{1}, wall, {});
+  EXPECT_DOUBLE_EQ(idle.cpu_per_wall_second, 0.1);
+  EXPECT_GE(idle.overload_threshold_cores, 1.0);
+  EXPECT_FALSE(idle.overloaded);
+
+  const auto busy = MakeDriverStats(Histogram{}, true, std::chrono::seconds{2000}, wall, {});
+  EXPECT_DOUBLE_EQ(busy.cpu_per_wall_second, 200.0);
+  EXPECT_TRUE(busy.overloaded);
+}
+
+TEST(ReporterTest, UnevaluatedTargetsNeverPass) {
+  auto report = MakeFixtureReport();
+  OperationStats get_stats;
+  get_stats.count = 1;
+  get_stats.p99_ns = 1'000;
+  report.operations["GET"] = get_stats;
+  report.workload.targets.throughput_ops.reset();
+  report.targets_not_evaluated = "targets not evaluated (closed-loop)";
+  EvaluateTargets(report);
+
+  ASSERT_FALSE(report.targets.empty());
+  EXPECT_FALSE(report.targets[0].evaluated);
+  EXPECT_FALSE(report.pass);
+  std::ostringstream out;
+  WriteReportJson(report, out);
+  EXPECT_NE(out.str().find(R"("targets_evaluated":false)"), std::string::npos);
+  EXPECT_NE(out.str().find("not evaluated (closed-loop)"), std::string::npos);
+}
+
+TEST(ReporterTest, SweepStepsAndSummaryAreReported) {
+  auto report = MakeFixtureReport();
+  report.config["wal-fsync-policy"] = "group_commit";
+  report.sweep = {{.offered_ops = 1000,
+                   .achieved_ops = 999,
+                   .p99_ns = 500'000,
+                   .pass = true,
+                   .queue_entries = 4096},
+                  {.offered_ops = 2000, .achieved_ops = 1500, .p99_ns = 9'000'000}};
+  report.sweep_result_ops = 1000;
+
+  std::ostringstream json;
+  WriteReportJson(report, json);
+  EXPECT_NE(json.str().find(R"("sweep_result_ops":1000)"), std::string::npos);
+  EXPECT_NE(json.str().find(R"("offered_ops":2000)"), std::string::npos);
+  EXPECT_NE(json.str().find(R"("queue_entries":4096)"), std::string::npos);
+  EXPECT_EQ(json.str().find(R"("queue_bytes")"), std::string::npos);
+
+  std::ostringstream summary;
+  WriteSummary(report, summary);
+  EXPECT_NE(summary.str().find("wal-fsync-policy=group_commit"), std::string::npos);
+  EXPECT_NE(summary.str().find("sweep result: 1000"), std::string::npos);
+}
+
+TEST(ReporterTest, JsonOmitsServerForInProcessRuns) {
+  const auto report = MakeFixtureReport();
+  std::ostringstream out;
+  WriteReportJson(report, out);
+  EXPECT_EQ(out.str().find(R"("server":)"), std::string::npos);
+}
+
 TEST(ReporterTest, BuildInfoReportsCompilerAndBuildType) {
   const auto b = CurrentBuildInfo();
   EXPECT_FALSE(b.compiler.empty());

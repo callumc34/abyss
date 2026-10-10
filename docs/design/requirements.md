@@ -6,9 +6,9 @@ These are the invariants that all components must uphold. They are not guideline
 
 **The queue is the single source of truth.** Every write goes to the queue. There is no dual write. The hot store and cold store are materialised views of the queue. If they diverge, the queue is correct.
 
-**A client never receives OK for a write that is subsequently lost.** A write is acknowledged only after the queue append is durable (fsync complete for group commit) and the hot consumer has applied it. If the process crashes between these two events, the client never saw OK, so it can retry.
+**No reply, to a read or a write, reflects a write that a failure in the configured durability class can lose.** In particular, a write is acknowledged only after its queue entry reaches the configured durability class and its effect is applied to hot. If the process fails before then, the client never saw OK and can retry. See [ADP-015](proposals/015-write-path-and-durability.md) §Durability classes and §Read visibility.
 
-**Consumers are independent.** The hot consumer and cold consumer read from the queue at their own pace. Neither blocks the other. The hot consumer is always near the head. The cold consumer deliberately lags to accumulate writes for compaction.
+**Cold lag is decoupled from writes.** The cold consumer reads from the queue at its own pace and deliberately lags to accumulate writes for compaction. Its lag reaches the write path only through bounded, observable memory backpressure: hot cannot evict a key that cold has not drained. It never causes unbounded memory growth. (Until [ADP-015](proposals/015-write-path-and-durability.md) Phase 2 lands, hot is also a queue consumer that stays near the head.)
 
 **Recovery is pure queue replay.** The cold store is never read during recovery. Both consumers rebuild their state entirely from the queue. This eliminates consistency concerns between the queue and the stores.
 
@@ -16,19 +16,28 @@ These are the invariants that all components must uphold. They are not guideline
 
 ## Performance Targets
 
-| Metric | Target |
-|--------|--------|
-| Hot read (embedded) | < 100 us p99 |
-| Hot write (queue append + ACK, embedded) | < 50 us p99 |
-| Buffer read | < 50 us p99 |
-| Queue append (external) | < 1 ms p99 |
-| Cold read | < 5 ms p99 |
-| Cold batch write (10K ops) | < 50 ms p99 |
-| Recovery (24h queue, 1M entries) | < 60 s |
-| Write throughput (embedded) | > 100K ops/s |
-| Write throughput (external) | > 50K ops/s |
+A durable write cannot be acknowledged faster than the device's flush, so write targets are stated per durability class (see [ADP-015](proposals/015-write-path-and-durability.md)). The `power_loss` target is stated relative to the flush latency measured on the same volume in the same run. Where a target is measured is set out in [ADP-013](proposals/013-performance-harness.md).
+
+| ID | Metric | Definition | Target |
+|----|--------|------------|--------|
+| H1 | Hot apply (engine) | In-process apply of one write to the hot store | < 5 us p99 |
+| R1 | Hot read (embedded) | GET of a hot-resident key | < 100 us p99 |
+| W1 | Write overhead | SET acknowledged at `process_crash`, in-process, at ≤ 50% of saturation | < 20 us p99 |
+| W1-L | Write over loopback | SET acknowledged at `process_crash`, RESP over loopback, 64 connections, open-loop burst arrivals of 16 pipelined requests per connection, at ≤ 50% of saturation | p99 ≤ Valkey 8 (`appendfsync everysec`, I/O threads tuned) at the same offered load and shape, same run; provisional ceiling 250 us |
+| R1-L | Read under writes | GET over loopback in a 90/10 GET/SET mix, 64 connections, pipeline depth 1, at ≤ 50% of saturation | p99 ≤ Valkey 8 at the same offered load and shape, same run; provisional ceiling 250 us |
+| W2 | Durable write | SET acknowledged at `power_loss`, at ≤ 50% of saturation | ≤ 2 × measured device flush p99 + 50 us |
+| W3 | Durable write throughput | The highest open-loop offered SET rate sustained with p99 within the W2 bound, found by a rate sweep, on a device whose flush p99 ≤ 1 ms (NVMe or provisioned cloud volume, named in the report). Concurrency is whatever the rate needs; no in-flight count is fixed, because Little's law ties it to latency. | > 100K ops/s |
+| X1 | Comparative | The comparison matrix in [ADP-013](proposals/013-performance-harness.md) §Comparative baselines: Valkey 8 per durability class, and Dragonfly vs `process_crash` (labelled no-AOF), with tuning parity | On an 8-core host: lower p99 at the same offered load, and higher maximum throughput within the same latency SLO |
+| B1 | Buffer read | Compaction-buffer point read | < 50 us p99 |
+| C1 | Cold read | Cold point read | < 5 ms p99 |
+| C2 | Cold batch write | 10K-op cold batch | < 50 ms p99 |
+| Q1 | Queue append (external) | Broker produce acknowledged at the configured class | < 1 ms p99 |
+| RC1 | Recovery | 24 h queue, 1M entries | < 60 s |
+| T2 | Write throughput (external) | Sustained | > 50K ops/s |
 
 ## Durability Guarantees
+
+> **Superseded by [ADP-015](proposals/015-write-path-and-durability.md) §Durability classes.** Abyss acknowledges at a named durability class: `process_crash` (the default, acknowledged once the entry is in the operating system's page cache, with continuous background flushing) or `power_loss` (acknowledged after fdatasync). The fsync policies below describe current behaviour until the durability pipeline lands.
 
 **Group commit (default):** Writes are batched within a configurable window and fsynced together. The client blocks until its batch is fsynced. Maximum data loss on crash is limited to writes in the current unfsynced batch — but those writes were never acknowledged to the client.
 
@@ -44,6 +53,8 @@ The key guarantee: any write the client received OK for is durable. Group commit
 
 ### Phase 1 Threading
 
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** The hot consumer and resolver threads go away. Writes are sequenced under the shard lock on the calling thread, and cold consumers become a pool sized to cores. The list below describes current behaviour.
+
 - **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands, route to tiering engine.
 - **Hot consumer thread** (single, dedicated) — tails queue, applies to hot store, fulfils Consumer RPC promises for unconditional writes.
 - **Cold consumer thread** (single, dedicated) — tails queue into compaction buffer, flushes to cold.
@@ -51,6 +62,8 @@ The key guarantee: any write the client received OK for is durable. Group commit
 - **Background threads** — WAL segment cleanup, cold store compaction, TTL expiry scanning.
 
 ### Lock Discipline
+
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** The shard lock is taken by the per-shard sequencer, not a hot consumer, and becomes a spin-then-park lock with a constant-time critical section. The Consumer RPC registry is reduced to admin and flush use. The text below describes current behaviour.
 
 **Hot store:** Sharded lock scheme (lock striping by shard, where the shard is derived from the key's CRC16 slot — see [ADP-014](proposals/014-slot-routing-and-topology.md)). I/O threads acquire a shared lock on the relevant shard for reads. The hot consumer acquires an exclusive lock for writes. The number of lock shards is fixed at deployment and should equal the planned horizontal shard count to ease migration to Phase 2.
 
@@ -63,6 +76,8 @@ The key guarantee: any write the client received OK for is durable. Group commit
 Phase 2 does not change the threading model within a pod. Each pod runs the same thread structure as Phase 1. Horizontal scaling is achieved by partitioning the keyspace across pods, not by changing the concurrency model. See [ADP-008](proposals/008-horizontal-scaling.md).
 
 ## Consumer Coordination
+
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Retention is gated by the persisted committed offsets of the retention consumers (cold, and the resolver until it is removed). In one physical log per volume, a stuck shard pins reclamation for that volume. The text below describes current behaviour.
 
 The queue retains entries until both consumers have acknowledged. Under normal operation, the cold consumer lags behind the hot consumer by up to the eviction window (since it uses that window to accumulate and compact writes before flushing).
 

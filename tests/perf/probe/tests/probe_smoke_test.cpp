@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
+#include <sys/wait.h>
 #include <yaml-cpp/yaml.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -19,6 +21,7 @@ int RunProbe(std::string_view binary, std::string_view extra_args, const std::st
   std::ostringstream cmd;
   cmd << binary << " --duration 1 --warmup 0 --workers 2 --key-count 100 --value-size-bytes 16 "
       << "--output " << output_path << ' ' << extra_args;
+  // NOLINTNEXTLINE(bugprone-command-processor)
   return std::system(cmd.str().c_str());
 }
 
@@ -50,10 +53,17 @@ void AssertReportShape(const YAML::Node& report, const std::string& expected_op)
 TEST(ProbeSmokeTest, HotProbeRunsAndEmitsReport) {
   abyss::testing::TempDir dir{"probe_hot"};
   const auto output = dir.Sub("hot.json").string();
-  const auto rc = RunProbe(ABYSS_HOT_PROBE_BINARY, "--mix \"hot_get=1.0\"", output);
+  const auto rc = RunProbe(ABYSS_HOT_PROBE_BINARY, "", output);
   ASSERT_EQ(rc, kProbeOk);
   const auto report = ParseProbeJson(output);
   AssertReportShape(report, "hot_get");
+  AssertReportShape(report, "hot_apply");
+}
+
+TEST(ProbeSmokeTest, HotProbeRejectsUnknownOp) {
+  abyss::testing::TempDir dir{"probe_hot_unknown"};
+  const auto output = dir.Sub("hot.json").string();
+  EXPECT_NE(RunProbe(ABYSS_HOT_PROBE_BINARY, "--mix \"hot_set=1.0\"", output), kProbeOk);
 }
 
 TEST(ProbeSmokeTest, BufferProbeRunsAndEmitsReport) {
@@ -73,6 +83,74 @@ TEST(ProbeSmokeTest, ColdProbeRunsAndEmitsReport) {
   ASSERT_EQ(rc, kProbeOk);
   const auto report = ParseProbeJson(output);
   AssertReportShape(report, "cold_get");
+}
+#endif
+
+#ifdef ABYSS_HAVE_WRITE_PROBE
+std::string WriteProbeArgs(const abyss::testing::TempDir& dir, std::string_view extra) {
+  return "--fsync-policy none --shards 2 --flush-samples 6 --flush-concurrency 2 --wal-path " +
+         dir.Sub("wal").string() + " --cold-path " + dir.Sub("cold").string() + ' ' +
+         std::string{extra};
+}
+
+TEST(ProbeSmokeTest, WriteProbeClosedLoopLeavesTargetsUnevaluated) {
+  abyss::testing::TempDir dir{"probe_write"};
+  const auto output = dir.Sub("write.json").string();
+  ASSERT_EQ(
+      RunProbe(ABYSS_WRITE_PROBE_BINARY, WriteProbeArgs(dir, "--prefill-entries 300"), output),
+      kProbeOk);
+  const auto report = ParseProbeJson(output);
+  AssertReportShape(report, "write_ack");
+  AssertReportShape(report, "device_flush");
+  AssertReportShape(report, "device_flush_concurrent");
+  EXPECT_EQ(report["operations"]["write_ack"]["errors"].as<uint64_t>(), 0U);
+  EXPECT_EQ(report["operations"]["device_flush"]["count"].as<uint64_t>(), 6U);
+  EXPECT_EQ(report["operations"]["device_flush_concurrent"]["count"].as<uint64_t>(), 6U);
+
+  EXPECT_EQ(report["config"]["fsync_policy"].as<std::string>(), "fsync_none");
+  EXPECT_EQ(report["config"]["prefill_entries"].as<std::string>(), "300");
+  EXPECT_EQ(report["config"]["workers"].as<std::string>(), "2");
+  EXPECT_FALSE(report["driver"]["open_loop"].as<bool>());
+
+  ASSERT_EQ(report["targets"].size(), 1U);
+  EXPECT_EQ(report["targets"][0]["metric"].as<std::string>(), "operations.write_ack.p99_us");
+  EXPECT_FALSE(report["targets"][0]["evaluated"].as<bool>());
+  EXPECT_FALSE(report["targets_evaluated"].as<bool>());
+  EXPECT_FALSE(report["pass"].as<bool>());
+}
+
+TEST(ProbeSmokeTest, WriteProbeOpenLoopEvaluatesTargets) {
+  abyss::testing::TempDir dir{"probe_write_open"};
+  const auto output = dir.Sub("write.json").string();
+  ASSERT_EQ(
+      RunProbe(ABYSS_WRITE_PROBE_BINARY, WriteProbeArgs(dir, "--target-rate-ops 200"), output),
+      kProbeOk);
+  const auto report = ParseProbeJson(output);
+  AssertReportShape(report, "write_ack");
+  EXPECT_TRUE(report["driver"]["open_loop"].as<bool>());
+  EXPECT_GT(report["driver"]["send_lag_us"]["count"].as<uint64_t>(), 0U);
+  ASSERT_EQ(report["targets"].size(), 1U);
+  EXPECT_TRUE(report["targets"][0]["evaluated"].as<bool>());
+  EXPECT_EQ(report["targets"][0]["target"].as<double>(), 20.0);
+  EXPECT_TRUE(report["targets_evaluated"].as<bool>());
+}
+
+TEST(ProbeSmokeTest, WriteProbeRejectsGateInClosedLoop) {
+  abyss::testing::TempDir dir{"probe_write_gate"};
+  const auto rc =
+      RunProbe(ABYSS_WRITE_PROBE_BINARY, WriteProbeArgs(dir, "--gate"), dir.Sub("w.json").string());
+  ASSERT_NE(rc, kProbeOk);
+  EXPECT_EQ(WEXITSTATUS(rc), 2);
+}
+
+TEST(ProbeSmokeTest, WriteProbeRefusesANonEmptyWal) {
+  abyss::testing::TempDir dir{"probe_write_dirty"};
+  std::filesystem::create_directories(dir.Sub("wal"));
+  std::ofstream{dir.Sub("wal") / "leftover"} << "x";
+  const auto rc = RunProbe(ABYSS_WRITE_PROBE_BINARY,
+                           "--fsync-policy none --shards 2 --wal-path " + dir.Sub("wal").string(),
+                           dir.Sub("write.json").string());
+  EXPECT_NE(rc, kProbeOk);
 }
 #endif
 

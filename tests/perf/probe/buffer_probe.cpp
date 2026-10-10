@@ -40,6 +40,7 @@ abyss::perf::WorkloadTargets DefaultTargets() {
 
 }  // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape)
 int main(int argc, char** argv) {
   CLI::App app{"In-process compaction buffer probe (ADP-013)"};
   abyss::perf::probe::ProbeArgs args;
@@ -74,12 +75,10 @@ int main(int argc, char** argv) {
 
   auto cfg = abyss::perf::probe::MakeRunLoopConfig(args, mix);
 
-  std::atomic<uint64_t> read_misses{0};
+  // Every key was preloaded, so a miss is a failed read.
   abyss::perf::OpFn op_fn = [&](int /*worker_id*/, std::string_view /*op_name*/,
                                 uint64_t key_index) {
-    const auto key = KeyFor(key_index);
-    auto rc = buffer.Read(key);
-    if (!rc.has_value()) read_misses.fetch_add(1, std::memory_order_relaxed);
+    return buffer.Read(KeyFor(key_index)).has_value();
   };
 
   const auto result = abyss::perf::RunLoop(cfg, op_fn);
@@ -90,8 +89,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (read_misses.load() > 0) {
-    std::cerr << "buffer_probe: " << read_misses.load() << " read misses during run\n";
+  if (const auto errors = abyss::perf::TotalErrors(result); errors > 0) {
+    std::cerr << "buffer_probe: " << errors << " read misses during run\n";
+    return abyss::perf::probe::kExitOpErrors;
   }
   if (args.gate && !report.pass) {
     std::cerr << "buffer_probe: one or more targets failed\n";

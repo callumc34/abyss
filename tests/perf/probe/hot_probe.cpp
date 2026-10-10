@@ -19,7 +19,7 @@
 namespace {
 
 constexpr std::string_view kOpGet = "hot_get";
-constexpr std::string_view kOpSet = "hot_set";
+constexpr std::string_view kOpApply = "hot_apply";
 
 std::string KeyFor(uint64_t idx) {
   std::array<char, 32> buf{};
@@ -31,7 +31,7 @@ std::string KeyFor(uint64_t idx) {
 abyss::perf::OperationMix DefaultMix() {
   abyss::perf::OperationMix mix;
   mix.weights[std::string{kOpGet}] = 0.5;
-  mix.weights[std::string{kOpSet}] = 0.5;
+  mix.weights[std::string{kOpApply}] = 0.5;
   return mix;
 }
 
@@ -39,15 +39,16 @@ abyss::perf::WorkloadTargets DefaultTargets() {
   abyss::perf::WorkloadTargets t;
   abyss::perf::TargetSpec get_spec;
   get_spec.p99_us = 100;
-  abyss::perf::TargetSpec set_spec;
-  set_spec.p99_us = 50;
+  abyss::perf::TargetSpec apply_spec;
+  apply_spec.p99_us = 5;
   t.per_op[std::string{kOpGet}] = get_spec;
-  t.per_op[std::string{kOpSet}] = set_spec;
+  t.per_op[std::string{kOpApply}] = apply_spec;
   return t;
 }
 
 }  // namespace
 
+// NOLINTNEXTLINE(bugprone-exception-escape)
 int main(int argc, char** argv) {
   CLI::App app{"In-process hot store probe (ADP-013)"};
   abyss::perf::probe::ProbeArgs args;
@@ -68,6 +69,13 @@ int main(int argc, char** argv) {
     return 2;
   }
   const auto& mix = *mix_or;
+  for (const auto& [name, weight] : mix.weights) {
+    if (name != kOpGet && name != kOpApply) {
+      std::cerr << "unknown op in mix: " << name << " (expected " << kOpGet << " or " << kOpApply
+                << ")\n";
+      return 2;
+    }
+  }
 
   abyss::core::EvictionPolicy eviction{std::chrono::seconds{86400}};
   abyss::hot::ShardedHotStore hot{abyss::hot::ShardedHotStoreConfig{
@@ -97,14 +105,13 @@ int main(int argc, char** argv) {
 
   auto cfg = abyss::perf::probe::MakeRunLoopConfig(args, mix);
 
-  std::atomic<uint64_t> error_count{0};
   abyss::perf::OpFn op_fn = [&](int worker_id, std::string_view op_name, uint64_t key_index) {
     const auto key = KeyFor(key_index);
     if (op_name == kOpGet) {
       abyss::core::ops::StringGet read{.key = key};
-      auto rc = hot.Exec(read);
-      if (!rc.has_value()) error_count.fetch_add(1, std::memory_order_relaxed);
-    } else {
+      return hot.Exec(read).has_value();
+    }
+    {
       const auto& val = values_pool[static_cast<size_t>(worker_id)];
       abyss::core::ops::StringSet set_op{
           .key = key,
@@ -112,8 +119,7 @@ int main(int argc, char** argv) {
           .abs_ttl_ms = 0,
       };
       abyss::core::ops::WriteOp write = set_op;
-      auto rc = hot.Apply(write, /*seq=*/0);
-      if (!rc.has_value()) error_count.fetch_add(1, std::memory_order_relaxed);
+      return hot.Apply(write, /*seq=*/0).has_value();
     }
   };
 
@@ -125,12 +131,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (const auto errors = abyss::perf::TotalErrors(result); errors > 0) {
+    std::cerr << "hot_probe: " << errors << " op errors during run\n";
+    return abyss::perf::probe::kExitOpErrors;
+  }
   if (args.gate && !report.pass) {
     std::cerr << "hot_probe: one or more targets failed\n";
     return 3;
-  }
-  if (error_count.load() > 0) {
-    std::cerr << "hot_probe: " << error_count.load() << " op errors during run\n";
   }
   return 0;
 }

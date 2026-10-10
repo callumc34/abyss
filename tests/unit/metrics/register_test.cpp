@@ -21,8 +21,7 @@ TEST_F(RegisterTest, CounterIncrementAndRead) {
   handle.Increment(3.0);
 
   const auto value = testing::GetCounterValue(names::kHitsTotal, Tier::kHot);
-  ASSERT_TRUE(value.has_value());
-  EXPECT_DOUBLE_EQ(*value, 5.0);
+  EXPECT_EQ(value, 5.0);
 }
 
 TEST_F(RegisterTest, GaugeSetAndRead) {
@@ -33,23 +32,21 @@ TEST_F(RegisterTest, GaugeSetAndRead) {
   handle.Decrement(256.0);
 
   const auto value = testing::GetGaugeValue(names::kHotMemoryBytes);
-  ASSERT_TRUE(value.has_value());
-  EXPECT_DOUBLE_EQ(*value, 1280.0);
+  EXPECT_EQ(value, 1280.0);
 }
 
 TEST_F(RegisterTest, HistogramObserveAndRead) {
   auto& reg = Registry::Instance();
-  auto handle = reg.Histogram(names::kQueueAppendDurationSeconds);
+  auto handle = reg.Histogram(names::kWalFlushDurationSeconds);
   handle.Observe(0.002);
   handle.Observe(0.050);
   handle.Observe(0.500);
 
-  const auto count = testing::GetHistogramCount(names::kQueueAppendDurationSeconds);
-  const auto sum = testing::GetHistogramSum(names::kQueueAppendDurationSeconds);
-  ASSERT_TRUE(count.has_value());
+  const auto count = testing::GetHistogramCount(names::kWalFlushDurationSeconds);
+  const auto sum = testing::GetHistogramSum(names::kWalFlushDurationSeconds);
+  EXPECT_EQ(count, 3U);
   ASSERT_TRUE(sum.has_value());
-  EXPECT_EQ(*count, 3U);
-  EXPECT_NEAR(*sum, 0.552, 1e-9);
+  EXPECT_NEAR(sum.value_or(0.0), 0.552, 1e-9);
 }
 
 TEST_F(RegisterTest, LabelledCounterSeriesAreDistinct) {
@@ -58,8 +55,8 @@ TEST_F(RegisterTest, LabelledCounterSeriesAreDistinct) {
   reg.Counter(names::kHitsTotal, Tier::kHot).Increment();
   reg.Counter(names::kHitsTotal, Tier::kCold).Increment();
 
-  EXPECT_DOUBLE_EQ(*testing::GetCounterValue(names::kHitsTotal, Tier::kHot), 2.0);
-  EXPECT_DOUBLE_EQ(*testing::GetCounterValue(names::kHitsTotal, Tier::kCold), 1.0);
+  EXPECT_EQ(testing::GetCounterValue(names::kHitsTotal, Tier::kHot), 2.0);
+  EXPECT_EQ(testing::GetCounterValue(names::kHitsTotal, Tier::kCold), 1.0);
   EXPECT_FALSE(testing::GetCounterValue(names::kHitsTotal, Tier::kBuffer).has_value());
 }
 

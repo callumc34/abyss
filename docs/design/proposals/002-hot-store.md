@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Hot will be applied by the per-shard sequencer as part of each write, not by a trailing hot consumer. It is subject to the residency invariant: writes to non-resident keys load them first, eviction waits for cold to drain the key's latest write, and evicted keys leave stubs (Phase 2). The sections below describe current behaviour until then.
+
 ## Context
 
 The hot store is the in-memory tier of Abyss. It serves the lowest-latency reads and is the first tier checked on every read. The hot consumer applies writes from the queue in real-time, and I/O threads read from it concurrently.

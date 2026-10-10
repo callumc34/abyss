@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** The write path becomes a sequenced write that is decided, logged and applied under the shard lock, then acknowledged at the configured durability class. A cold hit fills hot directly instead of appending a promotion entry, and the read-consistency wait is replaced by the residency invariant (Phase 2). The Flush acknowledgement no longer requires a persisted consumer offset (Phase 1a). The sections below describe current behaviour until each phase lands.
+
 ## Context
 
 The read and write paths are the core data flows through Abyss. The write path ensures durability and consistency through the queue. The read path provides tiered access across hot, buffer, and cold with promotion semantics for cold hits.

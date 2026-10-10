@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
+> **Amended by [ADP-015](015-write-path-and-durability.md).** The consumer loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain (Phase 1a). Absorption is capped at the power-durable watermark, and consumers run as a pool sized to cores (Phase 1b). The loop below describes current behaviour until then.
+
 ## Context
 
 The cold consumer is the most architecturally significant component in Abyss. It reads from the queue, maintains an in-memory compaction buffer, and flushes to the cold store only when it is smart to do so.

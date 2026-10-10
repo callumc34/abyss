@@ -273,13 +273,16 @@ struct HistogramDesc {
 
 namespace buckets {
 
-// Sub-100us resolution is load-bearing: the hot-read (<100us), hot-write (<50us) and
-// buffer-read (<50us) targets are unresolvable by histogram_quantile without boundaries
-// below them. Upper decades stay coarse so cold (5ms) and queue-append remain resolvable
-// without per-histogram bucket proliferation.
+// Sub-100us boundaries resolve hot reads (<100us) and buffer reads
+// (<50us). H1 and W1 need finer resolution and are probe-measured.
+// Coarse upper decades still resolve cold reads (5ms).
 inline constexpr std::array<double, 14> kLatencySeconds{0.00001, 0.000025, 0.00005, 0.0001, 0.00025,
                                                         0.0005,  0.001,    0.0025,  0.005,  0.01,
                                                         0.05,    0.1,      1.0,     10.0};
+
+// Durable flushes: 50us (NVMe) to a second (a stalled volume).
+inline constexpr std::array<double, 13> kFlushLatencySeconds{
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0};
 
 // Power-of-ten buckets for batch sizes.
 inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
@@ -327,10 +330,24 @@ inline constexpr CounterDesc<ProtoLabel> kRespProtocolVersionTotal{
     .help = "HELLO handshakes by negotiated protocol version.",
 };
 
-inline constexpr HistogramDesc<> kQueueAppendDurationSeconds{
-    .name = "abyss_queue_append_duration_seconds",
-    .help = "Queue append latency including group-commit fsync.",
-    .buckets = buckets::kLatencySeconds,
+inline constexpr HistogramDesc<> kWalFlushDurationSeconds{
+    .name = "abyss_wal_flush_duration_seconds",
+    .help =
+        "Duration of one group-commit or per-write WAL flush. Segment create and seal fsyncs "
+        "and offset syncs are not included.",
+    .buckets = buckets::kFlushLatencySeconds,
+};
+
+inline constexpr HistogramDesc<> kWalFlushBatchEntries{
+    .name = "abyss_wal_flush_batch_entries",
+    .help = "WAL entries covered by one durability flush.",
+    .buckets = buckets::kBatchSize,
+};
+
+inline constexpr HistogramDesc<> kQueueOffsetPersistDurationSeconds{
+    .name = "abyss_queue_offset_persist_duration_seconds",
+    .help = "Duration of one durable persist of committed offsets.",
+    .buckets = buckets::kFlushLatencySeconds,
 };
 
 inline constexpr HistogramDesc<> kColdFlushBatchSize{
