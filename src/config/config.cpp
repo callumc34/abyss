@@ -71,8 +71,6 @@ core::Result<void> ParseCold(const YamlCursor& cur, ColdConfig& out) {
       .Finish();
 }
 
-// YAML uses wal_fsync_policy (the name operators see in configs); the struct
-// field stays fsync_policy to match queue::FsyncPolicyFromString.
 core::Result<void> ParseQueue(const YamlCursor& cur, QueueConfig& out) {
   return SectionDecoder(cur)
       .Optional("backend", out.backend)
@@ -81,9 +79,15 @@ core::Result<void> ParseQueue(const YamlCursor& cur, QueueConfig& out) {
       .Optional("max_value_size_bytes", out.max_value_size_bytes)
       .Optional("min_retention_seconds", out.min_retention)
       .Optional("offset_fsync_interval_ms", out.offset_fsync_interval)
-      .Optional("wal_fsync_policy", out.fsync_policy)
-      .Optional("group_commit_interval_us", out.group_commit_interval_us)
-      .Optional("group_commit_max_bytes", out.group_commit_max_bytes)
+      .Optional("durability", out.durability)
+      .Optional("durability_window_bytes", out.durability_window_bytes)
+      .Optional("durability_window_ms", out.durability_window)
+      .Removed("wal_fsync_policy", "removed; use queue.durability (process_crash | power_loss)")
+      .Removed("group_commit_interval_us",
+               "removed; a flush starts as soon as the previous one ends, and "
+               "queue.durability_window_ms bounds how long data stays unflushed")
+      .Removed("group_commit_max_bytes",
+               "removed; the unflushed window is bounded by queue.durability_window_bytes")
       .Finish();
 }
 

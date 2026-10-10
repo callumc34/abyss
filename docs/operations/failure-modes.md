@@ -15,7 +15,9 @@
 | Cold scan exceeds the scan deadline | A large `SMEMBERS`/`ZRANGE`/`HGETALL` served from cold could not complete within `cold_scan_deadline`. The read fails closed with a timeout error to the client rather than returning a silently truncated result. | Inspect `abyss_cold_scan_deadline_exceeded_total`. Raise `cold_scan_deadline` for workloads with large cold-resident collections, or address the cold-volume I/O pressure (compaction, disk) that slowed the scan. |
 | Hot store memory pressure | LRU evicts keys before their eviction deadline. Reads for evicted keys fall through to buffer then cold. | Provision more hot store memory or reduce eviction durations. Data is safe in queue and eventually in cold. |
 | Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
-| Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). With any retention `fsync_policy` this is a **refuse-to-start** condition — a persisted ack could outrun durable storage, violating "no OK for a lost write". | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk). As a deliberate, durability-disabling override, set `fsync_policy: none`. Watch `abyss_fs_durable_dir_supported`. |
+| Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). This is a **refuse-to-start** condition under both durability classes: a power loss could drop whole segments, far beyond the durability window. | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk; Docker Desktop bind mounts often do not, so use a named volume). Watch `abyss_fs_durable_dir_supported`. |
+| WAL flush cannot keep up | The device flushes slower than writes arrive, so acknowledged-but-not-power-durable data grows until it hits `queue.durability_window_bytes` or `queue.durability_window_ms`. Writes then wait for a flush, and after `engine.write_timeout` fail with "WAL durability window full". Acknowledged data is untouched. | Inspect `abyss_wal_durability_lag_seconds`, `abyss_wal_unflushed_bytes`, `abyss_wal_flush_duration_seconds` and `abyss_wal_backpressure_*`. Provision a faster or higher-IOPS volume; widening the window trades a larger power-loss exposure for headroom. |
+| WAL flush or segment seal fails | An fdatasync of published WAL data returns an error. The kernel may already have dropped the dirty pages, so the process terminates rather than let a later flush mark lost data durable. The pod restarts (CrashLoopBackOff if the fault persists) and recovery replays the log. | Look for the CRITICAL `fatal invariant breach; terminating` log naming the WAL flush. Check the volume for I/O errors before restarting. |
 
 ## Durability Capability Gate
 
@@ -30,17 +32,16 @@ Abyss makes this observable and fail-closed rather than silently degrading (inva
   `abyss_fs_durable_dir_supported` (1 = durable directory fsync available, 0 = not).
 - The per-OS `fsync` backend is logged at startup (`fsync_backend` on the `WAL durability probe`
   line): macOS uses `F_FULLFSYNC` (the only Darwin call that pushes the drive cache to platter),
-  Linux uses `fsync`, Windows uses `FlushFileBuffers` (rename durability via
-  `MOVEFILE_WRITE_THROUGH`).
-- If the volume cannot make directory entries durable **and** a retention `fsync_policy`
-  (`per_write` or `group_commit`) is configured, startup fails with a `kFailedPrecondition`
-  error rather than accepting writes it cannot honour.
+  Linux uses `fsync` (`fdatasync` for WAL flushes), Windows uses `FlushFileBuffers` (rename
+  durability via `MOVEFILE_WRITE_THROUGH`).
+- If the volume cannot make directory entries durable, startup fails with a
+  `kFailedPrecondition` error rather than accepting writes it cannot honour. This holds under
+  both durability classes.
 - The same check is enforced at the point of every durability-critical atomic write (node
   identity, consumer offsets): a directory-sync-unsupported volume returns an error instead of
   reporting a durable commit.
 
-To run on a volume that genuinely cannot provide durable directory fsync, set
-`fsync_policy: none` — this disables durability by design and logs a CRITICAL warning at startup.
+There is no override: a volume that cannot provide durable directory fsync cannot host the WAL.
 
 ## Backpressure Cascade
 
@@ -60,9 +61,15 @@ There is no magic. Each stage is visible in metrics. Operators must provision re
 
 ## Write Failures
 
-A write that fails at the queue level (disk full, I/O error) returns a Redis error to the client. The write was never committed to the queue, so no state is inconsistent.
+A write rejected before it is published returns a Redis error to the client: disk full creating the next segment, an I/O error on the segment write, or the durability window still full at the command's deadline. The write was never committed to the queue, so no state is inconsistent.
 
-A write that succeeds at the queue level but whose hot consumer promise times out returns a Redis error to the client. The write IS durable in the queue and WILL be applied eventually. The client received an error, so it may retry — the retry will be a duplicate write, which is safe because last-write-wins is the default semantic.
+A failed WAL flush or segment seal after publication terminates the process instead (see "WAL flush or segment seal fails" above); there is no error reply for it.
+
+A write that is published but whose hot consumer promise times out returns a Redis error to the client. The write is in the queue and WILL be applied on catch-up. Under `power_loss` it is also power-durable; under `process_crash` it is only process-crash durable, so a power loss before the next flush can still drop it. The client received an error, so it may retry. The retry is a duplicate write, which is safe because last-write-wins is the default semantic.
+
+A multi-key write (`MSET`, multi-key `DEL`) appends one entry per key, all within one deadline. Under backpressure, key *k* can be rejected after keys 0 to *k*−1 were published, so the command fails with those keys applied. This used to need an I/O error, but is now an ordinary backpressure outcome. It ends when cross-shard commands log one batch frame (ADP-015 §Cross-shard atomic commands).
+
+FLUSHDB behaves the same way. It appends one `Flush` entry per shard, so under backpressure shards 0 to *k*−1 can be wiped before shard *k* is rejected and the command returns an error. Retrying completes it, because each shard's wipe is idempotent.
 
 ## Recovery After Crash
 
@@ -193,7 +200,8 @@ action beyond that — the reaper retries every eligible segment on each pass.
 
 - `ApplyBatch` is a cheap memtable write (`sync=false`); it does not fsync.
 - `Checkpoint` (`FlushWAL(sync=true)`) makes every prior batch durable. It fires on a **bounded cadence** — at most every `checkpoint_max_flushes` applied batches or `checkpoint_min_interval` — so a burst of small flushes amortises into one fsync rather than an fsync-per-batch storm (`F_FULLFSYNC` is expensive on macOS).
-- The cold WAL ack only advances to `min(low_water, last_checkpointed_seq, DurableSeq(shard))`. It can never outrun cold's own durable storage nor the durable WAL tail, so the segment reaper never releases WAL retention for data that is not yet durable on both tiers.
+- Before any `ApplyBatch`, every entry the batch's effects came from must be power-durable in the WAL ([ADP-004](../design/proposals/004-cold-consumer.md) §Persisting at the power-durable log). RocksDB may persist an applied batch before any checkpoint, so the gate sits at the apply.
+- The cold WAL commit only advances to `min(low_water, last_checkpointed_seq, DurableEnd(shard, power_loss) - 1)`. It can never outrun cold's own durable storage or the power-durable end of the WAL, so the segment reaper never releases WAL retention for data that is not yet durable on both tiers.
 
 This is fail-closed (invariant 5): a failed or slow checkpoint **pins** the ack (back-pressure), it does not silently advance.
 

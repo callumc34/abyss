@@ -135,16 +135,13 @@ void EncodeSlot(std::span<std::byte> slot, uint64_t epoch, uint32_t shard_count,
   PutU32(slot.data() + payload, Crc32c(slot.first(payload)));
 }
 
-core::Result<void> SyncDir(const std::filesystem::path& dir, bool required) {
+core::Result<void> SyncDir(const std::filesystem::path& dir) {
   auto out = pfs::FsyncDir(dir);
   if (!out.has_value()) return std::unexpected(out.error());
   if (*out == pfs::DirSyncOutcome::kUnsupported) {
-    if (required) {
-      return std::unexpected(
-          core::Error{core::ErrorCode::kFailedPrecondition,
-                      "offset checkpoint directory '" + dir.string() + "' cannot be made durable"});
-    }
-    ABYSS_LOG_WARN("offset checkpoint directory entry is not durable", {"dir", dir.string()});
+    return std::unexpected(
+        core::Error{core::ErrorCode::kFailedPrecondition,
+                    "offset checkpoint directory '" + dir.string() + "' cannot be made durable"});
   }
   return {};
 }
@@ -173,8 +170,7 @@ core::Result<void> RejectLegacyLayout(const std::filesystem::path& dir) {
 // Created under a temporary name and renamed into place, so the checkpoint
 // file, once visible, always holds at least one valid slot.
 core::Result<void> CreateFile(const std::filesystem::path& path, size_t slot_bytes,
-                              uint32_t shard_count, std::span<const core::ConsumerId> consumers,
-                              bool require_durable_dir) {
+                              uint32_t shard_count, std::span<const core::ConsumerId> consumers) {
   auto tmp = path;
   tmp += ".tmp";
   std::error_code ec;
@@ -197,7 +193,7 @@ core::Result<void> CreateFile(const std::filesystem::path& path, size_t slot_byt
     std::filesystem::remove(tmp, ec);
     return std::unexpected(written.error());
   }
-  return SyncDir(path.parent_path(), require_durable_dir);
+  return SyncDir(path.parent_path());
 }
 
 }  // namespace
@@ -227,7 +223,7 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
         core::Error{core::ErrorCode::kInternal, "create offsets dir: " + ec.message()});
   }
   if (created_dir) {
-    if (auto r = SyncDir(config.dir.parent_path(), config.require_durable_dir); !r.has_value()) {
+    if (auto r = SyncDir(config.dir.parent_path()); !r.has_value()) {
       return std::unexpected(r.error());
     }
   }
@@ -241,8 +237,7 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
         core::Error{core::ErrorCode::kInternal, "stat offset checkpoint: " + ec.message()});
   }
   if (!exists) {
-    if (auto r = CreateFile(path, expected_slot_bytes, config.shard_count, config.consumers,
-                            config.require_durable_dir);
+    if (auto r = CreateFile(path, expected_slot_bytes, config.shard_count, config.consumers);
         !r.has_value()) {
       return std::unexpected(r.error());
     }

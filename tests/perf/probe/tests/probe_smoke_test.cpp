@@ -87,8 +87,10 @@ TEST(ProbeSmokeTest, ColdProbeRunsAndEmitsReport) {
 #endif
 
 #ifdef ABYSS_HAVE_WRITE_PROBE
-std::string WriteProbeArgs(const abyss::testing::TempDir& dir, std::string_view extra) {
-  return "--fsync-policy none --shards 2 --flush-samples 6 --flush-concurrency 2 --wal-path " +
+std::string WriteProbeArgs(const abyss::testing::TempDir& dir, std::string_view extra,
+                           std::string_view durability = "process_crash") {
+  return "--durability " + std::string{durability} +
+         " --shards 2 --flush-samples 6 --flush-concurrency 2 --wal-path " +
          dir.Sub("wal").string() + " --cold-path " + dir.Sub("cold").string() + ' ' +
          std::string{extra};
 }
@@ -107,7 +109,7 @@ TEST(ProbeSmokeTest, WriteProbeClosedLoopLeavesTargetsUnevaluated) {
   EXPECT_EQ(report["operations"]["device_flush"]["count"].as<uint64_t>(), 6U);
   EXPECT_EQ(report["operations"]["device_flush_concurrent"]["count"].as<uint64_t>(), 6U);
 
-  EXPECT_EQ(report["config"]["fsync_policy"].as<std::string>(), "fsync_none");
+  EXPECT_EQ(report["config"]["durability"].as<std::string>(), "process_crash");
   EXPECT_EQ(report["config"]["prefill_entries"].as<std::string>(), "300");
   EXPECT_EQ(report["config"]["workers"].as<std::string>(), "2");
   EXPECT_FALSE(report["driver"]["open_loop"].as<bool>());
@@ -135,6 +137,30 @@ TEST(ProbeSmokeTest, WriteProbeOpenLoopEvaluatesTargets) {
   EXPECT_TRUE(report["targets_evaluated"].as<bool>());
 }
 
+// W2: under power_loss the target is twice the calibrated flush p99 plus
+// headroom, so it always exceeds the headroom alone.
+TEST(ProbeSmokeTest, WriteProbePowerLossEvaluatesTheFlushBoundTarget) {
+  abyss::testing::TempDir dir{"probe_write_power"};
+  const auto output = dir.Sub("write.json").string();
+  ASSERT_EQ(RunProbe(ABYSS_WRITE_PROBE_BINARY,
+                     WriteProbeArgs(dir, "--target-rate-ops 200", "power_loss"), output),
+            kProbeOk);
+  const auto report = ParseProbeJson(output);
+  AssertReportShape(report, "write_ack");
+  EXPECT_EQ(report["config"]["durability"].as<std::string>(), "power_loss");
+  ASSERT_EQ(report["targets"].size(), 1U);
+  EXPECT_TRUE(report["targets"][0]["evaluated"].as<bool>());
+  EXPECT_GT(report["targets"][0]["target"].as<double>(), 50.0);
+}
+
+TEST(ProbeSmokeTest, WriteProbeRejectsAnUnknownDurability) {
+  abyss::testing::TempDir dir{"probe_write_bad_durability"};
+  const auto rc = RunProbe(ABYSS_WRITE_PROBE_BINARY, WriteProbeArgs(dir, "", "fsync_none"),
+                           dir.Sub("w.json").string());
+  ASSERT_NE(rc, kProbeOk);
+  EXPECT_EQ(WEXITSTATUS(rc), 2);
+}
+
 TEST(ProbeSmokeTest, WriteProbeRejectsGateInClosedLoop) {
   abyss::testing::TempDir dir{"probe_write_gate"};
   const auto rc =
@@ -147,9 +173,10 @@ TEST(ProbeSmokeTest, WriteProbeRefusesANonEmptyWal) {
   abyss::testing::TempDir dir{"probe_write_dirty"};
   std::filesystem::create_directories(dir.Sub("wal"));
   std::ofstream{dir.Sub("wal") / "leftover"} << "x";
-  const auto rc = RunProbe(ABYSS_WRITE_PROBE_BINARY,
-                           "--fsync-policy none --shards 2 --wal-path " + dir.Sub("wal").string(),
-                           dir.Sub("write.json").string());
+  const auto rc =
+      RunProbe(ABYSS_WRITE_PROBE_BINARY,
+               "--durability process_crash --shards 2 --wal-path " + dir.Sub("wal").string(),
+               dir.Sub("write.json").string());
   EXPECT_NE(rc, kProbeOk);
 }
 #endif

@@ -52,6 +52,10 @@ struct HashOverlay {
   std::unordered_set<std::string> removed_fields;
 };
 
+// Entries selected for a flush. They stay buffered and readable until
+// EraseFlushed or Reschedule; nothing else may mutate the buffer meanwhile.
+using FlushBatch = std::vector<std::reference_wrapper<const BufferEntry>>;
+
 class CompactionBuffer {
  public:
   CompactionBuffer(FlushStrategy strategy, core::SteadyClockFn clock,
@@ -61,8 +65,10 @@ class CompactionBuffer {
   explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock,
                             core::WallClockFn wall_clock = core::DefaultWallClock);
 
+  // `position` is the seq replay must resume from to re-derive the effect;
+  // `carrier` is the seq of the entry that holds it (ADP-004).
   void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction,
-              core::SequenceId seq = 0) ABYSS_EXCLUDES(mutex_);
+              core::SequenceId position, core::SequenceId carrier) ABYSS_EXCLUDES(mutex_);
 
   // kNotFound signals "fall through to next tier"; tombstones surface as
   // RespValue::Null so the caller treats a buffered DEL as authoritative.
@@ -74,14 +80,16 @@ class CompactionBuffer {
 
   HashOverlay HashOverlayFor(std::string_view key) const ABYSS_EXCLUDES(mutex_);
 
-  std::vector<BufferEntry> FlushReady(core::SteadyTime now,
-                                      size_t max_count = std::numeric_limits<size_t>::max())
+  FlushBatch FlushReady(core::SteadyTime now, size_t max_count = std::numeric_limits<size_t>::max())
       ABYSS_EXCLUDES(mutex_);
 
-  std::vector<BufferEntry> FlushOldest(size_t target_bytes, size_t max_count)
-      ABYSS_EXCLUDES(mutex_);
+  FlushBatch FlushOldest(size_t target_bytes, size_t max_count) ABYSS_EXCLUDES(mutex_);
 
-  void Reinsert(std::vector<BufferEntry> entries) ABYSS_EXCLUDES(mutex_);
+  // After the batch is applied; its references dangle afterwards.
+  void EraseFlushed(const FlushBatch& batch) ABYSS_EXCLUDES(mutex_);
+
+  // After a failed or deferred apply: the batch is due again.
+  void Reschedule(const FlushBatch& batch) ABYSS_EXCLUDES(mutex_);
 
   std::optional<core::SequenceId> OldestPendingSeq() const ABYSS_EXCLUDES(mutex_);
 
@@ -117,6 +125,10 @@ class CompactionBuffer {
   // overhead. Records the scheduled time on the entry for dedup on re-absorb.
   void PushHeapEntry(BufferEntry& entry, core::SteadyTime scheduled) ABYSS_REQUIRES(mutex_);
 
+  // Marks `key` in flight if `heap_time` is its live schedule; else null.
+  BufferEntry* SelectLocked(const std::string& key, core::SteadyTime heap_time)
+      ABYSS_REQUIRES(mutex_);
+
   std::chrono::milliseconds ComputeJitter() ABYSS_REQUIRES(mutex_);
 
   const FlushStrategy strategy_;
@@ -130,6 +142,8 @@ class CompactionBuffer {
   // Charged on every heap push, decremented on every pop (including stale-skip
   // pops). Folded into BytesEstimate so heap growth surfaces as backpressure.
   size_t heap_overhead_bytes_ ABYSS_GUARDED_BY(mutex_) = 0;
+  // Entries selected for a flush and not yet erased or rescheduled.
+  size_t in_flight_ ABYSS_GUARDED_BY(mutex_) = 0;
   std::mt19937_64 rng_ ABYSS_GUARDED_BY(mutex_);
 };
 

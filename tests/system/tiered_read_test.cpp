@@ -48,9 +48,6 @@ queue:
   wal_path: "${DATA_DIR}/wal"
   segment_size_bytes: 134217728
   min_retention_seconds: 3
-  wal_fsync_policy: group_commit
-  group_commit_interval_us: 1000
-  group_commit_max_bytes: 1048576
 
 hot_consumer:
   read_batch_size: 64

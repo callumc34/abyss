@@ -15,6 +15,7 @@ add_executable(abyss_core_tests
   core/topology_manifest_test.cpp
   core/atomic_file_test.cpp
   core/fatal_test.cpp
+  core/durability_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
@@ -31,6 +32,7 @@ add_executable(abyss_queue_tests
   queue/offset_checkpoint_test.cpp
   queue/segment_reaper_test.cpp
   queue/wal_flush_metrics_test.cpp
+  queue/durability_window_test.cpp
 )
 
 target_include_directories(abyss_queue_tests PRIVATE

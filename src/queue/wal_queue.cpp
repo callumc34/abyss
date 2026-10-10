@@ -43,6 +43,11 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
     return std::unexpected(
         core::Error{core::ErrorCode::kInvalidArgument, "offset_fsync_interval must be > 0"});
   }
+  if (config.durability_window_bytes == 0 ||
+      config.durability_window <= std::chrono::milliseconds::zero()) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "durability window bounds must be > 0"});
+  }
 
   std::error_code ec;
   std::filesystem::create_directories(config.wal_path, ec);
@@ -52,10 +57,9 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
   }
 
   // Surface the volume's real durability posture before any ack is given
-  // (invariant 5). A retention-bearing policy on a volume that cannot make
-  // directory renames durable is a refuse-to-start condition: the persisted-commit
-  // <= durable-tail contract A1 relies on cannot hold there.
-  const bool durability_required = config.commit.policy != FsyncPolicy::kNone;
+  // (invariant 5). A volume that cannot make directory entries durable
+  // could lose whole segments, not just the unflushed window, on a power
+  // loss: refuse to start.
   if (auto cap = platform::fs::ProbeDurability(config.wal_path); cap.has_value()) {
     metrics::Registry::Instance()
         .Gauge(metrics::names::kFsDurableDirSupported)
@@ -63,13 +67,12 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
     ABYSS_LOG_INFO("WAL durability probe", {"path", std::string_view{config.wal_path}},
                    {"dir_sync_supported", cap->dir_sync_supported},
                    {"fsync_backend", static_cast<int64_t>(cap->backend)});
-    if (durability_required && !cap->dir_sync_supported) {
+    if (!cap->dir_sync_supported) {
       ABYSS_LOG_CRITICAL("data volume cannot make directory entries durable",
                          {"path", std::string_view{config.wal_path}});
-      return std::unexpected(core::Error{
-          core::ErrorCode::kFailedPrecondition,
-          "data volume does not support durable directory fsync; refusing to start with a "
-          "retention fsync policy (set fsync_policy=none to override at the cost of durability)"});
+      return std::unexpected(
+          core::Error{core::ErrorCode::kFailedPrecondition,
+                      "data volume does not support durable directory fsync; refusing to start"});
     }
   } else {
     return std::unexpected(cap.error());
@@ -87,6 +90,7 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
   }
   ABYSS_LOG_INFO("WAL opened", {"path", std::string_view{queue->config_.wal_path}},
                  {"shard_count", static_cast<int64_t>(queue->config_.shard_count)},
+                 {"durability", core::DurabilityName(queue->config_.durability)},
                  {"segment_size_bytes", static_cast<uint64_t>(queue->config_.segment_size_bytes)},
                  {"min_retention_s", static_cast<int64_t>(queue->config_.min_retention.count())},
                  {"offset_fsync_interval_ms",
@@ -97,6 +101,7 @@ core::Result<std::unique_ptr<WalQueue>> WalQueue::Open(WalConfig config) {
 
 WalQueue::WalQueue(WalConfig config)
     : config_(std::move(config)),
+      window_(config_.durability_window_bytes, config_.durability_window),
       committed_(config_.retention_consumers.size() * config_.shard_count),
       persist_duration_(metrics::Registry::Instance().Histogram(
           metrics::names::kQueueOffsetPersistDurationSeconds)),
@@ -116,6 +121,7 @@ WalQueue::~WalQueue() {
   // Consumers have stopped committing by now; anything they committed that
   // the last round missed is persisted here. A failure is already logged.
   if (persist) (void)PersistOffsets();  // NOLINT(bugprone-unused-return-value)
+  window_.Shutdown();
   for (auto& shard : shards_) {
     if (shard) shard->Shutdown();
   }
@@ -126,7 +132,6 @@ core::Result<void> WalQueue::Initialize() {
       .dir = std::filesystem::path(config_.wal_path) / OffsetsDirName(),
       .shard_count = static_cast<uint32_t>(config_.shard_count),
       .consumers = config_.retention_consumers,
-      .require_durable_dir = config_.commit.policy != FsyncPolicy::kNone,
   });
   if (!checkpoint.has_value()) return std::unexpected(checkpoint.error());
   checkpoint_ = std::move(*checkpoint);
@@ -139,7 +144,8 @@ core::Result<void> WalQueue::Initialize() {
         .directory = shard_dir.string(),
         .segment_size_bytes = config_.segment_size_bytes,
         .max_value_size_bytes = config_.max_value_size_bytes,
-        .commit = config_.commit,
+        .ack_durability = config_.durability,
+        .window = &window_,
         .on_rotate = [this] { RunReaper(); },
     });
     if (!state.has_value()) return std::unexpected(state.error());
@@ -148,21 +154,9 @@ core::Result<void> WalQueue::Initialize() {
       const core::ConsumerId consumer = config_.retention_consumers[c];
       const auto persisted = checkpoint_->Get(consumer, shard);
       if (!persisted.has_value()) continue;
-      // A committed seq names an entry that existed, so it is below head.
-      // Without WAL fsync a power loss can drop entries the checkpoint
-      // named; that policy accepts the loss, so clamp rather than refuse.
-      std::optional<core::SequenceId> effective = persisted;
-      if (*persisted >= (*state)->head_seq() && config_.commit.policy == FsyncPolicy::kNone) {
-        const core::SequenceId head = (*state)->head_seq();
-        ABYSS_LOG_WARN("persisted offset beyond WAL head under fsync_policy=none; clamping",
-                       {"consumer", static_cast<uint64_t>(consumer)},
-                       {"shard", static_cast<int64_t>(shard)},
-                       {"persisted", static_cast<uint64_t>(*persisted)},
-                       {"head_seq", static_cast<uint64_t>(head)});
-        effective = head > 0 ? std::optional<core::SequenceId>{head - 1} : std::nullopt;
-        // Rewrite the checkpoint with the clamped offsets on the next round.
-        commit_generation_.fetch_add(1, std::memory_order_relaxed);
-      } else if (*persisted >= (*state)->head_seq()) {
+      // Commits are gated on the power-durable end, so a persisted offset
+      // names an entry that survives any crash: it is below head.
+      if (*persisted >= (*state)->head_seq()) {
         ABYSS_LOG_CRITICAL("persisted offset exceeds WAL head",
                            {"consumer", static_cast<uint64_t>(consumer)},
                            {"shard", static_cast<int64_t>(shard)},
@@ -171,7 +165,7 @@ core::Result<void> WalQueue::Initialize() {
         return std::unexpected(core::Error{core::ErrorCode::kCorruption,
                                            "persisted offset exceeds WAL head for consumer/shard"});
       }
-      committed_[(c * config_.shard_count) + shard].store(OffsetCheckpoint::Encode(effective),
+      committed_[(c * config_.shard_count) + shard].store(OffsetCheckpoint::Encode(persisted),
                                                           std::memory_order_relaxed);
     }
 
@@ -258,6 +252,24 @@ void WalQueue::SkipFinalOffsetPersistForTesting() {
   persist_on_close_ = false;
 }
 
+void WalQueue::SetFlushHookForTesting(const FlushHook& hook) {
+  for (auto& shard : shards_) shard->SetFlushHookForTesting(hook);
+}
+
+FlushedExtent WalQueue::FlushedExtentForTesting(core::ShardId shard) const {
+  return shards_.at(shard)->FlushedExtentForTesting();
+}
+
+void WalQueue::SkipFinalFlushForTesting() {
+  for (auto& shard : shards_) shard->SkipFinalFlushForTesting();
+}
+
+core::Duration WalQueue::DurabilityLag() const {
+  core::Duration lag = core::Duration::zero();
+  for (const auto& shard : shards_) lag = std::max(lag, shard->DurabilityLag());
+  return lag;
+}
+
 void WalQueue::RunReaper() {
   const std::scoped_lock lock(reaper_mu_);
   if (!reaper_) return;
@@ -312,34 +324,59 @@ core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
   return {};
 }
 
-core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry) {
+core::SteadyTime WalQueue::DefaultAdmitBy() const {
+  return core::SteadyClock::now() + config_.admission_timeout;
+}
+
+core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry,
+                                                  core::SteadyTime admit_by) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->BeginAppend(std::move(entry));
+  return shards_[shard]->BeginAppend(std::move(entry), admit_by);
+}
+
+core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
+    core::ShardId shard, std::span<const core::QueueEntry> entries, core::SteadyTime admit_by) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->BeginAppendBatch(entries, admit_by);
+}
+
+core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry,
+                                            core::SteadyTime admit_by) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->Append(std::move(entry), admit_by);
+}
+
+core::Result<AppendBatchResult> WalQueue::AppendBatch(core::ShardId shard,
+                                                      std::span<const core::QueueEntry> entries,
+                                                      core::SteadyTime admit_by) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
+  return shards_[shard]->AppendBatch(entries, admit_by);
+}
+
+core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry) {
+  return BeginAppend(shard, std::move(entry), DefaultAdmitBy());
 }
 
 core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
     core::ShardId shard, std::span<const core::QueueEntry> entries) {
-  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->BeginAppendBatch(entries);
+  return BeginAppendBatch(shard, entries, DefaultAdmitBy());
 }
 
 core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry) {
-  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->Append(std::move(entry));
+  return Append(shard, std::move(entry), DefaultAdmitBy());
 }
 
 core::Result<AppendBatchResult> WalQueue::AppendBatch(core::ShardId shard,
                                                       std::span<const core::QueueEntry> entries) {
-  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->AppendBatch(entries);
+  return AppendBatch(shard, entries, DefaultAdmitBy());
 }
 
 core::Result<std::vector<core::QueueEntry>> WalQueue::Read(core::ShardId shard,
                                                            core::SequenceId from_seq,
-                                                           size_t max_count,
-                                                           core::Duration timeout) {
+                                                           size_t max_count, core::Duration timeout,
+                                                           core::Durability visible) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->Read(from_seq, max_count, timeout);
+  return shards_[shard]->Read(from_seq, max_count, timeout, visible);
 }
 
 core::Result<void> WalQueue::CommitOffset(core::ConsumerId consumer, core::ShardId shard,
@@ -352,19 +389,15 @@ core::Result<void> WalQueue::CommitOffset(core::ConsumerId consumer, core::Shard
                     "consumer " + std::to_string(consumer) + " does not commit offsets"});
   }
   // Fail-closed durability gate (QUEUE-2/XERR-2/XDUR-1/XDUR-2/HOTC-5): a
-  // committed offset can never advance past the durable WAL tail. Consumers
-  // (cold/resolver) clamp to DurableSeq or AwaitDurable before committing;
-  // this is the backstop. Under fsync_none durable_seq tracks the published
-  // seq so the gate is a correct no-op (Decision 1). HasDurable settles the
-  // seq-0 edge: a 0 watermark with nothing durable must reject seq 0, but
-  // once seq 0 is durable the same commit is accepted.
-  const bool any_durable = shards_[shard]->HasDurable();
-  const core::SequenceId durable = shards_[shard]->DurableSeq();
-  if (!any_durable || seq > durable) {
-    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
-                                       "commit seq " + std::to_string(seq) +
-                                           " exceeds durable WAL tail " + std::to_string(durable) +
-                                           " for shard " + std::to_string(shard)});
+  // committed offset never passes the power-durable log, under either
+  // class. Consumers clamp or await before committing; this is the
+  // backstop.
+  const core::SequenceId durable_end = shards_[shard]->DurableEnd(core::Durability::kPowerLoss);
+  if (seq >= durable_end) {
+    return std::unexpected(core::Error{
+        core::ErrorCode::kFailedPrecondition,
+        "commit seq " + std::to_string(seq) + " is not below the power-durable WAL end " +
+            std::to_string(durable_end) + " for shard " + std::to_string(shard)});
   }
 
   const uint64_t want = OffsetCheckpoint::Encode(seq);
@@ -407,15 +440,16 @@ core::Result<std::optional<core::SequenceId>> WalQueue::PersistedOffset(core::Co
   return checkpoint_->Get(consumer, shard);
 }
 
-core::Result<core::SequenceId> WalQueue::DurableSeq(core::ShardId shard) {
+core::Result<core::SequenceId> WalQueue::DurableEnd(core::ShardId shard,
+                                                    core::Durability durability) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->DurableSeq();
+  return shards_[shard]->DurableEnd(durability);
 }
 
 core::Result<bool> WalQueue::AwaitDurable(core::ShardId shard, core::SequenceId seq,
-                                          core::Duration timeout) {
+                                          core::Durability durability, core::Duration timeout) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return shards_[shard]->AwaitDurable(seq, timeout);
+  return shards_[shard]->AwaitDurable(seq, durability, timeout);
 }
 
 core::Result<core::SequenceId> WalQueue::FirstSeq(core::ShardId shard) {

@@ -25,10 +25,10 @@ Client ──▶ RESP Frontend ──▶ Queue.Append() ──▶ Hot Consumer �
 
 1. The RESP frontend receives a write command, wraps it in a `QueueEntry` (Write or Conditional variant), and appends it to the queue for the appropriate shard.
 2. The write handler registers a promise in the `ConsumerRpc` registry, keyed by the returned sequence ID.
-3. The queue append blocks until the write is durable (for group commit: the batch containing this write has been fsynced).
-4. Concurrently, the hot consumer reads the entry from the queue's in-memory buffer and applies the typed operation to the hot store.
+3. The write handler waits until the append reaches the configured durability class ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
+4. The hot consumer reads the entry once it is durable at that class and applies the typed operation to the hot store. Under `power_loss` it therefore applies only fdatasynced entries, so no reply reflects a write a power loss could drop.
 5. After applying, the hot consumer fulfils the promise with the response value.
-6. The write handler awaits both the queue fsync and the promise fulfillment. When both are complete, it returns the response to the client.
+6. The write handler awaits both the durability future (at the configured class) and the promise fulfillment, within one deadline that also bounds admission to the WAL durability window. When both are complete, it returns the response to the client.
 
 The queue is the sole write path. There is no dual write. The hot consumer ACK is an in-process synchronisation — this is why the hot consumer is always an in-process thread, even when the queue and hot store are external.
 
@@ -173,7 +173,7 @@ Conditional writes are validated the same way but are appended in the client's o
 1. Reads check tiers in order: hot → buffer → cold. No tier is skipped.
 2. Hot hits refresh the eviction timer. Buffer and cold hits do not.
 3. Buffer hits do not promote. Cold hits do promote (via queue append).
-4. A write is never acknowledged until both the queue fsync and hot consumer apply are complete.
+4. A write is never acknowledged until it is durable at the configured durability class (`process_crash`: its entry is in the OS page cache; `power_loss`: the fdatasync covering it has completed) and the hot consumer has applied it.
 5. The promise registry is bounded: entries are removed on fulfillment or timeout. A stalled consumer causes promise timeouts, not unbounded registry growth.
 6. A recent delete is an authoritative hot tombstone: reads of a deleted key (`GET`, `EXISTS`, emptied-collection reads) return `nil`/empty from hot without consulting the lagging overlay or waiting. A read that genuinely misses hot **and** must merge a collection overlay waits — signal-driven, not polling — for the per-shard cold consumer to reach hot's settled seq; if the wait exceeds `engine.buffer_consistency_wait_timeout_ms` the engine returns a Redis error rather than serving a stale overlay. Because entering the wait also wakes the cold consumer out of any idle backoff, that timeout indicates a genuinely wedged consumer rather than a merely sleeping one. Tombstones are reclaimed once cold has drained past the delete and do not count toward `DBSIZE`.
 

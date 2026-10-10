@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Created:** 2026-04-15
 
-> **Superseded in part by [ADP-015](015-write-path-and-durability.md).** The resolver, the `Conditional`/`Resolved` entry pair and block-and-scan are replaced by decide-then-log on the per-shard sequencer, and Consumer RPC is reduced to admin and flush use (Phase 2). This document describes current behaviour until then.
+> **Superseded in part by [ADP-015](015-write-path-and-durability.md).** The resolver, the `Conditional`/`Resolved` entry pair and block-and-scan are replaced by decide-then-log on the per-shard sequencer, and Consumer RPC is reduced to admin and flush use (Phase 2). This document describes current behaviour until then, with one change already made. The resolver now reads only entries durable at the acknowledgement class. Under `power_loss` a conditional therefore waits for its Conditional's flush and then its Resolved's, and §Parallel Execution with Fsync describes the earlier fixed commit window ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
 
 ## Context
 
@@ -195,7 +195,7 @@ consumer_rpc:
 5. On recovery, the resolver replays before cold, which replays before hot.
 6. Consumer RPC IDs are globally unique: writes and conditionals use the queue `SequenceId`; non-write RPCs use a separate monotonic counter with a distinguishing tag.
 7. `Resolved` entries applied by hot and cold take effect at the `Conditional`'s seq position, not the `Resolved`'s seq position. Queue order is preserved.
-8. The write/conditional-write client path is not acknowledged until the queue fsync completes AND the responsible consumer fulfils the Consumer RPC.
+8. The write/conditional-write client path is not acknowledged until the write is durable at the configured durability class AND the responsible consumer fulfils the Consumer RPC.
 9. `Resolved` whose `ref` is less than the latest applied `Flush` seq on a consumer is a no-op for state. Both ends of the Conditional/Resolved pair land on the wiped side of the Flush boundary, so the materialised ops are discarded. The Resolver, on observing a `Flush` mid-replay, emits Skip Resolveds for pre-Flush dangling Conditionals so hot and cold's block-and-scan can advance — those Resolveds carry no materialised ops and are dropped under this invariant on arrival.
 
 ## Trade-offs
