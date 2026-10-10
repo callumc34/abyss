@@ -302,7 +302,8 @@ TEST_F(HotReplayerRecoveryTest, ARestartPastTheEvictionWindowLeavesAKeyToCold) {
 
 // The same log, replayed with the wall clock an hour behind, on time and
 // an hour ahead, leaves hot the same up to the sweep, which alone reads
-// the clock: replay judges no TTL and links keys at their appended_at.
+// the clock: replay judges TTLs only at each frame's appended_at and
+// links keys there.
 // Reads after recovery agree as well, for TTLs well clear of the shift.
 TEST_F(HotReplayerRecoveryTest, ReplayNeverReadsTheClock) {
   Open(Options{.shards = 2});
@@ -310,23 +311,23 @@ TEST_F(HotReplayerRecoveryTest, ReplayNeverReadsTheClock) {
                          core::WallClock::now().time_since_epoch())
                          .count();
   wall_ = [t0] { return AtMs(t0); };
-  const std::string near = std::to_string(t0 + (int64_t{30} * 60 * 1000));
-  const std::string far = std::to_string(t0 + (int64_t{10} * 3600 * 1000));
+  const std::string near_ms = std::to_string(t0 + (int64_t{30} * 60 * 1000));
+  const std::string far_ms = std::to_string(t0 + (int64_t{10} * 3600 * 1000));
   const std::vector<std::vector<std::string>> writes{
-      {"SET", "near", "v", "PXAT", near},
-      {"SET", "far", "v", "PXAT", far},
+      {"SET", "near", "v", "PXAT", near_ms},
+      {"SET", "far", "v", "PXAT", far_ms},
       {"SET", "plain", "v"},
       {"SADD", "set", "a", "b", "c"},
-      {"PEXPIREAT", "set", near},
+      {"PEXPIREAT", "set", near_ms},
       {"SADD", "set2", "x", "y"},
-      {"PEXPIREAT", "set2", far},
+      {"PEXPIREAT", "set2", far_ms},
       {"HSET", "h", "f1", "v1", "f2", "v2"},
       {"HDEL", "h", "f1"},
       {"ZADD", "z", "1", "m", "2", "n"},
       {"ZREM", "z", "m"},
       {"SET", "gone", "v"},
       {"DEL", "gone"},
-      {"SET", "p", "v", "PXAT", far},
+      {"SET", "p", "v", "PXAT", far_ms},
       {"PERSIST", "p"},
   };
   for (const auto& args : writes) ASSERT_NE(Write(args).substr(0, 5), "error") << args[0];

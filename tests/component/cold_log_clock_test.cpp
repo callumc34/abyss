@@ -248,7 +248,9 @@ TEST_P(LogClockRaceTest, AWriteDecidedWhileItsKeyWasLiveLands) {
       case Step::kScan: {
         // k sorts first, so the scanner's samples reach it.
         const uint64_t with_ttl = shard.Scan();
-        if (!flushed || race.write == Write::kSadd) EXPECT_GT(with_ttl, 0U) << "k went unsampled";
+        if (!flushed || race.write == Write::kSadd) {
+          EXPECT_GT(with_ttl, 0U) << "k went unsampled";
+        }
         scanned_after_flush = flushed;
         break;
       }

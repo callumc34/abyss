@@ -126,7 +126,9 @@ uint64_t ReadWord(const std::filesystem::path& path, uint64_t offset) {
   auto file = pfs::Open(path, {.mode = pfs::OpenMode::kRead});
   EXPECT_TRUE(file.has_value());
   std::array<std::byte, 8> bytes{};
-  if (file.has_value()) EXPECT_TRUE(pfs::Pread(*file, bytes.data(), bytes.size(), offset));
+  if (file.has_value()) {
+    EXPECT_TRUE(pfs::Pread(*file, bytes.data(), bytes.size(), offset));
+  }
   return binary::LoadLE<uint64_t>(bytes.data());
 }
 

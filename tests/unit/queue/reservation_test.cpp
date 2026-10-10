@@ -243,7 +243,9 @@ TEST_F(ReservationTest, ThreeShardsShareOneContiguousBatch) {
   uint64_t total = 0;
   for (const std::size_t size : sizes) total += size;
   for (std::size_t i = 0; i < positions.size(); ++i) {
-    if (i > 0) EXPECT_EQ(positions[i], positions[i - 1] + sizes[i - 1]) << "frame " << i;
+    if (i > 0) {
+      EXPECT_EQ(positions[i], positions[i - 1] + sizes[i - 1]) << "frame " << i;
+    }
     const frame::Header header =
         HeaderAt(positions[i]).value_or(frame::Header{.kind = frame::Kind::kPadding});
     ASSERT_EQ(header.kind, frame::Kind::kEntry) << "frame " << i;
@@ -347,9 +349,9 @@ TEST_F(ReservationTest, NoSpareRefusesWithoutConsumingASeq) {
   const abyss::testing::OnExit resume([this] { queue_->PauseSegmentPreparerForTesting(0, false); });
 
   std::vector<core::QueueEntry> large{Write("large", kLarge)};
-  std::vector<core::QueueEntry> small{Write("small")};
+  std::vector<core::QueueEntry> small_part{Write("small")};
   const std::array parts{ShardEntries{.shard = 0, .entries = large},
-                         ShardEntries{.shard = 1, .entries = small}};
+                         ShardEntries{.shard = 1, .entries = small_part}};
   core::Result<void> refusal;
   core::SequenceId accepted = 0;
   for (int i = 0; i < 100; ++i) {

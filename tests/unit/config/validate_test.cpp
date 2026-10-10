@@ -278,8 +278,9 @@ TEST(ConfigValidate, RemovedQueueKeysNameTheirReplacement) {
 }
 
 TEST(ConfigValidate, DurabilityAcceptsBothClasses) {
-  for (const auto [name, durability] : {std::pair{"process_crash", core::Durability::kProcessCrash},
-                                        std::pair{"power_loss", core::Durability::kPowerLoss}}) {
+  for (const auto& [name, durability] :
+       {std::pair{"process_crash", core::Durability::kProcessCrash},
+        std::pair{"power_loss", core::Durability::kPowerLoss}}) {
     auto cfg = Config::ParseFromYaml(std::string("queue:\n  durability: ") + name + "\n");
     ASSERT_TRUE(cfg.has_value()) << name << ": " << cfg.error().message();
     EXPECT_EQ(cfg->queue.durability, durability);
