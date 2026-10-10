@@ -1546,6 +1546,13 @@ TEST_F(WalQueueTest, StalledFlushBackpressuresThenRejectsAppends) {
             1.0);
 
   stall.Release();
+  // The released flush syncs before it frees the window, which can take
+  // longer than the admission timeout on a slow device.
+  const auto drain_by = std::chrono::steady_clock::now() + 10s;
+  while (queue_->UnflushedBytes() >= cfg.durability_window_bytes) {
+    ASSERT_LT(std::chrono::steady_clock::now(), drain_by) << "the released flush never drained";
+    std::this_thread::sleep_for(1ms);
+  }
   auto after = queue_->Append(0, MakeWrite({"SET", "k", value}));
   ASSERT_TRUE(after.has_value()) << after.error().message();
   EXPECT_EQ(after->seq, static_cast<core::SequenceId>(admitted));
