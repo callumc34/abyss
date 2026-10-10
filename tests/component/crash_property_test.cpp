@@ -773,16 +773,16 @@ class CrashTest : public PropertyHarness {
 
 TEST_F(CrashTest, PowerLossRecoversAPrefixThatExplainsEveryReply) {
   std::vector<uint64_t> seeds;
-  if (const auto seed = EnvNumber("ABYSS_CRASH_SEED")) {
-    seeds = {*seed};
+  if (const auto only = EnvNumber("ABYSS_CRASH_SEED")) {
+    seeds = {*only};
   } else if (const auto count = EnvNumber("ABYSS_CRASH_POWER_LOSSES")) {
     // The long tier, opt-in.
-    for (uint64_t seed = 100; seed < 100 + *count; ++seed) seeds.push_back(seed);
+    for (uint64_t s = 100; s < 100 + *count; ++s) seeds.push_back(s);
   } else if (kSanitizerDivisor > 1) {
     // One of each class: seed 4 runs at process_crash.
     seeds = {1, 4};
   } else {
-    for (uint64_t seed = 1; seed <= 12; ++seed) seeds.push_back(seed);
+    for (uint64_t s = 1; s <= 12; ++s) seeds.push_back(s);
   }
   Tally total;
   const auto started = std::chrono::steady_clock::now();

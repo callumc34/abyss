@@ -213,9 +213,16 @@ std::string DescribePairs(const core::Result<core::RespValue>& reply) {
   return out + "}";
 }
 
+// Generous, so a slow runner never times a read out, and distinct, so
+// a test can tell which deadline a read used.
+constexpr std::chrono::milliseconds kPointDeadline = 5s;
+constexpr std::chrono::milliseconds kScanDeadline = 10s;
+
 class ReadPathFixture : public ::testing::Test {
  protected:
-  explicit ReadPathFixture(ReadPathConfig config = {.fill_doorkeeper = false}) {
+  explicit ReadPathFixture(ReadPathConfig config = {.cold_read_deadline = kPointDeadline,
+                                                    .cold_scan_deadline = kScanDeadline,
+                                                    .fill_doorkeeper = false}) {
     config.wall_clock = clock_.WallFn();
     reads_ = std::make_unique<ReadPath>(hot_, loader_, sequencer_, config);
   }
@@ -583,7 +590,7 @@ TEST_F(ReadPathTest, AMissNeverWaitsForColdToDrain) {
   EXPECT_EQ(Describe(Read({"GET", "k"})), "$v");
   const auto elapsed = core::SteadyClock::now() - start;
   EXPECT_EQ(router_.drain_waits.load(), 0);
-  EXPECT_LE(cold_.LastBudget(), ReadPathConfig{}.cold_read_deadline) << "a point read's deadline";
+  EXPECT_LE(cold_.LastBudget(), kPointDeadline) << "a point read's deadline";
   EXPECT_LT(elapsed, 1s);
 }
 
@@ -726,7 +733,7 @@ TEST_F(ReadPathTest, AReadNeverWaitsOnAWritesLoad) {
   ASSERT_TRUE(hot_.LoadPending("k") && hot_.LoadPending("h"));
 
   EXPECT_EQ(Describe(Read({"GET", "k"})), "$v");
-  EXPECT_LE(cold_.LastBudget(), ReadPathConfig{}.cold_read_deadline) << "a point read's deadline";
+  EXPECT_LE(cold_.LastBudget(), kPointDeadline) << "a point read's deadline";
   EXPECT_EQ(DescribePairs(Read({"HGETALL", "h"})), "{f=9,g=2}");
   EXPECT_EQ(fills(), filled);
   EXPECT_EQ(loader_.JoinsForTesting(), 0U);
@@ -799,7 +806,7 @@ TEST_F(ReadPathTest, ACardinalityOfALargeColdSetReadsNoMember) {
   rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
 
   EXPECT_EQ(Describe(card), ":100000") << "within the point read's deadline";
-  EXPECT_LE(cold_.LastBudget(), ReadPathConfig{}.cold_read_deadline);
+  EXPECT_LE(cold_.LastBudget(), kPointDeadline);
   EXPECT_EQ(nexts, 0U) << "SCARD read the set's members";
   EXPECT_EQ(seeks, 0U);
   EXPECT_EQ(cold_.loads.load(), 0);
@@ -872,7 +879,9 @@ TEST_F(ReadPathTest, HmgetReadsItsColdFieldsInOneBatch) {
 
 class ReadPathDoorkeeperTest : public ReadPathFixture {
  protected:
-  ReadPathDoorkeeperTest() : ReadPathFixture(ReadPathConfig{}) {}
+  ReadPathDoorkeeperTest()
+      : ReadPathFixture(ReadPathConfig{.cold_read_deadline = kPointDeadline,
+                                       .cold_scan_deadline = kScanDeadline}) {}
 };
 
 TEST_F(ReadPathDoorkeeperTest, AKeyFillsOnItsSecondMiss) {
