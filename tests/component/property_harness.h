@@ -37,12 +37,12 @@ namespace abyss::engine {
 
 using abyss::testing::RedisModel;
 
-// ASan and TSan slow every step 5 to 15 times; the bounded tiers
-// shrink by this.
-#ifdef ABYSS_PROPERTY_SANITIZED
-inline constexpr int kSanitizerDivisor = 8;
+// ASan, TSan and Windows' per-ack FlushFileBuffers slow every step
+// 5 to 15 times; there the bounded tiers shrink by this.
+#ifdef ABYSS_PROPERTY_REDUCED
+inline constexpr int kReducedDivisor = 8;
 #else
-inline constexpr int kSanitizerDivisor = 1;
+inline constexpr int kReducedDivisor = 1;
 #endif
 
 // A deterministic generator: the seed alone fixes every choice.
