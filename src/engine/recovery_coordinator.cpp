@@ -91,7 +91,7 @@ void RecoveryCoordinator::TransitionPhase(RecoverySnapshot::Phase next) {
 
 core::Result<void> RecoveryCoordinator::RunResolverPhase(const std::atomic<bool>& cancel) {
   const uint32_t shards = resolver_pool_.ShardCount();
-  resolver_starting_ = CaptureAckOffsets(core::kResolverConsumer);
+  resolver_starting_ = CaptureCommittedOffsets(core::kResolverConsumer);
   resolver_target_ = CaptureTargets();
   resolver_target_gauge_.Set(static_cast<double>(SumDelta(resolver_target_, resolver_starting_)));
   TransitionPhase(RecoverySnapshot::Phase::kResolverReplay);
@@ -132,8 +132,9 @@ core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>&
 
   // Recapture targets — Resolver may have emitted Resolveds, extending the
   // tail. Cold and hot must drain through those.
-  cold_starting_ = CaptureAckOffsets(core::kColdConsumer);
-  hot_starting_ = CaptureAckOffsets(core::kHotConsumer);
+  cold_starting_ = CaptureCommittedOffsets(core::kColdConsumer);
+  // Hot commits nothing; it rebuilds from the first retained seq.
+  hot_starting_ = CaptureFirstSeqs();
   cold_target_ = CaptureTargets();
   hot_target_ = cold_target_;
   cold_target_gauge_.Set(static_cast<double>(SumDelta(cold_target_, cold_starting_)));
@@ -192,13 +193,23 @@ std::vector<core::SequenceId> RecoveryCoordinator::CaptureTargets() const {
   return out;
 }
 
-std::vector<core::SequenceId> RecoveryCoordinator::CaptureAckOffsets(
+std::vector<core::SequenceId> RecoveryCoordinator::CaptureCommittedOffsets(
     core::ConsumerId consumer) const {
   const uint32_t shards = hot_pool_.ShardCount();
   std::vector<core::SequenceId> out(shards, 0);
   for (uint32_t s = 0; s < shards; ++s) {
-    auto a = queue_.AckOffset(consumer, s);
-    if (a.has_value()) out[s] = *a;
+    auto committed = queue_.CommittedOffset(consumer, s);
+    if (committed.has_value()) out[s] = committed->value_or(0);
+  }
+  return out;
+}
+
+std::vector<core::SequenceId> RecoveryCoordinator::CaptureFirstSeqs() const {
+  const uint32_t shards = hot_pool_.ShardCount();
+  std::vector<core::SequenceId> out(shards, 0);
+  for (uint32_t s = 0; s < shards; ++s) {
+    auto first = queue_.FirstSeq(s);
+    if (first.has_value()) out[s] = *first;
   }
   return out;
 }

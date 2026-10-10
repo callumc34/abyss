@@ -239,7 +239,7 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
 
   // Per-shard durable frontier recorded by Checkpoint. Guards the recorded
   // value against concurrent ApplyBatch/Checkpoint from a single consumer; the
-  // cold ack is computed from the value Checkpoint returns, not read here.
+  // cold commit is computed from the value Checkpoint returns, not read here.
   std::mutex checkpoint_mu;
   std::unordered_map<core::ShardId, core::SequenceId> checkpointed_seq;
 
@@ -530,7 +530,7 @@ core::Result<void> RocksdbStore::Checkpoint(core::ShardId shard, core::SequenceI
 core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
   // DeleteRange per <type><shard> slice, batched into one synced write. The
   // batch is atomic and fsynced (wo.sync) so a post-wipe crash can't resurrect
-  // pre-Flush data once the cold consumer's ack is durable (#136). DeleteRange
+  // pre-Flush data once the cold consumer's commit is durable (#136). DeleteRange
   // is the sanctioned exception for this bounded admin wipe (not the per-key
   // DEL path); see ADP-010 §Per-shard wipe. 0xFF (format version) is outside
   // every range, so it survives.
@@ -549,7 +549,7 @@ core::Result<void> RocksdbStore::Wipe(core::ShardId shard) {
   }
 
   // DeleteRange + synced write: atomic and fsynced so a post-wipe crash can't
-  // resurrect pre-Flush data once the cold consumer's ack is durable (#136).
+  // resurrect pre-Flush data once the cold consumer's commit is durable (#136).
   return impl_->WriteDurable(&batch, "Wipe: Write");
 }
 
@@ -680,7 +680,7 @@ core::Result<void> RocksdbStore::Impl::ApplyBatch(std::span<const core::ops::Wri
   // Default WriteOptions: sync=false. With manual_wal_flush the WAL stays in
   // RocksDB's buffer; this is a memtable-only write. Durability is established
   // by a later Checkpoint(FlushWAL sync=true), never per batch (A6). The cold
-  // consumer tracks highest_wal_seq and gates its ack on the checkpointed seq,
+  // consumer tracks highest_wal_seq and gates its commit on the checkpointed seq,
   // so it is not recorded here.
   auto status = db->Write(rocksdb::WriteOptions(), wb.GetWriteBatch());
   if (!status.ok()) return std::unexpected(FromStatus(status, "ApplyBatch"));

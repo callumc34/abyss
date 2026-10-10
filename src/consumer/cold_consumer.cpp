@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
@@ -109,31 +112,20 @@ void ColdConsumer::RunLoop() {
   ABYSS_LOG_DEBUG("cold consumer started", {"shard", static_cast<int64_t>(shard_)});
   auto backoff = config_.loop_initial_backoff;
   while (!stop_requested_.load(std::memory_order_acquire)) {
-    const core::SequenceId drained_before = latest_drained_seq_.load(std::memory_order_acquire);
     const size_t drained = Drain();
     if (stop_requested_.load(std::memory_order_acquire)) break;
     const FlushOutcome outcome = Flush();
     CheckBlockAndScanTimeout();
 
-    // A poison clamp pins latest_drained_seq_ below the un-materialised entry,
-    // so the queue re-delivers it every loop. Drain() still returns a non-zero
-    // count (it re-handles the poison), but the drained FRONTIER does not
-    // advance — treat that as no-progress so a poison entry backs off on the
-    // capped exponential instead of busy-spinning (XERR-5 ⋀ C3 backoff).
-    const bool poison_pinned = oldest_poison_seq_.load(std::memory_order_acquire) != kNoPoison;
-    const core::SequenceId drained_after = latest_drained_seq_.load(std::memory_order_acquire);
-    const bool drain_advanced = drained > 0 && (!poison_pinned || drained_after != drained_before);
-
-    // Backoff state machine (XRES-5): re-iterate immediately on progress
-    // (frontier advanced or a flush that wrote), otherwise sleep on a capped
-    // exponential backoff so a poisoned/unwritable/idle shard never busy-spins.
-    const bool made_progress = drain_advanced || outcome == FlushOutcome::kProgress;
-    if (made_progress) {
+    // Backoff state machine (XRES-5): re-iterate immediately on progress (the
+    // cursor moved or a flush wrote), otherwise sleep on a capped exponential
+    // backoff so a poisoned/unwritable/idle shard never busy-spins.
+    if (drained > 0 || outcome == FlushOutcome::kProgress) {
       backoff = config_.loop_initial_backoff;
       continue;
     }
-    if (poison_pinned) {
-      backoff_poisoned_.Increment();
+    if (wipe_pending_) {
+      backoff_backpressure_.Increment();
     } else {
       switch (outcome) {
         case FlushOutcome::kPoisoned:
@@ -165,13 +157,13 @@ void ColdConsumer::RunLoop() {
     }
     backoff = std::min(backoff * 2, config_.loop_max_backoff);
   }
-  // Graceful stop: drain the buffer to durable cold and advance the ack before
-  // returning (G6). Abrupt stop (RequestStop) skips this and relies on the WAL.
+  // Graceful stop: drain the buffer to durable cold and advance the commit
+  // before returning (G6). Abrupt stop (RequestStop) relies on the WAL.
   if (draining_.load(std::memory_order_acquire)) {
     DrainAndFlush();
   }
   ABYSS_LOG_DEBUG("cold consumer stopped", {"shard", static_cast<int64_t>(shard_)},
-                  {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())},
+                  {"last_commit_seq", static_cast<uint64_t>(last_commit_seq_.load())},
                   {"buffer_entries", static_cast<uint64_t>(buffer_.Size())});
 }
 
@@ -205,28 +197,32 @@ void ColdConsumer::DrainAndFlush() {
     }
   }
 
-  // Force a checkpoint so the advanced ack is durable-gated even though the
-  // drain flushed fewer batches than the steady-state cadence (A6 + XDUR-1).
-  // Reuses TryAdvanceAck's existing checkpoint-then-ack gate: it never acks past
-  // the cold checkpoint or the durable WAL tail, so a partial drain is sound.
-  TryAdvanceAck(/*force_checkpoint=*/true);
+  // Force a checkpoint so the advanced commit is durable-gated even though
+  // the drain flushed fewer batches than the steady-state cadence (A6 +
+  // XDUR-1). TryAdvanceCommit never commits past the cold checkpoint or the
+  // durable WAL tail, so a partial drain is sound.
+  TryAdvanceCommit(/*force_checkpoint=*/true);
 
   if (truncated) {
     drain_truncated_.Increment();
     ABYSS_LOG_WARN("cold drain truncated at deadline; remaining buffer replays from WAL",
                    {"shard", static_cast<int64_t>(shard_)},
                    {"buffer_entries", static_cast<uint64_t>(buffer_.Size())},
-                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())});
+                   {"last_commit_seq", static_cast<uint64_t>(last_commit_seq_.load())});
   } else {
     ABYSS_LOG_INFO("cold drain complete", {"shard", static_cast<int64_t>(shard_)},
-                   {"last_ack_seq", static_cast<uint64_t>(last_ack_seq_.load())});
+                   {"last_commit_seq", static_cast<uint64_t>(last_commit_seq_.load())});
   }
 }
 
 size_t ColdConsumer::Drain() { return DrainWithBatch(config_.queue_read_max_count); }
 
 size_t ColdConsumer::DrainWithBatch(size_t max_count) {
-  auto result = queue_.Read(core::kColdConsumer, shard_, max_count, config_.queue_read_timeout);
+  if (auto seeded = SeedCursor(); !seeded.has_value()) {
+    counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+  auto result = queue_.Read(shard_, next_read_seq_, max_count, config_.queue_read_timeout);
   if (!result.has_value()) {
     if (result.error().code() == core::ErrorCode::kUnavailable) {
       // Queue has shut down; signal loop exit rather than spinning on the same error.
@@ -235,55 +231,84 @@ size_t ColdConsumer::DrainWithBatch(size_t max_count) {
       stop_requested_.store(true, std::memory_order_release);
       return 0;
     }
+    if (result.error().code() == core::ErrorCode::kOutOfRange) FailOutOfRange(next_read_seq_);
     counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
+  if (result->empty()) return 0;
+  const size_t consumed = ConsumeBatch(*result);
+  // Wake any read-consistency waiters now that the drained seq has advanced.
+  if (consumed > 0) NotifyDrained();
+  return consumed;
+}
 
-  size_t count = 0;
-  core::SequenceId batch_poison = kNoPoison;
-  for (const auto& entry : *result) {
-    const auto seq = entry.seq;
-    // Queue.Read uses the persisted ack offset as its read floor and
-    // re-delivers everything above it on every call. Cold's low-water-mark
-    // ack policy pins that floor below any unflushed buffer entry, so without
-    // this guard the consumer re-absorbs the same entries each iteration,
-    // advancing `last_modified` and pushing quiet flushes past the eviction
-    // deadline.
-    //
-    // FIXME: queue API conflates ack offset with read offset; long-term fix is
-    // to track read offset separately on the queue side.
-    if (drained_anything_ && seq <= latest_drained_seq_.load(std::memory_order_acquire)) {
-      continue;
+core::Result<void> ColdConsumer::SeedCursor() {
+  if (cursor_seeded_) return {};
+  auto committed = queue_.CommittedOffset(core::kColdConsumer, shard_);
+  if (!committed.has_value()) return std::unexpected(committed.error());
+  committed_ = *committed;
+  if (committed_.has_value()) {
+    next_read_seq_ = *committed_ + 1;
+    if (*committed_ > latest_drained_seq_.load(std::memory_order_acquire)) {
+      latest_drained_seq_.store(*committed_, std::memory_order_release);
     }
-    std::optional<core::SequenceId> poison;
-    std::visit(
-        [this, &entry, &count, &poison](const auto& payload) {
+    last_commit_seq_.store(*committed_, std::memory_order_release);
+  }
+  cursor_seeded_ = true;
+  return {};
+}
+
+size_t ColdConsumer::ConsumeBatch(const std::vector<core::QueueEntry>& batch) {
+  size_t consumed = 0;
+  for (const auto& entry : batch) {
+    // Handlers see the cursor past the entry they are applying.
+    next_read_seq_ = entry.seq + 1;
+    const bool applied = std::visit(
+        [this, &entry](const auto& payload) {
           using T = std::decay_t<decltype(payload)>;
-          if constexpr (std::is_same_v<T, core::entry::Write>) {
-            poison = HandleWrite(entry, payload);
-            ++count;
-          } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-            HandleConditional(entry, payload);
-          } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-            poison = HandleResolved(entry, payload);
-            ++count;
-          } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
-            HandleFlush(entry);
-            ++count;
+          // Only a Flush can fail to apply; the else keeps MSVC from
+          // flagging the shared return as unreachable for it (C4702).
+          if constexpr (std::is_same_v<T, core::entry::Flush>) {
+            return HandleFlush(entry);
+          } else {
+            if constexpr (std::is_same_v<T, core::entry::Write>) {
+              HandleWrite(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
+              HandleConditional(entry, payload);
+            } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
+              HandleResolved(entry, payload);
+            }
+            return true;
           }
         },
         entry.payload);
-    if (poison.has_value()) batch_poison = std::min(batch_poison, *poison);
-    // Pin the drained frontier below the lowest poison seen so far: the
-    // un-materialised entry stays unacked and the WAL retains it (XERR-5).
-    const core::SequenceId frontier =
-        batch_poison == kNoPoison ? seq : std::min(seq, batch_poison - 1);
+    // A failed wipe holds the cursor and frontier below the Flush, so
+    // the commit cannot pass it and the next drain retries it.
+    if (!applied) {
+      next_read_seq_ = entry.seq;
+      break;
+    }
+    // The cursor moves past a poison entry, but the drained frontier stays
+    // pinned below it, so the commit (and WAL retention) does too (XERR-5).
+    const core::SequenceId poison = oldest_poison_seq_.load(std::memory_order_acquire);
+    core::SequenceId frontier = entry.seq;
+    if (poison != kNoPoison) frontier = poison == 0 ? 0 : std::min(entry.seq, poison - 1);
     latest_drained_seq_.store(frontier, std::memory_order_release);
-    drained_anything_ = true;
+    ++consumed;
   }
-  // Wake any read-consistency waiters now that the drained seq has advanced.
-  if (!result->empty()) NotifyDrained();
-  return count;
+  return consumed;
+}
+
+void ColdConsumer::FailOutOfRange(core::SequenceId requested) {
+  const auto first = queue_.FirstSeq(shard_);
+  const std::string first_text = first.has_value() ? std::to_string(*first) : "unknown";
+  ABYSS_LOG_CRITICAL(
+      "cold consumer read below the first retained WAL seq", {"consumer", std::string_view{"cold"}},
+      {"shard", static_cast<int64_t>(shard_)}, {"requested_seq", static_cast<uint64_t>(requested)},
+      {"first_seq", std::string_view{first_text}});
+  core::Fatal("cold consumer on shard " + std::to_string(shard_) + " read seq " +
+              std::to_string(requested) + " below first retained seq " + first_text +
+              ": WAL entries above its persisted offset were reclaimed");
 }
 
 core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
@@ -291,82 +316,54 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
   ABYSS_LOG_INFO("cold replay starting", {"shard", static_cast<int64_t>(shard_)},
                  {"target_seq", static_cast<uint64_t>(target)});
 
-  // Seed from the persisted ack offset; otherwise prior-run acks would leave
-  // latest_drained_seq_ stuck below target and the drain loop would spin.
-  if (auto offset = queue_.AckOffset(core::kColdConsumer, shard_); offset.has_value()) {
-    if (*offset > latest_drained_seq_.load(std::memory_order_acquire)) {
-      latest_drained_seq_.store(*offset, std::memory_order_release);
-    }
-    if (*offset > last_ack_seq_.load(std::memory_order_acquire)) {
-      last_ack_seq_.store(*offset, std::memory_order_release);
-      first_ack_recorded_ = true;
-      drained_anything_ = true;
-    }
-  }
+  if (auto seeded = SeedCursor(); !seeded.has_value()) return std::unexpected(seeded.error());
 
-  // Drain to target. Drive progress on the read result rather than the
-  // post-condition: latest_drained_seq starts at 0 and target may also be 0
-  // (single entry at seq 0), so we cannot use `latest_drained < target` as
-  // the loop guard without skipping that entry.
+  // Caught up once the cursor passes target. An empty read also means caught
+  // up: target was captured below the head, so nothing at the cursor proves
+  // the cursor is past it (and covers the empty queue, where target 0 names
+  // no entry).
+  bool caught_up = false;
+  auto wipe_retry_backoff = config_.loop_initial_backoff;
   while (!cancel.load(std::memory_order_acquire)) {
     if (stop_requested_.load(std::memory_order_acquire)) {
       return std::unexpected(
           core::Error{core::ErrorCode::kUnavailable, "cold replay aborted by stop"});
     }
-    auto read = queue_.Read(core::kColdConsumer, shard_, config_.replay_batch_size,
-                            config_.queue_read_timeout);
+    if (next_read_seq_ > target) {
+      caught_up = true;
+      break;
+    }
+    auto read =
+        queue_.Read(shard_, next_read_seq_, config_.replay_batch_size, config_.queue_read_timeout);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
         return std::unexpected(read.error());
       }
+      if (read.error().code() == core::ErrorCode::kOutOfRange) FailOutOfRange(next_read_seq_);
       counters_.queue_read_failures.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-
     if (read->empty()) {
-      if (latest_drained_seq_.load(std::memory_order_acquire) >= target) break;
+      caught_up = true;
+      break;
+    }
+    if (ConsumeBatch(*read) < read->size()) {
+      // A Flush's wipe failed; retry it on a capped backoff, not a spin.
+      std::unique_lock lock(stop_mu_);
+      stop_cv_.wait_for(lock, wipe_retry_backoff,
+                        [this] { return stop_requested_.load(std::memory_order_acquire); });
+      wipe_retry_backoff = std::min(wipe_retry_backoff * 2, config_.loop_max_backoff);
       continue;
     }
-
-    core::SequenceId batch_poison = kNoPoison;
-    for (const auto& entry : *read) {
-      const auto seq = entry.seq;
-      // Same re-delivery guard as DrainWithBatch; see comment there.
-      if (drained_anything_ && seq <= latest_drained_seq_.load(std::memory_order_acquire)) {
-        continue;
-      }
-      std::optional<core::SequenceId> poison;
-      std::visit(
-          [this, &entry, &poison](const auto& payload) {
-            using T = std::decay_t<decltype(payload)>;
-            if constexpr (std::is_same_v<T, core::entry::Write>) {
-              poison = HandleWrite(entry, payload);
-            } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-              HandleConditional(entry, payload);
-            } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
-              poison = HandleResolved(entry, payload);
-            } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
-              HandleFlush(entry);
-            }
-          },
-          entry.payload);
-      if (poison.has_value()) batch_poison = std::min(batch_poison, *poison);
-      // Same poison clamp as DrainWithBatch: never advance the drained frontier
-      // past an un-materialised entry, so recovery re-reads it next run (XERR-5).
-      const core::SequenceId frontier =
-          batch_poison == kNoPoison ? seq : std::min(seq, batch_poison - 1);
-      latest_drained_seq_.store(frontier, std::memory_order_release);
-      drained_anything_ = true;
-    }
+    wipe_retry_backoff = config_.loop_initial_backoff;
+    NotifyDrained();
 
     if (buffer_.BytesEstimate() >= config_.buffer_high_water_bytes) {
       Flush();
     }
-    if (latest_drained_seq_.load(std::memory_order_acquire) >= target) break;
   }
 
-  if (cancel.load(std::memory_order_acquire) &&
-      latest_drained_seq_.load(std::memory_order_acquire) < target) {
+  if (!caught_up) {
     ABYSS_LOG_WARN("cold replay cancelled before reaching target",
                    {"shard", static_cast<int64_t>(shard_)},
                    {"target_seq", static_cast<uint64_t>(target)});
@@ -390,9 +387,10 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
       return std::unexpected(core::Error{core::ErrorCode::kInternal, "cold replay flush stalled"});
     }
   }
-  // Force a checkpoint so the post-recovery ack is durable-gated even when the
-  // drain flushed fewer batches than the steady-state cadence (XDUR-1).
-  TryAdvanceAck(/*force_checkpoint=*/true);
+  // Force a checkpoint so the post-recovery commit is durable-gated even
+  // when the drain flushed fewer batches than the steady-state cadence
+  // (XDUR-1).
+  TryAdvanceCommit(/*force_checkpoint=*/true);
 
   if (cancel.load(std::memory_order_acquire) && buffer_.Size() > 0) {
     return std::unexpected(
@@ -403,21 +401,20 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
       "cold replay complete", {"shard", static_cast<int64_t>(shard_)},
       {"latest_drained",
        static_cast<uint64_t>(latest_drained_seq_.load(std::memory_order_acquire))},
-      {"last_ack", static_cast<uint64_t>(last_ack_seq_.load(std::memory_order_acquire))});
+      {"last_commit_seq", static_cast<uint64_t>(last_commit_seq_.load(std::memory_order_acquire))});
   return {};
 }
 
-std::optional<core::SequenceId> ColdConsumer::HandleWrite(const core::QueueEntry& entry,
-                                                          const core::entry::Write& write) {
+void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
   if (write.cmd.args.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     RecordPoison(entry.seq, "empty write command");
-    return entry.seq;
+    return;
   }
   const uint64_t wall_now_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
           .count());
-  return AbsorbResolvedOp(write.cmd, entry.seq, wall_now_ms);
+  AbsorbResolvedOp(write.cmd, entry.seq, wall_now_ms);
 }
 
 void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
@@ -428,41 +425,34 @@ void ColdConsumer::HandleConditional(const core::QueueEntry& entry,
       seq, PendingConditional{.seq = seq, .received_at = std::chrono::steady_clock::now()});
 }
 
-std::optional<core::SequenceId> ColdConsumer::HandleResolved(
-    const core::QueueEntry& entry, const core::entry::Resolved& resolved) {
+void ColdConsumer::HandleResolved(const core::QueueEntry& entry,
+                                  const core::entry::Resolved& resolved) {
   {
     const std::scoped_lock lock(pending_mu_);
     pending_conditionals_.erase(resolved.ref);
   }
   // Drop if the Conditional ref lives on the wiped side of a Flush.
   const core::SequenceId flush_high = latest_flush_seq_.load(std::memory_order_acquire);
-  if (flush_high > 0 && resolved.ref < flush_high) return std::nullopt;
-  if (resolved.decision != core::Decision::kApply) return std::nullopt;
+  if (flush_high > 0 && resolved.ref < flush_high) return;
+  if (resolved.decision != core::Decision::kApply) return;
   // Materialised ops use PXAT so wall_now_ms is unused; pass appended_at for symmetry.
   const uint64_t wall_now_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(entry.appended_at.time_since_epoch())
           .count());
-  std::optional<core::SequenceId> poison;
   for (const auto& cmd : resolved.materialised_ops) {
     if (cmd.args.empty()) {
       counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
       RecordPoison(resolved.ref, "empty resolved materialised op");
-      poison = resolved.ref;
       continue;
     }
-    // Non-poison ops in the same Resolved still absorb; only the poison seq is
-    // returned so the ack pins below it.
-    if (auto p = AbsorbResolvedOp(cmd, resolved.ref, wall_now_ms); p.has_value()) {
-      poison = p;
-    }
+    // Non-poison ops in the same Resolved still absorb.
+    AbsorbResolvedOp(cmd, resolved.ref, wall_now_ms);
   }
-  return poison;
 }
 
-void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
+bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
   ABYSS_LOG_DEBUG("cold HandleFlush", {"shard", static_cast<int64_t>(shard_)},
                   {"seq", static_cast<uint64_t>(entry.seq)});
-  buffer_.Clear();
 
   // Erase pre-Flush pending Conditionals so block-and-scan doesn't stall on
   // them. The client-facing RPC is cancelled by the hot consumer.
@@ -477,64 +467,59 @@ void ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
     }
   }
 
+  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
   auto wiped = cold_store_.Wipe(shard_);
   if (!wiped.has_value()) {
     counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_ERROR("cold wipe failed", {"shard", static_cast<int64_t>(shard_)},
+    ABYSS_LOG_ERROR("cold wipe failed; retrying the Flush", {"shard", static_cast<int64_t>(shard_)},
                     {"seq", static_cast<uint64_t>(entry.seq)},
                     {"err", std::string_view{wiped.error().message()}});
-    const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
-    rpc_.Fulfill(rpc_id,
-                 core::RespValue::Error(core::ErrorPrefix::kErr,
-                                        "cold store wipe failed: " + wiped.error().message()));
-    return;
+    // No reply yet: OK follows a successful retry, and the engine's own
+    // timeout reports a FLUSHDB that is still pending.
+    wipe_pending_ = true;
+    return false;
   }
+  wipe_pending_ = false;
+  // Only after the wipe: until then the buffer is the newest pre-Flush
+  // state, and dropping it would let reads fall back to older cold data.
+  buffer_.Clear();
 
   latest_flush_seq_.store(entry.seq, std::memory_order_release);
   flushes_applied_.fetch_add(1, std::memory_order_relaxed);
 
+  // A poison before the Flush pinned data the Wipe just discarded, and a
+  // replay re-wipes it too, so it no longer holds retention.
+  if (const core::SequenceId poison = oldest_poison_seq_.load(std::memory_order_acquire);
+      poison < entry.seq) {
+    oldest_poison_seq_.store(kNoPoison, std::memory_order_release);
+    ABYSS_LOG_INFO("cold flush released the parse-poison retention pin",
+                   {"shard", static_cast<int64_t>(shard_)},
+                   {"poison_seq", static_cast<uint64_t>(poison)},
+                   {"flush_seq", static_cast<uint64_t>(entry.seq)});
+  }
+
   // Wipe is a synced (durable) write, so the Flush seq is on cold's stable
-  // storage on return — advance the checkpoint frontier so the ack clamp lets
-  // it through without a second FlushWAL. Pre-Flush applied-uncheckpointed
-  // data was discarded by the Wipe, so its frontier no longer matters.
+  // storage on return: advance the checkpoint frontier so the commit clamp
+  // lets it through without a second FlushWAL. The Wipe discarded any
+  // pre-Flush uncheckpointed data, so its frontier no longer matters.
   if (entry.seq > last_checkpointed_seq_.load(std::memory_order_acquire)) {
     last_checkpointed_seq_.store(entry.seq, std::memory_order_release);
     highest_applied_uncheckpointed_seq_.store(entry.seq, std::memory_order_release);
   }
-
-  // Persist the Flush ack BEFORE fulfilling the RPC. Without this, FLUSHDB can
-  // return OK to the client while a peer shard's cold ack is still pre-Flush.
   latest_drained_seq_.store(entry.seq, std::memory_order_release);
-  drained_anything_ = true;
   NotifyDrained();
-  // The Flush RPC is fulfilled synchronously here, so the ack must reach
-  // entry.seq in this call. The cold data is durable (Wipe is synced), but the
-  // fail-closed WAL Ack gate also requires entry.seq to be past the durable WAL
-  // tail. The Flush entry was appended just before this; wait briefly for its
-  // group-commit fsync so the ack clamp does not reject it (XDUR-1). A timeout
-  // is non-fatal: TryAdvanceAck clamps and the RPC returns retry below.
-  auto durable = queue_.AwaitDurable(shard_, entry.seq, config_.queue_read_timeout);
-  if (!durable.has_value() || !*durable) {
-    ABYSS_LOG_DEBUG("cold flush awaiting WAL durability", {"shard", static_cast<int64_t>(shard_)},
-                    {"seq", static_cast<uint64_t>(entry.seq)});
-  }
-  TryAdvanceAck();
 
-  const core::RpcId rpc_id = core::MakeFlushRpcId(core::kColdConsumer, shard_, entry.seq);
-  if (last_ack_seq_.load(std::memory_order_acquire) < entry.seq) {
-    ABYSS_LOG_ERROR("cold flush ack persist failed", {"shard", static_cast<int64_t>(shard_)},
-                    {"seq", static_cast<uint64_t>(entry.seq)});
-    rpc_.Fulfill(rpc_id, core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                "cold flush ack persist failed; retry"));
-    return;
-  }
-
+  // OK needs only the synced Wipe: the engine already awaited the Flush
+  // entry's WAL durability, a replayed Flush re-wipes this shard, and
+  // retention follows the persisted offset, so post-Flush writes stay
+  // replayable whether or not this commit lands now (ADP-006).
+  TryAdvanceCommit();
   (void)rpc_.Fulfill(rpc_id, core::RespValue::SimpleString("OK"));
+  return true;
 }
 
-std::optional<core::SequenceId> ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd,
-                                                               core::SequenceId seq,
-                                                               uint64_t wall_now_ms) {
+void ColdConsumer::AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId seq,
+                                    uint64_t wall_now_ms) {
   // A command with no parser at all cannot be materialised by ANY tier in this
   // build, so hot rejected it too and there is no state for cold to be missing:
   // both views agree the entry produced nothing. Poisoning here would pin WAL
@@ -547,27 +532,26 @@ std::optional<core::SequenceId> ColdConsumer::AbsorbResolvedOp(const core::RespC
     ABYSS_LOG_WARN("cold skipping write with no parser in this build",
                    {"shard", static_cast<int64_t>(shard_)}, {"seq", static_cast<uint64_t>(seq)},
                    {"cmd", std::string(cmd.Name())});
-    return std::nullopt;
+    return;
   }
 
   auto op = core::ops::ParseWriteOp(cmd.Name(), cmd, wall_now_ms);
   if (!op.has_value()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     RecordPoison(seq, "ParseWriteOp failed");
-    return seq;
+    return;
   }
 
   auto key = core::ops::PrimaryKey(*op);
   if (key.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     RecordPoison(seq, "empty primary key");
-    return seq;
+    return;
   }
 
   const std::string key_str(key);
   auto eviction = eviction_policy_.Resolve(key_str);
   buffer_.Absorb(key_str, *op, eviction, seq);
-  return std::nullopt;
 }
 
 void ColdConsumer::RecordPoison(core::SequenceId seq, std::string_view reason) {
@@ -632,9 +616,9 @@ ColdConsumer::FlushOutcome ColdConsumer::Flush() {
                              : buffer_.FlushReady(now, config_.max_flush_batch_size);
 
   if (to_flush.empty()) {
-    // Nothing due to flush. Still try to advance the ack: a checkpoint may now
-    // be due, or DurableSeq may have caught up to already-checkpointed data.
-    TryAdvanceAck();
+    // Nothing due to flush. Still try to advance the commit: a checkpoint
+    // may now be due, or DurableSeq may have caught up to checkpointed data.
+    TryAdvanceCommit();
     return FlushOutcome::kIdle;
   }
 
@@ -649,7 +633,7 @@ ColdConsumer::FlushOutcome ColdConsumer::FlushUnscheduled(metrics::FlushReason r
   const auto flush_start = std::chrono::steady_clock::now();
   auto to_flush = buffer_.FlushOldest(/*target_bytes=*/0, config_.max_flush_batch_size);
   if (to_flush.empty()) {
-    TryAdvanceAck();
+    TryAdvanceCommit();
     return FlushOutcome::kIdle;
   }
   // Bypass-the-strategy flushes (replay or graceful drain) are attributed by
@@ -668,8 +652,8 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
   uint64_t quiet_count = 0;
   uint64_t deadline_count = 0;
   // Highest WAL seq this flush materialises (informational; passed to
-  // ApplyBatch). The ack frontier is derived from the live buffer state in
-  // TryAdvanceAck, not from this, so a reinserted failed batch re-pins it.
+  // ApplyBatch). TryAdvanceCommit derives the commit frontier from the live
+  // buffer state, not from this, so a reinserted failed batch re-pins it.
   const core::SequenceId batch_highest_seq = HighestSeqOf(to_flush);
   for (auto& entry : to_flush) {
     if (AbsTtlExpired(entry, wall_now)) {
@@ -731,7 +715,7 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
     }
   }
 
-  TryAdvanceAck();
+  TryAdvanceCommit();
   return outcome;
 }
 
@@ -868,7 +852,8 @@ bool ColdConsumer::MaybeCheckpoint(core::SequenceId up_to, bool force) {
   if (!result.has_value()) {
     checkpoint_total_failure_.Increment();
     counters_.apply_failures.fetch_add(1, std::memory_order_relaxed);
-    ABYSS_LOG_ERROR("cold checkpoint failed; ack pinned", {"shard", static_cast<int64_t>(shard_)},
+    ABYSS_LOG_ERROR("cold checkpoint failed; commit pinned",
+                    {"shard", static_cast<int64_t>(shard_)},
                     {"up_to_wal_seq", static_cast<uint64_t>(up_to)},
                     {"err", std::string_view{result.error().message()}});
     return false;
@@ -886,20 +871,21 @@ bool ColdConsumer::MaybeCheckpoint(core::SequenceId up_to, bool force) {
   return true;
 }
 
-void ColdConsumer::TryAdvanceAck(bool force_checkpoint) {
-  if (!drained_anything_) return;
+void ColdConsumer::TryAdvanceCommit(bool force_checkpoint) {
+  // Nothing consumed and nothing committed: there is no seq to commit.
+  if (next_read_seq_ == 0) return;
 
   const auto oldest_unflushed = buffer_.OldestPendingSeq();
   const auto oldest_pending_cond = OldestPendingConditional();
   const auto poison = oldest_poison_seq_.load(std::memory_order_acquire);
   const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
 
-  // Unsigned seq space has no "before 0" — at seq 0 the ack must stay put,
-  // else Read skips seq 0 (`from_seq = offset + 1`).
+  // Unsigned seq space has no "before 0": a commit below seq 0 cannot be
+  // expressed, so an unfinished entry at seq 0 holds the commit back.
   if (oldest_unflushed.has_value() && *oldest_unflushed == 0) return;
   if (oldest_pending_cond.has_value() && *oldest_pending_cond == 0) return;
-  // A poison at seq 0 pins the whole shard at the floor: nothing can be acked
-  // without passing the un-materialised entry (XERR-5, fail-closed).
+  // A poison at seq 0 pins the whole shard at the floor: nothing can be
+  // committed without passing the un-materialised entry (XERR-5).
   if (poison == 0) return;
 
   // Low-water target: every seq <= this has been flushed to cold's memtable
@@ -912,53 +898,48 @@ void ColdConsumer::TryAdvanceAck(bool force_checkpoint) {
   if (oldest_pending_cond.has_value()) {
     target = std::min(target, *oldest_pending_cond - 1);
   }
-  // Poison clamp (XERR-5): never ack past a structurally-undecodable entry the
-  // cold view could not materialise. Pins WAL retention below the poison for
-  // the whole shard until operator intervention. Composes with C3's
-  // checkpoint-gated ack below — it only lowers the target, which the gate
-  // already tolerates.
+  // Poison clamp (XERR-5): never commit past a structurally-undecodable
+  // entry the cold view could not materialise. Pins WAL retention below the
+  // poison for the whole shard until operator intervention. Composes with
+  // C3's checkpoint-gated commit below: it only lowers the target.
   if (poison != kNoPoison) {
     target = std::min(target, poison - 1);
   }
 
   // (1) Make the cold data for `target` durable (on the bounded cadence, or
-  // unconditionally when forced) so the ack below can advance past it (A6). A
-  // failed checkpoint pins the ack (back-pressure, not silent advance) —
+  // unconditionally when forced) so the commit below can pass it (A6). A
+  // failed checkpoint pins the commit (back-pressure, not silent advance):
   // last_checkpointed_seq_ stays put.
   MaybeCheckpoint(target, force_checkpoint);
 
-  // (2) Cold-durability clamp: the ack can never pass data not yet on cold's
-  // stable storage (the FlushWAL checkpoint frontier) — XDUR-1/COLDC-1.
+  // (2) Cold-durability clamp: the commit can never pass data not yet on
+  // cold's stable storage (the FlushWAL checkpoint frontier), XDUR-1.
   target = std::min(target, last_checkpointed_seq_.load(std::memory_order_acquire));
 
-  // (3) WAL-durability clamp (A1): the ack can never pass the durable WAL tail.
-  // Clamp to DurableSeq so the fail-closed retention-Ack gate never rejects us,
-  // turning `ERR cold flush ack persist failed` into clean back-pressure.
+  // (3) WAL-durability clamp (A1): the commit can never pass the durable
+  // WAL tail. Clamping to DurableSeq means the fail-closed CommitOffset
+  // gate never rejects us, turning WAL lag into clean back-pressure.
   if (auto durable = queue_.DurableSeq(shard_); durable.has_value()) {
     target = std::min(target, *durable);
   } else {
-    counters_.ack_failures.fetch_add(1, std::memory_order_relaxed);
+    counters_.commit_failures.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
-  const auto last_ack = last_ack_seq_.load(std::memory_order_acquire);
-  if (first_ack_recorded_ && target <= last_ack) return;
-  // Before the first ack we cannot tell "target 0 = ack seq 0" from "nothing
-  // durable yet"; if cold has checkpointed nothing, ack nothing this round and
-  // retry next round once a checkpoint lands.
-  if (!first_ack_recorded_ && target == 0 &&
+  if (committed_.has_value() && target <= *committed_) return;
+  // The checkpoint frontier's 0 is ambiguous ("seq 0" or "nothing yet").
+  // With nothing committed, wait for a checkpoint above 0 to commit seq 0.
+  if (!committed_.has_value() && target == 0 &&
       last_checkpointed_seq_.load(std::memory_order_acquire) == 0) {
     return;
   }
 
-  auto ack = queue_.Ack(core::kColdConsumer, shard_, target);
-  if (!ack.has_value()) {
-    counters_.ack_failures.fetch_add(1, std::memory_order_relaxed);
+  if (auto commit = queue_.CommitOffset(core::kColdConsumer, shard_, target); !commit.has_value()) {
+    counters_.commit_failures.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-
-  last_ack_seq_.store(target, std::memory_order_release);
-  first_ack_recorded_ = true;
+  committed_ = target;
+  last_commit_seq_.store(target, std::memory_order_release);
 }
 
 bool ColdConsumer::WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout) {
@@ -1014,7 +995,7 @@ ColdConsumer::Metrics ColdConsumer::Snapshot() const {
   out.parse_poison = parse_poison_.load(std::memory_order_relaxed);
   out.unsupported_ops = unsupported_ops_.load(std::memory_order_relaxed);
   out.queue_read_failures = common.queue_read_failures;
-  out.last_ack_seq = last_ack_seq_.load(std::memory_order_acquire);
+  out.last_commit_seq = last_commit_seq_.load(std::memory_order_acquire);
   out.latest_drained_seq = latest_drained_seq_.load(std::memory_order_acquire);
   out.mode_transitions = mode_transitions_.load(std::memory_order_relaxed);
   return out;

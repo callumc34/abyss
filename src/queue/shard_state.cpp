@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <optional>
@@ -11,7 +12,10 @@
 #include <utility>
 
 #include "abyss/log/log.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
 #include "abyss/platform/fs.h"
+#include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/segment_header.h"
 #include "abyss/queue/wal_entry.h"
 
@@ -136,7 +140,7 @@ core::Result<std::unique_ptr<ShardState>> ShardState::Open(ShardStateConfig conf
     ABYSS_LOG_INFO("shard recovered", {"shard", static_cast<int64_t>(state->config_.shard)},
                    {"segments", static_cast<int64_t>(segment_count)},
                    {"head_seq", static_cast<uint64_t>(state->head_seq())},
-                   {"tail_seq", static_cast<uint64_t>(state->tail_seq())});
+                   {"first_seq", static_cast<uint64_t>(state->first_seq())});
   } else {
     ABYSS_LOG_DEBUG("shard opened", {"shard", static_cast<int64_t>(state->config_.shard)});
   }
@@ -154,7 +158,7 @@ core::Result<void> ShardState::Initialize() {
   if (!existing.has_value()) return std::unexpected(existing.error());
 
   if (existing->empty()) {
-    auto created = CreateInitialSegment();
+    auto created = CreateActiveSegment(0);
     if (!created.has_value()) return std::unexpected(created.error());
   } else {
     auto opened = OpenExistingSegments();
@@ -169,17 +173,17 @@ core::Result<void> ShardState::Initialize() {
   return {};
 }
 
-core::Result<void> ShardState::CreateInitialSegment() {
+core::Result<void> ShardState::CreateActiveSegment(core::SequenceId base_seq) {
   const SegmentHeader header{
       .format_major = kWalFormatMajor,
       .format_minor = kWalFormatMinor,
       .flags = 0,
       .shard_id = config_.shard,
-      .base_seq = 0,
+      .base_seq = base_seq,
       .created_at = core::WallClock::now(),
   };
 
-  const auto path = std::filesystem::path(config_.directory) / FormatSegmentName(0);
+  const auto path = std::filesystem::path(config_.directory) / FormatSegmentName(base_seq);
   auto seg = Segment::Create(path.string(), header, config_.segment_size_bytes);
   if (!seg.has_value()) return std::unexpected(seg.error());
 
@@ -207,7 +211,56 @@ core::Result<void> ShardState::OpenExistingSegments() {
   for (size_t i = 0; i < existing->size(); ++i) {
     const auto path = std::filesystem::path(config_.directory) / FormatSegmentName((*existing)[i]);
     auto opened = Segment::Open(path.string(), config_.segment_size_bytes);
-    if (!opened.has_value()) return std::unexpected(opened.error());
+    if (!opened.has_value()) {
+      // A crash between creating the newest segment and syncing its header
+      // leaves at most a header's bytes and no entries: redo the creation.
+      std::error_code size_ec;
+      const auto size = std::filesystem::file_size(path, size_ec);
+      if (i + 1 == existing->size() && !size_ec && size <= kSegmentHeaderSize) {
+        ABYSS_LOG_WARN("discarding a segment whose creation did not complete",
+                       {"path", path.string()}, {"shard", static_cast<int64_t>(config_.shard)},
+                       {"bytes", static_cast<uint64_t>(size)});
+        std::error_code rm_ec;
+        std::filesystem::remove(path, rm_ec);
+        if (rm_ec) {
+          return std::unexpected(core::Error{core::ErrorCode::kInternal,
+                                             "remove aborted segment: " + rm_ec.message()});
+        }
+        if (auto sync = FsyncShardDir(config_.directory); !sync.has_value()) {
+          return std::unexpected(sync.error());
+        }
+        // Recreate where the previous segment's recovered tail ends. A
+        // power loss can drop that unsynced tail while the stub's name
+        // survives; those seqs were never durable, so reusing them is safe.
+        // With no previous segment, the name is the only record of the base.
+        const core::SequenceId named = (*existing)[i];
+        const core::SequenceId base = expected_base_seq.value_or(named);
+        if (base > named) {
+          return std::unexpected(
+              core::Error{core::ErrorCode::kCorruption,
+                          "aborted segment named below the recovered tail at " + path.string()});
+        }
+        if (base < named) {
+          ABYSS_LOG_WARN("unsynced WAL tail lost before an aborted segment creation",
+                         {"shard", static_cast<int64_t>(config_.shard)},
+                         {"lost_from_seq", static_cast<uint64_t>(base)},
+                         {"lost_to_seq", static_cast<uint64_t>(named)});
+        }
+        if (!sealed_.empty() && sealed_.back()->base_seq() == base) {
+          // The previous segment recovered empty, so it already starts at
+          // base: reopen it as the active segment instead of creating one.
+          const std::string previous = sealed_.back()->path();
+          sealed_.pop_back();
+          auto reopened = Segment::Open(previous, config_.segment_size_bytes);
+          if (!reopened.has_value()) return std::unexpected(reopened.error());
+          active_ = std::make_shared<Segment>(std::move(*reopened));
+        } else if (auto created = CreateActiveSegment(base); !created) {
+          return std::unexpected(created.error());
+        }
+        break;
+      }
+      return std::unexpected(opened.error());
+    }
 
     if (opened->header().shard_id != config_.shard) {
       ABYSS_LOG_CRITICAL("segment shard_id mismatch", {"path", path.string()},
@@ -240,11 +293,30 @@ core::Result<void> ShardState::OpenExistingSegments() {
       const auto sealed_next = segment->next_seq();
       if (sealed_next > sealed_base) {
         // Segment holds at least one committed entry; it is fully fsynced.
-        highest_sealed_seq_ = std::max(highest_sealed_seq_, sealed_next - 1);
-        has_sealed_durable_ = true;
+        highest_synced_seq_ = std::max(highest_synced_seq_, sealed_next - 1);
+        has_synced_durable_ = true;
       }
       sealed_.push_back(std::move(segment));
     }
+  }
+
+  // A crashed process may have left the recovered tail only in the page
+  // cache. Sync it so every recovered entry is durable before replay.
+  // fsync_none skips the sync but still counts the tail, as for appends.
+  const auto active_base = active_->base_seq();
+  const auto active_next = active_->next_seq();
+  if (active_next > active_base) {
+    if (config_.commit.policy != FsyncPolicy::kNone) {
+      const auto start = std::chrono::steady_clock::now();
+      if (auto sync = active_->Fsync(); !sync.has_value()) return std::unexpected(sync.error());
+      const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start);
+      ABYSS_LOG_INFO("recovered WAL tail synced", {"shard", static_cast<int64_t>(config_.shard)},
+                     {"tail_seq", static_cast<uint64_t>(active_next - 1)},
+                     {"duration_us", static_cast<int64_t>(elapsed.count())});
+    }
+    highest_synced_seq_ = std::max(highest_synced_seq_, active_next - 1);
+    has_synced_durable_ = true;
   }
 
   next_seq_ = active_->next_seq();
@@ -302,8 +374,8 @@ core::Result<void> ShardState::Rotate() {
   const auto sealed_entries = active_->entry_count();
   const auto sealed_next = active_->next_seq();
   if (sealed_next > sealed_base) {
-    highest_sealed_seq_ = std::max(highest_sealed_seq_, sealed_next - 1);
-    has_sealed_durable_ = true;
+    highest_synced_seq_ = std::max(highest_synced_seq_, sealed_next - 1);
+    has_synced_durable_ = true;
   }
   sealed_.push_back(std::move(active_));
   committer_.reset();
@@ -458,6 +530,13 @@ core::Result<std::vector<core::QueueEntry>> ShardState::Read(core::SequenceId fr
     if (shutting_down_) {
       return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
     }
+    if (const core::SequenceId first = FirstSeqLocked(); from_seq < first) {
+      metrics::Registry::Instance().Counter(metrics::names::kQueueReadOutOfRangeTotal).Increment();
+      return std::unexpected(core::Error{core::ErrorCode::kOutOfRange,
+                                         "read from seq " + std::to_string(from_seq) +
+                                             " below first retained seq " + std::to_string(first) +
+                                             " on shard " + std::to_string(config_.shard)});
+    }
     if (next_seq_ <= from_seq) {
       return std::vector<core::QueueEntry>{};
     }
@@ -495,8 +574,12 @@ core::SequenceId ShardState::head_seq() const {
   return next_seq_;
 }
 
-core::SequenceId ShardState::tail_seq() const {
+core::SequenceId ShardState::first_seq() const {
   const std::scoped_lock lock(append_mu_);
+  return FirstSeqLocked();
+}
+
+core::SequenceId ShardState::FirstSeqLocked() const {
   if (!sealed_.empty()) {
     return sealed_.front()->base_seq();
   }
@@ -505,7 +588,7 @@ core::SequenceId ShardState::tail_seq() const {
 
 core::SequenceId ShardState::DurableSeq() const {
   const std::scoped_lock lock(append_mu_);
-  core::SequenceId durable = highest_sealed_seq_;
+  core::SequenceId durable = highest_synced_seq_;
   if (committer_) {
     durable = std::max(durable, committer_->DurableSeq());
   }
@@ -514,7 +597,7 @@ core::SequenceId ShardState::DurableSeq() const {
 
 bool ShardState::HasDurable() const {
   const std::scoped_lock lock(append_mu_);
-  if (has_sealed_durable_) return true;
+  if (has_synced_durable_) return true;
   return committer_ && committer_->HasDurable();
 }
 
@@ -525,10 +608,10 @@ bool ShardState::AwaitDurable(core::SequenceId seq, core::Duration timeout) cons
   std::shared_ptr<GroupCommitter> committer;
   {
     const std::scoped_lock lock(append_mu_);
-    // A sealed segment covering seq is already durable. Guard the seq-0 case
-    // with has_sealed_durable_ so a 0 watermark with no sealed data does not
-    // falsely satisfy the wait.
-    if (has_sealed_durable_ && highest_sealed_seq_ >= seq) return true;
+    // A synced segment covering seq is already durable. Guard the seq-0
+    // case with has_synced_durable_ so a 0 watermark with no synced data
+    // does not falsely satisfy the wait.
+    if (has_synced_durable_ && highest_synced_seq_ >= seq) return true;
     committer = committer_;
   }
   if (!committer) return false;

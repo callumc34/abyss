@@ -33,7 +33,7 @@ class ColdStore : public Reader {
   // Applies a compacted batch. `highest_wal_seq` is the highest WAL sequence
   // this batch materialises. The write is a non-durable (memtable-only) write;
   // durability is established only by a later Checkpoint, never per batch. The
-  // cold consumer must not ack past an applied-but-uncheckpointed seq.
+  // cold consumer must not commit past an applied-but-uncheckpointed seq.
   virtual Result<void> ApplyBatch(std::span<const ops::WriteOp> ops,
                                   SequenceId highest_wal_seq) = 0;
 
@@ -41,7 +41,7 @@ class ColdStore : public Reader {
   // records `up_to_wal_seq` as the highest WAL seq now durable for `shard`.
   // Idempotent and cheap when nothing is dirty. After this returns ok every
   // write with WAL seq <= up_to_wal_seq applied via ApplyBatch is on stable
-  // storage. This is the A6 cold-durable frontier the cold ack is gated on.
+  // storage. This is the A6 cold-durable frontier the cold commit is gated on.
   virtual Result<void> Checkpoint(ShardId shard, SequenceId up_to_wal_seq) = 0;
 
   // Drops every key owned by `shard` and no other shard's. Per-shard so a

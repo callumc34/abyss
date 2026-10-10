@@ -94,17 +94,18 @@ class Server {
   std::unique_ptr<core::EvictionPolicy> eviction_policy_;
   // Validated cluster topology. Written/checked before any data subsystem opens.
   std::unique_ptr<core::TopologyManifest> topology_;
+  // Outlives every consumer, so its final offset persist sees all commits.
   std::unique_ptr<queue::WalQueue> queue_;
+  std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
+  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
   std::unique_ptr<hot::ShardedHotStore> hot_store_;
   std::unique_ptr<core::ColdStore> cold_store_;
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   // Declared after cold_pool_ so it is destroyed before it.
   std::unique_ptr<hot::EvictionWorker> hot_eviction_worker_;
-  std::unique_ptr<core::ConsumerRpc> consumer_rpc_;
-  std::unique_ptr<core::ApplyNotifier> apply_notifier_;
-  std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
   std::unique_ptr<consumer::ResolverPool> resolver_pool_;
+  std::unique_ptr<engine::TieringEngine> engine_;
   std::unique_ptr<engine::BoundedThreadShardScheduler> recovery_scheduler_;
   std::unique_ptr<engine::RecoveryCoordinator> recovery_coordinator_;
 

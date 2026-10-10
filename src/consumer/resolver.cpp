@@ -4,14 +4,17 @@
 #include <charconv>
 #include <chrono>
 #include <future>
+#include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
 
-#include "abyss/core/fire_and_forget.h"
+#include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_format.h"
 #include "abyss/core/shard_router.h"
@@ -22,6 +25,10 @@ ABYSS_LOG_COMPONENT("abyss.resolver")
 namespace abyss::consumer {
 
 namespace {
+
+// Same capped doubling as the cold consumer's no-progress loop backoff.
+constexpr std::chrono::milliseconds kAppendRetryInitialBackoff{1};
+constexpr std::chrono::milliseconds kAppendRetryMaxBackoff{1000};
 
 std::string AsciiUpper(std::string_view s) {
   std::string out(s);
@@ -136,7 +143,13 @@ void Resolver::Start() {
   thread_ = std::thread(&Resolver::Run, this);
 }
 
-void Resolver::RequestStop() { stop_requested_.store(true, std::memory_order_release); }
+void Resolver::RequestStop() {
+  {
+    const std::scoped_lock lock(stop_mu_);
+    stop_requested_.store(true, std::memory_order_release);
+  }
+  stop_cv_.notify_all();
+}
 
 void Resolver::Join() {
   if (!running_.load(std::memory_order_acquire)) return;
@@ -162,12 +175,13 @@ Resolver::Snapshot Resolver::GetSnapshot() const {
   s.apply_wait_timeouts = apply_wait_timeouts_.load(std::memory_order_relaxed);
   s.durable_wait_timeouts = durable_wait_timeouts_.load(std::memory_order_relaxed);
   s.append_failures = append_failures_.load(std::memory_order_relaxed);
+  s.commit_failures = commit_failures_.load(std::memory_order_relaxed);
   s.parse_failures = parse_failures_.load(std::memory_order_relaxed);
   s.replayed_resolveds_emitted = replayed_resolveds_emitted_.load(std::memory_order_relaxed);
   s.flushes_observed = flushes_observed_.load(std::memory_order_relaxed);
   s.flush_skip_resolveds_emitted = flush_skip_resolveds_emitted_.load(std::memory_order_relaxed);
   s.latest_drained_seq = latest_drained_seq_.load(std::memory_order_relaxed);
-  s.last_ack_seq = last_ack_seq_.load(std::memory_order_relaxed);
+  s.last_commit_seq = last_commit_seq_.load(std::memory_order_relaxed);
   s.resolver_durable_floor = resolver_durable_floor_.load(std::memory_order_relaxed);
   s.latest_flush_seq = latest_flush_seq_.load(std::memory_order_relaxed);
   s.cache_entries = cache_.Size();
@@ -630,14 +644,15 @@ core::entry::Resolved Resolver::Decide(const core::QueueEntry& entry,
           seq, core::RespValue::Error(core::ErrorPrefix::kErr, "TTL is not a valid integer"));
     }
     uint64_t requested_abs_ttl = 0;
-    if (name == "EXPIRE")
+    if (name == "EXPIRE") {
       requested_abs_ttl = now_ms + (ttl_arg * 1000);
-    else if (name == "PEXPIRE")
+    } else if (name == "PEXPIRE") {
       requested_abs_ttl = now_ms + ttl_arg;
-    else if (name == "EXPIREAT")
+    } else if (name == "EXPIREAT") {
       requested_abs_ttl = ttl_arg * 1000;
-    else
+    } else {
       requested_abs_ttl = ttl_arg;
+    }
 
     // Predicate from the entry, not from re-reading the tokens; see ParseSetArgs.
     const bool nx = core::HasFlag(cond.flags, core::PredicateFlags::kNx);
@@ -811,17 +826,15 @@ void Resolver::HandleFlush(const core::QueueEntry& entry) {
   apply_notifier_.NotifyApplied(config_.shard, entry.seq);
 }
 
-void Resolver::ProcessEntry(const core::QueueEntry& entry) {
-  std::visit(
-      [this, &entry](const auto& payload) {
+bool Resolver::ProcessEntry(const core::QueueEntry& entry) {
+  return std::visit(
+      [this, &entry](const auto& payload) -> bool {
         using T = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<T, core::entry::Write>) {
           ApplyToCache(entry.seq, entry.appended_at, payload.cmd);
         } else if constexpr (std::is_same_v<T, core::entry::Flush>) {
           HandleFlush(entry);
         } else if constexpr (std::is_same_v<T, core::entry::Conditional>) {
-          conditionals_resolved_.fetch_add(1, std::memory_order_relaxed);
-
           // Sorted+deduped stripe acquisition for deadlock-freedom.
           std::vector<std::string_view> keys;
           if (!payload.cmd.args.empty()) {
@@ -867,12 +880,12 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
                               {"shard", static_cast<int64_t>(config_.shard)},
                               {"seq", static_cast<uint64_t>(entry.seq)},
                               {"err", std::string_view{append.error().message()}});
-              (void)rpc_.Fulfill(client_rpc_id,
-                                 core::RespValue::Error(core::ErrorPrefix::kErr,
-                                                        "resolver could not append decision"));
-              return;
+              // No reply: the retry still decides X, so a failure reply
+              // could be false. The engine's timeout reports it pending.
+              return false;
             }
             resolved_seq = append->seq;
+            conditionals_resolved_.fetch_add(1, std::memory_order_relaxed);
 
             if (resolved.decision == core::Decision::kApply) {
               decisions_apply_.fetch_add(1, std::memory_order_relaxed);
@@ -884,7 +897,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
           }
 
           // Track the highest Resolved seq this resolver has emitted; the
-          // steady-state ack clamp (Run) holds the persisted offset behind any
+          // steady-state commit clamp (Run) holds the persisted offset behind any
           // Conditional whose Resolved is not yet durable (XDUR-2). Resolveds
           // are appended monotonically after their Conditionals, so this is the
           // durability target the durable-floor advances behind.
@@ -902,7 +915,7 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
                 core::RespValue::Error(core::ErrorPrefix::kErr,
                                        "conditional write durable wait exceeded timeout; will "
                                        "apply on consumer catch-up"));
-            return;
+            return true;
           }
 
           // Block until hot applies — required for read-your-write. On timeout
@@ -920,72 +933,122 @@ void Resolver::ProcessEntry(const core::QueueEntry& entry) {
         } else if constexpr (std::is_same_v<T, core::entry::Resolved>) {
           UpdateCacheFromResolved(entry.seq, entry.appended_at, payload);
         }
+        return true;
       },
       entry.payload);
+}
+
+core::Result<void> Resolver::SeedCursor() {
+  auto committed = queue_.CommittedOffset(core::kResolverConsumer, config_.shard);
+  if (!committed.has_value()) return std::unexpected(committed.error());
+  committed_ = *committed;
+  next_read_seq_ = committed_.has_value() ? *committed_ + 1 : 0;
+  if (committed_.has_value()) {
+    AdvanceMaxSeq(latest_drained_seq_, *committed_);
+    last_commit_seq_.store(*committed_, std::memory_order_release);
+  }
+  cursor_seeded_ = true;
+  return {};
+}
+
+void Resolver::Commit(core::SequenceId seq) {
+  if (auto commit = queue_.CommitOffset(core::kResolverConsumer, config_.shard, seq);
+      !commit.has_value()) {
+    commit_failures_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  committed_ = seq;
+  last_commit_seq_.store(seq, std::memory_order_release);
+}
+
+void Resolver::FailOutOfRange(core::SequenceId requested) {
+  const auto first = queue_.FirstSeq(config_.shard);
+  const std::string first_text = first.has_value() ? std::to_string(*first) : "unknown";
+  ABYSS_LOG_CRITICAL("resolver read below the first retained WAL seq",
+                     {"consumer", std::string_view{"resolver"}},
+                     {"shard", static_cast<int64_t>(config_.shard)},
+                     {"requested_seq", static_cast<uint64_t>(requested)},
+                     {"first_seq", std::string_view{first_text}});
+  core::Fatal("resolver on shard " + std::to_string(config_.shard) + " read seq " +
+              std::to_string(requested) + " below first retained seq " + first_text +
+              ": WAL entries above its persisted offset were reclaimed");
 }
 
 void Resolver::Run() {
   ABYSS_LOG_DEBUG("resolver started", {"shard", static_cast<int64_t>(config_.shard)});
 
-  // Disambiguates `latest_drained_seq_=0` between "nothing drained" and "drained seq 0".
-  bool drained_anything = false;
-  bool first_ack_recorded = false;
+  while (!cursor_seeded_ && !stop_requested_.load(std::memory_order_acquire)) {
+    if (auto seeded = SeedCursor(); !seeded.has_value()) {
+      ABYSS_LOG_WARN("resolver could not read its committed offset; retrying",
+                     {"shard", static_cast<int64_t>(config_.shard)},
+                     {"err", std::string_view{seeded.error().message()}});
+      std::this_thread::sleep_for(config_.read_timeout);
+    }
+  }
 
+  auto append_backoff = kAppendRetryInitialBackoff;
   while (!stop_requested_.load(std::memory_order_acquire)) {
-    auto read = queue_.Read(core::kResolverConsumer, config_.shard, config_.read_batch_size,
-                            config_.read_timeout);
+    auto read =
+        queue_.Read(config_.shard, next_read_seq_, config_.read_batch_size, config_.read_timeout);
     if (!read.has_value()) {
       if (read.error().code() == core::ErrorCode::kUnavailable) {
         ABYSS_LOG_WARN("resolver stopping: queue unavailable",
                        {"shard", static_cast<int64_t>(config_.shard)});
         return;
       }
+      if (read.error().code() == core::ErrorCode::kOutOfRange) FailOutOfRange(next_read_seq_);
       continue;
     }
+    // The cursor passes an entry only once it is processed, so an entry
+    // is decided at most once whether or not the commit below advances.
+    // A failed Resolved append holds the cursor at X and ends the batch.
+    const core::SequenceId batch_start = next_read_seq_;
+    bool retry = false;
     for (const auto& entry : *read) {
-      ProcessEntry(entry);
+      if (!ProcessEntry(entry)) {
+        retry = true;
+        break;
+      }
+      next_read_seq_ = entry.seq + 1;
       latest_drained_seq_.store(entry.seq, std::memory_order_release);
-      drained_anything = true;
     }
-    if (drained_anything) {
-      // Kafka HW vs LEO: latest_drained_seq_ is read progress (log-end); the
-      // persisted retention ack is the high-watermark and must never outrun the
-      // durable tail. A Conditional at X may have emitted a Resolved at Y > X
-      // that is published+hot-applied+client-OK'd but not yet fsynced; acking
-      // past X then would let a crash lose Y while recovery seeds past X and
-      // never re-decides it (XDUR-2). So we ack a Conditional X only once every
+    if (next_read_seq_ > 0 && (!committed_.has_value() || *committed_ + 1 < next_read_seq_)) {
+      // Kafka HW vs LEO: the cursor is read progress (log-end); the committed
+      // offset is the high-watermark and must never outrun the durable tail. A
+      // Conditional at X may have emitted a Resolved at Y > X that is
+      // published+hot-applied+client-OK'd but not yet fsynced; committing past
+      // X then would let a crash lose Y while recovery resumes past X and never
+      // re-decides it (XDUR-2). So we commit a Conditional X only once every
       // Resolved emitted for Conditionals <= X is durable. The durability
       // target is max(drained, highest emitted Resolved seq): Resolveds sit at
       // seqs > their Conditionals, so confirming the highest emitted Resolved
-      // is durable also satisfies the fail-closed Ack gate (seq <= DurableSeq).
-      const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
+      // is durable also satisfies the fail-closed CommitOffset gate.
+      const auto drained = next_read_seq_ - 1;
       const auto durable_target =
           std::max(drained, highest_emitted_resolved_seq_.load(std::memory_order_acquire));
-      // Confirm (with a bounded wait, never an unbounded block) that every
-      // Resolved emitted for drained Conditionals is durable before advancing
-      // the floor. AwaitDurable returns true iff DurableSeq >= durable_target
-      // within the timeout.
-      auto durable = queue_.AwaitDurable(config_.shard, durable_target, config_.read_timeout);
+      // Bounded wait, never an unbounded block: AwaitDurable returns true iff
+      // DurableSeq >= durable_target within the timeout. Only a fresh batch
+      // waits; an idle pass just checks, so it never delays the next Read.
+      const core::Duration wait = read->empty() ? core::Duration::zero() : config_.read_timeout;
+      auto durable = queue_.AwaitDurable(config_.shard, durable_target, wait);
       const bool floor_advanced = durable.has_value() && *durable;
       if (floor_advanced) {
         AdvanceMaxSeq(resolver_durable_floor_, drained);
       }
-      // The ack never passes the durable floor (clamped behind any Conditional
-      // whose Resolved is not yet durable). Unsigned seq 0 is ambiguous before
-      // the first confirmed floor, so the first ack is gated on a confirmed
-      // durable advance rather than on target > 0.
+      // The commit never passes the durable floor. The floor's 0 is ambiguous
+      // until one advance is confirmed, so the first commit waits for that.
       const auto target = resolver_durable_floor_.load(std::memory_order_acquire);
-      const auto last = last_ack_seq_.load(std::memory_order_acquire);
-      const bool can_first_ack = !first_ack_recorded && floor_advanced;
-      if (can_first_ack || (first_ack_recorded && target > last)) {
-        auto ack = queue_.Ack(core::kResolverConsumer, config_.shard, target);
-        if (ack.has_value()) {
-          last_ack_seq_.store(target, std::memory_order_release);
-          first_ack_recorded = true;
-        }
-      }
+      if (committed_.has_value() ? target > *committed_ : floor_advanced) Commit(target);
     }
     cache_.SweepExpired();
+
+    if (!retry || next_read_seq_ != batch_start) append_backoff = kAppendRetryInitialBackoff;
+    if (retry) {
+      std::unique_lock lock(stop_mu_);
+      stop_cv_.wait_for(lock, append_backoff,
+                        [this] { return stop_requested_.load(std::memory_order_acquire); });
+      append_backoff = std::min(append_backoff * 2, kAppendRetryMaxBackoff);
+    }
   }
 
   ABYSS_LOG_DEBUG("resolver stopped", {"shard", static_cast<int64_t>(config_.shard)});
@@ -1148,13 +1211,29 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
   };
   ReplayGuard guard(replay_mode_);
 
+  // Every scan starts at the committed offset, which never passes a dangling
+  // Conditional, so a retried replay sees the same danglings again.
+  if (auto seeded = SeedCursor(); !seeded.has_value()) return std::unexpected(seeded.error());
+
   std::unordered_map<core::SequenceId, core::QueueEntry> dangling;
-  core::SequenceId highest_seen = 0;
   // Highest seq of any Resolved this replay re-emits (pre-flush Skips and
-  // terminal dangling re-decisions). The terminal Ack barrier (HOTC-5) awaits
+  // terminal dangling re-decisions). Each commit barrier (HOTC-5) awaits
   // this seq's WAL fsync before advancing the recovery offset past the
   // danglings, so cold/hot never replay a non-durable re-emitted Resolved.
   core::SequenceId highest_reemitted_seq = 0;
+  // Highest re-emitted seq a per-scan barrier already confirmed durable.
+  core::SequenceId awaited_reemitted_seq = 0;
+  // On timeout the offset stays put and kUnavailable retries the shard.
+  const auto await_durable = [this](core::SequenceId barrier) -> core::Result<void> {
+    auto durable = queue_.AwaitDurable(config_.shard, barrier, config_.durable_wait_timeout);
+    if (durable.has_value() && *durable) return {};
+    durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+    ABYSS_LOG_WARN("resolver recovery durability barrier timed out; offset left clamped",
+                   {"shard", static_cast<int64_t>(config_.shard)},
+                   {"barrier_seq", static_cast<uint64_t>(barrier)});
+    return std::unexpected(core::Error{core::ErrorCode::kUnavailable,
+                                       "resolver recovery: scanned or re-emitted log not durable"});
+  };
   while (true) {
     if (cancel.load(std::memory_order_acquire)) {
       ABYSS_LOG_WARN("resolver replay cancelled during scan",
@@ -1162,18 +1241,16 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
       return std::unexpected(
           core::Error{core::ErrorCode::kUnavailable, "resolver replay cancelled"});
     }
-    auto batch = queue_.Read(core::kResolverConsumer, config_.shard, config_.replay_batch_size,
-                             core::Duration{50});
-    if (!batch.has_value()) break;
+    auto batch =
+        queue_.Read(config_.shard, next_read_seq_, config_.replay_batch_size, core::Duration{50});
+    if (!batch.has_value()) {
+      if (batch.error().code() == core::ErrorCode::kOutOfRange) FailOutOfRange(next_read_seq_);
+      break;
+    }
     if (batch->empty()) break;
 
-    bool any_new = false;
     for (const auto& entry : *batch) {
-      // Read returns from the persisted ack offset; once the consumer has
-      // dangling Conditionals we cannot ack past, subsequent Reads will
-      // re-emit entries we've already absorbed. Skip them.
-      if (entry.seq <= highest_seen) continue;
-      any_new = true;
+      next_read_seq_ = entry.seq + 1;
       std::visit(
           [&](const auto& payload) {
             using T = std::decay_t<decltype(payload)>;
@@ -1216,33 +1293,34 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
             }
           },
           entry.payload);
-      highest_seen = entry.seq;
       latest_drained_seq_.store(entry.seq, std::memory_order_release);
     }
-    if (!any_new) break;
 
-    // Low-water-mark ack so the next Read advances past entries we've absorbed,
-    // but never past a dangling Conditional. Holding the offset behind any
-    // unresolved Conditional preserves replay correctness across a crash mid-
-    // recovery: a dangling Conditional whose Resolved we have not yet emitted
-    // stays in the queue's unread range and gets re-processed on the next
-    // ReplayForRecovery.
-    core::SequenceId ack_to = highest_seen;
+    // Low-water-mark commit past what this scan absorbed, but never past a
+    // dangling Conditional. Holding the offset behind any unresolved
+    // Conditional preserves replay correctness across a crash mid-recovery: a
+    // dangling Conditional whose Resolved we have not yet emitted is rescanned
+    // by the next ReplayForRecovery.
+    core::SequenceId commit_to = next_read_seq_ - 1;
+    bool committable = true;
     if (!dangling.empty()) {
       core::SequenceId oldest_dangling = std::numeric_limits<core::SequenceId>::max();
       for (const auto& [seq, _] : dangling) {
         oldest_dangling = std::min(oldest_dangling, seq);
       }
-      if (oldest_dangling > 0 && oldest_dangling - 1 < ack_to) {
-        ack_to = oldest_dangling - 1;
-      } else if (oldest_dangling == 0) {
-        ack_to = 0;
-      }
+      committable = oldest_dangling > 0;
+      if (committable) commit_to = std::min(commit_to, oldest_dangling - 1);
     }
-    if (ack_to > last_ack_seq_.load(std::memory_order_acquire)) {
-      core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, ack_to),
-                          append_failures_);
-      last_ack_seq_.store(ack_to, std::memory_order_release);
+    if (committable && (!committed_.has_value() || commit_to > *committed_)) {
+      // A pre-flush Skip erased its dangling: it must be durable before the
+      // commit passes that Conditional.
+      if (highest_reemitted_seq > awaited_reemitted_seq) {
+        if (auto barrier = await_durable(highest_reemitted_seq); !barrier.has_value()) {
+          return barrier;
+        }
+        awaited_reemitted_seq = highest_reemitted_seq;
+      }
+      Commit(commit_to);
     }
   }
 
@@ -1277,43 +1355,22 @@ core::Result<void> Resolver::ReplayForRecovery(const std::atomic<bool>& cancel) 
     replayed_resolveds_emitted_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  // HOTC-5 recovery barrier: the terminal Ack jumps past the danglings (which
-  // sit at seqs <= drained) to latest_drained_seq_. Before advancing the
-  // persisted offset past a dangling whose Resolved was just re-emitted, that
-  // re-emitted Resolved MUST be durable — otherwise a crash after the offset
-  // fsync but before the Resolved fsync loses both the Conditional (now
-  // acked-past, never re-read) and its Resolved, leaving it permanently
-  // unresolved. AwaitDurable on the highest re-emitted seq is the flush barrier
-  // (subsumes a separate FlushDurable). On barrier timeout we leave the ack at
-  // the already-correct per-scan low-water clamp and return kUnavailable so the
-  // RecoveryCoordinator retries the shard — partial progress is durable and
-  // resumable (the replay-cancel contract). The terminal ack is additionally
-  // clamped to DurableSeq so the fail-closed retention-Ack gate never rejects
-  // it (turns disk back-pressure into a clean retry, not a hard error).
-  const auto drained = latest_drained_seq_.load(std::memory_order_acquire);
-  if (drained > 0) {
-    if (highest_reemitted_seq > 0) {
-      auto durable =
-          queue_.AwaitDurable(config_.shard, highest_reemitted_seq, config_.durable_wait_timeout);
-      if (!durable.has_value() || !*durable) {
-        durable_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-        ABYSS_LOG_WARN("resolver recovery durability barrier timed out; offset left clamped",
-                       {"shard", static_cast<int64_t>(config_.shard)},
-                       {"reemitted_seq", static_cast<uint64_t>(highest_reemitted_seq)});
-        return std::unexpected(
-            core::Error{core::ErrorCode::kUnavailable,
-                        "resolver recovery: re-emitted Resolved not yet durable"});
-      }
+  // HOTC-5 recovery barrier: the terminal commit jumps past the danglings
+  // (which sit below the cursor) to the end of the scan. Before the offset
+  // passes a Conditional, its Resolved MUST be durable: otherwise a crash
+  // after the offset persists but before the Resolved fsync loses both the
+  // Conditional (committed past, never re-read) and its Resolved, leaving
+  // it permanently unresolved. So await everything scanned (a retried
+  // replay scans Resolveds an earlier attempt appended) and everything
+  // re-emitted. On timeout the offset stays at the per-scan low-water clamp
+  // and kUnavailable makes the RecoveryCoordinator retry the shard.
+  if (next_read_seq_ > 0) {
+    const core::SequenceId scanned = next_read_seq_ - 1;
+    if (auto barrier = await_durable(std::max(scanned, highest_reemitted_seq));
+        !barrier.has_value()) {
+      return barrier;
     }
-    core::SequenceId ack_to = drained;
-    if (auto durable_seq = queue_.DurableSeq(config_.shard); durable_seq.has_value()) {
-      ack_to = std::min(ack_to, *durable_seq);
-    }
-    if (ack_to > last_ack_seq_.load(std::memory_order_acquire)) {
-      core::FireAndForget(queue_.Ack(core::kResolverConsumer, config_.shard, ack_to),
-                          append_failures_);
-      last_ack_seq_.store(ack_to, std::memory_order_release);
-    }
+    if (!committed_.has_value() || scanned > *committed_) Commit(scanned);
   }
 
   ABYSS_LOG_INFO("resolver replay complete", {"shard", static_cast<int64_t>(config_.shard)},

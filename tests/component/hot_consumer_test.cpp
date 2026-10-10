@@ -46,7 +46,6 @@ class HotConsumerTest : public ::testing::Test {
                    .interval = std::chrono::microseconds{500},
                    .max_bytes = 1024UL * 1024UL},
         .min_retention = 10s,
-        .volatile_consumers = {core::kHotConsumer},
     });
     ASSERT_TRUE(queue_result.has_value()) << queue_result.error().message();
     queue_ = std::move(*queue_result);
@@ -290,7 +289,7 @@ TEST_F(HotConsumerTest, MetricsAdvanceOnApply) {
   EXPECT_EQ(snap.apply_failures, 1U);
   EXPECT_EQ(snap.parse_failures, 0U);
   EXPECT_EQ(snap.queue_read_failures, 0U);
-  EXPECT_EQ(snap.ack_failures, 0U);
+  EXPECT_EQ(snap.commit_failures, 0U);
 }
 
 TEST_F(HotConsumerTest, ConcurrentWritersAlwaysSeeRegisteredEntries) {
@@ -394,7 +393,9 @@ TEST_F(HotConsumerTest, SteadyStateAppliesEvenWhenAppendedAtIsAncient) {
   EXPECT_EQ(consumer_->Snapshot().replay_skipped_eviction, 0U);
 }
 
-TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {
+// Hot commits no offset: a fresh consumer over a blank store rebuilds the
+// whole retained log, not just what arrives after it starts.
+TEST_F(HotConsumerTest, NewConsumerRebuildsFromRetainedLog) {
   StartConsumer();
   auto f1 = AppendWithRpc({"SET", "a", "1"});
   auto f2 = AppendWithRpc({"SET", "b", "2"});
@@ -402,8 +403,6 @@ TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {
   (void)f2.get();
   consumer_->Stop();
 
-  // Simulate restart: blank hot store, same WAL (acks persisted). Prior
-  // entries were acked so they must not replay.
   hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
       .max_memory_bytes = 16UL * 1024UL * 1024UL,
       .shard_count = 1,
@@ -414,10 +413,121 @@ TEST_F(HotConsumerTest, ResumesFromAckOffsetAcrossRestart) {
   EXPECT_EQ(f3.get().AsString(), "OK");
 
   auto r_a = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "a"}});
-  EXPECT_FALSE(r_a.has_value());
+  ASSERT_TRUE(r_a.has_value());
+  EXPECT_EQ(r_a->AsString(), "1");
   auto r_c = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "c"}});
   ASSERT_TRUE(r_c.has_value());
   EXPECT_EQ(r_c->AsString(), "3");
+}
+
+// Run continues from the cursor ReplayUntil left, never re-applying.
+TEST_F(HotConsumerTest, RunResumesWhereReplayStopped) {
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(queue_->Append(0, MakeWrite({"SET", "r" + std::to_string(i), "v"})).has_value());
+  }
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+  ASSERT_EQ(consumer_->Snapshot().applied, 3U);
+
+  consumer_->Start();
+  auto f = AppendWithRpc({"SET", "after", "v"});
+  ASSERT_EQ(f.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(f.get().AsString(), "OK");
+  EXPECT_EQ(consumer_->Snapshot().applied, 4U) << "Run re-applied entries replay already applied";
+}
+
+// A1: with a Conditional pending at X, more than read_batch_size writes
+// land before its Resolved. When the read position followed the clamped
+// commit, every Read re-delivered from X: writes were re-applied and, past
+// one batch, the Resolved was never reached (a shard write outage).
+TEST_F(HotConsumerTest, PendingConditionalNeverRedeliversLaterWrites) {
+  policy_ = core::EvictionPolicy{core::EvictionTTL{86400}};
+  consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_, apply_notifier_,
+                                            HotConsumer::Config{
+                                                .shard = 0,
+                                                .read_batch_size = 256,
+                                                .read_timeout = core::Duration{10},
+                                            },
+                                            policy_);
+  consumer_->Start();
+
+  auto warmup = AppendWithRpc({"SET", "warm", "0"});
+  ASSERT_EQ(warmup.wait_for(5s), std::future_status::ready);
+  const core::SequenceId x = AppendPayload(core::entry::Conditional{
+      .cmd = core::RespCommand{{"SETNX", "cond", "v"}},
+      .flags = core::PredicateFlags::kNx,
+  });
+  ASSERT_GT(x, 0U);
+
+  // Batches keep each append inside one 4 KiB segment.
+  constexpr int kWrites = 300;
+  constexpr int kPerBatch = 50;
+  for (int b = 0; b < kWrites / kPerBatch; ++b) {
+    std::vector<core::QueueEntry> batch;
+    batch.reserve(kPerBatch);
+    for (int i = 0; i < kPerBatch; ++i) {
+      batch.push_back(MakeWrite({"SET", "w" + std::to_string((b * kPerBatch) + i), "v"}));
+    }
+    auto appended = queue_->AppendBatch(0, batch);
+    ASSERT_TRUE(appended.has_value()) << appended.error().message();
+    ASSERT_TRUE(appended->durable.get().has_value());
+  }
+  AppendPayload(core::entry::Resolved{
+      .ref = x,
+      .decision = core::Decision::kSkip,
+      .materialised_ops = {},
+      .return_value = core::RespValue::Integer(0),
+  });
+
+  const core::SequenceId tail = queue_->TailSeq(0).value();
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while ((consumer_->PendingConditionalCount() != 0 || consumer_->HighestSettledSeq() < tail) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+
+  EXPECT_EQ(consumer_->PendingConditionalCount(), 0U) << "the Resolved was never reached";
+  EXPECT_EQ(consumer_->HighestSettledSeq(), tail);
+  EXPECT_EQ(consumer_->Snapshot().applied, static_cast<uint64_t>(kWrites) + 1)
+      << "a write behind the pending Conditional was applied more than once";
+}
+
+// Hot is a volatile view: once the reaper reclaimed the head of the log, a
+// fresh hot consumer rebuilds from the first retained seq, not failing.
+TEST_F(HotConsumerTest, RebuildsFromFirstRetainedSeqAfterReclaim) {
+  queue_.reset();
+  const testing::TempDir dir("hot_consumer_reaped");
+  auto opened = queue::WalQueue::Open(queue::WalConfig{
+      .wal_path = dir.String(),
+      .segment_size_bytes = 256,
+      .shard_count = 1,
+      .commit = {.policy = queue::FsyncPolicy::kGroupCommit,
+                 .interval = std::chrono::microseconds{500},
+                 .max_bytes = 1024UL * 1024UL},
+      .min_retention = 0s,
+      .retention_consumers = {core::kColdConsumer},
+  });
+  ASSERT_TRUE(opened.has_value()) << opened.error().message();
+  queue_ = std::move(*opened);
+
+  for (int i = 0; i < 30; ++i) {
+    auto r = queue_->Append(0, MakeWrite({"SET", "k" + std::to_string(i), "v"}));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(r->durable.get().has_value());
+  }
+  const core::SequenceId tail = queue_->TailSeq(0).value();
+  ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, tail).has_value());
+  ASSERT_TRUE(queue_->FlushOffsets().has_value());
+  const core::SequenceId first = queue_->FirstSeq(0).value();
+  ASSERT_GT(first, 0U) << "the reaper reclaimed nothing";
+
+  BuildConsumerWithClock([] { return core::WallClock::now(); });
+  std::atomic<bool> cancel{false};
+  ASSERT_TRUE(consumer_->ReplayUntil(tail, cancel).has_value());
+  EXPECT_EQ(consumer_->Snapshot().applied, tail - first + 1);
+  consumer_.reset();
+  queue_.reset();
 }
 
 // --- Memory-pressure during/after replay (HOT-1) ---
@@ -466,7 +576,7 @@ TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
 TEST_F(HotConsumerTest, OverBudgetWriteSurfacesOomButStaysDurable) {
   // A live steady-state write that cannot be admitted yields -OOM to the client
   // (MapApplyError path) while the queue entry remains durable and the seq is
-  // acked/NotifyApplied — the consumer does not wedge (invariant 1/2).
+  // settled/NotifyApplied — the consumer does not wedge (invariant 1/2).
   hot::ShardedHotStore probe{hot::ShardedHotStoreConfig{.max_memory_bytes = 0, .shard_count = 1}};
   ASSERT_TRUE(probe.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "small", .value = "v"}}, 0)
                   .has_value());

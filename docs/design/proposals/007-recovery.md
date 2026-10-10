@@ -21,7 +21,7 @@ Pod starts
   │
   ├─ 1. Open the queue (synchronous self-recovery)
   │     The embedded WAL backend scans segments, validates per-entry CRCs,
-  │     truncates a torn tail, and replays consumer-offset files. External
+  │     truncates a torn tail, and reads the offset checkpoint. External
   │     queue backends (Kafka, NATS) typically no-op this phase. Phase
   │     surfaces as kQueueOpen on RecoveryCoordinator::Snapshot for
   │     consistency across backends.
@@ -83,6 +83,12 @@ Pod starts
 - Cold replay benefits from the compaction buffer — recovery write volume to cold is bounded by unique keys, not total queue entries.
 - **`entry::Flush` during replay.** Hot wipes its store and drops any pending Conditionals at seq < Flush.seq. Cold drops its compaction buffer and wipes its own shard's slice of the cold backend (ADP-010 §Per-shard wipe). Because each shard wipes only its slice, a lagging shard's replayed Flush cannot destroy a peer shard's post-Flush data that parallel replay has already flushed. Resolver clears its existence cache and emits Skip Resolveds for pre-Flush dangling Conditionals so hot/cold's block-and-scan can advance past them. While the Resolver is in replay mode and has observed a Flush at seq `F`, dangling Conditionals at seq > F are decided cache-only — the cold tier on disk reflects pre-Flush state until cold replay runs (which is sequenced after resolver replay), so a cache miss is treated as definitively absent rather than falling through to stale cold data.
 
+### Replay start positions
+
+- Cold and the resolver resume one past their persisted committed offset, or at the first retained entry if they have none. Entries after the persisted offset may be replayed a second time, which is idempotent.
+- Hot commits nothing. It rebuilds from the first retained entry.
+- A retention consumer whose start position has already been reclaimed has lost data it never committed. It fails the process instead of skipping ahead.
+
 ### Replay Ordering
 
 Resolver replay completes before cold and hot. Cold and hot run **in parallel**, each per-shard, both bounded by `recovery.replay_parallelism` total scheduler workers.
@@ -96,7 +102,7 @@ Rationale:
 
 `engine::RecoveryCoordinator` owns the phase state machine. It depends on:
 
-- `core::Queue` — to capture per-shard `TailSeq` and `AckOffset`.
+- `core::Queue` — to capture per-shard `TailSeq`, `FirstSeq` and each retention consumer's `CommittedOffset`.
 - `consumer::ResolverPool` / `ColdConsumerPool` / `HotConsumerPool` — to dispatch per-shard `ReplayForRecovery` / `ReplayUntil`.
 - `engine::ShardScheduler` — abstract over per-shard work dispatch. Phase 1 ships `BoundedThreadShardScheduler`; the per-core / Seastar implementation in Phase 4 will plug into the same interface.
 
@@ -105,8 +111,8 @@ Each consumer exposes a synchronous per-shard replay primitive:
 | Consumer | Method | Termination signal |
 |----------|--------|--------------------|
 | `Resolver` | `ReplayForRecovery(cancel)` | Queue read returns empty AND no dangling conditionals remain |
-| `ColdConsumer` | `ReplayUntil(target, cancel)` | Buffer absorbs through `target`, then drains to cold store |
-| `HotConsumer` | `ReplayUntil(target, cancel)` | `HighestSettledSeq() >= target` after the next batch |
+| `ColdConsumer` | `ReplayUntil(target, cancel)` | Its read position passes `target`, then the buffer drains to the cold store |
+| `HotConsumer` | `ReplayUntil(target, cancel)` | Its read position passes `target` |
 
 Cancellation is observable end-to-end: `Server::Run` passes the SIGTERM-backed `std::atomic<bool>` to `RecoveryCoordinator::Run`, which propagates it to every `ReplayUntil` / `ReplayForRecovery`. A cancel mid-replay returns `kUnavailable`, the server logs it, calls `Shutdown`, and exits non-zero. /ready stays 503 until the process restarts.
 

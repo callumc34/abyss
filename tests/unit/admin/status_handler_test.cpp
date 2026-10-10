@@ -78,6 +78,19 @@ TEST(StatusHandlerTest, BodyHasAllTopLevelKeys) {
                                          }));
 }
 
+// Renaming queue.tail_seq and consumers.*.last_ack_seq_* broke the
+// schema: version 2, with no aliases for the old keys.
+TEST(StatusHandlerTest, SchemaVersionTwoHasOnlyRenamedKeys) {
+  FakeProvider provider(MakeMinimalSnapshot());
+  StatusHandler handler(&provider);
+  HttpRequest request;
+  const auto response = handler.Handle(request);
+  EXPECT_TRUE(ContainsAll(response.body, {"\"schema_version\":2", "\"first_seq\"",
+                                          "\"last_commit_seq_min\"", "\"last_commit_seq_max\""}));
+  EXPECT_FALSE(response.body.contains("\"tail_seq\""));
+  EXPECT_FALSE(response.body.contains("last_ack_seq"));
+}
+
 TEST(StatusHandlerTest, IncludesNodeIdAndVersion) {
   FakeProvider provider(MakeMinimalSnapshot());
   StatusHandler handler(&provider);

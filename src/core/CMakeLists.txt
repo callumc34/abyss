@@ -10,6 +10,7 @@ add_library(abyss_core
   slot_shard_map.cpp
   topology_manifest.cpp
   atomic_file.cpp
+  fatal.cpp
 )
 add_library(abyss::core ALIAS abyss_core)
 

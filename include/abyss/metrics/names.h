@@ -346,7 +346,7 @@ inline constexpr HistogramDesc<> kWalFlushBatchEntries{
 
 inline constexpr HistogramDesc<> kQueueOffsetPersistDurationSeconds{
     .name = "abyss_queue_offset_persist_duration_seconds",
-    .help = "Duration of one durable persist of committed offsets.",
+    .help = "Duration of one durable persist of committed offsets (slot write plus fsync).",
     .buckets = buckets::kFlushLatencySeconds,
 };
 
@@ -436,6 +436,18 @@ inline constexpr CounterDesc<> kQueueReaperFailuresTotal{
 inline constexpr GaugeDesc<> kQueueOldestEligibleUnreapedAgeSeconds{
     .name = "abyss_queue_oldest_eligible_unreaped_age_seconds",
     .help = "Age of the oldest reap-eligible segment still on disk; rises when reaping stalls.",
+};
+
+inline constexpr CounterDesc<> kQueueOffsetPersistFailuresTotal{
+    .name = "abyss_queue_offset_persist_failures_total",
+    .help =
+        "Committed-offset checkpoint writes that failed. Persisted offsets stop advancing, so WAL "
+        "retention stalls until a later write succeeds; nothing committed is lost.",
+};
+
+inline constexpr CounterDesc<> kQueueReadOutOfRangeTotal{
+    .name = "abyss_queue_read_out_of_range_total",
+    .help = "Queue reads rejected because the requested seq is below the first retained seq.",
 };
 
 inline constexpr GaugeDesc<> kColdBufferEntries{
@@ -701,7 +713,7 @@ inline constexpr GaugeDesc<> kRecoveryResolverEntriesTarget{
 
 // Conditional-write durability pressure: the resolver could not confirm a
 // self-emitted Resolved's WAL fsync within its budget before fulfilling the
-// client (steady state) or before advancing the recovery ack past a re-decided
+// client (steady state) or before advancing the recovery commit past a re-decided
 // dangling. A non-zero rate means conditional acks are stalling/erroring on
 // durable-layer latency, not silently losing writes (the Resolved stays in the
 // WAL and applies on catch-up). Surfaces XDUR-2 / HOTC-5 (no silent degradation).
@@ -709,7 +721,7 @@ inline constexpr CounterDesc<> kResolverDurableWaitTimeoutsTotal{
     .name = "abyss_resolver_durable_wait_timeouts_total",
     .help =
         "Resolver self-emitted Resolved durability waits that timed out before "
-        "the conditional ack (steady-state) or the recovery ack barrier.",
+        "the conditional ack (steady-state) or the recovery commit barrier.",
 };
 
 inline constexpr GaugeDesc<> kRecoveryColdEntriesReplayed{

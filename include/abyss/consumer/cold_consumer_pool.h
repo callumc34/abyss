@@ -66,7 +66,7 @@ class ColdConsumerPool : public CompactionBufferRouter {
   // tests.
   void Stop();
   // Graceful stop (G6): request a bounded drain-to-durable on every consumer in
-  // parallel (each flushes + checkpoints + advances its ack within
+  // parallel (each flushes + checkpoints + advances its commit within
   // `drain_budget`), THEN joins them. Drains run concurrently so one slow shard
   // does not serialise O(N) budgets. Falls back to the abrupt behaviour per
   // shard on deadline expiry — correctness is preserved by the WAL.

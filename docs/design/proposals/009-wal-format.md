@@ -4,7 +4,7 @@
 **Created:** 2026-04-15
 **Updated:** 2026-04-18
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Reads use a sparse in-memory sequence-to-offset index rebuilt at open (Phase 1a). Segments become preallocated and zero-filled, with a zero body length marking the end of the log, and are organised as one physical log per volume carrying per-shard streams (Phase 1b). Entries carry decided effects (Phase 2). The format below is current until each phase lands.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Reads use a sparse in-memory sequence-to-offset index rebuilt at open, as §Positioned reads describes. Segments become preallocated and zero-filled, with a zero body length marking the end of the log, and are organised as one physical log per volume carrying per-shard streams (Phase 1b). Entries carry decided effects (Phase 2). The format below is current until each phase lands.
 
 ## Context
 
@@ -35,9 +35,10 @@ This ADP applies only to the embedded WAL. External broker profiles (ADP-001 "Ex
 ├── shard-0001/
 │   └── ...
 └── offsets/
-    ├── hot.offsets
-    └── cold.offsets
+    └── offsets.ckpt
 ```
+
+`offsets.ckpt` is the dual-slot checkpoint of every retention consumer's committed offset per shard ([ADP-001](001-queue-wal.md) §Offset persistence). Hot keeps no offset: recovery rebuilds it from each shard's oldest retained entry.
 
 Segment filenames are `{base_seq:020d}.log` — the base sequence ID of the segment, zero-padded to 20 digits. This produces a total order under lexicographic sort that matches sequence order, so directory listings can be iterated without parsing filenames.
 
@@ -173,6 +174,15 @@ Segment rotation:
 - Before each append, the writer checks whether adding the entry would push the segment past `segment_size_bytes` (default 64 MiB).
 - If so, the active segment is closed (no more writes), and a new segment is created with `base_seq = last_seq + 1`.
 - Segments never exceed their configured size.
+
+### Positioned reads
+
+Each segment keeps a sparse in-memory index of (sequence, file offset) points, one roughly every 64 KiB of entries, rebuilt by the scan at open and trimmed to the recovered tail. A read at a given sequence:
+1. finds the nearest preceding index point;
+2. walks forward reading only each frame's length and sequence fields;
+3. fully decodes and checksums only the frames it returns.
+
+Frames below the published write offset were verified at open or written by this process. During the skip, a frame whose sequence is out of order, or a frame that fails its checksum when decoded, is reported as corruption rather than silently ending the read. The index changes nothing on disk.
 
 ### Read semantics and crash recovery
 

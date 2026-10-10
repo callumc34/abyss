@@ -49,9 +49,9 @@ bool SegmentReaper::ShouldDelete(const SegmentRegistry::SealedSegmentInfo& info,
   if (config_.consumers.empty()) return false;
 
   for (auto consumer : config_.consumers) {
-    auto ack = offsets_.Get(consumer, info.shard);
-    if (!ack.has_value()) return false;
-    if (*ack < info.last_seq) return false;
+    auto persisted = offsets_.Get(consumer, info.shard);
+    if (!persisted.has_value()) return false;
+    if (*persisted < info.last_seq) return false;
   }
 
   const auto age = now - info.created_at;
