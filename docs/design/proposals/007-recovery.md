@@ -21,7 +21,7 @@ Pod starts
   │
   ├─ 1. Open the queue (synchronous self-recovery)
   │     The embedded WAL backend scans segments, validates per-entry CRCs,
-  │     truncates a torn tail, and replays consumer-offset files. External
+  │     truncates a torn tail, and reads the offset checkpoint. External
   │     queue backends (Kafka, NATS) typically no-op this phase. Phase
   │     surfaces as kQueueOpen on RecoveryCoordinator::Snapshot for
   │     consistency across backends.

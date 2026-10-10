@@ -35,9 +35,10 @@ This ADP applies only to the embedded WAL. External broker profiles (ADP-001 "Ex
 ├── shard-0001/
 │   └── ...
 └── offsets/
-    ├── hot.offsets
-    └── cold.offsets
+    └── offsets.ckpt
 ```
+
+`offsets.ckpt` is the dual-slot checkpoint of every retention consumer's committed offset per shard ([ADP-001](001-queue-wal.md) §Offset persistence). Hot keeps no offset: recovery rebuilds it from each shard's oldest retained entry.
 
 Segment filenames are `{base_seq:020d}.log` — the base sequence ID of the segment, zero-padded to 20 digits. This produces a total order under lexicographic sort that matches sequence order, so directory listings can be iterated without parsing filenames.
 
