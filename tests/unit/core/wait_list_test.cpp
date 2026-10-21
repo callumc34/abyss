@@ -220,6 +220,33 @@ TEST(WaitListTest, WokenWaitersThatReBlockKeepTheirPlaces) {
   EXPECT_EQ(log, (std::vector<size_t>{0, 1, 2}));
 }
 
+// A woken waiter that re-registers and passes hands off inside
+// Register; one that has not been woken does not.
+TEST(WaitListTest, AWokenWaiterThatPassesOnRegisterWakesTheNext) {
+  WaitList list;
+  std::vector<size_t> log;
+  std::deque<LoggingWaiter> waiters;
+  const auto never = [] { return false; };
+  const auto room = [] { return true; };
+  for (size_t id = 0; id < 3; ++id) {
+    waiters.emplace_back(id, &log);
+    ASSERT_FALSE(list.Register(waiters.back(), never).has_value());
+  }
+  list.HandOff();
+  ASSERT_EQ(log, (std::vector<size_t>{0}));
+
+  auto passed = list.Register(waiters.at(0), room);
+  ASSERT_TRUE(passed.has_value());
+  EXPECT_TRUE(passed->has_value());
+  EXPECT_EQ(log, (std::vector<size_t>{0, 1}));
+
+  LoggingWaiter fresh(3, &log);
+  ASSERT_TRUE(list.Register(fresh, room).has_value());
+  EXPECT_EQ(log, (std::vector<size_t>{0, 1}));
+  EXPECT_EQ(list.size(), 1U);
+  list.FailAll(Stopped());
+}
+
 // A woken waiter that gives up passes its ok wake on, and its next
 // wait queues afresh.
 TEST(WaitListTest, FinishAfterAnOkWakeWakesTheNextWaiter) {

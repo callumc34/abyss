@@ -85,12 +85,9 @@ void WaitList::FailAll(const Error& error) {
 Result<void> WaitList::Await(const std::function<bool()>& condition, Duration timeout) {
   BlockingWaiter waiter;
   const SteadyTime deadline = SteadyClock::now() + timeout;
-  bool woken = false;
   while (true) {
-    if (auto ready = Register(waiter, condition)) {
-      if (woken && ready->has_value()) HandOff();
-      return *std::move(ready);
-    }
+    // A woken pass hands off inside Register.
+    if (auto ready = Register(waiter, condition)) return *std::move(ready);
     // A lost Cancel means a wake is on its way, and the waiter must
     // outlive it.
     if (!waiter.WaitUntil(deadline) && Cancel(waiter)) {
@@ -100,7 +97,6 @@ Result<void> WaitList::Await(const std::function<bool()>& condition, Duration ti
       Finish(waiter);
       return wake;
     }
-    woken = true;
   }
 }
 
