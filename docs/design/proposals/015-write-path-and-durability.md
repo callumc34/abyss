@@ -5,7 +5,7 @@
 **Supersedes:** ADP-001 §Group Commit and §Offset persistence, ADP-011 in full (the resolver, the `Conditional`/`Resolved` entry pair, block-and-scan and the consumer RPC)
 **Amends:** ADP-001 §Interface, ADP-002 §Hot Consumer (now §Applying Writes and §Residency) and §Eviction, ADP-004 §Consumer Thread Loop, ADP-005 §TCP server implementation and §Write Acknowledgement, ADP-006 §Write Path, §Read Path, §Cold Hit Promotion (now §Cache Fill) and §Broadcast Write Path, ADP-007 §Recovery Process, ADP-008 §Resharding, ADP-009 §Read semantics, ADP-013 §Three substrates, `requirements.md` §Design Principles, §Performance Targets, §Durability Guarantees, §Concurrency Model and §Consumer Coordination
 
-Delivery is phased (§Delivery) and tracked by epic #172. Each amended document keeps describing current behaviour, under a banner pointing here, until the phase that changes that behaviour lands and rewrites the section. Phases 0 and 1 have landed, and Phase 2 through its fifth stage: the sections below describe them as current behaviour, and the documents they amend have been rewritten to match. Phase 2 completes with stage 6, which adds the three-way property test (§Delivery). Asynchronous request execution (Phase 3, #161) and the later rows are still to come, and their sections say so.
+Delivery is phased (§Delivery) and tracked by epic #172. Each amended document keeps describing current behaviour, under a banner pointing here, until the phase that changes that behaviour lands and rewrites the section. Phases 0, 1 and 2 have landed: the sections below describe them as current behaviour, and the documents they amend have been rewritten to match. Phase 3 is next. Phase 2 completes with stage 6, which adds the three-way property test (§Delivery). Asynchronous request execution (Phase 3, #161) and the later rows are still to come, and their sections say so.
 
 ## Context
 
@@ -256,7 +256,7 @@ This section is still to come (#161). Until it lands, the calling reactor thread
 | ADP-006 | Sequenced write path, read fence, cache fill in place of promotion, no read-consistency wait. The Flush acknowledgement no longer requires a persisted consumer offset: the Flush entry's own durability suffices, Wipe stays synced, and a replayed Flush is idempotent per shard. | 1a, 2 |
 | ADP-007 | Recovery syncs the log before replay. Hot and cold replay through one demultiplexing scan per log. Resolver phase removed; the hot replayer's residency rule and sweep. | 1b, 1c, 2 |
 | ADP-008 | A broker-backed log requires producer fencing so an outgoing shard owner cannot interleave effects during resharding. | 2 |
-| ADP-009 | Sparse in-memory index. Format 2: a physical log per volume with per-shard streams, recycled segments with per-frame generations, commit words, batch closure by position. Effect frames. | 1a, 1c, 2 |
+| ADP-009 | Sparse in-memory index. Format 2: a physical log per volume with per-shard streams, recycled segments with per-frame generations, commit words, batch closure by position. Format 3: decided effect frames, `Conditional` and `Resolved` retired. | 1a, 1c, 2 |
 | ADP-011 | Superseded in full: the resolver, the entry pair, block-and-scan and the consumer RPC are removed. | 2 |
 | ADP-013 | Target-to-substrate map, write probe, comparative drivers and matrix, load-driver pipelining. | 0 |
 

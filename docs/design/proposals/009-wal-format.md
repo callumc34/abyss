@@ -4,7 +4,7 @@
 **Created:** 2026-04-15
 **Updated:** 2026-10-09
 
-> **Format 2.** This revision replaces format 1's per-shard segment files with the physical log of [ADP-015](015-write-path-and-durability.md) §Log durability pipeline: one log per data volume carrying every shard's stream, in fixed-size, recycled, memory-mapped segments. A data directory in the format 1 layout refuses to start; there is no migration, because no format 1 WAL exists outside development. Entries carry decided effects (ADP-015 §Sequenced write path): format 2 retired the `Conditional` and `Resolved` entry types before it shipped.
+> **Format 3.** Format 2 replaced format 1's per-shard segment files with the physical log of [ADP-015](015-write-path-and-durability.md) §Log durability pipeline: one log per data volume carrying every shard's stream, in fixed-size, recycled, memory-mapped segments. Format 3 keeps that layout and changes what an entry means: entries carry decided effects (ADP-015 §Sequenced write path), the `Conditional` and `Resolved` entry types are retired, and `kReplacesState` (below) marks an effect that alone determines its key. A format 2 frame read as format 3 would replay wrongly, so the major changed. A data directory in the format 1 layout, or holding any file of format 2, refuses to start, naming the file and both majors; there is no migration, because neither exists outside development.
 
 ## Context
 
@@ -55,7 +55,7 @@ One 4 KiB block, so frames start page-aligned. Little-endian throughout.
 | Field | Type | Description |
 |---|---|---|
 | `magic` | 4 bytes | Identifies an Abyss WAL segment |
-| `format_major` | u8 | 2 |
+| `format_major` | u8 | 3 |
 | `format_minor` | u8 | 0 |
 | reserved | u16 | Zero |
 | `log_id` | u32 | The log this segment belongs to |
@@ -102,7 +102,7 @@ The fixed overhead is 44 bytes plus padding, against format 1's 37. It buys lock
 
 The log carries only decided effects ("decide-then-log", ADP-015 §Sequenced write path). The sequencer decides a conditional command (`SET NX`, `ZADD GT`, `RENAMENX` and so on) against the key's complete state in hot, and logs what it decided as plain `Write` frames, or nothing when the decision has no effect. Replay applies effects and re-decides nothing, so no entry type carries a predicate or a decision.
 
-Types `1` and `2` belonged to `Conditional` (a command with a predicate) and `Resolved` (the decision for a prior `Conditional`, [ADP-011](011-conditional-writes-and-consumer-rpc.md)). They were retired before format 2 shipped, so no format 2 log holds them, and the bytes stay reserved so they are never reused with another meaning. A frame whose type is not `0` or `3`, or whose flags hold an unknown bit, is corruption under a valid CRC: a positioned read that meets one fail-stops, naming the shard and seq, and the recovery scan fails. It is never skipped as a poison entry.
+Types `1` and `2` belonged to `Conditional` (a command with a predicate) and `Resolved` (the decision for a prior `Conditional`, [ADP-011](011-conditional-writes-and-consumer-rpc.md)). They are retired in format 3, so no format 3 log holds them (a format 2 log refuses by its major, before any entry is read), and the bytes stay reserved so they are never reused with another meaning. A frame whose type is not `0` or `3`, or whose flags hold an unknown bit, is corruption under a valid CRC: a positioned read that meets one fail-stops, naming the shard and seq, and the recovery scan fails. It is never skipped as a poison entry.
 
 **`kReplacesState`.** The sequencer sets this flag on a `Write` whose effect alone determines its key's whole state:
 - `SET` and `DEL`;
