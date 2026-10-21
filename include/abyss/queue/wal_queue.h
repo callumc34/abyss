@@ -22,13 +22,13 @@
 #include "abyss/metrics/metrics.h"
 #include "abyss/queue/durability_window.h"
 #include "abyss/queue/group_commit.h"
-#include "abyss/queue/offset_checkpoint.h"
 #include "abyss/queue/reservation.h"
 #include "abyss/queue/segment_reaper.h"
 #include "abyss/queue/segment_registry.h"
 
 namespace abyss::queue {
 
+class OffsetCheckpoint;
 class ShardStream;
 struct LogUnit;
 

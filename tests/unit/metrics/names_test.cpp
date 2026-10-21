@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <set>
 #include <string_view>
 
@@ -17,6 +18,7 @@ TEST(Names, LabelKeyStringSpellings) {
   EXPECT_EQ(ToStringView(LabelKey::kOp), "op");
   EXPECT_EQ(ToStringView(LabelKey::kOutcome), "outcome");
   EXPECT_EQ(ToStringView(LabelKey::kPass), "pass");
+  EXPECT_EQ(ToStringView(LabelKey::kPhase), "phase");
 }
 
 TEST(Names, TierEnumSpellings) {
@@ -63,6 +65,20 @@ TEST(Names, MaintenancePassSpellings) {
   static_assert(LabelKeyOf<MaintenancePass>::value == LabelKey::kPass);
 }
 
+TEST(Names, WritePhaseSpellings) {
+  EXPECT_EQ(ToStringView(WritePhase::kAdmit), "admit");
+  EXPECT_EQ(ToStringView(WritePhase::kLockWait), "lock_wait");
+  EXPECT_EQ(ToStringView(WritePhase::kDecide), "decide");
+  EXPECT_EQ(ToStringView(WritePhase::kLoad), "load");
+  EXPECT_EQ(ToStringView(WritePhase::kEntries), "entries");
+  EXPECT_EQ(ToStringView(WritePhase::kReserve), "reserve");
+  EXPECT_EQ(ToStringView(WritePhase::kApply), "apply");
+  EXPECT_EQ(ToStringView(WritePhase::kComplete), "complete");
+  EXPECT_EQ(ToStringView(WritePhase::kDurable), "durable");
+  static_assert(static_cast<size_t>(WritePhase::kDurable) + 1 == kWritePhaseCount);
+  static_assert(LabelKeyOf<WritePhase>::value == LabelKey::kPhase);
+}
+
 TEST(Names, LabelKeyOfMapping) {
   static_assert(LabelKeyOf<Tier>::value == LabelKey::kTier);
   static_assert(LabelKeyOf<FlushStatus>::value == LabelKey::kStatus);
@@ -73,9 +89,6 @@ TEST(Names, LabelKeyOfMapping) {
 
 TEST(Names, CatalogueNamesAreUnique) {
   constexpr std::array kAllNames = {
-      names::kHotOpDurationSeconds.name,
-      names::kColdOpDurationSeconds.name,
-      names::kBufferOpDurationSeconds.name,
       names::kRespRequestDurationSeconds.name,
       names::kWalFlushDurationSeconds.name,
       names::kWalFlushBatchEntries.name,
@@ -95,9 +108,9 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kWalScanBytesTotal.name,
       names::kQueueOffsetPersistDurationSeconds.name,
       names::kColdFlushBatchSize.name,
+      names::kColdDurabilityWaitsTotal.name,
       names::kColdConsumerLagEntries.name,
       names::kColdBufferOldestEntryAgeSeconds.name,
-      names::kColdConsumerSeq.name,
       names::kHotMemoryBytes.name,
       names::kHotKeys.name,
       names::kHotStubEntries.name,
@@ -128,6 +141,7 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kSequencerLockedCopyBytesTotal.name,
       names::kSequencerRedecidesTotal.name,
       names::kSequencerLockHoldSeconds.name,
+      names::kSequencerPhaseSeconds.name,
       names::kQueueOffsetPersistFailuresTotal.name,
       names::kQueueReadOutOfRangeTotal.name,
       names::kRecoveryPhase.name,
@@ -136,7 +150,6 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kRecoveryHotEntriesReplayed.name,
       names::kRecoveryHotEntriesTarget.name,
       names::kRecoveryHotSkippedFramesTotal.name,
-      names::kRecoveryColdDrainRequestsTotal.name,
       names::kRecoveryDurationSeconds.name,
   };
   std::set<std::string_view> seen;

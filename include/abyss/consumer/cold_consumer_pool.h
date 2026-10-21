@@ -32,7 +32,6 @@ class ColdConsumerPool : public CompactionBufferRouter {
     uint64_t entries_expired_abs_ttl = 0;
     uint64_t apply_failures = 0;
     uint64_t retry_attempts = 0;
-    uint64_t durability_waits_timed_out = 0;
     uint64_t parse_failures = 0;
     uint32_t shards_in_aggressive_mode = 0;
     // Max over shards, not a sum: the worst-lagging shard is the one racing the

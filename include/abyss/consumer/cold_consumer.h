@@ -49,7 +49,7 @@ class ColdConsumer {
     std::chrono::milliseconds loop_initial_backoff{1};
     std::chrono::milliseconds loop_max_backoff{1000};
     // How long a replay fed through ApplyReplayBatch retries one failing
-    // wipe, or FlushThrough a flush, before it gives up.
+    // wipe before it gives up.
     std::chrono::milliseconds drain_grace{15000};
     std::optional<uint64_t> rng_seed = std::nullopt;
   };
@@ -141,11 +141,6 @@ class ColdConsumer {
   core::Result<void> ApplyReplayBatch(std::span<const core::QueueEntry> batch,
                                       const std::atomic<bool>& cancel);
   core::Result<void> FinishReplay(core::SequenceId end, const std::atomic<bool>& cancel);
-  // Flushes the buffer until it holds nothing at or below `through`,
-  // as replay asks when hot needs room; on replay's thread. Each batch
-  // waits for its seqs to be power-durable. Fails if it makes no
-  // progress for drain_grace or a batch is refused.
-  core::Result<void> FlushThrough(core::SequenceId through);
 
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
@@ -212,7 +207,9 @@ class ColdConsumer {
 
   // `appended_at_ms` is the entry's appended_at, so hot and cold
   // materialise identical absolute TTLs from PX/EX args.
-  void AbsorbOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t appended_at_ms);
+  // `replaces_state` is its kReplacesState flag.
+  void AbsorbOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t appended_at_ms,
+                bool replaces_state);
 
   // True once `seq` is power-durable, waiting up to queue_read_timeout.
   bool AwaitPowerDurable(core::SequenceId seq);
@@ -349,6 +346,8 @@ class ColdConsumer {
   metrics::CounterHandle drain_truncated_;
   metrics::CounterHandle flush_total_success_;
   metrics::CounterHandle flush_total_failure_;
+  metrics::HistogramHandle flush_batch_size_;
+  metrics::CounterHandle durability_waits_total_;
   metrics::CounterHandle checkpoint_total_success_;
   metrics::CounterHandle checkpoint_total_failure_;
   metrics::HistogramHandle checkpoint_duration_;

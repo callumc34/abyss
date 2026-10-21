@@ -11,12 +11,14 @@ namespace {
 
 TEST(FatalTest, RunsTheInstalledHandlerWithTheReason) {
   const testing::ScopedFatalCapture capture;
+  std::string reason;
+  // Nothing follows Fatal in the try: it does not return.
   try {
     Fatal("invariant broken: shard 3");
-    FAIL() << "Fatal returned";
   } catch (const testing::FatalCalled& fatal) {
-    EXPECT_EQ(fatal.reason, "invariant broken: shard 3");
+    reason = fatal.reason;
   }
+  EXPECT_EQ(reason, "invariant broken: shard 3");
 }
 
 #ifndef NDEBUG

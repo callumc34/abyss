@@ -83,10 +83,6 @@ class RecoveryCoordinator {
   core::Result<void> ScanColdHot(const std::vector<core::SequenceId>& first,
                                  const std::vector<core::SequenceId>& end,
                                  const std::atomic<bool>& cancel);
-  // Makes `shard`'s cold flush through `through`, capped at its power
-  // end, for the replayer.
-  core::Result<void> DrainCold(core::ShardId shard, core::SequenceId through);
-
   // Updates phase_ atomic and the phase gauge in lockstep.
   void TransitionPhase(RecoverySnapshot::Phase next);
 

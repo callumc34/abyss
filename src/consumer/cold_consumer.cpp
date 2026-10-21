@@ -57,6 +57,8 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
       reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kSuccess);
   flush_total_failure_ =
       reg.Counter(metrics::names::kColdFlushTotal, metrics::FlushStatus::kFailure);
+  flush_batch_size_ = reg.Histogram(metrics::names::kColdFlushBatchSize);
+  durability_waits_total_ = reg.Counter(metrics::names::kColdDurabilityWaitsTotal);
   checkpoint_total_success_ =
       reg.Counter(metrics::names::kColdCheckpointTotal, metrics::FlushStatus::kSuccess);
   checkpoint_total_failure_ =
@@ -409,51 +411,13 @@ core::Result<void> ColdConsumer::FinishReplay(core::SequenceId end,
   return {};
 }
 
-core::Result<void> ColdConsumer::FlushThrough(core::SequenceId through) {
-  const auto give_up_at = std::chrono::steady_clock::now() + config_.drain_grace;
-  auto backoff = config_.loop_initial_backoff;
-  for (;;) {
-    const auto oldest = buffer_.OldestPendingSeq();
-    if (!oldest.has_value() || *oldest > through) return {};
-    const FlushOutcome outcome = FlushUnscheduled();
-    if (outcome == FlushOutcome::kProgress) {
-      backoff = config_.loop_initial_backoff;
-      continue;
-    }
-    if (outcome == FlushOutcome::kPoisoned) {
-      return std::unexpected(core::Error{core::ErrorCode::kCorruption,
-                                         "cold flush of shard " + std::to_string(shard_) +
-                                             " through seq " + std::to_string(through) +
-                                             " hit a batch cold refuses"});
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= give_up_at) {
-      return std::unexpected(core::Error{core::ErrorCode::kTimeout,
-                                         "cold flush of shard " + std::to_string(shard_) +
-                                             " through seq " + std::to_string(through) +
-                                             " made no progress for " +
-                                             std::to_string(config_.drain_grace.count()) + " ms"});
-    }
-    // A durability wait paced the pass already.
-    if (outcome == FlushOutcome::kDurabilityPending) continue;
-    std::unique_lock lock(stop_mu_);
-    if (stop_cv_.wait_for(lock,
-                          std::min<std::chrono::steady_clock::duration>(backoff, give_up_at - now),
-                          [this] { return stop_requested_.load(std::memory_order_acquire); })) {
-      return std::unexpected(
-          core::Error{core::ErrorCode::kUnavailable, "cold flush aborted by stop"});
-    }
-    backoff = std::min(backoff * 2, config_.loop_max_backoff);
-  }
-}
-
 void ColdConsumer::HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write) {
   if (write.cmd.args.empty()) {
     counters_.parse_failures.fetch_add(1, std::memory_order_relaxed);
     RecordPoison(entry.seq, "empty write command");
     return;
   }
-  AbsorbOp(write.cmd, entry.seq, AppendedAtMs(entry));
+  AbsorbOp(write.cmd, entry.seq, AppendedAtMs(entry), entry.replaces_state);
 }
 
 bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
@@ -514,7 +478,7 @@ bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
 }
 
 void ColdConsumer::AbsorbOp(const core::RespCommand& cmd, core::SequenceId seq,
-                            uint64_t appended_at_ms) {
+                            uint64_t appended_at_ms, bool replaces_state) {
   // A command with no parser at all cannot be materialised by ANY tier in this
   // build, so hot rejected it too and there is no state for cold to be missing:
   // both views agree the entry produced nothing. Poisoning here would pin WAL
@@ -546,7 +510,7 @@ void ColdConsumer::AbsorbOp(const core::RespCommand& cmd, core::SequenceId seq,
 
   const std::string key_str(key);
   auto eviction = eviction_policy_.Resolve(key_str);
-  buffer_.Absorb(key_str, *op, eviction, seq, appended_at_ms);
+  buffer_.Absorb(key_str, *op, eviction, seq, appended_at_ms, replaces_state);
 }
 
 void ColdConsumer::RecordPoison(core::SequenceId seq, std::string_view reason) {
@@ -642,6 +606,7 @@ ColdConsumer::FlushOutcome ColdConsumer::ApplyFlushBatch(
   if (batch_count > 0 && outcome != FlushOutcome::kDurabilityPending) {
     if (applied) {
       flush_total_success_.Increment(static_cast<double>(batch_count));
+      flush_batch_size_.Observe(static_cast<double>(batch_count));
       if (aggressive) {
         flushes_aggressive_.fetch_add(batch_count, std::memory_order_relaxed);
         auto& reason_counter = *aggressive_reason == metrics::FlushReason::kDrain
@@ -768,6 +733,7 @@ bool ColdConsumer::AwaitPowerDurable(core::SequenceId seq) {
   }
   // Not a failure: a slow device shows up as WAL durability lag.
   durability_waits_timed_out_.fetch_add(1, std::memory_order_relaxed);
+  durability_waits_total_.Increment();
   if (!durability_wait_logged_) {
     durability_wait_logged_ = true;
     ABYSS_LOG_DEBUG("cold persistence waiting for WAL power durability",

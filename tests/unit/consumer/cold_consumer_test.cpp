@@ -1090,12 +1090,12 @@ TEST_F(ColdConsumerTest, DurabilityPendingRetriesWithoutTheBackoffLadder) {
 
   const auto start = std::chrono::steady_clock::now();
   c->Start();
-  // Ten 5 ms waits take ~50 ms; the 50 ms-doubling ladder would take seconds.
-  while (waits.load() < 10 && std::chrono::steady_clock::now() - start < 1500ms) {
+  // Ten 5 ms waits take ~50 ms. The 50 ms-doubling ladder needs ~6.5 s
+  // for ten, so it manages about six in this window, however loaded.
+  while (waits.load() < 10 && std::chrono::steady_clock::now() - start < 3s) {
     std::this_thread::sleep_for(1ms);
   }
-  EXPECT_GE(waits.load(), 10);
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 1000ms) << "the held batch backed off";
+  EXPECT_GE(waits.load(), 10) << "the held batch backed off";
   EXPECT_EQ(applies.load(), 0);
 
   end.store(2);
@@ -1542,55 +1542,6 @@ TEST_F(ColdConsumerTest, FinishReplayShortOfItsEndFails) {
   ASSERT_FALSE(finished.has_value());
   EXPECT_EQ(finished.error().code(), core::ErrorCode::kInternal);
   EXPECT_NE(finished.error().message().find("short of its end"), std::string::npos);
-}
-
-// Replay's drain request: everything at or below the seq leaves the
-// buffer, through cold, whatever its flush schedule.
-TEST_F(ColdConsumerTest, FlushThroughEmptiesTheBufferUpToItsSeq) {
-  ColdConsumer::Config cfg;
-  cfg.quiet_threshold = 3600s;
-  cfg.max_flush_batch_size = 1;
-  auto c = MakeConsumer(cfg);
-  ASSERT_EQ(c->BeginReplay().value(), kFirst);
-  std::vector<std::string> applied;
-  EXPECT_CALL(cold_, ApplyBatch(_, _))
-      .WillRepeatedly([&applied](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
-        for (const auto& op : ops) applied.emplace_back(core::ops::PrimaryKey(op));
-        return core::Result<void>{};
-      });
-  const std::vector<core::QueueEntry> batch{
-      MakeWriteEntry(kFirst, {"SET", "a", "v"}),
-      MakeWriteEntry(kFirst + 1, {"SET", "b", "v"}),
-      MakeWriteEntry(kFirst + 2, {"SET", "c", "v"}),
-  };
-  const std::atomic<bool> cancel{false};
-  ASSERT_TRUE(c->ApplyReplayBatch(batch, cancel).has_value());
-
-  ASSERT_TRUE(c->FlushThrough(kFirst + 1).has_value());
-  EXPECT_GE(applied.size(), 2U);
-  const auto oldest = c->Buffer().OldestPendingSeq();
-  EXPECT_TRUE(!oldest.has_value() || *oldest > kFirst + 1);
-}
-
-// A forced flush that cold keeps refusing fails within drain_grace, so
-// recovery fails loudly instead of hanging.
-TEST_F(ColdConsumerTest, FlushThroughGivesUpOnAColdThatKeepsFailing) {
-  ColdConsumer::Config cfg;
-  cfg.drain_grace = 20ms;
-  cfg.loop_max_backoff = 5ms;
-  auto c = MakeConsumer(cfg);
-  ASSERT_EQ(c->BeginReplay().value(), kFirst);
-  EXPECT_CALL(cold_, ApplyBatch(_, _))
-      .WillRepeatedly(Return(core::Result<void>(
-          std::unexpected(core::Error{core::ErrorCode::kUnavailable, "cold down (test)"}))));
-  const std::vector<core::QueueEntry> batch{MakeWriteEntry(kFirst, {"SET", "a", "v"})};
-  const std::atomic<bool> cancel{false};
-  ASSERT_TRUE(c->ApplyReplayBatch(batch, cancel).has_value());
-
-  auto flushed = c->FlushThrough(kFirst);
-  ASSERT_FALSE(flushed.has_value());
-  EXPECT_EQ(flushed.error().code(), core::ErrorCode::kTimeout);
-  EXPECT_EQ(c->Buffer().Size(), 1U) << "the refused batch stays buffered";
 }
 
 // --- COLDC-5: oldest_unflushed_age lag signal ---------------------------------

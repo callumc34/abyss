@@ -12,11 +12,10 @@ ABYSS_LOG_COMPONENT("abyss.engine.replay")
 
 namespace abyss::engine {
 
-HotReplayer::HotReplayer(hot::ShardedHotStore& hot, DrainFn drain, Config config)
-    : hot_(hot), drain_(std::move(drain)), config_(std::move(config)), shards_(hot.shard_count()) {
-  auto& reg = metrics::Registry::Instance();
-  skipped_total_ = reg.Counter(metrics::names::kRecoveryHotSkippedFramesTotal);
-  drain_requests_total_ = reg.Counter(metrics::names::kRecoveryColdDrainRequestsTotal);
+HotReplayer::HotReplayer(hot::ShardedHotStore& hot, Config config)
+    : hot_(hot), config_(std::move(config)), shards_(hot.shard_count()) {
+  skipped_total_ =
+      metrics::Registry::Instance().Counter(metrics::names::kRecoveryHotSkippedFramesTotal);
 }
 
 void HotReplayer::Begin(std::span<const core::SequenceId> from,
@@ -35,8 +34,7 @@ void HotReplayer::Begin(std::span<const core::SequenceId> from,
 
 core::Result<void> HotReplayer::Apply(core::ShardId shard, std::vector<core::QueueEntry>& batch) {
   ShardProgress& progress = shards_[shard];
-  // Cold has absorbed this batch: a drain may free what the last could
-  // not.
+  // Cold absorbed this batch first: its drained seq may have moved.
   progress.stuck = false;
   for (core::QueueEntry& entry : batch) {
     const core::SequenceId expected = progress.next.load(std::memory_order_relaxed);
@@ -46,7 +44,9 @@ core::Result<void> HotReplayer::Apply(core::ShardId shard, std::vector<core::Que
                                              " was handed seq " + std::to_string(entry.seq) +
                                              " at its cursor " + std::to_string(expected)});
     }
-    const auto replayed = hot_.Replay(shard, entry);
+    auto replayed_or = hot_.Replay(shard, entry);
+    if (!replayed_or.has_value()) return std::unexpected(replayed_or.error());
+    const hot::ShardedHotStore::Replayed& replayed = *replayed_or;
     progress.next.store(entry.seq + 1, std::memory_order_relaxed);
     if (!replayed.applied) {
       skipped_.fetch_add(1, std::memory_order_relaxed);
@@ -59,14 +59,14 @@ core::Result<void> HotReplayer::Apply(core::ShardId shard, std::vector<core::Que
     }
     hot::ShardedHotStore::ShardMemory memory = replayed.memory;
     if (!progress.stuck) {
-      if (auto made = MakeRoom(shard, replayed.shard, entry.seq); !made.has_value()) return made;
+      MakeRoom(shard, entry.seq);
       if (!progress.stuck) continue;
-      memory = hot_.Memory(replayed.shard);
+      memory = hot_.Memory(shard);
     }
     if (memory.used_bytes > 2 * memory.limit_bytes) {
       return std::unexpected(core::Error{
           core::ErrorCode::kResourceExhausted,
-          "hot replay of shard " + std::to_string(replayed.shard) + " passed twice its " +
+          "hot replay of shard " + std::to_string(shard) + " passed twice its " +
               std::to_string(memory.limit_bytes) + "-byte backpressure limit at seq " +
               std::to_string(entry.seq) + " (" + std::to_string(memory.used_bytes) +
               " bytes) with nothing it can evict: cold's drained seq is pinned, as by an " +
@@ -76,21 +76,10 @@ core::Result<void> HotReplayer::Apply(core::ShardId shard, std::vector<core::Que
   return {};
 }
 
-core::Result<void> HotReplayer::MakeRoom(core::ShardId shard, core::ShardId hot_shard,
-                                         core::SequenceId seq) {
-  hot_.GcTombstones(hot_shard);
-  if (hot_.EvictShardToTarget(hot_shard)) return {};
+void HotReplayer::MakeRoom(core::ShardId shard, core::SequenceId seq) {
+  hot_.GcTombstones(shard);
+  if (hot_.EvictShardToTarget(shard)) return;
   // Everything left is newer than cold's drained seq.
-  drain_requests_.fetch_add(1, std::memory_order_relaxed);
-  drain_requests_total_.Increment();
-  if (auto drained = drain_(shard, seq); !drained.has_value()) {
-    return std::unexpected(core::Error{
-        drained.error().code(),
-        "hot replay of shard " + std::to_string(shard) +
-            " is over its memory limit and cold could not drain: " + drained.error().message()});
-  }
-  hot_.GcTombstones(hot_shard);
-  if (hot_.EvictShardToTarget(hot_shard)) return {};
   ShardProgress& progress = shards_[shard];
   progress.stuck = true;
   // Once a spell: a shard stuck over many batches would otherwise warn
@@ -98,9 +87,8 @@ core::Result<void> HotReplayer::MakeRoom(core::ShardId shard, core::ShardId hot_
   if (!progress.warned) {
     progress.warned = true;
     ABYSS_LOG_WARN("hot replay is over its memory limit with nothing it can evict",
-                   {"shard", static_cast<int64_t>(hot_shard)}, {"seq", static_cast<uint64_t>(seq)});
+                   {"shard", static_cast<int64_t>(shard)}, {"seq", static_cast<uint64_t>(seq)});
   }
-  return {};
 }
 
 core::Result<void> HotReplayer::Finish() {
@@ -124,7 +112,6 @@ core::Result<void> HotReplayer::Finish() {
   const size_t reclaimed = hot_.GcTombstones();
   const size_t evicted = hot_.EvictToMemoryTarget();
   ABYSS_LOG_INFO("hot replay complete", {"frames", Replayed()}, {"skipped", Skipped()},
-                 {"drain_requests", DrainRequests()},
                  {"evicted_past_eviction", static_cast<uint64_t>(expired.by_deadline)},
                  {"expired", static_cast<uint64_t>(expired.by_ttl)},
                  {"tombstones_reclaimed", static_cast<uint64_t>(reclaimed)},

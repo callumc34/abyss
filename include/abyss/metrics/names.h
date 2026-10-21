@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -20,6 +21,7 @@ enum class LabelKey : uint8_t {
   kSubject,
   kOutcome,
   kPass,
+  kPhase,
 };
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
@@ -44,6 +46,8 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "outcome";
     case LabelKey::kPass:
       return "pass";
+    case LabelKey::kPhase:
+      return "phase";
   }
   return {};
 }
@@ -249,6 +253,44 @@ constexpr std::string_view ToStringView(MaintenancePass p) noexcept {
   return {};
 }
 
+// A stage of one sequenced write, in the order a write passes them.
+enum class WritePhase : uint8_t {
+  kAdmit,
+  kLockWait,
+  kDecide,
+  kLoad,
+  kEntries,
+  kReserve,
+  kApply,
+  kComplete,
+  kDurable,
+};
+inline constexpr size_t kWritePhaseCount = 9;
+
+constexpr std::string_view ToStringView(WritePhase p) noexcept {
+  switch (p) {
+    case WritePhase::kAdmit:
+      return "admit";
+    case WritePhase::kLockWait:
+      return "lock_wait";
+    case WritePhase::kDecide:
+      return "decide";
+    case WritePhase::kLoad:
+      return "load";
+    case WritePhase::kEntries:
+      return "entries";
+    case WritePhase::kReserve:
+      return "reserve";
+    case WritePhase::kApply:
+      return "apply";
+    case WritePhase::kComplete:
+      return "complete";
+    case WritePhase::kDurable:
+      return "durable";
+  }
+  return {};
+}
+
 // Command-name label value. Values are expected to be views into the command
 // registry; never client-supplied strings.
 struct CmdLabel {
@@ -303,6 +345,10 @@ struct LabelKeyOf<MaintenancePass> {
   static constexpr LabelKey value = LabelKey::kPass;
 };
 template <>
+struct LabelKeyOf<WritePhase> {
+  static constexpr LabelKey value = LabelKey::kPhase;
+};
+template <>
 struct LabelKeyOf<CmdLabel> {
   static constexpr LabelKey value = LabelKey::kCmd;
 };
@@ -334,6 +380,7 @@ inline std::string ToLabelString(RejectReason r) { return std::string(ToStringVi
 inline std::string ToLabelString(RedecideReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(FillOutcome o) { return std::string(ToStringView(o)); }
 inline std::string ToLabelString(MaintenancePass p) { return std::string(ToStringView(p)); }
+inline std::string ToLabelString(WritePhase p) { return std::string(ToStringView(p)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
@@ -378,10 +425,18 @@ inline constexpr std::array<double, 14> kLatencySeconds{0.00001, 0.000025, 0.000
 inline constexpr std::array<double, 13> kFlushLatencySeconds{
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0};
 
-// Exclusive lock holds: 1us to 10ms, where W1's budget lies.
-inline constexpr std::array<double, 12> kLockHoldSeconds{0.000001, 0.0000025, 0.000005, 0.00001,
-                                                         0.000025, 0.00005,   0.0001,   0.00025,
-                                                         0.0005,   0.001,     0.0025,   0.01};
+// Exclusive lock holds: 250ns to 100ms, where W1's budget lies, finer
+// past 1ms so a stall's tail is not one bucket wide.
+inline constexpr std::array<double, 21> kLockHoldSeconds{
+    0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025,
+    0.00005,    0.0001,    0.00025,  0.0005,    0.001,    0.0015,  0.002,
+    0.003,      0.005,     0.0075,   0.01,      0.025,    0.05,    0.1};
+
+// Stages of a write: sub-microsecond steps up to a durable wait.
+inline constexpr std::array<double, 23> kWritePhaseSeconds{
+    0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005,
+    0.0001,     0.00025,   0.0005,   0.001,     0.0015,   0.002,   0.003,    0.005,
+    0.0075,     0.01,      0.025,    0.05,      0.1,      0.25,    1.0};
 
 // Power-of-ten buckets for batch sizes.
 inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
@@ -389,24 +444,6 @@ inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
 }  // namespace buckets
 
 namespace names {
-
-inline constexpr HistogramDesc<CmdLabel> kHotOpDurationSeconds{
-    .name = "abyss_hot_op_duration_seconds",
-    .help = "Hot store operation latency per command.",
-    .buckets = buckets::kLatencySeconds,
-};
-
-inline constexpr HistogramDesc<CmdLabel> kColdOpDurationSeconds{
-    .name = "abyss_cold_op_duration_seconds",
-    .help = "Cold store operation latency per command.",
-    .buckets = buckets::kLatencySeconds,
-};
-
-inline constexpr HistogramDesc<CmdLabel> kBufferOpDurationSeconds{
-    .name = "abyss_buffer_op_duration_seconds",
-    .help = "Compaction buffer read latency per command.",
-    .buckets = buckets::kLatencySeconds,
-};
 
 inline constexpr HistogramDesc<CmdLabel> kRespRequestDurationSeconds{
     .name = "abyss_resp_request_duration_seconds",
@@ -538,11 +575,6 @@ inline constexpr GaugeDesc<> kColdBufferOldestEntryAgeSeconds{
     .help = "Age of the oldest un-flushed compaction-buffer entry.",
 };
 
-inline constexpr GaugeDesc<> kColdConsumerSeq{
-    .name = "abyss_cold_consumer_seq",
-    .help = "Cold consumer current sequence position.",
-};
-
 inline constexpr GaugeDesc<> kHotMemoryBytes{
     .name = "abyss_hot_memory_bytes",
     .help = "Hot store memory usage in bytes.",
@@ -635,7 +667,7 @@ inline constexpr GaugeDesc<> kWalUnflushedBytes{
 
 inline constexpr GaugeDesc<> kWalDurabilityLagSeconds{
     .name = "abyss_wal_durability_lag_seconds",
-    .help = "Age of the oldest WAL entry not yet power-durable, worst shard.",
+    .help = "Age bound of the oldest WAL entry not yet power-durable, worst log.",
 };
 
 inline constexpr CounterDesc<> kQueueOffsetPersistFailuresTotal{
@@ -728,6 +760,13 @@ inline constexpr CounterDesc<> kColdParsePoisonTotal{
         "retention below the poison seq for the shard until operator intervention (fail-closed).",
 };
 
+inline constexpr CounterDesc<> kColdDurabilityWaitsTotal{
+    .name = "abyss_cold_durability_waits_total",
+    .help =
+        "Cold flushes and wipes held a queue read timeout because their entries were not yet "
+        "power-durable in the WAL.",
+};
+
 inline constexpr CounterDesc<> kColdApplyTypeConflictsTotal{
     .name = "abyss_cold_apply_type_conflicts_total",
     .help =
@@ -784,8 +823,14 @@ inline constexpr CounterDesc<RedecideReason> kSequencerRedecidesTotal{
 
 inline constexpr HistogramDesc<> kSequencerLockHoldSeconds{
     .name = "abyss_sequencer_lock_hold_seconds",
-    .help = "Time the sequencer held a write's hot shard locks; one hold in 64 is sampled.",
+    .help = "Time the sequencer held a write's hot shard locks; about one write in 64 is sampled.",
     .buckets = buckets::kLockHoldSeconds,
+};
+
+inline constexpr HistogramDesc<WritePhase> kSequencerPhaseSeconds{
+    .name = "abyss_sequencer_phase_seconds",
+    .help = "Time a successful write spent in each sequencer stage; about one in 64 is sampled.",
+    .buckets = buckets::kWritePhaseSeconds,
 };
 
 inline constexpr CounterDesc<> kHotLoadDiscardsTotal{
@@ -947,13 +992,6 @@ inline constexpr CounterDesc<> kRecoveryHotSkippedFramesTotal{
     .help =
         "Replayed log entries hot left to buffer and cold: a partial effect on a key "
         "it does not hold.",
-};
-
-inline constexpr CounterDesc<> kRecoveryColdDrainRequestsTotal{
-    .name = "abyss_recovery_cold_drain_requests_total",
-    .help =
-        "Times recovery made cold flush its buffer because hot reached its backpressure "
-        "limit with nothing it could evict.",
 };
 
 inline constexpr GaugeDesc<> kRecoveryDurationSeconds{

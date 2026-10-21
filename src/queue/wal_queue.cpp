@@ -20,6 +20,7 @@
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
 #include "abyss/platform/fs.h"
+#include "abyss/queue/offset_checkpoint.h"
 #include "segment_header_v2.h"
 #include "shard_stream.h"
 

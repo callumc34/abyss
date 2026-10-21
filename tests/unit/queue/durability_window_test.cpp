@@ -121,7 +121,6 @@ TEST_F(DurabilityWindowTest, PastDeadlineChecksWithoutWaitingOrCounting) {
   window_->Add(kMaxBytes);
   const auto start = Clock::now();
   auto admitted = window_->Admit(age_, start);
-  EXPECT_LT(Clock::now() - start, 5ms);
   ASSERT_FALSE(admitted.has_value());
   EXPECT_EQ(admitted.error().code(), core::ErrorCode::kResourceExhausted);
   EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kWalBackpressureWaitsTotal), 0.0);

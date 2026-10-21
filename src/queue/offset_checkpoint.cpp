@@ -172,8 +172,9 @@ core::Result<void> RejectLegacyLayout(const std::filesystem::path& dir) {
 
 // Created under a temporary name and renamed into place, so the checkpoint
 // file, once visible, always holds at least one valid slot.
-core::Result<void> CreateFile(const std::filesystem::path& path, size_t slot_bytes,
-                              uint32_t shard_count, std::span<const core::ConsumerId> consumers) {
+core::Result<void> CreateCheckpointFile(const std::filesystem::path& path, size_t slot_bytes,
+                                        uint32_t shard_count,
+                                        std::span<const core::ConsumerId> consumers) {
   auto tmp = path;
   tmp += ".tmp";
   std::error_code ec;
@@ -240,7 +241,8 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
         core::Error{core::ErrorCode::kInternal, "stat offset checkpoint: " + ec.message()});
   }
   if (!exists) {
-    if (auto r = CreateFile(path, expected_slot_bytes, config.shard_count, config.consumers);
+    if (auto r =
+            CreateCheckpointFile(path, expected_slot_bytes, config.shard_count, config.consumers);
         !r.has_value()) {
       return std::unexpected(r.error());
     }

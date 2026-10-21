@@ -61,6 +61,7 @@ class Sequencer {
 
  private:
   class Hold;
+  class Phases;
 
   // Off every lock: evicts each shard over its limit to its budget and
   // waits for its cold drain until it is not; OOM at the deadline.
@@ -76,7 +77,6 @@ class Sequencer {
   consumer::CompactionBufferRouter& buffers_;
   SequencerConfig config_;
 
-  std::atomic<uint64_t> holds_{0};
   std::atomic<uint64_t> locked_copy_bytes_{0};
   std::array<std::atomic<uint64_t>, 4> redecides_{};
   std::atomic<uint64_t> backpressure_waits_{0};
@@ -87,6 +87,7 @@ class Sequencer {
   metrics::CounterHandle backpressure_waits_metric_;
   metrics::CounterHandle backpressure_rejections_metric_;
   metrics::HistogramHandle lock_hold_;
+  std::array<metrics::HistogramHandle, metrics::kWritePhaseCount> phase_seconds_;
 };
 
 }  // namespace abyss::engine

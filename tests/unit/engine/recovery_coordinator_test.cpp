@@ -26,6 +26,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/names.h"
@@ -46,8 +47,13 @@ using ::testing::UnorderedElementsAreArray;
 constexpr uint32_t kShards = 2;
 constexpr core::SequenceId kFirst = core::kFirstSeq;
 
+// A key on `shard`, as the sequencer logs a write only on its key's.
 std::string KeyOf(core::ShardId shard, core::SequenceId seq) {
-  return "s" + std::to_string(shard) + ":" + std::to_string(seq);
+  for (int i = 0;; ++i) {
+    std::string key =
+        "s" + std::to_string(shard) + ":" + std::to_string(seq) + ":" + std::to_string(i);
+    if (core::ComputeShard(key, kShards) == shard) return key;
+  }
 }
 
 // A SET replaces its key's state, so the sequencer flags it.

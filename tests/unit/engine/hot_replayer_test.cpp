@@ -20,8 +20,10 @@
 #include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
+#include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "hot_bytes.h"
 
 namespace abyss::engine {
 namespace {
@@ -49,14 +51,9 @@ core::QueueEntry FlushFrame(core::SequenceId seq, int64_t at_ms = kT0) {
   return core::QueueEntry{.seq = seq, .appended_at = At(at_ms), .payload = core::entry::Flush{}};
 }
 
-// The bytes each key of Sets takes in hot.
+// The bytes each key of Sets takes in hot, past its map's buckets.
 size_t EntryBytes() {
-  hot::SingleShardStore probe(hot::SingleShardConfig{});
-  const auto applied =
-      probe.Apply(core::ops::StringSet{.key = "k10000", .value = std::string(200, 'x')},
-                  core::EvictionTTL{3600});
-  EXPECT_TRUE(applied.has_value());
-  return static_cast<size_t>(probe.Stats().used_bytes);
+  return static_cast<size_t>(abyss::testing::StringEntryBytes("k10000", std::string(200, 'x')));
 }
 
 // Frames [first, first + n), each setting a key of its own, all as
@@ -97,24 +94,19 @@ class HotReplayerTest : public ::testing::Test {
   void SetUp() override { metrics::testing::Reset(); }
   void TearDown() override { metrics::testing::Reset(); }
 
-  void Build(size_t max_memory_bytes = size_t{64} << 20) {
+  void Build(size_t max_memory_bytes = size_t{64} << 20, uint32_t shards = 1) {
     hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
         .max_memory_bytes = max_memory_bytes,
-        .shard_count = 1,
+        .shard_count = shards,
+        // Sized for 64 keys, so its buckets never grow mid-replay.
+        .reserve_bytes_per_key = std::max<size_t>(max_memory_bytes / 64, 1),
         .drained = [this](core::ShardId) { return horizon_.load(); },
         .eviction_policy = &policy_,
         .steady_clock = hot_clocks_.Steady(),
         .wall_clock = hot_clocks_.Wall(),
     });
     replayer_ = std::make_unique<HotReplayer>(
-        *hot_,
-        [this](core::ShardId shard, core::SequenceId through) -> core::Result<void> {
-          drains_.emplace_back(shard, through);
-          if (!drain_result_.has_value()) return drain_result_;
-          if (drain_advances_) horizon_.store(through);
-          return {};
-        },
-        HotReplayer::Config{.steady_clock = clocks_.Steady(), .wall_clock = clocks_.Wall()});
+        *hot_, HotReplayer::Config{.steady_clock = clocks_.Steady(), .wall_clock = clocks_.Wall()});
   }
 
   // One batch of every frame, from kFirst; the replayer expects `end`.
@@ -131,7 +123,7 @@ class HotReplayerTest : public ::testing::Test {
   }
 
   hot::KeyView::Presence PresenceOf(std::string_view key) {
-    auto locks = hot_->LockExclusive(std::vector<core::ShardId>{0});
+    auto locks = hot_->LockExclusive(std::vector<core::ShardId>{hot_->ShardOf(key)});
     return locks.View(key, 0).presence;
   }
   bool Resident(std::string_view key) {
@@ -145,9 +137,6 @@ class HotReplayerTest : public ::testing::Test {
   CountingClocks hot_clocks_;
   CountingClocks clocks_;
   std::atomic<core::SequenceId> horizon_{hot::kAllDrained};
-  std::vector<std::pair<core::ShardId, core::SequenceId>> drains_;
-  core::Result<void> drain_result_;
-  bool drain_advances_ = true;
   std::unique_ptr<hot::ShardedHotStore> hot_;
   std::unique_ptr<HotReplayer> replayer_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -236,6 +225,29 @@ TEST_F(HotReplayerTest, AFrameOutOfPlaceFailsReplay) {
   EXPECT_NE(applied.error().message().find("at its cursor"), std::string::npos);
 }
 
+// A Write logged on another key's stream is corrupt: replay refuses
+// it rather than give the key that stream's seq.
+TEST_F(HotReplayerTest, AWriteOnAnotherShardsStreamFailsReplay) {
+  Build(size_t{64} << 20, 2);
+  std::string key = "k";
+  while (hot_->ShardOf(key) != 1) key += "k";
+  const std::vector<core::SequenceId> from{kFirst, kFirst};
+  const std::vector<core::SequenceId> end{kFirst + 1, kFirst};
+  replayer_->Begin(from, end);
+  std::vector<core::QueueEntry> batch{Frame(kFirst, {"SET", key, "v"}, true)};
+
+  const auto applied = replayer_->Apply(0, batch);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(applied.error().code(), core::ErrorCode::kCorruption);
+  const std::string& message = applied.error().message();
+  EXPECT_NE(message.find("seq " + std::to_string(kFirst) + " on shard 0 "), std::string::npos)
+      << message;
+  EXPECT_NE(message.find("key_hash " + std::to_string(log::KeyHash(key))), std::string::npos)
+      << message;
+  EXPECT_FALSE(Resident(key));
+  EXPECT_EQ(replayer_->Replayed(), 0U);
+}
+
 // Replay must apply or skip exactly every frame below each shard's end.
 TEST_F(HotReplayerTest, FinishShortOfAShardsEndFailsReplay) {
   Build();
@@ -299,20 +311,19 @@ TEST_F(HotReplayerTest, TheSweepNeverEvictsAnUndrainedKey) {
   EXPECT_TRUE(Resident("old"));
 }
 
-// Replay may exceed the budget only within the backpressure ratio. At
-// the ratio with nothing evictable, the replayer makes cold drain
-// through the frame, rather than wait for a drain that only replay
-// drives, then evicts.
-TEST_F(HotReplayerTest, AtTheRatioWithNothingEvictableColdIsMadeToDrain) {
+// Replay may exceed the budget only within the backpressure ratio: at
+// the ratio it evicts what cold has drained, which cold, fed each
+// batch first, has drained through the batch.
+TEST_F(HotReplayerTest, AtTheRatioReplayEvictsWhatColdHasDrained) {
   const size_t entry = EntryBytes();
   Build(20 * entry);
-  horizon_.store(0);
   std::vector<core::QueueEntry> frames = Sets(kFirst, 200);
   const std::vector<core::SequenceId> from{kFirst};
   const std::vector<core::SequenceId> end{kFirst + frames.size()};
   replayer_->Begin(from, end);
   uint64_t peak = 0;
   for (auto& frame : frames) {
+    horizon_.store(frame.seq);
     std::vector<core::QueueEntry> one{std::move(frame)};
     ASSERT_TRUE(replayer_->Apply(0, one).has_value());
     peak = std::max(peak, hot_->Stats()->used_bytes);
@@ -320,65 +331,38 @@ TEST_F(HotReplayerTest, AtTheRatioWithNothingEvictableColdIsMadeToDrain) {
 
   EXPECT_LE(static_cast<double>(peak), (20.0 * static_cast<double>(entry) * 1.25) + entry)
       << "replay passed the backpressure ratio";
-  ASSERT_GT(replayer_->DrainRequests(), 0U);
-  EXPECT_EQ(drains_.size(), replayer_->DrainRequests());
-  EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kRecoveryColdDrainRequestsTotal),
-            static_cast<double>(replayer_->DrainRequests()));
-  for (size_t i = 1; i < drains_.size(); ++i) {
-    EXPECT_GT(drains_[i].second, drains_[i - 1].second) << "a drain asked for nothing new";
-  }
-  // Cold's FinishReplay drains it all; the sweep then reaches the budget.
-  horizon_.store(hot::kAllDrained);
   ASSERT_TRUE(replayer_->Finish().has_value());
   EXPECT_LE(hot_->Stats()->used_bytes, 20 * entry);
 }
 
-// A drain cold cannot make fails recovery, loudly.
-TEST_F(HotReplayerTest, ADrainThatFailsFailsReplay) {
-  Build(4096);
-  horizon_.store(0);
-  drain_result_ = std::unexpected(core::Error{core::ErrorCode::kTimeout, "cold stuck (test)"});
-  std::vector<core::QueueEntry> frames;
-  frames.reserve(100);
-  for (core::SequenceId i = 0; i < 100; ++i) {
-    frames.push_back(
-        Frame(kFirst + i, {"SET", "k" + std::to_string(i), std::string(200, 'x')}, true));
-  }
-  auto applied = ReplayAll(std::move(frames));
-  ASSERT_FALSE(applied.has_value());
-  EXPECT_EQ(applied.error().code(), core::ErrorCode::kTimeout);
-  EXPECT_NE(applied.error().message().find("cold could not drain"), std::string::npos);
-  EXPECT_EQ(replayer_->DrainRequests(), 1U);
-}
-
-// When even a drain leaves nothing to evict, replay carries on over
-// the limit without asking again in that batch. Cold absorbs each
-// batch before hot replays it, so the next batch asks again.
-TEST_F(HotReplayerTest, StillOverAfterADrainAsksAgainOnlyInTheNextBatch) {
+// Over the limit with nothing evictable, replay carries on and tries
+// again in the next batch, by when cold may have drained further.
+TEST_F(HotReplayerTest, StillOverWithNothingEvictableEvictsInTheNextBatch) {
   const size_t entry = EntryBytes();
   Build(20 * entry);
   horizon_.store(0);
-  drain_advances_ = false;
   const std::vector<core::SequenceId> from{kFirst};
   const std::vector<core::SequenceId> end{kFirst + 45};
   replayer_->Begin(from, end);
   auto first = Sets(kFirst, 40);
   ASSERT_TRUE(replayer_->Apply(0, first).has_value());
-  EXPECT_EQ(replayer_->DrainRequests(), 1U) << "asked again within a batch";
+  EXPECT_GT(hot_->Stats()->used_bytes, 25 * entry) << "evicted what cold had not drained";
+  horizon_.store(kFirst + 44);
   auto second = Sets(kFirst + 40, 5);
   ASSERT_TRUE(replayer_->Apply(0, second).has_value());
-  EXPECT_EQ(replayer_->DrainRequests(), 2U) << "a new batch never asked";
+  EXPECT_LE(static_cast<double>(hot_->Stats()->used_bytes),
+            (20.0 * static_cast<double>(entry) * 1.25) + entry)
+      << "the next batch never evicted";
   EXPECT_EQ(replayer_->Replayed(), 45U);
 }
 
 // A drained seq that never advances, as an entry cold cannot parse
 // pins it, leaves replay nothing to evict. Replay fails, naming the
 // cause, at the first frame past twice the backpressure limit.
-TEST_F(HotReplayerTest, APinnedDrainFailsReplayPastTwiceTheLimit) {
+TEST_F(HotReplayerTest, APinnedDrainedSeqFailsReplayPastTwiceTheLimit) {
   const size_t entry = EntryBytes();
   Build(20 * entry);
   horizon_.store(0);
-  drain_advances_ = false;
   const uint64_t ceiling = uint64_t{2} * 25 * entry;
   constexpr size_t kFrames = 80;
   constexpr size_t kBatch = 4;

@@ -135,6 +135,8 @@ ShardStream::ShardStream(ShardStreamConfig config)
           metrics::Registry::Instance().Histogram(metrics::names::kWalPublishWaitSeconds)),
       index_gauge_(metrics::Registry::Instance().Gauge(metrics::names::kWalIndexBytes)),
       ring_gauge_(metrics::Registry::Instance().Gauge(metrics::names::kWalRingBytes)),
+      read_out_of_range_(
+          metrics::Registry::Instance().Counter(metrics::names::kQueueReadOutOfRangeTotal)),
       ring_mask_(config_.ring_entries - 1),
       ring_(config_.ring_entries) {
   for (Slot& slot : ring_) slot.stamp.store(kNever, std::memory_order_relaxed);
@@ -322,15 +324,32 @@ class ShardStream::MultiFiller final : public ReservationFiller {
 };
 
 core::Result<Reservation> ShardStream::Reserve(std::span<const LogParts> logs) {
-  std::vector<std::unique_lock<std::mutex>> locks;
+  // Kept per thread, so a reservation allocates nothing under the
+  // caller's locks that it does not hand back. Cleared on every return,
+  // which releases the appends.
+  thread_local std::vector<std::unique_lock<std::mutex>> t_locks;
+  thread_local std::vector<uint64_t> t_totals;
+  // Checked before the guard: a re-entry would clear the outer's locks.
+  ABYSS_DCHECK(t_locks.empty() && t_totals.empty(), "a reservation re-entered on its thread");
+  struct Clear {
+    Clear(const Clear&) = delete;
+    Clear& operator=(const Clear&) = delete;
+    Clear(Clear&&) = delete;
+    Clear& operator=(Clear&&) = delete;
+    Clear() = default;
+    ~Clear() {
+      t_locks.clear();
+      t_totals.clear();
+    }
+  } const clear;
+  std::vector<std::unique_lock<std::mutex>>& locks = t_locks;
   for (const LogParts& group : logs) {
     for (ShardStream* stream : group.streams) {
       locks.emplace_back(stream->append_mu_);
       if (stream->stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
     }
   }
-  std::vector<uint64_t> totals;
-  totals.reserve(logs.size());
+  std::vector<uint64_t>& totals = t_totals;
   for (const LogParts& group : logs) {
     uint64_t total = 0;
     for (const uint32_t size : group.sizes) total += size;
@@ -350,9 +369,14 @@ core::Result<Reservation> ShardStream::Reserve(std::span<const LogParts> logs) {
 
   std::vector<ReservedRange> ranges;
   DurableFutures durable;
-  std::vector<std::unique_ptr<ReservationFiller>> fillers;
   // Bytes encoded under the caller's locks, across the reservation.
   std::size_t locked = 0;
+  if (logs.size() == 1) {
+    auto filler = ReserveLocked(logs.front(), totals.front(), locked, ranges, durable);
+    if (!filler.has_value()) return std::unexpected(filler.error());
+    return Reservation(std::move(ranges), std::move(durable), *std::move(filler));
+  }
+  std::vector<std::unique_ptr<ReservationFiller>> fillers;
   for (std::size_t g = 0; g < logs.size(); ++g) {
     auto filler = ReserveLocked(logs[g], totals[g], locked, ranges, durable);
     if (!filler.has_value()) {
@@ -361,10 +385,8 @@ core::Result<Reservation> ShardStream::Reserve(std::span<const LogParts> logs) {
     }
     fillers.push_back(*std::move(filler));
   }
-  std::unique_ptr<ReservationFiller> filler =
-      fillers.size() == 1 ? std::move(fillers.front())
-                          : std::make_unique<MultiFiller>(std::move(fillers));
-  return Reservation(std::move(ranges), std::move(durable), std::move(filler));
+  return Reservation(std::move(ranges), std::move(durable),
+                     std::make_unique<MultiFiller>(std::move(fillers)));
 }
 
 core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
@@ -718,7 +740,7 @@ core::Result<LogPosition> ShardStream::Locate(Log::Cursor& cursor, core::Sequenc
 core::Result<void> ShardStream::CheckReadable(core::SequenceId from) const {
   if (stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
   if (const core::SequenceId first = first_seq(); from < first) {
-    metrics::Registry::Instance().Counter(metrics::names::kQueueReadOutOfRangeTotal).Increment();
+    read_out_of_range_.Increment();
     return std::unexpected(core::Error{core::ErrorCode::kOutOfRange,
                                        "read from seq " + std::to_string(from) +
                                            " below first retained seq " + std::to_string(first) +
@@ -733,7 +755,7 @@ core::Error ShardStream::ReadFailed(const core::Error& error, core::SequenceId s
                 std::to_string(seq) + " failed: " + error.message());
   }
   if (error.code() == core::ErrorCode::kOutOfRange) {
-    metrics::Registry::Instance().Counter(metrics::names::kQueueReadOutOfRangeTotal).Increment();
+    read_out_of_range_.Increment();
   }
   return error;
 }

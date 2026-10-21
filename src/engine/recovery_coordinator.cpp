@@ -45,12 +45,7 @@ RecoveryCoordinator::RecoveryCoordinator(core::Queue& queue, consumer::ColdConsu
       cold_pool_(cold_pool),
       scheduler_(scheduler),
       config_(std::move(config)),
-      replayer_(
-          hot,
-          [this](core::ShardId shard, core::SequenceId through) {
-            return DrainCold(shard, through);
-          },
-          config_.replayer),
+      replayer_(hot, config_.replayer),
       shard_count_(hot.shard_count()) {
   config_.replay_parallelism = std::max(config_.replay_parallelism, kMinParallelism);
 
@@ -195,14 +190,6 @@ core::Result<void> RecoveryCoordinator::ScanColdHot(const std::vector<core::Sequ
     return replayer_.Apply(shard, batch);
   };
   return queue_.Scan(from, end, config_.replay_parallelism, sink, cancel);
-}
-
-core::Result<void> RecoveryCoordinator::DrainCold(core::ShardId shard, core::SequenceId through) {
-  // Recovery synced the log it read, so this cap only guards the gate.
-  auto power = queue_.DurableEnd(shard, core::Durability::kPowerLoss);
-  if (!power.has_value()) return std::unexpected(power.error());
-  if (*power == core::kFirstSeq) return {};
-  return cold_pool_.ConsumerFor(shard).FlushThrough(std::min(through, *power - 1));
 }
 
 std::vector<core::SequenceId> RecoveryCoordinator::CaptureColdOffsets() const {

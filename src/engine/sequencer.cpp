@@ -1,13 +1,18 @@
 #include "abyss/engine/sequencer.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <future>
+#include <numeric>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -22,6 +27,7 @@ namespace abyss::engine {
 namespace {
 
 using metrics::RedecideReason;
+using metrics::WritePhase;
 
 constexpr std::string_view kWriteDurableTimeout =
     "write durable wait exceeded server timeout; the write is applied and may yet become durable";
@@ -81,14 +87,34 @@ bool IsValueArg(const core::RespCommand& cmd, size_t i) {
          name == "HDEL";
 }
 
+// One write in 64 on average is timed, picked at random per thread: a
+// fixed stride could line up with frames on a page, and no writer
+// touches a shared cache line to decide.
+bool Sampled() {
+  thread_local uint64_t t_state = 0;
+  if (t_state == 0) {
+    uint64_t seed =
+        std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
+        static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    seed = (seed ^ (seed >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+    seed = (seed ^ (seed >> 27U)) * 0x94D049BB133111EBULL;
+    // xorshift never reaches 0 from anything else.
+    t_state = (seed ^ (seed >> 31U)) | 1U;
+  }
+  t_state ^= t_state << 13U;
+  t_state ^= t_state >> 7U;
+  t_state ^= t_state << 17U;
+  return (t_state >> 58U) == 0;
+}
+
 }  // namespace
 
-// The hot locks of one attempt, with one hold in 64 timed.
+// The hot locks of one attempt, timed when its write is sampled.
 class Sequencer::Hold {
  public:
-  Hold(Sequencer& sequencer, std::span<const core::ShardId> shards)
+  Hold(Sequencer& sequencer, std::span<const core::ShardId> shards, bool sampled)
       : sequencer_(sequencer),
-        sampled_((sequencer.holds_.fetch_add(1, std::memory_order_relaxed) & 63U) == 0),
+        sampled_(sampled),
         locks_(sequencer.hot_.LockExclusive(shards)),
         start_(sampled_ ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{}) {}
@@ -118,6 +144,44 @@ class Sequencer::Hold {
   std::chrono::steady_clock::time_point start_;
 };
 
+// A sampled write's time in each stage. Each lap charges the time
+// since the last to one stage; a stage passed twice adds up.
+class Sequencer::Phases {
+ public:
+  explicit Phases(Sequencer& sequencer)
+      : sequencer_(sequencer),
+        sampled_(Sampled()),
+        last_(sampled_ ? std::chrono::steady_clock::now()
+                       : std::chrono::steady_clock::time_point{}) {}
+
+  bool sampled() const { return sampled_; }
+
+  void Lap(WritePhase phase) {
+    if (!sampled_) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto index = static_cast<size_t>(phase);
+    spent_.at(index) += now - last_;
+    passed_.at(index) = true;
+    last_ = now;
+  }
+
+  // Once the write succeeded: the stages it passed.
+  void Record() const {
+    if (!sampled_) return;
+    for (size_t i = 0; i < spent_.size(); ++i) {
+      if (!passed_.at(i)) continue;
+      sequencer_.phase_seconds_.at(i).Observe(std::chrono::duration<double>(spent_.at(i)).count());
+    }
+  }
+
+ private:
+  Sequencer& sequencer_;
+  bool sampled_;
+  std::chrono::steady_clock::time_point last_;
+  std::array<std::chrono::steady_clock::duration, metrics::kWritePhaseCount> spent_{};
+  std::array<bool, metrics::kWritePhaseCount> passed_{};
+};
+
 Sequencer::Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& loader,
                      consumer::CompactionBufferRouter& buffers, SequencerConfig config)
     : hot_(hot), queue_(queue), loader_(loader), buffers_(buffers), config_(std::move(config)) {
@@ -131,6 +195,10 @@ Sequencer::Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& load
   backpressure_waits_metric_ = reg.Counter(metrics::names::kHotBackpressureWaitsTotal);
   backpressure_rejections_metric_ = reg.Counter(metrics::names::kHotBackpressureRejectionsTotal);
   lock_hold_ = reg.Histogram(metrics::names::kSequencerLockHoldSeconds);
+  for (size_t i = 0; i < phase_seconds_.size(); ++i) {
+    phase_seconds_.at(i) =
+        reg.Histogram(metrics::names::kSequencerPhaseSeconds, static_cast<WritePhase>(i));
+  }
 }
 
 // Deadlock-free: hot shard locks are taken ascending, then each
@@ -139,6 +207,7 @@ Sequencer::Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& load
 // are all waited for with every lock released.
 core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
                                                  core::PredicateFlags flags) {
+  Phases phases(*this);
   const core::SteadyTime deadline = core::SteadyClock::now() + config_.write_timeout;
   auto keys = WriteKeys(cmd);
   if (!keys.has_value()) return std::unexpected(keys.error());
@@ -154,13 +223,19 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
   }
 
   // Large arguments are copied for the log before any lock, once; a
-  // decision moves the request's own strings into hot.
-  std::vector<std::optional<std::string>> spare(cmd.args.size());
+  // decision moves the request's own strings into hot. `lent` marks a
+  // copy an attempt's log entry holds, to take back if it fails.
+  struct Spare {
+    std::optional<std::string> copy;
+    bool lent = false;
+  };
+  std::vector<Spare> spare;
   size_t total = 0;
   for (size_t i = 1; i < cmd.args.size(); ++i) total += cmd.args[i].size();
   for (size_t i = 1; i < cmd.args.size(); ++i) {
     if (total > core::kLockHoldFrameBytes || cmd.args[i].size() > core::kLockHoldFrameBytes) {
-      spare[i] = cmd.args[i];
+      if (spare.empty()) spare.resize(cmd.args.size());
+      spare[i].copy = cmd.args[i];
     }
   }
 
@@ -197,7 +272,9 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
     // One instant per hold is decide's now and every entry's stamp.
     core::WallTime wall = config_.wall_clock();
     std::optional<Hold> hold;
-    hold.emplace(*this, shards);
+    phases.Lap(WritePhase::kAdmit);
+    hold.emplace(*this, shards, phases.sampled());
+    phases.Lap(WritePhase::kLockWait);
     const auto instant_of = [&shards, &hold](core::WallTime from) {
       for (const core::ShardId shard : shards) {
         from = std::max(from, (*hold)->LastAppendedAt(shard));
@@ -210,6 +287,7 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       return (*hold)->View(key, now_ms);
     };
     Decision decision = Decide(cmd, flags, now_ms, lookup);
+    phases.Lap(WritePhase::kDecide);
     // Memory judged before this hold's loads went in: what they add is
     // the decision's own keys, which an eviction would only send to
     // load again.
@@ -266,7 +344,9 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
 
       wall = config_.wall_clock();
       hold.reset();
-      hold.emplace(*this, shards);
+      phases.Lap(WritePhase::kLoad);
+      hold.emplace(*this, shards, phases.sampled());
+      phases.Lap(WritePhase::kLockWait);
       // A full load grows memory however the command reads. A write
       // that grows is judged here, before its own keys go in: a TTL
       // load of a string brings its value too.
@@ -287,9 +367,11 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
         }
         if (!mine.empty()) (*hold)->CompleteLoads(shard, mine);
       }
+      phases.Lap(WritePhase::kLoad);
       instant = instant_of(wall);
       now_ms = WallMs(instant);
       decision = Decide(cmd, flags, now_ms, lookup);
+      phases.Lap(WritePhase::kDecide);
       if (!decision.needs_load.empty()) {
         // A blind write overtook a load.
         hold->Unlock();
@@ -307,6 +389,8 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       }
       if (decision.error.has_value()) return std::unexpected(*std::move(decision.error));
       ABYSS_DCHECK(decision.reply.has_value(), "a decision with no effect has no reply");
+      phases.Lap(WritePhase::kDurable);
+      phases.Record();
       return *std::move(decision.reply);
     }
     if (grows && !judged && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
@@ -319,58 +403,106 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       continue;
     }
 
-    // Each effect's entry, grouped by shard slot, in effect order.
-    std::vector<std::vector<core::QueueEntry>> entries(shards.size());
-    std::vector<std::pair<size_t, size_t>> where(decision.effects.size());
-    std::vector<std::vector<std::string>> args(decision.effects.size());
-    std::vector<std::vector<bool>> taken(decision.effects.size());
-    for (size_t e = 0; e < decision.effects.size(); ++e) {
-      args[e].resize(decision.effects[e].cmd.args.size());
-      taken[e].resize(args[e].size(), false);
-    }
-    for (const Moved& moved : decision.moved) {
-      auto& copy = spare[moved.request_arg];
-      if (!copy.has_value()) continue;
-      args[moved.effect][moved.arg] = *std::move(copy);
-      copy.reset();
-      taken[moved.effect][moved.arg] = true;
-    }
-    uint64_t copied = 0;
-    for (size_t e = 0; e < decision.effects.size(); ++e) {
-      const core::Effect& effect = decision.effects[e];
-      for (size_t a = 0; a < args[e].size(); ++a) {
-        if (taken[e][a]) continue;
-        args[e][a] = effect.cmd.args[a];
-        if (IsValueArg(effect.cmd, a)) copied += args[e][a].size();
+    // The log entries, grouped by shard slot, each group in effect
+    // order. One shard, the common case, keeps effect order and needs
+    // no table: `order` lists the effects by slot only for several.
+    const size_t count = decision.effects.size();
+    std::vector<uint32_t> order;
+    std::vector<uint32_t> slot_of;
+    // Each effect's place in `order`.
+    std::vector<uint32_t> placed;
+    if (shards.size() > 1) {
+      slot_of.reserve(count);
+      for (const core::Effect& effect : decision.effects) {
+        slot_of.push_back(static_cast<uint32_t>(SlotOf(shards, hot_.ShardOf(effect.key))));
       }
-      const size_t slot = SlotOf(shards, hot_.ShardOf(effect.key));
-      where[e] = {slot, entries[slot].size()};
-      entries[slot].push_back(core::QueueEntry{
+      order.resize(count);
+      std::ranges::iota(order, uint32_t{0});
+      std::ranges::stable_sort(order, {}, [&slot_of](uint32_t e) { return slot_of[e]; });
+      placed.resize(count);
+      for (size_t i = 0; i < count; ++i) placed[order[i]] = static_cast<uint32_t>(i);
+    }
+    const auto effect_at = [&order](size_t i) -> size_t { return order.empty() ? i : order[i]; };
+    const auto slot_at = [&slot_of, &order](size_t i) -> size_t {
+      return order.empty() ? 0 : slot_of[order[i]];
+    };
+    std::vector<core::QueueEntry> entries;
+    entries.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      const core::Effect& effect = decision.effects[effect_at(i)];
+      entries.push_back(core::QueueEntry{
           .appended_at = instant,
-          .payload = core::entry::Write{.cmd = core::RespCommand{.args = std::move(args[e])}},
+          .payload = core::entry::Write{.cmd = core::RespCommand{.args = std::vector<std::string>(
+                                                                     effect.cmd.args.size())}},
           .replaces_state = effect.replaces_state,
       });
+    }
+    const auto args_at = [&entries](size_t i) -> std::vector<std::string>& {
+      return std::get<core::entry::Write>(entries[i].payload).cmd.args;
+    };
+    const auto entry_of = [&placed](size_t effect) -> size_t {
+      return placed.empty() ? effect : placed[effect];
+    };
+    if (!spare.empty()) {
+      for (const Moved& moved : decision.moved) {
+        Spare& copy = spare[moved.request_arg];
+        if (!copy.copy.has_value()) continue;
+        args_at(entry_of(moved.effect))[moved.arg] = *std::move(copy.copy);
+        copy.copy.reset();
+        copy.lent = true;
+      }
+    }
+    uint64_t copied = 0;
+    for (size_t i = 0; i < count; ++i) {
+      const core::Effect& effect = decision.effects[effect_at(i)];
+      std::vector<std::string>& args = args_at(i);
+      for (size_t a = 0; a < args.size(); ++a) {
+        // Filled from a copy made before the locks; an empty one equals
+        // the request's, so copying it again changes nothing.
+        if (!args[a].empty()) {
+          // A lent copy's original was moved into the effect.
+          ABYSS_DCHECK(args[a] == effect.cmd.args[a], "a lent copy differs from its request arg");
+          continue;
+        }
+        args[a] = effect.cmd.args[a];
+        if (IsValueArg(effect.cmd, a)) copied += args[a].size();
+      }
     }
     if (copied > 0) {
       locked_copy_bytes_.fetch_add(copied, std::memory_order_relaxed);
       locked_copy_bytes_metric_.Increment(static_cast<double>(copied));
     }
-    std::vector<queue::ShardEntries> parts;
-    for (size_t slot = 0; slot < shards.size(); ++slot) {
-      if (!entries[slot].empty()) {
-        parts.push_back({.shard = shards[slot], .entries = entries[slot]});
+    // Each slot's run of entries, and where it starts.
+    std::array<queue::ShardEntries, 1> one_part;
+    std::vector<queue::ShardEntries> many_parts;
+    std::vector<size_t> run_start;
+    std::span<const queue::ShardEntries> parts;
+    if (order.empty()) {
+      one_part[0] = {.shard = shards.front(), .entries = entries};
+      parts = one_part;
+    } else {
+      for (size_t i = 0; i < count; ++i) {
+        if (i > 0 && slot_at(i) == slot_at(i - 1)) continue;
+        size_t end = i + 1;
+        while (end < count && slot_at(end) == slot_at(i)) ++end;
+        many_parts.push_back(
+            {.shard = shards[slot_at(i)], .entries = std::span(entries).subspan(i, end - i)});
+        run_start.push_back(i);
       }
+      parts = many_parts;
     }
 
+    phases.Lap(WritePhase::kEntries);
     auto reserved = queue_.Reserve(parts);
+    phases.Lap(WritePhase::kReserve);
     if (!reserved.has_value()) {
       // Nothing was taken from the entries: the copies go back for the
       // next attempt.
       for (const Moved& moved : decision.moved) {
-        const auto [slot, index] = where[moved.effect];
-        if (!taken[moved.effect][moved.arg]) continue;
-        auto& write = std::get<core::entry::Write>(entries[slot][index].payload);
-        spare[moved.request_arg] = std::move(write.cmd.args[moved.arg]);
+        if (spare.empty() || !spare[moved.request_arg].lent) continue;
+        Spare& copy = spare[moved.request_arg];
+        copy.copy = std::move(args_at(entry_of(moved.effect))[moved.arg]);
+        copy.lent = false;
       }
       Restore(std::move(decision), cmd);
       hold->Unlock();
@@ -405,28 +537,43 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
 
     queue::Reservation reservation = *std::move(reserved);
     for (const core::ShardId shard : shards) (*hold)->RaiseAppendedAt(shard, instant);
-    std::vector<std::vector<core::Effect>> by_slot(shards.size());
-    for (size_t e = 0; e < decision.effects.size(); ++e) {
-      by_slot[where[e].first].push_back(std::move(decision.effects[e]));
-    }
-    std::vector<std::vector<core::RespValue>> replies(shards.size());
-    for (const queue::ReservedRange& range : reservation.ranges()) {
-      const size_t slot = SlotOf(shards, range.shard);
-      replies[slot] = (*hold)->ApplyEffects(range.shard, by_slot[slot], range.first, instant);
+    // The reply of the last effect, a single-key command's own.
+    std::optional<core::RespValue> own;
+    if (order.empty()) {
+      const queue::ReservedRange& range = reservation.ranges().front();
+      auto replies = (*hold)->ApplyEffects(range.shard, decision.effects, range.first, instant);
+      own = std::move(replies.back());
+    } else {
+      std::vector<core::Effect> sorted;
+      sorted.reserve(count);
+      for (const uint32_t e : order) sorted.push_back(std::move(decision.effects[e]));
+      const size_t last = entry_of(count - 1);
+      for (const queue::ReservedRange& range : reservation.ranges()) {
+        const auto run = std::ranges::find(many_parts, range.shard, &queue::ShardEntries::shard);
+        const size_t from = run_start[static_cast<size_t>(run - many_parts.begin())];
+        auto replies =
+            (*hold)->ApplyEffects(range.shard, std::span(sorted).subspan(from, run->entries.size()),
+                                  range.first, instant);
+        if (last >= from && last < from + replies.size()) own = std::move(replies[last - from]);
+      }
     }
     // Freed once published: a large free would delay this publish, and
     // the next writer's on the shard waits on it.
     hot::Graveyard replaced = hold->Unlock();
+    phases.Lap(WritePhase::kApply);
 
     const std::vector<queue::ReservedRange> ranges = reservation.ranges();
     queue::DurableFutures futures = queue_.Complete(std::move(reservation));
     replaced = {};
+    phases.Lap(WritePhase::kComplete);
     if (auto durable = AwaitDurable(futures, ranges, deadline, /*flush=*/false); !durable) {
       return std::unexpected(durable.error());
     }
+    phases.Lap(WritePhase::kDurable);
+    phases.Record();
     if (decision.reply.has_value()) return *std::move(decision.reply);
-    const auto [slot, index] = where.back();
-    return std::move(replies[slot][index]);
+    ABYSS_DCHECK(own.has_value(), "no reply for the last effect");
+    return *std::move(own);
   }
 }
 
@@ -444,8 +591,12 @@ core::Result<core::RespValue> Sequencer::Flush() {
     if (redecided.has_value() && core::SteadyClock::now() >= deadline) {
       return TimedOut(*redecided);
     }
+    // Built before the hold, which only swaps them in; built per pass,
+    // so no pass is handed one already moved from.
+    std::vector<hot::FreshMaps> fresh(hot_.shard_count());
+    for (const core::ShardId shard : shards) fresh[shard] = hot_.ReservedMaps(shard);
     const core::WallTime wall = config_.wall_clock();
-    Hold hold(*this, shards);
+    Hold hold(*this, shards, Sampled());
     core::WallTime instant = wall;
     for (const core::ShardId shard : shards) {
       instant = std::max(instant, hold->LastAppendedAt(shard));
@@ -453,9 +604,9 @@ core::Result<core::RespValue> Sequencer::Flush() {
     std::vector<core::QueueEntry> entries(shards.size());
     std::vector<queue::ShardEntries> parts;
     parts.reserve(shards.size());
-    for (const core::ShardId shard : shards) {
-      entries[shard] = core::QueueEntry{.appended_at = instant, .payload = core::entry::Flush{}};
-      parts.push_back({.shard = shard, .entries = std::span(&entries[shard], 1)});
+    for (size_t slot = 0; slot < shards.size(); ++slot) {
+      entries[slot] = core::QueueEntry{.appended_at = instant, .payload = core::entry::Flush{}};
+      parts.push_back({.shard = shards[slot], .entries = std::span(&entries[slot], 1)});
     }
     // With several logs each log's Flushes are one batch: atomic to
     // readers, who hold these locks, but not across a crash.
@@ -496,7 +647,7 @@ core::Result<core::RespValue> Sequencer::Flush() {
     queue::Reservation reservation = *std::move(reserved);
     for (const core::ShardId shard : shards) hold->RaiseAppendedAt(shard, instant);
     for (const queue::ReservedRange& range : reservation.ranges()) {
-      hold->Wipe(range.shard, range.first);
+      hold->Wipe(range.shard, range.first, std::move(fresh[range.shard]));
     }
     hot::Graveyard wiped = hold.Unlock();
 

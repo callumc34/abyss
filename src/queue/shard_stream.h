@@ -208,6 +208,7 @@ class ShardStream {
   metrics::HistogramHandle publish_wait_;
   metrics::GaugeHandle index_gauge_;
   metrics::GaugeHandle ring_gauge_;
+  mutable metrics::CounterHandle read_out_of_range_;
 
   mutable std::mutex append_mu_;
   core::SequenceId next_seq_ ABYSS_GUARDED_BY(append_mu_) = core::kFirstSeq;
