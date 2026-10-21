@@ -71,7 +71,11 @@ target_link_libraries(abyss_hot_hold_cap_tests PRIVATE
   GTest::gtest_main
 )
 
-abyss_discover_tests(abyss_hot_hold_cap_tests "component")
+# Its caps are wall-clock, which ASan and TSan's slowdown makes
+# meaningless; the unit maintenance tests cover the logic there.
+if(NOT ABYSS_SANITIZER MATCHES "^(address|thread)")
+  abyss_discover_tests(abyss_hot_hold_cap_tests "component")
+endif()
 
 add_executable(abyss_component_net_tests
   net/tcp_server_test.cpp

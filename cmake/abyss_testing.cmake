@@ -29,11 +29,17 @@ macro(abyss_discover_slow_tests target labels)
   _abyss_discover_tests_impl(${target} "${labels}\;slow" ${ABYSS_TEST_TIMEOUT_SLOW})
 endmacro()
 
+# A whole suite as one test, which sanitizers slow several times over.
 macro(abyss_add_binary_test target labels)
   add_test(NAME ${target} COMMAND ${target})
+  if(ABYSS_SANITIZER_ACTIVE)
+    set(_abyss_binary_timeout 900)
+  else()
+    set(_abyss_binary_timeout ${ABYSS_TEST_TIMEOUT_SLOW})
+  endif()
   set_tests_properties(${target} PROPERTIES
     LABELS "${labels}"
-    TIMEOUT ${ABYSS_TEST_TIMEOUT_SLOW}
+    TIMEOUT ${_abyss_binary_timeout}
   )
 endmacro()
 
