@@ -71,6 +71,13 @@ class OneBufferRouter : public consumer::CompactionBufferRouter {
                          std::chrono::milliseconds /*timeout*/) override {
     return true;
   }
+  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
+                                                core::SeqWaiterNode& /*node*/) override {
+    return core::Result<void>{};
+  }
+  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+    return false;
+  }
 
  private:
   consumer::CompactionBuffer& buffer_;
@@ -479,6 +486,71 @@ TEST_F(LoaderTest, ConcurrentLoadsShareOneColdReadAndItsError) {
   auto again = loader_.LoadAs(0, "k", KeyType::kSet, Deadline());
   ASSERT_TRUE(again.has_value()) << "a completed load is not reused";
   EXPECT_NE(std::get_if<hot::LoadedFull>(again.value().get()), nullptr);
+}
+
+// Waits, bounded, until shard 0 has no load in flight.
+bool Landed(const Loader& loader) {
+  const auto until = core::SteadyClock::now() + 10s;
+  while (loader.FlightsForTesting(0) > 0) {
+    if (core::SteadyClock::now() >= until) return false;
+    std::this_thread::sleep_for(1ms);
+  }
+  return true;
+}
+
+// The leader lands between a joiner's registration and its wait: the
+// joiner still takes the leader's result, at once.
+TEST_F(LoaderTest, ALandingBeforeTheJoinerWaitsIsNotLost) {
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        entered.Open();
+        release.Wait();
+        return LoadAsResult{core::LoadedAs{
+            core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
+      });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  loader_.SetJoinHookForTesting([&] {
+    release.Open();
+    EXPECT_TRUE(Landed(loader_));
+  });
+  const auto start = core::SteadyClock::now();
+  auto joined = loader_.LoadAs(0, "k", KeyType::kSet, Deadline());
+  EXPECT_LT(core::SteadyClock::now() - start, 5s) << "the landing was lost";
+  ASSERT_TRUE(joined.has_value()) << joined.error().message();
+  EXPECT_NE(std::get_if<hot::LoadedFull>(joined.value().get()), nullptr);
+  EXPECT_EQ(loader_.JoinsForTesting(), 1U);
+  EXPECT_TRUE(leader.get().has_value());
+  EXPECT_EQ(loader_.JoinersForTesting(0), 0U);
+}
+
+TEST_F(LoaderTest, JoinersThatTimeOutLeaveNoneBehind) {
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        entered.Open();
+        // Held across 200 retries, however slow the host.
+        release.Wait(120s);
+        return LoadAsResult{std::optional<core::LoadedAs>{}};
+      });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  for (int i = 0; i < 200; ++i) {
+    const auto joined = loader_.LoadAs(0, "k", KeyType::kSet, core::SteadyClock::now() + 5ms);
+    ASSERT_FALSE(joined.has_value()) << "retry " << i;
+    ASSERT_EQ(joined.error().code(), core::ErrorCode::kTimeout) << "retry " << i;
+    ASSERT_EQ(loader_.JoinersForTesting(0), 0U) << "retry " << i;
+  }
+  release.Open();
+  EXPECT_TRUE(leader.get().has_value());
+  EXPECT_EQ(loader_.FlightsForTesting(0), 0U);
 }
 
 }  // namespace

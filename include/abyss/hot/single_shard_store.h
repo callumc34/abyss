@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -373,6 +374,32 @@ struct LoadCompletion {
   LoadResult result;
 };
 
+// Waits for another caller's load of one key. Owned by whoever
+// registered it; a store holds only a link, on the key's placeholder.
+class LoadWaiter {
+ public:
+  virtual ~LoadWaiter();
+
+  LoadWaiter(const LoadWaiter&) = delete;
+  LoadWaiter& operator=(const LoadWaiter&) = delete;
+  LoadWaiter(LoadWaiter&&) = delete;
+  LoadWaiter& operator=(LoadWaiter&&) = delete;
+
+  // Once, unlinked and outside the shard's lock: ok when the
+  // placeholder ended, kUnavailable when its store went first.
+  virtual void Wake(core::Result<void> result) noexcept = 0;
+
+ protected:
+  LoadWaiter() = default;
+
+ private:
+  friend class SingleShardStore;
+
+  LoadWaiter* prev_ = nullptr;
+  LoadWaiter* next_ = nullptr;
+  bool linked_ = false;
+};
+
 class SingleShardStore {
  public:
   explicit SingleShardStore(SingleShardConfig config);
@@ -487,6 +514,22 @@ class SingleShardStore {
   void AbortLoad(std::string_view key, LoadToken token);
   bool LoadPending(std::string_view key) const;
   size_t PendingLoads() const { return loading_.size(); }
+  // Links `waiter` on `key`'s placeholder, which wakes it when it ends
+  // however it ends; false, and nothing linked, if the key has none.
+  bool AddLoadWaiter(std::string_view key, LoadWaiter& waiter);
+  // True: unlinked, and no wake comes. False: an ended placeholder took
+  // it, and its wake comes.
+  bool CancelLoadWaiter(std::string_view key, LoadWaiter& waiter);
+  // Waiters of placeholders ended since the last call, chained by
+  // next_: the lock holder takes them, then wakes them after unlocking.
+  LoadWaiter* TakeWoken() noexcept { return std::exchange(woken_, nullptr); }
+  // Ends every wait, as for the store's teardown; TakeWoken has them.
+  void EndLoadWaits();
+  // Wakes each of a TakeWoken chain with `result`.
+  static void Wake(LoadWaiter* woken, const core::Result<void>& result) noexcept;
+  // Chain `front` ahead of `back`.
+  static LoadWaiter* Chain(LoadWaiter* front, LoadWaiter* back) noexcept;
+  size_t LoadWaitersForTesting(std::string_view key) const;
   // Whether a stub, and so an existence load, can be held.
   bool RetainsStubs() const { return config_.stub_max_entries > 0; }
 
@@ -678,7 +721,16 @@ class SingleShardStore {
   // What a read hit stamps, as SteadyTime ticks; kNeverRead until the
   // first SetAccessTime, so a read stamps nothing.
   std::atomic<core::SteadyTime::rep> access_now_{kNeverRead};
-  core::StringMap<LoadToken> loading_;
+  struct Loading {
+    LoadToken token;
+    LoadWaiter* waiters = nullptr;
+  };
+  // Hands the placeholder's waiters to woken_, then erases it.
+  void EndLoad(core::StringMap<Loading>::iterator it) noexcept;
+  void EndWaits(Loading& loading) noexcept;
+
+  core::StringMap<Loading> loading_;
+  LoadWaiter* woken_ = nullptr;
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
   // Keys installed as absent, oldest first, in their own FIFO so they

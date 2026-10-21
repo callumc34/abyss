@@ -113,7 +113,7 @@ class Log {
   // Copies `frame` (one EncodeEntry output, sized to the reservation)
   // to dst after its commit word, then CommitInPlace.
   void Commit(const Reservation& reservation, std::span<const std::byte> frame);
-  // Spins, then yields, until the filled prefix reaches `end`.
+  // Spins, yields, then parks until the filled prefix reaches `end`.
   void AwaitFilled(LogPosition end) const;
 
   // End of every reservation so far, seq_cst; at least FilledPrefix().
@@ -179,6 +179,13 @@ class Log {
 
   void Shutdown();
 
+  // WaitForSpare's waiters, and a hook it runs before it registers.
+  std::size_t SpareWaitersForTesting() const noexcept;
+  void SetSpareWaitHookForTesting(std::function<void()> hook);
+  // AwaitFilled's parked waiters, and a hook each runs just before it
+  // parks.
+  uint32_t FillParkedForTesting() const noexcept;
+  void SetFillParkHookForTesting(std::function<void()> hook);
   // While paused the preparer prepares no spares and retries nothing.
   void PausePreparerForTesting();
   void ResumePreparerForTesting();

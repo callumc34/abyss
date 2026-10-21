@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <condition_variable>
 #include <functional>
-#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -27,15 +26,18 @@ class MockQueue : public core::Queue {
   MockQueue() {
     // Permissive durability defaults so tests that don't care about the A1
     // watermark keep compiling and passing: DurableEnd reports "everything
-    // durable" and AwaitDurable always succeeds. Tests exercising durability
-    // override these with EXPECT_CALL/ON_CALL.
+    // durable" and AwaitDurable succeeds but for reservations held or
+    // failed below. Tests exercising durability override these with
+    // EXPECT_CALL/ON_CALL.
     using ::testing::_;
     using ::testing::Return;
     ON_CALL(*this, AckDurability()).WillByDefault(Return(core::Durability::kProcessCrash));
     ON_CALL(*this, DurableEnd(_, _))
         .WillByDefault(
             Return(core::Result<core::SequenceId>(std::numeric_limits<core::SequenceId>::max())));
-    ON_CALL(*this, AwaitDurable(_, _, _, _)).WillByDefault(Return(core::Result<bool>(true)));
+    ON_CALL(*this, AwaitDurable(_, _, _, _))
+        .WillByDefault([this](core::ShardId shard, core::SequenceId seq, core::Durability,
+                              core::Duration timeout) { return FakeDurable(shard, seq, timeout); });
     ON_CALL(*this, Admit(_, _)).WillByDefault(Return(core::Result<void>{}));
     ON_CALL(*this, WaitForSpare(_, _)).WillByDefault(Return(true));
   }
@@ -78,8 +80,8 @@ class MockQueue : public core::Queue {
   MOCK_METHOD(bool, WaitForSpare, (core::ShardId shard, core::SteadyTime deadline), (override));
 
   // In memory: seqs per shard from kFirstSeq, each shard published in seq
-  // order, durable futures ready unless HoldDurable. It takes every
-  // entry, as a queue may the ones it fills in Complete.
+  // order, durable unless held or failed. It takes every entry, as a
+  // queue may the ones it fills in Complete.
   core::Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) override {
     ABYSS_DCHECK(queue::ReservationsHeld() == 0, "reservation by a thread holding one");
     const std::scoped_lock lock(fake_->mu);
@@ -87,7 +89,6 @@ class MockQueue : public core::Queue {
       if (auto fault = fake_->reserve_fault(parts)) return std::unexpected(std::move(*fault));
     }
     std::vector<queue::ReservedRange> ranges;
-    queue::DurableFutures durable;
     auto filler = std::make_unique<FakeFiller>(fake_);
     for (const queue::ShardEntries& part : parts) {
       FakeShard& shard = fake_->shards[part.shard];
@@ -98,17 +99,13 @@ class MockQueue : public core::Queue {
       }
       ranges.push_back({.shard = part.shard, .first = first, .last = shard.next - 1});
       filler->parts.push_back(ranges.back());
-      std::promise<core::Result<void>> promise;
-      durable.push_back({.shard = part.shard, .durable = promise.get_future()});
-      if (fake_->durable_error.has_value()) {
-        promise.set_value(std::unexpected(*fake_->durable_error));
-      } else if (fake_->hold_durable) {
-        fake_->held.push_back(std::move(promise));
-      } else {
-        promise.set_value({});
+      if (fake_->durable_error.has_value() && !shard.fail_from.has_value()) {
+        shard.fail_from = first;
+      } else if (fake_->hold_durable && !shard.hold_from.has_value()) {
+        shard.hold_from = first;
       }
     }
-    return queue::Reservation(std::move(ranges), std::move(durable), std::move(filler));
+    return queue::Reservation(std::move(ranges), std::move(filler));
   }
 
   uint32_t LogOf(core::ShardId shard) const override { return shard % log_count_; }
@@ -122,7 +119,7 @@ class MockQueue : public core::Queue {
     return Reserve(parts);
   }
 
-  queue::DurableFutures Complete(queue::Reservation&& reservation) override {
+  std::vector<queue::ReservedRange> Complete(queue::Reservation&& reservation) override {
     queue::Reservation owned = std::move(reservation);
     std::function<void()> hook;
     {
@@ -144,24 +141,23 @@ class MockQueue : public core::Queue {
     const std::scoped_lock lock(fake_->mu);
     fake_->reserve_fault = std::move(fault);
   }
-  // Durable futures of later reservations resolve with `error`.
+  // AwaitDurable on later reservations' seqs fails with `error`.
   void FailDurable(core::Error error) {
     const std::scoped_lock lock(fake_->mu);
     fake_->durable_error = std::move(error);
   }
-  // Durable futures of later reservations stay pending until released.
+  // AwaitDurable on later reservations' seqs waits until released.
   void HoldDurable() {
     const std::scoped_lock lock(fake_->mu);
     fake_->hold_durable = true;
   }
   void ReleaseDurable() {
-    std::vector<std::promise<core::Result<void>>> held;
     {
       const std::scoped_lock lock(fake_->mu);
       fake_->hold_durable = false;
-      held.swap(fake_->held);
+      for (auto& [id, shard] : fake_->shards) shard.hold_from.reset();
     }
-    for (auto& promise : held) promise.set_value({});
+    fake_->durable_cv.notify_all();
   }
   // Entries Complete published on `shard`, in seq order.
   std::vector<core::QueueEntry> Published(core::ShardId shard) const {
@@ -190,15 +186,18 @@ class MockQueue : public core::Queue {
     core::SequenceId next = core::kFirstSeq;
     // The entry at seq s is at s - kFirstSeq.
     std::vector<core::QueueEntry> published;
+    // Seqs from these on are held, or fail with durable_error.
+    std::optional<core::SequenceId> hold_from;
+    std::optional<core::SequenceId> fail_from;
   };
   struct FakeLog {
     mutable std::mutex mu;
     std::condition_variable published_cv;
+    std::condition_variable durable_cv;
     std::map<core::ShardId, FakeShard> shards;
     bool hold_durable = false;
     std::optional<core::Error> durable_error;
     std::function<void()> on_complete;
-    std::vector<std::promise<core::Result<void>>> held;
     std::function<std::optional<core::Error>(std::span<const queue::ShardEntries>)> reserve_fault;
   };
   class FakeFiller final : public queue::ReservationFiller {
@@ -227,6 +226,18 @@ class MockQueue : public core::Queue {
    private:
     std::shared_ptr<FakeLog> log_;
   };
+
+  core::Result<bool> FakeDurable(core::ShardId id, core::SequenceId seq, core::Duration timeout) {
+    std::unique_lock lock(fake_->mu);
+    FakeShard& shard = fake_->shards[id];
+    if (shard.fail_from.has_value() && seq >= *shard.fail_from &&
+        fake_->durable_error.has_value()) {
+      return std::unexpected(*fake_->durable_error);
+    }
+    return fake_->durable_cv.wait_for(lock, timeout, [&shard, seq] {
+      return !shard.hold_from.has_value() || seq < *shard.hold_from;
+    });
+  }
 
   std::shared_ptr<FakeLog> fake_ = std::make_shared<FakeLog>();
   uint32_t log_count_ = 1;

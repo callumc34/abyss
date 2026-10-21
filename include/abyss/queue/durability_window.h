@@ -2,14 +2,12 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <mutex>
 
 #include "abyss/core/result.h"
-#include "abyss/core/thread_annotations.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/metrics/metrics.h"
 
 namespace abyss::queue {
@@ -54,30 +52,39 @@ class DurabilityWindow {
   // kUnavailable on Shutdown. A deadline already past checks once,
   // uncounted.
   core::Result<void> Admit(const LogAge& age, Clock::time_point deadline);
+  // Admit's lock-free check, which its waiters make again.
+  bool Admissible(const LogAge& age) const noexcept;
+  // Admit's waiters, for one that registers itself. Its condition is
+  // stopped() || Admissible(age).
+  core::WaitList& admission() noexcept { return admission_; }
+  bool stopped() const noexcept { return stopped_.load(std::memory_order_seq_cst); }
 
   // Entry frame bytes: after Reserve, before Commit.
   void Add(uint64_t bytes) noexcept;
   // After a flush, once the log's age is updated. Wakes waiters.
   void Release(uint64_t bytes) noexcept;
+  // Fails every admission wait, now and later, with kUnavailable.
   void Shutdown();
 
   uint64_t UnflushedBytes() const noexcept {
     return unflushed_bytes_.load(std::memory_order_acquire);
   }
 
- private:
-  bool Admissible(const LogAge& age) const noexcept;
+  // Runs in Admit between its check and its wait.
+  void SetAdmitHookForTesting(std::function<void()> hook) { admit_hook_ = std::move(hook); }
 
+ private:
   const uint64_t max_bytes_;
   const Clock::duration max_age_;
   std::atomic<uint64_t> unflushed_bytes_{0};
-  std::atomic<uint64_t> waiters_{0};
+  std::atomic<bool> stopped_{false};
   metrics::CounterHandle waits_;
   metrics::CounterHandle rejections_;
-
-  std::mutex mu_;
-  std::condition_variable cv_;
-  bool stopped_ ABYSS_GUARDED_BY(mu_) = false;
+  // Every waiter on a log tests the same bytes and age, never its own
+  // size, so none passes a head that fails. A wait ends by admit_by,
+  // as kResourceExhausted and a rejection counted.
+  core::WaitList admission_;
+  std::function<void()> admit_hook_;
 };
 
 }  // namespace abyss::queue

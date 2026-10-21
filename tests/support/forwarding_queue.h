@@ -54,7 +54,7 @@ class ForwardingQueue : public core::Queue {
     return queue_.ReserveFlush(parts);
   }
   uint32_t LogOf(core::ShardId shard) const override { return queue_.LogOf(shard); }
-  queue::DurableFutures Complete(queue::Reservation&& reservation) override {
+  std::vector<queue::ReservedRange> Complete(queue::Reservation&& reservation) override {
     return queue_.Complete(std::move(reservation));
   }
   core::Result<std::vector<core::QueueEntry>> Read(core::ShardId shard, core::SequenceId from_seq,

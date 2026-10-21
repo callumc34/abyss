@@ -49,6 +49,13 @@ class NoBuffers : public consumer::CompactionBufferRouter {
                          std::chrono::milliseconds /*timeout*/) override {
     return true;
   }
+  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
+                                                core::SeqWaiterNode& /*node*/) override {
+    return core::Result<void>{};
+  }
+  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+    return false;
+  }
 };
 
 std::filesystem::path TempPath(std::string_view name) {

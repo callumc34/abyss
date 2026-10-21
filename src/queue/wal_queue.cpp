@@ -482,6 +482,14 @@ const ShardStream& WalQueue::StreamForTesting(core::ShardId shard) const {
   return *streams_.at(shard);
 }
 
+void WalQueue::SetDurableWaitHookForTesting(const std::function<void()>& hook) {
+  for (auto& stream : streams_) stream->SetDurableWaitHookForTesting(hook);
+}
+
+void WalQueue::SetPublishParkHookForTesting(core::ShardId shard, std::function<void()> hook) {
+  streams_.at(shard)->SetParkHookForTesting(std::move(hook));
+}
+
 std::optional<uint64_t> WalQueue::PositionForTesting(core::ShardId shard,
                                                      core::SequenceId seq) const {
   return streams_.at(shard)->RingPositionForTesting(seq);
@@ -680,7 +688,7 @@ core::Result<Reservation> WalQueue::ReserveFlush(std::span<const ShardEntries> p
   return ShardStream::Reserve(groups);
 }
 
-DurableFutures WalQueue::Complete(Reservation&& reservation) {
+std::vector<ReservedRange> WalQueue::Complete(Reservation&& reservation) {
   Reservation owned = std::move(reservation);
   return owned.Finish();
 }
@@ -805,6 +813,18 @@ core::Result<bool> WalQueue::AwaitDurable(core::ShardId shard, core::SequenceId 
                                           core::Durability durability, core::Duration timeout) {
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
   return streams_[shard]->AwaitDurable(seq, durability, timeout);
+}
+
+std::optional<core::Result<void>> WalQueue::WhenDurable(core::ShardId shard,
+                                                        core::Durability durability,
+                                                        core::SeqWaiterNode& node) {
+  if (auto v = ValidateShard(shard); !v.has_value()) return v;
+  return streams_[shard]->WhenDurable(durability, node);
+}
+
+bool WalQueue::CancelDurable(core::ShardId shard, core::Durability durability,
+                             core::SeqWaiterNode& node) noexcept {
+  return shard < streams_.size() && streams_[shard]->CancelDurable(durability, node);
 }
 
 core::Result<core::SequenceId> WalQueue::FirstSeq(core::ShardId shard) {

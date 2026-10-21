@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -52,6 +54,21 @@ LoadToken MustBeginLoad(ShardedHotStore& store, std::string_view key) {
   EXPECT_TRUE(start.started()) << "no load token for " << key;
   return start.token_if_started().value_or(LoadToken{});
 }
+
+// Counts its wakes, as a registered task would be resumed.
+class CountingLoadWaiter final : public LoadWaiter {
+ public:
+  void Wake(core::Result<void> result) noexcept override {
+    last_ok_.store(result.has_value());
+    wakes_.fetch_add(1);
+  }
+  int wakes() const { return wakes_.load(); }
+  bool last_ok() const { return last_ok_.load(); }
+
+ private:
+  std::atomic<int> wakes_{0};
+  std::atomic<bool> last_ok_{false};
+};
 
 class ResidencyTest : public ::testing::Test {
  protected:
@@ -1133,6 +1150,83 @@ TEST_F(ShardedResidencyTest, AwaitLoadWakesOnWipe) {
   ASSERT_TRUE(store_.BeginLoad("k").started());
   const auto shard = core::ComputeShard("k", store_.shard_count());
   ExpectAwaitWakes("k", [&] { EXPECT_TRUE(store_.Wipe(shard, 4).has_value()); });
+}
+
+// Each placeholder holds its own key's waiters: ending one wakes them
+// and no other key's.
+TEST_F(ShardedResidencyTest, EndingALoadWakesOnlyItsKeysWaiters) {
+  constexpr int kOthers = 100;
+  std::vector<std::string> others;
+  std::vector<LoadToken> tokens;
+  std::vector<std::unique_ptr<CountingLoadWaiter>> waiting;
+  for (int i = 0; i < kOthers; ++i) {
+    others.push_back("p" + std::to_string(i));
+    tokens.push_back(MustBeginLoad(store_, others.back()));
+    waiting.push_back(std::make_unique<CountingLoadWaiter>());
+    ASSERT_TRUE(store_.WhenLoaded(others.back(), *waiting.back()));
+  }
+  const LoadToken token = MustBeginLoad(store_, "k");
+  CountingLoadWaiter on_k;
+  ASSERT_TRUE(store_.WhenLoaded("k", on_k));
+  ASSERT_EQ(store_.LoadWaitersForTesting("k"), 1U);
+
+  EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedAbsent{}));
+  EXPECT_EQ(on_k.wakes(), 1);
+  EXPECT_TRUE(on_k.last_ok());
+  for (int i = 0; i < kOthers; ++i) {
+    EXPECT_EQ(waiting[i]->wakes(), 0) << others[i];
+    EXPECT_EQ(store_.LoadWaitersForTesting(others[i]), 1U) << others[i];
+  }
+  EXPECT_FALSE(store_.WhenLoaded("k", on_k)) << "no load is in flight";
+
+  for (int i = 0; i < kOthers; ++i) store_.AbortLoad(others[i], tokens[i]);
+  for (const auto& waiter : waiting) EXPECT_EQ(waiter->wakes(), 1);
+}
+
+// A hold that ends a placeholder wakes its waiters once it unlocks.
+TEST_F(ShardedResidencyTest, AHoldWakesTheWaitersItEndedAfterUnlocking) {
+  const LoadToken token = MustBeginLoad(store_, "k");
+  const std::array<core::ShardId, 1> held{core::ComputeShard("k", store_.shard_count())};
+  auto locks = store_.LockExclusive(held);
+  ASSERT_EQ(locks.BeginLoad("k").status, LoadStart::Status::kPending);
+  CountingLoadWaiter waiter;
+  ASSERT_TRUE(locks.WhenLoaded("k", waiter));
+  locks.AbortLoad("k", token);
+  EXPECT_EQ(waiter.wakes(), 0) << "woken under the lock";
+  locks.Unlock();
+  EXPECT_EQ(waiter.wakes(), 1);
+  EXPECT_TRUE(waiter.last_ok());
+}
+
+// A load ending between the caller's sight of it and AwaitLoad's
+// registration is seen at the registration.
+TEST_F(ShardedResidencyTest, ALoadEndingBetweenTheCheckAndTheWaitIsNotLost) {
+  const LoadToken token = MustBeginLoad(store_, "k");
+  store_.SetLoadWaitHookForTesting(
+      [&] { EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedAbsent{})); });
+  const auto start = core::SteadyClock::now();
+  EXPECT_TRUE(store_.AwaitLoad("k", start + 10s));
+  EXPECT_LT(core::SteadyClock::now() - start, 5s) << "the end of the load was lost";
+  store_.SetLoadWaitHookForTesting(nullptr);
+}
+
+TEST_F(ShardedResidencyTest, RetriesOnTimeoutLeaveNoLoadWaiters) {
+  const LoadToken token = MustBeginLoad(store_, "k");
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_FALSE(store_.AwaitLoad("k", core::SteadyClock::now() + 5ms)) << "retry " << i;
+    ASSERT_EQ(store_.LoadWaitersForTesting("k"), 0U) << "retry " << i;
+  }
+  store_.AbortLoad("k", token);
+}
+
+TEST(ShardedResidencyTeardownTest, TheStoresTeardownWakesItsLoadWaitersUnavailable) {
+  auto store = std::make_unique<ShardedHotStore>(ShardedHotStoreConfig{.shard_count = 2});
+  ASSERT_TRUE(store->BeginLoad("k").started());
+  CountingLoadWaiter waiter;
+  ASSERT_TRUE(store->WhenLoaded("k", waiter));
+  store.reset();
+  EXPECT_EQ(waiter.wakes(), 1);
+  EXPECT_FALSE(waiter.last_ok());
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadTimesOutWhileTheLoadIsPending) {

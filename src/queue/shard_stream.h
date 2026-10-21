@@ -2,7 +2,6 @@
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -18,6 +17,7 @@
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/metrics.h"
@@ -110,16 +110,26 @@ class ShardStream {
   core::SequenceId next_seq() const;
   core::SequenceId first_seq() const noexcept { return first_seq_.load(std::memory_order_acquire); }
   core::SequenceId DurableEnd(core::Durability durability) const noexcept;
-  bool AwaitDurable(core::SequenceId seq, core::Durability durability,
-                    core::Duration timeout) const;
+  // SeqWaiters::Register on `durability`'s list, whose waiters fail
+  // kUnavailable once the stream stops: process_crash's at Shutdown,
+  // power_loss's at CommitterStopped, after the final flush.
+  std::optional<core::Result<void>> WhenDurable(core::Durability durability,
+                                                core::SeqWaiterNode& node);
+  bool CancelDurable(core::Durability durability, core::SeqWaiterNode& node) noexcept;
+  // True once `seq` is durable, false at the timeout, kUnavailable
+  // once that class's waiters failed.
+  core::Result<bool> AwaitDurable(core::SequenceId seq, core::Durability durability,
+                                  core::Duration timeout);
+  std::size_t DurableWaitersForTesting(core::Durability durability) const noexcept {
+    return Waiters(durability).size();
+  }
 
   // Commit thread, in the flush walk, before the log's durable prefix
   // moves: a batch that ends this shard's seqs at `end` is durable. True
   // iff that moved the power end, which never passes the published end.
   bool Durable(core::SequenceId end) noexcept;
-  // After the power end moved: resolves append futures below it and
-  // wakes its waiters.
-  void PowerAdvanced();
+  // After the power end moved: wakes its waiters below it.
+  void PowerAdvanced() noexcept;
 
   // Retention, under the unit's reclaim_mu: a segment of this log was
   // reclaimed. `max_seq` is this shard's highest seq in it, if any;
@@ -131,11 +141,10 @@ class ShardStream {
 
   std::size_t index_points() const;
 
-  // Stops admission and wakes readers.
+  // Stops admission and fails process_crash waiters.
   void Shutdown();
   bool stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
-  // After the committer stopped: what still waits resolves
-  // kUnavailable.
+  // After the committer stopped: power_loss waiters fail kUnavailable.
   void CommitterStopped();
 
   core::ShardId shard() const noexcept { return config_.shard; }
@@ -148,6 +157,16 @@ class ShardStream {
   }
   // Frames header-read while locating seqs off the ring.
   uint64_t SkippedForTesting() const noexcept { return skipped_.load(std::memory_order_relaxed); }
+  // Publishers parked in AwaitPublished, or about to park.
+  uint32_t PublishParkedForTesting() const noexcept {
+    return publish_parked_.load(std::memory_order_seq_cst);
+  }
+  // Runs in AwaitPublished just before a publisher parks.
+  void SetParkHookForTesting(std::function<void()> hook) { park_hook_ = std::move(hook); }
+  // Runs in AwaitDurable between its check of the end and its wait.
+  void SetDurableWaitHookForTesting(std::function<void()> hook) {
+    durable_wait_hook_ = std::move(hook);
+  }
 
  private:
   struct Slot {
@@ -177,20 +196,29 @@ class ShardStream {
   // `locked` counts the bytes encoded under the caller's locks so far.
   static core::Result<std::unique_ptr<ReservationFiller>> ReserveLocked(
       const LogParts& group, uint64_t total, std::size_t& locked,
-      std::vector<ReservedRange>& ranges, DurableFutures& durable) ABYSS_NO_THREAD_SAFETY_ANALYSIS;
+      std::vector<ReservedRange>& ranges) ABYSS_NO_THREAD_SAFETY_ANALYSIS;
 
   Log& log() const noexcept { return *config_.unit->log; }
 
   core::Result<Begun> Begin(std::span<core::QueueEntry> entries, core::SteadyTime admit_by);
   void Record(core::SequenceId seq, LogPosition pos, uint32_t size) ABYSS_REQUIRES(append_mu_);
-  DurabilityFuture WhenPowerDurable(core::SequenceId seq);
+  // An append's future, resolved by power_waiters_.
+  DurabilityFuture PowerDurableFuture(core::SequenceId last);
   // Until every seq below `first` is published.
   void AwaitPublished(core::SequenceId first) noexcept;
   // Complete's publish of [first, end).
   void PublishInOrder(core::SequenceId first, core::SequenceId end) noexcept;
-  void WakeReaders() const noexcept;
-  void Published(LogPosition end_pos) noexcept;
-  bool WaitForEnd(core::SequenceId seq, core::Durability durability, core::Duration timeout) const;
+  // After published_end_ moved to `end`: wakes what waits on it.
+  void WakePublished(core::SequenceId end) noexcept;
+  core::SeqWaiters& Waiters(core::Durability durability) noexcept {
+    return durability == core::Durability::kPowerLoss ? power_waiters_ : published_waiters_;
+  }
+  const core::SeqWaiters& Waiters(core::Durability durability) const noexcept {
+    return durability == core::Durability::kPowerLoss ? power_waiters_ : published_waiters_;
+  }
+  const std::atomic<core::SequenceId>& EndOf(core::Durability durability) const noexcept {
+    return durability == core::Durability::kPowerLoss ? power_end_ : published_end_;
+  }
 
   // True iff it moved the power end.
   bool RaisePowerEnd() noexcept;
@@ -230,23 +258,18 @@ class ShardStream {
   // Exclusive ends, so an empty stream's are kFirstSeq.
   std::atomic<core::SequenceId> first_seq_{core::kFirstSeq};
   std::atomic<core::SequenceId> published_end_{core::kFirstSeq};
+  // Beside the end each publish stores: AwaitPublished's parked
+  // publishers, Dekker-counted so a publish notifies only when one is.
+  std::atomic<uint32_t> publish_parked_{0};
   // Batch ends the flush walk has found durable, published or not.
   std::atomic<core::SequenceId> flushed_end_{core::kFirstSeq};
   std::atomic<core::SequenceId> power_end_{core::kFirstSeq};
 
-  // Readers of published_end_, Dekker-counted so a publish notifies
-  // only when someone waits.
-  mutable std::mutex read_mu_;
-  mutable std::condition_variable read_cv_;
-  mutable std::atomic<uint32_t> readers_waiting_{0};
-
-  mutable std::mutex power_mu_;
-  mutable std::condition_variable power_cv_;
-  mutable uint32_t power_waiting_ ABYSS_GUARDED_BY(power_mu_) = 0;
-  bool committer_stopped_ ABYSS_GUARDED_BY(power_mu_) = false;
-  // Seq order: registered under the append lock.
-  std::deque<std::pair<core::SequenceId, std::promise<core::Result<void>>>> futures_
-      ABYSS_GUARDED_BY(power_mu_);
+  // Waiters on published_end_ and on power_end_.
+  core::SeqWaiters published_waiters_;
+  core::SeqWaiters power_waiters_;
+  std::function<void()> park_hook_;
+  std::function<void()> durable_wait_hook_;
 
   std::optional<core::SequenceId> recovered_first_;
   std::optional<core::SequenceId> recovered_next_;

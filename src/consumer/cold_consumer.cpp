@@ -76,6 +76,9 @@ ColdConsumer::ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core
   flush_heap_depth_ = reg.Gauge(metrics::names::kColdFlushHeapDepth);
 }
 
+// Only failing the drained waits can throw here, on allocation, and an
+// OOM at teardown may terminate.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 ColdConsumer::~ColdConsumer() { Stop(); }
 
 void ColdConsumer::Start() {
@@ -105,9 +108,11 @@ void ColdConsumer::RequestStopAndDrain(std::chrono::steady_clock::time_point dea
 }
 
 void ColdConsumer::Join() {
-  if (!running_.load(std::memory_order_acquire)) return;
-  if (thread_.joinable()) thread_.join();
-  running_.store(false, std::memory_order_release);
+  if (running_.load(std::memory_order_acquire)) {
+    if (thread_.joinable()) thread_.join();
+    running_.store(false, std::memory_order_release);
+  }
+  drained_waiters_.FailAll(core::Error{core::ErrorCode::kUnavailable, "cold consumer stopped"});
 }
 
 void ColdConsumer::Stop() {
@@ -258,12 +263,13 @@ core::Result<void> ColdConsumer::SeedCursor() {
   auto committed = queue_.CommittedOffset(core::kColdConsumer, shard_);
   if (!committed.has_value()) return std::unexpected(committed.error());
   committed_ = *committed;
-  if (committed_.has_value()) {
-    next_read_seq_ = *committed_ + 1;
-    if (*committed_ > latest_drained_seq_.load(std::memory_order_acquire)) {
-      latest_drained_seq_.store(*committed_, std::memory_order_release);
+  if (const auto seeded = *committed; seeded.has_value()) {
+    next_read_seq_ = *seeded + 1;
+    if (*seeded > latest_drained_seq_.load(std::memory_order_acquire)) {
+      latest_drained_seq_.store(*seeded, std::memory_order_seq_cst);
+      NotifyDrained();
     }
-    last_commit_seq_.store(*committed_, std::memory_order_release);
+    last_commit_seq_.store(*seeded, std::memory_order_release);
   }
   cursor_seeded_ = true;
   return {};
@@ -299,7 +305,7 @@ size_t ColdConsumer::ConsumeBatch(std::span<const core::QueueEntry> batch) {
     const core::SequenceId poison = oldest_poison_seq_.load(std::memory_order_acquire);
     core::SequenceId frontier = entry.seq;
     if (poison != kNoPoison) frontier = std::min(entry.seq, poison - 1);
-    latest_drained_seq_.store(frontier, std::memory_order_release);
+    latest_drained_seq_.store(frontier, std::memory_order_seq_cst);
     ++consumed;
   }
   return consumed;
@@ -467,7 +473,7 @@ bool ColdConsumer::HandleFlush(const core::QueueEntry& entry) {
     last_checkpointed_seq_.store(entry.seq, std::memory_order_release);
     highest_applied_uncheckpointed_seq_.store(entry.seq, std::memory_order_release);
   }
-  latest_drained_seq_.store(entry.seq, std::memory_order_release);
+  latest_drained_seq_.store(entry.seq, std::memory_order_seq_cst);
   NotifyDrained();
 
   // The Flush entry is power-durable, a replayed Flush re-wipes this
@@ -875,28 +881,30 @@ void ColdConsumer::TryAdvanceCommit(bool force_checkpoint) {
 
 bool ColdConsumer::WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout) {
   if (latest_drained_seq_.load(std::memory_order_acquire) >= target) return true;
+  RequestDrain();
+  if (drained_wait_hook_) drained_wait_hook_();
+  return drained_waiters_.AwaitEnd(latest_drained_seq_, target - 1, timeout).has_value();
+}
 
-  // Ask the loop to drain now rather than finish its idle backoff, which may be
-  // an order of magnitude longer than this wait's deadline.
+std::optional<core::Result<void>> ColdConsumer::WhenDrained(core::SeqWaiterNode& node) {
+  if (latest_drained_seq_.load(std::memory_order_acquire) > node.seq()) return core::Result<void>{};
+  RequestDrain();
+  return drained_waiters_.Register(node, latest_drained_seq_);
+}
+
+// Asks the loop to drain now rather than finish its idle backoff, which
+// may be an order of magnitude longer than a waiter's deadline.
+void ColdConsumer::RequestDrain() {
   {
     const std::scoped_lock wake_lock(stop_mu_);
     drain_wake_requested_.store(true, std::memory_order_release);
   }
   stop_cv_.notify_all();
-
-  std::unique_lock lock(drain_wait_mu_);
-  return drain_wait_cv_.wait_for(lock, timeout, [this, target] {
-    return latest_drained_seq_.load(std::memory_order_acquire) >= target;
-  });
 }
 
-void ColdConsumer::NotifyDrained() {
-  // Take and release the wait mutex so a waiter sitting between its predicate
-  // check and entering wait() cannot miss this wakeup, then notify.
-  {
-    const std::scoped_lock lock(drain_wait_mu_);
-  }
-  drain_wait_cv_.notify_all();
+// The drained seq was stored seq_cst; Advance loads the waiter count.
+void ColdConsumer::NotifyDrained() noexcept {
+  drained_waiters_.Advance(latest_drained_seq_.load(std::memory_order_seq_cst));
 }
 
 ColdConsumer::Metrics ColdConsumer::Snapshot() const {

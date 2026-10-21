@@ -5,6 +5,8 @@
 #include <string_view>
 
 #include "abyss/consumer/compacted_state.h"
+#include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
 
 namespace abyss::consumer {
@@ -27,6 +29,12 @@ class CompactionBufferRouter {
   // or `timeout` elapses. Returns true on catch-up, false on timeout.
   virtual bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                                  std::chrono::milliseconds timeout) = 0;
+  // Registers `node`, posted once the shard has drained past its seq,
+  // so through seq + 1: SeqWaiters::Register. kUnavailable once the
+  // shard's consumer stopped.
+  virtual std::optional<core::Result<void>> WhenDrained(core::ShardId shard,
+                                                        core::SeqWaiterNode& node) = 0;
+  virtual bool CancelDrained(core::ShardId shard, core::SeqWaiterNode& node) noexcept = 0;
 };
 
 }  // namespace abyss::consumer

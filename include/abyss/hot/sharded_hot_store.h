@@ -1,7 +1,6 @@
 #pragma once
 
 #include <array>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -53,8 +52,9 @@ class ShardedHotStore;
 
 // An exclusive hold on a set of hot shards, and everything the
 // sequencer may do under it. Ending the hold (Unlock or destruction)
-// releases the locks, then wakes load waiters; what its applies
-// replaced is freed after the locks too, by Unlock's caller.
+// releases the locks, then wakes the waiters of loads it ended; what
+// its applies replaced is freed after the locks too, by Unlock's
+// caller.
 class ShardLocks {
  public:
   ShardLocks(ShardLocks&& other) noexcept;
@@ -66,6 +66,9 @@ class ShardLocks {
   // `key`'s shard must be held. Expiry is judged at `now_ms`.
   KeyView View(std::string_view key, uint64_t now_ms) const;
   LoadStart BeginLoad(std::string_view key);
+  // For BeginLoad's kPending: links `waiter` on that load, woken when
+  // it ends; false if `key` has no load in flight.
+  bool WhenLoaded(std::string_view key, LoadWaiter& waiter);
   // SingleShardStore::CompleteLoads: no eviction, no stub drop.
   size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
   void AbortLoad(std::string_view key, LoadToken token);
@@ -90,14 +93,11 @@ class ShardLocks {
   // The held shard's position in shards_.
   size_t Slot(core::ShardId shard) const;
   SingleShardStore& Store(core::ShardId shard) const;
-  // Marks `shard` for a load-cv wake if its loads changed.
-  void NoteLoads(core::ShardId shard, size_t before);
 
   ShardedHotStore* hot_;
   std::vector<core::ShardId> shards_;
   // Each shard's cold drained seq, read once the locks were held.
   std::vector<core::SequenceId> horizons_;
-  std::vector<bool> wake_;
   Graveyard graveyard_;
   bool held_ = false;
 };
@@ -191,8 +191,16 @@ class ShardedHotStore : public core::HotStore {
   // SingleShardStore::CompleteLoads on `shard`, in one exclusive hold.
   size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
   void AbortLoad(std::string_view key, LoadToken token);
+  // Links `waiter` on `key`'s load in flight, woken when it ends; false
+  // if there is none. The store's teardown wakes it kUnavailable.
+  bool WhenLoaded(std::string_view key, LoadWaiter& waiter);
+  // SingleShardStore::CancelLoadWaiter, under the shard's lock.
+  bool CancelLoadWait(std::string_view key, LoadWaiter& waiter);
   // Waits until `key` has no load in flight; false at the deadline.
   bool AwaitLoad(std::string_view key, core::SteadyTime deadline);
+  size_t LoadWaitersForTesting(std::string_view key);
+  // Runs in AwaitLoad before it looks for the load.
+  void SetLoadWaitHookForTesting(std::function<void()> hook) { load_wait_hook_ = std::move(hook); }
   bool LoadPending(std::string_view key);
   bool RetainsStubs() const { return shards_.front()->store.RetainsStubs(); }
   // SingleShardStore::ReservedMaps: it takes no lock.
@@ -253,8 +261,6 @@ class ShardedHotStore : public core::HotStore {
   struct Shard {
     mutable std::shared_mutex mutex;
     SingleShardStore store;
-    // Signalled when a load placeholder may have gone.
-    std::condition_variable_any load_cv;
 
     explicit Shard(SingleShardConfig config) : store(std::move(config)) {}
   };
@@ -293,6 +299,7 @@ class ShardedHotStore : public core::HotStore {
   metrics::HistogramHandle rehash_seconds_;
   HoldObserver hold_observer_;
   WriteHoldObserver write_hold_observer_;
+  std::function<void()> load_wait_hook_;
   // The TTL pass's place in its sweep of the shards.
   std::mutex ttl_mu_;
   core::ShardId ttl_next_shard_ ABYSS_GUARDED_BY(ttl_mu_) = 0;

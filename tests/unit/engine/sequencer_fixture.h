@@ -20,6 +20,7 @@
 
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/cold_store.h"
+#include "abyss/core/fatal.h"
 #include "abyss/core/predicate.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
@@ -44,6 +45,17 @@ class DrainRouter : public consumer::CompactionBufferRouter {
                          std::chrono::milliseconds timeout) override {
     std::unique_lock lock(mu_);
     return cv_.wait_for(lock, timeout, [&] { return drained_ >= target_seq; });
+  }
+  // The sequencer only waits blocking: a drain not yet reached is not
+  // faked.
+  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
+                                                core::SeqWaiterNode& node) override {
+    const std::scoped_lock lock(mu_);
+    if (drained_ <= node.seq()) core::Fatal("WhenDrained on an undrained seq is not faked");
+    return core::Result<void>{};
+  }
+  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+    return false;
   }
 
   void Advance(core::SequenceId to) {

@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstddef>
 #include <future>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
@@ -138,6 +140,64 @@ TEST_F(DurabilityWindowTest, ShutdownWakesWaitersUnavailable) {
   auto result = admitted.get();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
+}
+
+TEST_F(DurabilityWindowTest, ALaterAdmitAfterShutdownFailsAtOnce) {
+  window_->Add(kMaxBytes);
+  window_->Shutdown();
+  const auto start = Clock::now();
+  auto result = window_->Admit(age_, start + 10s);
+  EXPECT_LT(Clock::now() - start, 1s);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
+  EXPECT_EQ(window_->admission().size(), 0U);
+}
+
+// A release that lands between Admit's check and its registration is
+// seen by the registration's own re-check.
+TEST_F(DurabilityWindowTest, AReleaseBetweenTheCheckAndTheWaitIsNotLost) {
+  window_->Add(kMaxBytes);
+  window_->SetAdmitHookForTesting([this] { window_->Release(kMaxBytes); });
+  const auto start = Clock::now();
+  auto admitted = window_->Admit(age_, start + 10s);
+  EXPECT_LT(Clock::now() - start, 5s) << "the release in the window was lost";
+  EXPECT_TRUE(admitted.has_value());
+  EXPECT_EQ(window_->admission().size(), 0U);
+}
+
+// One release, then each admitted waiter hands off to the next: every
+// blocked Admit gets in, where notify_all would have woken them all.
+TEST_F(DurabilityWindowTest, OneReleaseAdmitsEveryBlockedWaiter) {
+  constexpr std::size_t kWaiters = 130;
+  window_->Add(kMaxBytes);
+  std::vector<std::future<core::Result<void>>> admits;
+  admits.reserve(kWaiters);
+  for (std::size_t i = 0; i < kWaiters; ++i) admits.push_back(AdmitAsync(20s));
+  const auto until = Clock::now() + 10s;
+  while (window_->admission().size() < kWaiters && Clock::now() < until) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(window_->admission().size(), kWaiters);
+
+  window_->Release(kMaxBytes);
+  for (auto& admit : admits) {
+    ASSERT_EQ(admit.wait_for(10s), std::future_status::ready) << "a waiter was stranded";
+    EXPECT_TRUE(admit.get().has_value());
+  }
+  EXPECT_EQ(window_->admission().size(), 0U);
+}
+
+// A caller that retries on every timeout leaves no waiter behind.
+TEST_F(DurabilityWindowTest, RetriesOnTimeoutLeaveNoWaiters) {
+  window_->Add(kMaxBytes);
+  for (int i = 0; i < 200; ++i) {
+    auto admitted = window_->Admit(age_, Clock::now() + 5ms);
+    ASSERT_FALSE(admitted.has_value());
+    ASSERT_EQ(admitted.error().code(), core::ErrorCode::kResourceExhausted);
+    ASSERT_EQ(window_->admission().size(), 0U) << "retry " << i;
+  }
+  EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kWalBackpressureRejectionsTotal),
+            200.0);
 }
 
 TEST(LogAgeTest, StartsOnlyWhenClear) {

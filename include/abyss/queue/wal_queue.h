@@ -18,6 +18,7 @@
 #include "abyss/core/durability.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/queue/durability_window.h"
@@ -96,7 +97,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<Reservation> Reserve(std::span<const ShardEntries> parts) override;
   core::Result<Reservation> ReserveFlush(std::span<const ShardEntries> parts) override;
   uint32_t LogOf(core::ShardId shard) const override { return shard % config_.log_count; }
-  DurableFutures Complete(Reservation&& reservation) override;
+  std::vector<ReservedRange> Complete(Reservation&& reservation) override;
 
   // As above, admitting within WalConfig::admission_timeout.
   core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry);
@@ -117,6 +118,12 @@ class WalQueue : public core::Queue, public SegmentRegistry {
                                             core::Durability durability) override;
   core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
                                   core::Durability durability, core::Duration timeout) override;
+  // Registers `node` to be posted once its seq is durable at
+  // `durability`: SeqWaiters::Register, on that shard's stream.
+  std::optional<core::Result<void>> WhenDurable(core::ShardId shard, core::Durability durability,
+                                                core::SeqWaiterNode& node);
+  bool CancelDurable(core::ShardId shard, core::Durability durability,
+                     core::SeqWaiterNode& node) noexcept;
   core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override;
   core::RetentionPin PinRetention() override;
   core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override;
@@ -183,6 +190,10 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void InjectSegmentRemoveErrorForTesting(uint32_t log, core::Error error);
   // For tests that look at how a shard's reads locate frames.
   const ShardStream& StreamForTesting(core::ShardId shard) const;
+  // Runs in AwaitDurable between its check of the end and its wait.
+  void SetDurableWaitHookForTesting(const std::function<void()>& hook);
+  // Runs as a publisher on `shard` is about to park.
+  void SetPublishParkHookForTesting(core::ShardId shard, std::function<void()> hook);
   // The log position `seq`'s frame was reserved at, while the shard's
   // offset ring still holds it.
   std::optional<uint64_t> PositionForTesting(core::ShardId shard, core::SequenceId seq) const;

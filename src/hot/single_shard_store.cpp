@@ -1503,6 +1503,7 @@ void SingleShardStore::WipeAllButMaps(core::SequenceId seq) {
   parked_.Clear();
   parked_bytes_ = 0;
   lru_dry_ = false;
+  for (auto& pending : loading_) EndWaits(pending.second);
   loading_.clear();
   negatives_.clear();
   negative_entries_ = 0;
@@ -1518,7 +1519,7 @@ bool SingleShardStore::DropStub(std::string_view key) { return stubs_.Erase(key)
 std::optional<LoadToken> SingleShardStore::BeginLoad(std::string_view key) {
   if (entries_.contains(key) || loading_.contains(key)) return std::nullopt;
   const LoadToken token{.id = ++next_load_id_};
-  loading_.emplace(std::string(key), token);
+  loading_.emplace(std::string(key), Loading{.token = token});
   return token;
 }
 
@@ -1543,11 +1544,11 @@ bool SingleShardStore::InstallLoad(std::string_view key, LoadToken token, LoadRe
                                    core::EvictionTTL eviction, core::SequenceId horizon,
                                    bool in_batch) {
   const auto pending = loading_.find(key);
-  if (pending == loading_.end() || pending->second != token) {
+  if (pending == loading_.end() || pending->second.token != token) {
     ++load_discards_;
     return false;
   }
-  loading_.erase(pending);
+  EndLoad(pending);
   if (entries_.contains(key)) {
     ++load_discards_;
     return false;
@@ -1607,11 +1608,98 @@ size_t SingleShardStore::CompleteLoads(std::span<LoadCompletion> loads,
 
 void SingleShardStore::AbortLoad(std::string_view key, LoadToken token) {
   const auto pending = loading_.find(key);
-  if (pending != loading_.end() && pending->second == token) loading_.erase(pending);
+  if (pending != loading_.end() && pending->second.token == token) EndLoad(pending);
 }
 
 bool SingleShardStore::LoadPending(std::string_view key) const {
   return !loading_.empty() && loading_.contains(key);
+}
+
+LoadWaiter::~LoadWaiter() {
+  if (linked_) core::Fatal("LoadWaiter destroyed while linked");
+}
+
+bool SingleShardStore::AddLoadWaiter(std::string_view key, LoadWaiter& waiter) {
+  if (waiter.linked_) core::Fatal("LoadWaiter registered twice");
+  const auto pending = loading_.find(key);
+  if (pending == loading_.end()) return false;
+  LoadWaiter*& head = pending->second.waiters;
+  waiter.prev_ = nullptr;
+  waiter.next_ = head;
+  if (head != nullptr) head->prev_ = &waiter;
+  head = &waiter;
+  waiter.linked_ = true;
+  return true;
+}
+
+bool SingleShardStore::CancelLoadWaiter(std::string_view key, LoadWaiter& waiter) {
+  if (!waiter.linked_) return false;
+  if (waiter.prev_ != nullptr) {
+    waiter.prev_->next_ = waiter.next_;
+  } else {
+    const auto pending = loading_.find(key);
+    if (pending == loading_.end() || pending->second.waiters != &waiter) {
+      core::Fatal("a LoadWaiter cancelled on a key it does not wait on");
+    }
+    pending->second.waiters = waiter.next_;
+  }
+  if (waiter.next_ != nullptr) waiter.next_->prev_ = waiter.prev_;
+  waiter.prev_ = nullptr;
+  waiter.next_ = nullptr;
+  waiter.linked_ = false;
+  return true;
+}
+
+void SingleShardStore::EndLoadWaits() {
+  for (auto& pending : loading_) EndWaits(pending.second);
+}
+
+// Only copying an error can throw here, and an OOM while waking may
+// terminate.
+// NOLINTNEXTLINE(bugprone-exception-escape)
+void SingleShardStore::Wake(LoadWaiter* woken, const core::Result<void>& result) noexcept {
+  while (woken != nullptr) {
+    // Read first: once woken, its owner may free it.
+    LoadWaiter* const next = std::exchange(woken->next_, nullptr);
+    woken->Wake(result);
+    woken = next;
+  }
+}
+
+LoadWaiter* SingleShardStore::Chain(LoadWaiter* front, LoadWaiter* back) noexcept {
+  if (front == nullptr) return back;
+  LoadWaiter* tail = front;
+  while (tail->next_ != nullptr) tail = tail->next_;
+  tail->next_ = back;
+  return front;
+}
+
+size_t SingleShardStore::LoadWaitersForTesting(std::string_view key) const {
+  const auto pending = loading_.find(key);
+  size_t count = 0;
+  if (pending == loading_.end()) return count;
+  for (const LoadWaiter* waiter = pending->second.waiters; waiter != nullptr;
+       waiter = waiter->next_) {
+    ++count;
+  }
+  return count;
+}
+
+void SingleShardStore::EndLoad(core::StringMap<Loading>::iterator it) noexcept {
+  EndWaits(it->second);
+  loading_.erase(it);
+}
+
+void SingleShardStore::EndWaits(Loading& loading) noexcept {
+  LoadWaiter* waiter = std::exchange(loading.waiters, nullptr);
+  while (waiter != nullptr) {
+    LoadWaiter* const next = waiter->next_;
+    waiter->prev_ = nullptr;
+    waiter->linked_ = false;
+    waiter->next_ = woken_;
+    woken_ = waiter;
+    waiter = next;
+  }
 }
 
 KeyView SingleShardStore::View(std::string_view key, core::SequenceId horizon,
@@ -1922,7 +2010,7 @@ void SingleShardStore::MarkWritten(std::string_view key, core::SequenceId seq,
     }
   }
   if (!loading_.empty()) {
-    if (const auto pending = loading_.find(key); pending != loading_.end()) loading_.erase(pending);
+    if (const auto pending = loading_.find(key); pending != loading_.end()) EndLoad(pending);
   }
   stubs_.Erase(key);
 }

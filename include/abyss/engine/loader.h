@@ -1,8 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <future>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -127,6 +128,11 @@ class Loader {
 
   // Calls that joined another's load in flight.
   uint64_t JoinsForTesting() const { return joins_.load(); }
+  // Loads in flight on `shard`, and the joiners still waiting on them.
+  std::size_t FlightsForTesting(core::ShardId shard) const;
+  std::size_t JoinersForTesting(core::ShardId shard) const;
+  // Runs in a join between its registration and its wait.
+  void SetJoinHookForTesting(std::function<void()> hook) { join_hook_ = std::move(hook); }
 
  private:
   // LoadAs, unshared.
@@ -160,16 +166,20 @@ class Loader {
     core::Result<Shared> result;
     Source source = Source::kBuffer;
   };
+  // A call joined to another's load, linked on it while it flies.
+  class Joiner;
   struct Pending {
-    std::shared_future<Flight> done;
-    size_t waiters = 0;
+    Joiner* joiners = nullptr;
   };
+  using FlightId = std::tuple<std::string, core::KeyType, core::SequenceId>;
   // Loads in flight, per shard: LoadAs's and Install's.
   struct Flights {
-    std::mutex mu;
+    mutable std::mutex mu;
     // By key, type and the drain horizon the leader started at.
-    std::map<std::tuple<std::string, core::KeyType, core::SequenceId>, Pending> loading;
+    std::map<FlightId, Pending> loading;
   };
+  // False if the leader already took `joiner`, whose landing comes.
+  static bool Unjoin(Flights& flights, const FlightId& id, Joiner& joiner);
 
   hot::ShardedHotStore& hot_;
   const consumer::CompactionBufferRouter& buffers_;
@@ -177,6 +187,7 @@ class Loader {
   core::WallClockFn wall_clock_;
   std::vector<std::unique_ptr<Flights>> flights_;
   mutable std::atomic<uint64_t> joins_{0};
+  std::function<void()> join_hook_;
 };
 
 // The key as cold will hold it once `delta` (null: none) is flushed

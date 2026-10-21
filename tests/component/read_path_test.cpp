@@ -147,6 +147,13 @@ class OneBufferRouter : public consumer::CompactionBufferRouter {
     ++drain_waits;
     return true;
   }
+  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
+                                                core::SeqWaiterNode& /*node*/) override {
+    return core::Result<void>{};
+  }
+  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+    return false;
+  }
 
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::atomic<int> drain_waits{0};

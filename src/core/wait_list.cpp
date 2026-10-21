@@ -82,9 +82,8 @@ void WaitList::FailAll(const Error& error) {
   }
 }
 
-Result<void> WaitList::Await(const std::function<bool()>& condition, Duration timeout) {
+Result<void> WaitList::Await(const std::function<bool()>& condition, SteadyTime deadline) {
   BlockingWaiter waiter;
-  const SteadyTime deadline = SteadyClock::now() + timeout;
   while (true) {
     // A woken pass hands off inside Register.
     if (auto ready = Register(waiter, condition)) return *std::move(ready);

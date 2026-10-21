@@ -15,14 +15,17 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <thread>
 #include <variant>
 #include <vector>
 
+#include "abyss/core/completion.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
 #include "abyss/log/testing.h"
 #include "abyss/metrics/names.h"
@@ -1032,38 +1035,99 @@ TEST_F(WalQueueTest, ChangedRetentionConsumerSetRefusesToOpen) {
 
 // --- Concurrency ------------------------------------------------------------------
 
-TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
-  // Order under concurrency, not flush cost: a power_loss ack per append
-  // made this a test of the device (Windows' FlushFileBuffers). Commits
-  // still trail the power-durable end, which flushes in the background.
-  WalConfig config = DefaultConfig();
-  config.durability = core::Durability::kProcessCrash;
-  OpenWith(std::move(config));
+// Counts each post, and whether the power-durable end had passed the
+// seq when the post ran.
+class EndCheckingSink final : public core::CompletionSink {
+ public:
+  explicit EndCheckingSink(WalQueue& queue) : queue_(queue) {}
+
+  // NOLINTNEXTLINE(bugprone-exception-escape): a test double.
+  void Post(std::span<const core::CompletionEvent> events) noexcept override {
+    const core::SequenceId end = queue_.DurableEnd(0, core::Durability::kPowerLoss).value_or(0);
+    {
+      const std::scoped_lock lock(mu_);
+      for (const core::CompletionEvent& event : events) {
+        if (!event.result.has_value() || end <= event.slot_seq) ++early_;
+        ++posts_;
+      }
+    }
+    cv_.notify_all();
+  }
+
+  bool WaitFor(uint64_t posts) {
+    std::unique_lock lock(mu_);
+    return cv_.wait_for(lock, 30s, [&] { return posts_ >= posts; });
+  }
+  uint64_t early() const {
+    const std::scoped_lock lock(mu_);
+    return early_;
+  }
+
+ private:
+  WalQueue& queue_;
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  uint64_t posts_ = 0;
+  uint64_t early_ = 0;
+};
+
+class ConcurrentProducersTest : public WalQueueTest,
+                                public ::testing::WithParamInterface<core::Durability> {};
+
+// Under power_loss every ack waits on a flush, so fewer appends keep
+// the class covered within a slow device's budget.
+TEST_P(ConcurrentProducersTest, ConcurrentProducersAndConsumers) {
+  const core::Durability durability = GetParam();
+  const bool power = durability == core::Durability::kPowerLoss;
+  auto config = DefaultConfig();
+  config.durability = durability;
+  OpenWith(config);
 
   constexpr int kProducers = 4;
-  constexpr int kPerProducer = 200;
+  const int per_producer = power ? 25 : 200;
   std::atomic<int> produced{0};
+  std::atomic<int> early_futures{0};
+  std::vector<std::unique_ptr<EndCheckingSink>> sinks;
+  sinks.reserve(kProducers);
+  for (int t = 0; t < kProducers; ++t) sinks.push_back(std::make_unique<EndCheckingSink>(*queue_));
   std::vector<std::thread> producers;
   producers.reserve(kProducers);
   for (int t = 0; t < kProducers; ++t) {
-    producers.emplace_back([this, &produced] {
-      for (int i = 0; i < kPerProducer; ++i) {
+    producers.emplace_back([&, sink = sinks[t].get()] {
+      uint64_t posted = 0;
+      for (int i = 0; i < per_producer; ++i) {
         auto r = queue_->Append(0, MakeWrite({"SET", "k", std::to_string(i)}));
-        if (r.has_value() && r->durable.get().has_value()) {
-          produced.fetch_add(1, std::memory_order_relaxed);
+        if (!r.has_value()) continue;
+        // A waiter on the same seq: its post runs at the very moment
+        // the end passes it.
+        core::SeqWaiterNode node(
+            r->seq, core::Completion{.sink = sink, .client_id = 0, .slot_seq = r->seq});
+        const bool linked = power && !queue_->WhenDurable(0, durability, node).has_value();
+        const bool acked = r->durable.get().has_value();
+        if (acked && power &&
+            queue_->DurableEnd(0, core::Durability::kPowerLoss).value() <= r->seq) {
+          early_futures.fetch_add(1, std::memory_order_relaxed);
         }
+        if (linked && !sink->WaitFor(++posted)) {
+          ADD_FAILURE() << "no post for seq " << r->seq;
+          if (!queue_->CancelDurable(0, durability, node)) {
+            EXPECT_TRUE(sink->WaitFor(posted));
+          }
+          continue;
+        }
+        if (acked) produced.fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
 
   std::atomic<bool> stop{false};
   std::vector<core::SequenceId> observed_seqs;
-  std::thread consumer([this, &stop, &observed_seqs] {
+  std::thread consumer([this, &stop, &observed_seqs, durability] {
     // The consumer owns its read position; commits trail it, clamped to the
     // durable tail as every retention consumer's must be.
     core::SequenceId next = kFirst;
     auto consume = [&](core::Duration timeout) -> bool {
-      auto read = queue_->Read(0, next, 128, timeout, core::Durability::kProcessCrash);
+      auto read = queue_->Read(0, next, 128, timeout, durability);
       if (!read.has_value() || read->empty()) return false;
       for (const auto& e : *read) {
         EXPECT_EQ(e.seq, next) << "a read was not contiguous from the cursor";
@@ -1086,12 +1150,23 @@ TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
   stop.store(true, std::memory_order_release);
   consumer.join();
 
-  EXPECT_EQ(produced.load(), kProducers * kPerProducer);
-  EXPECT_EQ(observed_seqs.size(), static_cast<size_t>(kProducers * kPerProducer));
+  const int total = kProducers * per_producer;
+  EXPECT_EQ(produced.load(), total);
+  EXPECT_EQ(early_futures.load(), 0) << "a future resolved before the end passed its seq";
+  for (const auto& sink : sinks) EXPECT_EQ(sink->early(), 0U) << "a waiter was posted early";
+  EXPECT_EQ(observed_seqs.size(), static_cast<size_t>(total));
   for (size_t i = 0; i < observed_seqs.size(); ++i) {
     EXPECT_EQ(observed_seqs[i], kFirst + i);
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(BothClasses, ConcurrentProducersTest,
+                         ::testing::Values(core::Durability::kProcessCrash,
+                                           core::Durability::kPowerLoss),
+                         [](const ::testing::TestParamInfo<core::Durability>& param) {
+                           return param.param == core::Durability::kProcessCrash ? "ProcessCrash"
+                                                                                 : "PowerLoss";
+                         });
 
 // Readers race an appender that rotates constantly and a committer that
 // persists and reaps behind them. Covers index publication on the active

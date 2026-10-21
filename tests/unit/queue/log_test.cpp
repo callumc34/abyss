@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -33,6 +34,7 @@
 #include "abyss/platform/fs.h"
 #include "binary_io.h"
 #include "crc32c.h"
+#include "latch.h"
 #include "on_exit.h"
 #include "segment_header_v2.h"
 #include "temp_dir.h"
@@ -187,6 +189,16 @@ class LogTest : public ::testing::Test {
     if (!reservation.has_value()) return {};
     log.Commit(*reservation, bytes);
     return *reservation;
+  }
+
+  // Pauses the preparer and spends both spares: the next frame waits.
+  static void SpendTheSpares(Log& log) {
+    log.PausePreparerForTesting();
+    for (core::SequenceId seq = 0; seq < 9; ++seq) Append(log, 0, seq, 20000);
+    ASSERT_EQ(log.spare_count(), 0U);
+    auto reservation = log.Reserve(20000);
+    ASSERT_FALSE(reservation.has_value());
+    ASSERT_EQ(reservation.error().code(), core::ErrorCode::kUnavailable);
   }
 
   std::filesystem::path SegPath(uint64_t ordinal) const {
@@ -414,6 +426,93 @@ TEST_F(LogTest, TheFilledPrefixStopsAtAHole) {
   EXPECT_EQ(log->FilledPrefix(), a->pos);
   log->Commit(*a, a_bytes);
   EXPECT_EQ(log->FilledPrefix(), b->pos + 64);
+}
+
+// A spare published between the caller's refusal and its registration
+// is seen by the registration's re-check.
+TEST_F(LogTest, ASpareBetweenTheCheckAndTheWaitIsNotLost) {
+  auto log = OpenLog();
+  ASSERT_NE(log, nullptr);
+  ASSERT_NO_FATAL_FAILURE(SpendTheSpares(*log));
+  log->SetSpareWaitHookForTesting([&log] {
+    log->ResumePreparerForTesting();
+    EXPECT_TRUE(Eventually([&log] { return log->spare_count() > 0; }));
+  });
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_TRUE(log->WaitForSpare(start + 10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the spare was lost";
+  EXPECT_EQ(log->SpareWaitersForTesting(), 0U);
+}
+
+TEST_F(LogTest, RetriesOnTimeoutLeaveNoSpareWaiters) {
+  auto log = OpenLog();
+  ASSERT_NE(log, nullptr);
+  ASSERT_NO_FATAL_FAILURE(SpendTheSpares(*log));
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_FALSE(log->WaitForSpare(std::chrono::steady_clock::now() + 5ms)) << "retry " << i;
+    ASSERT_EQ(log->SpareWaitersForTesting(), 0U) << "retry " << i;
+  }
+  log->ResumePreparerForTesting();
+  EXPECT_TRUE(log->WaitForSpare(std::chrono::steady_clock::now() + 5s));
+}
+
+TEST_F(LogTest, ShutdownFailsSpareWaitsNowAndLater) {
+  auto log = OpenLog();
+  ASSERT_NE(log, nullptr);
+  ASSERT_NO_FATAL_FAILURE(SpendTheSpares(*log));
+  auto waiting = std::async(std::launch::async, [&log] {
+    return log->WaitForSpare(std::chrono::steady_clock::now() + 20s);
+  });
+  ASSERT_TRUE(Eventually([&log] { return log->SpareWaitersForTesting() == 1; }));
+  log->Shutdown();
+  ASSERT_EQ(waiting.wait_for(5s), std::future_status::ready);
+  EXPECT_FALSE(waiting.get());
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(log->WaitForSpare(start + 10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+}
+
+// A fill held behind an earlier, unfilled reservation parks past its
+// yield, and wakes once the hole fills.
+TEST_F(LogTest, AFillBehindAHoleParksAndWakes) {
+  auto log = OpenLog();
+  ASSERT_NE(log, nullptr);
+  auto a = log->Reserve(64);
+  auto b = log->Reserve(64);
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  log->Commit(*b, Frame(1, 0, 64));
+  const LogPosition end = b->pos + 64;
+  auto filled = std::async(std::launch::async, [&log, end] { log->AwaitFilled(end); });
+  ASSERT_TRUE(Eventually([&log] { return log->FillParkedForTesting() == 1; }));
+  EXPECT_EQ(filled.wait_for(20ms), std::future_status::timeout);
+  log->Commit(*a, Frame(0, 0, 64));
+  ASSERT_EQ(filled.wait_for(5s), std::future_status::ready) << "the parked fill never woke";
+  EXPECT_EQ(log->FilledPrefix(), end);
+  EXPECT_EQ(log->FillParkedForTesting(), 0U);
+}
+
+// The hole fills just as the waiter parks, when the combiner counts no
+// one parked and so notifies no one: the parker's re-read sees it.
+TEST_F(LogTest, AFillRacingAParkIsNotLost) {
+  auto log = OpenLog();
+  ASSERT_NE(log, nullptr);
+  auto a = log->Reserve(64);
+  auto b = log->Reserve(64);
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  log->Commit(*b, Frame(1, 0, 64));
+  abyss::testing::Latch parking;
+  abyss::testing::Latch committed;
+  log->SetFillParkHookForTesting([&] {
+    parking.Open();
+    committed.Wait();
+  });
+  const LogPosition end = b->pos + 64;
+  auto filled = std::async(std::launch::async, [&log, end] { log->AwaitFilled(end); });
+  ASSERT_TRUE(parking.Wait());
+  log->Commit(*a, Frame(0, 0, 64));
+  committed.Open();
+  ASSERT_EQ(filled.wait_for(5s), std::future_status::ready) << "the racing fill was lost";
+  EXPECT_EQ(log->FilledPrefix(), end);
 }
 
 TEST_F(LogTest, FlushReportsEachNewlyDurableEntryOnceInOrder) {

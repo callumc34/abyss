@@ -8,7 +8,6 @@
 
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
-#include "abyss/queue/append_result.h"
 
 namespace abyss::queue {
 
@@ -23,13 +22,6 @@ struct ReservedRange {
   core::SequenceId first = 0;
   core::SequenceId last = 0;
 };
-
-struct ShardDurable {
-  core::ShardId shard = 0;
-  // Resolves once the shard's part is durable at AckDurability().
-  DurabilityFuture durable;
-};
-using DurableFutures = std::vector<ShardDurable>;
 
 // What a queue still owes a reservation: fill what Reserve left, then
 // publish each shard once its earlier seqs are published.
@@ -53,8 +45,7 @@ class ReservationFiller {
 // Complete's own waits: a lock holder may be waiting on this fill.
 class Reservation {
  public:
-  Reservation(std::vector<ReservedRange> ranges, DurableFutures durable,
-              std::unique_ptr<ReservationFiller> filler);
+  Reservation(std::vector<ReservedRange> ranges, std::unique_ptr<ReservationFiller> filler);
   ~Reservation();
 
   Reservation(Reservation&& other) noexcept = default;
@@ -65,13 +56,12 @@ class Reservation {
   // In the order of Reserve's parts.
   const std::vector<ReservedRange>& ranges() const noexcept { return ranges_; }
 
-  // For Queue::Complete: fills and publishes, then hands back each
-  // shard's future. Once only.
-  DurableFutures Finish() noexcept;
+  // For Queue::Complete: fills and publishes, then hands back the
+  // ranges. Once only.
+  std::vector<ReservedRange> Finish() noexcept;
 
  private:
   std::vector<ReservedRange> ranges_;
-  DurableFutures durable_;
   std::unique_ptr<ReservationFiller> filler_;
   // The thread whose count of held reservations this one is in.
   std::thread::id owner_;

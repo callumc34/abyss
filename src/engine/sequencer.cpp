@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -562,11 +561,10 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
     hot::Graveyard replaced = hold->Unlock();
     phases.Lap(WritePhase::kApply);
 
-    const std::vector<queue::ReservedRange> ranges = reservation.ranges();
-    queue::DurableFutures futures = queue_.Complete(std::move(reservation));
+    const std::vector<queue::ReservedRange> ranges = queue_.Complete(std::move(reservation));
     replaced = {};
     phases.Lap(WritePhase::kComplete);
-    if (auto durable = AwaitDurable(futures, ranges, deadline, /*flush=*/false); !durable) {
+    if (auto durable = AwaitDurable(ranges, deadline, /*flush=*/false); !durable) {
       return std::unexpected(durable.error());
     }
     phases.Lap(WritePhase::kDurable);
@@ -651,10 +649,9 @@ core::Result<core::RespValue> Sequencer::Flush() {
     }
     hot::Graveyard wiped = hold.Unlock();
 
-    const std::vector<queue::ReservedRange> ranges = reservation.ranges();
-    queue::DurableFutures futures = queue_.Complete(std::move(reservation));
+    const std::vector<queue::ReservedRange> ranges = queue_.Complete(std::move(reservation));
     wiped = {};
-    if (auto durable = AwaitDurable(futures, ranges, deadline, /*flush=*/true); !durable) {
+    if (auto durable = AwaitDurable(ranges, deadline, /*flush=*/true); !durable) {
       return std::unexpected(durable.error());
     }
     return core::RespValue::SimpleString("OK");
@@ -709,27 +706,28 @@ core::Result<void> Sequencer::AwaitMemory(std::span<const core::ShardId> shards,
   return {};
 }
 
-core::Result<void> Sequencer::AwaitDurable(queue::DurableFutures& futures,
-                                           const std::vector<queue::ReservedRange>& ranges,
+core::Result<void> Sequencer::AwaitDurable(std::span<const queue::ReservedRange> ranges,
                                            core::SteadyTime deadline, bool flush) const {
-  for (queue::ShardDurable& future : futures) {
-    const auto range = std::ranges::find(ranges, future.shard, &queue::ReservedRange::shard);
-    const auto seq = range != ranges.end() ? range->last : core::SequenceId{0};
-    if (future.durable.wait_until(deadline) == std::future_status::timeout) {
+  for (const queue::ReservedRange& range : ranges) {
+    const auto now = core::SteadyClock::now();
+    const auto timeout =
+        now < deadline ? std::chrono::ceil<core::Duration>(deadline - now) : core::Duration::zero();
+    auto durable = queue_.AwaitDurable(range.shard, range.last, queue_.AckDurability(), timeout);
+    if (!durable.has_value()) {
+      ABYSS_LOG_ERROR(flush ? "flush durable failed" : "write durable failed",
+                      {"shard", static_cast<int64_t>(range.shard)},
+                      {"seq", static_cast<uint64_t>(range.last)},
+                      {"err", std::string_view{durable.error().message()}});
+      return std::unexpected(durable.error());
+    }
+    if (!*durable) {
       ABYSS_LOG_WARN(flush ? "flush durable wait timeout" : "write durable wait timeout",
-                     {"shard", static_cast<int64_t>(future.shard)},
-                     {"seq", static_cast<uint64_t>(seq)},
+                     {"shard", static_cast<int64_t>(range.shard)},
+                     {"seq", static_cast<uint64_t>(range.last)},
                      {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
       return std::unexpected(
           core::Error{core::ErrorCode::kTimeout,
                       std::string(flush ? kFlushDurableTimeout : kWriteDurableTimeout)});
-    }
-    if (auto durable = future.durable.get(); !durable.has_value()) {
-      ABYSS_LOG_ERROR(flush ? "flush durable failed" : "write durable failed",
-                      {"shard", static_cast<int64_t>(future.shard)},
-                      {"seq", static_cast<uint64_t>(seq)},
-                      {"err", std::string_view{durable.error().message()}});
-      return std::unexpected(durable.error());
     }
   }
   return {};
