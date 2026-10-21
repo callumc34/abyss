@@ -65,8 +65,8 @@ Pod starts
 
 ### Recovery Semantics
 
-- The queue WAL or external broker retains all entries since the oldest un-acked position.
-- For the embedded profile: cold store RocksDB survives on PVC. The cold consumer only replays entries since its last ack point.
+- The queue WAL or external broker retains all entries since the lowest persisted committed offset.
+- For the embedded profile: cold store RocksDB survives on PVC. The cold consumer only replays entries since its last persisted committed offset.
 - For the hot store: rebuilt from each shard's first retained entry, holding only keys whose whole history it replayed (§Hot replay). Every other key is served from buffer plus cold, which hold it whole once cold's replay finishes.
 - **The cold store is never read during recovery.** Recovery is purely queue replay.
 - Cold replay benefits from the compaction buffer — recovery write volume to cold is bounded by unique keys, not total queue entries.
@@ -175,7 +175,7 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 5. Cold and hot each get every one of a shard's frames from their start position to the captured end, in order; otherwise recovery fails.
 6. During recovery, the RESP port returns `LOADING` errors for data-plane commands; a narrow admin set (see [ADP-005](005-resp-frontend.md)) remains available. The LOADING signal is raised while either the recovery coordinator or the queue reports that it is recovering.
 7. After recovery, the readiness probe goes healthy and normal operation resumes. /ready reports `recovery_complete: true`.
-8. Cancellation propagates from the server through the recovery coordinator to the scan and cold's replay. A cancelled recovery exits non-zero; partial acks are persisted, so a restart resumes from the last checkpoint.
+8. Cancellation propagates from the server through the recovery coordinator to the scan and cold's replay. A cancelled recovery exits non-zero; offsets committed by the partial replay are persisted, so a restart resumes from the last checkpoint.
 
 ## Trade-offs
 

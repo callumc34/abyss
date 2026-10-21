@@ -57,7 +57,7 @@ The 30-second default `TIMEOUT` is a safety net for runaway tests, not a target.
 
 - `DifferentialTest`: a seeded command stream over a small overlapping keyspace, interleaved with eviction pressure, cold absorbs and flushes, loads raced by evictions and blind writes, segment starvation and restarts. Every reply is compared with the model, and every key the command touched in hot, or in buffer plus cold when not resident. Each seed also fixes the configuration (shards, logs, durability class, memory, stubs, doorkeeper and so on).
 - `LinearizabilityTest`: concurrent clients on fixed key groups, each group's history checked for linearizability against the model (`tests/support/linearizability.h`).
-- `CrashTest`: power loss that keeps an arbitrary subset of unflushed pages, with bit flips, and kill -9 of a victim process; the recovered log must be a prefix that holds every acknowledged write and explains every reply. A cross-shard batch is cut at every frame.
+- `CrashTest`: power loss that keeps an arbitrary subset of unflushed pages, with bit flips, and kill -9 of a victim process; the recovered log must be a prefix that explains every reply, and holds every acknowledged write after a kill -9, or after a power loss under `power_loss`. A cross-shard batch is cut at every frame.
 
 The bounded tiers take about 20 s locally (Debug), and run in CI; under a sanitizer they shrink to stay inside the 30 s test timeout. A failure prints its seed and configuration; replay it alone with `ABYSS_PROPERTY_SEED=<n>` (add `ABYSS_PROPERTY_TRACE=1` for every step), `ABYSS_LINEARIZABILITY_SEED=<n>` or `ABYSS_CRASH_SEED=<n>`. The long tiers are opt-in and local only:
 

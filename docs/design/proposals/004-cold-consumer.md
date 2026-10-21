@@ -4,7 +4,7 @@
 **Created:** 2026-04-09
 
 > **Amended by [ADP-015](015-write-path-and-durability.md).** These parts already describe the amended behaviour:
-> - **§Consumer Thread Loop:** the loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain.
+> - **§Consumer Thread Loop:** the loop reads by its own position, so its persisted committed offset no longer limits what it can drain.
 > - **§Persisting at the power-durable log:** writes to the cold store never run ahead of the power-durable log.
 > - **§Replay at recovery:** the demultiplexing scan of each log hands this consumer its shard's entries in batches.
 > - **Throughout:** the log carries only decided effects (decide-then-log), so the consumer applies each `Write` and `Flush` as it reads it. It has no conditional to wait for, since block-and-scan is gone, and it acknowledges nothing to the write path: a write replies once its frame is durable, and FLUSHDB once its `Flush` frames are.
@@ -222,7 +222,7 @@ cold_consumer:
   drain_grace_seconds: 15               # Bound on the graceful drain-and-flush
 ```
 
-The checkpoint knobs bound the cold durable-checkpoint cadence. The cold consumer's ack cannot pass data the last checkpoint has not made durable, so together they bound how far WAL retention release trails the applied frontier — trading checkpoint cost against retained WAL.
+The checkpoint knobs bound the cold durable-checkpoint cadence. The cold consumer's committed offset cannot pass data the last checkpoint has not made durable, so together they bound how far WAL retention release trails the applied frontier — trading checkpoint cost against retained WAL.
 
 ## Invariants
 

@@ -36,7 +36,7 @@ The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wa
 The queue interface offers two append paths:
 
 - **The sequencer's append** ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). Every write the server takes goes through it, in three steps:
-  - `Admit` waits for room in the shard's durability window, and `WaitForSpare` for a prepared segment, under no lock.
+  - `Admit` waits for room in the durability window (volume-wide bytes, and the age of the shard's log), and `WaitForSpare` for a prepared segment, under no lock.
   - `Reserve` runs under the hot shard locks and never waits. It assigns each involved shard's seqs and reserves every part as one batch in one log, committing its frames in place until their total reaches 16 KiB. On failure nothing is taken and no seq is used: the window is full, no spare is ready, an entry is too large, or the shards span logs (`CROSSSLOT`). `ReserveFlush` reserves one `Flush` per shard, one batch per log.
   - `Complete` runs once the locks are released. It fills the reservation's remaining frames, publishes each shard once its earlier seqs are published, and returns the durability futures, which resolve when the entries reach the configured durability class (§Durability classes and group commit).
 - **Two-phase and one-shot** — `BeginAppend` / `BeginAppendBatch` return a handle that publishes the entry when the caller publishes it, or on destruction if the caller drops it, so a forgotten publish degrades to a latency bug, never a lost write. `Append` / `AppendBatch` publish inline. The server's write path no longer uses them.
@@ -71,7 +71,7 @@ The built-in queue implementation is an append-only WAL on the PVC: one physical
 - **Format.** See [ADP-009](009-wal-format.md).
 - **Committed offsets** are persisted lazily to one checkpoint file under `{wal_path}/offsets/`. See "Offset persistence" below.
 
-**Retention:** The queue retains entries until all consumers have acknowledged. Minimum retention is:
+**Retention:** The queue retains a segment until reclamation releases it, as above: it is older than `min_retention`, and every retention consumer's persisted committed offset has passed its frames. The cold consumer is the only retention consumer. Hot commits nothing, and retention never moves where any consumer reads. Minimum retention is:
 
 ```
 minimum_queue_retention = max(default_eviction, max(eviction_overrides))
@@ -160,6 +160,7 @@ The sequencer applies the entry's effect to hot before the entry is published, a
 - Acknowledged-but-not-power-durable data is bounded by `queue.durability_window_bytes` (volume-wide unflushed bytes) and `queue.durability_window_ms` (the age of a log's oldest unflushed entry).
 - Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.write_timeout_ms`, it is rejected with an error saying the device is not keeping up.
 - An empty window always admits, so a single value larger than the window cannot deadlock.
+- Both bounds are soft. Concurrent appends can each pass the check before the others' bytes count, so unflushed bytes can overshoot by up to one reservation per concurrent appender, and a slow flush lets admitted data age past `durability_window_ms`.
 - `abyss_wal_unflushed_bytes`, `abyss_wal_durability_lag_seconds` and the backpressure counters report it.
 
 **Failures.**

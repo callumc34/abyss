@@ -4,12 +4,12 @@
 
 | Scenario | Impact | Recovery |
 |----------|--------|----------|
-| Pod crash (embedded) | Hot store lost. WAL + cold store intact on PVC. | Pod restarts. One scan of the log rebuilds hot through the hot replayer, and the cold consumer catches up from its last ack point. |
+| Pod crash (embedded) | Hot store lost. WAL + cold store intact on PVC. | Pod restarts. One scan of the log rebuilds hot through the hot replayer, and the cold consumer catches up from its last persisted committed offset. |
 | Pod crash (external) | In-process orchestrator lost. External stores (Redis, Kafka, KVRocks) retain data. | Pod restarts, resumes queue consumption. |
 | Cold store PVC full | Cold consumer's `apply_batch()` fails. Cold consumer stalls. Queue grows. Eventually queue fills and writes fail. | Provision more cold storage. |
 | Cold store cannot fsync (checkpoint or wipe fails) | The cold consumer applies flushes to the memtable, but `Checkpoint()` (a synced `FlushWAL`) or a synced `Wipe` fails, so it does **not** advance its committed offset: the log is retained, not reclaimed. RocksDB records a WAL sync failure as a hard background error. With `manual_wal_flush` it does not resume on its own, so every later write and checkpoint fails too. A later sync can therefore never report as durable data that the failed one may have dropped. No acknowledged write is lost: cold stalls visibly, hot backpressure follows, and recovery rebuilds cold from its committed offset. | Inspect `abyss_cold_checkpoint_total{status="failure"}` and the cold-store volume. Resolve the I/O fault, then restart the pod. |
 | Poisoned cold flush batch | A structurally-undecodable op (`kCorruption`/`kInvalidArgument`) cannot be applied. The batch is reinserted and the loop backs off (capped exponential) instead of busy-spinning a core. The shard's WAL stays pinned below the poison. | Inspect `abyss_cold_consumer_backoff_total{reason="poisoned"}` and the `cold apply batch poisoned` CRITICAL log. Operator intervention required to clear the bad entry. |
-| Cold parse poison (undecodable WAL op) | A WAL entry the cold consumer cannot parse into a materialisable op (`ParseWriteOp` failure, empty command, or empty key). The cold view never advances its ack past the un-materialised seq — the WAL retains it for the whole shard — and the loop backs off instead of busy-spinning. No acked write is dropped; cold simply stops making forward progress on that shard until the entry is dealt with. | Inspect `abyss_cold_parse_poison_total` and the `cold parse poison; WAL retention pinned below seq` CRITICAL log (carries the shard + seq). The shard's WAL retention age / disk bytes will rise. See [Cold Parse Poison Quarantine](#cold-parse-poison-quarantine) below for the inspect / quarantine / skip recovery procedure. |
+| Cold parse poison (undecodable WAL op) | A WAL entry the cold consumer cannot parse into a materialisable op (`ParseWriteOp` failure, empty command, or empty key). The cold view never advances its committed offset past the un-materialised seq — the WAL retains it for the whole shard — and the loop backs off instead of busy-spinning. No acked write is dropped; cold simply stops making forward progress on that shard until the entry is dealt with. | Inspect `abyss_cold_parse_poison_total` and the `cold parse poison; WAL retention pinned below seq` CRITICAL log (carries the shard + seq). The shard's WAL retention age / disk bytes will rise. See [Cold Parse Poison Quarantine](#cold-parse-poison-quarantine) below for the inspect / quarantine / skip recovery procedure. |
 | Queue WAL PVC full | The segment preparer cannot create a spare, so the next rotation finds none. Appends wait for a spare until their deadline, then fail with "no spare WAL segment ready". Nothing is applied or acknowledged for a rejected write. | Provision more WAL storage or speed up cold consumer (allows segment cleanup). `abyss_wal_segment_prepare_failures_total` rises first, then `abyss_wal_spare_segments` falls to 0 and `abyss_wal_spare_waits_total` rises. |
 | Spares exhausted during warm-up | Before retention first reclaims a segment, every new segment is zero-filled. A sustained write rate above about half the volume's bandwidth can outrun the preparer, with the same symptoms as a full PVC. | Lower the write rate, or provision more volume bandwidth. `abyss_wal_segments_grown_total` rising with spares at zero confirms it. It clears once recycling starts. |
 | Cold consumer lag > eviction | Hot evicts a key only once cold's drained seq has passed the key's latest write, so a key past its eviction stays in hot until cold has absorbed it. A read of an evicted key finds it in the compaction buffer or cold, never a stale value. If the lag outgrows hot's budget, writes meet memory backpressure (see [Hot Memory Over Its Limit](#hot-memory-over-its-limit)). | Cold consumer catches up. No data loss, and no read waits for it. |
@@ -55,7 +55,7 @@ The backpressure model is intentionally simple and cascading:
 ```
 Cold store disk full
   → cold consumer stalls
-    → queue entries accumulate (not acked by cold consumer)
+    → queue entries accumulate (cold's committed offset stops advancing)
       → queue WAL grows
         → WAL PVC fills
           → Append() fails
@@ -121,7 +121,7 @@ If the cold consumer stalls (cold store I/O errors, bugs, resource exhaustion):
 
 - Hot store continues serving reads normally.
 - The compaction buffer continues serving buffer-hit reads.
-- The queue grows because the cold consumer isn't acking entries.
+- The queue grows because the cold consumer's committed offset stops advancing.
 - Hot cannot evict what cold has not drained, so hot memory grows with the writes since the stall.
 - Write throughput is unaffected until a shard passes `hot.max_memory_bytes` ÷ `hot.shard_count` × `hot.backpressure_ratio` (writes to it that grow memory then wait, and fail with `-OOM`), or the queue fills.
 - **Metric to watch:** `abyss_cold_buffer_oldest_entry_age_seconds`, `abyss_cold_consumer_lag_entries` and `abyss_hot_unevictable_bytes`.
@@ -156,15 +156,15 @@ means those writes are absent from both tiers.
 
 Instead the cold consumer **quarantines** the poison (fail-closed, invariant 5):
 
-- It does **not** advance its drained frontier or its persisted WAL ack past the poison seq. The
-  ack is pinned at `poison_seq - 1` for the **whole shard** — the WAL (single source of truth)
+- It does **not** advance its drained frontier or its committed offset past the poison seq. The
+  offset is pinned at `poison_seq - 1` for the **whole shard** — the WAL (single source of truth)
   retains the un-materialised entry indefinitely.
 - It increments `abyss_cold_parse_poison_total` and logs a CRITICAL line
   (`cold parse poison; WAL retention pinned below seq`) carrying the shard and seq.
 - The drain/flush loop backs off on the capped exponential (`abyss_cold_consumer_backoff_total{reason="poisoned"}`)
   rather than busy-spinning, even though the queue keeps re-delivering the pinned entry.
 - Writes **surrounding** the poison still materialise: a valid write after the poison is still
-  absorbed and flushed to cold. Only the *ack frontier* is quarantined, not the data flow.
+  absorbed and flushed to cold. Only the *committed offset* is quarantined, not the data flow.
 
 This is deliberately a hard stall on the shard's WAL reaping: a single poison entry at the
 retention floor blocks segment cleanup for that shard, so **WAL retention age and disk bytes will
@@ -178,7 +178,7 @@ a delivered write.
 - The `cold parse poison; WAL retention pinned below seq` CRITICAL log — identifies the exact
   shard and seq to inspect.
 - The WAL's retention gauges (`abyss_queue_disk_bytes`, and the oldest-eligible-unreaped age)
-  rise because the ack cannot advance past the poison, and reclamation is oldest-first per log,
+  rise because cold's committed offset cannot advance past the poison, and reclamation is oldest-first per log,
   so the poisoned shard holds back every later segment of its log. This is the disk-fill early
   warning before the WAL PVC fills.
 
@@ -190,17 +190,17 @@ a delivered write.
    source, not a transient.
 2. **Quarantine / fix forward.** The correct resolution for a decoder-skew poison is to deploy a
    cold build whose `ParseWriteOp` decodes the entry. On restart the cold consumer re-reads the
-   pinned entry from the WAL, parses it, materialises it, and the ack resumes advancing — cold
+   pinned entry from the WAL, parses it, materialises it, and its committed offset resumes advancing — cold
    converges back to hot with no data loss.
 3. **Skip (last resort, lossy).** If the entry is irrecoverably corrupt and cannot be decoded by
-   any build, an operator must explicitly advance the cold ack past it (manual ack-offset
+   any build, an operator must explicitly advance cold's committed offset past it (manual offset
    override), accepting that the single write the entry carried is dropped from the cold view.
    This is the only escape and it is intentionally manual and explicit, because it discards a
    delivered write.
 
 Do not raise the loop backoff ceiling as a "fix" — the backoff only prevents a busy-spin; it does
 not clear the poison. The pin is released only by a successful parse-and-apply (fix forward) or an
-explicit operator ack override (skip).
+explicit operator offset override (skip).
 
 ## WAL Retention Reclamation Stalled
 
@@ -227,10 +227,10 @@ un-reclaimable segment is real disk pressure and invariant 5 forbids degrading s
 - `abyss_queue_disk_bytes` — confirms whether the stall is actually consuming disk.
 
 Note that a rising unreaped age does **not** by itself mean the reaper is broken. A consumer that
-legitimately has not acked yet — a lagging cold consumer, or a shard pinned by the poison
+legitimately has not committed far enough yet — a lagging cold consumer, or a shard pinned by the poison
 quarantine above — holds segments back by design. One such shard holds back every later segment
 of its log, because a segment carries frames of every shard on the log. Check `abyss_queue_reaper_failures_total` first:
-non-zero implicates the reaper, zero implicates a consumer that is not acking.
+non-zero implicates the reaper, zero implicates a consumer whose committed offset is not advancing.
 
 **Recovery:** inspect the first-error message in the reaper's log line for the failing path, and
 resolve the underlying filesystem condition. The next sweep reclaims the segment with no operator
@@ -239,14 +239,14 @@ the oldest segment once it succeeds.
 
 ## Cold Durability Checkpoint
 
-"Cold acked seq N" means **N is on cold's stable storage AND N is past the durable WAL tail** — never merely "handed to RocksDB". The cold consumer makes this true with a two-phase write/checkpoint:
+"Cold committed offset N" means **N is on cold's stable storage AND N is below the power-durable end of the WAL** — never merely "handed to RocksDB". The cold consumer makes this true with a two-phase write/checkpoint:
 
 - `ApplyBatch` is a cheap memtable write (`sync=false`); it does not fsync.
 - `Checkpoint` (`FlushWAL(sync=true)`) makes every prior batch durable. It fires on a **bounded cadence** — at most every `checkpoint_max_flushes` applied batches or `checkpoint_min_interval` — so a burst of small flushes amortises into one fsync rather than an fsync-per-batch storm (`F_FULLFSYNC` is expensive on macOS).
 - Before any `ApplyBatch`, every entry the batch's effects came from must be power-durable in the WAL ([ADP-004](../design/proposals/004-cold-consumer.md) §Persisting at the power-durable log). RocksDB may persist an applied batch before any checkpoint, so the gate sits at the apply.
 - The cold WAL commit only advances to `min(low_water, last_checkpointed_seq, DurableEnd(shard, power_loss) - 1)`. It can never outrun cold's own durable storage or the power-durable end of the WAL, so the segment reaper never releases WAL retention for data that is not yet durable on both tiers.
 
-This is fail-closed (invariant 5): a failed or slow checkpoint **pins** the ack (back-pressure), it does not silently advance.
+This is fail-closed (invariant 5): a failed or slow checkpoint **pins** the committed offset (back-pressure), it does not silently advance.
 
 - **Metrics to watch:** `abyss_cold_checkpoint_total{status}` (success/failure), `abyss_cold_checkpoint_duration_seconds` (fsync cost), `abyss_cold_checkpoint_interval_seconds` (observed cadence — confirms the bound is being honoured), and `abyss_cold_consumer_backoff_total{reason}` (idle/poisoned/backpressure loop backoff).
 - A rising checkpoint interval or duration is the early signal that the cold volume's fsync is becoming a throughput bottleneck before the WAL fills.

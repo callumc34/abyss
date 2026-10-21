@@ -199,6 +199,8 @@ log:
 
 The parser is strict: an unknown section or key fails the load, naming it. [`config/abyss.example.yaml`](../../config/abyss.example.yaml) lists every accepted key.
 
+**The durability window is a soft bound.** `durability_window_bytes` and `durability_window_ms` gate admission. Concurrent appends can each pass the check before the others' bytes count, so unflushed bytes can overshoot the window by up to one reservation per concurrent appender, and a slow flush lets admitted data age past `durability_window_ms`.
+
 **Removed settings.** A config that still names one fails to load, and the error names the setting and what replaced it:
 - the `hot_consumer` section: the sequencer applies each write to hot, and recovery's one log scan rebuilds it;
 - the `consumer_rpc` section: a write replies once it is durable, with no consumer apply to wait for;
