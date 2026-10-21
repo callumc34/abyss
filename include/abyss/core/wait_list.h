@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include "abyss/core/result.h"
 #include "abyss/core/thread_annotations.h"
@@ -85,15 +86,17 @@ class WaitList {
     requires std::predicate<const Condition&>
   std::optional<Result<void>> Register(Waiter& waiter, const Condition& condition) {
     const std::scoped_lock lock(mu_);
+    // Built in place: gcc's -Wmaybe-uninitialized misfires on a
+    // temporary expected<void, Error> moved into the optional.
     if (failed_.has_value()) {
       EndWait(waiter);
-      return Result<void>{std::unexpected(*failed_)};
+      return std::optional<Result<void>>(std::in_place, std::unexpect, *failed_);
     }
     Link(waiter);
     if (condition()) {
       Unlink(waiter);
       EndWait(waiter);
-      return Result<void>{};
+      return std::optional<Result<void>>(std::in_place);
     }
     return std::nullopt;
   }
