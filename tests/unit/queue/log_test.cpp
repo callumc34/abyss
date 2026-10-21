@@ -224,6 +224,31 @@ class LogTest : public ::testing::Test {
     return header;
   }
 
+  // Frames of segment 0's gen fill segments 0 and 1; 2 and 3 are
+  // spares. Another writer's major on every file must not read as an
+  // empty log, and the refusal changes nothing.
+  void ExpectAnotherMajorRefusesAndTouchesNothing(uint8_t major) {
+    {
+      auto log = OpenLog();
+      ASSERT_NE(log, nullptr);
+      for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+    }
+    const std::array other{static_cast<std::byte>(major)};
+    for (const auto& name : FilesWith(".seg")) PatchFile(Config().dir / name, 4, other);
+    std::ofstream(Config().dir / (Padded(9) + ".seg.tmp")) << "partial";
+    const auto before = Snapshot();
+
+    auto log = Log::Open(Config(), {});
+    ASSERT_FALSE(log.has_value());
+    EXPECT_EQ(log.error().code(), core::ErrorCode::kFailedPrecondition);
+    const std::string& message = log.error().message();
+    EXPECT_NE(message.find(Padded(0) + ".seg"), std::string::npos) << message;
+    EXPECT_NE(message.find("major " + std::to_string(major)), std::string::npos) << message;
+    EXPECT_NE(message.find("reads major " + std::to_string(kLogFormatMajor)), std::string::npos)
+        << message;
+    EXPECT_EQ(Snapshot(), before);
+  }
+
  private:
   testing::TempDir dir_{"log"};
 };
@@ -1355,29 +1380,14 @@ TEST_F(LogTest, AnOrdinalGapIsCorruption) {
   EXPECT_NE(log.error().message().find("segment 1"), std::string::npos) << log.error().message();
 }
 
-// Frames of segment 0's gen fill segments 0 and 1; 2 and 3 are spares.
-// A newer writer's major on every file must not read as an empty log.
 TEST_F(LogTest, ANewerFormatMajorRefusesAndTouchesNothing) {
-  {
-    auto log = OpenLog();
-    ASSERT_NE(log, nullptr);
-    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
-  }
-  const std::array newer{static_cast<std::byte>(kLogFormatMajor + 1)};
-  for (const auto& name : FilesWith(".seg")) PatchFile(Config().dir / name, 4, newer);
-  std::ofstream(Config().dir / (Padded(9) + ".seg.tmp")) << "partial";
-  const auto before = Snapshot();
+  ExpectAnotherMajorRefusesAndTouchesNothing(kLogFormatMajor + 1);
+}
 
-  auto log = Log::Open(Config(), {});
-  ASSERT_FALSE(log.has_value());
-  EXPECT_EQ(log.error().code(), core::ErrorCode::kFailedPrecondition);
-  const std::string& message = log.error().message();
-  EXPECT_NE(message.find(Padded(0) + ".seg"), std::string::npos) << message;
-  EXPECT_NE(message.find("major " + std::to_string(kLogFormatMajor + 1)), std::string::npos)
-      << message;
-  EXPECT_NE(message.find("reads major " + std::to_string(kLogFormatMajor)), std::string::npos)
-      << message;
-  EXPECT_EQ(Snapshot(), before);
+// Format 2 frames are not decided effects: a log a build before them
+// wrote refuses, as a rollback's newer log does.
+TEST_F(LogTest, AnOlderFormatMajorRefusesAndTouchesNothing) {
+  ExpectAnotherMajorRefusesAndTouchesNothing(kLogFormatMajor - 1);
 }
 
 TEST_F(LogTest, ANewerFormatMajorInThePoolRefuses) {
@@ -1546,7 +1556,8 @@ TEST(LogSegmentHeaderTest, RoundTripsAndRejectsDamage) {
 TEST(LogSegmentHeaderTest, AnotherMajorIsAFailedPreconditionNotDamage) {
   std::vector<std::byte> bytes(kLogSegmentHeaderBytes);
   EncodeLogSegmentHeader(LogSegmentHeader{.log_id = 1, .ordinal = 5}, bytes);
-  for (const uint8_t major : {uint8_t{1}, static_cast<uint8_t>(kLogFormatMajor + 1)}) {
+  for (const uint8_t major : {uint8_t{1}, static_cast<uint8_t>(kLogFormatMajor - 1),
+                              static_cast<uint8_t>(kLogFormatMajor + 1)}) {
     bytes[4] = static_cast<std::byte>(major);
     auto decoded = DecodeLogSegmentHeader(bytes);
     ASSERT_FALSE(decoded.has_value());

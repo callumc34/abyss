@@ -39,7 +39,7 @@ target_link_libraries(fuzz_resp_stream PRIVATE
 )
 target_compile_options(fuzz_resp_stream PRIVATE -fsanitize=fuzzer)
 
-# The format 2 frame codec: Inspect with and without CRC verification,
+# The WAL frame codec: Inspect with and without CRC verification,
 # then DecodeEntry. Its CRC oracle uses the queue's private CRC32C and
 # byte helpers, hence the source-tree include path.
 add_executable(fuzz_frame_decoder frame_decoder_fuzz.cpp)

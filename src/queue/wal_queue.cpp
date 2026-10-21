@@ -63,7 +63,7 @@ core::Result<void> CheckLayout(const std::filesystem::path& wal_path, uint32_t l
       return std::unexpected(
           core::Error{core::ErrorCode::kFailedPrecondition,
                       "wal_path " + wal_path.string() + " holds a WAL format 1 layout (" + name +
-                          "); format 2 has no migration from it, so start from an empty wal_path"});
+                          "); there is no migration from it, so start from an empty wal_path"});
     }
     if (!name.starts_with(kLogPrefix)) continue;
     const std::string_view digits = std::string_view(name).substr(kLogPrefix.size());

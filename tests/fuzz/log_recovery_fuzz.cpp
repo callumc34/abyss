@@ -1,4 +1,4 @@
-// libFuzzer harness for WAL format 2 log recovery.
+// libFuzzer harness for WAL log recovery.
 //
 // Initialisation builds a real log with Log: segment 0 holds a valid
 // header and a few real frames, segments 1 and 2 are spares. Each input

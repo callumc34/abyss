@@ -9,7 +9,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
-// WAL format 2 frames (ADP-009). Every frame starts 8-byte aligned:
+// WAL format 3 frames (ADP-009). Every frame starts 8-byte aligned:
 //
 //   commit word   u64   {len: low u32, gen: high u32}, stored last
 //   crc32c        u32   over body[0, covered), the segment's salt, then
