@@ -395,7 +395,7 @@ These were taken on one laptop while the sequenced write path (ADP-015, #160) wa
 
 ### W1: a write at `process_crash` (target p99 < 20 µs)
 
-> **Placeholder: the W1 headline on the final tree (#197).** The nine 5,000/s runs are to be re-run on the final, rebased tree on a quiet host. Until then: tree **TBD**, host load **TBD**, p50 **TBD** µs, p99 **TBD** µs, p99.9 **TBD** µs, lagging, overloaded and backlog **TBD**. Every W1 figure below is from the second round of these measurements, on tree `5dc726e+dirty.939d007e0dd3` and a loaded host.
+> **W1 on the final tree: FAIL (#197).** Tree `4e1d54b`, Release, three 60 s runs at 5,000/s with nothing building: p50 **5.8 µs** (5.6–6.3), p99 **134 µs** (127–256), p99.9 **1.69 ms** (1.61–3.31). 0 of 3 runs lagging and 0 overloaded; 0.87–1.14% of slots backlogged, waiting 6.7 ms at p99 (5.6–8.4). The one-minute load at start was 2.35, 2.45 and 4.29, from other sessions on this host; the third run started when the 15-minute quiet gate expired. The p99 is higher than round 2's below (median 52 µs, range 39–7,030 µs, on tree 939d and a busier host). The difference is not attributed: three runs on a shared macOS host cannot separate it from noise, and the authoritative W1 run is on Linux (#197).
 
 One worker, open loop, round 2's runs (tree `939d…`, loaded host). Each cell is the median over all its runs, with the range in brackets.
 
@@ -591,6 +591,8 @@ So the cause is not isolated: neither the hottest shard's offered load nor the l
 - lock waits per shard, since `abyss_sequencer_phase_seconds{phase="lock_wait"}` carries no shard label;
 - the scrambled-Zipf re-run #196 lists, to separate key-to-shard concentration from per-key contention;
 - the same cells over 64 shards on Linux.
+
+**On the final tree the collapse is gone.** The same 50/50 cell at 50,000/s (tree `4e1d54b`, the command below) has a write p99 of 4.5 ms and p99.9 of 15 ms, against round 2's 382 ms and 478 ms on tree 939d; the backlogged slots' p99 wait fell from 406 ms to 6.5 ms. Both runs are flagged lagging and overloaded: at 50,000/s the eight inline workers saturate this host's CPU, so neither run is a clean saturation measurement. Tree 939d predates the fix for a quadratic absorb (a buffered collection's size was recomputed over every member on each absorb, under the buffer mutex that collection reads also take), and 5 of the 20 hottest keys are collections, key 0 a set. That fits the collapse, but does not explain why Zipf 1.2, whose hottest key is the same set, kept up in round 2. The attribution is therefore likely but not controlled; a Linux re-run of the cell settles it (#196).
 
 For an operator, the signal for writers queueing on a shard's lock is `abyss_sequencer_phase_seconds{phase="lock_wait"}` (#196; #185 tracks a reader-scalable shard lock). Here it rose with the load under every distribution, so it did not mark this collapse ahead of the latency.
 
