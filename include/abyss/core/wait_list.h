@@ -124,6 +124,13 @@ class WaitList {
     WakeFront(kWakeBatch);
   }
 
+  // Wakes the front waiter only, for an owner each of whose events
+  // makes room for about one: one that passes hands on in turn.
+  void NotifyOne() noexcept {
+    if (count_.load(std::memory_order_seq_cst) == 0) return;
+    WakeFront(1);
+  }
+
   // Called by a woken waiter whose condition held (an attempt that
   // passed admission, or found a spare or memory) before it goes on.
   // Wakes the next waiter, which hands on in turn if its own condition

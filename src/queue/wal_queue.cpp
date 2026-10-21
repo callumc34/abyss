@@ -600,6 +600,48 @@ bool WalQueue::WaitForSpare(core::ShardId shard, core::SteadyTime deadline) {
   return logs_[shard % config_.log_count]->log->WaitForSpare(deadline);
 }
 
+bool WalQueue::Admissible(core::ShardId shard) {
+  return shard < config_.shard_count && window_.Admissible(shard % config_.log_count);
+}
+
+std::optional<core::Result<void>> WalQueue::WhenReady(core::QueueWait wait, core::ShardId shard,
+                                                      core::Waiter& waiter, bool first) {
+  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL wait by a thread holding a reservation");
+  if (auto v = ValidateShard(shard); !v.has_value()) return v;
+  const uint32_t log = shard % config_.log_count;
+  if (wait == core::QueueWait::kAdmission) return window_.WhenAdmissible(log, waiter, first);
+  // A stopping queue refuses Reserve, so a ready spare must not invite
+  // another attempt.
+  if (streams_[shard]->stopping()) {
+    return core::Result<void>{
+        std::unexpected(core::Error{core::ErrorCode::kUnavailable, "WAL queue is shutting down"})};
+  }
+  return logs_[log]->log->WhenSpare(waiter, first);
+}
+
+bool WalQueue::CancelWait(core::QueueWait wait, core::ShardId shard,
+                          core::Waiter& waiter) noexcept {
+  if (shard >= config_.shard_count) return false;
+  const uint32_t log = shard % config_.log_count;
+  if (wait == core::QueueWait::kAdmission) return window_.CancelAdmission(log, waiter);
+  return logs_[log]->log->CancelSpare(waiter);
+}
+
+void WalQueue::FinishWait(core::QueueWait wait, core::ShardId shard,
+                          core::Waiter& waiter) noexcept {
+  if (shard >= config_.shard_count) return;
+  const uint32_t log = shard % config_.log_count;
+  if (wait == core::QueueWait::kAdmission) {
+    window_.FinishAdmission(log, waiter);
+  } else {
+    logs_[log]->log->FinishSpare(waiter);
+  }
+}
+
+core::Error WalQueue::AdmissionTimedOut(core::ShardId shard) {
+  return window_.Rejected(shard % config_.log_count);
+}
+
 core::Result<Reservation> WalQueue::Reserve(std::span<const ShardEntries> parts) {
   ABYSS_DCHECK(ReservationsHeld() == 0, "WAL reservation by a thread holding one");
   if (parts.empty()) return std::unexpected(Invalid("reservation has no parts"));

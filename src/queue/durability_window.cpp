@@ -83,14 +83,33 @@ core::Result<void> DurabilityWindow::Admit(std::size_t log, Clock::time_point de
   }
   if (admitted.has_value()) return {};
   if (admitted.error().code() != core::ErrorCode::kTimeout) return admitted;
+  return std::unexpected(Rejected(log));
+}
 
+std::optional<core::Result<void>> DurabilityWindow::WhenAdmissible(std::size_t log,
+                                                                   core::Waiter& waiter,
+                                                                   bool first) {
+  if (first) {
+    waits_.Increment();
+    if (admit_hook_) admit_hook_();
+  }
+  auto admitted =
+      admission(log).Register(waiter, [this, log] { return stopped() || Admissible(log); });
+  if (admitted.has_value() && admitted->has_value() && stopped()) {
+    return core::Result<void>{
+        std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"})};
+  }
+  return admitted;
+}
+
+core::Error DurabilityWindow::Rejected(std::size_t log) {
   rejections_.Increment();
-  return std::unexpected(core::Error{
+  return core::Error{
       core::ErrorCode::kResourceExhausted,
       "WAL durability window full: the device is not keeping up with writes (unflushed " +
           std::to_string(UnflushedBytes()) + " of " + std::to_string(max_bytes_) +
           " bytes, oldest " + std::to_string(ToMillis(age(log).Age(Clock::now()))) + " of " +
-          std::to_string(ToMillis(max_age_)) + " ms)"});
+          std::to_string(ToMillis(max_age_)) + " ms)"};
 }
 
 void DurabilityWindow::Add(uint64_t bytes) noexcept {

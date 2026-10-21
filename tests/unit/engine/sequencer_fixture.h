@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -26,6 +25,8 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
+#include "abyss/engine/blocking_driver.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -34,46 +35,41 @@
 
 namespace abyss::engine::testing {
 
-// No buffered deltas, and a drained seq the test moves.
+// No buffered deltas, and a drained seq the test moves. Memory's waits
+// for room are a real WaitList, each advance waking one, as a cold
+// consumer's are.
 class DrainRouter : public consumer::CompactionBufferRouter {
  public:
   std::optional<consumer::CompactedState> Snapshot(core::ShardId /*shard*/,
                                                    std::string_view /*key*/) const override {
     return std::nullopt;
   }
-  bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId target_seq,
-                         std::chrono::milliseconds timeout) override {
-    std::unique_lock lock(mu_);
-    return cv_.wait_for(lock, timeout, [&] { return drained_ >= target_seq; });
+  std::optional<core::Result<void>> WhenDrainedPast(core::ShardId /*shard*/, core::SequenceId past,
+                                                    core::Waiter& waiter) override {
+    return room_.Register(waiter,
+                          [this, past] { return drained_.load(std::memory_order_seq_cst) > past; });
   }
-  // The sequencer only waits blocking: a drain not yet reached is not
-  // faked.
-  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
-                                                core::SeqWaiterNode& node) override {
-    const std::scoped_lock lock(mu_);
-    if (drained_ <= node.seq()) core::Fatal("WhenDrained on an undrained seq is not faked");
-    return core::Result<void>{};
+  bool CancelDrainWait(core::ShardId /*shard*/, core::Waiter& waiter) noexcept override {
+    return room_.Cancel(waiter);
   }
-  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
-    return false;
+  void FinishDrainWait(core::ShardId /*shard*/, core::Waiter& waiter) noexcept override {
+    room_.Finish(waiter);
   }
 
   void Advance(core::SequenceId to) {
-    {
-      const std::scoped_lock lock(mu_);
-      drained_ = to;
-    }
-    cv_.notify_all();
+    drained_.store(to, std::memory_order_seq_cst);
+    room_.NotifyOne();
   }
-  core::SequenceId Drained() const {
-    const std::scoped_lock lock(mu_);
-    return drained_;
+  core::SequenceId Drained() const { return drained_.load(std::memory_order_seq_cst); }
+  // As a cold consumer's Join.
+  void Stop() {
+    room_.FailAll(core::Error{core::ErrorCode::kUnavailable, "cold consumer stopped"});
   }
+  size_t RoomWaiters() const { return room_.size(); }
 
  private:
-  mutable std::mutex mu_;
-  std::condition_variable cv_;
-  core::SequenceId drained_ = 0;
+  std::atomic<core::SequenceId> drained_{0};
+  core::WaitList room_;
 };
 
 // A real hot store and loader over an in-memory queue and a cold map,
@@ -141,13 +137,11 @@ class SequencerFixture : public ::testing::Test {
     }
     hot_ = std::make_unique<hot::ShardedHotStore>(std::move(config));
     loader_ = std::make_unique<Loader>(*hot_, router_, cold_, [this] { return Wall(); });
-    sequencer_ =
-        std::make_unique<Sequencer>(*hot_, queue_, *loader_, router_,
-                                    SequencerConfig{
-                                        .write_timeout = options.write_timeout,
-                                        .backpressure_wait_slice = std::chrono::milliseconds{5},
-                                        .wall_clock = [this] { return WallRead(); },
-                                    });
+    sequencer_ = std::make_unique<Sequencer>(*hot_, queue_, *loader_, router_,
+                                             SequencerConfig{
+                                                 .write_timeout = options.write_timeout,
+                                                 .wall_clock = [this] { return WallRead(); },
+                                             });
   }
 
   core::WallTime Wall() const { return core::WallTime{std::chrono::milliseconds{wall_ms_.load()}}; }
@@ -158,7 +152,7 @@ class SequencerFixture : public ::testing::Test {
 
   core::Result<core::RespValue> Run(std::vector<std::string> args,
                                     core::PredicateFlags flags = core::PredicateFlags::kNone) {
-    return sequencer_->Execute(core::RespCommand{.args = std::move(args)}, flags);
+    return RunToCompletion(*sequencer_, core::RespCommand{.args = std::move(args)}, flags);
   }
   // A reply, failing the test on an error Result.
   std::string Reply(std::vector<std::string> args,

@@ -33,6 +33,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/blocking_driver.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
@@ -67,6 +68,7 @@ struct Options {
   std::chrono::milliseconds write_timeout{5000};
   // How often committed offsets persist, and so segments are reclaimed.
   std::chrono::milliseconds offset_fsync_interval{std::chrono::hours{1}};
+  uint64_t durability_window_bytes = uint64_t{64} << 20;
   // Prefixes the store directories, so one test can open several.
   std::string run;
 };
@@ -172,6 +174,7 @@ class SequencedEngineTest : public ::testing::Test {
         .shard_count = options_.shards,
         .log_count = options_.log_count,
         .durability = options_.durability,
+        .durability_window_bytes = options_.durability_window_bytes,
         .min_retention = 0s,
         .retention_consumers = {core::kColdConsumer},
         .offset_fsync_interval = options_.offset_fsync_interval,
@@ -251,7 +254,7 @@ class SequencedEngineTest : public ::testing::Test {
   void TearDown() override { CloseAll(); }
 
   std::string Write(std::vector<std::string> args, Flags flags = Flags::kNone) {
-    auto reply = sequencer_->Execute(core::RespCommand{.args = std::move(args)}, flags);
+    auto reply = RunToCompletion(*sequencer_, core::RespCommand{.args = std::move(args)}, flags);
     if (!reply.has_value()) return "error: " + reply.error().message();
     return Describe(*reply);
   }

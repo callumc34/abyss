@@ -12,7 +12,9 @@
 #include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 
 namespace abyss::testing {
 
@@ -40,11 +42,21 @@ class ForwardingQueue : public core::Queue {
                                                      core::SteadyTime admit_by) override {
     return queue_.AppendBatch(shard, entries, admit_by);
   }
-  core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by) override {
-    return queue_.Admit(shard, admit_by);
+  bool Admissible(core::ShardId shard) override { return queue_.Admissible(shard); }
+  std::optional<core::Result<void>> WhenReady(core::QueueWait wait, core::ShardId shard,
+                                              core::Waiter& waiter, bool first) override {
+    return queue_.WhenReady(wait, shard, waiter, first);
   }
-  bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline) override {
-    return queue_.WaitForSpare(shard, deadline);
+  bool CancelWait(core::QueueWait wait, core::ShardId shard,
+                  core::Waiter& waiter) noexcept override {
+    return queue_.CancelWait(wait, shard, waiter);
+  }
+  void FinishWait(core::QueueWait wait, core::ShardId shard,
+                  core::Waiter& waiter) noexcept override {
+    queue_.FinishWait(wait, shard, waiter);
+  }
+  core::Error AdmissionTimedOut(core::ShardId shard) override {
+    return queue_.AdmissionTimedOut(shard);
   }
   core::Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) override {
     return queue_.Reserve(parts);
@@ -78,6 +90,14 @@ class ForwardingQueue : public core::Queue {
   core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
                                   core::Durability durability, core::Duration timeout) override {
     return queue_.AwaitDurable(shard, seq, durability, timeout);
+  }
+  std::optional<core::Result<void>> WhenDurable(core::ShardId shard, core::Durability durability,
+                                                core::SeqWaiterNode& node) override {
+    return queue_.WhenDurable(shard, durability, node);
+  }
+  bool CancelDurable(core::ShardId shard, core::Durability durability,
+                     core::SeqWaiterNode& node) noexcept override {
+    return queue_.CancelDurable(shard, durability, node);
   }
   core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override {
     return queue_.FirstSeq(shard);

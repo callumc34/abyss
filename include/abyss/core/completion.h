@@ -11,9 +11,12 @@ enum class CompletionKind : uint8_t {
   kSequenced,
   kReplied,
   kDurable,
+  // A parked task's wait ended: run it again on its owner's thread.
+  kResume,
 };
 
-// `result` is kDurable's outcome: ok, or kUnavailable at shutdown.
+// `result` is kDurable's or kResume's outcome: ok, or the owner's
+// error at shutdown.
 struct CompletionEvent {
   uint64_t client_id = 0;
   uint64_t slot_seq = 0;

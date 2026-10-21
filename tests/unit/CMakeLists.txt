@@ -253,6 +253,7 @@ add_executable(abyss_engine_tests
   engine/hot_replayer_test.cpp
   engine/loader_merge_test.cpp
   engine/loader_test.cpp
+  engine/sequencer_attempt_test.cpp
   engine/sequencer_test.cpp
 )
 

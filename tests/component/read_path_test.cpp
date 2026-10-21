@@ -31,6 +31,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/blocking_driver.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
@@ -142,18 +143,17 @@ class OneBufferRouter : public consumer::CompactionBufferRouter {
                                                    std::string_view key) const override {
     return buffer_.Snapshot(key);
   }
-  bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId /*target_seq*/,
-                         std::chrono::milliseconds /*timeout*/) override {
+  // Nothing drains here: a wait for room finds it already.
+  std::optional<core::Result<void>> WhenDrainedPast(core::ShardId /*shard*/,
+                                                    core::SequenceId /*past*/,
+                                                    core::Waiter& /*waiter*/) override {
     ++drain_waits;
-    return true;
-  }
-  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
-                                                core::SeqWaiterNode& /*node*/) override {
     return core::Result<void>{};
   }
-  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+  bool CancelDrainWait(core::ShardId /*shard*/, core::Waiter& /*waiter*/) noexcept override {
     return false;
   }
+  void FinishDrainWait(core::ShardId /*shard*/, core::Waiter& /*waiter*/) noexcept override {}
 
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::atomic<int> drain_waits{0};
@@ -242,8 +242,8 @@ class ReadPathFixture : public ::testing::Test {
 
   // Through the sequencer, so hot holds the key as decided.
   void Write(std::vector<std::string> args) {
-    auto written =
-        sequencer_.Execute(core::RespCommand{.args = std::move(args)}, core::PredicateFlags::kNone);
+    auto written = RunToCompletion(sequencer_, core::RespCommand{.args = std::move(args)},
+                                   core::PredicateFlags::kNone);
     ASSERT_TRUE(written.has_value()) << written.error().message();
     ASSERT_FALSE(written->IsError()) << written->AsString();
   }
@@ -722,8 +722,8 @@ TEST_F(ReadPathTest, AReadNeverWaitsOnAWritesLoad) {
   const double filled = fills();
   const auto write = [this](std::vector<std::string> args) {
     return std::async(std::launch::async, [this, args = std::move(args)]() mutable {
-      return sequencer_.Execute(core::RespCommand{.args = std::move(args)},
-                                core::PredicateFlags::kNone);
+      return RunToCompletion(sequencer_, core::RespCommand{.args = std::move(args)},
+                             core::PredicateFlags::kNone);
     });
   };
   cold_.HoldFullLoads();
@@ -866,7 +866,7 @@ TEST_F(ReadPathTest, AGetOfALargeColdSetIsWrongTypeAndReadsNoMembers) {
 TEST_F(ReadPathTest, AKeyWrittenAfterAFlushIsResidentToAFill) {
   drained_ = 0;
   Cold({ops::StringSet{.key = "k", .value = "pre-flush"}});
-  ASSERT_TRUE(sequencer_.Flush().has_value());
+  ASSERT_TRUE(RunFlushToCompletion(sequencer_).has_value());
   Write({"SET", "k", "post"});
   auto filled = loader_.Install("k", core::KeyType::kString, core::SteadyClock::now() + 1s);
   ASSERT_TRUE(filled.has_value());

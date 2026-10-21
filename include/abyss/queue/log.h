@@ -12,6 +12,7 @@
 
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/queue/frame.h"
 
 namespace abyss::queue {
@@ -102,6 +103,12 @@ class Log {
   bool CanReserve(uint32_t size) const;
   // False at the deadline, or once the log is shutting down.
   bool WaitForSpare(core::SteadyTime deadline);
+  // WaitForSpare for a waiter that registers itself, counted when
+  // `first`: outcomes as WaitList::Register's, kUnavailable once the
+  // log is shutting down.
+  std::optional<core::Result<void>> WhenSpare(core::Waiter& waiter, bool first);
+  bool CancelSpare(core::Waiter& waiter) noexcept;
+  void FinishSpare(core::Waiter& waiter) noexcept;
 
   // Commits the frame EncodeEntryInto wrote at the reservation's dst,
   // whose body is `len` bytes: seals its CRC for the reservation's gen

@@ -113,6 +113,7 @@ void ColdConsumer::Join() {
     running_.store(false, std::memory_order_release);
   }
   drained_waiters_.FailAll(core::Error{core::ErrorCode::kUnavailable, "cold consumer stopped"});
+  room_waiters_.FailAll(core::Error{core::ErrorCode::kUnavailable, "cold consumer stopped"});
 }
 
 void ColdConsumer::Stop() {
@@ -893,6 +894,13 @@ std::optional<core::Result<void>> ColdConsumer::WhenDrained(core::SeqWaiterNode&
   return drained_waiters_.Register(node, latest_drained_seq_);
 }
 
+std::optional<core::Result<void>> ColdConsumer::WhenDrainedPast(core::SequenceId past,
+                                                                core::Waiter& waiter) {
+  RequestDrain();
+  return room_waiters_.Register(
+      waiter, [this, past] { return latest_drained_seq_.load(std::memory_order_seq_cst) > past; });
+}
+
 // Asks the loop to drain now rather than finish its idle backoff, which
 // may be an order of magnitude longer than a waiter's deadline.
 void ColdConsumer::RequestDrain() {
@@ -906,6 +914,7 @@ void ColdConsumer::RequestDrain() {
 // The drained seq was stored seq_cst; Advance loads the waiter count.
 void ColdConsumer::NotifyDrained() noexcept {
   drained_waiters_.Advance(latest_drained_seq_.load(std::memory_order_seq_cst));
+  room_waiters_.NotifyOne();
 }
 
 ColdConsumer::Metrics ColdConsumer::Snapshot() const {

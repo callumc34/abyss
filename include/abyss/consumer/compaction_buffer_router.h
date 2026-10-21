@@ -1,13 +1,12 @@
 #pragma once
 
-#include <chrono>
 #include <optional>
 #include <string_view>
 
 #include "abyss/consumer/compacted_state.h"
 #include "abyss/core/result.h"
-#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 
 namespace abyss::consumer {
 
@@ -25,16 +24,16 @@ class CompactionBufferRouter {
   virtual std::optional<CompactedState> Snapshot(core::ShardId shard,
                                                  std::string_view key) const = 0;
 
-  // Blocks until the shard's cold consumer has drained through `target_seq`,
-  // or `timeout` elapses. Returns true on catch-up, false on timeout.
-  virtual bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
-                                 std::chrono::milliseconds timeout) = 0;
-  // Registers `node`, posted once the shard has drained past its seq,
-  // so through seq + 1: SeqWaiters::Register. kUnavailable once the
-  // shard's consumer stopped.
-  virtual std::optional<core::Result<void>> WhenDrained(core::ShardId shard,
-                                                        core::SeqWaiterNode& node) = 0;
-  virtual bool CancelDrained(core::ShardId shard, core::SeqWaiterNode& node) noexcept = 0;
+  // Memory backpressure's wait for room (core::WaitList): links
+  // `waiter` until `shard` has drained past `past`, waking one waiter
+  // per advance, and asks the drain to run now. Outcomes as
+  // WaitList::Register's; kUnavailable once the shard's consumer
+  // stopped.
+  virtual std::optional<core::Result<void>> WhenDrainedPast(core::ShardId shard,
+                                                            core::SequenceId past,
+                                                            core::Waiter& waiter) = 0;
+  virtual bool CancelDrainWait(core::ShardId shard, core::Waiter& waiter) noexcept = 0;
+  virtual void FinishDrainWait(core::ShardId shard, core::Waiter& waiter) noexcept = 0;
 };
 
 }  // namespace abyss::consumer

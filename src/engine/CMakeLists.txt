@@ -3,8 +3,10 @@ add_library(abyss_engine
   doorkeeper.cpp
   hot_replayer.cpp
   loader.cpp
+  pending_write.cpp
   read_path.cpp
   sequencer.cpp
+  blocking_driver.cpp
   tiering_engine.cpp
   recovery_coordinator.cpp
   bounded_thread_shard_scheduler.cpp

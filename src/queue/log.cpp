@@ -1369,6 +1369,24 @@ bool Log::WaitForSpare(core::SteadyTime deadline) {
   return !impl.stopping;
 }
 
+std::optional<core::Result<void>> Log::WhenSpare(core::Waiter& waiter, bool first) {
+  Impl& impl = *impl_;
+  if (first) {
+    impl.spare_waits.Increment();
+    if (impl.spare_wait_hook) impl.spare_wait_hook();
+  }
+  auto ready = impl.spare_waiters.Register(waiter, [&impl] { return impl.SpareReady(); });
+  if (!ready.has_value() || !ready->has_value()) return ready;
+  const std::scoped_lock lock(impl.mu);
+  if (!impl.stopping) return ready;
+  return core::Result<void>{std::unexpected(
+      LogError(core::ErrorCode::kUnavailable, impl.id(), "shutting down: no spare segments"))};
+}
+
+bool Log::CancelSpare(core::Waiter& waiter) noexcept { return impl_->spare_waiters.Cancel(waiter); }
+
+void Log::FinishSpare(core::Waiter& waiter) noexcept { impl_->spare_waiters.Finish(waiter); }
+
 // The bytes before the commit word were written in place, unordered.
 // Readers and recovery trust a frame only through its commit word (its
 // gen) and its CRC, so that is as safe as a copy made first would be.

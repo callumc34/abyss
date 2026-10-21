@@ -34,6 +34,7 @@ constexpr std::string_view kFlushDurableTimeout =
     "flush durable wait exceeded server timeout; retry to complete the wipe";
 constexpr std::string_view kFenceTimeout =
     "durable wait exceeded server timeout; the reply would show a write not yet durable";
+constexpr std::string_view kForeignLoadTimeout = "write timed out awaiting a load of its key";
 
 core::RespValue CrossSlot() {
   return core::RespValue::Error(core::ErrorPrefix::kCrossSlot,
@@ -63,6 +64,12 @@ core::Result<core::RespValue> TimedOut(RedecideReason reason) {
       return OutOfMemory();
   }
   return std::unexpected(core::Error{core::ErrorCode::kTimeout, "write timed out"});
+}
+
+core::Error SpareTimedOut(bool flush) {
+  return core::Error{core::ErrorCode::kTimeout,
+                     flush ? "flush timed out waiting for a spare WAL segment"
+                           : "write timed out waiting for a spare WAL segment"};
 }
 
 uint64_t WallMs(core::WallTime at) {
@@ -143,42 +150,38 @@ class Sequencer::Hold {
   std::chrono::steady_clock::time_point start_;
 };
 
-// A sampled write's time in each stage. Each lap charges the time
-// since the last to one stage; a stage passed twice adds up.
+// A sampled write's time in each stage, kept in the write across its
+// attempts. Each lap charges the time since the last to one stage; a
+// stage passed twice adds up.
 class Sequencer::Phases {
  public:
-  explicit Phases(Sequencer& sequencer)
-      : sequencer_(sequencer),
-        sampled_(Sampled()),
-        last_(sampled_ ? std::chrono::steady_clock::now()
-                       : std::chrono::steady_clock::time_point{}) {}
+  Phases(Sequencer& sequencer, PendingWrite::PhaseTimes& times)
+      : sequencer_(sequencer), times_(times) {}
 
-  bool sampled() const { return sampled_; }
+  bool sampled() const { return times_.sampled; }
 
   void Lap(WritePhase phase) {
-    if (!sampled_) return;
+    if (!times_.sampled) return;
     const auto now = std::chrono::steady_clock::now();
     const auto index = static_cast<size_t>(phase);
-    spent_.at(index) += now - last_;
-    passed_.at(index) = true;
-    last_ = now;
+    times_.spent.at(index) += now - times_.last;
+    times_.passed.at(index) = true;
+    times_.last = now;
   }
 
   // Once the write succeeded: the stages it passed.
   void Record() const {
-    if (!sampled_) return;
-    for (size_t i = 0; i < spent_.size(); ++i) {
-      if (!passed_.at(i)) continue;
-      sequencer_.phase_seconds_.at(i).Observe(std::chrono::duration<double>(spent_.at(i)).count());
+    if (!times_.sampled) return;
+    for (size_t i = 0; i < times_.spent.size(); ++i) {
+      if (!times_.passed.at(i)) continue;
+      sequencer_.phase_seconds_.at(i).Observe(
+          std::chrono::duration<double>(times_.spent.at(i)).count());
     }
   }
 
  private:
   Sequencer& sequencer_;
-  bool sampled_;
-  std::chrono::steady_clock::time_point last_;
-  std::array<std::chrono::steady_clock::duration, metrics::kWritePhaseCount> spent_{};
-  std::array<bool, metrics::kWritePhaseCount> passed_{};
+  PendingWrite::PhaseTimes& times_;
 };
 
 Sequencer::Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& loader,
@@ -200,181 +203,240 @@ Sequencer::Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& load
   }
 }
 
+Step Sequencer::Attempt(PendingWrite& write) {
+  ABYSS_DCHECK(write.owner_ == std::this_thread::get_id(),
+               "a write attempted off its owner's thread");
+  ABYSS_DCHECK(write.phase_ != PendingWrite::Phase::kDone, "an attempt of a write that replied");
+  if (write.phase_ == PendingWrite::Phase::kDurable) return AwaitDurable(write);
+  if (write.waiting_) {
+    const bool ended =
+        write.wake_.has_value() || write.expired_ || write.wait_reason_ == WaitReason::kLoads;
+    ABYSS_DCHECK(ended, "a write attempted while its wait is open");
+    // Past its deadline it is never applied, whatever woke it.
+    if (write.expired_ || core::SteadyClock::now() >= write.deadline_) return Abandon(write);
+    write.waiting_ = false;
+  }
+  return write.flush_ ? FlushAttempt(write) : WriteAttempt(write);
+}
+
+void Sequencer::Load(PendingWrite& write) {
+  write.completions_.reserve(write.owned_.size());
+  for (const PendingWrite::Owned& load : write.owned_) {
+    auto result = loader_.Load(load.shard, load.key, load.need, write.deadline_);
+    if (!result.has_value()) {
+      write.load_error_ = result.error();
+      return;
+    }
+    write.completions_.push_back(
+        {.key = load.key, .token = load.token, .result = *std::move(result)});
+  }
+}
+
+bool Sequencer::Expire(PendingWrite& write) {
+  ABYSS_DCHECK(write.owner_ == std::this_thread::get_id(),
+               "a write expired off its owner's thread");
+  ABYSS_DCHECK(write.waiting_, "a write expired while not waiting");
+  ABYSS_DCHECK(!write.wake_.has_value(), "a write expired with its wake in hand");
+  bool cancelled = false;
+  if (write.phase_ == PendingWrite::Phase::kDurable) {
+    const ShardSeq at = write.DurableAt(write.durable_next_);
+    cancelled = write.node_.has_value() &&
+                queue_.CancelDurable(at.shard, queue_.AckDurability(), *write.node_);
+    if (cancelled) write.node_.reset();
+  } else {
+    switch (write.wait_reason_) {
+      case WaitReason::kAdmission:
+        cancelled = queue_.CancelWait(core::QueueWait::kAdmission, write.wait_shard_, write);
+        break;
+      case WaitReason::kSpare:
+        cancelled = queue_.CancelWait(core::QueueWait::kSpare, write.wait_shard_, write);
+        break;
+      case WaitReason::kBackpressure:
+        cancelled = buffers_.CancelDrainWait(write.wait_shard_, write);
+        break;
+      case WaitReason::kForeignLoad:
+        cancelled = hot_.CancelLoadWait(write.foreign_.at(write.foreign_next_), write.load_wake_);
+        break;
+      case WaitReason::kLoads:
+        // A load in flight reports back when it lands.
+        break;
+    }
+  }
+  write.expired_ = cancelled;
+  return cancelled;
+}
+
 // Deadlock-free: hot shard locks are taken ascending, then each
 // stream's append_mu_ inside Reserve, and nothing waits under a hot
 // lock: admission, spare segments, loads, cold drain and durability
 // are all waited for with every lock released.
-core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
-                                                 core::PredicateFlags flags) {
-  Phases phases(*this);
-  const core::SteadyTime deadline = core::SteadyClock::now() + config_.write_timeout;
-  auto keys = WriteKeys(cmd);
-  if (!keys.has_value()) return std::unexpected(keys.error());
-  std::vector<core::ShardId> shards;
-  shards.reserve(keys->size());
-  for (const std::string_view key : *keys) shards.push_back(hot_.ShardOf(key));
-  std::ranges::sort(shards);
-  shards.erase(std::ranges::unique(shards).begin(), shards.end());
-  if (std::ranges::any_of(shards, [&](core::ShardId shard) {
-        return queue_.LogOf(shard) != queue_.LogOf(shards.front());
-      })) {
-    return CrossSlot();
-  }
-
-  // Large arguments are copied for the log before any lock, once; a
-  // decision moves the request's own strings into hot. `lent` marks a
-  // copy an attempt's log entry holds, to take back if it fails.
-  struct Spare {
-    std::optional<std::string> copy;
-    bool lent = false;
-  };
-  std::vector<Spare> spare;
-  size_t total = 0;
-  for (size_t i = 1; i < cmd.args.size(); ++i) total += cmd.args[i].size();
-  for (size_t i = 1; i < cmd.args.size(); ++i) {
-    if (total > core::kLockHoldFrameBytes || cmd.args[i].size() > core::kLockHoldFrameBytes) {
-      if (spare.empty()) spare.resize(cmd.args.size());
-      spare[i].copy = cmd.args[i];
+Step Sequencer::WriteAttempt(PendingWrite& write) {
+  using Phase = PendingWrite::Phase;
+  Phases phases(*this, write.phase_times_);
+  core::RespCommand& cmd = write.cmd_;
+  std::vector<core::ShardId>& shards = write.shards_;
+  std::vector<PendingWrite::Spare>& spare = write.spare_;
+  if (write.phase_ == Phase::kStart) {
+    Start(write);
+    auto keys = WriteKeys(cmd);
+    if (!keys.has_value()) return Done(write, std::unexpected(keys.error()));
+    shards.reserve(keys->size());
+    for (const std::string_view key : *keys) shards.push_back(hot_.ShardOf(key));
+    std::ranges::sort(shards);
+    shards.erase(std::ranges::unique(shards).begin(), shards.end());
+    if (std::ranges::any_of(shards, [&](core::ShardId shard) {
+          return queue_.LogOf(shard) != queue_.LogOf(shards.front());
+        })) {
+      return Done(write, CrossSlot());
     }
-  }
 
-  for (const core::ShardId shard : shards) {
-    if (auto admitted = queue_.Admit(shard, deadline); !admitted) {
-      return std::unexpected(admitted.error());
+    // Large arguments are copied for the log before any lock, once; a
+    // decision moves the request's own strings into hot.
+    size_t total = 0;
+    for (size_t i = 1; i < cmd.args.size(); ++i) total += cmd.args[i].size();
+    for (size_t i = 1; i < cmd.args.size(); ++i) {
+      if (total > core::kLockHoldFrameBytes || cmd.args[i].size() > core::kLockHoldFrameBytes) {
+        if (spare.empty()) spare.resize(cmd.args.size());
+        spare[i].copy = cmd.args[i];
+      }
     }
+    write.grows_ = GrowsMemory(cmd);
+    write.phase_ = Phase::kAdmit;
   }
-  // Set once a hold finds a shard over its memory limit.
-  bool await_memory = false;
-  const bool grows = GrowsMemory(cmd);
-  std::optional<RedecideReason> redecided;
-  const auto again = [this, &redecided](RedecideReason reason) {
-    Redecided(reason);
-    redecided = reason;
-  };
+  if (write.phase_ == Phase::kLoads) write.phase_ = Phase::kLoaded;
+
   for (;;) {
-    // Every way round is bounded by the deadline, a re-check under the
-    // locks that keeps failing after its wait succeeded included.
-    if (redecided.has_value() && core::SteadyClock::now() >= deadline) {
-      if (*redecided == RedecideReason::kBackpressure) {
-        backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
-        backpressure_rejections_metric_.Increment();
-      }
-      return TimedOut(*redecided);
+    if (write.phase_ == Phase::kAdmit) {
+      if (auto step = AwaitAdmission(write)) return *std::move(step);
+      write.phase_ = Phase::kTop;
     }
-    if (await_memory) {
-      if (auto memory = AwaitMemory(shards, deadline); !memory) {
-        if (memory.error().code() == core::ErrorCode::kResourceExhausted) return OutOfMemory();
-        return std::unexpected(memory.error());
-      }
+    if (write.phase_ == Phase::kSpare) {
+      if (auto step = AwaitSpares(write)) return *std::move(step);
+      write.phase_ = Phase::kTop;
     }
     // A shard's appended_at never goes backwards: cold expires by it.
     // One instant per hold is decide's now and every entry's stamp.
-    core::WallTime wall = config_.wall_clock();
+    core::WallTime wall;
     std::optional<Hold> hold;
-    phases.Lap(WritePhase::kAdmit);
-    hold.emplace(*this, shards, phases.sampled());
-    phases.Lap(WritePhase::kLockWait);
     const auto instant_of = [&shards, &hold](core::WallTime from) {
       for (const core::ShardId shard : shards) {
         from = std::max(from, (*hold)->LastAppendedAt(shard));
       }
       return from;
     };
-    core::WallTime instant = instant_of(wall);
-    uint64_t now_ms = WallMs(instant);
+    core::WallTime instant;
+    uint64_t now_ms = 0;
     const KeyLookup lookup = [&hold, &now_ms](std::string_view key) {
       return (*hold)->View(key, now_ms);
     };
-    Decision decision = Decide(cmd, flags, now_ms, lookup);
-    phases.Lap(WritePhase::kDecide);
+    Decision decision;
     // Memory judged before this hold's loads went in: what they add is
     // the decision's own keys, which an eviction would only send to
     // load again.
     bool judged = false;
 
-    if (!decision.needs_load.empty()) {
-      struct Owned {
-        std::string key;
-        core::ShardId shard;
-        Need need;
-        hot::LoadToken token;
-      };
-      std::vector<Owned> owned;
-      std::vector<std::string> foreign;
-      bool full_load = false;
-      for (KeyLoad& load : decision.needs_load) {
-        const hot::LoadStart start = (*hold)->BeginLoad(load.key);
-        if (start.started()) {
-          full_load = full_load || load.need == Need::kState;
-          const core::ShardId shard = hot_.ShardOf(load.key);
-          owned.push_back({.key = std::move(load.key),
-                           .shard = shard,
-                           .need = load.need,
-                           .token = start.token});
-        } else {
-          // Decide found the key unknown in this same hold, so it can
-          // only be another's load.
-          ABYSS_DCHECK(start.status == hot::LoadStart::Status::kPending,
-                       "a key decide could not see is resident or flushed");
-          foreign.push_back(std::move(load.key));
+    if (write.phase_ == Phase::kTop) {
+      // Every way round is bounded by the deadline, a re-check under the
+      // locks that keeps failing after its wait succeeded included.
+      // A memory wait resuming goes on inside AwaitMemory, as it would
+      // have blocked there.
+      if (!write.wake_.has_value() && write.redecided_.has_value() &&
+          core::SteadyClock::now() >= write.deadline_) {
+        if (*write.redecided_ == RedecideReason::kBackpressure) {
+          backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
+          backpressure_rejections_metric_.Increment();
         }
+        return Done(write, TimedOut(*write.redecided_));
       }
-      hold->Unlock();
-      const auto abort = [this, &owned] {
-        for (const Owned& load : owned) hot_.AbortLoad(load.key, load.token);
-      };
-      for (const std::string& key : foreign) {
-        if (!hot_.AwaitLoad(key, deadline)) {
-          abort();
-          return std::unexpected(
-              core::Error{core::ErrorCode::kTimeout, "write timed out awaiting a load of its key"});
-        }
+      if (write.await_memory_) {
+        if (auto step = AwaitMemory(write)) return *std::move(step);
       }
-      std::vector<hot::LoadCompletion> completions;
-      completions.reserve(owned.size());
-      for (const Owned& load : owned) {
-        auto result = loader_.Load(load.shard, load.key, load.need, deadline);
-        if (!result.has_value()) {
-          abort();
-          return std::unexpected(result.error());
-        }
-        completions.push_back({.key = load.key, .token = load.token, .result = *std::move(result)});
-      }
+      wall = config_.wall_clock();
+      phases.Lap(WritePhase::kAdmit);
+      hold.emplace(*this, shards, phases.sampled());
+      phases.Lap(WritePhase::kLockWait);
+      instant = instant_of(wall);
+      now_ms = WallMs(instant);
+      decision = Decide(cmd, write.flags_, now_ms, lookup);
+      phases.Lap(WritePhase::kDecide);
 
+      if (!decision.needs_load.empty()) {
+        for (KeyLoad& load : decision.needs_load) {
+          const hot::LoadStart start = (*hold)->BeginLoad(load.key);
+          if (start.started()) {
+            write.full_load_ = write.full_load_ || load.need == Need::kState;
+            const core::ShardId shard = hot_.ShardOf(load.key);
+            write.owned_.push_back({.key = std::move(load.key),
+                                    .shard = shard,
+                                    .need = load.need,
+                                    .token = start.token});
+          } else {
+            // Decide found the key unknown in this same hold, so it can
+            // only be another's load.
+            ABYSS_DCHECK(start.status == hot::LoadStart::Status::kPending,
+                         "a key decide could not see is resident or flushed");
+            write.foreign_.push_back(std::move(load.key));
+          }
+        }
+        hold->Unlock();
+        write.phase_ = Phase::kForeign;
+      }
+    }
+
+    if (write.phase_ == Phase::kForeign) {
+      if (auto step = AwaitForeignLoads(write)) return *std::move(step);
+      if (!write.owned_.empty()) {
+        write.phase_ = Phase::kLoads;
+        return Waiting(write, WaitReason::kLoads);
+      }
+      write.phase_ = Phase::kLoaded;
+    }
+
+    if (write.phase_ == Phase::kLoaded) {
+      if (write.load_error_.has_value()) {
+        core::Error error = *std::move(write.load_error_);
+        AbortLoads(write);
+        return Done(write, std::unexpected(std::move(error)));
+      }
       wall = config_.wall_clock();
       hold.reset();
       phases.Lap(WritePhase::kLoad);
       hold.emplace(*this, shards, phases.sampled());
       phases.Lap(WritePhase::kLockWait);
+      write.phase_ = Phase::kTop;
       // A full load grows memory however the command reads. A write
       // that grows is judged here, before its own keys go in: a TTL
       // load of a string brings its value too.
-      if ((full_load || grows) && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
-            return (*hold)->OverBackpressure(shard);
-          })) {
-        for (const Owned& load : owned) (*hold)->AbortLoad(load.key, load.token);
+      if ((write.full_load_ || write.grows_) &&
+          std::ranges::any_of(
+              shards, [&hold](core::ShardId shard) { return (*hold)->OverBackpressure(shard); })) {
+        for (const PendingWrite::Owned& load : write.owned_) {
+          (*hold)->AbortLoad(load.key, load.token);
+        }
         hold->Unlock();
-        again(RedecideReason::kBackpressure);
-        await_memory = true;
+        ClearLoads(write);
+        Again(write, RedecideReason::kBackpressure);
+        write.await_memory_ = true;
         continue;
       }
-      judged = full_load || grows;
+      judged = write.full_load_ || write.grows_;
       for (const core::ShardId shard : shards) {
         std::vector<hot::LoadCompletion> mine;
-        for (size_t i = 0; i < owned.size(); ++i) {
-          if (owned[i].shard == shard) mine.push_back(std::move(completions[i]));
+        for (size_t i = 0; i < write.owned_.size(); ++i) {
+          if (write.owned_[i].shard == shard) mine.push_back(std::move(write.completions_[i]));
         }
         if (!mine.empty()) (*hold)->CompleteLoads(shard, mine);
       }
+      ClearLoads(write);
       phases.Lap(WritePhase::kLoad);
       instant = instant_of(wall);
       now_ms = WallMs(instant);
-      decision = Decide(cmd, flags, now_ms, lookup);
+      decision = Decide(cmd, write.flags_, now_ms, lookup);
       phases.Lap(WritePhase::kDecide);
       if (!decision.needs_load.empty()) {
         // A blind write overtook a load.
         hold->Unlock();
-        again(RedecideReason::kLoad);
+        Again(write, RedecideReason::kLoad);
         continue;
       }
     }
@@ -383,22 +445,25 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       // Nothing to log: the reply, an error included, still waits until
       // what it read is durable.
       hold->Unlock();
-      if (auto fenced = Fence(decision.observed, deadline); !fenced) {
-        return std::unexpected(fenced.error());
+      write.fences_ = std::move(decision.observed);
+      write.record_phases_ = !decision.error.has_value();
+      if (decision.error.has_value()) {
+        write.reply_ = std::unexpected(*std::move(decision.error));
+      } else {
+        ABYSS_DCHECK(decision.reply.has_value(), "a decision with no effect has no reply");
+        write.reply_ = *std::move(decision.reply);
       }
-      if (decision.error.has_value()) return std::unexpected(*std::move(decision.error));
-      ABYSS_DCHECK(decision.reply.has_value(), "a decision with no effect has no reply");
-      phases.Lap(WritePhase::kDurable);
-      phases.Record();
-      return *std::move(decision.reply);
+      write.durable_kind_ = PendingWrite::DurableKind::kFence;
+      write.phase_ = Phase::kDurable;
+      return AwaitDurable(write);
     }
-    if (grows && !judged && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
+    if (write.grows_ && !judged && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
           return (*hold)->OverBackpressure(shard);
         })) {
       Restore(std::move(decision), cmd);
       hold->Unlock();
-      again(RedecideReason::kBackpressure);
-      await_memory = true;
+      Again(write, RedecideReason::kBackpressure);
+      write.await_memory_ = true;
       continue;
     }
 
@@ -444,7 +509,7 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
     };
     if (!spare.empty()) {
       for (const Moved& moved : decision.moved) {
-        Spare& copy = spare[moved.request_arg];
+        PendingWrite::Spare& copy = spare[moved.request_arg];
         if (!copy.copy.has_value()) continue;
         args_at(entry_of(moved.effect))[moved.arg] = *std::move(copy.copy);
         copy.copy.reset();
@@ -499,7 +564,7 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       // next attempt.
       for (const Moved& moved : decision.moved) {
         if (spare.empty() || !spare[moved.request_arg].lent) continue;
-        Spare& copy = spare[moved.request_arg];
+        PendingWrite::Spare& copy = spare[moved.request_arg];
         copy.copy = std::move(args_at(entry_of(moved.effect))[moved.arg]);
         copy.lent = false;
       }
@@ -508,29 +573,22 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
       const core::Error& error = reserved.error();
       switch (error.code()) {
         case core::ErrorCode::kResourceExhausted:
-          again(RedecideReason::kAdmission);
-          for (const core::ShardId shard : shards) {
-            if (auto admitted = queue_.Admit(shard, deadline); !admitted) {
-              return std::unexpected(admitted.error());
-            }
-          }
+          Again(write, RedecideReason::kAdmission);
+          write.admit_next_ = 0;
+          write.phase_ = Phase::kAdmit;
           continue;
         case core::ErrorCode::kUnavailable:
-          again(RedecideReason::kSpare);
-          if (!queue_.WaitForSpare(shards.front(), deadline)) {
-            if (core::SteadyClock::now() >= deadline) {
-              return std::unexpected(core::Error{
-                  core::ErrorCode::kTimeout, "write timed out waiting for a spare WAL segment"});
-            }
-            return std::unexpected(error);
-          }
+          Again(write, RedecideReason::kSpare);
+          write.refusal_ = error;
+          write.spare_next_ = 0;
+          write.phase_ = Phase::kSpare;
           continue;
         case core::ErrorCode::kInvalidArgument:
-          if (error.message().starts_with("CROSSSLOT")) return CrossSlot();
-          return std::unexpected(error);
+          if (error.message().starts_with("CROSSSLOT")) return Done(write, CrossSlot());
+          return Done(write, std::unexpected(error));
         default:
           // kValueTooLarge never fits; anything else is not retried.
-          return std::unexpected(error);
+          return Done(write, std::unexpected(error));
       }
     }
 
@@ -561,33 +619,41 @@ core::Result<core::RespValue> Sequencer::Execute(core::RespCommand cmd,
     hot::Graveyard replaced = hold->Unlock();
     phases.Lap(WritePhase::kApply);
 
-    const std::vector<queue::ReservedRange> ranges = queue_.Complete(std::move(reservation));
+    write.ranges_ = queue_.Complete(std::move(reservation));
     replaced = {};
     phases.Lap(WritePhase::kComplete);
-    if (auto durable = AwaitDurable(ranges, deadline, /*flush=*/false); !durable) {
-      return std::unexpected(durable.error());
+    if (decision.reply.has_value()) {
+      write.reply_ = *std::move(decision.reply);
+    } else {
+      ABYSS_DCHECK(own.has_value(), "no reply for the last effect");
+      write.reply_ = *std::move(own);
     }
-    phases.Lap(WritePhase::kDurable);
-    phases.Record();
-    if (decision.reply.has_value()) return *std::move(decision.reply);
-    ABYSS_DCHECK(own.has_value(), "no reply for the last effect");
-    return *std::move(own);
+    write.durable_kind_ = PendingWrite::DurableKind::kWrite;
+    write.record_phases_ = true;
+    write.phase_ = Phase::kDurable;
+    return AwaitDurable(write);
   }
 }
 
-core::Result<core::RespValue> Sequencer::Flush() {
-  const core::SteadyTime deadline = core::SteadyClock::now() + config_.write_timeout;
-  std::vector<core::ShardId> shards(hot_.shard_count());
-  for (core::ShardId shard = 0; shard < shards.size(); ++shard) shards[shard] = shard;
-  for (const core::ShardId shard : shards) {
-    if (auto admitted = queue_.Admit(shard, deadline); !admitted) {
-      return std::unexpected(admitted.error());
-    }
+Step Sequencer::FlushAttempt(PendingWrite& write) {
+  using Phase = PendingWrite::Phase;
+  std::vector<core::ShardId>& shards = write.shards_;
+  if (write.phase_ == Phase::kStart) {
+    shards.resize(hot_.shard_count());
+    for (core::ShardId shard = 0; shard < shards.size(); ++shard) shards[shard] = shard;
+    write.phase_ = Phase::kAdmit;
   }
-  std::optional<RedecideReason> redecided;
   for (;;) {
-    if (redecided.has_value() && core::SteadyClock::now() >= deadline) {
-      return TimedOut(*redecided);
+    if (write.phase_ == Phase::kAdmit) {
+      if (auto step = AwaitAdmission(write)) return *std::move(step);
+      write.phase_ = Phase::kTop;
+    }
+    if (write.phase_ == Phase::kSpare) {
+      if (auto step = AwaitSpares(write)) return *std::move(step);
+      write.phase_ = Phase::kTop;
+    }
+    if (write.redecided_.has_value() && core::SteadyClock::now() >= write.deadline_) {
+      return Done(write, TimedOut(*write.redecided_));
     }
     // Built before the hold, which only swaps them in; built per pass,
     // so no pass is handed one already moved from.
@@ -613,34 +679,20 @@ core::Result<core::RespValue> Sequencer::Flush() {
       hold.Unlock();
       const core::Error& error = reserved.error();
       if (error.code() == core::ErrorCode::kResourceExhausted) {
-        Redecided(RedecideReason::kAdmission);
-        redecided = RedecideReason::kAdmission;
-        for (const core::ShardId shard : shards) {
-          if (auto admitted = queue_.Admit(shard, deadline); !admitted) {
-            return std::unexpected(admitted.error());
-          }
-        }
+        Again(write, RedecideReason::kAdmission);
+        write.admit_next_ = 0;
+        write.phase_ = Phase::kAdmit;
         continue;
       }
       if (error.code() == core::ErrorCode::kUnavailable) {
-        Redecided(RedecideReason::kSpare);
-        redecided = RedecideReason::kSpare;
-        std::vector<uint32_t> waited;
-        for (const core::ShardId shard : shards) {
-          if (std::ranges::find(waited, queue_.LogOf(shard)) != waited.end()) continue;
-          waited.push_back(queue_.LogOf(shard));
-          if (!queue_.WaitForSpare(shard, deadline)) {
-            if (core::SteadyClock::now() >= deadline) {
-              return std::unexpected(core::Error{
-                  core::ErrorCode::kTimeout, "flush timed out waiting for a spare WAL segment"});
-            }
-            return std::unexpected(error);
-          }
-        }
+        Again(write, RedecideReason::kSpare);
+        write.refusal_ = error;
+        write.spare_next_ = 0;
+        write.phase_ = Phase::kSpare;
         continue;
       }
       ABYSS_LOG_ERROR("flush append failed", {"err", std::string_view{error.message()}});
-      return std::unexpected(error);
+      return Done(write, std::unexpected(error));
     }
     queue::Reservation reservation = *std::move(reserved);
     for (const core::ShardId shard : shards) hold->RaiseAppendedAt(shard, instant);
@@ -649,19 +701,305 @@ core::Result<core::RespValue> Sequencer::Flush() {
     }
     hot::Graveyard wiped = hold.Unlock();
 
-    const std::vector<queue::ReservedRange> ranges = queue_.Complete(std::move(reservation));
+    write.ranges_ = queue_.Complete(std::move(reservation));
     wiped = {};
-    if (auto durable = AwaitDurable(ranges, deadline, /*flush=*/true); !durable) {
-      return std::unexpected(durable.error());
-    }
-    return core::RespValue::SimpleString("OK");
+    write.reply_ = core::RespValue::SimpleString("OK");
+    write.durable_kind_ = PendingWrite::DurableKind::kFlush;
+    write.record_phases_ = false;
+    write.phase_ = Phase::kDurable;
+    return AwaitDurable(write);
   }
+}
+
+void Sequencer::Start(PendingWrite& write) {
+  PendingWrite::PhaseTimes& times = write.phase_times_;
+  times.sampled = Sampled();
+  if (times.sampled) times.last = std::chrono::steady_clock::now();
+}
+
+std::optional<Step> Sequencer::AwaitAdmission(PendingWrite& write) {
+  for (; write.admit_next_ < write.shards_.size(); ++write.admit_next_) {
+    const core::ShardId shard = write.shards_[write.admit_next_];
+    std::optional<core::Result<void>> admitted;
+    if (std::optional<core::Result<void>> wake = write.TakeWake()) {
+      if (wake->has_value()) {
+        // Checked again, and a pass hands on to the next waiter.
+        admitted = queue_.WhenReady(core::QueueWait::kAdmission, shard, write, /*first=*/false);
+      } else {
+        queue_.FinishWait(core::QueueWait::kAdmission, shard, write);
+        admitted = std::move(wake);
+      }
+    } else if (queue_.Admissible(shard)) {
+      continue;
+    } else if (core::SteadyClock::now() >= write.deadline_) {
+      return Done(write, std::unexpected(core::Error{core::ErrorCode::kResourceExhausted,
+                                                     "WAL durability window full"}));
+    } else {
+      admitted = queue_.WhenReady(core::QueueWait::kAdmission, shard, write, /*first=*/true);
+    }
+    if (!admitted.has_value()) return Waiting(write, WaitReason::kAdmission, shard);
+    if (!admitted->has_value()) return Done(write, std::unexpected(admitted->error()));
+  }
+  return std::nullopt;
+}
+
+std::optional<Step> Sequencer::AwaitSpares(PendingWrite& write) {
+  // A write's shards share a log; a flush waits on each of its logs.
+  const size_t end = write.flush_ ? write.shards_.size() : 1;
+  for (; write.spare_next_ < end; ++write.spare_next_) {
+    const core::ShardId shard = write.shards_[write.spare_next_];
+    std::optional<core::Result<void>> ready;
+    if (std::optional<core::Result<void>> wake = write.TakeWake()) {
+      if (wake->has_value()) {
+        ready = queue_.WhenReady(core::QueueWait::kSpare, shard, write, /*first=*/false);
+      } else {
+        queue_.FinishWait(core::QueueWait::kSpare, shard, write);
+        ready = std::move(wake);
+      }
+    } else {
+      if (write.flush_) {
+        const uint32_t log = queue_.LogOf(shard);
+        if (std::ranges::find(write.spare_logs_, log) != write.spare_logs_.end()) continue;
+        write.spare_logs_.push_back(log);
+      }
+      ready = queue_.WhenReady(core::QueueWait::kSpare, shard, write, /*first=*/true);
+    }
+    if (!ready.has_value()) return Waiting(write, WaitReason::kSpare, shard);
+    if (!ready->has_value()) {
+      if (core::SteadyClock::now() >= write.deadline_) {
+        return Done(write, std::unexpected(SpareTimedOut(write.flush_)));
+      }
+      // As before the wait: the refusal that sent it, shutting down.
+      return Done(write, std::unexpected(write.refusal_.value_or(ready->error())));
+    }
+  }
+  write.refusal_.reset();
+  write.spare_logs_.clear();
+  return std::nullopt;
+}
+
+std::optional<Step> Sequencer::AwaitMemory(PendingWrite& write) {
+  for (; write.memory_next_ < write.shards_.size(); ++write.memory_next_) {
+    const core::ShardId shard = write.shards_[write.memory_next_];
+    // A woken wait not yet ended, which a pass must hand on.
+    bool woken = false;
+    if (std::optional<core::Result<void>> wake = write.TakeWake()) {
+      if (!wake->has_value()) {
+        buffers_.FinishDrainWait(shard, write);
+        return Done(write, std::unexpected(wake->error()));
+      }
+      woken = true;
+    }
+    for (;;) {
+      // Eviction takes only what cold has drained, so a wait is for the
+      // drain to move past what this one could take.
+      const core::SequenceId past = hot_.Drained(shard);
+      if (hot_.EvictShardToTarget(shard)) break;
+      if (!write.memory_waited_) {
+        write.memory_waited_ = true;
+        backpressure_waits_.fetch_add(1, std::memory_order_relaxed);
+        backpressure_waits_metric_.Increment();
+      }
+      if (core::SteadyClock::now() >= write.deadline_) {
+        if (woken) buffers_.FinishDrainWait(shard, write);
+        backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
+        backpressure_rejections_metric_.Increment();
+        return Done(write, OutOfMemory());
+      }
+      auto room = buffers_.WhenDrainedPast(shard, past, write);
+      if (!room.has_value()) return Waiting(write, WaitReason::kBackpressure, shard);
+      // The wait ended there, and a woken one that passed handed on.
+      woken = false;
+      if (!room->has_value()) return Done(write, std::unexpected(room->error()));
+    }
+    if (woken) buffers_.FinishDrainWait(shard, write);
+  }
+  write.memory_next_ = 0;
+  write.memory_waited_ = false;
+  return std::nullopt;
+}
+
+std::optional<Step> Sequencer::AwaitForeignLoads(PendingWrite& write) {
+  for (; write.foreign_next_ < write.foreign_.size(); ++write.foreign_next_) {
+    if (std::optional<core::Result<void>> wake = write.TakeWake()) {
+      if (!wake->has_value()) {
+        AbortLoads(write);
+        return Done(write, std::unexpected(wake->error()));
+      }
+      continue;
+    }
+    const auto now = hot_.WhenLoaded(write.foreign_[write.foreign_next_], write.load_wake_);
+    if (!now.has_value()) return Waiting(write, WaitReason::kForeignLoad);
+    if (!now->has_value()) {
+      AbortLoads(write);
+      return Done(write, std::unexpected(now->error()));
+    }
+  }
+  return std::nullopt;
 }
 
 // A decision with effects needs no fence: within one log its frames
 // follow everything it observed, and Complete's AwaitFilled and each
 // class's durable end are prefix-ordered by position. CROSSSLOT keeps
 // every multi-shard decision within one log.
+Step Sequencer::AwaitDurable(PendingWrite& write) {
+  const core::Durability ack = queue_.AckDurability();
+  if (write.waiting_) {
+    write.waiting_ = false;
+    if (write.expired_) return DurableTimedOut(write);
+    std::optional<core::Result<void>> wake = write.TakeWake();
+    ABYSS_DCHECK(wake.has_value(), "a durable wait resumed before its post");
+    write.node_.reset();
+    if (!wake->has_value()) return DurableFailed(write, wake->error());
+    ++write.durable_next_;
+  }
+  for (; write.durable_next_ < write.DurableCount(); ++write.durable_next_) {
+    const ShardSeq at = write.DurableAt(write.durable_next_);
+    core::SeqWaiterNode& node = write.node_.emplace(at.seq, write.completion_);
+    auto durable = queue_.WhenDurable(at.shard, ack, node);
+    if (!durable.has_value()) {
+      // Past the deadline it was checked once more; a lost Cancel
+      // means its post is on the way.
+      if (core::SteadyClock::now() < write.deadline_ ||
+          !queue_.CancelDurable(at.shard, ack, node)) {
+        write.waiting_ = true;
+        return Step{.kind = Step::Kind::kSequenced};
+      }
+      write.node_.reset();
+      return DurableTimedOut(write);
+    }
+    write.node_.reset();
+    if (!durable->has_value()) return DurableFailed(write, durable->error());
+  }
+  if (write.record_phases_) {
+    Phases phases(*this, write.phase_times_);
+    phases.Lap(WritePhase::kDurable);
+    phases.Record();
+  }
+  return Done(write, std::move(write.reply_));
+}
+
+Step Sequencer::Waiting(PendingWrite& write, WaitReason reason, core::ShardId shard) {
+  write.waiting_ = true;
+  write.wait_reason_ = reason;
+  write.wait_shard_ = shard;
+  Step step{.kind = Step::Kind::kWait, .reason = reason, .shard = shard};
+  if (reason == WaitReason::kForeignLoad) step.key = write.foreign_.at(write.foreign_next_);
+  return step;
+}
+
+Step Sequencer::Done(PendingWrite& write, core::Result<core::RespValue> reply) {
+  ABYSS_DCHECK(write.owned_.empty(), "a write replied with a load open");
+  ABYSS_DCHECK(!write.node_.has_value(), "a write replied with a durable wait open");
+  write.phase_ = PendingWrite::Phase::kDone;
+  write.waiting_ = false;
+  write.spare_.clear();
+  return Step{.kind = Step::Kind::kReplied, .reply = std::move(reply)};
+}
+
+Step Sequencer::Abandon(PendingWrite& write) {
+  const std::optional<core::Result<void>> wake = write.TakeWake();
+  const bool woken = wake.has_value();
+  const bool failed = woken && !wake->has_value();
+  const core::ShardId shard = write.wait_shard_;
+  write.waiting_ = false;
+  write.expired_ = false;
+  switch (write.wait_reason_) {
+    case WaitReason::kAdmission:
+      if (woken) queue_.FinishWait(core::QueueWait::kAdmission, shard, write);
+      if (failed) return Done(write, std::unexpected(wake->error()));
+      return Done(write, std::unexpected(queue_.AdmissionTimedOut(shard)));
+    case WaitReason::kSpare:
+      if (woken) queue_.FinishWait(core::QueueWait::kSpare, shard, write);
+      return Done(write, std::unexpected(SpareTimedOut(write.flush_)));
+    case WaitReason::kBackpressure:
+      if (woken) buffers_.FinishDrainWait(shard, write);
+      if (failed) return Done(write, std::unexpected(wake->error()));
+      backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
+      backpressure_rejections_metric_.Increment();
+      return Done(write, OutOfMemory());
+    case WaitReason::kForeignLoad:
+      AbortLoads(write);
+      if (failed) return Done(write, std::unexpected(wake->error()));
+      return Done(write, std::unexpected(core::Error{core::ErrorCode::kTimeout,
+                                                     std::string(kForeignLoadTimeout)}));
+    case WaitReason::kLoads:
+      if (write.load_error_.has_value()) {
+        core::Error error = *std::move(write.load_error_);
+        AbortLoads(write);
+        return Done(write, std::unexpected(std::move(error)));
+      }
+      InstallLoads(write);
+      return Done(write, TimedOut(RedecideReason::kLoad));
+  }
+  return Done(write, TimedOut(RedecideReason::kLoad));
+}
+
+void Sequencer::AbortLoads(PendingWrite& write) {
+  for (const PendingWrite::Owned& load : write.owned_) hot_.AbortLoad(load.key, load.token);
+  ClearLoads(write);
+}
+
+// What an abandoned write loaded still installs: its tokens judge it
+// as they would any load's.
+void Sequencer::InstallLoads(PendingWrite& write) {
+  for (const core::ShardId shard : write.shards_) {
+    std::vector<hot::LoadCompletion> mine;
+    for (size_t i = 0; i < write.completions_.size(); ++i) {
+      if (write.owned_[i].shard == shard) mine.push_back(std::move(write.completions_[i]));
+    }
+    if (!mine.empty()) hot_.CompleteLoads(shard, mine);
+  }
+  for (size_t i = write.completions_.size(); i < write.owned_.size(); ++i) {
+    hot_.AbortLoad(write.owned_[i].key, write.owned_[i].token);
+  }
+  ClearLoads(write);
+}
+
+void Sequencer::ClearLoads(PendingWrite& write) {
+  write.owned_.clear();
+  write.foreign_.clear();
+  write.foreign_next_ = 0;
+  write.full_load_ = false;
+  write.completions_.clear();
+  write.load_error_.reset();
+}
+
+Step Sequencer::DurableTimedOut(PendingWrite& write) {
+  write.expired_ = false;
+  const ShardSeq at = write.DurableAt(write.durable_next_);
+  if (write.durable_kind_ == PendingWrite::DurableKind::kFence) {
+    ABYSS_LOG_WARN("fence durable wait timeout", {"shard", static_cast<int64_t>(at.shard)},
+                   {"seq", static_cast<uint64_t>(at.seq)});
+    return Done(
+        write, std::unexpected(core::Error{core::ErrorCode::kTimeout, std::string(kFenceTimeout)}));
+  }
+  const bool flush = write.durable_kind_ == PendingWrite::DurableKind::kFlush;
+  ABYSS_LOG_WARN(flush ? "flush durable wait timeout" : "write durable wait timeout",
+                 {"shard", static_cast<int64_t>(at.shard)}, {"seq", static_cast<uint64_t>(at.seq)},
+                 {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
+  return Done(write, std::unexpected(core::Error{
+                         core::ErrorCode::kTimeout,
+                         std::string(flush ? kFlushDurableTimeout : kWriteDurableTimeout)}));
+}
+
+Step Sequencer::DurableFailed(PendingWrite& write, const core::Error& error) {
+  if (write.durable_kind_ != PendingWrite::DurableKind::kFence) {
+    const ShardSeq at = write.DurableAt(write.durable_next_);
+    ABYSS_LOG_ERROR(
+        write.durable_kind_ == PendingWrite::DurableKind::kFlush ? "flush durable failed"
+                                                                 : "write durable failed",
+        {"shard", static_cast<int64_t>(at.shard)}, {"seq", static_cast<uint64_t>(at.seq)},
+        {"err", std::string_view{error.message()}});
+  }
+  return Done(write, std::unexpected(error));
+}
+
+void Sequencer::Again(PendingWrite& write, RedecideReason reason) {
+  Redecided(reason);
+  write.redecided_ = reason;
+}
+
 core::Result<void> Sequencer::Fence(std::span<const ShardSeq> fences, core::SteadyTime deadline) {
   for (const ShardSeq& fence : fences) {
     const auto now = core::SteadyClock::now();
@@ -673,61 +1011,6 @@ core::Result<void> Sequencer::Fence(std::span<const ShardSeq> fences, core::Stea
       ABYSS_LOG_WARN("fence durable wait timeout", {"shard", static_cast<int64_t>(fence.shard)},
                      {"seq", static_cast<uint64_t>(fence.seq)});
       return std::unexpected(core::Error{core::ErrorCode::kTimeout, std::string(kFenceTimeout)});
-    }
-  }
-  return {};
-}
-
-core::Result<void> Sequencer::AwaitMemory(std::span<const core::ShardId> shards,
-                                          core::SteadyTime deadline) {
-  bool waited = false;
-  for (const core::ShardId shard : shards) {
-    // Eviction takes only what cold has drained, so each slice waits
-    // for the drain to move on.
-    while (!hot_.EvictShardToTarget(shard)) {
-      if (!waited) {
-        waited = true;
-        backpressure_waits_.fetch_add(1, std::memory_order_relaxed);
-        backpressure_waits_metric_.Increment();
-      }
-      const auto now = core::SteadyClock::now();
-      if (now >= deadline) {
-        backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
-        backpressure_rejections_metric_.Increment();
-        return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted,
-                                           "hot memory over its limit and cold is behind"});
-      }
-      const auto slice =
-          std::min<core::SteadyClock::duration>(config_.backpressure_wait_slice, deadline - now);
-      buffers_.WaitForDrainedSeq(shard, hot_.Drained(shard) + 1,
-                                 std::chrono::ceil<std::chrono::milliseconds>(slice));
-    }
-  }
-  return {};
-}
-
-core::Result<void> Sequencer::AwaitDurable(std::span<const queue::ReservedRange> ranges,
-                                           core::SteadyTime deadline, bool flush) const {
-  for (const queue::ReservedRange& range : ranges) {
-    const auto now = core::SteadyClock::now();
-    const auto timeout =
-        now < deadline ? std::chrono::ceil<core::Duration>(deadline - now) : core::Duration::zero();
-    auto durable = queue_.AwaitDurable(range.shard, range.last, queue_.AckDurability(), timeout);
-    if (!durable.has_value()) {
-      ABYSS_LOG_ERROR(flush ? "flush durable failed" : "write durable failed",
-                      {"shard", static_cast<int64_t>(range.shard)},
-                      {"seq", static_cast<uint64_t>(range.last)},
-                      {"err", std::string_view{durable.error().message()}});
-      return std::unexpected(durable.error());
-    }
-    if (!*durable) {
-      ABYSS_LOG_WARN(flush ? "flush durable wait timeout" : "write durable wait timeout",
-                     {"shard", static_cast<int64_t>(range.shard)},
-                     {"seq", static_cast<uint64_t>(range.last)},
-                     {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
-      return std::unexpected(
-          core::Error{core::ErrorCode::kTimeout,
-                      std::string(flush ? kFlushDurableTimeout : kWriteDurableTimeout)});
     }
   }
   return {};

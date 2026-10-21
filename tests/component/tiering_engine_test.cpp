@@ -35,21 +35,17 @@ class SingleBufferRouter : public consumer::CompactionBufferRouter {
                                                    std::string_view key) const override {
     return buffer_.Snapshot(key);
   }
-  // Component-level engine tests run without a cold consumer thread, so the
-  // wait is a structural no-op: there is no producer to advance the seq.
-  // Returning true models "already caught up", which is the steady-state
-  // expectation outside the slow-cold race we cover in integration tests.
-  bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId /*target_seq*/,
-                         std::chrono::milliseconds /*timeout*/) override {
-    return true;
-  }
-  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
-                                                core::SeqWaiterNode& /*node*/) override {
+  // No cold consumer runs, so nothing drains: a wait for room finds
+  // it already.
+  std::optional<core::Result<void>> WhenDrainedPast(core::ShardId /*shard*/,
+                                                    core::SequenceId /*past*/,
+                                                    core::Waiter& /*waiter*/) override {
     return core::Result<void>{};
   }
-  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+  bool CancelDrainWait(core::ShardId /*shard*/, core::Waiter& /*waiter*/) noexcept override {
     return false;
   }
+  void FinishDrainWait(core::ShardId /*shard*/, core::Waiter& /*waiter*/) noexcept override {}
 
  private:
   consumer::CompactionBuffer& buffer_;
@@ -265,46 +261,60 @@ TEST_F(TieringEngineTest, DelCountsLiveKeysInOneDecision) {
   EXPECT_EQ(result->AsInteger(), 2);
 }
 
-TEST_F(TieringEngineTest, FlushAdmitsEveryShardWithinOneDeadline) {
+TEST_F(TieringEngineTest, FlushAdmitsEveryShard) {
   auto engine = MakeEngine();
-  std::vector<core::SteadyTime> deadlines;
-  EXPECT_CALL(queue_, Admit(_, _))
+  std::vector<core::ShardId> checked;
+  EXPECT_CALL(queue_, Admissible(_))
       .Times(kShardCount)
-      .WillRepeatedly([&deadlines](core::ShardId, core::SteadyTime admit_by) {
-        deadlines.push_back(admit_by);
-        return core::Result<void>{};
+      .WillRepeatedly([&checked](core::ShardId shard) {
+        checked.push_back(shard);
+        return true;
       });
 
   auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
-  ASSERT_EQ(deadlines.size(), kShardCount);
-  EXPECT_TRUE(std::ranges::all_of(deadlines, [&](auto d) { return d == deadlines.front(); }));
+  ASSERT_EQ(checked.size(), kShardCount);
   for (core::ShardId shard = 0; shard < kShardCount; ++shard) {
+    EXPECT_EQ(checked[shard], shard);
     const auto published = queue_.Published(shard);
     ASSERT_EQ(published.size(), 1U) << shard;
     EXPECT_TRUE(std::holds_alternative<core::entry::Flush>(published[0].payload));
   }
 }
 
+// A flush's admission waits end at its own deadline, and leave no
+// waiter behind.
+TEST_F(TieringEngineTest, FlushAdmissionTimesOutAtItsDeadline) {
+  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.write_timeout = 50ms});
+  TieringEngine engine(reads_, fast);
+  queue_.SetAdmissible(false);
+  const auto start = core::SteadyClock::now();
+  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  const auto waited = core::SteadyClock::now() - start;
+  queue_.SetAdmissible(true);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_GE(waited, 50ms);
+  EXPECT_LT(waited, kWriteTimeout);
+  EXPECT_EQ(queue_.AdmissionWaiters(), 0U);
+}
+
 TEST_F(TieringEngineTest, FlushAdmissionFailureWipesNothing) {
   auto engine = MakeEngine();
   ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "k", "v"}));
-  std::vector<core::SteadyTime> deadlines;
-  ON_CALL(queue_, Admit(_, _))
-      .WillByDefault([&deadlines](core::ShardId shard,
-                                  core::SteadyTime admit_by) -> core::Result<void> {
-        deadlines.push_back(admit_by);
-        if (shard == kShardCount - 1) {
-          return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"});
-        }
-        return {};
-      });
+  std::vector<core::ShardId> checked;
+  ON_CALL(queue_, Admissible(_)).WillByDefault([&checked](core::ShardId shard) {
+    checked.push_back(shard);
+    return shard != kShardCount - 1;
+  });
+  EXPECT_CALL(queue_, WhenReady(core::QueueWait::kAdmission, kShardCount - 1, _, true))
+      .WillOnce(Return(std::optional<core::Result<void>>(core::Result<void>{
+          std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"})})));
   auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
-  ASSERT_EQ(deadlines.size(), kShardCount);
-  EXPECT_TRUE(std::ranges::all_of(deadlines, [&](auto d) { return d == deadlines.front(); }));
+  EXPECT_EQ(checked.size(), kShardCount);
   for (core::ShardId shard = 0; shard < kShardCount; ++shard) {
     EXPECT_EQ(queue_.Published(shard).size(), shard == ShardOf("k") ? 1U : 0U) << shard;
   }
@@ -344,23 +354,25 @@ TEST_F(TieringEngineTest, FlushDurableFailurePropagates) {
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
 }
 
-// A multi-key DEL admits every shard against one deadline, the write's.
-TEST_F(TieringEngineTest, DelAdmitsEveryShardWithinOneDeadline) {
+// A multi-key DEL is admitted on each of its shards before its lock.
+TEST_F(TieringEngineTest, DelAdmitsEveryShard) {
   auto engine = MakeEngine();
-  std::vector<core::SteadyTime> deadlines;
-  ON_CALL(queue_, Admit(_, _))
-      .WillByDefault([&deadlines](core::ShardId, core::SteadyTime admit_by) {
-        deadlines.push_back(admit_by);
-        return core::Result<void>{};
-      });
-  const auto start = core::SteadyClock::now();
+  std::vector<core::ShardId> checked;
+  ON_CALL(queue_, Admissible(_)).WillByDefault([&checked](core::ShardId shard) {
+    checked.push_back(shard);
+    return true;
+  });
+  const std::vector<std::string> keys{"a", "b", "c", "d", "e"};
   auto result =
       engine.DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c", "d", "e"}));
   ASSERT_TRUE(result.has_value()) << result.error().message();
-  ASSERT_GE(deadlines.size(), 2U);
-  EXPECT_TRUE(std::ranges::all_of(deadlines, [&](auto d) { return d == deadlines.front(); }));
-  EXPECT_GE(deadlines.front(), start + kWriteTimeout);
-  EXPECT_LT(deadlines.front(), start + kWriteTimeout + 1s);
+  std::vector<core::ShardId> shards;
+  shards.reserve(keys.size());
+  for (const std::string& key : keys) shards.push_back(ShardOf(key));
+  std::ranges::sort(shards);
+  shards.erase(std::ranges::unique(shards).begin(), shards.end());
+  ASSERT_GE(shards.size(), 2U);
+  EXPECT_EQ(checked, shards);
 }
 
 // One reservation: a refused MSET applies none of its keys.

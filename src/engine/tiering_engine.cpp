@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "abyss/core/ops.h"
+#include "abyss/engine/blocking_driver.h"
 
 namespace abyss::engine {
 
@@ -20,13 +21,13 @@ core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
 }
 
 core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*target*/) {
-  return sequencer_.Flush();
+  return RunFlushToCompletion(sequencer_);
 }
 
 core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
                                                            core::RespCommand cmd,
                                                            core::PredicateFlags flags) {
-  return sequencer_.Execute(std::move(cmd), flags);
+  return RunToCompletion(sequencer_, std::move(cmd), flags);
 }
 
 core::Result<core::RespValue> TieringEngine::DispatchFanOut(core::MultiKeyKind kind,
@@ -49,7 +50,7 @@ core::Result<core::RespValue> TieringEngine::DispatchFanOut(core::MultiKeyKind k
       return reads_.Exists(keys);
     case core::MultiKeyKind::kMset:
     case core::MultiKeyKind::kDelete:
-      return sequencer_.Execute(std::move(cmd), core::PredicateFlags::kNone);
+      return RunToCompletion(sequencer_, std::move(cmd), core::PredicateFlags::kNone);
     case core::MultiKeyKind::kNone:
       break;
   }

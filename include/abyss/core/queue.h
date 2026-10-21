@@ -12,7 +12,9 @@
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/pending_append.h"
 #include "abyss/queue/reservation.h"
@@ -68,6 +70,14 @@ class RetentionPin {
 // empty shard's is kFirstSeq and 0 is always below it.
 // DurableEnd(kPowerLoss) never passes DurableEnd(kProcessCrash): nothing
 // is visible before it is published.
+// What a sequenced write waits on in the queue, off every lock.
+enum class QueueWait : uint8_t {
+  // Room in the shard's durability window.
+  kAdmission,
+  // A spare segment on the shard's log.
+  kSpare,
+};
+
 class Queue {
  public:
   Queue() = default;
@@ -89,22 +99,34 @@ class Queue {
                                                        std::span<const QueueEntry> entries,
                                                        SteadyTime admit_by) = 0;
 
-  // The sequencer's append (ADP-015 §Sequenced write path): Admit and
-  // WaitForSpare wait under no lock, Reserve runs under the hot shard
-  // locks and never waits, and Complete runs once they are released.
+  // The sequencer's append (ADP-015 §Sequenced write path): its waits
+  // for admission and a spare are registered under no lock, Reserve
+  // runs under the hot shard locks and never waits, and Complete runs
+  // once they are released.
   //
-  // Waits for room in `shard`'s durability window, as an append's
-  // admission does.
-  virtual Result<void> Admit(ShardId shard, SteadyTime admit_by) = 0;
-  // Waits for a spare segment on `shard`'s log; false at the deadline
-  // or on shutdown.
-  virtual bool WaitForSpare(ShardId shard, SteadyTime deadline) = 0;
+  // Room in `shard`'s durability window, as an append's admission
+  // checks it, lock-free.
+  virtual bool Admissible(ShardId shard) = 0;
+  // A wait for `wait` on `shard` (WaitList::Register), for a waiter
+  // that registers itself rather than block. nullopt: linked, and a
+  // wake comes. Otherwise the outcome now: ok, or the error that ends
+  // every wait at shutdown. A waiter woken ok registers again to
+  // re-check, and one that gives up calls FinishWait. `first` counts
+  // the wait, as a blocking append's wait is counted once.
+  virtual std::optional<Result<void>> WhenReady(QueueWait wait, ShardId shard, Waiter& waiter,
+                                                bool first) = 0;
+  // For a linked waiter. True: unlinked, and no wake comes.
+  virtual bool CancelWait(QueueWait wait, ShardId shard, Waiter& waiter) noexcept = 0;
+  virtual void FinishWait(QueueWait wait, ShardId shard, Waiter& waiter) noexcept = 0;
+  // An admission wait's error at its deadline, counted as a rejection.
+  virtual Error AdmissionTimedOut(ShardId shard) = 0;
   // Assigns each part's seqs and reserves every part as one batch.
   // Parts are sorted by shard and distinct. It takes the entries it
   // leaves to Complete; on an error none is taken and no seq is used:
-  //   kResourceExhausted: the window is full; Admit, then decide again.
-  //   kUnavailable: no spare segment, or shutting down; WaitForSpare,
-  //     then decide again.
+  //   kResourceExhausted: the window is full; wait for admission, then
+  //     decide again.
+  //   kUnavailable: no spare segment, or shutting down; wait for a
+  //     spare, then decide again.
   //   kInvalidArgument starting "CROSSSLOT": the shards span logs.
   //   kValueTooLarge: an entry or the batch exceeds what a frame or a
   //     segment holds.
@@ -145,6 +167,12 @@ class Queue {
   // kUnavailable once the queue stopped, and that class with it.
   virtual Result<bool> AwaitDurable(ShardId shard, SequenceId seq, Durability durability,
                                     Duration timeout) = 0;
+  // Registers `node` to be posted once its seq is durable at
+  // `durability` (SeqWaiters::Register); CancelDurable unlinks it.
+  virtual std::optional<Result<void>> WhenDurable(ShardId shard, Durability durability,
+                                                  SeqWaiterNode& node) = 0;
+  virtual bool CancelDurable(ShardId shard, Durability durability,
+                             SeqWaiterNode& node) noexcept = 0;
 
   // Lowest seq still readable on `shard`.
   virtual Result<SequenceId> FirstSeq(ShardId shard) = 0;

@@ -22,6 +22,7 @@
 #include "abyss/core/queue.h"
 #include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/blocking_driver.h"
 #include "abyss/metrics/names.h"
 #include "latch.h"
 #include "sequencer_fixture.h"
@@ -155,9 +156,9 @@ TEST_F(SequencerTest, AWriteThatChangesNothingStillCountsAsUse) {
 TEST_F(SequencerTest, AdmissionFailureRetriesWithTheRequestRestored) {
   FailReserves(core::ErrorCode::kResourceExhausted, 1);
   int admits = 0;
-  ON_CALL(queue_, Admit(_, _)).WillByDefault([&admits](core::ShardId, core::SteadyTime) {
+  ON_CALL(queue_, Admissible(_)).WillByDefault([&admits](core::ShardId) {
     ++admits;
-    return core::Result<void>{};
+    return true;
   });
   EXPECT_EQ(Reply({"SADD", "k", "a", "b"}), ":2");
   EXPECT_EQ(Redecides(RedecideReason::kAdmission), 1U);
@@ -167,7 +168,8 @@ TEST_F(SequencerTest, AdmissionFailureRetriesWithTheRequestRestored) {
 
 TEST_F(SequencerTest, NoSpareWaitsThenRetries) {
   FailReserves(core::ErrorCode::kUnavailable, 1);
-  EXPECT_CALL(queue_, WaitForSpare(ShardOf("k"), _)).WillOnce(Return(true));
+  EXPECT_CALL(queue_, WhenReady(core::QueueWait::kSpare, ShardOf("k"), _, true))
+      .WillOnce(Return(std::optional<core::Result<void>>(core::Result<void>{})));
   EXPECT_EQ(Reply({"SET", "k", "v"}), "OK");
   EXPECT_EQ(Redecides(RedecideReason::kSpare), 1U);
   EXPECT_EQ(NewlyLogged(), (std::vector<std::vector<std::string>>{{"SET", "k", "v"}}));
@@ -175,7 +177,9 @@ TEST_F(SequencerTest, NoSpareWaitsThenRetries) {
 
 TEST_F(SequencerTest, ASpareWaitThatFailsBeforeTheDeadlineIsShutdown) {
   FailReserves(core::ErrorCode::kUnavailable, 1, "WAL queue is shutting down");
-  EXPECT_CALL(queue_, WaitForSpare(_, _)).WillOnce(Return(false));
+  EXPECT_CALL(queue_, WhenReady(core::QueueWait::kSpare, _, _, _))
+      .WillOnce(Return(std::optional<core::Result<void>>(core::Result<void>{
+          std::unexpected(core::Error{core::ErrorCode::kUnavailable, "shutting down"})})));
   auto result = Run({"SET", "k", "v"});
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
@@ -298,19 +302,17 @@ TEST_F(SequencerTest, AnMsetOfManyMidSizeValuesCopiesWithinTheBudget) {
 TEST_F(SequencerTest, ANoEffectDecisionFencesOnWhatItRead) {
   EXPECT_EQ(Reply({"SET", "k", "v"}), "OK");
   abyss::testing::Latch entered;
-  abyss::testing::Latch release;
   std::optional<std::pair<core::ShardId, core::SequenceId>> fenced;
-  EXPECT_CALL(queue_, AwaitDurable(_, _, core::Durability::kProcessCrash, _))
-      .WillOnce([&](core::ShardId shard, core::SequenceId seq, core::Durability,
-                    core::Duration) -> core::Result<bool> {
-        fenced = {shard, seq};
+  EXPECT_CALL(queue_, WhenDurable(_, core::Durability::kProcessCrash, _))
+      .WillOnce([&](core::ShardId shard, core::Durability, core::SeqWaiterNode& node) {
+        fenced = {shard, node.seq()};
         entered.Open();
-        return release.Wait();
+        return queue_.ParkDurable(shard, node);
       });
   auto reply = std::async(std::launch::async, [this] { return Reply({"SETNX", "k", "w"}); });
   ASSERT_TRUE(entered.Wait());
   EXPECT_EQ(reply.wait_for(50ms), std::future_status::timeout) << "replied before the fence";
-  release.Open();
+  queue_.ReleaseDurable();
   EXPECT_EQ(reply.get(), ":0");
   EXPECT_EQ(
       fenced,
@@ -318,8 +320,12 @@ TEST_F(SequencerTest, ANoEffectDecisionFencesOnWhatItRead) {
 }
 
 TEST_F(SequencerTest, AFenceTimeoutRepliesWithTheTimeoutText) {
+  Build(Options{.write_timeout = 50ms});
   EXPECT_EQ(Reply({"SET", "k", "v"}), "OK");
-  EXPECT_CALL(queue_, AwaitDurable(_, _, _, _)).WillOnce(Return(core::Result<bool>(false)));
+  EXPECT_CALL(queue_, WhenDurable(_, _, _))
+      .WillOnce([this](core::ShardId shard, core::Durability, core::SeqWaiterNode& node) {
+        return queue_.ParkDurable(shard, node);
+      });
   auto result = Run({"SETNX", "k", "w"});
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
@@ -331,12 +337,14 @@ TEST_F(SequencerTest, AFenceTimeoutRepliesWithTheTimeoutText) {
 // loaded absent still replies at once.
 TEST_F(SequencerTest, LoadedStateFencesOnZeroWhichIsDurableAlready) {
   std::vector<core::SequenceId> fenced;
-  EXPECT_CALL(queue_, AwaitDurable(_, _, _, _))
-      .WillRepeatedly([&fenced](core::ShardId, core::SequenceId seq, core::Durability,
-                                core::Duration) -> core::Result<bool> {
-        fenced.push_back(seq);
-        return seq < core::kFirstSeq;
-      });
+  EXPECT_CALL(queue_, WhenDurable(_, _, _))
+      .WillRepeatedly(
+          [this, &fenced](core::ShardId shard, core::Durability, core::SeqWaiterNode& node) {
+            fenced.push_back(node.seq());
+            if (node.seq() < core::kFirstSeq)
+              return std::optional<core::Result<void>>(core::Result<void>{});
+            return queue_.ParkDurable(shard, node);
+          });
   EXPECT_EQ(Reply({"SREM", "absent", "m"}), ":0");
   EXPECT_EQ(fenced, std::vector<core::SequenceId>{0});
 }
@@ -358,7 +366,7 @@ TEST_F(SequencerTest, MultiKeyWritesAcrossLogsAreCrossSlot) {
     EXPECT_TRUE(NewlyLogged().empty());
   }
   EXPECT_EQ(Reply({"MSET", KeyOn(0), "1", KeyOn(2), "2"}), "OK") << "shards 0 and 2 share a log";
-  auto flushed = sequencer_->Flush();
+  auto flushed = RunFlushToCompletion(*sequencer_);
   ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     ASSERT_FALSE(Logged(shard).empty());
@@ -434,7 +442,7 @@ TEST_F(SequencerTest, FlushWipesEveryShardAtItsSeqAndSetsTheFloor) {
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     ASSERT_EQ(Reply({"SET", KeyOn(shard), "v"}), "OK");
   }
-  auto flushed = sequencer_->Flush();
+  auto flushed = RunFlushToCompletion(*sequencer_);
   ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
   EXPECT_EQ(flushed->AsString(), "OK");
   for (core::ShardId shard = 0; shard < kShards; ++shard) {

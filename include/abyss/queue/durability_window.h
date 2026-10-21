@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "abyss/core/result.h"
@@ -62,6 +63,20 @@ class DurabilityWindow {
   // Log `log`'s Admit waiters, for one that registers itself. Its
   // condition is stopped() || Admissible(log).
   core::WaitList& admission(std::size_t log) noexcept { return logs_[log].admission; }
+  // Admit's wait for a waiter that registers itself: counted when
+  // `first`; outcomes as WaitList::Register's, kUnavailable once
+  // stopped.
+  std::optional<core::Result<void>> WhenAdmissible(std::size_t log, core::Waiter& waiter,
+                                                   bool first);
+  // For a waiter WhenAdmissible linked, as WaitList's.
+  bool CancelAdmission(std::size_t log, core::Waiter& waiter) noexcept {
+    return admission(log).Cancel(waiter);
+  }
+  void FinishAdmission(std::size_t log, core::Waiter& waiter) noexcept {
+    admission(log).Finish(waiter);
+  }
+  // Admit's error at its deadline, counted as a rejection.
+  core::Error Rejected(std::size_t log);
   bool stopped() const noexcept { return stopped_.load(std::memory_order_seq_cst); }
 
   // Entry frame bytes: after Reserve, before Commit.
@@ -76,7 +91,8 @@ class DurabilityWindow {
     return unflushed_bytes_.load(std::memory_order_acquire);
   }
 
-  // Runs in Admit between its check and its wait.
+  // Runs in Admit, and a first WhenAdmissible, between the check and
+  // the wait.
   void SetAdmitHookForTesting(std::function<void()> hook) { admit_hook_ = std::move(hook); }
 
  private:

@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <limits>
@@ -16,7 +17,9 @@
 
 #include "abyss/core/fatal.h"
 #include "abyss/core/queue.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/queue/reservation.h"
 
 namespace abyss::testing {
@@ -38,8 +41,39 @@ class MockQueue : public core::Queue {
     ON_CALL(*this, AwaitDurable(_, _, _, _))
         .WillByDefault([this](core::ShardId shard, core::SequenceId seq, core::Durability,
                               core::Duration timeout) { return FakeDurable(shard, seq, timeout); });
-    ON_CALL(*this, Admit(_, _)).WillByDefault(Return(core::Result<void>{}));
-    ON_CALL(*this, WaitForSpare(_, _)).WillByDefault(Return(true));
+    ON_CALL(*this, Admissible(_)).WillByDefault([this](core::ShardId) {
+      return fake_->admissible.load(std::memory_order_seq_cst);
+    });
+    ON_CALL(*this, WhenReady(_, _, _, _))
+        .WillByDefault([this](core::QueueWait wait, core::ShardId, core::Waiter& waiter, bool) {
+          return wait == core::QueueWait::kAdmission
+                     ? fake_->admission.Register(
+                           waiter,
+                           [this] { return fake_->admissible.load(std::memory_order_seq_cst); })
+                     : fake_->spares.Register(waiter, [this] {
+                         return fake_->spare_ready.load(std::memory_order_seq_cst);
+                       });
+        });
+    ON_CALL(*this, CancelWait(_, _, _))
+        .WillByDefault([this](core::QueueWait wait, core::ShardId, core::Waiter& waiter) {
+          return ListOf(wait).Cancel(waiter);
+        });
+    ON_CALL(*this, FinishWait(_, _, _))
+        .WillByDefault([this](core::QueueWait wait, core::ShardId, core::Waiter& waiter) {
+          ListOf(wait).Finish(waiter);
+        });
+    ON_CALL(*this, AdmissionTimedOut(_)).WillByDefault([](core::ShardId) {
+      return core::Error{core::ErrorCode::kResourceExhausted,
+                         "WAL durability window full: the device is not keeping up with writes"};
+    });
+    ON_CALL(*this, WhenDurable(_, _, _))
+        .WillByDefault([this](core::ShardId shard, core::Durability, core::SeqWaiterNode& node) {
+          return FakeWhenDurable(shard, node);
+        });
+    ON_CALL(*this, CancelDurable(_, _, _))
+        .WillByDefault([this](core::ShardId shard, core::Durability, core::SeqWaiterNode& node) {
+          return Shard(shard).waiters.Cancel(node);
+        });
   }
 
   MOCK_METHOD(core::Result<queue::PendingAppend>, BeginAppend,
@@ -75,9 +109,47 @@ class MockQueue : public core::Queue {
   MOCK_METHOD(core::Result<core::SequenceId>, OldestRetained, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::SequenceId>, TailSeq, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::QueueStats>, Stats, (), (override));
-  MOCK_METHOD(core::Result<void>, Admit, (core::ShardId shard, core::SteadyTime admit_by),
+  MOCK_METHOD(bool, Admissible, (core::ShardId shard), (override));
+  MOCK_METHOD(std::optional<core::Result<void>>, WhenReady,
+              (core::QueueWait wait, core::ShardId shard, core::Waiter& waiter, bool first),
               (override));
-  MOCK_METHOD(bool, WaitForSpare, (core::ShardId shard, core::SteadyTime deadline), (override));
+  // NOLINTNEXTLINE(bugprone-exception-escape): a test double.
+  MOCK_METHOD(bool, CancelWait, (core::QueueWait wait, core::ShardId shard, core::Waiter& waiter),
+              (noexcept, override));
+  // NOLINTNEXTLINE(bugprone-exception-escape): a test double.
+  MOCK_METHOD(void, FinishWait, (core::QueueWait wait, core::ShardId shard, core::Waiter& waiter),
+              (noexcept, override));
+  MOCK_METHOD(core::Error, AdmissionTimedOut, (core::ShardId shard), (override));
+  MOCK_METHOD(std::optional<core::Result<void>>, WhenDurable,
+              (core::ShardId shard, core::Durability durability, core::SeqWaiterNode& node),
+              (override));
+  // NOLINTNEXTLINE(bugprone-exception-escape): a test double.
+  MOCK_METHOD(bool, CancelDurable,
+              (core::ShardId shard, core::Durability durability, core::SeqWaiterNode& node),
+              (noexcept, override));
+
+  // The fake window: whether it admits. Opening it wakes one waiter,
+  // which hands on if it passes.
+  void SetAdmissible(bool admissible) {
+    fake_->admissible.store(admissible, std::memory_order_seq_cst);
+    if (admissible) fake_->admission.NotifyOne();
+  }
+  void SetSpareReady(bool ready) {
+    fake_->spare_ready.store(ready, std::memory_order_seq_cst);
+    if (ready) fake_->spares.Notify();
+  }
+  size_t AdmissionWaiters() const { return fake_->admission.size(); }
+  size_t SpareWaiters() const { return fake_->spares.size(); }
+  // Links `node` on `shard` as not yet durable, whatever it is, until
+  // ReleaseDurable.
+  std::optional<core::Result<void>> ParkDurable(core::ShardId shard, core::SeqWaiterNode& node) {
+    FakeShard& state = Shard(shard);
+    {
+      const std::scoped_lock lock(fake_->mu);
+      if (state.end.load() > node.seq()) state.end.store(node.seq(), std::memory_order_seq_cst);
+    }
+    return state.waiters.Register(node, state.end);
+  }
 
   // In memory: seqs per shard from kFirstSeq, each shard published in seq
   // order, durable unless held or failed. It takes every entry, as a
@@ -103,6 +175,7 @@ class MockQueue : public core::Queue {
         shard.fail_from = first;
       } else if (fake_->hold_durable && !shard.hold_from.has_value()) {
         shard.hold_from = first;
+        shard.end.store(first, std::memory_order_seq_cst);
       }
     }
     return queue::Reservation(std::move(ranges), std::move(filler));
@@ -152,12 +225,18 @@ class MockQueue : public core::Queue {
     fake_->hold_durable = true;
   }
   void ReleaseDurable() {
+    std::vector<FakeShard*> released;
     {
       const std::scoped_lock lock(fake_->mu);
       fake_->hold_durable = false;
-      for (auto& [id, shard] : fake_->shards) shard.hold_from.reset();
+      for (auto& [id, shard] : fake_->shards) {
+        shard.hold_from.reset();
+        shard.end.store(kAllDurable, std::memory_order_seq_cst);
+        released.push_back(&shard);
+      }
     }
     fake_->durable_cv.notify_all();
+    for (FakeShard* shard : released) shard->waiters.Advance(kAllDurable);
   }
   // Entries Complete published on `shard`, in seq order.
   std::vector<core::QueueEntry> Published(core::ShardId shard) const {
@@ -182,6 +261,8 @@ class MockQueue : public core::Queue {
   }
 
  private:
+  static constexpr core::SequenceId kAllDurable = std::numeric_limits<core::SequenceId>::max();
+
   struct FakeShard {
     core::SequenceId next = core::kFirstSeq;
     // The entry at seq s is at s - kFirstSeq.
@@ -189,8 +270,15 @@ class MockQueue : public core::Queue {
     // Seqs from these on are held, or fail with durable_error.
     std::optional<core::SequenceId> hold_from;
     std::optional<core::SequenceId> fail_from;
+    // WhenDurable's: seqs below `end` are durable.
+    std::atomic<core::SequenceId> end{kAllDurable};
+    core::SeqWaiters waiters;
   };
   struct FakeLog {
+    std::atomic<bool> admissible{true};
+    std::atomic<bool> spare_ready{true};
+    core::WaitList admission;
+    core::WaitList spares;
     mutable std::mutex mu;
     std::condition_variable published_cv;
     std::condition_variable durable_cv;
@@ -237,6 +325,25 @@ class MockQueue : public core::Queue {
     return fake_->durable_cv.wait_for(lock, timeout, [&shard, seq] {
       return !shard.hold_from.has_value() || seq < *shard.hold_from;
     });
+  }
+
+  std::optional<core::Result<void>> FakeWhenDurable(core::ShardId id, core::SeqWaiterNode& node) {
+    FakeShard& shard = Shard(id);
+    {
+      const std::scoped_lock lock(fake_->mu);
+      if (shard.fail_from.has_value() && node.seq() >= *shard.fail_from &&
+          fake_->durable_error.has_value()) {
+        return core::Result<void>{std::unexpected(*fake_->durable_error)};
+      }
+    }
+    return shard.waiters.Register(node, shard.end);
+  }
+  FakeShard& Shard(core::ShardId id) {
+    const std::scoped_lock lock(fake_->mu);
+    return fake_->shards[id];
+  }
+  core::WaitList& ListOf(core::QueueWait wait) {
+    return wait == core::QueueWait::kAdmission ? fake_->admission : fake_->spares;
   }
 
   std::shared_ptr<FakeLog> fake_ = std::make_shared<FakeLog>();

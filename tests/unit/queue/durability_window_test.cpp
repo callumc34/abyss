@@ -163,6 +163,32 @@ TEST_F(DurabilityWindowTest, AFlushThatClearsTheAgeAdmitsEveryHeldWaiter) {
   EXPECT_EQ(window_->admission(0).size(), 0U);
 }
 
+// A waiter that registers itself, as a sequenced write does, waits on
+// its own log's list and age, and is rejected with that log's age.
+TEST_F(DurabilityWindowTest, ARegisteredWaiterWaitsOnItsOwnLog) {
+  struct CountingWaiter : core::Waiter {
+    void Wake(core::Result<void> /*result*/) noexcept override { ++wakes; }
+    int wakes = 0;
+  };
+  SetAge(window_->age(1), Clock::now() - (2 * kMaxAge));
+  window_->Add(1);
+  CountingWaiter on_zero;
+  CountingWaiter on_one;
+  const auto zero = window_->WhenAdmissible(0, on_zero, /*first=*/true);
+  ASSERT_TRUE(zero.has_value()) << "log 1's age held log 0";
+  EXPECT_TRUE(zero->has_value());
+  ASSERT_FALSE(window_->WhenAdmissible(1, on_one, /*first=*/true).has_value());
+  EXPECT_EQ(window_->admission(1).size(), 1U);
+  EXPECT_EQ(window_->admission(0).size(), 0U);
+
+  const core::Error rejected = window_->Rejected(1);
+  EXPECT_EQ(rejected.code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_EQ(rejected.message().find("oldest 0 of"), std::string::npos) << rejected.message();
+  EXPECT_TRUE(window_->CancelAdmission(1, on_one));
+  EXPECT_EQ(window_->admission(1).size(), 0U);
+  EXPECT_EQ(on_one.wakes, 0);
+}
+
 TEST_F(DurabilityWindowTest, RejectsAtTheDeadline) {
   window_->Add(kMaxBytes);
   const auto start = Clock::now();

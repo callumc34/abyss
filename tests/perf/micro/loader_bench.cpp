@@ -42,17 +42,16 @@ class NoBuffers : public consumer::CompactionBufferRouter {
                                                    std::string_view /*key*/) const override {
     return std::nullopt;
   }
-  bool WaitForDrainedSeq(core::ShardId /*shard*/, core::SequenceId /*seq*/,
-                         std::chrono::milliseconds /*timeout*/) override {
-    return true;
-  }
-  std::optional<core::Result<void>> WhenDrained(core::ShardId /*shard*/,
-                                                core::SeqWaiterNode& /*node*/) override {
+  // Nothing drains here: a wait for room finds it already.
+  std::optional<core::Result<void>> WhenDrainedPast(core::ShardId /*shard*/,
+                                                    core::SequenceId /*past*/,
+                                                    core::Waiter& /*waiter*/) override {
     return core::Result<void>{};
   }
-  bool CancelDrained(core::ShardId /*shard*/, core::SeqWaiterNode& /*node*/) noexcept override {
+  bool CancelDrainWait(core::ShardId /*shard*/, core::Waiter& /*waiter*/) noexcept override {
     return false;
   }
+  void FinishDrainWait(core::ShardId /*shard*/, core::Waiter& /*waiter*/) noexcept override {}
 };
 
 struct Fixture {

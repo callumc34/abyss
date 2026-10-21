@@ -22,6 +22,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/metrics/consumer_metrics.h"
 #include "abyss/metrics/metrics.h"
 
@@ -187,6 +188,11 @@ class ColdConsumer {
   std::optional<core::Result<void>> WhenDrained(core::SeqWaiterNode& node);
   bool CancelDrained(core::SeqWaiterNode& node) noexcept { return drained_waiters_.Cancel(node); }
   std::size_t DrainedWaitersForTesting() const noexcept { return drained_waiters_.size(); }
+  // CompactionBufferRouter::WhenDrainedPast on this shard.
+  std::optional<core::Result<void>> WhenDrainedPast(core::SequenceId past, core::Waiter& waiter);
+  bool CancelDrainWait(core::Waiter& waiter) noexcept { return room_waiters_.Cancel(waiter); }
+  void FinishDrainWait(core::Waiter& waiter) noexcept { room_waiters_.Finish(waiter); }
+  std::size_t RoomWaitersForTesting() const noexcept { return room_waiters_.size(); }
   // Runs in WaitForDrainedSeq between its check and its wait.
   void SetDrainedWaitHookForTesting(std::function<void()> hook) {
     drained_wait_hook_ = std::move(hook);
@@ -333,6 +339,10 @@ class ColdConsumer {
   // woken in seq order, has no head for a small request to pass.
   core::SeqWaiters drained_waiters_;
   std::function<void()> drained_wait_hook_;
+  // Waiters for room in hot: each advance wakes the front one, which
+  // evicts again and hands on if that left the shard under its limit.
+  // Waking them all would herd them on the shard's exclusive lock.
+  core::WaitList room_waiters_;
 
   // Lowest seq of a structurally-undecodable op the cold consumer could
   // not materialise (XERR-5). The commit/drain frontier is pinned below it

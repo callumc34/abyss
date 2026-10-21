@@ -83,18 +83,23 @@ bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId t
   return consumers_[shard]->WaitForDrainedSeq(target_seq, timeout);
 }
 
-std::optional<core::Result<void>> ColdConsumerPool::WhenDrained(core::ShardId shard,
-                                                                core::SeqWaiterNode& node) {
+std::optional<core::Result<void>> ColdConsumerPool::WhenDrainedPast(core::ShardId shard,
+                                                                    core::SequenceId past,
+                                                                    core::Waiter& waiter) {
   if (shard >= consumers_.size()) {
     return core::Result<void>{
         std::unexpected(core::Error{core::ErrorCode::kInvalidArgument,
                                     "cold shard " + std::to_string(shard) + " out of range"})};
   }
-  return consumers_[shard]->WhenDrained(node);
+  return consumers_[shard]->WhenDrainedPast(past, waiter);
 }
 
-bool ColdConsumerPool::CancelDrained(core::ShardId shard, core::SeqWaiterNode& node) noexcept {
-  return shard < consumers_.size() && consumers_[shard]->CancelDrained(node);
+bool ColdConsumerPool::CancelDrainWait(core::ShardId shard, core::Waiter& waiter) noexcept {
+  return shard < consumers_.size() && consumers_[shard]->CancelDrainWait(waiter);
+}
+
+void ColdConsumerPool::FinishDrainWait(core::ShardId shard, core::Waiter& waiter) noexcept {
+  if (shard < consumers_.size()) consumers_[shard]->FinishDrainWait(waiter);
 }
 
 core::ShardId ColdConsumerPool::ShardForKey(std::string_view key) const {

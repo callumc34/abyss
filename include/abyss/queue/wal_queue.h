@@ -92,12 +92,23 @@ class WalQueue : public core::Queue, public SegmentRegistry {
                                               std::span<const core::QueueEntry> entries,
                                               core::SteadyTime admit_by) override;
 
-  core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by) override;
-  bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline) override;
+  bool Admissible(core::ShardId shard) override;
+  std::optional<core::Result<void>> WhenReady(core::QueueWait wait, core::ShardId shard,
+                                              core::Waiter& waiter, bool first) override;
+  bool CancelWait(core::QueueWait wait, core::ShardId shard,
+                  core::Waiter& waiter) noexcept override;
+  void FinishWait(core::QueueWait wait, core::ShardId shard,
+                  core::Waiter& waiter) noexcept override;
+  core::Error AdmissionTimedOut(core::ShardId shard) override;
   core::Result<Reservation> Reserve(std::span<const ShardEntries> parts) override;
   core::Result<Reservation> ReserveFlush(std::span<const ShardEntries> parts) override;
   uint32_t LogOf(core::ShardId shard) const override { return shard % config_.log_count; }
   std::vector<ReservedRange> Complete(Reservation&& reservation) override;
+
+  // Blocking forms of the waits above: room in `shard`'s window, and
+  // a spare on its log (false at the deadline or on shutdown).
+  core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by);
+  bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline);
 
   // As above, admitting within WalConfig::admission_timeout.
   core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry);
@@ -118,12 +129,11 @@ class WalQueue : public core::Queue, public SegmentRegistry {
                                             core::Durability durability) override;
   core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
                                   core::Durability durability, core::Duration timeout) override;
-  // Registers `node` to be posted once its seq is durable at
-  // `durability`: SeqWaiters::Register, on that shard's stream.
+  // On that shard's stream.
   std::optional<core::Result<void>> WhenDurable(core::ShardId shard, core::Durability durability,
-                                                core::SeqWaiterNode& node);
+                                                core::SeqWaiterNode& node) override;
   bool CancelDurable(core::ShardId shard, core::Durability durability,
-                     core::SeqWaiterNode& node) noexcept;
+                     core::SeqWaiterNode& node) noexcept override;
   core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override;
   core::RetentionPin PinRetention() override;
   core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override;
