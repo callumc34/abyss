@@ -100,7 +100,7 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 ## Success Criteria
 
 1. **Latency** — hot reads < 100us p99, cold reads < 5ms p99.
-2. **Durability** — zero data loss across pod restart for non-expired keys. Clients never receive OK for a write that is subsequently lost.
+2. **Durability** — zero data loss across pod restart for non-expired keys. Clients never receive OK for a write that a failure in the configured durability class can lose; under `process_crash` a node power loss loses at most the durability window.
 3. **Throughput** — > 100K ops/s sustained on embedded profile.
 4. **Recovery** — pod restart to ready in < 60 seconds for a 24-hour queue window.
 5. **Simplicity** — embedded profile deployable with zero external dependencies beyond Kubernetes and PVCs.

@@ -183,7 +183,7 @@ Conditional writes are validated the same way but are appended in the client's o
 
 **Why promote from cold via queue instead of writing directly to hot?** The queue is the sole write path. If we wrote directly to hot, the promoted key would not have a queue entry and would be lost on crash. Promoting through the queue gives the key a fresh entry that survives recovery. The cold consumer harmlessly re-absorbs it (the cold store already has the data, so the compacted flush is a no-op).
 
-**Why block the write handler on both fsync and hot apply?** The client expects that after receiving OK, a subsequent read returns the written value. If we only waited for fsync, there would be a window where the write is durable but not yet readable from hot. The client might read stale data immediately after a successful write. Waiting for both ensures read-after-write consistency.
+**Why block the write handler on both durability at the configured class and hot apply?** The client expects that after receiving OK, a subsequent read returns the written value. If we only waited for durability, there would be a window where the write is durable but not yet readable from hot. The client might read stale data immediately after a successful write. Waiting for both ensures read-after-write consistency.
 
 ## Amendment: the settled seq is a floor, not a raw max
 

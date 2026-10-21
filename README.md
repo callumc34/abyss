@@ -24,9 +24,10 @@
 A Redis-compatible KV store built on a Kappa architecture: an append-only
 queue is the single source of truth, and two independent consumers
 materialise that queue into a fast in-memory hot tier and a durable on-disk
-cold tier. Writes are not acknowledged until they are durable in the queue,
-so a crash never costs you an acked write. Data moves between tiers
-automatically. Any Redis client library connects.
+cold tier. Writes are acknowledged only once durable in the queue at the
+configured class: by default a process crash never costs an acked write,
+and `queue.durability: power_loss` extends that to power loss. Data moves
+between tiers automatically. Any Redis client library connects.
 
 ## Quick start
 
@@ -55,7 +56,7 @@ Clang 17+), and vcpkg with `VCPKG_ROOT` set.
 Five hard invariants drive the design:
 
 1. The queue is the single source of truth — no dual writes.
-2. A client never receives OK for a lost write.
+2. No reply reflects a write that the configured durability class can lose.
 3. Hot and cold consumers are independent — neither blocks the other.
 4. Recovery is pure queue replay; the cold store is never read during recovery.
 5. No silent degradation — backpressure surfaces as metrics and errors.
@@ -68,8 +69,8 @@ The authoritative diagram and the full design rationale live in
 - **Redis compatible.** RESP2 protocol. Any Redis client works out of the box.
 - **Two-tier storage.** In-memory hot tier for sub-millisecond reads, on-disk
   cold tier for durability. Transparent promotion and eviction.
-- **Durable writes.** Writes are not acknowledged until committed to the
-  append-only queue. A crash never loses an acknowledged write.
+- **Durable writes.** Writes are acknowledged once durable in the queue at
+  the configured class (`process_crash` by default, or `power_loss`).
 - **Smart compaction.** The cold consumer collapses intermediate writes — a
   key updated 1000 times results in a single disk write.
 - **Pluggable backends.** Embedded (zero dependencies) or external (Kafka,
