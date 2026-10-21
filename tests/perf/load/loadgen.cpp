@@ -449,8 +449,9 @@ int main(int argc, char** argv) {
         abyss::perf::StatsFromHistogram(hist, count, result.measured_duration);
     report.operations[name].errors = result.per_op_errors.at(name);
   }
-  report.driver = abyss::perf::MakeDriverStats(result.send_lag, result.open_loop, result.driver_cpu,
-                                               result.measured_duration, workload.targets);
+  report.driver =
+      abyss::perf::MakeDriverStats(result.send_lag, result.backlog, result.open_loop,
+                                   result.driver_cpu, result.measured_duration, workload.targets);
   report.server_metrics = std::move(server_snapshots);
   if (rate_sweep.has_value()) {
     report.sweep = rate_sweep->Steps();

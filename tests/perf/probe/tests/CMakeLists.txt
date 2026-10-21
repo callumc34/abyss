@@ -1,9 +1,11 @@
 add_executable(abyss_perf_probe_tests
   probe_smoke_test.cpp
+  workload_shape_test.cpp
 )
 
 target_link_libraries(abyss_perf_probe_tests PRIVATE
   abyss::compiler_options
+  abyss::perf_probe_common
   abyss::test_support
   GTest::gtest_main
   yaml-cpp::yaml-cpp

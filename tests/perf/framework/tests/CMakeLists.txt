@@ -18,3 +18,6 @@ target_link_libraries(abyss_perf_framework_tests PRIVATE
 )
 
 abyss_discover_tests(abyss_perf_framework_tests "perf-framework")
+abyss_mark_serial_tests(perf_framework "${CMAKE_CURRENT_SOURCE_DIR}"
+  CoordinatedOmissionTest.StallIsChargedToEveryDelayedOp
+  PipelinedRunLoopTest.BurstArrivalOffersTheTargetRequestRate)

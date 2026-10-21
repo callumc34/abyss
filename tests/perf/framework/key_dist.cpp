@@ -1,6 +1,9 @@
 #include "key_dist.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <memory>
 #include <stdexcept>
 
 namespace abyss::perf {
@@ -16,7 +19,56 @@ double ComputeZeta(uint64_t n, double theta) {
   return sum;
 }
 
+// log1p(x) / x, and (exp(x) - 1) / x, accurate near 0.
+double Log1pOverX(double x) {
+  constexpr double kSmall = 1e-8;
+  if (std::abs(x) > kSmall) return std::log1p(x) / x;
+  return 1.0 - (x * (0.5 - (x * ((1.0 / 3.0) - (0.25 * x)))));
+}
+
+double Expm1OverX(double x) {
+  constexpr double kSmall = 1e-8;
+  if (std::abs(x) > kSmall) return std::expm1(x) / x;
+  return 1.0 + (x * 0.5 * (1.0 + (x / 3.0 * (1.0 + (0.25 * x)))));
+}
+
 }  // namespace
+
+ZipfRejectionInversion::ZipfRejectionInversion(uint64_t key_count, double exponent, uint64_t seed)
+    : key_count_(key_count), exponent_(exponent), rng_(seed), uniform_(0.0, 1.0) {
+  if (key_count_ == 0) {
+    throw std::invalid_argument("ZipfRejectionInversion: key_count must be > 0");
+  }
+  if (exponent_ <= 0.0) {
+    throw std::invalid_argument("ZipfRejectionInversion: exponent must be > 0");
+  }
+  h_integral_x1_ = HIntegral(1.5) - 1.0;
+  h_integral_n_ = HIntegral(static_cast<double>(key_count_) + 0.5);
+  s_ = 2.0 - HIntegralInverse(HIntegral(2.5) - H(2.0));
+}
+
+double ZipfRejectionInversion::H(double x) const { return std::exp(-exponent_ * std::log(x)); }
+
+double ZipfRejectionInversion::HIntegral(double x) const {
+  const double log_x = std::log(x);
+  return Expm1OverX((1.0 - exponent_) * log_x) * log_x;
+}
+
+double ZipfRejectionInversion::HIntegralInverse(double x) const {
+  const double t = std::max(x * (1.0 - exponent_), -1.0);
+  return std::exp(Log1pOverX(t) * x);
+}
+
+// NOLINTNEXTLINE(readability-make-member-function-const): uniform_ and rng_ are mutated.
+uint64_t ZipfRejectionInversion::Next() {
+  const auto n = static_cast<double>(key_count_);
+  for (;;) {
+    const double u = h_integral_n_ + (uniform_(rng_) * (h_integral_x1_ - h_integral_n_));
+    const double x = HIntegralInverse(u);
+    const double k = std::clamp(std::floor(x + 0.5), 1.0, n);
+    if (k - x <= s_ || u >= HIntegral(k + 0.5) - H(k)) return static_cast<uint64_t>(k) - 1;
+  }
+}
 
 UniformDistribution::UniformDistribution(uint64_t key_count, uint64_t seed)
     : key_count_(key_count), rng_(seed) {
@@ -75,6 +127,9 @@ std::unique_ptr<KeyDistribution> MakeKeyDistribution(const KeyDistConfig& config
     case KeyDistConfig::Kind::kUniform:
       return std::make_unique<UniformDistribution>(key_count, config.seed);
     case KeyDistConfig::Kind::kZipfian:
+      if (config.theta >= 1.0) {
+        return std::make_unique<ZipfRejectionInversion>(key_count, config.theta, config.seed);
+      }
       return std::make_unique<ZipfianDistribution>(key_count, config.theta, config.seed);
     case KeyDistConfig::Kind::kLatest:
       return std::make_unique<LatestDistribution>(key_count, config.theta, config.seed);

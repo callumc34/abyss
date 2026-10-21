@@ -78,5 +78,3 @@ BENCHMARK(BM_FrameDecode)->Arg(64)->Arg(1 << 10)->Arg(1 << 16);
 
 }  // namespace
 }  // namespace abyss::queue
-
-BENCHMARK_MAIN();

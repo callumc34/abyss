@@ -51,6 +51,29 @@ class ZipfianDistribution final : public KeyDistribution {
   std::uniform_real_distribution<double> uniform_;
 };
 
+// Zipf with any exponent above 0, by rejection-inversion (Hörmann and
+// Derflinger, 1996): O(1) setup and sampling. Key 0 is the hottest.
+// Used for theta >= 1, which the YCSB method cannot take.
+class ZipfRejectionInversion final : public KeyDistribution {
+ public:
+  ZipfRejectionInversion(uint64_t key_count, double exponent, uint64_t seed);
+  uint64_t Next() override;
+  uint64_t KeyCount() const override { return key_count_; }
+
+ private:
+  double H(double x) const;
+  double HIntegral(double x) const;
+  double HIntegralInverse(double x) const;
+
+  uint64_t key_count_;
+  double exponent_;
+  double h_integral_x1_;
+  double h_integral_n_;
+  double s_;
+  std::mt19937_64 rng_;
+  std::uniform_real_distribution<double> uniform_;
+};
+
 // YCSB Latest. Emphasises the highest-numbered keys.
 class LatestDistribution final : public KeyDistribution {
  public:

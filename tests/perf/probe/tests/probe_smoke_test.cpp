@@ -121,6 +121,36 @@ TEST(ProbeSmokeTest, WriteProbeClosedLoopLeavesTargetsUnevaluated) {
   EXPECT_FALSE(report["pass"].as<bool>());
 }
 
+TEST(ProbeSmokeTest, WriteProbeRunsTheTraceShapeWithReads) {
+  abyss::testing::TempDir dir{"probe_write_trace"};
+  const auto output = dir.Sub("write.json").string();
+  ASSERT_EQ(RunProbe(ABYSS_WRITE_PROBE_BINARY,
+                     WriteProbeArgs(dir,
+                                    "--shape trace --prefill-entries 100 "
+                                    "--mix \"write_ack=0.5,read=0.5\""),
+                     output),
+            kProbeOk);
+  const auto report = ParseProbeJson(output);
+  AssertReportShape(report, "write_ack");
+  AssertReportShape(report, "read");
+  EXPECT_EQ(report["operations"]["read"]["errors"].as<uint64_t>(), 0U);
+  EXPECT_EQ(report["config"]["shape"].as<std::string>(), "trace");
+  ASSERT_TRUE(report["server_histograms"]);
+  bool phases = false;
+  for (const auto& h : report["server_histograms"]) {
+    phases = phases || h["series"].as<std::string>().starts_with("abyss_sequencer_phase_seconds");
+  }
+  EXPECT_TRUE(phases) << "no write was timed by stage";
+}
+
+TEST(ProbeSmokeTest, WriteProbeRejectsAnUnknownOp) {
+  abyss::testing::TempDir dir{"probe_write_op"};
+  const auto output = dir.Sub("write.json").string();
+  EXPECT_NE(RunProbe(ABYSS_WRITE_PROBE_BINARY,
+                     WriteProbeArgs(dir, "--mix \"write_ack=0.5,scan=0.5\""), output),
+            kProbeOk);
+}
+
 TEST(ProbeSmokeTest, WriteProbeOpenLoopEvaluatesTargets) {
   abyss::testing::TempDir dir{"probe_write_open"};
   const auto output = dir.Sub("write.json").string();

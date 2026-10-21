@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <string>
 
+#include "abyss/consumer/buffer_entry.h"
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/types.h"
+#include "footprint.h"
 
 // Single-threaded lower-bound measurement of compaction buffer Read. The
 // realistic-load measurement lives in tests/perf/probe/buffer_probe.cpp.
@@ -50,6 +52,30 @@ void BM_BufferRead(benchmark::State& state) {
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
 }
 BENCHMARK(BM_BufferRead)->Args({10000, 64})->Args({100000, 64})->Unit(benchmark::kNanosecond);
+
+// What one buffered key costs: the process's growth and the buffer's
+// own estimate, per key, for distinct SETs of small values.
+void BM_BufferMemoryPerEntry(benchmark::State& state) {
+  const int64_t keys = state.range(0);
+  const auto value_bytes = static_cast<size_t>(state.range(1));
+  double footprint = 0;
+  double estimate = 0;
+  for ([[maybe_unused]] auto _ : state) {
+    const size_t before = bench::Footprint();
+    BufferFixture fixture{keys, value_bytes};
+    footprint = static_cast<double>(bench::Footprint() - before) / static_cast<double>(keys);
+    estimate = static_cast<double>(fixture.buffer.BytesEstimate()) / static_cast<double>(keys);
+  }
+  state.counters["footprint_per_key"] = footprint;
+  state.counters["estimate_per_key"] = estimate;
+  state.counters["sizeof_entry"] = static_cast<double>(sizeof(BufferEntry));
+}
+BENCHMARK(BM_BufferMemoryPerEntry)
+    ->ArgNames({"keys", "value"})
+    ->Args({1'000'000, 16})
+    ->Args({1'000'000, 230})
+    ->Iterations(1)
+    ->Unit(benchmark::kMillisecond);
 
 }  // namespace
 }  // namespace abyss::consumer

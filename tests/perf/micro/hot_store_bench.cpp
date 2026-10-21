@@ -15,6 +15,8 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/hot/single_shard_store.h"
+#include "footprint.h"
 
 // Single-threaded lower-bound measurement of hot store Get / Apply. Provides
 // a fixed reference point for regression tracking; the realistic-load
@@ -136,6 +138,50 @@ BENCHMARK(BM_HotReadScaling)
     ->Threads(1)
     ->Threads(8)
     ->UseRealTime();
+
+// What a resident string key costs: the process's growth and what the
+// store counts, per key, for 1M keys of 21 bytes (inline in a
+// std::string) and small values. The map grows as keys arrive, so its
+// bucket array is in the figure, about 8 bytes a key. With no stub
+// share: the stub index is reserved for its cap up front, a fixed cost
+// of the budget, not of the keys.
+void BM_HotMemoryPerKey(benchmark::State& state) {
+  const int64_t keys = state.range(0);
+  const auto value_bytes = static_cast<size_t>(state.range(1));
+  double footprint = 0;
+  double accounted = 0;
+  for ([[maybe_unused]] auto _ : state) {
+    const std::string value(value_bytes, 'x');
+    const size_t before = bench::Footprint();
+    core::EvictionPolicy eviction{core::EvictionTTL{86400}};
+    ShardedHotStore store(ShardedHotStoreConfig{
+        .max_memory_bytes = size_t{64} << 30,
+        .shard_count = 64,
+        .stub_memory_fraction = 0,
+        .eviction_policy = &eviction,
+    });
+    for (int64_t i = 0; i < keys; ++i) {
+      const auto key = KeyFor(i);
+      const core::ops::StringSet set_op{.key = key, .value = value};
+      if (!store.Apply(core::ops::WriteOp{set_op}, core::kFirstSeq).has_value()) std::abort();
+    }
+    footprint = static_cast<double>(bench::Footprint() - before) / static_cast<double>(keys);
+    const auto stats = store.Stats();
+    if (!stats.has_value()) std::abort();
+    accounted = static_cast<double>(stats->used_bytes) / static_cast<double>(keys);
+  }
+  state.counters["footprint_per_key"] = footprint;
+  state.counters["accounted_per_key"] = accounted;
+  state.counters["sizeof_entry"] = static_cast<double>(sizeof(Entry));
+  state.counters["sizeof_value"] = static_cast<double>(sizeof(Value));
+}
+BENCHMARK(BM_HotMemoryPerKey)
+    ->ArgNames({"keys", "value"})
+    ->Args({1'000'000, 16})
+    ->Args({1'000'000, 64})
+    ->Args({1'000'000, 230})
+    ->Iterations(1)
+    ->Unit(benchmark::kMillisecond);
 
 }  // namespace
 }  // namespace abyss::hot

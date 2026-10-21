@@ -20,9 +20,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "abyss/version.h"
+#include "perf_source_tree.h"
 
 namespace abyss::perf {
 
@@ -341,6 +343,21 @@ void WriteDriver(std::ostream& out, const DriverStats& d) {
   out << Us(d.send_lag_max_ns);
   out << '}';
   out << ',';
+  WriteKey(out, "backlog_us");
+  out << '{';
+  WriteKey(out, "count");
+  out << d.backlog_count;
+  out << ',';
+  WriteKey(out, "p50");
+  out << Us(d.backlog_p50_ns);
+  out << ',';
+  WriteKey(out, "p99");
+  out << Us(d.backlog_p99_ns);
+  out << ',';
+  WriteKey(out, "max");
+  out << Us(d.backlog_max_ns);
+  out << '}';
+  out << ',';
   WriteKey(out, "lagging");
   out << (d.lagging ? "true" : "false");
   out << ',';
@@ -498,7 +515,7 @@ void EvaluateTargets(RunReport& report) {
   report.pass = overall && !report.targets.empty();
 }
 
-DriverStats MakeDriverStats(const Histogram& send_lag, bool open_loop,
+DriverStats MakeDriverStats(const Histogram& send_lag, const Histogram& backlog, bool open_loop,
                             std::chrono::nanoseconds driver_cpu,
                             std::chrono::nanoseconds measured_duration,
                             const WorkloadTargets& targets) {
@@ -508,6 +525,10 @@ DriverStats MakeDriverStats(const Histogram& send_lag, bool open_loop,
   d.send_lag_p50_ns = send_lag.PercentileNs(50.0);
   d.send_lag_p99_ns = send_lag.PercentileNs(99.0);
   d.send_lag_max_ns = send_lag.MaxNs();
+  d.backlog_count = static_cast<uint64_t>(backlog.Count());
+  d.backlog_p50_ns = backlog.PercentileNs(50.0);
+  d.backlog_p99_ns = backlog.PercentileNs(99.0);
+  d.backlog_max_ns = backlog.MaxNs();
   if (open_loop && d.send_lag_count > 0) {
     d.lagging = d.send_lag_p99_ns > kMaxSendLagNs;
     for (const auto& [_, spec] : targets.per_op) {
@@ -537,7 +558,9 @@ void WriteSummary(const RunReport& report, std::ostream& out) {
         << "us p99=" << Us(s.p99_ns) << "us p999=" << Us(s.p999_ns) << "us";
   }
   out << " | driver cpu=" << report.driver.cpu_per_wall_second
-      << " cores send_lag_p99=" << Us(report.driver.send_lag_p99_ns) << "us\n";
+      << " cores send_lag_p99=" << Us(report.driver.send_lag_p99_ns)
+      << "us backlog=" << report.driver.backlog_count
+      << " slots p99=" << Us(report.driver.backlog_p99_ns) << "us\n";
   for (const auto& step : report.sweep) {
     out << "sweep: offered=" << step.offered_ops << " achieved=" << step.achieved_ops
         << " p99=" << Us(step.p99_ns) << "us errors=" << step.errors
@@ -552,9 +575,9 @@ void WriteSummary(const RunReport& report, std::ostream& out) {
   if (!report.targets_not_evaluated.empty())
     out << "targets: " << report.targets_not_evaluated << '\n';
   if (report.driver.overloaded) {
-    out << "warning: driver used " << report.driver.cpu_per_wall_second << " cores, over the "
-        << report.driver.overload_threshold_cores
-        << "-core threshold; it competes with a server on this host\n";
+    out << "warning: " << (report.server.has_value() ? "driver" : "workers, engine inline,")
+        << " used " << report.driver.cpu_per_wall_second << " cores, over the "
+        << report.driver.overload_threshold_cores << "-core threshold\n";
   }
   if (report.driver.lagging) {
     out << "warning: driver send lag p99 " << Us(report.driver.send_lag_p99_ns)
@@ -579,6 +602,7 @@ HostClassification DetectClassification() {
 BuildInfo CurrentBuildInfo() {
   BuildInfo b;
   b.commit = kBuildCommit;
+  b.source_tree = kPerfSourceTree;
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables): false positive on if-init.
   if (const char* preset = std::getenv("ABYSS_PRESET"); preset != nullptr) {
     b.preset = preset;
@@ -632,6 +656,9 @@ void WriteReportJson(const RunReport& report, std::ostream& out) {
   WriteKey(out, "commit");
   WriteString(out, report.build.commit);
   out << ',';
+  WriteKey(out, "source_tree");
+  WriteString(out, report.build.source_tree);
+  out << ',';
   WriteKey(out, "preset");
   WriteString(out, report.build.preset);
   out << ',';
@@ -674,6 +701,11 @@ void WriteReportJson(const RunReport& report, std::ostream& out) {
   WriteKey(out, "config");
   WriteStringMap(out, report.config);
   out << ',';
+  if (!report.measured.empty()) {
+    WriteKey(out, "measured");
+    WriteMetricsMap(out, report.measured);
+    out << ',';
+  }
   WriteKey(out, "workload");
   WriteWorkload(out, report.workload);
   out << ',';
@@ -706,6 +738,42 @@ void WriteReportJson(const RunReport& report, std::ostream& out) {
   }
   out << ']';
   out << ',';
+  if (!report.server_histograms.empty()) {
+    WriteKey(out, "server_histograms");
+    out << '[';
+    first = true;
+    for (const auto& h : report.server_histograms) {
+      if (!first) out << ',';
+      out << '{';
+      WriteKey(out, "series");
+      WriteString(out, h.series);
+      out << ',';
+      WriteKey(out, "count");
+      out << h.count;
+      out << ',';
+      WriteKey(out, "mean_us");
+      out << h.mean_us;
+      for (const auto& [key, q] : {std::pair{"p50", &h.p50_us}, std::pair{"p99", &h.p99_us},
+                                   std::pair{"p999", &h.p999_us}}) {
+        out << ',';
+        WriteKey(out, key);
+        out << '{';
+        WriteKey(out, "le_us");
+        out << q->le;
+        out << ',';
+        WriteKey(out, "beyond");
+        out << (q->beyond ? "true" : "false");
+        out << ',';
+        WriteKey(out, "samples");
+        out << q->samples;
+        out << '}';
+      }
+      out << '}';
+      first = false;
+    }
+    out << ']';
+    out << ',';
+  }
   WriteKey(out, "targets");
   out << '[';
   first = true;
