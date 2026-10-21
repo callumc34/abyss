@@ -14,9 +14,23 @@ add_executable(abyss_core_tests
   core/atomic_file_test.cpp
   core/fatal_test.cpp
   core/durability_test.cpp
+  core/seq_waiters_test.cpp
+  core/wait_list_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
+  abyss::test_support
+  GTest::gtest_main
+)
+
+# Replaces the global allocator to count allocations, so it is a
+# binary of its own.
+add_executable(abyss_core_alloc_tests
+  core/thread_allocs.cpp
+  core/wait_alloc_test.cpp
+)
+
+target_link_libraries(abyss_core_alloc_tests PRIVATE
   abyss::test_support
   GTest::gtest_main
 )
@@ -291,6 +305,7 @@ target_link_libraries(abyss_platform_tests PRIVATE
 )
 
 abyss_discover_tests(abyss_core_tests     "unit\;unit-core")
+abyss_discover_tests(abyss_core_alloc_tests "unit\;unit-core")
 abyss_discover_tests(abyss_queue_tests    "unit\;unit-queue")
 abyss_discover_tests(abyss_resp_tests     "unit\;unit-resp")
 abyss_discover_tests(abyss_hot_tests      "unit\;unit-hot")
