@@ -107,6 +107,12 @@ inline bool IsWrite(std::string_view name) {
   return std::ranges::find(kWrites, name) != kWrites.end();
 }
 
+// A write whose deadline passed while it waited for a spare segment,
+// before it reserved anything.
+inline bool SpareTimedOut(std::string_view message) {
+  return message == "write timed out waiting for a spare WAL segment";
+}
+
 // A cold load that ran out of its deadline: the cold store's check, the
 // RocksDB read's own, or a wait on another's load of the key.
 inline bool LoadTimedOut(std::string_view message) {

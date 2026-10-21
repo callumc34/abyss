@@ -1033,7 +1033,12 @@ TEST_F(WalQueueTest, ChangedRetentionConsumerSetRefusesToOpen) {
 // --- Concurrency ------------------------------------------------------------------
 
 TEST_F(WalQueueTest, ConcurrentProducersAndConsumers) {
-  OpenWith(DefaultConfig());
+  // Order under concurrency, not flush cost: a power_loss ack per append
+  // made this a test of the device (Windows' FlushFileBuffers). Commits
+  // still trail the power-durable end, which flushes in the background.
+  WalConfig config = DefaultConfig();
+  config.durability = core::Durability::kProcessCrash;
+  OpenWith(std::move(config));
 
   constexpr int kProducers = 4;
   constexpr int kPerProducer = 200;

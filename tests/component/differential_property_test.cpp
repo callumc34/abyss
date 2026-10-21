@@ -465,9 +465,11 @@ class DifferentialTest : public PropertyHarness {
       Oom(args, keys);
       return;
     }
-    if (write && reply.IsError() && LoadTimedOut(ErrorMessage(reply))) {
-      // Its loads ran out of the write's deadline before anything was
-      // reserved: the model skips it.
+    if (write && reply.IsError() &&
+        (LoadTimedOut(ErrorMessage(reply)) ||
+         (spare_timeout_ok_ && SpareTimedOut(ErrorMessage(reply))))) {
+      // Its loads, or its wait for a spare, ran out of the write's
+      // deadline before anything was reserved: the model skips it.
       for (const auto& nested : nested_) (void)model_.Execute(nested, now_ms_);
       (void)LoggedNothing(args, keys, got);
       return;
@@ -896,11 +898,16 @@ class DifferentialTest : public PropertyHarness {
     const int writes = static_cast<int>((3 * options_.segment_size_bytes) / 2048) + 2;
     starving_ = true;
     const bool relieve = relieve_;
+    // With the short deadline -OOM seeds use, the resumed preparer can
+    // miss a write's deadline on a slow disk; with the normal one it
+    // cannot, so there a spare timeout still fails the stream.
+    spare_timeout_ok_ = !relieve;
     relieve_ = true;
     for (int i = 0; i < writes && !failed_; ++i) {
       Command({"SET", Key(), std::string(2000, 's') + std::to_string(++counter_)});
     }
     relieve_ = relieve;
+    spare_timeout_ok_ = false;
     starving_ = false;
     done = true;
     resumer.join();
@@ -1042,6 +1049,7 @@ class DifferentialTest : public PropertyHarness {
   bool relieve_ = true;
   bool restarted_after_oom_ = false;
   bool starving_ = false;
+  bool spare_timeout_ok_ = false;
   std::optional<std::string> deadline_key_;
   Rng rng_{0};
   Rng hook_rng_{0};
