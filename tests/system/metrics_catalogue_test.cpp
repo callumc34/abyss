@@ -261,12 +261,17 @@ TEST_F(MetricsCatalogueTest, EveryDocumentedMetricIsRecorded) {
   EXPECT_TRUE(Client().Command({"GET", "short"}).IsNil());
 
   std::string body;
-  ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_evicted_total", {}, 1.0, 10s, &body))
-      << "nothing was evicted; last scrape:\n"
+  // Most keys evicted, so reads of untouched ones come from cold. A hot
+  // hit would refresh its key's eviction, so each is read only twice:
+  // a miss, then the second miss that fills.
+  ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_evicted_total", {}, 900.0, 30s, &body))
+      << "too little was evicted; last scrape:\n"
       << body;
   ASSERT_FALSE(AwaitColdQuiescence(mport).empty()) << "the buffer never emptied";
-  // From cold, and again: the second miss fills.
-  for (int i = 0; i < 3; ++i) EXPECT_EQ(Client().Command({"GET", "k2"}).String(), "v");
+  for (int i = 2; i < 22; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    for (int read = 0; read < 2; ++read) EXPECT_EQ(Client().Command({"GET", key}).String(), "v");
+  }
   ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_hits_total", {{"tier", "cold"}}, 1.0, 5s, &body));
   ASSERT_TRUE(PollCounterAtLeast(mport, "abyss_net_connections_closed_total",
                                  {{"reason", "client"}}, 1.0, 5s, &body));

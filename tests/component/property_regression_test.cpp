@@ -18,6 +18,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
+#include "hot_bytes.h"
 #include "sequenced_engine_fixture.h"
 
 namespace abyss::engine {
@@ -137,7 +138,9 @@ TEST_F(PropertyRegressionTest, MemoryPressureEvictsParkedKeysColdHasDrained) {
 TEST_F(PropertyRegressionTest, MemoryPressureFreesNegativesAndDrainedTombstones) {
   Options options;
   options.shards = 1;
-  options.hot_memory_bytes = 4096;
+  // 4 KiB of entries, plus the buckets the map grows to for them, which
+  // never shrink and differ by standard library.
+  options.hot_memory_bytes = 4096 + testing::EmptyStoreBytes(256);
   options.fill_doorkeeper = false;
   options.write_timeout = std::chrono::milliseconds(300);
   OpenWithClock(options);
