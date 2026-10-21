@@ -52,19 +52,23 @@ A *log position* is `ordinal × frame_space + offset`, with `frame_space = segme
 
 One 4 KiB block, so frames start page-aligned. Little-endian throughout.
 
-| Field | Description |
-|---|---|
-| `magic` | Identifies an Abyss WAL segment |
-| `format_major`, `format_minor` | 2 and 0 |
-| `log_id` | The log this segment belongs to |
-| `ordinal` | The segment's place in the log. Its low 32 bits are the segment's **generation** |
-| `created_at` | Wall-clock time the segment was prepared |
-| `shard_count` | The shard count the log was created with. Open refuses a log made for another count |
-| `durability_window_bytes` | The window in force when the segment was written. It sets the recovery CRC scope (§Recovery) |
-| `salt` | 64 random bits, fresh for each life of the segment, sealed into every frame's CRC |
-| `header_crc` | CRC32C over the fields above |
+| Field | Type | Description |
+|---|---|---|
+| `magic` | 4 bytes | Identifies an Abyss WAL segment |
+| `format_major` | u8 | 2 |
+| `format_minor` | u8 | 0 |
+| reserved | u16 | Zero |
+| `log_id` | u32 | The log this segment belongs to |
+| `shard_count` | u32 | The shard count the log was created with. Open refuses a log made for another count |
+| `ordinal` | u64 | The segment's place in the log. Its low 32 bits are the segment's **generation** |
+| `created_at` | i64 | Wall-clock time the segment was prepared, in microseconds |
+| `durability_window_bytes` | u64 | The window in force when the segment was written. It sets the recovery CRC scope (§Recovery) |
+| `salt` | u64 | 64 random bits, fresh for each life of the segment, sealed into every frame's CRC |
+| `header_crc` | u32 | CRC32C over the fields above |
 
 The header is written when a segment is prepared, synced, and never modified while the segment is in use.
+
+`magic` and `format_major` keep their offsets in every major version. A reader therefore checks the major before the length or the CRC, which a newer major may change, and can tell a newer writer's file from damage.
 
 ### Frame
 
@@ -111,7 +115,7 @@ The fixed overhead is 44 bytes plus padding, against format 1's 37. It buys lock
 
 A frame's generation and salt are known only once it is reserved. Putting them last in the CRC lets the fill extend a precomputed body CRC in constant time.
 
-**Which ordinal a segment file may take.** A reclaimed or renumbered file is only ever given an ordinal above the one in its header. Every stale frame in it then carries a smaller generation. A file whose header cannot be read is deleted rather than reused.
+**Which ordinal a segment file may take.** A reclaimed or renumbered file is only ever given an ordinal above the one in its header. Every stale frame in it then carries a smaller generation. A file whose header does not verify is never reused. Recovery deletes it if it holds no frames of the generation its file name gives, and refuses to start if it does (§Recovery).
 
 ### Integrity
 
@@ -129,13 +133,15 @@ The format uses CRC32C (Castagnoli). It is hardware-accelerated on x86-64 and AR
 
 ### Recovery
 
-Recovery scans each log once, from its oldest segment, and demultiplexes the frames into their shards' streams.
+Recovery walks each log twice from its oldest segment. A structural pass finds the end; a verifying pass checks the frames and demultiplexes them into their shards' streams.
 
-1. **Segments.**
-   - Leftover `.tmp` files are deleted, and `free-*` files rejoin the free pool.
-   - Every header must verify.
+1. **Segments.** Every file is classified before any file is removed.
+   - Whether a segment holds frames comes from its first commit word alone: a nonzero length under the generation its file name gives. Header damage never reaches the frames, and a recycled or torn spare carries an older generation or zeros.
+   - A file of any kind (segment, `free-*` or `.tmp`) whose header has the WAL magic but another `format_major` refuses the start, naming the file and both majors. A newer writer was here. A damaged major byte cannot be told from one, and refusing is safe for both.
+   - A segment that holds frames refuses the start if its header is short, fails its CRC, or names another ordinal, naming the file.
    - Ordinals must be contiguous among segments that hold frames.
-   - A prepared spare past the tail, with a valid header and no frames, stays a spare. A spare with an invalid or torn header returns to the pool.
+   - Only then are leftover `.tmp` files deleted. A `free-*` file with a valid header rejoins the free pool, and any other is deleted.
+   - A segment past the recovered end goes back to the pool (step 5). One without a valid header, or of the wrong size, is deleted instead; by then neither can hold frames.
 2. **The end of the log** is the first frame that is not filled, or that fails its CRC. An entry frame's shard must be in range, and its seq must be the next one for its shard; anything else is corruption.
 3. **CRC scope.** Every segment that can hold unflushed bytes is fully verified. That is every segment overlapping the last `max(durability_window_bytes, the largest window recorded in any header)` bytes before the recovered end, plus one more. Below that range the scan reads only commit words and headers, because those bytes were synced long before. Recording the window in each header means lowering it across a restart cannot shrink the verified range.
 4. **Batch closure, by position.** Only the trailing batch can be incomplete: the first frame whose `position + batch_rest` passes the recovered end starts it. That frame and everything after it are dropped, and the recovered end moves back to it. After recovery, every batch is present in full or not at all.
@@ -164,7 +170,7 @@ A read at a sequence id finds it in the ring, or else starts at the nearest inde
 
 The minor-version guarantee rests on three layout rules:
 1. New payload fields are appended at the end of an entry's payload.
-2. `len` is the authoritative body length, so a reader skips trailing payload bytes it does not know.
+2. `len` is the authoritative body length, so a reader skips trailing payload bytes it does not know. It does so only in a frame whose CRC it has verified; without that check, trailing bytes are corruption.
 3. A new frame **kind** is a major change unless older readers can skip it without loss of correctness. An unknown kind under a valid CRC fails closed, which keeps that decision explicit.
 
 | Writer vs. reader | Result |
@@ -190,7 +196,7 @@ Each minor bump ships with a round-trip compatibility test in both directions.
 4. The end of the log is the first frame that is unfilled or fails its CRC. No frame past it is ever replayed.
 5. Within a shard, sequence ids are contiguous and their positions increase. Per-shard seq order is log order.
 6. After recovery, every batch is present in full or not at all.
-7. A reader refuses a log with an unsupported `format_major`, an unknown frame kind, or a header that does not verify.
+7. A reader refuses a log with an unsupported `format_major` in any of its files, an unknown frame kind, or a header that does not verify on a segment holding frames. Recovery deletes no segment that holds frames of its own generation. Past the recovered end such frames are unacknowledged, and their segment is renumbered.
 8. Every `Write` entry holds a command that parses. Unconditional writes are canonicalised before the append ([ADP-006](006-read-write-paths.md) §Canonical form on the write path). A parse failure on a `Write` is therefore a corruption signal, or a command whose parser is absent from the reading build.
 
 ## Trade-offs

@@ -105,6 +105,7 @@ A persist overwrites the slot that does not hold the highest epoch, with the nex
 - A missing file is a fresh store.
 - A file with no valid slot, or with two valid slots of equal epoch, is corruption.
 - A shard-count or consumer mismatch refuses to start.
+- A slot of a newer format version refuses to start, naming the file and both versions, whatever the other slot holds: falling back to the other slot would roll every offset back. A newer version may move the checksum, so a torn newer slot refuses too.
 - An older per-consumer, per-shard offset layout refuses to start and names the layout, rather than silently starting from nothing.
 
 **Crash semantics.** After a crash, a consumer resumes from its last persisted offset. Entries after it are delivered again, at most one persist interval's worth; cold absorption and resolver replay are idempotent. A consumer with no committed offset starts at the first retained entry.
@@ -162,8 +163,9 @@ The write path still waits for the hot consumer to apply the entry before replyi
 - `abyss_wal_unflushed_bytes`, `abyss_wal_durability_lag_seconds` and the backpressure counters report it.
 
 **Failures.**
-- Before an entry is published, failures reject the write cleanly. These include encoding, admission, creating the next segment (including a full disk) and the segment write itself.
-- After publication, a failed flush or segment seal terminates the process. The kernel may already have dropped the dirty pages and cleared the error, so a later successful flush would advance the durable end over lost data. Recovery rebuilds from the log.
+- Before an entry is published, failures reject the write cleanly. These include encoding, admission, and no prepared segment to roll into by the deadline (a full disk stops segment preparation).
+- Filling a frame is a memory copy into the mapped segment, so it returns no error. A media fault there raises `SIGBUS`, which terminates the process.
+- After publication, a failed flush terminates the process. The kernel may already have dropped the dirty pages and cleared the error, so a later successful flush would advance the durable end over lost data. Recovery rebuilds from the log.
 
 **Removed settings.** `wal_fsync_policy`, `group_commit_interval_us` and `group_commit_max_bytes` fail to load, with an error naming the replacement.
 - Natural batching makes a per-write fsync pointless.

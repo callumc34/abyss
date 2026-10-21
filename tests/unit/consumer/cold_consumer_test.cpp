@@ -1487,7 +1487,7 @@ TEST_F(ColdConsumerTest, DrainDeadlineTruncatesAndReportsWithoutBlocking) {
   EXPECT_GT(c->Buffer().Size(), 0U) << "truncated drain must leave the rest for replay";
 }
 
-// --- Replay fed by a scan ----------------------------------------------------
+// --- Replay fed by a scan --------------------------------------------
 
 core::Result<void> WipeFails(core::ShardId /*shard*/) {
   return std::unexpected(core::Error{core::ErrorCode::kInternal, "wipe failed (test)"});

@@ -103,9 +103,10 @@ Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-
 | `--durability` | `process_crash` | `process_crash` or `power_loss` |
 | `--shards` | 64 | Shard count |
 | `--segment-size-bytes` | server default | WAL segment size; must hold one maximum-size value |
+| `--log-count` | server default | Physical WAL logs, a power of two |
 | `--flush-samples` | 1000 | Device flush calibration samples |
 | `--flush-concurrency` | `--shards` | Files flushed in parallel for the `device_flush_concurrent` calibration |
-| `--prefill-entries` | 0 | Entries appended before measuring, so the run starts deep in a segment |
+| `--prefill-entries` | 0 | Entries appended and drained before measuring, so the run starts with a retained log behind the head |
 | `--quiet-threshold-s` | server default | Cold consumer quiet window |
 | `--workers` | min(hardware threads, 16) | Concurrent writers. Each one blocks in the engine's write dispatch, as a reactor thread does, so this models reactors, not connections. |
 
@@ -118,10 +119,10 @@ Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-
 - A closed-loop run reports its targets as not evaluated and never claims a pass.
 - `--gate` without a rate is a usage error.
 
-**Run length.** The cold consumer starts flushing, checkpointing and acknowledging only after its quiet window (30 s by default). An authoritative run therefore lasts at least 60 s after warmup, or records a shorter `--quiet-threshold-s`. Prefill at least one deep-position run, because queue read cost depends on how far into a segment the consumers are reading.
+**Run length.** The cold consumer starts flushing, checkpointing and acknowledging only after its quiet window (30 s by default). An authoritative run therefore lasts at least 60 s after warmup, or records a shorter `--quiet-threshold-s`. A queue read costs the same at any position, through the offset ring or the sparse index, so prefill gives the run a realistic retained log rather than read depth.
 
 **Report contents.**
-- `config` records the effective settings: durability class, shard count, segment size, quiet window, value size, workers and prefill.
+- `config` records the effective settings: durability class, shard count, segment size, log count, quiet window, value size, workers and prefill.
 - `server_metrics` holds registry snapshots at `start` and `end`, so WAL flush and offset persist counts, durations and batch sizes for the run are in the same JSON.
 - The server's metrics snapshotter is not started; it takes shard locks once a second and is otherwise absent from this measurement.
 

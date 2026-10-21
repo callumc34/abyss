@@ -77,7 +77,7 @@ Gauges:
 - `abyss_cold_keys` — number of keys in cold store
 - `abyss_queue_depth` — number of entries in queue
 - `abyss_queue_disk_bytes` — queue WAL disk usage: retained, active, spare and free-pool segments
-- `abyss_wal_unflushed_bytes` — WAL bytes published but not yet power-durable, across shards. Bounded by `queue.durability_window_bytes`; under `process_crash` this is what a power loss would lose.
+- `abyss_wal_unflushed_bytes` — WAL entry bytes not yet power-durable, across all logs. A frame counts from its reservation, before it is filled and published. Bounded by `queue.durability_window_bytes`; under `process_crash`, the published part is what a power loss would lose.
 - `abyss_wal_durability_lag_seconds` — age bound of the oldest WAL entry not yet power-durable, worst log. Bounded by `queue.durability_window_ms`.
 - Both are set each snapshot interval by the metrics snapshotter, from the current time on its own thread, so they keep rising while a flush is stalled. They read 0 until recovery has finished.
 - `abyss_wal_spare_segments` — prepared segments ready for the next rotation, summed over logs. Two per log is healthy; zero means appends will wait at the next rotation.

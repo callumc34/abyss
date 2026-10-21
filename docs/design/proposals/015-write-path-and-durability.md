@@ -60,7 +60,7 @@ A configuration that still names a removed setting fails to load. The error name
   - Committed offsets are gated the same way.
   - Gating absorption itself would make every collection read wait for a device flush (ADP-004 §Persisting at the power-durable log).
   - What is absorbed but not yet persistable is bounded by the durability window below.
-- **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. It is set by `queue.durability_window_bytes` (default 64 MiB, volume-wide) and `queue.durability_window_ms` (default 1000, the age of a shard's oldest unflushed entry); an append over either bound waits, then is rejected after the write timeout.
+- **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. It is set by `queue.durability_window_bytes` (default 64 MiB, volume-wide) and `queue.durability_window_ms` (default 1000, the age of a log's oldest unflushed frame); an append over either bound waits, then is rejected after the write timeout.
 
 Two consequences follow from the persistence cap, and both are accepted:
 - Anything whose acknowledgement waits on cold applying an entry (FLUSHDB) pays `power_loss` latency in every class.
@@ -102,7 +102,7 @@ There is no batch byte cap. A natural batch is limited by how long the previous 
 - Values above a threshold of 16–64 KiB, sized by the lock-hold budget, are copied into a separate blob lane before sequencing. The log frame carries a reference.
 - The main log then holds only frames filled inside the critical section, so one large write cannot stall the durable watermark for every shard. Precedent: WiscKey, RocksDB BlobDB, Badger.
 - Under `power_loss` the watermark is the minimum of the log and the blob lane. Orphaned blobs are reclaimed by retention.
-- Until the blob lane lands, frames above the threshold are filled after the critical section. Readers of those keys wait on the read fence, later frames wait on the contiguous watermark, and a head-of-line metric reports the stall. The maximum value size stays 64 MiB.
+- Phase 2 behaviour: until the blob lane lands, frames above the threshold are filled after the critical section. Readers of those keys wait on the read fence, later frames wait on the contiguous watermark, and a head-of-line metric reports the stall. Before Phase 2, every frame is filled under its shard's append lock, whatever its size. The maximum value size stays 64 MiB.
 
 **Fail-stop after apply.** Failures split on whether the effect has been applied:
 - **Before the effect is applied, the write is rejected cleanly** and the process continues. This covers log space reservation, including a full disk when the next preallocated segment cannot be created. Writes fail, as `requirements.md` §Backpressure requires.
@@ -256,7 +256,7 @@ No reply, to a read or a write, reflects a write that a failure in the configure
 | 0 | #157 | Measurement: write probe with device-flush calibration, flush metrics, read-position micro-benchmark, a pipelining load driver, server-identified comparative runs. Targets in `requirements.md`. |
 | 1a | #158 | Read and acknowledgement contract: consumer-owned positions, explicit out-of-range, sparse index with header-only skip, lazy dual-slot offset checkpoint. |
 | 1b | #159 | Durability semantics on the existing per-shard segments: natural batching, durability classes, cold persistence ceiling, bounded durability window, fail-stop, recovery-time sync. |
-| 1c | #175 | Physical log: mapped, recycled segments in one log per volume with per-shard streams, a reserve/fill/commit tail and a filled-prefix watermark; offset rings and sparse indexes; per-segment, oldest-first retention; the demultiplexing recovery pass and scan-based hot and cold rebuild. Delivers W2 under concurrency and W3, which 1b's per-shard flushes cannot, because they serialise on the device. |
+| 1c | #175 | Physical log: mapped, recycled segments in one log per volume with per-shard streams, a reserve/fill/commit tail and a filled-prefix watermark; offset rings and sparse indexes; per-segment, oldest-first retention; the demultiplexing recovery pass and scan-based hot and cold rebuild. Targets W2 under concurrency and W3, which 1b's per-shard flushes cannot meet, because they serialise on the device. |
 | After 2 | #177 | Pooled cold workers, shard-affine. |
 | 2 | #160 | Sequenced write path, residency invariant, read visibility, cross-shard atomic commands, shard-lock measurement under skew; resolver removal. |
 | 3 | #161 | Asynchronous request execution and asynchronous cold I/O. |

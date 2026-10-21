@@ -18,16 +18,16 @@
 | Active TTL scanner stalled | Expired-but-unread keys accumulate on disk. Lazy expiry still cleans them on read; storage drifts upward until reads happen or the scanner resumes. | Inspect `abyss_cold_ttl_*` metrics and `abyss.cold.ttl_scanner` logs. Confirm the scanner thread is alive and not pinned by sustained CAS conflicts. Restart resets the scanner state. |
 | Data volume cannot make directory entries durable | The startup durability probe reports the WAL/data volume cannot `fsync` directories (FAT/exFAT, some network/overlay mounts). This is a **refuse-to-start** condition under both durability classes: a power loss could drop whole segments, far beyond the durability window. | Move the data directory to a volume that supports durable directory fsync (e.g. ext4/xfs/APFS/NTFS local disk; Docker Desktop bind mounts often do not, so use a named volume). Watch `abyss_fs_durable_dir_supported`. |
 | WAL flush cannot keep up | The device flushes slower than writes arrive, so acknowledged-but-not-power-durable data grows until it hits `queue.durability_window_bytes` or `queue.durability_window_ms`. Writes then wait for a flush, and after `engine.write_timeout` fail with "WAL durability window full". Acknowledged data is untouched. | Inspect `abyss_wal_durability_lag_seconds`, `abyss_wal_unflushed_bytes`, `abyss_wal_flush_duration_seconds` and `abyss_wal_backpressure_*`. Provision a faster or higher-IOPS volume; widening the window trades a larger power-loss exposure for headroom. |
-| WAL flush fails, or a mapped segment faults | An fdatasync of published WAL data returns an error, or a write into a mapped segment raises `SIGBUS`. The kernel may already have dropped the dirty pages, so the process terminates rather than let a later flush mark lost data durable. The pod restarts (CrashLoopBackOff if the fault persists) and recovery replays the log. | Look for the CRITICAL `fatal invariant breach; terminating` log naming the WAL flush. Check the volume for I/O errors before restarting. |
-| WAL media corruption | A reader finds a CRC failure below the range recovery verifies, in bytes that were synced long ago. This is media corruption, not a torn write, so the process terminates, naming the log, segment ordinal and offset. It is never skipped as a poison entry. | Check the volume for I/O errors. The entry is lost from the log, so restore the volume from backup, or truncate the log at the reported position and accept the loss. |
-| WAL from another format or layout | The WAL directory holds the format 1 layout (`shard-NNNN/`), a segment of another major version, or a frame of a kind this build does not know. Abyss refuses to start and names which. | There is no migration. Start with an empty WAL directory, or run the build that wrote it. |
+| WAL flush fails, or a mapped segment faults | An fdatasync of published WAL data returns an error, or a write into a mapped segment raises `SIGBUS`. The kernel may already have dropped the dirty pages, so the process terminates rather than let a later flush mark lost data durable. The pod restarts (CrashLoopBackOff if the fault persists) and recovery replays the log. | A flush error logs CRITICAL `fatal invariant breach; terminating`, naming the WAL flush. A mapped-segment fault has no handler and logs nothing: the container exits on `SIGBUS` (exit code 135). Check the volume for I/O errors before restarting. |
+| WAL media corruption | A reader finds a CRC failure below the range recovery verifies, in bytes that were synced long ago. This is media corruption, not a torn write, so the process terminates, naming the log, segment ordinal and offset. It is never skipped as a poison entry. At startup, a segment that holds frames but whose header is short, fails its CRC or names another segment is the same fault: Abyss refuses to start, naming the file, and never deletes it. | Check the volume for I/O errors. The data is lost from the log, so restore the volume from backup; there is no supported way to cut the log mid-stream. |
+| WAL from another format or layout | The WAL directory holds the format 1 layout (`shard-NNNN/`), a file of another major version (a segment, a `free-*` pool file or a `.tmp`), an `offsets.ckpt` slot of a newer version, or a frame of a kind this build does not know. A rollback after a format bump is the usual cause. Abyss refuses to start before it changes anything in the directory, naming the file and both versions. | There is no migration. Run the build that wrote it (after a rollback, roll forward again), or start with an empty WAL directory. |
 
 ## Durability Capability Gate
 
-Durability ("a write that returned OK survives power loss") depends on the data volume's
-`fsync` actually reaching stable media — including the directory entry that links a freshly
-created or renamed file. Not every volume can do this: FAT/exFAT, some network shares, and some
-overlay/tmpfs mounts silently drop directory syncs.
+Durability ("a write that returned OK survives the failures of its configured durability
+class") depends on the data volume's `fsync` actually reaching stable media — including the
+directory entry that links a freshly created or renamed file. Not every volume can do this:
+FAT/exFAT, some network shares, and some overlay/tmpfs mounts silently drop directory syncs.
 
 Abyss makes this observable and fail-closed rather than silently degrading (invariant 5):
 
@@ -64,9 +64,9 @@ There is no magic. Each stage is visible in metrics. Operators must provision re
 
 ## Write Failures
 
-A write rejected before it is published returns a Redis error to the client: disk full creating the next segment, an I/O error on the segment write, or the durability window still full at the command's deadline. The write was never committed to the queue, so no state is inconsistent.
+A write rejected before it is published returns a Redis error to the client: no prepared segment to roll into by the command's deadline (a full disk stops segment preparation), or the durability window still full at the deadline. The write was never committed to the queue, so no state is inconsistent.
 
-A failed WAL flush or segment seal after publication terminates the process instead (see "WAL flush or segment seal fails" above); there is no error reply for it.
+Filling a frame is a memory copy into the mapped segment, so it returns no error. A media fault there raises `SIGBUS`, and a failed WAL flush after publication terminates the process (see "WAL flush fails, or a mapped segment faults" above); there is no error reply for either.
 
 A write that is published but whose hot consumer promise times out returns a Redis error to the client. The write is in the queue and WILL be applied on catch-up. Under `power_loss` it is also power-durable; under `process_crash` it is only process-crash durable, so a power loss before the next flush can still drop it. The client received an error, so it may retry. The retry is a duplicate write, which is safe because last-write-wins is the default semantic.
 
@@ -81,7 +81,7 @@ See [ADP-007](../design/proposals/007-recovery.md) for the full recovery design.
 1. Recovery is pure queue replay. No external coordination.
 2. During recovery, the RESP port returns `LOADING` errors.
 3. The readiness probe (`/ready`) returns 503 until recovery is complete.
-4. Recovery time is bounded by the retained log. Open scans each log once (CRC-verifying only the range that can hold unflushed bytes), and the hot and cold rebuild reads it about once more through one demultiplexing scan.
+4. Recovery time is bounded by the retained log. Open walks each log twice, a structural pass and then a verifying pass (CRC-verifying only the range that can hold unflushed bytes), and the hot and cold rebuild reads it about once more through one demultiplexing scan.
 5. A torn write at a power loss, including a sector that persisted a new commit word over a recycled segment's old frame, ends the log cleanly at the tear. Writes acknowledged at `power_loss` are below it.
 
 ## Cold Consumer Stall

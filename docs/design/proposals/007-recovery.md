@@ -20,9 +20,10 @@ Phase 1 has three consumers: the Resolver ([ADP-011](011-conditional-writes-and-
 Pod starts
   │
   ├─ 1. Open the queue (synchronous self-recovery)
-  │     The embedded WAL backend scans each log once, demultiplexing frames
-  │     into per-shard streams. It CRC-verifies the segments that can hold
-  │     unflushed bytes, ends the log at the first unfilled or torn frame,
+  │     The embedded WAL backend walks each log twice, a structural pass
+  │     and then a verifying one, demultiplexing frames into per-shard
+  │     streams. It CRC-verifies the segments that can hold unflushed
+  │     bytes, ends the log at the first unfilled or torn frame,
   │     drops an incomplete trailing batch, seals the recovered tail with
   │     a padding frame, syncs so every retained entry is power-durable,
   │     and loads the committed-offset checkpoint.
@@ -92,7 +93,7 @@ Pod starts
 - For the hot store: replays everything within the eviction window that hasn't absolutely expired. The hot store is fully reconstructed from the queue without reading cold.
 - **The cold store is never read during recovery.** Recovery is purely queue replay.
 - Cold replay benefits from the compaction buffer — recovery write volume to cold is bounded by unique keys, not total queue entries.
-- **`entry::Flush` during replay.** Hot wipes its store and drops any pending Conditionals at seq < Flush.seq. Cold drops its compaction buffer and wipes its own shard's slice of the cold backend (ADP-010 §Per-shard wipe). Because each shard wipes only its slice, a lagging shard's replayed Flush cannot destroy a peer shard's post-Flush data that parallel replay has already flushed. Resolver clears its existence cache and emits Skip Resolveds for pre-Flush dangling Conditionals so hot/cold's block-and-scan can advance past them. While the Resolver is in replay mode and has observed a Flush at seq `F`, dangling Conditionals at seq > F are decided cache-only — the cold tier on disk reflects pre-Flush state until cold replay runs (which is sequenced after resolver replay), so a cache miss is treated as definitively absent rather than falling through to stale cold data.
+- **`entry::Flush` during replay.** Hot wipes its own shard's keys and drops any pending Conditionals at seq < Flush.seq. Cold drops its compaction buffer and wipes its own shard's slice of the cold backend (ADP-010 §Per-shard wipe). Because each shard wipes only its slice, a lagging shard's replayed Flush cannot destroy a peer shard's post-Flush data that parallel replay has already flushed. Resolver clears its existence cache and emits Skip Resolveds for pre-Flush dangling Conditionals so hot/cold's block-and-scan can advance past them. While the Resolver is in replay mode and has observed a Flush at seq `F`, dangling Conditionals at seq > F are decided cache-only — the cold tier on disk reflects pre-Flush state until cold replay runs (which is sequenced after resolver replay), so a cache miss is treated as definitively absent rather than falling through to stale cold data.
 
 ### Replay start positions
 
@@ -102,7 +103,7 @@ Pod starts
 
 ### Replay Ordering
 
-Resolver replay completes before cold and hot. Cold and hot run **in parallel**, each per-shard, both bounded by `recovery.replay_parallelism` total scheduler workers.
+Resolver replay completes before cold and hot. Cold and hot run **in parallel** from one scan: one walker per log, and `recovery.replay_parallelism` decode workers, at most one per shard.
 
 Rationale:
 
@@ -134,7 +135,7 @@ Cancellation is observable end-to-end: `Server::Run` passes the SIGTERM-backed `
 
 ```yaml
 recovery:
-  replay_parallelism: 4         # ShardScheduler concurrency cap
+  replay_parallelism: 4         # scan decode workers, beside one walker per log
   hot_replay_batch_size: 10000  # HotConsumer::ReplayUntil queue read max
   cold_replay_batch_size: 50000 # ColdConsumer::ReplayUntil queue read max
 ```
