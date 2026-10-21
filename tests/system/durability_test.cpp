@@ -199,8 +199,8 @@ TEST_F(DurabilityTestFixture, MsetnxAtomicOutcomeSurvivesCrash) {
   auto a = Client().Command({"GET", "a"});
   auto b = Client().Command({"GET", "b"});
   if (initial_apply) {
-    ASSERT_TRUE(a.IsBulk());
-    ASSERT_TRUE(b.IsBulk());
+    ASSERT_TRUE(a.IsBulk()) << a;
+    ASSERT_TRUE(b.IsBulk()) << b;
     EXPECT_EQ(a.String(), "1");
     EXPECT_EQ(b.String(), "2");
   } else {

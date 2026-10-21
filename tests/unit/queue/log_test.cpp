@@ -1274,6 +1274,7 @@ TEST_F(LogTest, AHeaderNamingAnotherOrdinalOverFramesRefuses) {
     auto log = OpenLog();
     ASSERT_NE(log, nullptr);
     for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+    ASSERT_TRUE(Eventually([&] { return log->spare_count() == 2; }));
   }
   PatchFile(SegPath(1), 0, HeaderOf(3));
   const auto before = Snapshot();
@@ -1294,6 +1295,7 @@ TEST_F(LogTest, AHeaderNamingAnotherOrdinalWithoutFramesIsRecycled) {
     auto log = OpenLog();
     ASSERT_NE(log, nullptr);
     Append(*log, 0, 0, 64);
+    ASSERT_TRUE(Eventually([&] { return log->spare_count() == 2; }));
   }
   PatchFile(SegPath(2), 0, HeaderOf(1));
   const double grown_before =
