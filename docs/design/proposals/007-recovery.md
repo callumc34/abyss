@@ -90,19 +90,20 @@ The hot replayer rebuilds hot from the scan, and nothing else feeds it. It appli
 
 A key's oldest retained frame may be the tail of its history: an SADD whose earlier frames were reclaimed. Applying it would build a partial collection, the replay form of #163. The rule keeps every resident key complete (the residency invariant, [ADP-015](015-write-path-and-durability.md) §Residency invariant). It replaces the earlier per-entry skip rules, by absolute TTL and by eviction window, which could also build partial state and made replay's result depend on when it ran. `abyss_recovery_hot_skipped_frames_total` counts skipped frames; skipping is normal.
 
+A Write is logged on its key's stream. One found on another stream is corrupt, and applying it would give the key that stream's seq, so recovery fails with `kCorruption`, naming the stream's shard, the seq and the key's hash.
+
 **Replay reads no clock.** A written key is linked at its frame's `appended_at`. Expiry is judged only at that same `appended_at`, the instant the frame was decided at, as the sequencer's apply judges it. A key past its TTL then is absent to the frame, so a key that cold's TTL sweep deleted, and that a later decision therefore saw as absent with no DEL logged, is not merged with its stale replayed state. Every frame, applied or skipped, raises its shard's `appended_at` stamp, so the first write after recovery is never stamped behind the log. After the scan, every replayed key's latest seq and each shard's flush floor are what the sequencer's apply set.
 
 **Eviction during replay** is gated on cold's drain, as always. Limits are per shard: a shard's budget is `hot.max_memory_bytes` ÷ `hot.shard_count`, and its ratio limit is that budget × `hot.backpressure_ratio`.
-- Cold is fed first in every batch, and its drained seq means absorbed into its buffer, so the drained seq covers each batch before hot applies it.
-- Replay normally stays within the ratio limit. At the limit the replayer reclaims the shard's drained tombstones and evicts it to its budget.
-- If nothing is evictable, it asks the shard's cold consumer to flush its buffer through the frame's seq, capped at the power-durable end, which recovery has synced, then evicts again. `abyss_recovery_cold_drain_requests_total` counts the requests. This forced flush is only a fallback: on a normal log it never fires, because with cold fed first everything hot holds is drained.
-- If the shard is still over with nothing evictable after that flush, replay carries on and retries eviction with each new scan batch, so at most one batch's growth can take it over the ratio limit.
-- Past a hard ceiling of twice the ratio limit, recovery fails loudly with an error naming the shard, the seq and the likely cause: cold's drained seq pinned, by a parse-poison entry for example, or one entry larger than the shard's budget. Recovery also fails if a forced flush fails, or makes no progress for `cold_consumer.drain_grace_seconds`.
+- Cold is fed first in every batch, and its drained seq means absorbed into its buffer, advanced entry by entry, so the drained seq covers each batch before hot applies it.
+- Replay therefore stays within the ratio limit: at the limit the replayer reclaims the shard's drained tombstones and evicts it to its budget.
+- Only a pinned drained seq leaves nothing evictable: a parse-poison entry holds it below the poison, and flushing cold cannot move it past. Replay then carries on and retries eviction with each new scan batch, so at most one batch's growth can take it over the ratio limit.
+- Past a hard ceiling of twice the ratio limit, recovery fails loudly with an error naming the shard, the seq and the likely cause: cold's drained seq pinned, by a parse-poison entry for example, or one entry larger than the shard's budget.
 
 **Every frame, in order, to the end.** Each frame must arrive at its shard's cursor, and at the end each shard must have had exactly as many frames as its end minus its first retained seq, applied or skipped. Otherwise recovery fails with an error naming the shard. Cold's finish likewise fails unless its cursor reached the shard's end.
 
 **The sweep.** After the scan and every shard's cold finish, the replayer reads the steady and wall clocks once.
-- It moves each replayed key's link and access stamp from `appended_at` *t* to steady now minus (wall now − *t*), never past steady now. The map is monotone, so every LRU list keeps its order.
+- It moves each replayed key's link from `appended_at` *t* to steady now minus (wall now − *t*), never past steady now. The map is monotone, so every LRU list keeps its order. A mapped link may fall before the steady clock's epoch, as on a host up for less than the window, so a key never read counts as read before every link, never as read at steady zero. Replay reads nothing, so it stamps no access.
 - It then runs the normal maintenance passes: keys past their TTL, keys whose last write is past their eviction window, drained tombstones, then LRU down to `hot.max_memory_bytes`. Cold has finished by then, so everything it absorbed is drained and evictable.
 - A key written 30 h before a restart, under a 24 h eviction window, is therefore not resident after recovery, and is served from cold.
 - The sweep decides residency only. It never changes a value.
@@ -133,7 +134,7 @@ Each side exposes synchronous per-shard replay steps:
 | Cold consumer | Begin replay, apply each scan batch, then finish | The scan reached the shard's end (otherwise an error), then the buffer drains to the cold store and checkpoints |
 | Hot replayer | Begin, apply each scan batch, then finish | Every shard got exactly its frames (otherwise an error), then the sweep |
 
-A cold wipe that keeps failing during the scan, or a forced flush that makes no progress, gives up after `cold_consumer.drain_grace_seconds` and fails recovery, rather than hanging every shard on its worker.
+A cold wipe that keeps failing during the scan gives up after `cold_consumer.drain_grace_seconds` and fails recovery, rather than hanging every shard on its worker.
 
 Cancellation is observable end-to-end: the server passes its SIGTERM-backed cancel flag to the recovery coordinator, which propagates it to the scan and to cold's replay. A cancel mid-replay fails recovery as unavailable; the server logs it, shuts down, and exits non-zero. /ready stays 503 until the process restarts.
 
@@ -155,7 +156,7 @@ The recovery coordinator's snapshots expose:
 - `hot_entries_replayed` / `_target` — frames the hot replayer has applied or skipped, and the sum across shards of end − first retained seq.
 - `elapsed_ms` — wall time since the run started; resets on `complete`.
 
-This snapshot is wired into `/status` under the `recovery: { ... }` section and serves as the source of truth for an operator inspecting a stalled recovery. Prometheus carries the same through `abyss_recovery_phase` (0 `queue_open`, 1 `cold_hot_replay`, 2 `complete`), `abyss_recovery_{cold,hot}_entries_{replayed,target}`, `abyss_recovery_hot_skipped_frames_total`, `abyss_recovery_cold_drain_requests_total` and `abyss_recovery_duration_seconds`.
+This snapshot is wired into `/status` under the `recovery: { ... }` section and serves as the source of truth for an operator inspecting a stalled recovery. Prometheus carries the same through `abyss_recovery_phase` (0 `queue_open`, 1 `cold_hot_replay`, 2 `complete`), `abyss_recovery_{cold,hot}_entries_{replayed,target}`, `abyss_recovery_hot_skipped_frames_total` and `abyss_recovery_duration_seconds`.
 
 ### Queue Retention for Recovery
 
@@ -186,7 +187,7 @@ This must fit on the WAL PVC (embedded) or within broker retention config (exter
 
 **Why rebuild hot at all rather than start it empty?** An empty hot store would make the first read of every key after a restart a cold read. Replaying keeps the recently written working set warm, and costs little: cold's replay reads most of the log anyway, and the scan reads it once for both.
 
-**Why force cold to drain rather than wait for it?** The forced flush is a fallback for a drained seq that lags the scan; on a normal log, cold fed first has already drained everything hot holds. During recovery cold flushes its buffer only past its high-water mark, so a replayer that waited on cold could wait for a drain that never comes. An explicit, capped flush request makes progress certain where progress is possible, and the hard ceiling fails recovery loudly, with the likely cause, where it is not.
+**Why no forced cold flush when hot is full?** Drained means absorbed into cold's buffer, not flushed, and cold is fed each batch first, so its drained seq already covers everything hot holds and eviction always has room. The one exception, a drained seq pinned below a parse poison, is one a flush cannot move. A forced flush would therefore never help, and the hard ceiling fails recovery loudly, with the likely cause, where nothing can.
 
 **Why use the compaction buffer during cold recovery?** Without the buffer, replaying N queue entries for a key that was written N times would produce N cold store writes. The compaction buffer collapses these into one write per key, making recovery write volume proportional to unique keys, not total queue depth. For a 24-hour queue with 1M entries but only 100K unique keys, this is a 10x reduction.
 

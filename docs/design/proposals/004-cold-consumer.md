@@ -47,7 +47,9 @@ Different Redis data structures require different merge strategies:
 
 **A `DEL` for any key type resets the buffer entry entirely.** All accumulated state is discarded and replaced with a tombstone.
 
-`CompactedState` is type-aware: it tracks which data type the key holds (string, hash, set, sorted set, or none) and maintains per-type storage internally. Absorption takes a typed write operation, not a raw RESP command. Emission produces the minimal set of typed write operations needed to materialise the compacted state in cold. Type conflicts (e.g. SADD on a string key) are handled per Redis semantics — SET and DEL override any type, other commands require a matching type or are skipped.
+**So does a frame flagged `kReplacesState`** ([ADP-009](009-wal-format.md)), before its own effect is absorbed. The sequencer flags an effect that alone determines its key, such as an add that creates the key. A removal that empties a collection deletes the key without a `DEL`, so the add that follows may be of another type, and absorbed as a plain add it would be skipped as a type conflict. The leading delete is emitted even with nothing yet buffered for the key: cold may still hold it past its TTL, not yet swept. A `SET` needs none, as cold's `SET` clears every other type and the old TTL itself.
+
+`CompactedState` is type-aware: it tracks which data type the key holds (string, hash, set, sorted set, or none) and maintains per-type storage internally. Absorption takes a typed write operation, not a raw RESP command. Emission produces the minimal set of typed write operations needed to materialise the compacted state in cold. Type conflicts (e.g. SADD on a string key) are handled per Redis semantics — SET, DEL and any flagged frame override any type, other commands require a matching type or are skipped.
 
 See `include/abyss/consumer/compacted_state.h` for the current interface.
 
@@ -121,7 +123,6 @@ loop:
 
 During recovery the consumer's thread does not run. Recovery's one scan of each log ([ADP-007](007-recovery.md)) hands the consumer its shard's entries in batches, from its committed offset plus one, and it absorbs them as the loop would, flushing when the buffer passes high-water. In each batch cold is fed before the hot replayer, so cold's drained seq covers the batch before hot applies it.
 - **Finishing.** Once the scan ends, the consumer fails recovery unless its cursor reached the shard's end. It then flushes its whole buffer and checkpoints, so reads after recovery never meet a cold store behind the log.
-- **Drain requests.** If hot reaches its backpressure limit during replay with nothing it can evict, the hot replayer asks the consumer to flush its buffer through the current frame, capped at the power-durable end. Each batch still passes the persistence gate below. A request that makes no progress for `drain_grace_seconds`, or meets a batch the cold store refuses, fails recovery.
 - **Wipes.** A wipe that keeps failing during the scan gives up after `drain_grace_seconds` and fails recovery, rather than hanging every shard on its worker.
 
 ### Persisting at the power-durable log

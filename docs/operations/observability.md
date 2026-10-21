@@ -4,16 +4,25 @@
 
 ### Latency Histograms
 
-- `abyss_hot_op_duration_seconds{cmd="..."}` — hot store operation latency per command
-- `abyss_cold_op_duration_seconds{cmd="..."}` — cold store operation latency per command
-- `abyss_buffer_op_duration_seconds{cmd="..."}` — compaction buffer read latency per command
 - `abyss_resp_request_duration_seconds{cmd="..."}` — end-to-end request latency per command
 - `abyss_wal_flush_duration_seconds` — duration of one WAL group-commit flush (fdatasync on Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). This is the device floor that `power_loss` acknowledgements and cold persistence wait on. It includes the walk that advances each shard's durable end after the sync. Segment preparation and offset persists are not included. Flushes per write is `rate(abyss_wal_flush_duration_seconds_count[1m]) / rate(abyss_queue_appended_total[1m])`. Near 1.0 under concurrent load, flushes are not batching.
 - `abyss_queue_offset_persist_duration_seconds` — duration of one durable persist of committed consumer offsets. The rate of persists (`_count`) shows how much flush capacity offset bookkeeping consumes.
 - `abyss_wal_flush_batch_entries` — WAL entries covered by one flush that covers at least one entry; a rising value under load shows batching is absorbing concurrency. A failed flush terminates the process, so both histograms record successful flushes only.
 - `abyss_wal_fill_wait_seconds` — time an append waited for earlier reservations in its log to be filled before it could be acknowledged. Recorded only when the wait outlasted a short spin (about 2 µs), so it counts the waits behind a large value or a preempted filler (the head-of-line effect the blob lane, #162, removes), not a neighbour mid-copy.
 - `abyss_wal_publish_wait_seconds` — time a shard's publish waited for an earlier reservation on the same shard to publish, since publishes go in seq order. Recorded only past the same short spin. Behind a large value's fill it rises together with the fill wait.
-- `abyss_sequencer_lock_hold_seconds` — how long a write held its hot shard locks for one decision: deciding, reserving its log space and applying to hot. One hold in 64 is sampled. Its tail under skewed load is what a single hot shard costs.
+- `abyss_sequencer_lock_hold_seconds` — how long a write held its hot shard locks for one decision: deciding, reserving its log space and applying to hot. One write in 64 on average is sampled, picked at random by each writer thread, so the sample cannot line up with a fixed pattern of frames on a page. Every hold of a sampled write is recorded, including one whose attempt is then decided again, and a `FLUSHDB`'s. Its tail under skewed load is what a single hot shard costs.
+- `abyss_sequencer_phase_seconds{phase="admit|lock_wait|decide|load|entries|reserve|apply|complete|durable"}` — where a write's time goes, on the same sampled writes. Only successful writes are recorded: a write that fails, is refused or times out records no stage. The stages are contiguous, so their means add up to the sequencer's share of a write's latency:
+  - `admit`: routing its keys, copying large arguments, and admission to the WAL durability window, plus any wait before a write is decided again;
+  - `lock_wait`: taking the write's hot shard locks;
+  - `decide`: deciding against hot;
+  - `load`: loading keys hot does not hold, between two holds;
+  - `entries`: building the log entries under the locks;
+  - `reserve`: reserving log space and sequence numbers, and encoding small frames in place;
+  - `apply`: applying to hot and releasing the locks;
+  - `complete`: filling large frames, publishing in sequence order, and freeing what the apply replaced;
+  - `durable`: waiting for the configured durability class, or for the fence of a write that logged nothing.
+
+  `lock_hold` is `decide` through `apply` of one hold. A stage a write did not pass is not recorded for it.
 
 ### RESP Frontend
 
@@ -25,7 +34,6 @@
 
 - `abyss_cold_consumer_lag_entries` — entries between cold consumer position and queue head
 - `abyss_cold_buffer_oldest_entry_age_seconds` — age of the oldest un-flushed buffer entry. **This is the most critical metric.** It directly indicates cold gap risk.
-- `abyss_cold_consumer_seq` — cold consumer's current sequence position (reflects latest entry read into buffer, not latest entry flushed to cold)
 
 ### Counters
 
@@ -43,6 +51,7 @@
 - `abyss_cold_flush_total{status="success|failure"}` — cold consumer flush operations
 - `abyss_cold_flush_reason_total{reason="quiet|deadline|pressure"}` — flush trigger reason
 - `abyss_cold_flush_batch_size` (histogram) — number of keys per flush batch
+- `abyss_cold_durability_waits_total` — cold flushes and wipes held for `cold_consumer.queue_read_timeout_ms` because their entries were not yet power-durable in the WAL; each is retried on the next pass. It rises with `abyss_wal_durability_lag_seconds` when the WAL device falls behind, and explains a growing compaction buffer that is not the cold store's fault.
 - `abyss_cold_drain_truncated_total` — graceful shutdown drains that stopped before the compaction buffer emptied: the drain hit `cold_consumer.drain_grace_seconds`, or a flush made no progress. Nothing is lost: the rest replays from the WAL at the next start. A non-zero count means the drain budget is too small for what the buffer holds at shutdown, and the next start replays further.
 - `abyss_ttl_expired_total{tier="hot|cold"}` — TTL expirations by tier. On cold, only the TTL scanner's deletes count: reads never delete.
 - `abyss_cold_apply_type_conflicts_total` — logged SADD, HSET or ZADD effects that found their key holding another type in cold. Any increase means the write path and cold disagree (see [failure-modes.md](failure-modes.md)).
@@ -114,10 +123,9 @@ Recovery is one scan of the log that feeds each shard's cold consumer and the ho
 - `abyss_recovery_cold_entries_replayed` / `abyss_recovery_cold_entries_target` (gauges) — entries cold drains during recovery, from its committed offset to the end of the log, all shards
 - `abyss_recovery_hot_entries_replayed` / `abyss_recovery_hot_entries_target` (gauges) — log entries the hot replayer applied or skipped, from each shard's first retained seq to its durable end, all shards. Recovery fails unless every shard's count matches.
 - `abyss_recovery_hot_skipped_frames_total` (counter) — replayed entries hot left to the buffer and cold: an effect that does not replace its key's state, on a key the rebuild does not hold. Normal after retention reclaims a key's earlier frames; not an error.
-- `abyss_recovery_cold_drain_requests_total` (counter) — times the hot replayer, with a shard at its `hot.backpressure_ratio` limit and nothing it could evict, made the shard's cold consumer flush its buffer. Zero on a healthy log; non-zero means cold's drained seq lagged the scan (see [failure-modes.md](failure-modes.md#recovery-failures)).
 - `abyss_recovery_duration_seconds` (gauge) — elapsed time of the recovery run
 
-**Removed.** `abyss_hot_consumer_seq` went with the hot consumer: the sequencer applies each write to hot under the shard lock, so hot has no position behind the log. `abyss_recovery_resolver_entries_replayed` and `abyss_recovery_resolver_entries_target` went with recovery's resolver phase, and `abyss_resolver_durable_wait_timeouts_total` with the resolver: the sequencer decides each conditional write before it is logged, and replay re-decides nothing.
+**Removed.** `abyss_hot_consumer_seq` went with the hot consumer: the sequencer applies each write to hot under the shard lock, so hot has no position behind the log. `abyss_recovery_resolver_entries_replayed` and `abyss_recovery_resolver_entries_target` went with recovery's resolver phase, and `abyss_resolver_durable_wait_timeouts_total` with the resolver: the sequencer decides each conditional write before it is logged, and replay re-decides nothing. `abyss_recovery_cold_drain_requests_total` went with replay's forced cold flush, which could never fire: cold is fed each scan batch first, and only a parse poison pins its drained seq, which no flush moves. `abyss_hot_op_duration_seconds`, `abyss_cold_op_duration_seconds`, `abyss_buffer_op_duration_seconds` and `abyss_cold_consumer_seq` were never recorded; use `abyss_sequencer_phase_seconds`, `abyss_resp_request_duration_seconds` with `abyss_hits_total`, and `abyss_cold_consumer_lag_entries`.
 
 ### TCP server
 

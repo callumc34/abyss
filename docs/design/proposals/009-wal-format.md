@@ -109,7 +109,7 @@ Types `1` and `2` belonged to `Conditional` (a command with a predicate) and `Re
 - an `SADD`, `HSET` or `ZADD` that creates its key;
 - the effect that recreates `RENAMENX`'s or `COPY`'s destination from the source's whole value (a `SET`, `SADD`, `ZADD` or `HSET`). The `EXPIRE` that follows a recreated collection is not flagged.
 
-The hot replayer uses it to rebuild only complete keys ([ADP-007](007-recovery.md) §Hot replay): a flagged frame makes its key resident and a `Flush` wipes its shard, while any other frame applies only to a key the rebuild already holds. Cold ignores the flag.
+The hot replayer uses it to rebuild only complete keys ([ADP-007](007-recovery.md) §Hot replay): a flagged frame makes its key resident and a `Flush` wipes its shard, while any other frame applies only to a key the rebuild already holds. The cold consumer discards what the key's buffered delta held before a flagged frame ([ADP-004](004-cold-consumer.md) §Compaction Semantics): a removal that empties a collection deletes its key without a `DEL`, so an add of another type may follow it in one compaction window.
 
 ### Writing a frame
 
