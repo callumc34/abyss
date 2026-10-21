@@ -11,6 +11,8 @@ add_library(abyss_core
   fatal.cpp
   durability.cpp
   queue.cpp
+  seq_waiters.cpp
+  wait_list.cpp
 )
 add_library(abyss::core ALIAS abyss_core)
 
