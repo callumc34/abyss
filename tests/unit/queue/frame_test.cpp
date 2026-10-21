@@ -266,19 +266,31 @@ TEST(FrameTest, UnparseablePayloadUnderAValidCrcIsCorruption) {
   EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
 }
 
-TEST(FrameTest, BytesAfterThePayloadAreCorruption) {
+// A newer minor may append payload fields that an older reader skips;
+// only a CRC can tell them from damage.
+TEST(FrameTest, BytesAfterThePayloadDecodeOnlyUnderAVerifiedCrc) {
   std::vector<std::byte> bytes;
-  EncodeEntry(core::QueueEntry{.seq = 1, .payload = core::entry::Flush{}}, 0, bytes);
+  EncodeEntry(WriteEntry(4, "v"), 0, bytes);
   const uint32_t len = CommitLen(binary::LoadLE<uint64_t>(bytes.data()));
-  bytes.resize(FrameSize(len + kAlign));
+  bytes.resize(FrameSize(len + kAlign), std::byte{0x5A});
   binary::StoreLE(bytes.data(), CommitWord(static_cast<uint32_t>(len + kAlign), 0));
   CloseBatch(bytes);
   Seal(bytes, kGen);
-  const View view = InspectAt(bytes, kGen);
-  ASSERT_EQ(view.state, State::kFilled);
-  auto decoded = DecodeEntry(view);
-  ASSERT_FALSE(decoded.has_value());
-  EXPECT_EQ(decoded.error().code(), core::ErrorCode::kCorruption);
+
+  const View verified = InspectAt(bytes, kGen);
+  ASSERT_EQ(verified.state, State::kFilled);
+  auto decoded = DecodeEntry(verified);
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+  EXPECT_EQ(decoded->seq, 4U);
+  const auto* write = std::get_if<core::entry::Write>(&decoded->payload);
+  ASSERT_NE(write, nullptr);
+  EXPECT_EQ(write->cmd.args.back(), "v");
+
+  const View unverified = InspectAt(bytes, kGen, false);
+  ASSERT_EQ(unverified.state, State::kFilled);
+  auto strict = DecodeEntry(unverified);
+  ASSERT_FALSE(strict.has_value());
+  EXPECT_EQ(strict.error().code(), core::ErrorCode::kCorruption);
 }
 
 }  // namespace

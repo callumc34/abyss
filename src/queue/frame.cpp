@@ -140,6 +140,7 @@ View Inspect(uint64_t commit_word, std::span<const std::byte> bytes, uint32_t ge
   };
   view.size = size;
   view.body = body;
+  view.crc_verified = verify_crc;
   return view;
 }
 
@@ -153,7 +154,7 @@ core::Result<core::QueueEntry> DecodeEntry(const View& view) {
   std::span<const std::byte> cursor = view.body.subspan(kHeaderBytes);
   auto payload = entry_payload::Decode(type, cursor);
   if (!payload.has_value()) return std::unexpected(payload.error());
-  if (!cursor.empty()) {
+  if (!cursor.empty() && !view.crc_verified) {
     return std::unexpected(Corrupt(std::to_string(cursor.size()) + " bytes after the payload"));
   }
   return core::QueueEntry{

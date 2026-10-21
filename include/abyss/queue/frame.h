@@ -85,6 +85,7 @@ struct View {
   // Whole frame, padding included; 0 unless kFilled.
   std::size_t size = 0;
   std::span<const std::byte> body;
+  bool crc_verified = false;
 };
 
 // Classifies the frame at the start of `bytes` for generation `gen` in
@@ -97,7 +98,9 @@ View Inspect(uint64_t commit_word, std::span<const std::byte> bytes, uint32_t ge
              bool verify_crc);
 
 // Decodes a filled entry frame's payload. kCorruption if the CRC holds
-// but the payload does not parse (genuine corruption, ADP-009).
+// but the payload does not parse (genuine corruption, ADP-009). Bytes
+// after the payload are a newer minor's under a verified CRC, and
+// kCorruption without one.
 core::Result<core::QueueEntry> DecodeEntry(const View& view);
 
 }  // namespace abyss::queue::frame
