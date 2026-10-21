@@ -100,6 +100,9 @@ void RecoveryCoordinator::TransitionPhase(RecoverySnapshot::Phase next) {
 
 core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>& cancel) {
   const uint32_t shards = shard_count_;
+  // Before FirstSeq is read, so no sweep reclaims what hot replays
+  // before the scan reads it.
+  const core::RetentionPin pinned = queue_.PinRetention();
   std::vector<core::SequenceId> end(shards, 0);
   // Hot commits nothing; it rebuilds from the first retained seq.
   std::vector<core::SequenceId> first(shards, 0);
