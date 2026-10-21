@@ -3,9 +3,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include "abyss/core/durability.h"
+#include "abyss/core/queue_entry.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
@@ -50,7 +57,10 @@ RecoveryCoordinator::RecoveryCoordinator(core::Queue& queue, consumer::ResolverP
 }
 
 core::Result<void> RecoveryCoordinator::Run(const std::atomic<bool>& cancel) {
-  started_at_ = std::chrono::steady_clock::now();
+  {
+    const std::scoped_lock lock(progress_mu_);
+    started_at_ = std::chrono::steady_clock::now();
+  }
   ABYSS_LOG_INFO("recovery starting", {"shard_count", static_cast<int64_t>(hot_pool_.ShardCount())},
                  {"replay_parallelism", static_cast<int64_t>(config_.replay_parallelism)});
 
@@ -91,8 +101,13 @@ void RecoveryCoordinator::TransitionPhase(RecoverySnapshot::Phase next) {
 
 core::Result<void> RecoveryCoordinator::RunResolverPhase(const std::atomic<bool>& cancel) {
   const uint32_t shards = resolver_pool_.ShardCount();
-  resolver_starting_ = CaptureCommittedOffsets(core::kResolverConsumer);
-  resolver_target_ = CaptureTargets();
+  auto starting = CaptureCommittedOffsets(core::kResolverConsumer);
+  auto targets = CaptureTargets();
+  {
+    const std::scoped_lock lock(progress_mu_);
+    resolver_starting_ = std::move(starting);
+    resolver_target_ = std::move(targets);
+  }
   resolver_target_gauge_.Set(static_cast<double>(SumDelta(resolver_target_, resolver_starting_)));
   TransitionPhase(RecoverySnapshot::Phase::kResolverReplay);
 
@@ -130,16 +145,40 @@ core::Result<void> RecoveryCoordinator::RunResolverPhase(const std::atomic<bool>
 core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>& cancel) {
   const uint32_t shards = hot_pool_.ShardCount();
 
-  // Recapture targets — Resolver may have emitted Resolveds, extending the
-  // tail. Cold and hot must drain through those.
-  cold_starting_ = CaptureCommittedOffsets(core::kColdConsumer);
+  // Captured after the resolver phase, so the Resolveds it emitted lie
+  // below the ends and cold and hot drain through them.
+  std::vector<core::SequenceId> end(shards, 0);
+  std::vector<core::SequenceId> target(shards, 0);
   // Hot commits nothing; it rebuilds from the first retained seq.
-  hot_starting_ = CaptureFirstSeqs();
-  cold_target_ = CaptureTargets();
-  hot_target_ = cold_target_;
+  std::vector<core::SequenceId> first(shards, 0);
+  for (uint32_t s = 0; s < shards; ++s) {
+    auto durable = queue_.DurableEnd(s, core::Durability::kProcessCrash);
+    if (!durable.has_value()) return std::unexpected(durable.error());
+    end[s] = *durable;
+    target[s] = end[s] > 0 ? end[s] - 1 : 0;
+    auto retained = queue_.FirstSeq(s);
+    if (!retained.has_value()) return std::unexpected(retained.error());
+    first[s] = *retained;
+  }
+  auto cold_starting = CaptureCommittedOffsets(core::kColdConsumer);
+  {
+    const std::scoped_lock lock(progress_mu_);
+    cold_starting_ = std::move(cold_starting);
+    hot_starting_ = std::move(first);
+    cold_target_ = target;
+    hot_target_ = std::move(target);
+  }
   cold_target_gauge_.Set(static_cast<double>(SumDelta(cold_target_, cold_starting_)));
   hot_target_gauge_.Set(static_cast<double>(SumDelta(hot_target_, hot_starting_)));
   TransitionPhase(RecoverySnapshot::Phase::kColdHotReplay);
+
+  if (auto scanned = ScanColdHot(end, cancel); !scanned.has_value()) {
+    if (cancel.load(std::memory_order_acquire)) {
+      return std::unexpected(
+          core::Error{core::ErrorCode::kUnavailable, "recovery cancelled in cold/hot phase"});
+    }
+    return scanned;
+  }
 
   std::atomic<bool> failed{false};
   core::Error first_error{core::ErrorCode::kInternal, "no error"};
@@ -160,13 +199,29 @@ core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>&
           }
         });
   };
+  // The scan delivered everything below the ends, so ReplayUntil must
+  // find nothing; a regression shows up here instead of being absorbed.
+  const auto expect_none = [](std::string_view tier, core::ShardId shard,
+                              const core::Result<uint64_t>& replayed) -> core::Result<void> {
+    if (!replayed.has_value()) return std::unexpected(replayed.error());
+    if (*replayed > 0) {
+      ABYSS_LOG_WARN("replay after the recovery scan found entries it missed", {"tier", tier},
+                     {"shard", static_cast<int64_t>(shard)}, {"entries", *replayed});
+    }
+    return {};
+  };
 
   for (uint32_t s = 0; s < shards; ++s) {
-    submit_replay(s, [this, s, &cancel] {
-      return cold_pool_.ConsumerFor(s).ReplayUntil(cold_target_[s], cancel);
+    const bool empty = end[s] == 0;
+    submit_replay(s, [this, s, empty, &cancel, &expect_none]() -> core::Result<void> {
+      consumer::ColdConsumer& cold = cold_pool_.ConsumerFor(s);
+      if (auto finished = cold.FinishReplay(cancel); !finished.has_value()) return finished;
+      if (empty) return {};
+      return expect_none("cold", s, cold.ReplayUntil(cold_target_[s], cancel));
     });
-    submit_replay(s, [this, s, &cancel] {
-      return hot_pool_.ConsumerFor(s).ReplayUntil(hot_target_[s], cancel);
+    if (empty) continue;
+    submit_replay(s, [this, s, &cancel, &expect_none] {
+      return expect_none("hot", s, hot_pool_.ConsumerFor(s).ReplayUntil(hot_target_[s], cancel));
     });
   }
   scheduler_.WaitAll();
@@ -181,6 +236,45 @@ core::Result<void> RecoveryCoordinator::RunColdHotPhase(const std::atomic<bool>&
   cold_replayed_gauge_.Set(static_cast<double>(SumDelta(cold_target_, cold_starting_)));
   hot_replayed_gauge_.Set(static_cast<double>(SumDelta(hot_target_, hot_starting_)));
   return {};
+}
+
+core::Result<void> RecoveryCoordinator::ScanColdHot(const std::vector<core::SequenceId>& end,
+                                                    const std::atomic<bool>& cancel) {
+  const uint32_t shards = hot_pool_.ShardCount();
+  std::vector<core::SequenceId> from_cold(shards, 0);
+  std::vector<core::SequenceId> from(shards, 0);
+  for (uint32_t s = 0; s < shards; ++s) {
+    auto begun = cold_pool_.ConsumerFor(s).BeginReplay();
+    if (!begun.has_value()) return std::unexpected(begun.error());
+    from_cold[s] = *begun;
+    from[s] = std::min(hot_starting_[s], from_cold[s]);
+  }
+
+  // The scan moves each hot cursor from its start to the end; one it
+  // left short is what the trailing ReplayUntil reports.
+  for (uint32_t s = 0; s < shards; ++s) {
+    consumer::HotConsumer& hot = hot_pool_.ConsumerFor(s);
+    hot.SetReplayCursor(hot_starting_[s]);
+    hot.BeginReplay();
+  }
+  const auto by_seq = [](const core::QueueEntry& entry) { return entry.seq; };
+  const core::Queue::ScanSink sink = [&](core::ShardId shard,
+                                         std::vector<core::QueueEntry>& batch) {
+    // Cold first: hot moves entries out of the batch it applies.
+    const std::span<const core::QueueEntry> entries(batch);
+    const auto cold_at = std::ranges::lower_bound(entries, from_cold[shard], {}, by_seq);
+    if (auto applied = cold_pool_.ConsumerFor(shard).ApplyReplayBatch(
+            entries.subspan(static_cast<std::size_t>(cold_at - entries.begin())), cancel);
+        !applied.has_value()) {
+      return applied;
+    }
+    batch.erase(batch.begin(), std::ranges::lower_bound(batch, hot_starting_[shard], {}, by_seq));
+    hot_pool_.ConsumerFor(shard).ApplyReplayBatch(batch);
+    return core::Result<void>{};
+  };
+  auto scanned = queue_.Scan(from, end, config_.replay_parallelism, sink, cancel);
+  for (uint32_t s = 0; s < shards; ++s) hot_pool_.ConsumerFor(s).EndReplay();
+  return scanned;
 }
 
 std::vector<core::SequenceId> RecoveryCoordinator::CaptureTargets() const {
@@ -204,16 +298,6 @@ std::vector<core::SequenceId> RecoveryCoordinator::CaptureCommittedOffsets(
   return out;
 }
 
-std::vector<core::SequenceId> RecoveryCoordinator::CaptureFirstSeqs() const {
-  const uint32_t shards = hot_pool_.ShardCount();
-  std::vector<core::SequenceId> out(shards, 0);
-  for (uint32_t s = 0; s < shards; ++s) {
-    auto first = queue_.FirstSeq(s);
-    if (first.has_value()) out[s] = *first;
-  }
-  return out;
-}
-
 uint64_t RecoveryCoordinator::SumDelta(const std::vector<core::SequenceId>& target,
                                        const std::vector<core::SequenceId>& starting) noexcept {
   uint64_t total = 0;
@@ -225,6 +309,7 @@ uint64_t RecoveryCoordinator::SumDelta(const std::vector<core::SequenceId>& targ
 RecoverySnapshot RecoveryCoordinator::Snapshot() const {
   RecoverySnapshot snap;
   snap.phase = phase_.load(std::memory_order_acquire);
+  const std::scoped_lock lock(progress_mu_);
 
   if (started_at_.time_since_epoch().count() != 0) {
     snap.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

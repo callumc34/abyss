@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -265,7 +267,7 @@ core::Result<void> ColdConsumer::SeedCursor() {
   return {};
 }
 
-size_t ColdConsumer::ConsumeBatch(const std::vector<core::QueueEntry>& batch) {
+size_t ColdConsumer::ConsumeBatch(std::span<const core::QueueEntry> batch) {
   size_t consumed = 0;
   for (const auto& entry : batch) {
     // Handlers see the cursor past the entry they are applying.
@@ -318,18 +320,19 @@ void ColdConsumer::FailOutOfRange(core::SequenceId requested) {
               ": WAL entries above its persisted offset were reclaimed");
 }
 
-core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
-                                             const std::atomic<bool>& cancel) {
+core::Result<uint64_t> ColdConsumer::ReplayUntil(core::SequenceId target,
+                                                 const std::atomic<bool>& cancel) {
   ABYSS_LOG_INFO("cold replay starting", {"shard", static_cast<int64_t>(shard_)},
                  {"target_seq", static_cast<uint64_t>(target)});
 
-  if (auto seeded = SeedCursor(); !seeded.has_value()) return std::unexpected(seeded.error());
+  if (auto begun = BeginReplay(); !begun.has_value()) return std::unexpected(begun.error());
 
   // Caught up once the cursor passes target. An empty read also means caught
   // up: target was captured below the head, so nothing at the cursor proves
   // the cursor is past it (and covers the empty queue, where target 0 names
   // no entry).
   bool caught_up = false;
+  uint64_t replayed = 0;
   auto wipe_retry_backoff = config_.loop_initial_backoff;
   while (!cancel.load(std::memory_order_acquire)) {
     if (stop_requested_.load(std::memory_order_acquire)) {
@@ -354,7 +357,9 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
       caught_up = true;
       break;
     }
-    if (ConsumeBatch(*read) < read->size()) {
+    const size_t consumed = ConsumeBatch(*read);
+    replayed += consumed;
+    if (consumed < read->size()) {
       // A Flush's wipe failed; retry it on a capped backoff, not a spin.
       std::unique_lock lock(stop_mu_);
       stop_cv_.wait_for(lock, wipe_retry_backoff,
@@ -377,6 +382,74 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
     return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "cold replay cancelled"});
   }
 
+  if (auto finished = FinishReplay(cancel); !finished.has_value()) {
+    return std::unexpected(finished.error());
+  }
+
+  ABYSS_LOG_INFO(
+      "cold replay complete", {"shard", static_cast<int64_t>(shard_)},
+      {"latest_drained",
+       static_cast<uint64_t>(latest_drained_seq_.load(std::memory_order_acquire))},
+      {"last_commit_seq", static_cast<uint64_t>(last_commit_seq_.load(std::memory_order_acquire))});
+  return replayed;
+}
+
+core::Result<core::SequenceId> ColdConsumer::BeginReplay() {
+  if (auto seeded = SeedCursor(); !seeded.has_value()) return std::unexpected(seeded.error());
+  return next_read_seq_;
+}
+
+core::Result<void> ColdConsumer::ApplyReplayBatch(std::span<const core::QueueEntry> batch,
+                                                  const std::atomic<bool>& cancel) {
+  if (batch.empty()) return {};
+  if (batch.front().seq != next_read_seq_) {
+    return std::unexpected(core::Error{core::ErrorCode::kInternal,
+                                       "cold replay of shard " + std::to_string(shard_) +
+                                           " was handed seq " + std::to_string(batch.front().seq) +
+                                           " at its cursor " + std::to_string(next_read_seq_)});
+  }
+  auto backoff = config_.loop_initial_backoff;
+  // Runs from the first failure of the Flush at the front of `batch`.
+  std::optional<std::chrono::steady_clock::time_point> give_up_at;
+  while (true) {
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      return std::unexpected(
+          core::Error{core::ErrorCode::kUnavailable, "cold replay aborted by stop"});
+    }
+    const size_t consumed = ConsumeBatch(batch);
+    batch = batch.subspan(consumed);
+    if (batch.empty()) break;
+    // A Flush's wipe failed. Retrying it on a Scan worker stalls every
+    // shard behind it, so the retry is bounded and then fails recovery.
+    const auto now = std::chrono::steady_clock::now();
+    if (consumed > 0 || !give_up_at.has_value()) {
+      give_up_at = now + config_.drain_grace;
+      backoff = config_.loop_initial_backoff;
+    }
+    if (cancel.load(std::memory_order_acquire)) {
+      return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "cold replay cancelled"});
+    }
+    if (now >= *give_up_at) {
+      return std::unexpected(core::Error{
+          core::ErrorCode::kTimeout,
+          "cold replay of shard " + std::to_string(shard_) + " gave up on the Flush at seq " +
+              std::to_string(batch.front().seq) + ": its wipe kept failing for " +
+              std::to_string(config_.drain_grace.count()) + " ms"});
+    }
+    std::unique_lock lock(stop_mu_);
+    stop_cv_.wait_for(lock,
+                      std::min<std::chrono::steady_clock::duration>(backoff, *give_up_at - now),
+                      [this] { return stop_requested_.load(std::memory_order_acquire); });
+    backoff = std::min(backoff * 2, config_.loop_max_backoff);
+  }
+  NotifyDrained();
+  if (buffer_.BytesEstimate() >= config_.buffer_high_water_bytes) {
+    Flush();
+  }
+  return {};
+}
+
+core::Result<void> ColdConsumer::FinishReplay(const std::atomic<bool>& cancel) {
   // Drain the buffer to disk. Replay-absorbed entries have a fresh first_seen
   // (set when DrainWithBatch absorbed them seconds ago), so the steady-state
   // FlushReady() would defer them by quiet_threshold and the loop would
@@ -405,12 +478,6 @@ core::Result<void> ColdConsumer::ReplayUntil(core::SequenceId target,
     return std::unexpected(
         core::Error{core::ErrorCode::kUnavailable, "cold replay cancelled during flush"});
   }
-
-  ABYSS_LOG_INFO(
-      "cold replay complete", {"shard", static_cast<int64_t>(shard_)},
-      {"latest_drained",
-       static_cast<uint64_t>(latest_drained_seq_.load(std::memory_order_acquire))},
-      {"last_commit_seq", static_cast<uint64_t>(last_commit_seq_.load(std::memory_order_acquire))});
   return {};
 }
 

@@ -1,10 +1,12 @@
 #ifndef _WIN32
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -13,8 +15,10 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "abyss/platform/fs.h"
+#include "abyss/platform/mapped_file.h"
 
 namespace abyss::platform::fs {
 
@@ -254,6 +258,63 @@ core::Result<DurabilityCapability> ProbeDurability(const std::filesystem::path& 
 }
 
 std::uint64_t ProcessId() noexcept { return static_cast<std::uint64_t>(::getpid()); }
+
+core::Result<MappedFile> MappedFile::Map(const File& file, std::size_t size) {
+  if (!file.valid() || size == 0) {
+    return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument, "map: no file or size"});
+  }
+  auto file_size = FileSize(file);
+  if (!file_size.has_value()) return std::unexpected(file_size.error());
+  if (*file_size < size) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "map: file is smaller than the mapping"});
+  }
+  void* addr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, file.get(), 0);
+  if (addr == MAP_FAILED) return std::unexpected(MakeErrno(core::ErrorCode::kInternal, "mmap"));
+  return MappedFile(static_cast<std::byte*>(addr), size, kInvalidOsFd);
+}
+
+MappedFile::~MappedFile() { Unmap(); }
+
+MappedFile::MappedFile(MappedFile&& other) noexcept
+    : data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      mapping_(std::exchange(other.mapping_, kInvalidOsFd)) {}
+
+MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
+  if (this != &other) {
+    Unmap();
+    data_ = std::exchange(other.data_, nullptr);
+    size_ = std::exchange(other.size_, 0);
+    mapping_ = std::exchange(other.mapping_, kInvalidOsFd);
+  }
+  return *this;
+}
+
+core::Result<void> MappedFile::WriteBack(std::size_t offset, std::size_t length) const {
+  if (data_ == nullptr || offset > size_ || length > size_ - offset) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "write back: range outside the mapping"});
+  }
+  return {};
+}
+
+void MappedFile::Unmap() noexcept {
+  if (data_ == nullptr) return;
+  ::munmap(data_, size_);
+  data_ = nullptr;
+  size_ = 0;
+}
+
+core::Result<void> ZeroFill(const File& file, std::uint64_t size) {
+  constexpr std::size_t kChunk = std::size_t{1} << 20;
+  static const std::vector<std::byte> zeros(kChunk);
+  for (std::uint64_t offset = 0; offset < size; offset += kChunk) {
+    const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, size - offset));
+    if (auto w = Pwrite(file, zeros.data(), n, offset); !w.has_value()) return w;
+  }
+  return Ftruncate(file, size);
+}
 
 namespace testing {
 

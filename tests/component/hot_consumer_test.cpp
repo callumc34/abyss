@@ -44,7 +44,7 @@ class HotConsumerTest : public ::testing::Test {
 
     auto queue_result = queue::WalQueue::Open(queue::WalConfig{
         .wal_path = dir_->String(),
-        .segment_size_bytes = 4096,
+        .segment_size_bytes = 8192,
         .shard_count = 1,
         .durability = core::Durability::kPowerLoss,
         .min_retention = 10s,
@@ -167,6 +167,39 @@ class HotConsumerTest : public ::testing::Test {
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
+// A Flush reaches every shard's stream and each consumer wipes only its
+// own shard, so it never drops another shard's writes.
+TEST_F(HotConsumerTest, AFlushWipesOnlyItsOwnShard) {
+  hot_ = std::make_unique<hot::ShardedHotStore>(hot::ShardedHotStoreConfig{
+      .max_memory_bytes = 16UL * 1024UL * 1024UL,
+      .shard_count = 2,
+  });
+  HotConsumer writer(*queue_, *hot_, rpc_, apply_notifier_, HotConsumer::Config{.shard = 0},
+                     policy_);
+  HotConsumer flusher(*queue_, *hot_, rpc_, apply_notifier_, HotConsumer::Config{.shard = 1},
+                      policy_);
+  constexpr int kKeys = 64;
+  std::vector<core::QueueEntry> writes;
+  for (int i = 0; i < kKeys; ++i) {
+    writes.push_back(MakeWrite({"SET", "key:" + std::to_string(i), "v"}));
+    writes.back().seq = static_cast<core::SequenceId>(i);
+  }
+  writer.BeginReplay();
+  writer.ApplyReplayBatch(writes);
+  writer.EndReplay();
+  ASSERT_EQ(hot_->Stats()->key_count, static_cast<uint64_t>(kKeys));
+
+  std::vector<core::QueueEntry> flush(1);
+  flush[0].appended_at = core::WallClock::now();
+  flush[0].payload = core::entry::Flush{};
+  flusher.BeginReplay();
+  flusher.ApplyReplayBatch(flush);
+  flusher.EndReplay();
+  const uint64_t left = hot_->Stats()->key_count;
+  EXPECT_GT(left, 0U) << "shard 1's Flush wiped shard 0";
+  EXPECT_LT(left, static_cast<uint64_t>(kKeys)) << "shard 1's Flush wiped nothing";
+}
+
 TEST_F(HotConsumerTest, AppliesWriteAndFulfillsOk) {
   StartConsumer();
   auto future = AppendWithRpc({"SET", "key", "value"});
@@ -188,7 +221,7 @@ TEST_F(HotConsumerTest, PowerLossAppliesOnlyFlushedWrites) {
     bool released = false;
   };
   auto stall = std::make_shared<Stall>();
-  queue_->SetFlushHookForTesting([stall](core::ShardId) -> core::Result<void> {
+  queue_->SetFlushHookForTesting([stall](uint32_t) -> core::Result<void> {
     std::unique_lock lock(stall->mu);
     stall->cv.wait(lock, [&stall] { return stall->released; });
     return {};
@@ -598,7 +631,7 @@ TEST_F(HotConsumerTest, RebuildsFromFirstRetainedSeqAfterReclaim) {
   const testing::TempDir dir("hot_consumer_reaped");
   auto opened = queue::WalQueue::Open(queue::WalConfig{
       .wal_path = dir.String(),
-      .segment_size_bytes = 256,
+      .segment_size_bytes = 4096 + 512,
       .shard_count = 1,
       .durability = core::Durability::kPowerLoss,
       .min_retention = 0s,
@@ -614,6 +647,8 @@ TEST_F(HotConsumerTest, RebuildsFromFirstRetainedSeqAfterReclaim) {
   }
   const core::SequenceId tail = queue_->TailSeq(0).value();
   ASSERT_TRUE(queue_->CommitOffset(core::kColdConsumer, 0, tail).has_value());
+  // Reclaimed once both checkpoint slots hold the commit.
+  ASSERT_TRUE(queue_->FlushOffsets().has_value());
   ASSERT_TRUE(queue_->FlushOffsets().has_value());
   const core::SequenceId first = queue_->FirstSeq(0).value();
   ASSERT_GT(first, 0U) << "the reaper reclaimed nothing";

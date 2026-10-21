@@ -67,6 +67,7 @@ size_t PayloadBytes(size_t shard_count, size_t consumer_count) {
 }
 
 struct ParsedSlot {
+  uint32_t version = 0;
   uint64_t epoch = 0;
   uint32_t shard_count = 0;
   std::vector<core::ConsumerId> consumers;
@@ -74,7 +75,7 @@ struct ParsedSlot {
   std::vector<uint64_t> encoded;
 };
 
-enum class SlotState : uint8_t { kValid, kInvalid, kUnsupportedVersion };
+enum class SlotState : uint8_t { kValid, kInvalid, kNewerVersion };
 
 SlotState ParseSlot(std::span<const std::byte> slot, ParsedSlot& out) {
   if (slot.size() < kHeaderBytes + kCrcBytes) return SlotState::kInvalid;
@@ -82,9 +83,11 @@ SlotState ParseSlot(std::span<const std::byte> slot, ParsedSlot& out) {
       0) {
     return SlotState::kInvalid;
   }
-  if (GetU32(slot.data() + kVersionOffset) != OffsetCheckpoint::kFormatVersion) {
-    return SlotState::kUnsupportedVersion;
-  }
+  // A newer version may move the CRC, so a torn newer slot cannot be
+  // told from a valid one; either means a newer writer was here.
+  out.version = GetU32(slot.data() + kVersionOffset);
+  if (out.version > OffsetCheckpoint::kFormatVersion) return SlotState::kNewerVersion;
+  if (out.version != OffsetCheckpoint::kFormatVersion) return SlotState::kInvalid;
   if (GetU32(slot.data() + kSlotBytesOffset) != slot.size()) return SlotState::kInvalid;
 
   const uint64_t epoch = GetU64(slot.data() + kEpochOffset);
@@ -269,14 +272,18 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
   ParsedSlot slot1;
   const SlotState state0 = ParseSlot(std::span(image).first(slot_bytes), slot0);
   const SlotState state1 = ParseSlot(std::span(image).subspan(slot_bytes), slot1);
+  // Falling back to the other slot would roll every offset back.
+  if (state0 == SlotState::kNewerVersion || state1 == SlotState::kNewerVersion) {
+    const bool first = state0 == SlotState::kNewerVersion;
+    return std::unexpected(
+        core::Error{core::ErrorCode::kFailedPrecondition,
+                    "offset checkpoint '" + path.string() + "' slot " + (first ? "0" : "1") +
+                        " has format version " + std::to_string((first ? slot0 : slot1).version) +
+                        "; this build reads version " + std::to_string(kFormatVersion)});
+  }
   const bool valid0 = state0 == SlotState::kValid;
   const bool valid1 = state1 == SlotState::kValid;
   if (!valid0 && !valid1) {
-    if (state0 == SlotState::kUnsupportedVersion || state1 == SlotState::kUnsupportedVersion) {
-      return std::unexpected(core::Error{
-          core::ErrorCode::kFailedPrecondition,
-          "offset checkpoint '" + path.string() + "' uses an unsupported format version"});
-    }
     ABYSS_LOG_CRITICAL("offset checkpoint has no valid slot", {"path", path.string()});
     return std::unexpected(
         core::Error{core::ErrorCode::kCorruption,
@@ -311,14 +318,28 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
   }
 
   // Re-index into config consumer order.
-  std::vector<uint64_t> persisted(chosen.encoded.size());
-  for (size_t c = 0; c < config.consumers.size(); ++c) {
-    const auto slot_index = static_cast<size_t>(
-        std::ranges::find(chosen.consumers, config.consumers[c]) - chosen.consumers.begin());
-    for (size_t s = 0; s < config.shard_count; ++s) {
-      persisted[(c * config.shard_count) + s] =
-          chosen.encoded[(slot_index * config.shard_count) + s];
+  const auto reindex = [&config](const ParsedSlot& slot) {
+    std::vector<uint64_t> out(config.consumers.size() * config.shard_count);
+    for (size_t c = 0; c < config.consumers.size(); ++c) {
+      const auto slot_index = static_cast<size_t>(
+          std::ranges::find(slot.consumers, config.consumers[c]) - slot.consumers.begin());
+      for (size_t s = 0; s < config.shard_count; ++s) {
+        out[(c * config.shard_count) + s] = slot.encoded[(slot_index * config.shard_count) + s];
+      }
     }
+    return out;
+  };
+  const std::vector<uint64_t> persisted = reindex(chosen);
+  // The other slot counts toward the floor only if it is a valid write
+  // for this same queue.
+  std::vector<uint64_t> floor(persisted.size(), 0);
+  const ParsedSlot& other = active == 0 ? slot1 : slot0;
+  auto other_sorted = other.consumers;
+  std::ranges::sort(other_sorted);
+  if (valid0 && valid1 && other.shard_count == config.shard_count &&
+      other_sorted == sorted_consumers) {
+    const std::vector<uint64_t> older = reindex(other);
+    for (size_t i = 0; i < floor.size(); ++i) floor[i] = std::min(persisted[i], older[i]);
   }
 
   ABYSS_LOG_INFO("offset checkpoint opened", {"path", path.string()},
@@ -326,22 +347,25 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
                  {"slot_bytes", static_cast<uint64_t>(slot_bytes)}, {"created", !exists});
   return std::unique_ptr<OffsetCheckpoint>(
       new OffsetCheckpoint(std::move(config.consumers), config.shard_count, std::move(*file),
-                           active, chosen.epoch, persisted));
+                           active, chosen.epoch, persisted, floor));
 }
 
 OffsetCheckpoint::OffsetCheckpoint(std::vector<core::ConsumerId> consumers, uint32_t shard_count,
                                    pfs::File file, size_t active_slot, uint64_t epoch,
-                                   std::span<const uint64_t> persisted)
+                                   std::span<const uint64_t> persisted,
+                                   std::span<const uint64_t> floor)
     : consumers_(std::move(consumers)),
       shard_count_(shard_count),
       slot_bytes_(SlotBytes(shard_count, consumers_.size())),
       persisted_(persisted.size()),
+      floor_(floor.size()),
       file_(std::move(file)),
       active_slot_(active_slot),
       epoch_(epoch),
       scratch_(slot_bytes_) {
   for (size_t i = 0; i < persisted.size(); ++i) {
     persisted_[i].store(persisted[i], std::memory_order_relaxed);
+    floor_[i].store(floor[i], std::memory_order_relaxed);
   }
 }
 
@@ -356,6 +380,13 @@ std::optional<core::SequenceId> OffsetCheckpoint::Get(core::ConsumerId consumer,
   const auto index = ConsumerIndex(consumer);
   if (!index.has_value() || shard >= shard_count_) return std::nullopt;
   return Decode(persisted_[(*index * shard_count_) + shard].load(std::memory_order_acquire));
+}
+
+std::optional<core::SequenceId> OffsetCheckpoint::ReclaimFloor(core::ConsumerId consumer,
+                                                               core::ShardId shard) const {
+  const auto index = ConsumerIndex(consumer);
+  if (!index.has_value() || shard >= shard_count_) return std::nullopt;
+  return Decode(floor_[(*index * shard_count_) + shard].load(std::memory_order_acquire));
 }
 
 core::Result<void> OffsetCheckpoint::Write(std::span<const uint64_t> encoded) {
@@ -375,7 +406,10 @@ core::Result<void> OffsetCheckpoint::Write(std::span<const uint64_t> encoded) {
 
   active_slot_ = target;
   epoch_ = epoch;
+  // The slot written over held the older of the two copies.
   for (size_t i = 0; i < encoded.size(); ++i) {
+    const uint64_t previous = persisted_[i].load(std::memory_order_relaxed);
+    floor_[i].store(std::min(previous, encoded[i]), std::memory_order_release);
     persisted_[i].store(encoded[i], std::memory_order_release);
   }
   return {};

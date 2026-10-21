@@ -38,17 +38,21 @@ queue:
   wal_path: /data/wal
   segment_size_bytes: 134217728
   # Largest single value accepted (default 64 MiB; up to 512 MiB). Must be at
-  # least ~1 KiB below segment_size_bytes so one value fits a fixed-size segment.
+  # least ~5 KiB below segment_size_bytes so one value fits a fixed-size segment.
   max_value_size_bytes: 67108864
+  # Physical logs on the data volume, a power of two <= hot.shard_count.
+  log_count: 1
+  # Per-shard offset ring slots, a power of two in 4096..16777216.
+  ring_entries: 65536
   min_retention_seconds: 86400
   # Committed-offset checkpoint cadence, 10..60000 ms. A crash replays at most
   # this much past the last checkpoint.
   offset_fsync_interval_ms: 1000
   # What an acknowledged write survives: process_crash or power_loss.
   durability: process_crash
-  # Unflushed bytes across shards before appends wait, 1 MiB..4 GiB.
+  # Unflushed bytes across logs before appends wait, 1 MiB..4 GiB.
   durability_window_bytes: 67108864
-  # Oldest unflushed entry's age per shard before appends wait, 10..60000 ms.
+  # Oldest unflushed entry's age per log before appends wait, 10..60000 ms.
   durability_window_ms: 1000
 
 hot_consumer:

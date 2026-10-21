@@ -3,13 +3,16 @@
 #include <io.h>
 #include <process.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "abyss/platform/fs.h"
+#include "abyss/platform/mapped_file.h"
 
 namespace abyss::platform::fs {
 
@@ -256,6 +259,80 @@ core::Result<DurabilityCapability> ProbeDurability(const std::filesystem::path& 
 }
 
 std::uint64_t ProcessId() noexcept { return static_cast<std::uint64_t>(::GetCurrentProcessId()); }
+
+core::Result<MappedFile> MappedFile::Map(const File& file, std::size_t size) {
+  if (!file.valid() || size == 0) {
+    return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument, "map: no file or size"});
+  }
+  auto file_size = FileSize(file);
+  if (!file_size.has_value()) return std::unexpected(file_size.error());
+  if (*file_size < size) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "map: file is smaller than the mapping"});
+  }
+  const auto wide = static_cast<std::uint64_t>(size);
+  const HANDLE mapping =
+      ::CreateFileMappingW(file.get(), nullptr, PAGE_READWRITE, static_cast<DWORD>(wide >> 32),
+                           static_cast<DWORD>(wide & 0xFFFFFFFFULL), nullptr);
+  if (mapping == nullptr) {
+    return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "CreateFileMapping"));
+  }
+  void* view = ::MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
+  if (view == nullptr) {
+    auto err = MakeWin32Error(core::ErrorCode::kInternal, "MapViewOfFile");
+    ::CloseHandle(mapping);
+    return std::unexpected(std::move(err));
+  }
+  return MappedFile(static_cast<std::byte*>(view), size, mapping);
+}
+
+MappedFile::~MappedFile() { Unmap(); }
+
+MappedFile::MappedFile(MappedFile&& other) noexcept
+    : data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      mapping_(std::exchange(other.mapping_, kInvalidOsFd)) {}
+
+MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
+  if (this != &other) {
+    Unmap();
+    data_ = std::exchange(other.data_, nullptr);
+    size_ = std::exchange(other.size_, 0);
+    mapping_ = std::exchange(other.mapping_, kInvalidOsFd);
+  }
+  return *this;
+}
+
+core::Result<void> MappedFile::WriteBack(std::size_t offset, std::size_t length) const {
+  if (data_ == nullptr || offset > size_ || length > size_ - offset) {
+    return std::unexpected(
+        core::Error{core::ErrorCode::kInvalidArgument, "write back: range outside the mapping"});
+  }
+  if (length == 0) return {};
+  if (::FlushViewOfFile(data_ + offset, length) == 0) {
+    return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "FlushViewOfFile"));
+  }
+  return {};
+}
+
+void MappedFile::Unmap() noexcept {
+  if (data_ == nullptr) return;
+  ::UnmapViewOfFile(data_);
+  if (mapping_ != kInvalidOsFd) ::CloseHandle(mapping_);
+  data_ = nullptr;
+  size_ = 0;
+  mapping_ = kInvalidOsFd;
+}
+
+core::Result<void> ZeroFill(const File& file, std::uint64_t size) {
+  constexpr std::size_t kChunk = std::size_t{1} << 20;
+  static const std::vector<std::byte> zeros(kChunk);
+  for (std::uint64_t offset = 0; offset < size; offset += kChunk) {
+    const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, size - offset));
+    if (auto w = Pwrite(file, zeros.data(), n, offset); !w.has_value()) return w;
+  }
+  return Ftruncate(file, size);
+}
 
 namespace testing {
 

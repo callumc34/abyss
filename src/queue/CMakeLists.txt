@@ -1,15 +1,17 @@
 add_library(abyss_queue
   wal_queue.cpp
-  segment.cpp
+  wal_scan.cpp
+  shard_stream.cpp
   group_commit.cpp
   crc32c.cpp
-  wal_entry.cpp
-  segment_header.cpp
+  entry_payload.cpp
+  frame.cpp
+  log.cpp
+  segment_header_v2.cpp
   durability_window.cpp
   memory_offset_store.cpp
   offset_checkpoint.cpp
   segment_reaper.cpp
-  shard_state.cpp
   pending_append.cpp
 )
 add_library(abyss::queue ALIAS abyss_queue)

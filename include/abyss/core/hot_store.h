@@ -60,7 +60,10 @@ class HotStore : public Reader {
   virtual void SetReplayMode(bool /*replaying*/) {}
 
   virtual Result<MemoryStats> Stats() = 0;
-  virtual Result<void> Wipe() = 0;
+  // Clears one shard. A Flush reaches every shard's stream, and each
+  // shard's consumer wipes only its own, so one shard's Flush never
+  // drops another's later writes.
+  virtual Result<void> Wipe(ShardId shard) = 0;
 };
 
 }  // namespace abyss::core

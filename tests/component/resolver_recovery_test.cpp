@@ -25,6 +25,7 @@
 #include "abyss/queue/wal_queue.h"
 #include "mock_cold_store.h"
 #include "temp_dir.h"
+#include "wal_power_loss.h"
 
 namespace abyss::consumer {
 namespace {
@@ -58,7 +59,7 @@ class ResolverRecoveryTest : public ::testing::Test {
   queue::WalConfig Config() const {
     return queue::WalConfig{
         .wal_path = dir_->String(),
-        .segment_size_bytes = 4096,
+        .segment_size_bytes = 8192,
         .shard_count = 1,
         .durability = core::Durability::kProcessCrash,
         .min_retention = 1s,
@@ -103,7 +104,7 @@ class ResolverRecoveryTest : public ::testing::Test {
 class FlushStall {
  public:
   queue::FlushHook Hook() const {
-    return [state = state_](core::ShardId) -> core::Result<void> {
+    return [state = state_](uint32_t) -> core::Result<void> {
       std::unique_lock lock(state->mu);
       state->cv.wait(lock, [&state] { return state->released; });
       return {};
@@ -160,11 +161,11 @@ TEST_F(ResolverRecoveryTest, ReplayCommitsPastRecoveredConditionalAndResolved) {
   EXPECT_EQ(resolver.GetSnapshot().commit_failures, 0U);
 }
 
-// The same pair, never flushed, then a power loss: the segment keeps only
+// The same pair, never flushed, then a power loss: the log keeps only
 // what the last flush covered. X and Y vanish together, and replay of
 // the shortened log commits nothing.
 TEST_F(ResolverRecoveryTest, PowerLossDropsAnUnflushedConditionalAndResolvedTogether) {
-  queue::FlushedExtent flushed;
+  queue::DurableExtent flushed;
   {
     auto crashed = queue::WalQueue::Open(Config());
     ASSERT_TRUE(crashed.has_value()) << crashed.error().message();
@@ -174,11 +175,11 @@ TEST_F(ResolverRecoveryTest, PowerLossDropsAnUnflushedConditionalAndResolvedToge
     ASSERT_TRUE(x.has_value());
     ASSERT_TRUE((*crashed)->Append(0, ResolvedFor(x->seq)).has_value());
     ASSERT_FALSE((*crashed)->AwaitDurable(0, 0, core::Durability::kPowerLoss, 0ms).value());
-    flushed = (*crashed)->FlushedExtentForTesting(0);
+    flushed = (*crashed)->DurableExtentForTesting(0);
     (*crashed)->SkipFinalFlushForTesting();
     stall.Release();
   }
-  std::filesystem::resize_file(flushed.path, flushed.offset);
+  testing::SimulatePowerLoss(flushed);
 
   auto reopened = queue::WalQueue::Open(Config());
   ASSERT_TRUE(reopened.has_value()) << reopened.error().message();

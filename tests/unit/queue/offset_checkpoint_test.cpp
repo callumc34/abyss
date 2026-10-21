@@ -7,11 +7,14 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "abyss/core/types.h"
 #include "abyss/platform/fs.h"
+#include "binary_io.h"
+#include "crc32c.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -77,6 +80,19 @@ class OffsetCheckpointTest : public ::testing::Test {
     ASSERT_TRUE(pfs::Pwrite(*f, &byte, 1, offset).has_value());
   }
 
+  // Sets slot 0's format version, and with `reseal` its CRC too, as a
+  // newer build keeping this layout would write it.
+  void SetSlot0Version(uint32_t version, bool reseal) const {
+    constexpr size_t kPayload = 32 + (4 * kConsumers.size()) + (16 * kConsumers.size() * kShards);
+    auto f = pfs::Open(FilePath(), {.mode = pfs::OpenMode::kReadWrite});
+    ASSERT_TRUE(f.has_value()) << f.error().message();
+    std::array<std::byte, kPayload + sizeof(uint32_t)> slot{};
+    ASSERT_EQ(pfs::Pread(*f, slot.data(), slot.size(), 0).value_or(0), slot.size());
+    binary::StoreLE(slot.data() + 8, version);
+    if (reseal) binary::StoreLE(slot.data() + kPayload, Crc32c(std::span(slot).first(kPayload)));
+    ASSERT_TRUE(pfs::Pwrite(*f, slot.data(), slot.size(), 0).has_value());
+  }
+
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   std::unique_ptr<testing::TempDir> dir_;
 };
@@ -138,6 +154,95 @@ TEST_F(OffsetCheckpointTest, CorruptNewestSlotFallsBackToThePreviousOne) {
   EXPECT_EQ(reopened->epoch(), 2U);
   ExpectMatches(*reopened, Pattern(10));
   EXPECT_EQ(slot_bytes, OffsetCheckpoint::kBlockSize);
+}
+
+// On a downgrade the older slot is a valid write, but taking it would
+// roll every committed offset back without a word.
+TEST_F(OffsetCheckpointTest, ANewerVersionSlotRefusesRatherThanFallingBack) {
+  {
+    auto ckpt = OpenOrDie();
+    ASSERT_NE(ckpt, nullptr);
+    ASSERT_TRUE(ckpt->Write(Pattern(10)).has_value());  // epoch 2, slot 1
+    ASSERT_TRUE(ckpt->Write(Pattern(20)).has_value());  // epoch 3, slot 0
+  }
+  SetSlot0Version(OffsetCheckpoint::kFormatVersion + 1, true);
+
+  auto reopened = Open();
+  ASSERT_FALSE(reopened.has_value());
+  EXPECT_EQ(reopened.error().code(), core::ErrorCode::kFailedPrecondition);
+  const std::string& message = reopened.error().message();
+  EXPECT_NE(message.find(FilePath().string()), std::string::npos) << message;
+  EXPECT_NE(message.find("format version " + std::to_string(OffsetCheckpoint::kFormatVersion + 1)),
+            std::string::npos)
+      << message;
+  EXPECT_NE(message.find("reads version " + std::to_string(OffsetCheckpoint::kFormatVersion)),
+            std::string::npos)
+      << message;
+}
+
+// A newer version may move its CRC, so this build cannot tell a torn
+// newer slot from a valid one.
+TEST_F(OffsetCheckpointTest, ANewerVersionSlotRefusesWhateverItsCrc) {
+  {
+    auto ckpt = OpenOrDie();
+    ASSERT_NE(ckpt, nullptr);
+    ASSERT_TRUE(ckpt->Write(Pattern(10)).has_value());
+    ASSERT_TRUE(ckpt->Write(Pattern(20)).has_value());
+  }
+  SetSlot0Version(OffsetCheckpoint::kFormatVersion + 1, false);
+
+  auto reopened = Open();
+  ASSERT_FALSE(reopened.has_value());
+  EXPECT_EQ(reopened.error().code(), core::ErrorCode::kFailedPrecondition);
+}
+
+TEST_F(OffsetCheckpointTest, AnOlderVersionThanAnyIsATornSlot) {
+  {
+    auto ckpt = OpenOrDie();
+    ASSERT_NE(ckpt, nullptr);
+    ASSERT_TRUE(ckpt->Write(Pattern(10)).has_value());
+    ASSERT_TRUE(ckpt->Write(Pattern(20)).has_value());
+  }
+  SetSlot0Version(0, true);
+
+  auto reopened = OpenOrDie();
+  ASSERT_NE(reopened, nullptr);
+  EXPECT_EQ(reopened->epoch(), 2U);
+  ExpectMatches(*reopened, Pattern(10));
+}
+
+// Retention may reclaim only what both slots hold: the floor is the
+// lower of the two, and nothing while one slot is not a valid write.
+TEST_F(OffsetCheckpointTest, TheReclaimFloorIsWhatBothSlotsHold) {
+  const auto expect_floor = [](const OffsetCheckpoint& ckpt, const std::vector<uint64_t>& encoded) {
+    for (size_t c = 0; c < kConsumers.size(); ++c) {
+      for (uint32_t s = 0; s < kShards; ++s) {
+        EXPECT_EQ(ckpt.ReclaimFloor(kConsumers.at(c), s),
+                  OffsetCheckpoint::Decode(encoded[(c * kShards) + s]))
+            << "consumer " << kConsumers.at(c) << " shard " << s;
+      }
+    }
+  };
+  const std::vector<uint64_t> none(kConsumers.size() * kShards, 0);
+  {
+    auto ckpt = OpenOrDie();
+    ASSERT_NE(ckpt, nullptr);
+    expect_floor(*ckpt, none);
+    ASSERT_TRUE(ckpt->Write(Pattern(10)).has_value());  // epoch 2, slot 1
+    expect_floor(*ckpt, none);
+    ASSERT_TRUE(ckpt->Write(Pattern(20)).has_value());  // epoch 3, slot 0
+    expect_floor(*ckpt, Pattern(10));
+  }
+  {
+    auto reopened = OpenOrDie();
+    ASSERT_NE(reopened, nullptr);
+    expect_floor(*reopened, Pattern(10));
+  }
+  FlipByte(100);  // inside slot 0's entries
+  auto damaged = OpenOrDie();
+  ASSERT_NE(damaged, nullptr);
+  ExpectMatches(*damaged, Pattern(10));
+  expect_floor(*damaged, none);
 }
 
 TEST_F(OffsetCheckpointTest, CorruptOlderSlotIsIgnored) {
