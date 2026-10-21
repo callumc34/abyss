@@ -235,9 +235,8 @@ TEST(WaitListTest, AWokenWaiterThatPassesOnRegisterWakesTheNext) {
   list.HandOff();
   ASSERT_EQ(log, (std::vector<size_t>{0}));
 
-  auto passed = list.Register(waiters.at(0), room);
-  ASSERT_TRUE(passed.has_value());
-  EXPECT_TRUE(passed->has_value());
+  const auto passed = list.Register(waiters.at(0), room);
+  EXPECT_TRUE(passed.has_value() && passed->has_value());
   EXPECT_EQ(log, (std::vector<size_t>{0, 1}));
 
   LoggingWaiter fresh(3, &log);
