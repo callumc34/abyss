@@ -67,6 +67,7 @@ size_t PayloadBytes(size_t shard_count, size_t consumer_count) {
 }
 
 struct ParsedSlot {
+  uint32_t version = 0;
   uint64_t epoch = 0;
   uint32_t shard_count = 0;
   std::vector<core::ConsumerId> consumers;
@@ -74,7 +75,7 @@ struct ParsedSlot {
   std::vector<uint64_t> encoded;
 };
 
-enum class SlotState : uint8_t { kValid, kInvalid, kUnsupportedVersion };
+enum class SlotState : uint8_t { kValid, kInvalid, kNewerVersion };
 
 SlotState ParseSlot(std::span<const std::byte> slot, ParsedSlot& out) {
   if (slot.size() < kHeaderBytes + kCrcBytes) return SlotState::kInvalid;
@@ -82,9 +83,11 @@ SlotState ParseSlot(std::span<const std::byte> slot, ParsedSlot& out) {
       0) {
     return SlotState::kInvalid;
   }
-  if (GetU32(slot.data() + kVersionOffset) != OffsetCheckpoint::kFormatVersion) {
-    return SlotState::kUnsupportedVersion;
-  }
+  // A newer version may move the CRC, so a torn newer slot cannot be
+  // told from a valid one; either means a newer writer was here.
+  out.version = GetU32(slot.data() + kVersionOffset);
+  if (out.version > OffsetCheckpoint::kFormatVersion) return SlotState::kNewerVersion;
+  if (out.version != OffsetCheckpoint::kFormatVersion) return SlotState::kInvalid;
   if (GetU32(slot.data() + kSlotBytesOffset) != slot.size()) return SlotState::kInvalid;
 
   const uint64_t epoch = GetU64(slot.data() + kEpochOffset);
@@ -269,14 +272,18 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
   ParsedSlot slot1;
   const SlotState state0 = ParseSlot(std::span(image).first(slot_bytes), slot0);
   const SlotState state1 = ParseSlot(std::span(image).subspan(slot_bytes), slot1);
+  // Falling back to the other slot would roll every offset back.
+  if (state0 == SlotState::kNewerVersion || state1 == SlotState::kNewerVersion) {
+    const bool first = state0 == SlotState::kNewerVersion;
+    return std::unexpected(
+        core::Error{core::ErrorCode::kFailedPrecondition,
+                    "offset checkpoint '" + path.string() + "' slot " + (first ? "0" : "1") +
+                        " has format version " + std::to_string((first ? slot0 : slot1).version) +
+                        "; this build reads version " + std::to_string(kFormatVersion)});
+  }
   const bool valid0 = state0 == SlotState::kValid;
   const bool valid1 = state1 == SlotState::kValid;
   if (!valid0 && !valid1) {
-    if (state0 == SlotState::kUnsupportedVersion || state1 == SlotState::kUnsupportedVersion) {
-      return std::unexpected(core::Error{
-          core::ErrorCode::kFailedPrecondition,
-          "offset checkpoint '" + path.string() + "' uses an unsupported format version"});
-    }
     ABYSS_LOG_CRITICAL("offset checkpoint has no valid slot", {"path", path.string()});
     return std::unexpected(
         core::Error{core::ErrorCode::kCorruption,
