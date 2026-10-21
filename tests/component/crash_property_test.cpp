@@ -196,9 +196,18 @@ class CrashTest : public PropertyHarness {
   queue::FlushHook GateHook() {
     return [this](uint32_t) -> core::Result<void> {
       std::unique_lock lock(gate_mu_);
+      ++at_gate_;
+      gate_cv_.notify_all();
       gate_cv_.wait(lock, [this] { return !gate_closed_; });
+      --at_gate_;
       return {};
     };
+  }
+  // With the gate closed: waits, bounded, until a flush stops at it, so
+  // none is past it and the durable extent holds still.
+  bool AwaitFlushAtGate() {
+    std::unique_lock lock(gate_mu_);
+    return gate_cv_.wait_for(lock, std::chrono::seconds(5), [this] { return at_gate_ > 0; });
   }
 
   // Each shard's retained log, as recovery left it.
@@ -225,26 +234,56 @@ class CrashTest : public PropertyHarness {
       for (auto& entry : *read) {
         if (const auto pos = queue_->PositionForTesting(shard, entry.seq)) {
           positions_[{shard, entry.seq}] = *pos;
+          last_position_ = std::max(last_position_, *pos);
         }
         log.push_back(std::move(entry));
       }
     }
   }
 
+  uint64_t FrameSpace() const { return options_.segment_size_bytes - 4096; }
+
   // Each free-pool file's bytes, by inode: what a recycled segment's
-  // lost pages revert to.
-  void SnapshotFreeFiles() {
+  // lost pages revert to. With `sealed`, each filled segment's too, as
+  // it will enter the pool, so a recycling caught only as a spare
+  // counts. A file gone since was unlinked, and a new file may reuse
+  // its inode, so it is forgotten.
+  void SnapshotFreeFiles(bool sealed = false) {
     const auto dir = dir_.Sub(options_.run + "wal") / "log-0000";
+    const uint64_t writing = last_position_ / FrameSpace();
+    std::set<uint64_t> present;
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
       const std::string name = entry.path().filename().string();
-      if (!name.starts_with("free-")) continue;
       const auto inode = InodeOf(entry.path());
-      if (!inode.has_value() || free_files_.contains(*inode)) continue;
+      if (!inode.has_value()) continue;
+      present.insert(*inode);
+      const bool filled = sealed && !name.starts_with("free-") &&
+                          entry.path().extension() == ".seg" &&
+                          std::stoull(entry.path().stem().string()) < writing;
+      if ((!name.starts_with("free-") && !filled) || free_files_.contains(*inode)) continue;
       std::ifstream in(entry.path(), std::ios::binary);
       std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
       if (!bytes.empty()) free_files_[*inode] = std::move(bytes);
     }
+    if (ec) return;
+    std::erase_if(free_files_,
+                  [&present](const auto& file) { return !present.contains(file.first); });
+  }
+
+  // Segments seen in the free pool that are now at or past `ordinal`.
+  size_t RecycledFrom(uint64_t ordinal) {
+    const auto dir = dir_.Sub(options_.run + "wal") / "log-0000";
+    size_t ahead = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.starts_with("free-") || entry.path().extension() != ".seg") continue;
+      if (std::stoull(entry.path().stem().string()) < ordinal) continue;
+      const auto inode = InodeOf(entry.path());
+      if (inode.has_value() && free_files_.contains(*inode)) ++ahead;
+    }
+    return ahead;
   }
 
   // A file's identity across renames; none on Windows, where recycled
@@ -261,22 +300,43 @@ class CrashTest : public PropertyHarness {
 
   // Cold takes what it can as clients run: absorbs at the ack class,
   // flushes and checkpoints, and persists its commits so retention
-  // reclaims and recycles segments.
+  // reclaims and recycles segments. While recycling_ is set it does all
+  // of that every round, until two recycled segments are ahead, then
+  // stops flushes.
   void Drain(const std::atomic<bool>& stop, uint64_t seed) {
     Rng rng(seed);
     while (!stop.load()) {
+      const bool recycling = recycling_.load();
       Tail();
       for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
         auto& consumer = pool_->ConsumerFor(shard);
-        if (consumer.LatestDrainedSeq() + 1 <
-            queue_->DurableEnd(shard, queue_->AckDurability()).value_or(0)) {
-          consumer.DrainWithBatch(1 + rng.Below(64));
+        const core::SequenceId next = consumer.LatestDrainedSeq() + 1;
+        if (next < queue_->DurableEnd(shard, queue_->AckDurability()).value_or(0)) {
+          // Recycling, cold takes all that is tailed, so retention keeps
+          // up with the clients; never more, so it reclaims nothing
+          // untailed.
+          const core::SequenceId tailed = core::kFirstSeq + full_log_.at(shard).size();
+          size_t batch = 1 + rng.Below(64);
+          if (recycling) batch = tailed > next ? tailed - next : 0;
+          consumer.DrainWithBatch(batch);
         }
-        if (rng.Chance(0.3)) (void)consumer.FlushUnscheduled();
+        if (recycling || rng.Chance(0.3)) (void)consumer.FlushUnscheduled();
       }
-      if (rng.Chance(0.2)) {
+      if (recycling || rng.Chance(0.2)) {
         EXPECT_TRUE(queue_->FlushOffsets().has_value());
-        SnapshotFreeFiles();
+        SnapshotFreeFiles(recycling);
+        // Two past the segment being written, then, with flushes
+        // stopped, past the durable extent: a power loss reverts their
+        // lost pages to old frames.
+        if (recycling && RecycledFrom(last_position_ / FrameSpace()) >= 2) {
+          Gate(true);
+          const auto extent = std::filesystem::path(queue_->DurableExtentForTesting(0).path);
+          if (AwaitFlushAtGate() && RecycledFrom(std::stoull(extent.stem().string())) >= 2) {
+            recycled_ = true;
+          } else {
+            Gate(false);
+          }
+        }
       }
       std::this_thread::sleep_for(std::chrono::microseconds(rng.Between(100, 800)));
     }
@@ -305,7 +365,9 @@ class CrashTest : public PropertyHarness {
     OpenAt(options, 1'700'000'000'000);
     full_log_.assign(options.shards, {});
     positions_.clear();
+    last_position_ = 0;
     free_files_.clear();
+    recycled_ = false;
     queue_->SetFlushHookForTesting(GateHook());
 
     std::vector<Call> calls;
@@ -366,6 +428,27 @@ class CrashTest : public PropertyHarness {
       (void)Run({"DEL", KeyName(k)});
       (void)Run({"SADD", KeyName(k), "edge"});
     }
+    // Some power_loss runs, however slow the host, crash only once
+    // reclaimed segments are back ahead of the durable extent: the
+    // drainer stops flushes as it sees them. At process_crash the
+    // clients can outrun cold, which recycling needs to keep up.
+    if (seed % 3 == 0 && options.durability == core::Durability::kPowerLoss &&
+        InodeOf(dir_.Sub(options_.run + "wal")).has_value()) {
+      recycling_ = true;
+      const auto driven = std::chrono::steady_clock::now();
+      while (!recycled_.load() &&
+             std::chrono::steady_clock::now() < driven + std::chrono::seconds(30)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      recycling_ = false;
+      EXPECT_TRUE(recycled_.load()) << "seed " << seed << ": no segment recycled in 30 s";
+      std::cout << "[crash] seed=" << seed << ": recycled in "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - driven)
+                       .count()
+                << " ms\n"
+                << std::flush;
+    }
     Gate(true);
     edge = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(rng.Between(20, 60)));
@@ -409,6 +492,8 @@ class CrashTest : public PropertyHarness {
           return it->second.substr(from, to - from);
         });
     if (::testing::Test::HasFatalFailure()) return {.ok = false};
+    std::cout << "[crash] seed=" << seed << ": " << recycled << " lost pages of recycled segments\n"
+              << std::flush;
 
     auto restarted = RestartAt();
     if (!restarted.has_value()) {
@@ -765,9 +850,14 @@ class CrashTest : public PropertyHarness {
   std::mutex gate_mu_;
   std::condition_variable gate_cv_;
   bool gate_closed_ = false;
+  int at_gate_ = 0;
   std::vector<std::vector<core::QueueEntry>> full_log_;
   std::map<std::pair<core::ShardId, core::SequenceId>, uint64_t> positions_;
+  // The furthest of positions_.
+  uint64_t last_position_ = 0;
   std::map<uint64_t, std::string> free_files_;
+  std::atomic<bool> recycling_{false};
+  std::atomic<bool> recycled_{false};
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
