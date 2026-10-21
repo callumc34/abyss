@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <mutex>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -303,6 +305,45 @@ bool DeltaRemoved(const CompactedState& delta, KeyType type, const std::string& 
 
 }  // namespace
 
+// On the joining call's stack. The leader unlinks every joiner under
+// the flights' lock, then lands the flight on each outside it. Land
+// notifies under mu_, and the joiner is destroyed only after relocking
+// mu_ and seeing the flight, so no leader is still inside cv_ by then.
+class Loader::Joiner {
+ public:
+  // A Flight copy throws only on allocation, and an OOM while landing
+  // may terminate.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
+  void Land(const Flight& flight) noexcept {
+    const std::scoped_lock lock(mu_);
+    flight_ = flight;
+    cv_.notify_one();
+  }
+
+  bool WaitUntil(core::SteadyTime deadline) {
+    std::unique_lock lock(mu_);
+    return cv_.wait_until(lock, deadline, [this] { return flight_.has_value(); });
+  }
+
+  Flight Take() {
+    std::unique_lock lock(mu_);
+    cv_.wait(lock, [this] { return flight_.has_value(); });
+    return std::move(flight_).value_or(Flight{});
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  // Under the flights' lock.
+  Joiner* prev = nullptr;
+  Joiner* next = nullptr;
+  bool linked = false;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::optional<Flight> flight_;
+};
+
 hot::LoadResult MergeLoad(std::optional<core::ColdKeyState> base, const CompactedState* delta) {
   if (delta == nullptr) return Loaded(std::move(base));
   return Loaded(MergeState(std::move(base), *delta));
@@ -346,40 +387,44 @@ core::Result<Loader::Shared> Loader::Fly(core::ShardId shard, std::string_view k
   // finds the key non-resident after such a write sees a later horizon
   // and loads afresh: no flight hands out state older than a write
   // that was resident when the caller missed.
-  const std::tuple<std::string, KeyType, core::SequenceId> id{std::string(key), type,
-                                                              hot_.Drained(shard)};
-  std::promise<Flight> leading;
-  std::shared_future<Flight> flight;
+  const FlightId id{std::string(key), type, hot_.Drained(shard)};
+  Joiner joiner;
   bool leader = false;
   {
     const std::scoped_lock lock(flights.mu);
     auto [it, started] = flights.loading.try_emplace(id);
     if (started) {
-      it->second.done = leading.get_future().share();
       leader = true;
     } else {
-      ++it->second.waiters;
+      // Found and joined in one hold of the lock the leader lands under.
+      Joiner*& head = it->second.joiners;
+      joiner.next = head;
+      if (head != nullptr) head->prev = &joiner;
+      head = &joiner;
+      joiner.linked = true;
       ++joins_;
     }
-    flight = it->second.done;
   }
   if (!leader) {
-    if (flight.wait_until(deadline) != std::future_status::ready) {
+    if (join_hook_) join_hook_();
+    if (!joiner.WaitUntil(deadline) && Unjoin(flights, id, joiner)) {
       return std::unexpected(
           core::Error{core::ErrorCode::kTimeout, "timed out awaiting another load of the key"});
     }
-    if (source != nullptr) *source = flight.get().source;
-    return flight.get().result;
+    Flight flight = joiner.Take();
+    if (source != nullptr) *source = flight.source;
+    return std::move(flight.result);
   }
 
   Flight done;
   auto loaded = LoadTyped(shard, key, type, deadline, &done.source);
-  size_t waiters = 0;
+  Joiner* joiners = nullptr;
   {
-    // Erased with its waiters counted, so none joins after.
+    // Erased with its joiners taken, so none joins after.
     const std::scoped_lock lock(flights.mu);
     const auto it = flights.loading.find(id);
-    waiters = it->second.waiters;
+    joiners = it->second.joiners;
+    for (Joiner* taken = joiners; taken != nullptr; taken = taken->next) taken->linked = false;
     flights.loading.erase(it);
   }
   if (!loaded.has_value()) {
@@ -387,13 +432,49 @@ core::Result<Loader::Shared> Loader::Fly(core::ShardId shard, std::string_view k
   } else if (owned == nullptr) {
     done.result = std::make_shared<const hot::LoadResult>(*std::move(loaded));
   } else {
-    // The caller keeps its own; waiters, if any, share a copy.
-    if (waiters > 0) done.result = std::make_shared<const hot::LoadResult>(*loaded);
+    // The caller keeps its own; joiners, if any, share a copy.
+    if (joiners != nullptr) done.result = std::make_shared<const hot::LoadResult>(*loaded);
     *owned = *std::move(loaded);
   }
-  leading.set_value(done);
+  while (joiners != nullptr) {
+    // Read first: once landed, a joiner may be gone.
+    Joiner* const next = joiners->next;
+    joiners->Land(done);
+    joiners = next;
+  }
   if (source != nullptr) *source = done.source;
   return std::move(done.result);
+}
+
+bool Loader::Unjoin(Flights& flights, const FlightId& id, Joiner& joiner) {
+  const std::scoped_lock lock(flights.mu);
+  if (!joiner.linked) return false;
+  if (joiner.prev != nullptr) {
+    joiner.prev->next = joiner.next;
+  } else {
+    flights.loading.at(id).joiners = joiner.next;
+  }
+  if (joiner.next != nullptr) joiner.next->prev = joiner.prev;
+  joiner.linked = false;
+  return true;
+}
+
+std::size_t Loader::FlightsForTesting(core::ShardId shard) const {
+  const Flights& flights = *flights_.at(shard);
+  const std::scoped_lock lock(flights.mu);
+  return flights.loading.size();
+}
+
+std::size_t Loader::JoinersForTesting(core::ShardId shard) const {
+  const Flights& flights = *flights_.at(shard);
+  const std::scoped_lock lock(flights.mu);
+  std::size_t count = 0;
+  for (const auto& flight : flights.loading) {
+    for (const Joiner* joiner = flight.second.joiners; joiner != nullptr; joiner = joiner->next) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 core::Result<hot::LoadResult> Loader::LoadTyped(core::ShardId shard, std::string_view key,

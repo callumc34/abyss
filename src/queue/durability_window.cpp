@@ -68,16 +68,13 @@ core::Result<void> DurabilityWindow::Admit(const LogAge& age, Clock::time_point 
         core::Error{core::ErrorCode::kResourceExhausted, "WAL durability window full"});
   }
   waits_.Increment();
-
-  std::unique_lock lock(mu_);
-  waiters_.fetch_add(1, std::memory_order_seq_cst);
-  const bool admitted = cv_.wait_until(
-      lock, deadline, [this, &age] ABYSS_REQUIRES(mu_) { return stopped_ || Admissible(age); });
-  waiters_.fetch_sub(1, std::memory_order_relaxed);
-  if (stopped_) {
+  if (admit_hook_) admit_hook_();
+  auto admitted = admission_.Await([this, &age] { return stopped() || Admissible(age); }, deadline);
+  if (stopped()) {
     return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
   }
-  if (admitted) return {};
+  if (admitted.has_value()) return {};
+  if (admitted.error().code() != core::ErrorCode::kTimeout) return admitted;
 
   rejections_.Increment();
   return std::unexpected(core::Error{
@@ -92,20 +89,16 @@ void DurabilityWindow::Add(uint64_t bytes) noexcept {
   unflushed_bytes_.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+// The flusher moved the age, then the bytes, seq_cst, before Notify
+// loads the waiter count.
 void DurabilityWindow::Release(uint64_t bytes) noexcept {
   unflushed_bytes_.fetch_sub(bytes, std::memory_order_seq_cst);
-  // Pairs with the waiter's increment before its predicate check.
-  if (waiters_.load(std::memory_order_seq_cst) == 0) return;
-  const std::scoped_lock lock(mu_);
-  cv_.notify_all();
+  admission_.Notify();
 }
 
 void DurabilityWindow::Shutdown() {
-  {
-    const std::scoped_lock lock(mu_);
-    stopped_ = true;
-  }
-  cv_.notify_all();
+  stopped_.store(true, std::memory_order_seq_cst);
+  admission_.FailAll(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
 }
 
 }  // namespace abyss::queue

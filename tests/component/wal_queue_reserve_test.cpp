@@ -172,9 +172,8 @@ TEST_P(FreshShardTest, EndsStartAtTheFirstSeqAndTheFirstWriteResolves) {
   auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 1, .entries = b}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   EXPECT_EQ(reserved->ranges().front().first, core::kFirstSeq);
-  for (ShardDurable& part : queue_->Complete(std::move(*reserved))) {
-    ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
-    EXPECT_TRUE(part.durable.get().has_value());
+  for (const ReservedRange& range : queue_->Complete(std::move(*reserved))) {
+    EXPECT_TRUE(queue_->AwaitDurable(range.shard, range.last, GetParam(), 10s).value());
   }
   for (const core::ShardId shard : {0U, 1U}) {
     SCOPED_TRACE(shard);
@@ -206,7 +205,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchIsPowerDurableOnlyOnceItsLastFrameIs
   auto in_batch = std::make_shared<Latch>();
   auto finish_batch = std::make_shared<Latch>();
   auto flushes = std::make_shared<std::atomic<int>>(0);
-  std::future<DurableFutures> batch;
+  std::future<std::vector<ReservedRange>> batch;
   const abyss::testing::OnExit release([=] {
     first_flush->Open();
     finish_batch->Open();
@@ -240,7 +239,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchIsPowerDurableOnlyOnceItsLastFrameIs
     auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = a},
                                                ShardEntries{.shard = 1, .entries = b},
                                                ShardEntries{.shard = 2, .entries = c}});
-    if (!reserved.has_value()) return DurableFutures{};
+    if (!reserved.has_value()) return std::vector<ReservedRange>{};
     return queue_->Complete(std::move(*reserved));
   });
   ASSERT_TRUE(in_batch->Wait());
@@ -252,21 +251,20 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchIsPowerDurableOnlyOnceItsLastFrameIs
   finish_batch->Open();
   ASSERT_TRUE(stalled->Wait());
   ASSERT_EQ(batch.wait_for(10s), std::future_status::ready);
-  DurableFutures durable = batch.get();
+  const std::vector<ReservedRange> durable = batch.get();
   ASSERT_EQ(durable.size(), 3U);
-  for (ShardDurable& part : durable) {
+  for (const ReservedRange& part : durable) {
     SCOPED_TRACE(part.shard);
     EXPECT_EQ(queue_->DurableEnd(part.shard, kProcess).value(), kFirst + 1);
     EXPECT_EQ(queue_->DurableEnd(part.shard, kPower).value(), kFirst);
-    EXPECT_EQ(part.durable.wait_for(0s), std::future_status::timeout);
+    EXPECT_FALSE(queue_->AwaitDurable(part.shard, part.last, kPower, 0ms).value());
   }
   EXPECT_FALSE(queue_->AwaitDurable(0, kFirst, kPower, 20ms).value());
 
   unstall->Open();
-  for (ShardDurable& part : durable) {
+  for (const ReservedRange& part : durable) {
     SCOPED_TRACE(part.shard);
-    ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
-    EXPECT_TRUE(part.durable.get().has_value());
+    EXPECT_TRUE(queue_->AwaitDurable(part.shard, part.last, kPower, 10s).value());
     EXPECT_EQ(queue_->DurableEnd(part.shard, kPower).value(), kFirst + 1);
   }
 }
@@ -289,8 +287,8 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
                                              ShardEntries{.shard = 1, .entries = b},
                                              ShardEntries{.shard = 3, .entries = d}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
-  for (ShardDurable& part : queue_->Complete(std::move(*reserved))) {
-    ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
+  for (const ReservedRange& range : queue_->Complete(std::move(*reserved))) {
+    ASSERT_TRUE(queue_->AwaitDurable(range.shard, range.last, kPower, 10s).value());
   }
   for (core::ShardId shard = 0; shard < 4; ++shard) {
     ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, kFirst));
@@ -325,8 +323,8 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
   ASSERT_TRUE(again.has_value()) << again.error().message();
   EXPECT_EQ(again->ranges()[0].first, kFirst + 1);
   EXPECT_EQ(again->ranges()[1].first, kFirst + 1);
-  for (ShardDurable& part : queue_->Complete(std::move(*again))) {
-    ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready);
+  for (const ReservedRange& range : queue_->Complete(std::move(*again))) {
+    ASSERT_TRUE(queue_->AwaitDurable(range.shard, range.last, kPower, 10s).value());
   }
 
   // Recovery's per-shard seq check holds across the new batch.

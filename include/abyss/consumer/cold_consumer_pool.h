@@ -51,6 +51,9 @@ class ColdConsumerPool : public CompactionBufferRouter {
   std::optional<CompactedState> Snapshot(core::ShardId shard, std::string_view key) const override;
   bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                          std::chrono::milliseconds timeout) override;
+  std::optional<core::Result<void>> WhenDrained(core::ShardId shard,
+                                                core::SeqWaiterNode& node) override;
+  bool CancelDrained(core::ShardId shard, core::SeqWaiterNode& node) noexcept override;
 
   void Start();
   // Abrupt stop: RequestStop + Join on every consumer. The in-memory cold

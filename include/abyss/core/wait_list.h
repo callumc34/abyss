@@ -143,7 +143,10 @@ class WaitList {
   // so it strands no one where notify_all would have woken them. A
   // wake collected just past the deadline is still re-checked, so it
   // can return ok then.
-  Result<void> Await(const std::function<bool()>& condition, Duration timeout);
+  Result<void> Await(const std::function<bool()>& condition, SteadyTime deadline);
+  Result<void> Await(const std::function<bool()>& condition, Duration timeout) {
+    return Await(condition, SteadyClock::now() + timeout);
+  }
 
   size_t size() const noexcept { return count_.load(std::memory_order_relaxed); }
 

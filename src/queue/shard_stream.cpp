@@ -5,6 +5,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include "abyss/core/fatal.h"
@@ -23,6 +24,8 @@ constexpr uint64_t kIndexStride = uint64_t{64} << 10;
 constexpr std::size_t kReadReserve = 256;
 // Keeps a thread's encode buffer from pinning a large value's memory.
 constexpr auto kSpinFor = std::chrono::microseconds(2);
+// Past this a publish wait parks rather than yields.
+constexpr auto kYieldFor = std::chrono::microseconds(100);
 
 thread_local std::vector<uint32_t> t_sizes;
 
@@ -33,6 +36,29 @@ DurabilityFuture ReadyFuture(core::Result<void> value) {
   promise.set_value(std::move(value));
   return promise.get_future();
 }
+
+// An append's power_loss future: its own node and sink, freed by the
+// one post its node gets.
+class PromiseWaiter final : public core::CompletionSink {
+ public:
+  explicit PromiseWaiter(core::SequenceId seq)
+      : node_(seq, core::Completion{.sink = this, .client_id = 0, .slot_seq = seq}) {}
+
+  core::SeqWaiterNode& node() noexcept { return node_; }
+  DurabilityFuture Future() { return promise_.get_future(); }
+  void Resolve(core::Result<void> result) { promise_.set_value(std::move(result)); }
+
+  // A promise throws only on a second value, which one post rules out.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
+  void Post(std::span<const core::CompletionEvent> events) noexcept override {
+    promise_.set_value(events.front().result);
+    delete this;  // NOLINT(cppcoreguidelines-owning-memory): released by its registrant.
+  }
+
+ private:
+  core::SeqWaiterNode node_;
+  std::promise<core::Result<void>> promise_;
+};
 
 // Encodes `entry` straight into its reserved slice, then commits it.
 void CommitEncoded(Log& log, const core::QueueEntry& entry, core::ShardId shard,
@@ -61,7 +87,8 @@ class ShardStream::Publisher final : public AppendPublisher {
     lock_.unlock();
     // A flush may have covered these frames before they were published.
     if (stream_.RaisePowerEnd()) stream_.PowerAdvanced();
-    stream_.Published(end_pos_);
+    stream_.WakePublished(end_);
+    stream_.config_.unit->committer->Published(end_pos_);
   }
 
  private:
@@ -299,7 +326,7 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
     next_seq_ = last + 1;
     appended_.Increment(static_cast<double>(entries.size()));
     DurabilityFuture durable = config_.ack_durability == core::Durability::kPowerLoss
-                                   ? WhenPowerDurable(last)
+                                   ? PowerDurableFuture(last)
                                    : ReadyFuture({});
     return Begun{
         .first = first,
@@ -368,30 +395,28 @@ core::Result<Reservation> ShardStream::Reserve(std::span<const LogParts> logs) {
   }
 
   std::vector<ReservedRange> ranges;
-  DurableFutures durable;
   // Bytes encoded under the caller's locks, across the reservation.
   std::size_t locked = 0;
   if (logs.size() == 1) {
-    auto filler = ReserveLocked(logs.front(), totals.front(), locked, ranges, durable);
+    auto filler = ReserveLocked(logs.front(), totals.front(), locked, ranges);
     if (!filler.has_value()) return std::unexpected(filler.error());
-    return Reservation(std::move(ranges), std::move(durable), *std::move(filler));
+    return Reservation(std::move(ranges), *std::move(filler));
   }
   std::vector<std::unique_ptr<ReservationFiller>> fillers;
   for (std::size_t g = 0; g < logs.size(); ++g) {
-    auto filler = ReserveLocked(logs[g], totals[g], locked, ranges, durable);
+    auto filler = ReserveLocked(logs[g], totals[g], locked, ranges);
     if (!filler.has_value()) {
       if (g > 0) core::Fatal("a WAL log refused space it was checked to have");
       return std::unexpected(filler.error());
     }
     fillers.push_back(*std::move(filler));
   }
-  return Reservation(std::move(ranges), std::move(durable),
-                     std::make_unique<MultiFiller>(std::move(fillers)));
+  return Reservation(std::move(ranges), std::make_unique<MultiFiller>(std::move(fillers)));
 }
 
 core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
-    const LogParts& group, uint64_t total, std::size_t& locked, std::vector<ReservedRange>& ranges,
-    DurableFutures& durable) {
+    const LogParts& group, uint64_t total, std::size_t& locked,
+    std::vector<ReservedRange>& ranges) {
   ShardStream& lead = *group.streams.front();
   LogUnit& unit = *lead.config_.unit;
   Log& log = *unit.log;
@@ -454,11 +479,6 @@ core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
     stream.next_seq_ = last + 1;
     stream.appended_.Increment(static_cast<double>(part.entries.size()));
     ranges.push_back(ReservedRange{.shard = part.shard, .first = first, .last = last});
-    durable.push_back(
-        ShardDurable{.shard = part.shard,
-                     .durable = stream.config_.ack_durability == core::Durability::kPowerLoss
-                                    ? stream.WhenPowerDurable(last)
-                                    : ReadyFuture({})});
     publish.push_back(Filler::Part{.stream = &stream, .first = first, .end = last + 1});
   }
   std::function<void(std::size_t)> fill_hook;
@@ -468,33 +488,55 @@ core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
                                   std::move(fill_hook), committed, group.sizes.size());
 }
 
-DurabilityFuture ShardStream::WhenPowerDurable(core::SequenceId seq) {
-  const std::scoped_lock lock(power_mu_);
-  if (seq < power_end_.load(std::memory_order_acquire)) return ReadyFuture({});
-  if (committer_stopped_) {
-    return ReadyFuture(
-        std::unexpected(core::Error{core::ErrorCode::kUnavailable, "WAL group committer stopped"}));
+DurabilityFuture ShardStream::PowerDurableFuture(core::SequenceId last) {
+  auto waiter = std::make_unique<PromiseWaiter>(last);
+  DurabilityFuture future = waiter->Future();
+  if (auto ready = power_waiters_.Register(waiter->node(), power_end_)) {
+    waiter->Resolve(*std::move(ready));
+  } else {
+    // Linked: the post that resolves it frees it.
+    std::ignore = waiter.release();
   }
-  std::promise<core::Result<void>> promise;
-  auto future = promise.get_future();
-  futures_.emplace_back(seq, std::move(promise));
   return future;
 }
 
-// Spins, then yields: the wait is a predecessor's fill and publish.
-// The acquire pairs with that publish's store, so its frames are filled
-// before this publisher's store too.
+// Spins, yields, then parks: the wait is a predecessor's fill and
+// publish. The acquire pairs with that publish's store, so its frames
+// are filled before this publisher's store too.
+//
+// Parking saves CPU; it is not the latency fix. The wait is head-of-
+// line behind a large fill on the same log, which only the blob lane
+// (#162) removes, and on an asynchronous reactor parking or yielding
+// here would stall the reactor all the same. A parked owner of a
+// reservation keeps the Reserve-to-Complete rule: this is Complete's
+// own wait, on an earlier seq whose publisher never waits on it. Only
+// a test's park hook can throw here.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 void ShardStream::AwaitPublished(core::SequenceId first) noexcept {
   if (published_end_.load(std::memory_order_acquire) < first) {
     const auto start = std::chrono::steady_clock::now();
     bool spinning = true;
     while (published_end_.load(std::memory_order_acquire) < first) {
-      if (spinning && std::chrono::steady_clock::now() - start >= kSpinFor) spinning = false;
-      if (spinning) {
+      const auto waited = std::chrono::steady_clock::now() - start;
+      if (waited < kSpinFor) {
         CpuRelax();
-      } else {
-        std::this_thread::yield();
+        continue;
       }
+      spinning = false;
+      if (waited < kYieldFor) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (park_hook_) park_hook_();
+      // Counted, then re-read, against WakePublished's store, then
+      // count: one of them sees the other, and wait() compares the
+      // value it was given, so no wake falls before the park.
+      publish_parked_.fetch_add(1, std::memory_order_seq_cst);
+      for (core::SequenceId seen = published_end_.load(std::memory_order_seq_cst); seen < first;
+           seen = published_end_.load(std::memory_order_seq_cst)) {
+        published_end_.wait(seen, std::memory_order_seq_cst);
+      }
+      publish_parked_.fetch_sub(1, std::memory_order_seq_cst);
     }
     if (!spinning) {
       publish_wait_.Observe(
@@ -515,46 +557,14 @@ void ShardStream::PublishInOrder(core::SequenceId first, core::SequenceId end) n
   // Only the publisher of `first` stores now, so the end never regresses.
   published_end_.store(end, std::memory_order_seq_cst);
   if (RaisePowerEnd()) PowerAdvanced();
-  WakeReaders();
+  WakePublished(end);
 }
 
-// The publisher stored published_end_ seq_cst, then reads the waiter
-// count; a reader counts itself, then reads the end. One of them sees
-// the other.
-void ShardStream::WakeReaders() const noexcept {
-  if (readers_waiting_.load(std::memory_order_seq_cst) > 0) {
-    const std::scoped_lock lock(read_mu_);
-    read_cv_.notify_all();
-  }
-}
-
-void ShardStream::Published(LogPosition end_pos) noexcept {
-  WakeReaders();
-  config_.unit->committer->Published(end_pos);
-}
-
-bool ShardStream::WaitForEnd(core::SequenceId seq, core::Durability durability,
-                             core::Duration timeout) const {
-  if (durability == core::Durability::kPowerLoss) {
-    std::unique_lock lock(power_mu_);
-    ++power_waiting_;
-    power_cv_.wait_for(lock, timeout, [this, seq] ABYSS_REQUIRES(power_mu_) {
-      return stopping_.load(std::memory_order_acquire) || committer_stopped_ ||
-             power_end_.load(std::memory_order_acquire) > seq;
-    });
-    --power_waiting_;
-    return power_end_.load(std::memory_order_acquire) > seq;
-  }
-  readers_waiting_.fetch_add(1, std::memory_order_seq_cst);
-  {
-    std::unique_lock lock(read_mu_);
-    read_cv_.wait_for(lock, timeout, [this, seq] {
-      return stopping_.load(std::memory_order_seq_cst) ||
-             published_end_.load(std::memory_order_seq_cst) > seq;
-    });
-  }
-  readers_waiting_.fetch_sub(1, std::memory_order_relaxed);
-  return published_end_.load(std::memory_order_acquire) > seq;
+// The publisher stored published_end_ seq_cst; each waiter count is
+// then loaded seq_cst, so the empty case costs a load apiece.
+void ShardStream::WakePublished(core::SequenceId end) noexcept {
+  if (publish_parked_.load(std::memory_order_seq_cst) > 0) published_end_.notify_all();
+  published_waiters_.Advance(end);
 }
 
 core::SequenceId ShardStream::next_seq() const {
@@ -563,14 +573,27 @@ core::SequenceId ShardStream::next_seq() const {
 }
 
 core::SequenceId ShardStream::DurableEnd(core::Durability durability) const noexcept {
-  const auto& end = durability == core::Durability::kPowerLoss ? power_end_ : published_end_;
-  return end.load(std::memory_order_acquire);
+  return EndOf(durability).load(std::memory_order_acquire);
 }
 
-bool ShardStream::AwaitDurable(core::SequenceId seq, core::Durability durability,
-                               core::Duration timeout) const {
+std::optional<core::Result<void>> ShardStream::WhenDurable(core::Durability durability,
+                                                           core::SeqWaiterNode& node) {
+  if (DurableEnd(durability) > node.seq()) return core::Result<void>{};
+  return Waiters(durability).Register(node, EndOf(durability));
+}
+
+bool ShardStream::CancelDurable(core::Durability durability, core::SeqWaiterNode& node) noexcept {
+  return Waiters(durability).Cancel(node);
+}
+
+core::Result<bool> ShardStream::AwaitDurable(core::SequenceId seq, core::Durability durability,
+                                             core::Duration timeout) {
   if (DurableEnd(durability) > seq) return true;
-  return WaitForEnd(seq, durability, timeout);
+  if (durable_wait_hook_) durable_wait_hook_();
+  auto waited = Waiters(durability).AwaitEnd(EndOf(durability), seq, timeout);
+  if (waited.has_value()) return true;
+  if (waited.error().code() == core::ErrorCode::kTimeout) return false;
+  return std::unexpected(waited.error());
 }
 
 bool ShardStream::Durable(core::SequenceId end) noexcept {
@@ -583,13 +606,14 @@ bool ShardStream::Durable(core::SequenceId end) noexcept {
 // a frame is filled, and may be flushed, before its PendingAppend is
 // published, and nothing may see it until then. The flusher stores the
 // flushed end and the publisher the published end, each then reading
-// the other, all seq_cst, so the later of the two raises it.
+// the other, all seq_cst, so the later of the two raises it. The raise
+// is seq_cst too, for PowerAdvanced's waiter count.
 bool ShardStream::RaisePowerEnd() noexcept {
   const core::SequenceId target = std::min(flushed_end_.load(std::memory_order_seq_cst),
                                            published_end_.load(std::memory_order_seq_cst));
   core::SequenceId current = power_end_.load(std::memory_order_relaxed);
   while (target > current) {
-    if (power_end_.compare_exchange_weak(current, target, std::memory_order_release,
+    if (power_end_.compare_exchange_weak(current, target, std::memory_order_seq_cst,
                                          std::memory_order_relaxed)) {
       return true;
     }
@@ -597,18 +621,8 @@ bool ShardStream::RaisePowerEnd() noexcept {
   return false;
 }
 
-void ShardStream::PowerAdvanced() {
-  std::vector<std::promise<core::Result<void>>> ready;
-  {
-    const std::scoped_lock lock(power_mu_);
-    const core::SequenceId end = power_end_.load(std::memory_order_acquire);
-    while (!futures_.empty() && futures_.front().first < end) {
-      ready.push_back(std::move(futures_.front().second));
-      futures_.pop_front();
-    }
-    if (power_waiting_ > 0) power_cv_.notify_all();
-  }
-  for (auto& promise : ready) promise.set_value({});
+void ShardStream::PowerAdvanced() noexcept {
+  power_waiters_.Advance(power_end_.load(std::memory_order_seq_cst));
 }
 
 void ShardStream::Reclaimed(std::optional<core::SequenceId> max_seq, LogPosition retained_from) {
@@ -774,7 +788,8 @@ core::Result<std::vector<core::QueueEntry>> ShardStream::Read(core::SequenceId f
                                                               core::Durability visible) {
   if (auto readable = CheckReadable(from); !readable) return std::unexpected(readable.error());
   if (DurableEnd(visible) <= from && timeout > core::Duration::zero()) {
-    WaitForEnd(from, visible, timeout);
+    // Ended, timed out or failed, the end decides what is read.
+    std::ignore = Waiters(visible).AwaitEnd(EndOf(visible), from, timeout);
     if (auto readable = CheckReadable(from); !readable) return std::unexpected(readable.error());
   }
   const core::SequenceId limit = DurableEnd(visible);
@@ -827,28 +842,11 @@ void ShardStream::Shutdown() {
     if (stopping_.load(std::memory_order_relaxed)) return;
     stopping_.store(true, std::memory_order_seq_cst);
   }
-  {
-    const std::scoped_lock lock(read_mu_);
-  }
-  read_cv_.notify_all();
-  {
-    const std::scoped_lock lock(power_mu_);
-  }
-  power_cv_.notify_all();
+  published_waiters_.FailAll(Stopping());
 }
 
 void ShardStream::CommitterStopped() {
-  std::deque<std::pair<core::SequenceId, std::promise<core::Result<void>>>> orphaned;
-  {
-    const std::scoped_lock lock(power_mu_);
-    committer_stopped_ = true;
-    orphaned.swap(futures_);
-  }
-  power_cv_.notify_all();
-  for (auto& [seq, promise] : orphaned) {
-    promise.set_value(
-        std::unexpected(core::Error{core::ErrorCode::kUnavailable, "WAL group committer stopped"}));
-  }
+  power_waiters_.FailAll(core::Error{core::ErrorCode::kUnavailable, "WAL group committer stopped"});
 }
 
 }  // namespace abyss::queue

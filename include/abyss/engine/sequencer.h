@@ -66,8 +66,8 @@ class Sequencer {
   // Off every lock: evicts each shard over its limit to its budget and
   // waits for its cold drain until it is not; OOM at the deadline.
   core::Result<void> AwaitMemory(std::span<const core::ShardId> shards, core::SteadyTime deadline);
-  core::Result<void> AwaitDurable(queue::DurableFutures& futures,
-                                  const std::vector<queue::ReservedRange>& ranges,
+  // Each range's last seq durable at the ack class, by `deadline`.
+  core::Result<void> AwaitDurable(std::span<const queue::ReservedRange> ranges,
                                   core::SteadyTime deadline, bool flush) const;
   void Redecided(metrics::RedecideReason reason);
 

@@ -104,28 +104,37 @@ BENCHMARK(BM_AppendProcessCrash)->Arg(64)->Arg(1024);
 // iteration counts below keep each run inside it.
 constexpr size_t kWholeRunSegment = size_t{64} << 20;
 
-std::unique_ptr<WalQueue> MakeWholeRunQueue(const std::string& dir) {
+std::unique_ptr<WalQueue> MakeWholeRunQueue(
+    const std::string& dir, core::Durability durability = core::Durability::kProcessCrash) {
   auto result = WalQueue::Open({
       .wal_path = dir,
       .segment_size_bytes = kWholeRunSegment,
       .shard_count = 1,
+      .durability = durability,
       .min_retention = 1s,
   });
   if (!result.has_value()) std::abort();
   return std::move(*result);
 }
 
-// One frame per iteration through Reserve and Complete at
-// process_crash. Rebuilding a value Reserve moved out is untimed.
-void BM_ReserveComplete(benchmark::State& state) {
+// One frame per iteration through Reserve and Complete, at the class
+// the argument names. Rebuilding a value Reserve moved out is untimed;
+// under power_loss a full window is waited out, timed, as a writer
+// would.
+void ReserveCompleteAt(benchmark::State& state, core::Durability durability) {
   TempDir tmp;
-  auto queue = MakeWholeRunQueue(tmp.path());
+  auto queue = MakeWholeRunQueue(tmp.path(), durability);
   const auto value_size = static_cast<size_t>(state.range(0));
   std::vector<core::QueueEntry> entries{MakeEntry(value_size)};
   const std::array parts{ShardEntries{.shard = 0, .entries = entries}};
   const bool moved = frame::EntryFrameSize(entries[0]) > core::kLockHoldFrameBytes;
   for ([[maybe_unused]] auto _ : state) {
     auto reserved = queue->Reserve(parts);
+    while (!reserved.has_value() &&
+           reserved.error().code() == core::ErrorCode::kResourceExhausted &&
+           queue->Admit(0, core::SteadyClock::now() + 5s).has_value()) {
+      reserved = queue->Reserve(parts);
+    }
     if (!reserved.has_value()) {
       state.SkipWithError("reserve failed");
       break;
@@ -140,9 +149,19 @@ void BM_ReserveComplete(benchmark::State& state) {
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * value_size));
 }
+
+void BM_ReserveComplete(benchmark::State& state) {
+  ReserveCompleteAt(state, core::Durability::kProcessCrash);
+}
 BENCHMARK(BM_ReserveComplete)->Arg(200)->Iterations(100000);
 BENCHMARK(BM_ReserveComplete)->Arg(16 << 10)->Iterations(3000);
 BENCHMARK(BM_ReserveComplete)->Arg(1 << 20)->Iterations(50);
+
+void BM_ReserveCompletePowerLoss(benchmark::State& state) {
+  ReserveCompleteAt(state, core::Durability::kPowerLoss);
+}
+BENCHMARK(BM_ReserveCompletePowerLoss)->Arg(200)->Iterations(100000);
+BENCHMARK(BM_ReserveCompletePowerLoss)->Arg(16 << 10)->Iterations(3000);
 
 // The same through BeginAppend, which takes the entry: its rebuild is
 // untimed.

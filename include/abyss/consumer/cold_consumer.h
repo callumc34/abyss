@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -18,6 +19,8 @@
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
+#include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/consumer_metrics.h"
 #include "abyss/metrics/metrics.h"
@@ -123,7 +126,8 @@ class ColdConsumer {
   // buffer.
   void RequestStopAndDrain(std::chrono::steady_clock::time_point deadline);
 
-  // Wait for the worker thread. Must be preceded by RequestStop.
+  // Wait for the worker thread. Must be preceded by RequestStop. Every
+  // drained wait then fails kUnavailable, now and later.
   void Join();
 
   // RequestStop + Join. Pools owning many consumers should call the split
@@ -178,6 +182,15 @@ class ColdConsumer {
   // Blocks until this consumer drains through `target` (true) or `timeout`
   // elapses (false). Signal-driven by the drain loop, not a poll.
   bool WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout);
+  // Registers `node`, posted once the drained seq passes its seq:
+  // SeqWaiters::Register. WhenDrained also asks the loop to drain now.
+  std::optional<core::Result<void>> WhenDrained(core::SeqWaiterNode& node);
+  bool CancelDrained(core::SeqWaiterNode& node) noexcept { return drained_waiters_.Cancel(node); }
+  std::size_t DrainedWaitersForTesting() const noexcept { return drained_waiters_.size(); }
+  // Runs in WaitForDrainedSeq between its check and its wait.
+  void SetDrainedWaitHookForTesting(std::function<void()> hook) {
+    drained_wait_hook_ = std::move(hook);
+  }
 
  private:
   void RunLoop();
@@ -257,7 +270,8 @@ class ColdConsumer {
   // graceful-drain commit is durable-gated even when fewer than the cadence
   // threshold of batches flushed.
   void TryAdvanceCommit(bool force_checkpoint = false);
-  void NotifyDrained();
+  void RequestDrain();
+  void NotifyDrained() noexcept;
 
   core::Queue& queue_;
   core::ColdStore& cold_store_;
@@ -314,9 +328,11 @@ class ColdConsumer {
   std::chrono::steady_clock::time_point last_checkpoint_at_{};
   std::atomic<uint64_t> flushes_applied_{0};
 
-  // Guards WaitForDrainedSeq.
-  std::mutex drain_wait_mu_;
-  std::condition_variable drain_wait_cv_;
+  // Waiters on latest_drained_seq_, an inclusive end: ready once it
+  // passes a node's seq, so drained through seq + 1. A per-seq wait,
+  // woken in seq order, has no head for a small request to pass.
+  core::SeqWaiters drained_waiters_;
+  std::function<void()> drained_wait_hook_;
 
   // Lowest seq of a structurally-undecodable op the cold consumer could
   // not materialise (XERR-5). The commit/drain frontier is pinned below it

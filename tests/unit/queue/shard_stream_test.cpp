@@ -2,10 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -16,11 +18,15 @@
 #include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "abyss/queue/reservation.h"
 #include "abyss/queue/wal_queue.h"
+#include "latch.h"
 #include "on_exit.h"
+#include "recording_sink.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -29,6 +35,7 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr auto kNow = core::Durability::kProcessCrash;
+constexpr auto kPower = core::Durability::kPowerLoss;
 
 core::QueueEntry Set(const std::string& key, std::size_t value_bytes) {
   return core::QueueEntry{
@@ -260,6 +267,230 @@ TEST_F(ShardStreamTest, SeqlockReadersRacingAWrappingWriter) {
   readers.clear();
   EXPECT_GT(appended, 0U);
   EXPECT_GT(reads.load(), 0U);
+}
+
+// --- Durable waits and parked publishes ---
+
+class StreamWaitTest : public ::testing::Test {
+ protected:
+  void SetUp() override { metrics::testing::Reset(); }
+  void TearDown() override {
+    release_.Open();
+    queue_.reset();
+    metrics::testing::Reset();
+  }
+
+  void Open(core::Durability durability) {
+    auto opened = WalQueue::Open(WalConfig{
+        .wal_path = dir_.String(),
+        .segment_size_bytes = std::size_t{64} << 10,
+        .shard_count = 1,
+        .durability = durability,
+        .min_retention = 0s,
+    });
+    ASSERT_TRUE(opened.has_value()) << opened.error().message();
+    queue_ = std::move(*opened);
+  }
+
+  // Until release_ opens, no flush syncs, so no power end moves.
+  void HoldFlushes() {
+    queue_->SetFlushHookForTesting([this](uint32_t) {
+      release_.Wait();
+      return core::Result<void>{};
+    });
+  }
+
+  // Bounded: until `shard`'s end at `durability` is past `seq`.
+  bool DurableBy(core::SequenceId seq, core::Durability durability) {
+    const auto until = std::chrono::steady_clock::now() + 10s;
+    while (queue_->DurableEnd(0, durability).value() <= seq) {
+      if (std::chrono::steady_clock::now() >= until) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return true;
+  }
+
+  std::size_t Waiters(core::Durability durability) const {
+    return queue_->StreamForTesting(0).DurableWaitersForTesting(durability);
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  abyss::testing::TempDir dir_{"stream_wait"};
+  abyss::testing::Latch release_;
+  std::unique_ptr<WalQueue> queue_;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+};
+
+// A publish between AwaitDurable's check and its registration is seen
+// by the registration's re-check.
+TEST_F(StreamWaitTest, APublishBetweenTheCheckAndTheWaitIsNotLost) {
+  Open(kNow);
+  auto pending = queue_->BeginAppend(0, Set("k", 8));
+  ASSERT_TRUE(pending.has_value()) << pending.error().message();
+  const core::SequenceId seq = pending->seq();
+  queue_->SetDurableWaitHookForTesting([&pending] { pending->Publish(); });
+  const auto start = std::chrono::steady_clock::now();
+  const auto durable = queue_->AwaitDurable(0, seq, kNow, 10s);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the publish was lost";
+  ASSERT_TRUE(durable.has_value()) << durable.error().message();
+  EXPECT_TRUE(*durable);
+  EXPECT_EQ(Waiters(kNow), 0U);
+}
+
+TEST_F(StreamWaitTest, AFlushBetweenTheCheckAndTheWaitIsNotLost) {
+  Open(kPower);
+  HoldFlushes();
+  auto appended = queue_->Append(0, Set("k", 8));
+  ASSERT_TRUE(appended.has_value()) << appended.error().message();
+  const core::SequenceId seq = appended->seq;
+  ASSERT_EQ(queue_->DurableEnd(0, kPower).value(), seq);
+  queue_->SetDurableWaitHookForTesting([&] {
+    release_.Open();
+    EXPECT_TRUE(DurableBy(seq, kPower));
+  });
+  const auto start = std::chrono::steady_clock::now();
+  const auto durable = queue_->AwaitDurable(0, seq, kPower, 10s);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the flush was lost";
+  ASSERT_TRUE(durable.has_value()) << durable.error().message();
+  EXPECT_TRUE(*durable);
+  EXPECT_TRUE(appended->durable.get().has_value());
+  EXPECT_EQ(Waiters(kPower), 0U);
+}
+
+// A caller that retries on every timeout leaves no waiter behind, at
+// either class.
+TEST_F(StreamWaitTest, RetriesOnTimeoutLeaveNoWaiters) {
+  Open(kPower);
+  HoldFlushes();
+  auto pending = queue_->BeginAppend(0, Set("k", 8));
+  ASSERT_TRUE(pending.has_value()) << pending.error().message();
+  const core::SequenceId seq = pending->seq();
+  // The append's own future waits on the power list throughout.
+  ASSERT_EQ(Waiters(kPower), 1U);
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_FALSE(queue_->AwaitDurable(0, seq, kNow, 5ms).value()) << "retry " << i;
+    ASSERT_EQ(Waiters(kNow), 0U) << "retry " << i;
+  }
+  pending->Publish();
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_FALSE(queue_->AwaitDurable(0, seq, kPower, 5ms).value()) << "retry " << i;
+    ASSERT_EQ(Waiters(kPower), 1U) << "retry " << i;
+  }
+  release_.Open();
+  EXPECT_TRUE(queue_->AwaitDurable(0, seq, kPower, 10s).value());
+  EXPECT_TRUE(DurableBy(seq, kPower));
+  EXPECT_EQ(Waiters(kNow), 0U);
+}
+
+TEST_F(StreamWaitTest, ARegisteredNodeIsPostedOnceItsClassPasses) {
+  Open(kPower);
+  HoldFlushes();
+  abyss::testing::RecordingSink sink;
+  auto pending = queue_->BeginAppend(0, Set("k", 8));
+  ASSERT_TRUE(pending.has_value()) << pending.error().message();
+  const core::SequenceId seq = pending->seq();
+  core::SeqWaiterNode published(seq, sink.For(1));
+  core::SeqWaiterNode power(seq, sink.For(2));
+  core::SeqWaiterNode cancelled(seq, sink.For(3));
+  ASSERT_FALSE(queue_->WhenDurable(0, kNow, published).has_value());
+  ASSERT_FALSE(queue_->WhenDurable(0, kPower, power).has_value());
+  ASSERT_FALSE(queue_->WhenDurable(0, kPower, cancelled).has_value());
+  EXPECT_TRUE(queue_->CancelDurable(0, kPower, cancelled));
+  EXPECT_FALSE(queue_->CancelDurable(0, kPower, cancelled));
+
+  pending->Publish();
+  ASSERT_TRUE(sink.WaitFor(1));
+  EXPECT_EQ(sink.Events().front().slot_seq, 1U);
+  release_.Open();
+  ASSERT_TRUE(sink.WaitFor(2));
+  const auto events = sink.Events();
+  ASSERT_EQ(events.size(), 2U);
+  EXPECT_EQ(events[1].slot_seq, 2U);
+  EXPECT_EQ(events[1].kind, core::CompletionKind::kDurable);
+  EXPECT_TRUE(events[1].result.has_value());
+
+  core::SeqWaiterNode late(seq, sink.For(4));
+  const auto now = queue_->WhenDurable(0, kPower, late);
+  EXPECT_TRUE(now.has_value() && now->has_value()) << "a durable seq is ready at once";
+}
+
+// Shutdown fails process_crash's waiters; the committer's stop, after
+// the final flush, fails power_loss's.
+TEST_F(StreamWaitTest, StoppingFailsEachClassesWaitersUnavailable) {
+  Open(kPower);
+  abyss::testing::RecordingSink sink;
+  core::SeqWaiterNode published(core::kFirstSeq + 5, sink.For(1));
+  core::SeqWaiterNode power(core::kFirstSeq + 5, sink.For(2));
+  ASSERT_FALSE(queue_->WhenDurable(0, kNow, published).has_value());
+  ASSERT_FALSE(queue_->WhenDurable(0, kPower, power).has_value());
+  queue_.reset();
+  ASSERT_TRUE(sink.WaitFor(2));
+  const auto events = sink.Events();
+  ASSERT_EQ(events.size(), 2U);
+  for (const core::CompletionEvent& event : events) {
+    SCOPED_TRACE(event.slot_seq);
+    ASSERT_FALSE(event.result.has_value());
+    EXPECT_EQ(event.result.error().code(), core::ErrorCode::kUnavailable);
+  }
+  EXPECT_EQ(events[0].result.error().message(), "queue shutting down");
+  EXPECT_EQ(events[1].result.error().message(), "WAL group committer stopped");
+}
+
+// A publish waiting on an earlier reservation parks past its yield, and
+// wakes once that reservation publishes.
+TEST_F(StreamWaitTest, APublishBehindAHeldReservationParksAndWakes) {
+  Open(kNow);
+  std::vector<core::QueueEntry> first{Set("a", 8)};
+  auto held = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = first}});
+  ASSERT_TRUE(held.has_value()) << held.error().message();
+  auto behind = std::async(std::launch::async, [this] {
+    std::vector<core::QueueEntry> second{Set("b", 8)};
+    auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = second}});
+    if (!reserved.has_value()) return false;
+    queue_->Complete(std::move(*reserved));
+    return true;
+  });
+  const auto until = std::chrono::steady_clock::now() + 10s;
+  while (queue_->StreamForTesting(0).PublishParkedForTesting() == 0 &&
+         std::chrono::steady_clock::now() < until) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(queue_->StreamForTesting(0).PublishParkedForTesting(), 1U);
+  EXPECT_EQ(behind.wait_for(20ms), std::future_status::timeout) << "published past a hole";
+
+  queue_->Complete(std::move(*held));
+  ASSERT_EQ(behind.wait_for(5s), std::future_status::ready) << "the parked publish never woke";
+  EXPECT_TRUE(behind.get());
+  EXPECT_EQ(queue_->DurableEnd(0, kNow).value(), core::kFirstSeq + 2);
+  EXPECT_EQ(queue_->StreamForTesting(0).PublishParkedForTesting(), 0U);
+}
+
+// A publish landing just as a publisher parks, when it counts no one
+// parked and so notifies no one, is seen by the parker's re-read.
+TEST_F(StreamWaitTest, APublishRacingAParkIsNotLost) {
+  Open(kNow);
+  std::vector<core::QueueEntry> first{Set("a", 8)};
+  auto held = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = first}});
+  ASSERT_TRUE(held.has_value()) << held.error().message();
+  abyss::testing::Latch parking;
+  abyss::testing::Latch published;
+  queue_->SetPublishParkHookForTesting(0, [&] {
+    parking.Open();
+    published.Wait();
+  });
+  auto behind = std::async(std::launch::async, [this] {
+    std::vector<core::QueueEntry> second{Set("b", 8)};
+    auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = second}});
+    if (!reserved.has_value()) return false;
+    queue_->Complete(std::move(*reserved));
+    return true;
+  });
+  ASSERT_TRUE(parking.Wait());
+  queue_->Complete(std::move(*held));
+  published.Open();
+  ASSERT_EQ(behind.wait_for(5s), std::future_status::ready) << "the racing publish was lost";
+  EXPECT_TRUE(behind.get());
+  EXPECT_EQ(queue_->DurableEnd(0, kNow).value(), core::kFirstSeq + 2);
 }
 
 }  // namespace

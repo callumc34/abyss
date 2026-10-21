@@ -181,13 +181,13 @@ TEST_F(ReservationTest, OneShardReservesThenPublishesOnComplete) {
   EXPECT_EQ(ReservationsHeld(), 1U);
   EXPECT_EQ(PublishedEnd(1), core::kFirstSeq) << "nothing is visible before Complete";
 
-  DurableFutures durable = queue_->Complete(std::move(*reserved));
+  const std::vector<ReservedRange> completed = queue_->Complete(std::move(*reserved));
   EXPECT_EQ(ReservationsHeld(), 0U);
   EXPECT_EQ(queue_->ReadyToComplete(0), 0U);
-  ASSERT_EQ(durable.size(), 1U);
-  EXPECT_EQ(durable[0].shard, 1U);
-  ASSERT_EQ(durable[0].durable.wait_for(0s), std::future_status::ready);
-  EXPECT_TRUE(durable[0].durable.get().has_value());
+  ASSERT_EQ(completed.size(), 1U);
+  EXPECT_EQ(completed[0].shard, 1U);
+  EXPECT_EQ(completed[0].last, core::kFirstSeq + 1);
+  EXPECT_TRUE(queue_->AwaitDurable(1, completed[0].last, queue_->AckDurability(), 0ms).value());
   EXPECT_EQ(PublishedEnd(1), core::kFirstSeq + 2);
   const auto read = ReadAll(1);
   ASSERT_EQ(read.size(), 2U);
@@ -227,8 +227,7 @@ TEST_F(ReservationTest, ThreeShardsShareOneContiguousBatch) {
   EXPECT_EQ(ranges[1].last, core::kFirstSeq + 1);
   EXPECT_EQ(ranges[2].first, core::kFirstSeq);
   EXPECT_EQ(ranges[2].last, core::kFirstSeq + 2);
-  DurableFutures durable = queue_->Complete(std::move(*reserved));
-  ASSERT_EQ(durable.size(), 3U);
+  ASSERT_EQ(queue_->Complete(std::move(*reserved)).size(), 3U);
 
   std::vector<LogPosition> positions;
   for (const ReservedRange& range : ranges) {
@@ -597,11 +596,10 @@ TEST_F(ReservationTest, PowerLossFuturesResolveOncePowerDurable) {
   auto reserved = queue_->Reserve(
       std::array{ShardEntries{.shard = 0, .entries = a}, ShardEntries{.shard = 2, .entries = c}});
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
-  DurableFutures durable = queue_->Complete(std::move(*reserved));
-  ASSERT_EQ(durable.size(), 2U);
-  for (ShardDurable& part : durable) {
-    ASSERT_EQ(part.durable.wait_for(10s), std::future_status::ready) << part.shard;
-    EXPECT_TRUE(part.durable.get().has_value());
+  const std::vector<ReservedRange> completed = queue_->Complete(std::move(*reserved));
+  ASSERT_EQ(completed.size(), 2U);
+  for (const ReservedRange& range : completed) {
+    EXPECT_TRUE(queue_->AwaitDurable(range.shard, range.last, kPower, 10s).value()) << range.shard;
   }
   EXPECT_EQ(queue_->DurableEnd(0, kPower).value(), core::kFirstSeq + 1);
   EXPECT_EQ(queue_->DurableEnd(2, kPower).value(), core::kFirstSeq + 2);
@@ -692,6 +690,7 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
   std::mutex placed_mu;
   std::vector<Placed> placed;
   std::vector<std::future<core::Result<void>>> futures;
+  std::vector<ReservedRange> completed;
   std::atomic<bool> done{false};
   std::atomic<int> failures{0};
   const auto fail = [&failures](const std::string& what) {
@@ -735,6 +734,7 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
     };
     std::vector<Placed> mine;
     std::vector<std::future<core::Result<void>>> pending;
+    std::vector<ReservedRange> reserved_ranges;
     for (int op = 0; op < kOps && failures.load() == 0; ++op) {
       const std::string tag = "w" + std::to_string(id) + "-" + std::to_string(op) + "-";
       if (std::uniform_int_distribution<int>(0, 3)(rng) == 0) {
@@ -799,13 +799,13 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
       }
       const auto delay = std::uniform_int_distribution<int>(0, 200)(rng);
       if (delay > 150) std::this_thread::sleep_for(std::chrono::microseconds(delay));
-      for (ShardDurable& part : queue_->Complete(std::move(*reserved))) {
-        pending.push_back(std::move(part.durable));
-      }
+      std::ranges::move(queue_->Complete(std::move(*reserved)),
+                        std::back_inserter(reserved_ranges));
     }
     const std::scoped_lock lock(placed_mu);
     std::ranges::move(mine, std::back_inserter(placed));
     std::ranges::move(pending, std::back_inserter(futures));
+    std::ranges::move(reserved_ranges, std::back_inserter(completed));
   };
 
   const auto start = std::chrono::steady_clock::now();
@@ -826,6 +826,10 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
   for (auto& future : futures) {
     ASSERT_EQ(future.wait_for(10s), std::future_status::ready);
     EXPECT_TRUE(future.get().has_value());
+  }
+  for (const ReservedRange& range : completed) {
+    EXPECT_TRUE(
+        queue_->AwaitDurable(range.shard, range.last, queue_->AckDurability(), 10s).value());
   }
   std::array<std::vector<std::string>, kShards> keys;
   for (Placed& at : placed) {

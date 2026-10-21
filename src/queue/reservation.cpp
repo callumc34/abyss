@@ -23,12 +23,9 @@ thread_local uint32_t t_held = 0;
 
 }  // namespace
 
-Reservation::Reservation(std::vector<ReservedRange> ranges, DurableFutures durable,
+Reservation::Reservation(std::vector<ReservedRange> ranges,
                          std::unique_ptr<ReservationFiller> filler)
-    : ranges_(std::move(ranges)),
-      durable_(std::move(durable)),
-      filler_(std::move(filler)),
-      owner_(std::this_thread::get_id()) {
+    : ranges_(std::move(ranges)), filler_(std::move(filler)), owner_(std::this_thread::get_id()) {
   if (filler_) ++t_held;
 }
 
@@ -43,13 +40,12 @@ Reservation& Reservation::operator=(Reservation&& other) noexcept {
   if (this == &other) return *this;
   if (filler_) Dropped(ranges_);
   ranges_ = std::move(other.ranges_);
-  durable_ = std::move(other.durable_);
   filler_ = std::move(other.filler_);
   owner_ = other.owner_;
   return *this;
 }
 
-DurableFutures Reservation::Finish() noexcept {
+std::vector<ReservedRange> Reservation::Finish() noexcept {
   if (filler_) {
     ABYSS_DCHECK(std::this_thread::get_id() == owner_,
                  "a WAL reservation was completed off the thread that reserved it");
@@ -57,7 +53,7 @@ DurableFutures Reservation::Finish() noexcept {
     filler_.reset();
     --t_held;
   }
-  return std::move(durable_);
+  return std::move(ranges_);
 }
 
 uint32_t ReservationsHeld() noexcept { return t_held; }

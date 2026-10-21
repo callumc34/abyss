@@ -21,10 +21,12 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/seq_waiters.h"
 #include "buffer_read.h"
 #include "fatal_capture.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"
+#include "recording_sink.h"
 #include "test_clock.h"
 
 namespace abyss::consumer {
@@ -1587,6 +1589,71 @@ TEST_F(ColdConsumerTest, OldestUnflushedAgeTracksNextOldestAfterFlush) {
   ASSERT_EQ(c->Buffer().Size(), 1U);
   // Not latched at the flushed entry's age: the signal tracks the live minimum.
   EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 24000ms);
+}
+
+// --- Drained-seq waits ---------------------------------------------------------
+
+// Read hands out seqs 1..3 once, then nothing.
+void ServeThree(NiceMock<testing::MockQueue>& queue) {
+  std::vector<core::QueueEntry> entries;
+  for (core::SequenceId seq = 1; seq <= 3; ++seq) {
+    entries.push_back(MakeWriteEntry(seq, {"SET", "k" + std::to_string(seq), "v"}));
+  }
+  EXPECT_CALL(queue, Read(kShard, _, _, _, _))
+      .WillOnce(Return(entries))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+}
+
+// A drain between WaitForDrainedSeq's check and its registration is
+// seen by the registration's re-check.
+TEST_F(ColdConsumerTest, ADrainBetweenTheCheckAndTheWaitIsNotLost) {
+  ServeThree(queue_);
+  auto c = MakeConsumer();
+  c->SetDrainedWaitHookForTesting([&c] { EXPECT_EQ(c->DrainWithBatch(16), 3U); });
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_TRUE(c->WaitForDrainedSeq(3, 10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the drain was lost";
+  EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
+}
+
+TEST_F(ColdConsumerTest, ARegisteredNodeIsPostedOnceTheDrainPassesIt) {
+  ServeThree(queue_);
+  auto c = MakeConsumer();
+  testing::RecordingSink sink;
+  core::SeqWaiterNode through_three(2, sink.For(2));
+  core::SeqWaiterNode through_four(3, sink.For(3));
+  ASSERT_FALSE(c->WhenDrained(through_three).has_value());
+  ASSERT_FALSE(c->WhenDrained(through_four).has_value());
+  EXPECT_EQ(c->DrainWithBatch(16), 3U);
+  ASSERT_TRUE(sink.WaitFor(1));
+  ASSERT_EQ(sink.Events().size(), 1U);
+  EXPECT_EQ(sink.Events().front().slot_seq, 2U);
+  EXPECT_TRUE(sink.Events().front().result.has_value());
+  EXPECT_TRUE(c->CancelDrained(through_four));
+  EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
+}
+
+TEST_F(ColdConsumerTest, RetriesOnTimeoutLeaveNoDrainedWaiters) {
+  auto c = MakeConsumer();
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_FALSE(c->WaitForDrainedSeq(5, 5ms)) << "retry " << i;
+    ASSERT_EQ(c->DrainedWaitersForTesting(), 0U) << "retry " << i;
+  }
+}
+
+TEST_F(ColdConsumerTest, StoppingFailsDrainedWaitsNowAndLater) {
+  auto c = MakeConsumer();
+  testing::RecordingSink sink;
+  core::SeqWaiterNode node(10, sink.For(1));
+  ASSERT_FALSE(c->WhenDrained(node).has_value());
+  c->Stop();
+  ASSERT_TRUE(sink.WaitFor(1));
+  const auto event = sink.Events().front();
+  ASSERT_FALSE(event.result.has_value());
+  EXPECT_EQ(event.result.error().code(), core::ErrorCode::kUnavailable);
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(c->WaitForDrainedSeq(11, 10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
 }
 
 }  // namespace

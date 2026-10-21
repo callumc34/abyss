@@ -96,8 +96,9 @@ class Queue {
   // The log `shard`'s stream is on; a Reserve stays within one.
   virtual uint32_t LogOf(ShardId shard) const = 0;
   // Fills what Reserve left, then publishes each shard once its earlier
-  // seqs are published.
-  virtual queue::DurableFutures Complete(queue::Reservation&& reservation) = 0;
+  // seqs are published. Returns the reservation's ranges, whose last
+  // seqs an ack waits on to be durable at AckDurability().
+  virtual std::vector<queue::ReservedRange> Complete(queue::Reservation&& reservation) = 0;
 
   // Up to `max_count` contiguous entries with seq >= `from_seq` that are
   // durable at `visible`. Waits up to `timeout` when none is yet.
@@ -119,7 +120,8 @@ class Queue {
   virtual Durability AckDurability() const = 0;
   // Monotonic per shard and class.
   virtual Result<SequenceId> DurableEnd(ShardId shard, Durability durability) = 0;
-  // True iff `seq` is durable at `durability` within `timeout`.
+  // True iff `seq` is durable at `durability` within `timeout`;
+  // kUnavailable once the queue stopped, and that class with it.
   virtual Result<bool> AwaitDurable(ShardId shard, SequenceId seq, Durability durability,
                                     Duration timeout) = 0;
 

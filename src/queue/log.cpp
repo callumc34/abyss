@@ -26,6 +26,7 @@
 
 #include "abyss/core/fatal.h"
 #include "abyss/core/thread_annotations.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
@@ -55,6 +56,8 @@ constexpr std::size_t kWaitingReserve = 1024;
 constexpr uint64_t kMaxFrameSpace = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kMaxShards = uint32_t{1} << 16;
 constexpr auto kSpinFor = std::chrono::microseconds(2);
+// Past this a fill wait parks rather than yields.
+constexpr auto kYieldFor = std::chrono::microseconds(100);
 constexpr auto kIdlePoll = std::chrono::seconds(1);
 constexpr auto kDeferredPoll = std::chrono::milliseconds(20);
 constexpr auto kMinBackoff = std::chrono::milliseconds(10);
@@ -524,9 +527,17 @@ struct Log::Impl {  // NOLINT(clang-analyzer-optin.performance.Padding)
   std::atomic<std::size_t> spares{0};
   std::atomic<std::size_t> frees{0};
 
+  // AwaitFilled's parked waiters, Dekker-counted against Fold's store.
+  std::atomic<uint32_t> fill_parked{0};
+  std::function<void()> fill_park_hook;
+
   mutable std::mutex mu;
   std::condition_variable work_cv;
-  std::condition_variable spare_cv;
+  // Waits for a spare. Each waiter tests the same thing, the next
+  // segment published, never its own size, so none passes a head that
+  // fails; a wait ends at its deadline as "no spare WAL segment".
+  core::WaitList spare_waiters;
+  std::function<void()> spare_wait_hook;
   std::map<uint64_t, std::shared_ptr<LogSegment>> segments ABYSS_GUARDED_BY(mu);
   // Ordinals below this are sealed.
   uint64_t sealed_end ABYSS_GUARDED_BY(mu) = 0;
@@ -617,7 +628,11 @@ void Log::Impl::Fold(const Completion* own) {
     std::ranges::pop_heap(waiting, later);
     waiting.pop_back();
   }
-  if (pos != from) filled.store(pos, std::memory_order_release);
+  if (pos != from) {
+    // Then the parked count: AwaitFilled counts, then re-reads.
+    filled.store(pos, std::memory_order_seq_cst);
+    if (fill_parked.load(std::memory_order_seq_cst) > 0) filled.notify_all();
+  }
 }
 
 void Log::Impl::Roll(LogPosition at, uint64_t ordinal) {
@@ -639,9 +654,10 @@ void Log::Impl::TailMoved() {
   work_cv.notify_one();
 }
 
+// Seq_cst against Publish's store and the waiters' count.
 bool Log::Impl::SpareReady() const noexcept {
-  const LogPosition at = tail.load(std::memory_order_acquire);
-  return published_end.load(std::memory_order_acquire) > (at + frame_space - 1) / frame_space;
+  const LogPosition at = tail.load(std::memory_order_seq_cst);
+  return published_end.load(std::memory_order_seq_cst) > (at + frame_space - 1) / frame_space;
 }
 
 std::shared_ptr<LogSegment> Log::Impl::Find(uint64_t ordinal) const {
@@ -691,9 +707,8 @@ void Log::Impl::Publish(std::shared_ptr<LogSegment> segment) {
   const uint64_t ordinal = segment->ordinal;
   ring[ordinal & ring_mask].store(segment.get(), std::memory_order_release);
   segments.emplace(ordinal, std::move(segment));
-  published_end.store(ordinal + 1, std::memory_order_release);
+  published_end.store(ordinal + 1, std::memory_order_seq_cst);
   UpdateGauges();
-  spare_cv.notify_all();
 }
 
 std::optional<PoolEntry> Log::Impl::TakeFree(uint64_t ordinal) {
@@ -918,6 +933,10 @@ void Log::Impl::RunPreparer() {
       Publish(std::move(*prepared));
       if (grown) grown_total.Increment();
       backoff = std::chrono::milliseconds(0);
+      // Not under mu: a woken waiter may go straight to Reserve.
+      lock.unlock();
+      spare_waiters.Notify();
+      lock.lock();
       continue;
     }
     prepare_failures.Increment();
@@ -1342,11 +1361,12 @@ bool Log::CanReserve(uint32_t size) const {
 bool Log::WaitForSpare(core::SteadyTime deadline) {
   Impl& impl = *impl_;
   impl.spare_waits.Increment();
-  std::unique_lock lock(impl.mu);
-  const bool ready = impl.spare_cv.wait_until(lock, deadline, [&impl] ABYSS_REQUIRES(impl.mu) {
-    return impl.stopping || impl.SpareReady();
-  });
-  return ready && !impl.stopping;
+  if (impl.spare_wait_hook) impl.spare_wait_hook();
+  if (!impl.spare_waiters.Await([&impl] { return impl.SpareReady(); }, deadline).has_value()) {
+    return false;
+  }
+  const std::scoped_lock lock(impl.mu);
+  return !impl.stopping;
 }
 
 // The bytes before the commit word were written in place, unordered.
@@ -1366,20 +1386,41 @@ void Log::Commit(const Reservation& reservation, std::span<const std::byte> fram
   CommitInPlace(reservation, frame::CommitLen(binary::LoadLE<uint64_t>(frame.data())));
 }
 
+// Parking saves CPU; it is not the latency fix. The wait is head-of-
+// line behind a large fill on the same log, which only the blob lane
+// (#162) removes, and on an asynchronous reactor parking or yielding
+// here would stall the reactor all the same. A parked waiter combines
+// nothing: every committer combines what it pushed. It waits only on
+// earlier positions, whose fillers never wait on it, so a parked
+// reservation owner keeps the Reserve-to-Complete rule. Fold stores,
+// then reads the count; the waiter counts, then re-reads, and wait()
+// compares the value it was given: no wake falls before the park.
 void Log::AwaitFilled(LogPosition end) const {
   if (filled_.load(std::memory_order_acquire) >= end) return;
+  Impl& impl = *impl_;
   const auto start = std::chrono::steady_clock::now();
   bool spinning = true;
   while (filled_.load(std::memory_order_acquire) < end) {
-    if (!impl_->combining.load(std::memory_order_relaxed) && impl_->completions.Ready()) {
-      impl_->Combine();
+    if (!impl.combining.load(std::memory_order_relaxed) && impl.completions.Ready()) {
+      impl.Combine();
     }
-    if (spinning && std::chrono::steady_clock::now() - start >= kSpinFor) spinning = false;
-    if (spinning) {
+    const auto waited = std::chrono::steady_clock::now() - start;
+    if (waited < kSpinFor) {
       CpuRelax();
-    } else {
-      std::this_thread::yield();
+      continue;
     }
+    spinning = false;
+    if (waited < kYieldFor) {
+      std::this_thread::yield();
+      continue;
+    }
+    if (impl.fill_park_hook) impl.fill_park_hook();
+    impl.fill_parked.fetch_add(1, std::memory_order_seq_cst);
+    for (LogPosition seen = filled_.load(std::memory_order_seq_cst); seen < end;
+         seen = filled_.load(std::memory_order_seq_cst)) {
+      filled_.wait(seen, std::memory_order_seq_cst);
+    }
+    impl.fill_parked.fetch_sub(1, std::memory_order_seq_cst);
   }
   // A wait inside the spin is a neighbour mid-copy; only longer ones,
   // behind a large value or a preempted filler, are worth recording.
@@ -1595,7 +1636,8 @@ void Log::Shutdown() {
     impl.stopping = true;
   }
   impl.work_cv.notify_all();
-  impl.spare_cv.notify_all();
+  impl.spare_waiters.FailAll(
+      LogError(core::ErrorCode::kUnavailable, impl.id(), "shutting down: no spare segments"));
   if (impl.preparer.joinable()) impl.preparer.join();
   impl.Combine();
   std::unique_lock lock(impl.mu);
@@ -1605,6 +1647,20 @@ void Log::Shutdown() {
                    {"err", std::string_view{recycled.error().message()}});
   }
   impl.UpdateGauges();
+}
+
+std::size_t Log::SpareWaitersForTesting() const noexcept { return impl_->spare_waiters.size(); }
+
+void Log::SetSpareWaitHookForTesting(std::function<void()> hook) {
+  impl_->spare_wait_hook = std::move(hook);
+}
+
+uint32_t Log::FillParkedForTesting() const noexcept {
+  return impl_->fill_parked.load(std::memory_order_seq_cst);
+}
+
+void Log::SetFillParkHookForTesting(std::function<void()> hook) {
+  impl_->fill_park_hook = std::move(hook);
 }
 
 void Log::PausePreparerForTesting() {
