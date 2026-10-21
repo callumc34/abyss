@@ -81,24 +81,29 @@ class WaitList {
   // so it must take no lock a notifier holds across Notify. nullopt:
   // linked, and Notify or FailAll will wake it. Otherwise the outcome
   // now (ok: the condition held; or FailAll's error), the wait ends,
-  // and no wake comes.
+  // and no wake comes. A woken waiter that passes here hands off, as
+  // Finish would, so no owner has to remember to.
   template <typename Condition>
     requires std::predicate<const Condition&>
   std::optional<Result<void>> Register(Waiter& waiter, const Condition& condition) {
-    const std::scoped_lock lock(mu_);
-    // Built in place: gcc's -Wmaybe-uninitialized misfires on a
-    // temporary expected<void, Error> moved into the optional.
-    if (failed_.has_value()) {
-      EndWait(waiter);
-      return std::optional<Result<void>>(std::in_place, std::unexpect, *failed_);
-    }
-    Link(waiter);
-    if (condition()) {
+    bool hand_off = false;
+    {
+      const std::scoped_lock lock(mu_);
+      // Built in place: gcc's -Wmaybe-uninitialized misfires on a
+      // temporary expected<void, Error> moved into the optional.
+      if (failed_.has_value()) {
+        EndWait(waiter);
+        return std::optional<Result<void>>(std::in_place, std::unexpect, *failed_);
+      }
+      const bool woken_ok = waiter.last_wake_ok_;
+      Link(waiter);
+      if (!condition()) return std::nullopt;
       Unlink(waiter);
       EndWait(waiter);
-      return std::optional<Result<void>>(std::in_place);
+      hand_off = woken_ok;
     }
-    return std::nullopt;
+    if (hand_off) HandOff();
+    return std::optional<Result<void>>(std::in_place);
   }
 
   // For a waiter whose Register returned nullopt. True: unlinked, the
