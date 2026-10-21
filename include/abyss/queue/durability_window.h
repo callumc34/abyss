@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <vector>
 
 #include "abyss/core/result.h"
 #include "abyss/core/wait_list.h"
@@ -39,7 +41,7 @@ class DurabilityWindow {
     std::atomic<int64_t> since_ns_{kClear};
   };
 
-  DurabilityWindow(uint64_t max_bytes, Clock::duration max_age);
+  DurabilityWindow(uint64_t max_bytes, Clock::duration max_age, std::size_t log_count);
 
   DurabilityWindow(const DurabilityWindow&) = delete;
   DurabilityWindow& operator=(const DurabilityWindow&) = delete;
@@ -47,21 +49,25 @@ class DurabilityWindow {
   DurabilityWindow& operator=(DurabilityWindow&&) = delete;
   ~DurabilityWindow() = default;
 
-  // Waits for room on the log `age` tracks until `deadline`. An empty
-  // window always admits. kResourceExhausted at the deadline;
-  // kUnavailable on Shutdown. A deadline already past checks once,
-  // uncounted.
-  core::Result<void> Admit(const LogAge& age, Clock::time_point deadline);
+  // Log `log`'s: its appenders start it and its flusher moves it.
+  LogAge& age(std::size_t log) noexcept { return logs_[log].age; }
+  const LogAge& age(std::size_t log) const noexcept { return logs_[log].age; }
+
+  // Waits for room on log `log` until `deadline`. An empty window
+  // always admits. kResourceExhausted at the deadline; kUnavailable on
+  // Shutdown. A deadline already past checks once, uncounted.
+  core::Result<void> Admit(std::size_t log, Clock::time_point deadline);
   // Admit's lock-free check, which its waiters make again.
-  bool Admissible(const LogAge& age) const noexcept;
-  // Admit's waiters, for one that registers itself. Its condition is
-  // stopped() || Admissible(age).
-  core::WaitList& admission() noexcept { return admission_; }
+  bool Admissible(std::size_t log) const noexcept;
+  // Log `log`'s Admit waiters, for one that registers itself. Its
+  // condition is stopped() || Admissible(log).
+  core::WaitList& admission(std::size_t log) noexcept { return logs_[log].admission; }
   bool stopped() const noexcept { return stopped_.load(std::memory_order_seq_cst); }
 
   // Entry frame bytes: after Reserve, before Commit.
   void Add(uint64_t bytes) noexcept;
-  // After a flush, once the log's age is updated. Wakes waiters.
+  // After a flush, once the log's age is updated. The bytes are every
+  // log's, so it wakes every log's waiters, the flushed log's included.
   void Release(uint64_t bytes) noexcept;
   // Fails every admission wait, now and later, with kUnavailable.
   void Shutdown();
@@ -80,10 +86,16 @@ class DurabilityWindow {
   std::atomic<bool> stopped_{false};
   metrics::CounterHandle waits_;
   metrics::CounterHandle rejections_;
-  // Every waiter on a log tests the same bytes and age, never its own
-  // size, so none passes a head that fails. A wait ends by admit_by,
-  // as kResourceExhausted and a rejection counted.
-  core::WaitList admission_;
+  struct Log {
+    LogAge age;
+    // Every waiter here tests the same bytes and this log's age, never
+    // its own size, so none passes a head that fails. A wait ends by
+    // admit_by, as kResourceExhausted and a rejection counted.
+    core::WaitList admission;
+  };
+  // One per log: a log's waiters wait on its own age, so one held by
+  // another log's age never stands in front of them.
+  std::vector<Log> logs_;
   std::function<void()> admit_hook_;
 };
 

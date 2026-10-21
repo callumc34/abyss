@@ -159,7 +159,7 @@ WalQueue::WalQueue(WalConfig config)
       frame_space_(config_.segment_size_bytes > kLogSegmentHeaderBytes
                        ? config_.segment_size_bytes - kLogSegmentHeaderBytes
                        : 0),
-      window_(config_.durability_window_bytes, config_.durability_window),
+      window_(config_.durability_window_bytes, config_.durability_window, config_.log_count),
       scan_bytes_(metrics::Registry::Instance().Counter(metrics::names::kWalScanBytesTotal)),
       committed_(config_.retention_consumers.size() * config_.shard_count),
       persist_duration_(metrics::Registry::Instance().Histogram(
@@ -213,6 +213,7 @@ core::Result<void> WalQueue::Initialize() {
   for (uint32_t id = 0; id < config_.log_count; ++id) {
     auto unit = std::make_unique<LogUnit>();
     unit->id = id;
+    unit->age = &window_.age(id);
     unit->is_touched.assign(config_.shard_count, false);
     logs_.push_back(std::move(unit));
   }
@@ -348,7 +349,7 @@ core::Result<GroupCommitter::Extent> WalQueue::FlushLog(LogUnit& unit) {
     batch.clear();
   });
   if (!flushed.has_value()) return std::unexpected(flushed.error());
-  unit.age.Flushed(snapshot_at, flushed->to, [&unit] { return unit.log->ReservedTail(); });
+  unit.age->Flushed(snapshot_at, flushed->to, [&unit] { return unit.log->ReservedTail(); });
   window_.Release(flushed->entry_bytes);
   return GroupCommitter::Extent{.end = flushed->to, .entries = flushed->entries};
 }
@@ -498,7 +499,7 @@ std::optional<uint64_t> WalQueue::PositionForTesting(core::ShardId shard,
 core::Duration WalQueue::DurabilityLag() const {
   const auto now = DurabilityWindow::Clock::now();
   DurabilityWindow::Clock::duration lag = DurabilityWindow::Clock::duration::zero();
-  for (const auto& unit : logs_) lag = std::max(lag, unit->age.Age(now));
+  for (const auto& unit : logs_) lag = std::max(lag, unit->age->Age(now));
   return std::chrono::duration_cast<core::Duration>(lag);
 }
 
@@ -588,7 +589,7 @@ core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
 core::Result<void> WalQueue::Admit(core::ShardId shard, core::SteadyTime admit_by) {
   ABYSS_DCHECK(ReservationsHeld() == 0, "WAL admission wait by a thread holding a reservation");
   if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return window_.Admit(logs_[shard % config_.log_count]->age, admit_by);
+  return window_.Admit(shard % config_.log_count, admit_by);
 }
 
 bool WalQueue::WaitForSpare(core::ShardId shard, core::SteadyTime deadline) {
@@ -644,7 +645,7 @@ core::Result<Reservation> WalQueue::Reserve(std::span<const ShardEntries> parts)
                                            std::to_string(frame_space_) + " bytes"});
   }
   // Re-checked without waiting: the caller holds its hot shard locks.
-  if (auto admitted = window_.Admit(logs_[log]->age, core::SteadyTime{}); !admitted) {
+  if (auto admitted = window_.Admit(log, core::SteadyTime{}); !admitted) {
     return std::unexpected(admitted.error());
   }
   const ShardStream::LogParts group{.streams = streams, .parts = parts, .sizes = sizes};
@@ -679,7 +680,7 @@ core::Result<Reservation> WalQueue::ReserveFlush(std::span<const ShardEntries> p
   groups.reserve(config_.log_count);
   for (uint32_t log = 0; log < config_.log_count; ++log) {
     if (by_log[log].empty()) continue;
-    if (auto admitted = window_.Admit(logs_[log]->age, core::SteadyTime{}); !admitted) {
+    if (auto admitted = window_.Admit(log, core::SteadyTime{}); !admitted) {
       return std::unexpected(admitted.error());
     }
     groups.push_back(

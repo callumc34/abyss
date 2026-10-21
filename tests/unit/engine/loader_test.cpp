@@ -8,11 +8,13 @@
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -551,6 +553,82 @@ TEST_F(LoaderTest, JoinersThatTimeOutLeaveNoneBehind) {
   release.Open();
   EXPECT_TRUE(leader.get().has_value());
   EXPECT_EQ(loader_.FlightsForTesting(0), 0U);
+}
+
+// The leader throws after taking its joiners, as an OOM copying its
+// result for them would: each still lands, kInternal, and the throw
+// goes on.
+TEST_F(LoaderTest, ALeaderThatThrowsLandsItsJoiners) {
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        entered.Open();
+        release.Wait();
+        return LoadAsResult{core::LoadedAs{
+            core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
+      });
+  loader_.SetLandHookForTesting([] { throw std::bad_alloc(); });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.Install("k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  auto joiner = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(JoinedBy(loader_, 1)) << "the joiner never joined the load";
+  release.Open();
+  EXPECT_THROW(std::ignore = leader.get(), std::bad_alloc);
+  ASSERT_EQ(joiner.wait_for(10s), std::future_status::ready) << "the joiner was stranded";
+  const auto joined = joiner.get();
+  ASSERT_FALSE(joined.has_value());
+  EXPECT_EQ(joined.error().code(), core::ErrorCode::kInternal);
+  EXPECT_EQ(loader_.FlightsForTesting(0), 0U);
+}
+
+// A throw out of Install, here from its load's landing, aborts the
+// load, so a later miss starts its own instead of finding it pending.
+TEST_F(LoaderTest, AnInstallThatThrowsAbortsItsLoad) {
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce(Return(LoadAsResult{core::LoadedAs{
+          core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}}));
+  loader_.SetLandHookForTesting([] { throw std::bad_alloc(); });
+  EXPECT_THROW(std::ignore = loader_.Install("k", KeyType::kSet, Deadline()), std::bad_alloc);
+  EXPECT_FALSE(hot_.LoadPending("k")) << "the throw left the load pending";
+  EXPECT_TRUE(hot_.BeginLoad("k").started());
+}
+
+// A joiner past its deadline that the leader already took cannot
+// leave: its landing is coming, so it waits for it and takes it.
+TEST_F(LoaderTest, AJoinerTakenAsItTimesOutTakesTheLanding) {
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  abyss::testing::Latch taken;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        entered.Open();
+        release.Wait();
+        return LoadAsResult{core::LoadedAs{
+            core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
+      });
+  loader_.SetLandHookForTesting([&] {
+    taken.Open();
+    // Long enough for the joiner to time out and lose its Unjoin.
+    std::this_thread::sleep_for(100ms);
+  });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  loader_.SetJoinHookForTesting([&] {
+    release.Open();
+    EXPECT_TRUE(taken.Wait());
+  });
+  // Already past: the joiner's wait ends at once, unlanded.
+  auto joined = loader_.LoadAs(0, "k", KeyType::kSet, core::SteadyClock::now());
+  ASSERT_TRUE(joined.has_value()) << joined.error().message();
+  EXPECT_NE(std::get_if<hot::LoadedFull>(joined.value().get()), nullptr);
+  EXPECT_EQ(loader_.JoinsForTesting(), 1U);
+  EXPECT_TRUE(leader.get().has_value());
 }
 
 }  // namespace

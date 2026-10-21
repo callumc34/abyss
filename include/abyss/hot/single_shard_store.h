@@ -395,9 +395,18 @@ class LoadWaiter {
  private:
   friend class SingleShardStore;
 
+  enum class State : uint8_t {
+    kIdle,
+    // On a placeholder.
+    kLinked,
+    // Its placeholder ended: on a woken chain, its wake to come.
+    kEnded,
+  };
+
   LoadWaiter* prev_ = nullptr;
   LoadWaiter* next_ = nullptr;
-  bool linked_ = false;
+  // Moved under the shard's lock, but back to kIdle by Wake outside it.
+  std::atomic<State> state_{State::kIdle};
 };
 
 class SingleShardStore {
@@ -514,17 +523,19 @@ class SingleShardStore {
   void AbortLoad(std::string_view key, LoadToken token);
   bool LoadPending(std::string_view key) const;
   size_t PendingLoads() const { return loading_.size(); }
-  // Links `waiter` on `key`'s placeholder, which wakes it when it ends
-  // however it ends; false, and nothing linked, if the key has none.
-  bool AddLoadWaiter(std::string_view key, LoadWaiter& waiter);
+  // nullopt: linked on `key`'s placeholder, which wakes it when it
+  // ends however it ends. Otherwise the outcome now, nothing linked: ok
+  // if the key has none, or FailLoadWaits's error.
+  std::optional<core::Result<void>> AddLoadWaiter(std::string_view key, LoadWaiter& waiter);
   // True: unlinked, and no wake comes. False: an ended placeholder took
   // it, and its wake comes.
   bool CancelLoadWaiter(std::string_view key, LoadWaiter& waiter);
   // Waiters of placeholders ended since the last call, chained by
   // next_: the lock holder takes them, then wakes them after unlocking.
   LoadWaiter* TakeWoken() noexcept { return std::exchange(woken_, nullptr); }
-  // Ends every wait, as for the store's teardown; TakeWoken has them.
-  void EndLoadWaits();
+  // Ends every wait, as for the store's teardown: TakeWoken has them,
+  // and every later AddLoadWaiter returns `error`.
+  void FailLoadWaits(const core::Error& error);
   // Wakes each of a TakeWoken chain with `result`.
   static void Wake(LoadWaiter* woken, const core::Result<void>& result) noexcept;
   // Chain `front` ahead of `back`.
@@ -560,6 +571,7 @@ class SingleShardStore {
   // While set, applies move what they replace or remove into
   // `graveyard` instead of freeing it.
   void SetGraveyard(Graveyard* graveyard) { graveyard_ = graveyard; }
+  bool HasGraveyardForTesting() const { return graveyard_ != nullptr; }
   // The highest appended_at given to the shard's writes.
   core::WallTime LastAppendedAt() const { return last_appended_at_; }
   // An entry, live, expired or a tombstone.
@@ -731,6 +743,7 @@ class SingleShardStore {
 
   core::StringMap<Loading> loading_;
   LoadWaiter* woken_ = nullptr;
+  std::optional<core::Error> load_waits_failed_;
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
   // Keys installed as absent, oldest first, in their own FIFO so they

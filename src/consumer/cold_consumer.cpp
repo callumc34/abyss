@@ -346,6 +346,8 @@ core::Result<void> ColdConsumer::ApplyReplayBatch(std::span<const core::QueueEnt
           core::Error{core::ErrorCode::kUnavailable, "cold replay aborted by stop"});
     }
     const size_t consumed = ConsumeBatch(batch);
+    // Before any exit, a failed one's included.
+    if (consumed > 0) NotifyDrained();
     batch = batch.subspan(consumed);
     if (batch.empty()) break;
     // A Flush's wipe failed. Retrying it on a Scan worker stalls every
@@ -371,7 +373,6 @@ core::Result<void> ColdConsumer::ApplyReplayBatch(std::span<const core::QueueEnt
                       [this] { return stop_requested_.load(std::memory_order_acquire); });
     backoff = std::min(backoff * 2, config_.loop_max_backoff);
   }
-  NotifyDrained();
   if (buffer_.BytesEstimate() >= config_.buffer_high_water_bytes) {
     Flush();
   }

@@ -132,6 +132,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   // A log-structured scan: one header-only walker per log feeds
   // shard-affine decode workers. Retention is held off meanwhile.
+  core::RetentionPin PinRetention() override;
   core::Result<void> Scan(std::span<const core::SequenceId> from,
                           std::span<const core::SequenceId> end, uint32_t parallelism,
                           const ScanSink& sink, const std::atomic<bool>& cancel) override;

@@ -133,6 +133,8 @@ class Loader {
   std::size_t JoinersForTesting(core::ShardId shard) const;
   // Runs in a join between its registration and its wait.
   void SetJoinHookForTesting(std::function<void()> hook) { join_hook_ = std::move(hook); }
+  // Runs in a leader between taking its joiners and landing them.
+  void SetLandHookForTesting(std::function<void()> hook) { land_hook_ = std::move(hook); }
 
  private:
   // LoadAs, unshared.
@@ -188,6 +190,7 @@ class Loader {
   std::vector<std::unique_ptr<Flights>> flights_;
   mutable std::atomic<uint64_t> joins_{0};
   std::function<void()> join_hook_;
+  std::function<void()> land_hook_;
 };
 
 // The key as cold will hold it once `delta` (null: none) is flushed

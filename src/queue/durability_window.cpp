@@ -1,5 +1,6 @@
 #include "abyss/queue/durability_window.h"
 
+#include <cstddef>
 #include <string>
 
 #include "abyss/metrics/names.h"
@@ -47,21 +48,23 @@ DurabilityWindow::Clock::duration DurabilityWindow::LogAge::Age(
                                        : Clock::duration::zero();
 }
 
-DurabilityWindow::DurabilityWindow(uint64_t max_bytes, Clock::duration max_age)
+DurabilityWindow::DurabilityWindow(uint64_t max_bytes, Clock::duration max_age,
+                                   std::size_t log_count)
     : max_bytes_(max_bytes),
       max_age_(max_age),
       waits_(metrics::Registry::Instance().Counter(metrics::names::kWalBackpressureWaitsTotal)),
       rejections_(
-          metrics::Registry::Instance().Counter(metrics::names::kWalBackpressureRejectionsTotal)) {}
+          metrics::Registry::Instance().Counter(metrics::names::kWalBackpressureRejectionsTotal)),
+      logs_(log_count) {}
 
-bool DurabilityWindow::Admissible(const LogAge& age) const noexcept {
+bool DurabilityWindow::Admissible(std::size_t log) const noexcept {
   const uint64_t bytes = unflushed_bytes_.load(std::memory_order_seq_cst);
   if (bytes == 0) return true;
-  return bytes < max_bytes_ && age.Age(Clock::now()) < max_age_;
+  return bytes < max_bytes_ && age(log).Age(Clock::now()) < max_age_;
 }
 
-core::Result<void> DurabilityWindow::Admit(const LogAge& age, Clock::time_point deadline) {
-  if (Admissible(age)) return {};
+core::Result<void> DurabilityWindow::Admit(std::size_t log, Clock::time_point deadline) {
+  if (Admissible(log)) return {};
   // A caller that cannot wait (a best-effort append) is not backpressure.
   if (deadline <= Clock::now()) {
     return std::unexpected(
@@ -69,7 +72,8 @@ core::Result<void> DurabilityWindow::Admit(const LogAge& age, Clock::time_point 
   }
   waits_.Increment();
   if (admit_hook_) admit_hook_();
-  auto admitted = admission_.Await([this, &age] { return stopped() || Admissible(age); }, deadline);
+  auto admitted =
+      admission(log).Await([this, log] { return stopped() || Admissible(log); }, deadline);
   if (stopped()) {
     return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
   }
@@ -81,7 +85,7 @@ core::Result<void> DurabilityWindow::Admit(const LogAge& age, Clock::time_point 
       core::ErrorCode::kResourceExhausted,
       "WAL durability window full: the device is not keeping up with writes (unflushed " +
           std::to_string(UnflushedBytes()) + " of " + std::to_string(max_bytes_) +
-          " bytes, oldest " + std::to_string(ToMillis(age.Age(Clock::now()))) + " of " +
+          " bytes, oldest " + std::to_string(ToMillis(age(log).Age(Clock::now()))) + " of " +
           std::to_string(ToMillis(max_age_)) + " ms)"});
 }
 
@@ -93,12 +97,13 @@ void DurabilityWindow::Add(uint64_t bytes) noexcept {
 // loads the waiter count.
 void DurabilityWindow::Release(uint64_t bytes) noexcept {
   unflushed_bytes_.fetch_sub(bytes, std::memory_order_seq_cst);
-  admission_.Notify();
+  for (Log& each : logs_) each.admission.Notify();
 }
 
 void DurabilityWindow::Shutdown() {
   stopped_.store(true, std::memory_order_seq_cst);
-  admission_.FailAll(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
+  const core::Error error{core::ErrorCode::kUnavailable, "queue shutting down"};
+  for (Log& each : logs_) each.admission.FailAll(error);
 }
 
 }  // namespace abyss::queue

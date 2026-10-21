@@ -1616,24 +1616,33 @@ bool SingleShardStore::LoadPending(std::string_view key) const {
 }
 
 LoadWaiter::~LoadWaiter() {
-  if (linked_) core::Fatal("LoadWaiter destroyed while linked");
+  if (state_.load(std::memory_order_relaxed) != State::kIdle) {
+    core::Fatal("LoadWaiter destroyed while linked or before its wake");
+  }
 }
 
-bool SingleShardStore::AddLoadWaiter(std::string_view key, LoadWaiter& waiter) {
-  if (waiter.linked_) core::Fatal("LoadWaiter registered twice");
+std::optional<core::Result<void>> SingleShardStore::AddLoadWaiter(std::string_view key,
+                                                                  LoadWaiter& waiter) {
+  // Linked, or on a woken chain: either way its next_ is in use.
+  if (waiter.state_.load(std::memory_order_relaxed) != LoadWaiter::State::kIdle) {
+    core::Fatal("LoadWaiter registered twice");
+  }
+  if (load_waits_failed_.has_value()) {
+    return std::optional<core::Result<void>>(std::in_place, std::unexpect, *load_waits_failed_);
+  }
   const auto pending = loading_.find(key);
-  if (pending == loading_.end()) return false;
+  if (pending == loading_.end()) return std::optional<core::Result<void>>(std::in_place);
   LoadWaiter*& head = pending->second.waiters;
   waiter.prev_ = nullptr;
   waiter.next_ = head;
   if (head != nullptr) head->prev_ = &waiter;
   head = &waiter;
-  waiter.linked_ = true;
-  return true;
+  waiter.state_.store(LoadWaiter::State::kLinked, std::memory_order_relaxed);
+  return std::nullopt;
 }
 
 bool SingleShardStore::CancelLoadWaiter(std::string_view key, LoadWaiter& waiter) {
-  if (!waiter.linked_) return false;
+  if (waiter.state_.load(std::memory_order_relaxed) != LoadWaiter::State::kLinked) return false;
   if (waiter.prev_ != nullptr) {
     waiter.prev_->next_ = waiter.next_;
   } else {
@@ -1646,11 +1655,12 @@ bool SingleShardStore::CancelLoadWaiter(std::string_view key, LoadWaiter& waiter
   if (waiter.next_ != nullptr) waiter.next_->prev_ = waiter.prev_;
   waiter.prev_ = nullptr;
   waiter.next_ = nullptr;
-  waiter.linked_ = false;
+  waiter.state_.store(LoadWaiter::State::kIdle, std::memory_order_relaxed);
   return true;
 }
 
-void SingleShardStore::EndLoadWaits() {
+void SingleShardStore::FailLoadWaits(const core::Error& error) {
+  load_waits_failed_ = error;
   for (auto& pending : loading_) EndWaits(pending.second);
 }
 
@@ -1661,6 +1671,7 @@ void SingleShardStore::Wake(LoadWaiter* woken, const core::Result<void>& result)
   while (woken != nullptr) {
     // Read first: once woken, its owner may free it.
     LoadWaiter* const next = std::exchange(woken->next_, nullptr);
+    woken->state_.store(LoadWaiter::State::kIdle, std::memory_order_relaxed);
     woken->Wake(result);
     woken = next;
   }
@@ -1695,7 +1706,7 @@ void SingleShardStore::EndWaits(Loading& loading) noexcept {
   while (waiter != nullptr) {
     LoadWaiter* const next = waiter->next_;
     waiter->prev_ = nullptr;
-    waiter->linked_ = false;
+    waiter->state_.store(LoadWaiter::State::kEnded, std::memory_order_relaxed);
     waiter->next_ = woken_;
     woken_ = waiter;
     waiter = next;

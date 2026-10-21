@@ -3,8 +3,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -65,6 +67,37 @@ class ShardLocksTest : public ::testing::Test {
   std::unique_ptr<ShardedHotStore> store_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
+
+// A throw while the locks are taken, here from the drained supplier,
+// leaves none held: every shard can be locked again.
+TEST(ShardLocksUnwindTest, AThrowWhileLockingLeavesEveryShardFree) {
+  std::atomic<bool> throwing{false};
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .shard_count = kShards,
+      .drained = [&throwing](core::ShardId shard) -> core::SequenceId {
+        if (throwing.load() && shard == 2) throw std::runtime_error("drained supplier failed");
+        return 0;
+      },
+  }};
+  const std::vector<core::ShardId> all{0, 1, 2, 3};
+  throwing = true;
+  EXPECT_THROW((void)store.LockExclusive(all), std::runtime_error);
+  throwing = false;
+  auto free = std::async(std::launch::async, [&store] {
+    std::vector<bool> out;
+    out.reserve(kShards);
+    for (core::ShardId shard = 0; shard < kShards; ++shard) {
+      out.push_back(store.ShardLockFreeForTesting(shard));
+    }
+    return out;
+  });
+  ASSERT_EQ(free.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+  const std::vector<bool> got = free.get();
+  for (core::ShardId shard = 0; shard < kShards; ++shard) {
+    EXPECT_TRUE(got.at(shard)) << "shard " << shard << " is still locked";
+    EXPECT_FALSE(store.HasGraveyardForTesting(shard)) << "shard " << shard;
+  }
+}
 
 TEST_F(ShardLocksTest, AViewNamesItsShard) {
   const std::string key = KeyOn(2);
