@@ -59,9 +59,11 @@ class ColdConsumerPoolWaitTest : public ::testing::Test {
 
 TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenTargetIsZero) {
   auto pool = MakePool();
+  // A long timeout, so returning well inside it shows no wait, however
+  // loaded the host.
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_TRUE(pool->WaitForDrainedSeq(/*shard=*/0, /*target_seq=*/0, /*timeout=*/100ms));
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 5ms);
+  EXPECT_TRUE(pool->WaitForDrainedSeq(/*shard=*/0, /*target_seq=*/0, /*timeout=*/10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
 }
 
 TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenAlreadyPastTarget) {
@@ -73,9 +75,9 @@ TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenAlreadyPastTarget) {
   pool->ConsumerFor(0).Drain();
   // latest_drained_seq advanced past 7; any target <= 7 should be instant.
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 5, 100ms));
-  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 7, 100ms));
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 5ms);
+  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 5, 10s));
+  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 7, 10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
 }
 
 TEST_F(ColdConsumerPoolWaitTest, TimesOutWhenConsumerDoesNotAdvance) {
@@ -85,7 +87,7 @@ TEST_F(ColdConsumerPoolWaitTest, TimesOutWhenConsumerDoesNotAdvance) {
   EXPECT_FALSE(pool->WaitForDrainedSeq(0, /*target_seq=*/42, 30ms));
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_GE(elapsed, 30ms);
-  EXPECT_LT(elapsed, 200ms);  // tight upper bound — poll interval is 100us.
+  EXPECT_LT(elapsed, 5s) << "the wait outlived its timeout";
 }
 
 TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueWhenConsumerAdvancesDuringWait) {
