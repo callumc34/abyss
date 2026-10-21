@@ -102,13 +102,13 @@ void ShardStream::FinishRecovery(core::SequenceId next) {
   power_end_.store(next, std::memory_order_release);
 }
 
-// Seqlock writer (single, under the append lock): the release fence
-// keeps the writing stamp ahead of the field stores.
+// Seqlock writer (single, under the append lock). The release store
+// of `pos` carries the writing stamp: a reader that sees the new pos
+// sees the stamp too. No fence, which TSan cannot model.
 void ShardStream::Record(core::SequenceId seq, LogPosition pos, uint32_t size) {
   Slot& slot = ring_[seq & ring_mask_];
   slot.stamp.store(seq | kWriting, std::memory_order_relaxed);
-  std::atomic_thread_fence(std::memory_order_release);
-  slot.pos.store(pos, std::memory_order_relaxed);
+  slot.pos.store(pos, std::memory_order_release);
   slot.stamp.store(seq, std::memory_order_release);
 
   if (!has_point_ || since_point_ >= kIndexStride) {
@@ -362,13 +362,12 @@ std::size_t ShardStream::index_points() const {
   return index_.size();
 }
 
-// Seqlock reader: the acquire fence keeps the field loads ahead of the
-// stamp re-read, so a slot rewritten meanwhile fails validation.
+// Seqlock reader: a pos from a rewrite acquires that rewrite's writing
+// stamp, so the re-read sees it and validation fails.
 std::optional<LogPosition> ShardStream::RingAt(core::SequenceId seq) const noexcept {
   const Slot& slot = ring_[seq & ring_mask_];
   if (slot.stamp.load(std::memory_order_acquire) != seq) return std::nullopt;
-  const LogPosition pos = slot.pos.load(std::memory_order_relaxed);
-  std::atomic_thread_fence(std::memory_order_acquire);
+  const LogPosition pos = slot.pos.load(std::memory_order_acquire);
   if (slot.stamp.load(std::memory_order_relaxed) != seq) return std::nullopt;
   return pos;
 }

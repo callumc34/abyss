@@ -823,8 +823,6 @@ core::Result<void> Log::Impl::RecycleReady(std::unique_lock<std::mutex>& lock) {
       work.push_back(
           Removal{.segment = std::move(segment), .path = std::move(path), .ordinal = ordinal});
     }
-    // Pairs with the release in each last reader's reference drop.
-    if (!work.empty()) std::atomic_thread_fence(std::memory_order_acquire);
   }
   if (work.empty()) return {};
 
@@ -843,7 +841,8 @@ core::Result<void> Log::Impl::RecycleReady(std::unique_lock<std::mutex>& lock) {
   std::vector<PoolEntry> recycled;
   std::size_t done = 0;
   for (; done < work.size(); ++done) {
-    // Unmaps and closes it.
+    // Unmaps and closes it. The last reference's drop is acq_rel, so
+    // every reader's use happens before the unmap.
     work[done].segment.reset();
     auto removed = RemoveFile(work[done], dests[done]);
     if (!removed.has_value()) {
