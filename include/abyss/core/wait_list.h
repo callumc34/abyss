@@ -41,15 +41,20 @@ class Waiter {
 
   Waiter* prev_ = nullptr;
   Waiter* next_ = nullptr;
-  // The ticket orders the waiter in ticket_list_ only.
+  // This wait's place in ticket_list_. Kept across wakes, so a woken
+  // waiter that re-blocks goes back to it; cleared when the wait ends.
   const WaitList* ticket_list_ = nullptr;
   uint64_t ticket_ = 0;
+  // Whether the last wake was ok, which Finish must pass on.
+  bool last_wake_ok_ = false;
   bool linked_ = false;
 };
 
 // A FIFO of waiters for capacity: admission, a spare segment, memory.
-// A waiter keeps the ticket it first took here, so one that re-blocks
-// goes back to its FIFO place.
+// A wait keeps the ticket it first took, so a woken waiter that
+// re-blocks goes back to its FIFO place. The wait, and its place, ends
+// when Register returns an outcome, on a true Cancel, or on Finish; a
+// reused waiter's next wait queues afresh.
 //
 // No lost wake-ups: the owner publishes its state seq_cst, then calls
 // Notify, which loads the count seq_cst. Register counts the waiter
@@ -74,23 +79,36 @@ class WaitList {
   // Links the waiter, then re-checks `condition` under the list's lock,
   // so it must take no lock a notifier holds across Notify. nullopt:
   // linked, and Notify or FailAll will wake it. Otherwise the outcome
-  // now (ok: the condition held; or FailAll's error), and no wake.
+  // now (ok: the condition held; or FailAll's error), the wait ends,
+  // and no wake comes.
   template <typename Condition>
     requires std::predicate<const Condition&>
   std::optional<Result<void>> Register(Waiter& waiter, const Condition& condition) {
     const std::scoped_lock lock(mu_);
-    if (failed_.has_value()) return Result<void>{std::unexpected(*failed_)};
+    if (failed_.has_value()) {
+      EndWait(waiter);
+      return Result<void>{std::unexpected(*failed_)};
+    }
     Link(waiter);
     if (condition()) {
       Unlink(waiter);
+      EndWait(waiter);
       return Result<void>{};
     }
     return std::nullopt;
   }
 
-  // For a waiter whose Register returned nullopt. True: unlinked, and
-  // no wake will come. False: a notifier took it and will wake it.
+  // For a waiter whose Register returned nullopt. True: unlinked, the
+  // wait ends, and no wake comes. False: a notifier took it and will
+  // wake it.
   bool Cancel(Waiter& waiter) noexcept;
+
+  // Ends the wait of a woken waiter that will not register again: it
+  // gave up (a deadline, a client gone), or it passed its own check.
+  // If the wake was ok, it may have been the one capacity was meant
+  // for, so it hands off. The list recorded that outcome as it woke
+  // the waiter, so an owner cannot pass on the wrong one.
+  void Finish(Waiter& waiter) noexcept;
 
   // Wakes up to kWakeBatch waiters, in FIFO order.
   void Notify() noexcept {
@@ -114,7 +132,9 @@ class WaitList {
 
   // The blocking wrapper: ok once `condition` holds, kTimeout, or
   // FailAll's error. A woken caller whose condition holds hands off,
-  // so it strands no one where notify_all would have woken them.
+  // so it strands no one where notify_all would have woken them. A
+  // wake collected just past the deadline is still re-checked, so it
+  // can return ok then.
   Result<void> Await(const std::function<bool()>& condition, Duration timeout);
 
   size_t size() const noexcept { return count_.load(std::memory_order_relaxed); }
@@ -122,9 +142,13 @@ class WaitList {
   Stats StatsForTesting() const;
 
  private:
+  static void EndWait(Waiter& waiter) noexcept {
+    waiter.ticket_list_ = nullptr;
+    waiter.last_wake_ok_ = false;
+  }
   void Link(Waiter& waiter) ABYSS_REQUIRES(mu_);
   void Unlink(Waiter& waiter) ABYSS_REQUIRES(mu_);
-  size_t PopFront(std::span<Waiter*> out) noexcept;
+  size_t PopFront(std::span<Waiter*> out, bool ok) noexcept;
   void WakeFront(size_t limit) noexcept;
 
   mutable std::mutex mu_;

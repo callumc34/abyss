@@ -55,7 +55,19 @@ bool WaitList::Cancel(Waiter& waiter) noexcept {
   const std::scoped_lock lock(mu_);
   if (!waiter.linked_) return false;
   Unlink(waiter);
+  EndWait(waiter);
   return true;
+}
+
+void WaitList::Finish(Waiter& waiter) noexcept {
+  bool hand_off = false;
+  {
+    const std::scoped_lock lock(mu_);
+    if (waiter.linked_) Fatal("Finish of a linked Waiter: Cancel it");
+    hand_off = waiter.last_wake_ok_;
+    EndWait(waiter);
+  }
+  if (hand_off) HandOff();
 }
 
 void WaitList::FailAll(const Error& error) {
@@ -65,7 +77,7 @@ void WaitList::FailAll(const Error& error) {
   }
   // Nothing links any more, so this drains the list.
   std::array<Waiter*, kWakeBatch> woken{};
-  while (const size_t n = PopFront(woken)) {
+  while (const size_t n = PopFront(woken, /*ok=*/false)) {
     for (Waiter* waiter : std::span(woken).first(n)) waiter->Wake(std::unexpected(error));
   }
 }
@@ -84,7 +96,10 @@ Result<void> WaitList::Await(const std::function<bool()>& condition, Duration ti
     if (!waiter.WaitUntil(deadline) && Cancel(waiter)) {
       return std::unexpected(Error{ErrorCode::kTimeout, "wait timed out"});
     }
-    if (Result<void> wake = waiter.Take(); !wake.has_value()) return wake;
+    if (Result<void> wake = waiter.Take(); !wake.has_value()) {
+      Finish(waiter);
+      return wake;
+    }
     woken = true;
   }
 }
@@ -94,8 +109,8 @@ WaitList::Stats WaitList::StatsForTesting() const {
   return stats_;
 }
 
-// A first registration takes the next ticket and appends in O(1). A
-// re-registration scans from the head, where its old place is.
+// A new wait takes the next ticket and appends in O(1). A woken wait
+// re-registering scans from the head, where its old place is.
 void WaitList::Link(Waiter& waiter) {
   if (waiter.linked_) Fatal("Waiter registered twice");
   Waiter* before = nullptr;
@@ -109,6 +124,7 @@ void WaitList::Link(Waiter& waiter) {
     waiter.ticket_list_ = this;
     waiter.ticket_ = ++next_ticket_;
   }
+  waiter.last_wake_ok_ = false;
   Waiter* const after = before != nullptr ? before->prev_ : tail_;
   waiter.prev_ = after;
   waiter.next_ = before;
@@ -143,12 +159,14 @@ void WaitList::Unlink(Waiter& waiter) {
   count_.fetch_sub(1, std::memory_order_seq_cst);
 }
 
-// Unlinks up to out.size() waiters from the front.
-size_t WaitList::PopFront(std::span<Waiter*> out) noexcept {
+// Unlinks up to out.size() waiters from the front, recording whether
+// their wake is ok. Their waits, and places, go on.
+size_t WaitList::PopFront(std::span<Waiter*> out, bool ok) noexcept {
   const std::scoped_lock lock(mu_);
   ++stats_.locked_pops;
   size_t n = 0;
   while (n < out.size() && head_ != nullptr) {
+    head_->last_wake_ok_ = ok;
     out[n++] = head_;
     Unlink(*head_);
   }
@@ -157,7 +175,7 @@ size_t WaitList::PopFront(std::span<Waiter*> out) noexcept {
 
 void WaitList::WakeFront(size_t limit) noexcept {
   std::array<Waiter*, kWakeBatch> woken{};
-  const size_t n = PopFront(std::span(woken).first(limit));
+  const size_t n = PopFront(std::span(woken).first(limit), /*ok=*/true);
   for (Waiter* waiter : std::span(woken).first(n)) waiter->Wake(Result<void>{});
 }
 
