@@ -36,7 +36,8 @@ struct LogUnit {
   uint32_t id = 0;
   std::unique_ptr<Log> log;
   std::unique_ptr<GroupCommitter> committer;
-  DurabilityWindow::LogAge age;
+  // The window's, for this log.
+  DurabilityWindow::LogAge* age = nullptr;
   // Held while a reclaimed segment's streams are brought up to date, so
   // a reader that found it gone sees the new floors.
   std::mutex reclaim_mu;

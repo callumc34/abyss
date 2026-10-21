@@ -1496,6 +1496,58 @@ TEST_F(ColdConsumerTest, AReplayBatchGivesUpOnAWipeThatKeepsFailing) {
   EXPECT_FALSE(testing::BufferRead(c->Buffer(), "b").has_value());
 }
 
+// What a failing batch drained before its Flush wakes its waiters, on
+// each way it fails.
+TEST_F(ColdConsumerTest, AReplayBatchThatFailsWakesWhatItDrained) {
+  ColdConsumer::Config cfg;
+  cfg.drain_grace = 20ms;
+  cfg.loop_max_backoff = 5ms;
+  auto c = MakeConsumer(cfg);
+  ASSERT_EQ(c->BeginReplay().value(), kFirst);
+  EXPECT_CALL(cold_, Wipe(kShard)).WillRepeatedly(WipeFails);
+  testing::RecordingSink sink;
+  core::SeqWaiterNode through_first(kFirst - 1, sink.For(kFirst));
+  ASSERT_FALSE(c->WhenDrained(through_first).has_value());
+  const std::vector<core::QueueEntry> batch{
+      MakeWriteEntry(kFirst, {"SET", "a", "v"}),
+      MakeFlushEntry(kFirst + 1),
+  };
+  const std::atomic<bool> cancel{false};
+
+  auto applied = c->ApplyReplayBatch(batch, cancel);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(applied.error().code(), core::ErrorCode::kTimeout);
+  ASSERT_EQ(c->LatestDrainedSeq(), kFirst);
+  ASSERT_EQ(sink.Events().size(), 1U) << "a drained seq's waiter was not woken";
+  EXPECT_TRUE(sink.Events().front().result.has_value());
+  EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
+}
+
+TEST_F(ColdConsumerTest, ACancelledReplayBatchWakesWhatItDrained) {
+  ColdConsumer::Config cfg;
+  cfg.drain_grace = std::chrono::hours{1};
+  auto c = MakeConsumer(cfg);
+  ASSERT_EQ(c->BeginReplay().value(), kFirst);
+  std::atomic<bool> cancel{false};
+  EXPECT_CALL(cold_, Wipe(kShard)).WillRepeatedly([&cancel](core::ShardId shard) {
+    cancel.store(true);
+    return WipeFails(shard);
+  });
+  testing::RecordingSink sink;
+  core::SeqWaiterNode through_first(kFirst - 1, sink.For(kFirst));
+  ASSERT_FALSE(c->WhenDrained(through_first).has_value());
+  const std::vector<core::QueueEntry> batch{
+      MakeWriteEntry(kFirst, {"SET", "a", "v"}),
+      MakeFlushEntry(kFirst + 1),
+  };
+
+  auto applied = c->ApplyReplayBatch(batch, cancel);
+  ASSERT_FALSE(applied.has_value());
+  EXPECT_EQ(applied.error().code(), core::ErrorCode::kUnavailable);
+  ASSERT_EQ(sink.Events().size(), 1U) << "a drained seq's waiter was not woken";
+  EXPECT_TRUE(sink.Events().front().result.has_value());
+}
+
 TEST_F(ColdConsumerTest, ACancelStopsAWipeRetry) {
   ColdConsumer::Config cfg;
   cfg.drain_grace = std::chrono::hours{1};

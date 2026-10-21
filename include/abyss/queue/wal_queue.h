@@ -131,6 +131,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   // A log-structured scan: one header-only walker per log feeds
   // shard-affine decode workers. Retention is held off meanwhile.
+  core::RetentionPin PinRetention() override;
   core::Result<void> Scan(std::span<const core::SequenceId> from,
                           std::span<const core::SequenceId> end, uint32_t parallelism,
                           const ScanSink& sink, const std::atomic<bool>& cancel) override;
@@ -253,11 +254,11 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   bool persister_stop_ ABYSS_GUARDED_BY(persister_mu_) = false;
   std::thread persister_;
 
-  // Sweeps run from the persister, one at a time, and never during a
-  // Scan.
+  // Sweeps run from the persister, one at a time, and never while
+  // retention is pinned, as a Scan pins it.
   std::mutex reaper_mu_;
   std::unique_ptr<SegmentReaper> reaper_ ABYSS_GUARDED_BY(reaper_mu_);
-  uint32_t scans_ ABYSS_GUARDED_BY(reaper_mu_) = 0;
+  uint32_t pins_ ABYSS_GUARDED_BY(reaper_mu_) = 0;
 };
 
 }  // namespace abyss::queue

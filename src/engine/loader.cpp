@@ -416,32 +416,67 @@ core::Result<Loader::Shared> Loader::Fly(core::ShardId shard, std::string_view k
     return std::move(flight.result);
   }
 
+  // Every joiner lands once, however the leader leaves: one unwinding
+  // lands them kInternal, as Take() has no deadline.
+  class Landing {
+   public:
+    Landing(Flights& flights, const FlightId& id) : flights_(&flights), id_(&id) {}
+    Landing(const Landing&) = delete;
+    Landing& operator=(const Landing&) = delete;
+    Landing(Landing&&) = delete;
+    Landing& operator=(Landing&&) = delete;
+    // An OOM while unwinding may terminate.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
+    ~Landing() {
+      if (landed_) return;
+      if (!taken_) Take();
+      Land(Flight{.result = std::unexpected(core::Error{core::ErrorCode::kInternal,
+                                                        "the load this call joined failed"})});
+    }
+
+    // Erased with its joiners taken, so none joins after.
+    void Take() {
+      const std::scoped_lock lock(flights_->mu);
+      const auto it = flights_->loading.find(*id_);
+      joiners_ = it->second.joiners;
+      for (Joiner* taken = joiners_; taken != nullptr; taken = taken->next) taken->linked = false;
+      flights_->loading.erase(it);
+      taken_ = true;
+    }
+    bool joined() const { return joiners_ != nullptr; }
+    void Land(const Flight& flight) noexcept {
+      landed_ = true;
+      while (joiners_ != nullptr) {
+        // Read first: once landed, a joiner may be gone.
+        Joiner* const next = joiners_->next;
+        joiners_->Land(flight);
+        joiners_ = next;
+      }
+    }
+
+   private:
+    Flights* flights_;
+    const FlightId* id_;
+    Joiner* joiners_ = nullptr;
+    bool taken_ = false;
+    bool landed_ = false;
+  };
+
+  Landing landing(flights, id);
   Flight done;
   auto loaded = LoadTyped(shard, key, type, deadline, &done.source);
-  Joiner* joiners = nullptr;
-  {
-    // Erased with its joiners taken, so none joins after.
-    const std::scoped_lock lock(flights.mu);
-    const auto it = flights.loading.find(id);
-    joiners = it->second.joiners;
-    for (Joiner* taken = joiners; taken != nullptr; taken = taken->next) taken->linked = false;
-    flights.loading.erase(it);
-  }
+  landing.Take();
+  if (land_hook_) land_hook_();
   if (!loaded.has_value()) {
     done.result = std::unexpected(loaded.error());
   } else if (owned == nullptr) {
     done.result = std::make_shared<const hot::LoadResult>(*std::move(loaded));
   } else {
     // The caller keeps its own; joiners, if any, share a copy.
-    if (joiners != nullptr) done.result = std::make_shared<const hot::LoadResult>(*loaded);
+    if (landing.joined()) done.result = std::make_shared<const hot::LoadResult>(*loaded);
     *owned = *std::move(loaded);
   }
-  while (joiners != nullptr) {
-    // Read first: once landed, a joiner may be gone.
-    Joiner* const next = joiners->next;
-    joiners->Land(done);
-    joiners = next;
-  }
+  landing.Land(done);
   if (source != nullptr) *source = done.source;
   return std::move(done.result);
 }
@@ -565,13 +600,34 @@ core::Result<Loader::Filled> Loader::Install(std::string_view key, KeyType type,
     case Status::kStarted:
       break;
   }
+  // Until Fill returns, any exit, a throw's included, aborts the load:
+  // left pending, it would hold every later miss on the key.
+  class Abort {
+   public:
+    Abort(hot::ShardedHotStore& hot, std::string_view key, hot::LoadToken token)
+        : hot_(&hot), key_(key), token_(token) {}
+    Abort(const Abort&) = delete;
+    Abort& operator=(const Abort&) = delete;
+    Abort(Abort&&) = delete;
+    Abort& operator=(Abort&&) = delete;
+    // A lock or an OOM while unwinding may terminate.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
+    ~Abort() {
+      if (armed_) hot_->AbortLoad(key_, token_);
+    }
+    void Disarm() { armed_ = false; }
+
+   private:
+    hot::ShardedHotStore* hot_;
+    std::string_view key_;
+    hot::LoadToken token_;
+    bool armed_ = true;
+  };
+  Abort pending(hot_, key, start.token);
   Source source = Source::kBuffer;
   std::optional<hot::LoadResult> owned;
   auto flown = Fly(shard, key, type, deadline, &source, &owned);
-  if (!flown.has_value()) {
-    hot_.AbortLoad(key, start.token);
-    return std::unexpected(flown.error());
-  }
+  if (!flown.has_value()) return std::unexpected(flown.error());
   // A read loading it already lent its result: a copy to install.
   std::optional<hot::LoadResult> loaded = std::move(owned);
   if (!loaded.has_value()) loaded = **flown;
@@ -580,6 +636,8 @@ core::Result<Loader::Filled> Loader::Install(std::string_view key, KeyType type,
   if (!std::holds_alternative<hot::LoadedFull>(*loaded)) kept = *loaded;
   using Result = hot::ShardedHotStore::FillResult;
   const Result filled = hot_.Fill(key, start.token, *std::move(loaded));
+  // Fill installed it or aborted it.
+  pending.Disarm();
   if (filled == Result::kInstalled) {
     return Filled{.fill = Fill::kInstalled, .result = std::move(kept), .source = source};
   }

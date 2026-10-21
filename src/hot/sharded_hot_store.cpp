@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <variant>
@@ -52,6 +54,45 @@ class BlockingLoadWaiter final : public LoadWaiter {
   std::condition_variable cv_;
   core::Result<void> result_ ABYSS_GUARDED_BY(mu_);
   bool done_ ABYSS_GUARDED_BY(mu_) = false;
+};
+
+// Wakes the load waits a hold ended, however the hold is left, a throw
+// included: taken while `lock` holds the shard, woken once it is not.
+class WakeEnded {
+ public:
+  WakeEnded(SingleShardStore& store, std::unique_lock<std::shared_mutex>& lock)
+      : store_(&store), lock_(&lock) {}
+  WakeEnded(const WakeEnded&) = delete;
+  WakeEnded& operator=(const WakeEnded&) = delete;
+  WakeEnded(WakeEnded&&) = delete;
+  WakeEnded& operator=(WakeEnded&&) = delete;
+  ~WakeEnded() {
+    LoadWaiter* const woken = store_->TakeWoken();
+    lock_->unlock();
+    SingleShardStore::Wake(woken, core::Result<void>{});
+  }
+
+ private:
+  SingleShardStore* store_;
+  std::unique_lock<std::shared_mutex>* lock_;
+};
+
+// Points the store's graveyard at `graveyard` while it lives, so no
+// exit, a throw's included, leaves the store pointing at a freed one.
+// Within the shard's lock.
+class Burial {
+ public:
+  Burial(SingleShardStore& store, Graveyard& graveyard) : store_(&store) {
+    store.SetGraveyard(&graveyard);
+  }
+  Burial(const Burial&) = delete;
+  Burial& operator=(const Burial&) = delete;
+  Burial(Burial&&) = delete;
+  Burial& operator=(Burial&&) = delete;
+  ~Burial() { store_->SetGraveyard(nullptr); }
+
+ private:
+  SingleShardStore* store_;
 };
 
 }  // namespace
@@ -100,7 +141,7 @@ ShardedHotStore::~ShardedHotStore() {
     LoadWaiter* woken = nullptr;
     {
       const std::unique_lock lock(shard->mutex);
-      shard->store.EndLoadWaits();
+      shard->store.FailLoadWaits(gone.error());
       woken = shard->store.TakeWoken();
     }
     SingleShardStore::Wake(woken, gone);
@@ -193,11 +234,8 @@ core::Result<core::RespValue> ShardedHotStore::ApplyToShard(
   const auto horizon = Horizon(index);
   auto& shard = *shards_[index];
   std::unique_lock lock(shard.mutex);
-  auto result = shard.store.Apply(op, eviction, seq, horizon);
-  LoadWaiter* const woken = shard.store.TakeWoken();
-  lock.unlock();
-  SingleShardStore::Wake(woken, core::Result<void>{});
-  return result;
+  const WakeEnded wake(shard.store, lock);
+  return shard.store.Apply(op, eviction, seq, horizon);
 }
 
 core::HotKeyPresence ShardedHotStore::Probe(std::string_view key) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
@@ -259,15 +297,12 @@ core::Result<void> ShardedHotStore::Wipe(core::ShardId shard,
   Shard& target = *shards_[shard];
   FreshMaps fresh = target.store.ReservedMaps();
   Graveyard wiped;
-  LoadWaiter* woken = nullptr;
   {
-    const std::unique_lock lock(target.mutex);
-    target.store.SetGraveyard(&wiped);
+    std::unique_lock lock(target.mutex);
+    const WakeEnded wake(target.store, lock);
+    const Burial burial(target.store, wiped);
     target.store.Wipe(seq, std::move(fresh));
-    target.store.SetGraveyard(nullptr);
-    woken = target.store.TakeWoken();
   }
-  SingleShardStore::Wake(woken, core::Result<void>{});
   return {};
 }
 
@@ -307,6 +342,7 @@ core::Result<ShardedHotStore::Replayed> ShardedHotStore::ReplayFrame(
       entry.appended_at.time_since_epoch()));
   Shard& target = *shards_.at(shard);
   std::unique_lock lock(target.mutex);
+  const WakeEnded wake(target.store, lock);
   target.store.RaiseAppendedAt(entry.appended_at);
   reply.reset();
   if (write != nullptr && !entry.replaces_state &&
@@ -329,16 +365,12 @@ core::Result<ShardedHotStore::Replayed> ShardedHotStore::ReplayFrame(
   } else {
     core::Fatal("only Write and Flush entries apply to hot as logged");
   }
-  const Replayed replayed{
+  return Replayed{
       .applied = reply.has_value(),
       .over_backpressure = target.store.OverBackpressure(),
       .memory = {.used_bytes = target.store.UsedBytes(),
                  .limit_bytes = target.store.BackpressureLimit()},
   };
-  LoadWaiter* const woken = target.store.TakeWoken();
-  lock.unlock();
-  SingleShardStore::Wake(woken, core::Result<void>{});
-  return replayed;
 }
 
 ShardedHotStore::ShardMemory ShardedHotStore::Memory(core::ShardId shard) const
@@ -417,15 +449,15 @@ ShardedHotStore::FillResult ShardedHotStore::Install(std::string_view key, LoadT
                          static_cast<double>(full->bytes) > budget * config_.fill_max_fraction;
   Graveyard evicted;
   FillResult outcome = FillResult::kDiscarded;
-  LoadWaiter* woken = nullptr;
   {
-    const std::unique_lock lock(shard.mutex);
+    std::unique_lock lock(shard.mutex);
+    const WakeEnded wake(shard.store, lock);
     const auto horizon = Horizon(index);
     if (too_large || (fill && shard.store.OverBackpressure())) {
       shard.store.AbortLoad(key, token);
       outcome = too_large ? FillResult::kTooLarge : FillResult::kOverBackpressure;
     } else {
-      shard.store.SetGraveyard(&evicted);
+      const Burial burial(shard.store, evicted);
       // A fill is optional: it evicts one hold's worth at most, and is
       // skipped if that is not enough.
       if (fill && full != nullptr && shard.store.LoadPending(key) &&
@@ -435,11 +467,8 @@ ShardedHotStore::FillResult ShardedHotStore::Install(std::string_view key, LoadT
       } else if (shard.store.CompleteLoad(key, token, std::move(result), eviction, horizon)) {
         outcome = FillResult::kInstalled;
       }
-      shard.store.SetGraveyard(nullptr);
     }
-    woken = shard.store.TakeWoken();
   }
-  SingleShardStore::Wake(woken, core::Result<void>{});
   return outcome;
 }
 
@@ -449,31 +478,21 @@ size_t ShardedHotStore::CompleteLoads(core::ShardId shard, std::span<LoadComplet
     if (ShardIndex(load.key) != shard) core::Fatal("a load completes on another key's shard");
   }
   auto& target = *shards_.at(shard);
-  size_t installed = 0;
-  LoadWaiter* woken = nullptr;
-  {
-    const std::unique_lock lock(target.mutex);
-    installed = target.store.CompleteLoads(loads, Policy());
-    woken = target.store.TakeWoken();
-  }
-  SingleShardStore::Wake(woken, core::Result<void>{});
-  return installed;
+  std::unique_lock lock(target.mutex);
+  const WakeEnded wake(target.store, lock);
+  return target.store.CompleteLoads(loads, Policy());
 }
 
 void ShardedHotStore::AbortLoad(std::string_view key,
                                 LoadToken token) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   auto& shard = ShardFor(key);
-  LoadWaiter* woken = nullptr;
-  {
-    const std::unique_lock lock(shard.mutex);
-    shard.store.AbortLoad(key, token);
-    woken = shard.store.TakeWoken();
-  }
-  SingleShardStore::Wake(woken, core::Result<void>{});
+  std::unique_lock lock(shard.mutex);
+  const WakeEnded wake(shard.store, lock);
+  shard.store.AbortLoad(key, token);
 }
 
-bool ShardedHotStore::WhenLoaded(std::string_view key,
-                                 LoadWaiter& waiter) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+std::optional<core::Result<void>> ShardedHotStore::WhenLoaded(
+    std::string_view key, LoadWaiter& waiter) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   auto& shard = ShardFor(key);
   const std::unique_lock lock(shard.mutex);
   return shard.store.AddLoadWaiter(key, waiter);
@@ -489,7 +508,7 @@ bool ShardedHotStore::CancelLoadWait(std::string_view key,
 bool ShardedHotStore::AwaitLoad(std::string_view key, core::SteadyTime deadline) {
   if (load_wait_hook_) load_wait_hook_();
   BlockingLoadWaiter waiter;
-  if (!WhenLoaded(key, waiter)) return true;
+  if (const auto now = WhenLoaded(key, waiter); now.has_value()) return now->has_value();
   // A lost Cancel means the placeholder ended and its wake is coming,
   // which the waiter must outlive.
   if (!waiter.WaitUntil(deadline) && CancelLoadWait(key, waiter)) return false;
@@ -552,9 +571,8 @@ void ShardedHotStore::RunHolds(core::ShardId index, metrics::MaintenancePass pas
     {
       const std::unique_lock lock(shard.mutex);
       const auto start = core::SteadyClock::now();
-      shard.store.SetGraveyard(&removed);
+      const Burial burial(shard.store, removed);
       done = step(shard.store, horizon, budget);
-      shard.store.SetGraveyard(nullptr);
       held = core::SteadyClock::now() - start;
     }
     hold_seconds_.at(static_cast<size_t>(pass))
@@ -674,12 +692,23 @@ ShardLocks::ShardLocks(ShardedHotStore& hot, std::span<const core::ShardId> shar
                "hot shards must be locked sorted and distinct");
   horizons_.reserve(shards_.size());
   Lock();
-  if (hot_->write_hold_observer_) hot_->write_hold_observer_(true);
-  for (const core::ShardId shard : shards_) {
-    // An atomic read, not a cold call. Taken under the locks, it is no
-    // older than any eviction a view's miss reflects.
-    horizons_.push_back(hot_->Horizon(shard));
-    hot_->shards_[shard]->store.SetGraveyard(&graveyard_);
+  // No destructor runs for a constructor that throws, as the drained
+  // supplier or a test's observer may: what Lock took is released here.
+  try {
+    if (hot_->write_hold_observer_) hot_->write_hold_observer_(true);
+    for (const core::ShardId shard : shards_) {
+      // An atomic read, not a cold call. Taken under the locks, it is no
+      // older than any eviction a view's miss reflects.
+      horizons_.push_back(hot_->Horizon(shard));
+      hot_->shards_[shard]->store.SetGraveyard(&graveyard_);
+    }
+  } catch (...) {
+    for (const core::ShardId shard : shards_) hot_->shards_[shard]->store.SetGraveyard(nullptr);
+    for (const core::ShardId shard : std::views::reverse(shards_)) {
+      hot_->shards_[shard]->mutex.unlock();
+    }
+    held_ = false;
+    throw;
   }
 }
 
@@ -698,8 +727,15 @@ ShardLocks::ShardLocks(ShardLocks&& other) noexcept
 // NOLINTNEXTLINE(bugprone-exception-escape): only a test's hold observer can throw.
 ShardLocks::~ShardLocks() { Unlock(); }
 
+// A lock that throws leaves the ones before it released, newest first.
 void ShardLocks::Lock() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
-  for (const core::ShardId shard : shards_) hot_->shards_.at(shard)->mutex.lock();
+  std::size_t taken = 0;
+  try {
+    for (; taken < shards_.size(); ++taken) hot_->shards_.at(shards_[taken])->mutex.lock();
+  } catch (...) {
+    while (taken > 0) hot_->shards_[shards_[--taken]]->mutex.unlock();
+    throw;
+  }
   held_ = true;
 }
 
@@ -748,7 +784,7 @@ LoadStart ShardLocks::BeginLoad(std::string_view key) {
 // Registered in the hold that saw BeginLoad's kPending, and every end
 // of a placeholder holds the shard exclusively: no wake can fall
 // between that sight and the link.
-bool ShardLocks::WhenLoaded(std::string_view key, LoadWaiter& waiter) {
+std::optional<core::Result<void>> ShardLocks::WhenLoaded(std::string_view key, LoadWaiter& waiter) {
   return Store(hot_->ShardIndex(key)).AddLoadWaiter(key, waiter);
 }
 

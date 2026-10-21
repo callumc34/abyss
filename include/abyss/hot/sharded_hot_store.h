@@ -66,9 +66,8 @@ class ShardLocks {
   // `key`'s shard must be held. Expiry is judged at `now_ms`.
   KeyView View(std::string_view key, uint64_t now_ms) const;
   LoadStart BeginLoad(std::string_view key);
-  // For BeginLoad's kPending: links `waiter` on that load, woken when
-  // it ends; false if `key` has no load in flight.
-  bool WhenLoaded(std::string_view key, LoadWaiter& waiter);
+  // For BeginLoad's kPending: SingleShardStore::AddLoadWaiter.
+  std::optional<core::Result<void>> WhenLoaded(std::string_view key, LoadWaiter& waiter);
   // SingleShardStore::CompleteLoads: no eviction, no stub drop.
   size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
   void AbortLoad(std::string_view key, LoadToken token);
@@ -191,12 +190,14 @@ class ShardedHotStore : public core::HotStore {
   // SingleShardStore::CompleteLoads on `shard`, in one exclusive hold.
   size_t CompleteLoads(core::ShardId shard, std::span<LoadCompletion> loads);
   void AbortLoad(std::string_view key, LoadToken token);
-  // Links `waiter` on `key`'s load in flight, woken when it ends; false
-  // if there is none. The store's teardown wakes it kUnavailable.
-  bool WhenLoaded(std::string_view key, LoadWaiter& waiter);
+  // nullopt: linked on `key`'s load in flight, woken when it ends, or
+  // kUnavailable by the store's teardown. Otherwise the outcome now: ok
+  // if there is none; kUnavailable once that teardown began.
+  std::optional<core::Result<void>> WhenLoaded(std::string_view key, LoadWaiter& waiter);
   // SingleShardStore::CancelLoadWaiter, under the shard's lock.
   bool CancelLoadWait(std::string_view key, LoadWaiter& waiter);
-  // Waits until `key` has no load in flight; false at the deadline.
+  // Waits until `key` has no load in flight; false at the deadline, or
+  // once the store's teardown began.
   bool AwaitLoad(std::string_view key, core::SteadyTime deadline);
   size_t LoadWaitersForTesting(std::string_view key);
   // Runs in AwaitLoad before it looks for the load.
@@ -249,6 +250,15 @@ class ShardedHotStore : public core::HotStore {
     write_hold_observer_ = std::move(observer);
   }
   // A shared hold on `shard`, as a read takes.
+  // From a thread holding none: whether `shard`'s lock is free now.
+  bool ShardLockFreeForTesting(core::ShardId shard) const {
+    const std::unique_lock lock(shards_.at(shard)->mutex, std::try_to_lock);
+    return lock.owns_lock();
+  }
+  bool HasGraveyardForTesting(core::ShardId shard) const {
+    const std::shared_lock lock(shards_.at(shard)->mutex);
+    return shards_.at(shard)->store.HasGraveyardForTesting();
+  }
   std::shared_lock<std::shared_mutex> LockSharedForTesting(core::ShardId shard) {
     return std::shared_lock(shards_.at(shard)->mutex);
   }

@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -14,7 +16,10 @@
 #include <variant>
 #include <vector>
 
+#include "abyss/core/effect.h"
 #include "abyss/core/eviction_policy.h"
+#include "abyss/core/queue_entry.h"
+#include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -892,6 +897,22 @@ class ShardedResidencyTest : public ::testing::Test {
         store_.Apply(ops::WriteOp{ops::StringSet{.key = key, .value = "v"}}, seq).has_value());
   }
 
+  // Bounded: until `key`'s load has `count` waiters.
+  bool WaitingOn(std::string_view key, size_t count) {
+    const auto until = core::SteadyClock::now() + 10s;
+    while (store_.LoadWaitersForTesting(key) != count) {
+      if (core::SteadyClock::now() >= until) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return true;
+  }
+
+  // `base`, lengthened until it is on `shard`.
+  std::string KeyOn(core::ShardId shard, std::string base) const {
+    while (core::ComputeShard(base, store_.shard_count()) != shard) base += "+";
+    return base;
+  }
+
   // Runs `act` while another thread waits on the key's load, and checks
   // the waiter wakes long before its deadline.
   void ExpectAwaitWakes(std::string_view key, const std::function<void()>& act) {
@@ -905,7 +926,7 @@ class ShardedResidencyTest : public ::testing::Test {
     });
     const abyss::testing::OnExit join([&] { waiter.join(); });
     ASSERT_TRUE(started.Wait());
-    std::this_thread::sleep_for(20ms);
+    ASSERT_TRUE(WaitingOn(key, 1));
     const auto acted = core::SteadyClock::now();
     act();
     ASSERT_TRUE(done.Wait(5s));
@@ -1152,6 +1173,148 @@ TEST_F(ShardedResidencyTest, AwaitLoadWakesOnWipe) {
   ExpectAwaitWakes("k", [&] { EXPECT_TRUE(store_.Wipe(shard, 4).has_value()); });
 }
 
+TEST_F(ShardedResidencyTest, AwaitLoadWakesOnAReplayedWrite) {
+  ASSERT_TRUE(store_.BeginLoad("k").started());
+  core::QueueEntry write{.seq = 4,
+                         .payload = core::entry::Write{.cmd = {.args = {"SET", "k", "v"}}},
+                         .replaces_state = true};
+  const auto shard = core::ComputeShard("k", store_.shard_count());
+  ExpectAwaitWakes("k", [&] {
+    const auto replayed = store_.Replay(shard, write);
+    EXPECT_TRUE(replayed.has_value() && replayed->applied);
+  });
+}
+
+TEST_F(ShardedResidencyTest, AwaitLoadWakesOnAReplayedFlush) {
+  ASSERT_TRUE(store_.BeginLoad("k").started());
+  core::QueueEntry flush{.seq = 4, .payload = core::entry::Flush{}};
+  const auto shard = core::ComputeShard("k", store_.shard_count());
+  ExpectAwaitWakes("k", [&] { EXPECT_TRUE(store_.Replay(shard, flush).has_value()); });
+}
+
+TEST_F(ShardedResidencyTest, CompleteLoadsWakesEveryLoadItEnds) {
+  const auto shard = core::ComputeShard("k", store_.shard_count());
+  const std::string other = KeyOn(shard, "j");
+  std::vector<LoadCompletion> loads;
+  loads.push_back({.key = "k",
+                   .token = MustBeginLoad(store_, "k"),
+                   .result = MakeLoadedFull(std::string("v"), 0)});
+  loads.push_back({.key = other, .token = MustBeginLoad(store_, other), .result = LoadedAbsent{}});
+  CountingLoadWaiter on_k;
+  CountingLoadWaiter on_other;
+  ASSERT_FALSE(store_.WhenLoaded("k", on_k).has_value());
+  ASSERT_FALSE(store_.WhenLoaded(other, on_other).has_value());
+
+  EXPECT_EQ(store_.CompleteLoads(shard, loads), 2U);
+  EXPECT_EQ(on_k.wakes(), 1);
+  EXPECT_TRUE(on_k.last_ok());
+  EXPECT_EQ(on_other.wakes(), 1);
+  EXPECT_TRUE(on_other.last_ok());
+}
+
+// Each way a hold ends a placeholder wakes its waiters once the hold is
+// released, never under it.
+TEST_F(ShardedResidencyTest, EveryEndInAHoldWakesOnceItIsReleased) {
+  const auto shard = core::ComputeShard("k", store_.shard_count());
+  const std::array<core::ShardId, 1> held{shard};
+  core::SequenceId seq = 10;
+  const auto expect_wake = [&](const std::string& key,
+                               const std::function<void(ShardLocks&, LoadToken)>& end) {
+    const LoadToken token = MustBeginLoad(store_, key);
+    CountingLoadWaiter waiter;
+    {
+      auto locks = store_.LockExclusive(held);
+      ASSERT_FALSE(locks.WhenLoaded(key, waiter).has_value());
+      end(locks, token);
+      EXPECT_EQ(waiter.wakes(), 0) << key << ": woken under the lock";
+    }
+    EXPECT_EQ(waiter.wakes(), 1) << key;
+    EXPECT_TRUE(waiter.last_ok()) << key;
+  };
+  const std::string aborted = KeyOn(shard, "a");
+  expect_wake(aborted,
+              [&](ShardLocks& locks, LoadToken token) { locks.AbortLoad(aborted, token); });
+  const std::string completed = KeyOn(shard, "c");
+  expect_wake(completed, [&](ShardLocks& locks, LoadToken token) {
+    std::vector<LoadCompletion> loads;
+    loads.push_back({.key = completed, .token = token, .result = LoadedAbsent{}});
+    EXPECT_EQ(locks.CompleteLoads(shard, loads), 1U);
+  });
+  const std::string written = KeyOn(shard, "w");
+  expect_wake(written, [&](ShardLocks& locks, LoadToken /*token*/) {
+    core::Effect effect{.key = written, .cmd = {.args = {"SET", written, "v"}}};
+    EXPECT_EQ(locks.ApplyEffects(shard, std::span(&effect, 1), ++seq, core::WallTime{}).size(), 1U);
+  });
+  const std::string wiped = KeyOn(shard, "f");
+  expect_wake(wiped, [&](ShardLocks& locks, LoadToken /*token*/) {
+    locks.Wipe(shard, ++seq, store_.ReservedMaps(shard));
+  });
+}
+
+// The deadline passes once the load ended but before its wake: the
+// waiter's Cancel loses, so it takes the wake to come, which is ok.
+TEST_F(ShardedResidencyTest, AWaiterWhoseCancelLosesToTheEndTakesItsWake) {
+  const LoadToken token = MustBeginLoad(store_, "k");
+  const std::array<core::ShardId, 1> held{core::ComputeShard("k", store_.shard_count())};
+  const auto deadline = core::SteadyClock::now() + 100ms;
+  std::atomic<bool> woke{false};
+  std::thread waiter([&] { woke = store_.AwaitLoad("k", deadline); });
+  const abyss::testing::OnExit join([&] {
+    if (waiter.joinable()) waiter.join();
+  });
+  ASSERT_TRUE(WaitingOn("k", 1));
+  {
+    auto locks = store_.LockExclusive(held);
+    locks.AbortLoad("k", token);
+    // Past the deadline, so the waiter's Cancel queues behind the hold.
+    std::this_thread::sleep_until(deadline + 50ms);
+  }
+  waiter.join();
+  EXPECT_TRUE(woke.load()) << "the waiter left before the wake it was owed";
+}
+
+// A throw out of a hold that ended a placeholder still wakes its
+// waiters: here CompleteLoad's install reads the clock and it throws.
+TEST(ShardedResidencyUnwindTest, AThrowAfterALoadEndedStillWakesItsWaiters) {
+  std::atomic<bool> throwing{false};
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .shard_count = 1,
+      .steady_clock =
+          [&throwing] {
+            if (throwing.load()) throw std::bad_alloc();
+            return core::SteadyClock::now();
+          },
+  }};
+  const LoadToken token = MustBeginLoad(store, "k");
+  CountingLoadWaiter waiter;
+  ASSERT_FALSE(store.WhenLoaded("k", waiter).has_value());
+  throwing = true;
+  EXPECT_THROW((void)store.CompleteLoad("k", token, MakeLoadedFull(std::string("v"), 0)),
+               std::bad_alloc);
+  throwing = false;
+  EXPECT_EQ(waiter.wakes(), 1) << "the unwind stranded the load's waiter";
+  EXPECT_TRUE(waiter.last_ok());
+  EXPECT_FALSE(store.HasGraveyardForTesting(0)) << "the unwind left the install's graveyard set";
+}
+
+// A throw out of a maintenance hold, here from the clock its pass reads,
+// leaves no graveyard set: the pass's own is gone once it unwinds.
+TEST(ShardedResidencyUnwindTest, AThrowOutOfAMaintenanceHoldLeavesNoGraveyardSet) {
+  std::atomic<bool> throwing{false};
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .shard_count = 1,
+      .wall_clock =
+          [&throwing] {
+            if (throwing.load()) throw std::bad_alloc();
+            return core::WallTime{std::chrono::milliseconds{1'000'000}};
+          },
+  }};
+  throwing = true;
+  EXPECT_THROW((void)store.EvictExpired(core::SteadyClock::now()), std::bad_alloc);
+  throwing = false;
+  EXPECT_FALSE(store.HasGraveyardForTesting(0)) << "the unwind left the pass's graveyard set";
+}
+
 // Each placeholder holds its own key's waiters: ending one wakes them
 // and no other key's.
 TEST_F(ShardedResidencyTest, EndingALoadWakesOnlyItsKeysWaiters) {
@@ -1163,11 +1326,11 @@ TEST_F(ShardedResidencyTest, EndingALoadWakesOnlyItsKeysWaiters) {
     others.push_back("p" + std::to_string(i));
     tokens.push_back(MustBeginLoad(store_, others.back()));
     waiting.push_back(std::make_unique<CountingLoadWaiter>());
-    ASSERT_TRUE(store_.WhenLoaded(others.back(), *waiting.back()));
+    ASSERT_FALSE(store_.WhenLoaded(others.back(), *waiting.back()).has_value());
   }
   const LoadToken token = MustBeginLoad(store_, "k");
   CountingLoadWaiter on_k;
-  ASSERT_TRUE(store_.WhenLoaded("k", on_k));
+  ASSERT_FALSE(store_.WhenLoaded("k", on_k).has_value());
   ASSERT_EQ(store_.LoadWaitersForTesting("k"), 1U);
 
   EXPECT_TRUE(store_.CompleteLoad("k", token, LoadedAbsent{}));
@@ -1177,7 +1340,8 @@ TEST_F(ShardedResidencyTest, EndingALoadWakesOnlyItsKeysWaiters) {
     EXPECT_EQ(waiting[i]->wakes(), 0) << others[i];
     EXPECT_EQ(store_.LoadWaitersForTesting(others[i]), 1U) << others[i];
   }
-  EXPECT_FALSE(store_.WhenLoaded("k", on_k)) << "no load is in flight";
+  const auto none = store_.WhenLoaded("k", on_k);
+  EXPECT_TRUE(none.has_value() && none->has_value()) << "no load is in flight";
 
   for (int i = 0; i < kOthers; ++i) store_.AbortLoad(others[i], tokens[i]);
   for (const auto& waiter : waiting) EXPECT_EQ(waiter->wakes(), 1);
@@ -1190,7 +1354,7 @@ TEST_F(ShardedResidencyTest, AHoldWakesTheWaitersItEndedAfterUnlocking) {
   auto locks = store_.LockExclusive(held);
   ASSERT_EQ(locks.BeginLoad("k").status, LoadStart::Status::kPending);
   CountingLoadWaiter waiter;
-  ASSERT_TRUE(locks.WhenLoaded("k", waiter));
+  ASSERT_FALSE(locks.WhenLoaded("k", waiter).has_value());
   locks.AbortLoad("k", token);
   EXPECT_EQ(waiter.wakes(), 0) << "woken under the lock";
   locks.Unlock();
@@ -1223,10 +1387,45 @@ TEST(ShardedResidencyTeardownTest, TheStoresTeardownWakesItsLoadWaitersUnavailab
   auto store = std::make_unique<ShardedHotStore>(ShardedHotStoreConfig{.shard_count = 2});
   ASSERT_TRUE(store->BeginLoad("k").started());
   CountingLoadWaiter waiter;
-  ASSERT_TRUE(store->WhenLoaded("k", waiter));
+  ASSERT_FALSE(store->WhenLoaded("k", waiter).has_value());
   store.reset();
   EXPECT_EQ(waiter.wakes(), 1);
   EXPECT_FALSE(waiter.last_ok());
+}
+
+// Once the teardown failed the waits, a store links no new one, which
+// no one would wake: it fails at once.
+TEST_F(ResidencyTest, AfterTheWaitsFailNoWaiterIsLinked) {
+  MustBeginLoad(store_, "k");
+  CountingLoadWaiter linked;
+  ASSERT_FALSE(store_.AddLoadWaiter("k", linked).has_value());
+  const core::Error gone{core::ErrorCode::kUnavailable, "gone"};
+  store_.FailLoadWaits(gone);
+  SingleShardStore::Wake(store_.TakeWoken(), std::unexpected(gone));
+  EXPECT_EQ(linked.wakes(), 1);
+  EXPECT_FALSE(linked.last_ok());
+
+  CountingLoadWaiter late;
+  const auto now = store_.AddLoadWaiter("k", late);
+  EXPECT_TRUE(now.has_value() && !now->has_value() &&
+              now->error().code() == core::ErrorCode::kUnavailable)
+      << "linked after the waits failed";
+  EXPECT_EQ(store_.LoadWaitersForTesting("k"), 0U);
+}
+
+// Its placeholder ended, a waiter is on the woken chain until its wake;
+// registering it again then would break that chain.
+TEST_F(ResidencyTest, RegisteringAWaiterBeforeItsWakeIsFatal) {
+  const LoadToken token = MustBeginLoad(store_, "k");
+  CountingLoadWaiter waiter;
+  ASSERT_FALSE(store_.AddLoadWaiter("k", waiter).has_value());
+  store_.AbortLoad("k", token);
+  MustBeginLoad(store_, "k");
+  EXPECT_DEATH((void)store_.AddLoadWaiter("k", waiter), "LoadWaiter registered twice");
+  SingleShardStore::Wake(store_.TakeWoken(), core::Result<void>{});
+  EXPECT_EQ(waiter.wakes(), 1);
+  EXPECT_FALSE(store_.AddLoadWaiter("k", waiter).has_value()) << "woken, it may wait again";
+  EXPECT_TRUE(store_.CancelLoadWaiter("k", waiter));
 }
 
 TEST_F(ShardedResidencyTest, AwaitLoadTimesOutWhileTheLoadIsPending) {
@@ -1405,6 +1604,59 @@ TEST(ShardedFillTest, AFillEvictsDrainedKeysToMakeRoom) {
             ShardedHotStore::FillResult::kInstalled);
   EXPECT_GT(store.Stats()->eviction_count, before);
   EXPECT_LE(store.Stats()->used_bytes, 64UL * 1024);
+}
+
+// Each way a fill is refused aborts its load, which wakes the load's
+// waiters.
+TEST(ShardedFillTest, EveryRefusedFillWakesItsLoadsWaiters) {
+  const auto expect_wake = [](ShardedHotStore& store, LoadResult result,
+                              ShardedHotStore::FillResult refused) {
+    const LoadToken token = MustBeginLoad(store, "fill");
+    CountingLoadWaiter waiter;
+    ASSERT_FALSE(store.WhenLoaded("fill", waiter).has_value());
+    EXPECT_EQ(store.Fill("fill", token, std::move(result)), refused);
+    EXPECT_EQ(waiter.wakes(), 1);
+    EXPECT_TRUE(waiter.last_ok());
+  };
+  {
+    ShardedHotStore store{ShardedHotStoreConfig{
+        .max_memory_bytes = 64UL * 1024, .shard_count = 1, .fill_max_fraction = 0.25}};
+    expect_wake(store, MakeLoadedFull(std::string(20000, 'x'), 0),
+                ShardedHotStore::FillResult::kTooLarge);
+  }
+  // Undrained, so nothing can be evicted to make room.
+  const auto fill_undrained = [](ShardedHotStore& store, uint64_t bytes) {
+    core::SequenceId seq = 0;
+    while (store.Stats()->used_bytes <= bytes) {
+      ASSERT_LT(seq, 1000U);
+      const auto applied =
+          store.Apply(ops::WriteOp{ops::StringSet{.key = "k" + std::to_string(seq),
+                                                  .value = std::string(4096, 'x')}},
+                      seq + 1);
+      EXPECT_TRUE(applied.has_value() ||
+                  applied.error().code() == core::ErrorCode::kResourceExhausted);
+      ++seq;
+    }
+  };
+  const ShardedHotStoreConfig undrained{
+      .max_memory_bytes = 64UL * 1024,
+      .shard_count = 1,
+      .drained = [](core::ShardId) { return core::SequenceId{0}; },
+  };
+  {
+    ShardedHotStore store{undrained};
+    fill_undrained(store, store.Stats()->max_bytes * 5 / 4);
+    ASSERT_TRUE(store.Memory(0).used_bytes > store.Memory(0).limit_bytes);
+    expect_wake(store, MakeLoadedFull(std::string("v"), 0),
+                ShardedHotStore::FillResult::kOverBackpressure);
+  }
+  {
+    ShardedHotStore store{undrained};
+    fill_undrained(store, store.Stats()->max_bytes);
+    ASSERT_FALSE(store.Memory(0).used_bytes > store.Memory(0).limit_bytes);
+    expect_wake(store, MakeLoadedFull(std::string(1000, 'y'), 0),
+                ShardedHotStore::FillResult::kNoRoom);
+  }
 }
 
 }  // namespace

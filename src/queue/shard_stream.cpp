@@ -257,7 +257,7 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
                                                     core::SteadyTime admit_by) {
   const bool batch = entries.size() > 1;
   if (config_.window != nullptr) {
-    if (auto admitted = config_.window->Admit(config_.unit->age, admit_by); !admitted) {
+    if (auto admitted = config_.window->Admit(config_.unit->id, admit_by); !admitted) {
       return std::unexpected(admitted.error());
     }
   }
@@ -303,7 +303,7 @@ core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> 
 
     const Log::Reservation& at = *reserved;
     if (config_.window != nullptr) config_.window->Add(total);
-    config_.unit->age.Start(DurabilityWindow::Clock::now());
+    config_.unit->age->Start(DurabilityWindow::Clock::now());
     const core::SequenceId first = next_seq_;
     ABYSS_DCHECK(first >= core::kFirstSeq, "a frame assigned seq 0");
     uint64_t off = 0;
@@ -438,7 +438,7 @@ core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
   }
 
   if (lead.config_.window != nullptr) lead.config_.window->Add(total);
-  unit.age.Start(DurabilityWindow::Clock::now());
+  unit.age->Start(DurabilityWindow::Clock::now());
   const std::function<void(std::size_t)>& hook = lead.batch_commit_hook_;
   std::vector<Filler::Part> publish;
   publish.reserve(group.parts.size());
