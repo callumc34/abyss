@@ -32,16 +32,39 @@ class LoggingWaiter final : public Waiter {
 
   // NOLINTNEXTLINE(bugprone-exception-escape): an OOM may terminate.
   void Wake(Result<void> result) noexcept override {
-    if (!result.has_value()) last_error_ = result.error().code();
+    if (result.has_value()) {
+      ++ok_wakes_;
+    } else {
+      last_error_ = result.error().code();
+    }
     log_->push_back(id_);
   }
 
+  int ok_wakes() const { return ok_wakes_; }
   std::optional<ErrorCode> last_error() const { return last_error_; }
 
  private:
   size_t id_;
   std::vector<size_t>* log_;
+  int ok_wakes_ = 0;
   std::optional<ErrorCode> last_error_;
+};
+
+// Its owner gives up on the wake at once, inside it.
+class FinishingWaiter final : public Waiter {
+ public:
+  explicit FinishingWaiter(WaitList* list) : list_(list) {}
+
+  void Wake(Result<void> result) noexcept override {
+    ok_ = result.has_value();
+    list_->Finish(*this);
+  }
+
+  bool ok() const { return ok_; }
+
+ private:
+  WaitList* list_;
+  bool ok_ = false;
 };
 
 // Counts wakes per slot. Wake's last act is the count, after which the
@@ -129,7 +152,9 @@ TEST(WaitListTest, NotifyWakesABatchInFifoOrder) {
   EXPECT_EQ(list.size(), 0U);
 }
 
-TEST(WaitListTest, NewRegistrationsAppendAndARetryKeepsItsTicket) {
+// A new wait appends in O(1). A cancelled wait has ended, so the same
+// waiter's next wait queues afresh behind everyone already waiting.
+TEST(WaitListTest, NewWaitsAppendAndACancelledWaiterQueuesAfresh) {
   WaitList list;
   std::vector<size_t> log;
   std::deque<LoggingWaiter> waiters;
@@ -140,18 +165,105 @@ TEST(WaitListTest, NewRegistrationsAppendAndARetryKeepsItsTicket) {
   }
   EXPECT_EQ(list.StatsForTesting().insert_steps, 0U);
 
-  // A timed-out retry: cancelled, then registered again in its place.
   ASSERT_TRUE(list.Cancel(waiters.at(2)));
   ASSERT_FALSE(list.Register(waiters.at(2), never).has_value());
-  EXPECT_EQ(list.StatsForTesting().insert_steps, 2U);
+  EXPECT_EQ(list.StatsForTesting().insert_steps, 0U);
 
   list.Notify();
-  ASSERT_GE(log.size(), 4U);
+  ASSERT_EQ(log.size(), WaitList::kWakeBatch);
   EXPECT_EQ(log.at(0), 0U);
   EXPECT_EQ(log.at(1), 1U);
-  EXPECT_EQ(log.at(2), 2U);
-  EXPECT_EQ(log.at(3), 3U);
+  EXPECT_EQ(log.at(2), 3U);
   list.FailAll(Stopped());
+  EXPECT_EQ(log.back(), 2U);
+}
+
+// A reused waiter's next wait is a new one: it queues behind a waiter
+// that registered after its last wait ended.
+TEST(WaitListTest, AReusedWaitersNextWaitQueuesAfresh) {
+  WaitList list;
+  std::vector<size_t> log;
+  LoggingWaiter reused(0, &log);
+  LoggingWaiter later(1, &log);
+  const auto never = [] { return false; };
+  ASSERT_FALSE(list.Register(reused, never).has_value());
+  list.Notify();
+  // Woken, it finds the room: its wait ends here.
+  ASSERT_TRUE(list.Register(reused, [] { return true; }).has_value());
+
+  ASSERT_FALSE(list.Register(later, never).has_value());
+  ASSERT_FALSE(list.Register(reused, never).has_value());
+  log.clear();
+  list.Notify();
+  EXPECT_EQ(log, (std::vector<size_t>{1, 0}));
+}
+
+// Woken waiters that re-block keep their places, in whatever order
+// they re-register, ahead of a newer wait.
+TEST(WaitListTest, WokenWaitersThatReBlockKeepTheirPlaces) {
+  WaitList list;
+  std::vector<size_t> log;
+  LoggingWaiter first(0, &log);
+  LoggingWaiter second(1, &log);
+  LoggingWaiter newer(2, &log);
+  const auto never = [] { return false; };
+  ASSERT_FALSE(list.Register(first, never).has_value());
+  ASSERT_FALSE(list.Register(second, never).has_value());
+  list.Notify();
+  ASSERT_EQ(log.size(), 2U);
+
+  ASSERT_FALSE(list.Register(second, never).has_value());
+  ASSERT_FALSE(list.Register(first, never).has_value());
+  ASSERT_FALSE(list.Register(newer, never).has_value());
+  log.clear();
+  list.Notify();
+  EXPECT_EQ(log, (std::vector<size_t>{0, 1, 2}));
+}
+
+// A woken waiter that gives up passes its ok wake on, and its next
+// wait queues afresh.
+TEST(WaitListTest, FinishAfterAnOkWakeWakesTheNextWaiter) {
+  WaitList list;
+  std::vector<size_t> log;
+  std::deque<LoggingWaiter> waiters;
+  const auto never = [] { return false; };
+  for (size_t id = 0; id < 3; ++id) {
+    waiters.emplace_back(id, &log);
+    ASSERT_FALSE(list.Register(waiters.back(), never).has_value());
+  }
+  list.HandOff();
+  ASSERT_EQ(log, (std::vector<size_t>{0}));
+  list.Finish(waiters.at(0));
+  EXPECT_EQ(log, (std::vector<size_t>{0, 1}));
+  EXPECT_EQ(waiters.at(1).ok_wakes(), 1);
+
+  ASSERT_FALSE(list.Register(waiters.at(0), never).has_value());
+  log.clear();
+  list.Notify();
+  EXPECT_EQ(log, (std::vector<size_t>{2, 0}));
+}
+
+// An error wake has no capacity to pass on. The finishing waiter is
+// first in FailAll's first batch, and the last waiter is still linked
+// when it finishes, so a hand-off would wake that one ok.
+TEST(WaitListTest, FinishAfterAnErrorWakeHandsNothingOn) {
+  WaitList list;
+  FinishingWaiter finishing(&list);
+  std::vector<size_t> log;
+  std::deque<LoggingWaiter> waiters;
+  const auto never = [] { return false; };
+  ASSERT_FALSE(list.Register(finishing, never).has_value());
+  for (size_t id = 0; id < WaitList::kWakeBatch; ++id) {
+    waiters.emplace_back(id, &log);
+    ASSERT_FALSE(list.Register(waiters.back(), never).has_value());
+  }
+  list.FailAll(Stopped());
+  EXPECT_FALSE(finishing.ok());
+  EXPECT_EQ(log.size(), WaitList::kWakeBatch);
+  for (const auto& waiter : waiters) {
+    EXPECT_EQ(waiter.ok_wakes(), 0);
+    EXPECT_EQ(waiter.last_error(), ErrorCode::kUnavailable);
+  }
 }
 
 // The owner published before the waiter was counted, so its Notify
@@ -420,6 +532,77 @@ TEST(WaitListTest, BlockingWaitWhoseCancelLostWaitsForTheWake) {
   notifier.join();
   blocked.join();
   EXPECT_TRUE(result.has_value());
+}
+
+struct HeldWake {
+  Result<void> a = std::unexpected(Error{ErrorCode::kInternal, "unset"});
+  size_t b_wakes = 0;
+  size_t left = 0;
+};
+
+// One Notify's batch ends with the blocking waiter A, and B is the
+// first left behind. The gate holds the batch until A's deadline has
+// passed, so A's Cancel loses and it waits for its wake. Whether the
+// room is still free when A re-checks is `room_kept`.
+HeldWake RunHeldWake(bool room_kept) {
+  WaitList list;
+  std::atomic<bool> room{false};
+  const auto never = [] { return false; };
+  const auto has_room = [&] { return room.load(); };
+  GateWaiter gate;
+  EXPECT_FALSE(list.Register(gate, never).has_value());
+  std::vector<size_t> filler_log;
+  std::deque<LoggingWaiter> fillers;
+  for (size_t id = 0; id + 2 < WaitList::kWakeBatch; ++id) {
+    fillers.emplace_back(id, &filler_log);
+    EXPECT_FALSE(list.Register(fillers.back(), never).has_value());
+  }
+
+  HeldWake out;
+  std::atomic<bool> a_returned{false};
+  std::thread a([&] {
+    out.a = list.Await(has_room, 50ms);
+    a_returned.store(true);
+  });
+  EXPECT_TRUE(Eventually([&] { return list.size() == WaitList::kWakeBatch; }));
+  std::vector<size_t> b_log;
+  LoggingWaiter b(0, &b_log);
+  EXPECT_FALSE(list.Register(b, has_room).has_value());
+
+  room.store(true);
+  std::thread notifier([&] { list.Notify(); });
+  EXPECT_TRUE(gate.AwaitEntered(10s));
+  EXPECT_EQ(list.size(), 1U);
+  std::this_thread::sleep_for(200ms);
+  EXPECT_FALSE(a_returned.load());
+  if (!room_kept) room.store(false);
+  gate.Open();
+  notifier.join();
+  a.join();
+
+  out.b_wakes = b_log.size();
+  out.left = list.size();
+  list.FailAll(Stopped());
+  return out;
+}
+
+// A wake held past A's deadline still finds the room free: A takes it
+// and hands on, so B wakes with no further Release.
+TEST(WaitListTest, WakeHeldPastTheDeadlineTakesFreeRoomAndHandsOn) {
+  const HeldWake run = RunHeldWake(/*room_kept=*/true);
+  EXPECT_TRUE(run.a.has_value());
+  EXPECT_EQ(run.b_wakes, 1U);
+  EXPECT_EQ(run.left, 0U);
+}
+
+// The room went before A re-checked: A times out, and with nothing to
+// pass on, B stays asleep.
+TEST(WaitListTest, WakeHeldPastTheDeadlineTimesOutWhenTheRoomIsGone) {
+  const HeldWake run = RunHeldWake(/*room_kept=*/false);
+  ASSERT_FALSE(run.a.has_value());
+  EXPECT_EQ(run.a.error().code(), ErrorCode::kTimeout);
+  EXPECT_EQ(run.b_wakes, 0U);
+  EXPECT_EQ(run.left, 1U);
 }
 
 // For the sanitizers: a notifier races each timing-out blocking wait,
