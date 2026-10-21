@@ -69,6 +69,7 @@ enum Sometimes : uint8_t {  // NOLINT(cppcoreguidelines-use-enum-class)
   kOom,
   kReclaimedRestart,
   kReplaySkipped,
+  kInvertedReplay,
   kSometimesCount,
 };
 constexpr std::array<std::string_view, kSometimesCount> kSometimesNames = {
@@ -85,7 +86,8 @@ constexpr std::array<std::string_view, kSometimesCount> kSometimesNames = {
     "CROSSSLOT reply",
     "-OOM reply",
     "restart over a reclaimed head",
-    "replay skipped a key it never saw created"};
+    "replay skipped a key it never saw created",
+    "cross-shard MSETNX after a DEL, replayed in inverted order"};
 
 using Counts = std::array<uint64_t, kSometimesCount>;
 
@@ -146,6 +148,7 @@ class DifferentialTest : public PropertyHarness {
 
     for (int step = 0; step < ops && !failed_; ++step) {
       step_ = step;
+      if (step == ops / 4) CrossShardMsetnxThenInvertedReplay();
       // Once a stream: cold takes everything and retention drops it, a
       // few dozen writes follow, then a restart replays only those, so
       // it meets updates to keys whose creation it never sees.
@@ -832,6 +835,38 @@ class DifferentialTest : public PropertyHarness {
       }
     }
     CheckAll("after a restart");
+  }
+
+  // #194's shape, once a stream: a DEL of a and b, then a cross-shard
+  // MSETNX of them whose first key's shard is the higher, then a restart
+  // that replays a's shard before b's, against the shards' order. A SET
+  // of b logged on a's shard would come back under b's older DEL.
+  void CrossShardMsetnxThenInvertedReplay() {
+    std::string a;
+    std::string b;
+    for (int i = 0; i < kHotKeys && b.empty(); ++i) {
+      for (int j = 0; j < kHotKeys && b.empty(); ++j) {
+        const std::string ki = "k" + std::to_string(i);
+        const std::string kj = "k" + std::to_string(j);
+        if (ShardOf(ki) > ShardOf(kj) && queue_->LogOf(ShardOf(ki)) == queue_->LogOf(ShardOf(kj))) {
+          a = ki;
+          b = kj;
+        }
+      }
+    }
+    if (b.empty()) return;
+    Command({"SET", b, "x" + std::to_string(++counter_)});
+    if (!failed_) Command({"DEL", a, b});
+    const std::string value = "x" + std::to_string(++counter_);
+    if (!failed_) Command({"MSETNX", a, value, b, value});
+    if (failed_) return;
+    const RedisModel::Value* got = model_.Find(b, now_ms_);
+    // Refused, as by -OOM: nothing to replay.
+    if (got == nullptr || got->str != value) return;
+    replay_order_ = {ShardOf(a), ShardOf(b)};
+    Reopen(/*settle_first=*/false);
+    replay_order_.clear();
+    if (!failed_) ++counts_.at(kInvertedReplay);
   }
 
   // No spare segment: the preparer is paused until a write re-decides

@@ -11,6 +11,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,8 +27,10 @@
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/predicate.h"
+#include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
+#include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
@@ -72,6 +76,111 @@ struct Clocks {
   core::WallClockFn wall = core::DefaultWallClock;
 };
 
+// A queue whose Scan hands each of `first`'s shards over whole, in that
+// order, then the rest in shard order: a test fixes the order shards
+// replay in, which a real Scan leaves to its workers.
+class OrderedScanQueue : public core::Queue {
+ public:
+  OrderedScanQueue(core::Queue& queue, std::vector<core::ShardId> first)
+      : queue_(queue), first_(std::move(first)) {}
+
+  core::Result<void> Scan(std::span<const core::SequenceId> from,
+                          std::span<const core::SequenceId> end, uint32_t /*parallelism*/,
+                          const ScanSink& sink, const std::atomic<bool>& cancel) override {
+    std::vector<std::vector<std::vector<core::QueueEntry>>> batches(from.size());
+    const ScanSink keep = [&batches](core::ShardId shard,
+                                     std::vector<core::QueueEntry>& batch) -> core::Result<void> {
+      batches.at(shard).push_back(std::move(batch));
+      return {};
+    };
+    if (auto scanned = queue_.Scan(from, end, 1, keep, cancel); !scanned.has_value()) {
+      return scanned;
+    }
+    std::vector<core::ShardId> order = first_;
+    for (core::ShardId shard = 0; shard < from.size(); ++shard) {
+      if (std::ranges::find(order, shard) == order.end()) order.push_back(shard);
+    }
+    for (const core::ShardId shard : order) {
+      for (auto& batch : batches.at(shard)) {
+        if (auto sunk = sink(shard, batch); !sunk.has_value()) return sunk;
+      }
+    }
+    return {};
+  }
+
+  core::Result<queue::PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry,
+                                                 core::SteadyTime admit_by) override {
+    return queue_.BeginAppend(shard, std::move(entry), admit_by);
+  }
+  core::Result<queue::PendingBatchAppend> BeginAppendBatch(
+      core::ShardId shard, std::span<const core::QueueEntry> entries,
+      core::SteadyTime admit_by) override {
+    return queue_.BeginAppendBatch(shard, entries, admit_by);
+  }
+  core::Result<queue::AppendResult> Append(core::ShardId shard, core::QueueEntry entry,
+                                           core::SteadyTime admit_by) override {
+    return queue_.Append(shard, std::move(entry), admit_by);
+  }
+  core::Result<queue::AppendBatchResult> AppendBatch(core::ShardId shard,
+                                                     std::span<const core::QueueEntry> entries,
+                                                     core::SteadyTime admit_by) override {
+    return queue_.AppendBatch(shard, entries, admit_by);
+  }
+  core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by) override {
+    return queue_.Admit(shard, admit_by);
+  }
+  bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline) override {
+    return queue_.WaitForSpare(shard, deadline);
+  }
+  core::Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) override {
+    return queue_.Reserve(parts);
+  }
+  core::Result<queue::Reservation> ReserveFlush(
+      std::span<const queue::ShardEntries> parts) override {
+    return queue_.ReserveFlush(parts);
+  }
+  uint32_t LogOf(core::ShardId shard) const override { return queue_.LogOf(shard); }
+  queue::DurableFutures Complete(queue::Reservation&& reservation) override {
+    return queue_.Complete(std::move(reservation));
+  }
+  core::Result<std::vector<core::QueueEntry>> Read(core::ShardId shard, core::SequenceId from_seq,
+                                                   size_t max_count, core::Duration timeout,
+                                                   core::Durability visible) override {
+    return queue_.Read(shard, from_seq, max_count, timeout, visible);
+  }
+  core::Result<void> CommitOffset(core::ConsumerId consumer, core::ShardId shard,
+                                  core::SequenceId seq) override {
+    return queue_.CommitOffset(consumer, shard, seq);
+  }
+  core::Result<std::optional<core::SequenceId>> CommittedOffset(core::ConsumerId consumer,
+                                                                core::ShardId shard) override {
+    return queue_.CommittedOffset(consumer, shard);
+  }
+  core::Durability AckDurability() const override { return queue_.AckDurability(); }
+  core::Result<core::SequenceId> DurableEnd(core::ShardId shard,
+                                            core::Durability durability) override {
+    return queue_.DurableEnd(shard, durability);
+  }
+  core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
+                                  core::Durability durability, core::Duration timeout) override {
+    return queue_.AwaitDurable(shard, seq, durability, timeout);
+  }
+  core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override {
+    return queue_.FirstSeq(shard);
+  }
+  core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override {
+    return queue_.OldestRetained(shard);
+  }
+  core::Result<core::SequenceId> TailSeq(core::ShardId shard) override {
+    return queue_.TailSeq(shard);
+  }
+  core::Result<core::QueueStats> Stats() override { return queue_.Stats(); }
+
+ private:
+  core::Queue& queue_;
+  std::vector<core::ShardId> first_;
+};
+
 // A real log, hot store, RocksDB cold store and cold consumers, the
 // consumers driven by hand, and the engine over them. Restart reopens
 // the log and cold store and recovers a fresh hot store from them.
@@ -97,8 +206,10 @@ class SequencedEngineTest : public ::testing::Test {
     hot_clocks_ = std::move(clocks);
     hot_ = NewHot();
     BoundedThreadShardScheduler scheduler(4);
+    OrderedScanQueue ordered(*queue_, replay_order_);
     RecoveryCoordinator coordinator(
-        *queue_, *pool_, *hot_, scheduler,
+        replay_order_.empty() ? static_cast<core::Queue&>(*queue_) : ordered, *pool_, *hot_,
+        scheduler,
         RecoveryConfig{.replay_parallelism = 2,
                        .replayer = HotReplayer::Config{.steady_clock = hot_clocks_.steady,
                                                        .wall_clock = hot_clocks_.wall}});
@@ -117,7 +228,6 @@ class SequencedEngineTest : public ::testing::Test {
     auto recovered = coordinator.Run(cancel);
     done = true;
     if (sampler.joinable()) sampler.join();
-    drain_requests_ = coordinator.Replayer().DrainRequests();
     skipped_ = coordinator.Replayer().Skipped();
     Rewire();
     return recovered;
@@ -299,10 +409,12 @@ class SequencedEngineTest : public ::testing::Test {
   std::function<core::WallTime()> wall_;
   // What the loader reads cold through, when set; else cold_.
   core::ColdStore* loader_cold_ = nullptr;
+  // The shards a restart replays first, each whole, in this order;
+  // empty: as the queue's Scan hands them over.
+  std::vector<core::ShardId> replay_order_;
   Clocks hot_clocks_;
   Options options_;
   core::EvictionPolicy policy_{core::EvictionTTL{3600}};
-  uint64_t drain_requests_ = 0;
   uint64_t skipped_ = 0;
   uint64_t peak_hot_bytes_ = 0;
   std::unique_ptr<queue::WalQueue> queue_;

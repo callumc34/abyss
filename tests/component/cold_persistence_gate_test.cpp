@@ -45,7 +45,6 @@
 #include "abyss/queue/wal_queue.h"
 #include "cold_read.h"
 #include "cold_replay.h"
-#include "durability_printer.h"
 #include "latch.h"
 #include "on_exit.h"
 #include "temp_dir.h"

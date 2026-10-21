@@ -48,3 +48,15 @@ function(abyss_mark_slow_tests tag dir)
   file(WRITE "${_overrides_file}" "${_content}")
   set_property(DIRECTORY "${dir}" APPEND PROPERTY TEST_INCLUDE_FILES "${_overrides_file}")
 endfunction()
+
+# Runs the named discovered tests alone: they assert wall-clock rates
+# that a busy host's other tests would distort.
+function(abyss_mark_serial_tests tag dir)
+  set(_overrides_file "${CMAKE_BINARY_DIR}/abyss_serial_${tag}_overrides.cmake")
+  set(_content "")
+  foreach(_test IN LISTS ARGN)
+    string(APPEND _content "set_tests_properties(${_test} PROPERTIES RUN_SERIAL TRUE)\n")
+  endforeach()
+  file(WRITE "${_overrides_file}" "${_content}")
+  set_property(DIRECTORY "${dir}" APPEND PROPERTY TEST_INCLUDE_FILES "${_overrides_file}")
+endfunction()

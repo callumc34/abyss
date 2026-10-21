@@ -5,12 +5,18 @@
 
 #ifdef ABYSS_HAVE_ROCKSDB
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
+#include "abyss/core/queue_entry.h"
+#include "abyss/core/resp_types.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "sequenced_engine_fixture.h"
 
@@ -33,6 +39,19 @@ class PropertyRegressionTest : public SequencedEngineTest {
     DrainToCold(ShardOf(key));
     EvictDrained();
     ASSERT_FALSE(Resident(key));
+  }
+  // What cold alone holds for set `key`: its members, sorted, and TTL.
+  std::string ColdSet(const std::string& key) {
+    auto loaded = cold_->LoadKey(key, core::SteadyClock::now() + 5s);
+    if (!loaded.has_value()) return "error: " + loaded.error().message();
+    if (!loaded->has_value()) return "absent";
+    const auto* members = std::get_if<core::StringSet>(&(*loaded)->value);
+    if (members == nullptr) return "not a set";
+    std::vector<std::string> sorted(members->begin(), members->end());
+    std::ranges::sort(sorted);
+    std::string out;
+    for (const auto& member : sorted) out += member + ",";
+    return out + " ttl " + std::to_string((*loaded)->abs_ttl_ms);
   }
 
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -191,6 +210,78 @@ TEST_F(PropertyRegressionTest, ASetWithATtlAlreadyPastLogsADel) {
   }
   ASSERT_TRUE(Restart(Clocks{.wall = wall_}).has_value());
   EXPECT_EQ(Read({"GET", "k"}), "nil");
+}
+
+// A set lost once evicted: HDEL emptied a hash, deleting the key,
+// and SADD made it a set. Cold ignored the SADD's kReplacesState, so
+// the buffer, still a hash, dropped the add, and buffer plus cold read
+// the key absent. Its TTL, from before the HDEL, outlived it the same
+// way.
+TEST_F(PropertyRegressionTest, AnAddReplacingAKeyARemovalEmptiedReachesCold) {
+  Options options;
+  // No stub to answer EXISTS: the miss reads buffer and cold.
+  options.stub_memory_fraction = 0;
+  OpenWithClock(options);
+  const std::string ttl = std::to_string(now_ms_.load() + 60'000);
+  ASSERT_EQ(Write({"HSET", "k", "f", "v"}), ":1");
+  ASSERT_EQ(Write({"PEXPIREAT", "k", ttl}), ":1");
+  ASSERT_EQ(Write({"HDEL", "k", "f"}), ":1");
+  ASSERT_EQ(Write({"SADD", "k", "a", "b"}), ":2");
+  // Absorbed into one window, not flushed.
+  pool_->ConsumerFor(ShardOf("k")).Drain();
+  EvictDrained();
+  ASSERT_FALSE(Resident("k"));
+
+  EXPECT_EQ(Exists("k"), ":1");
+  EXPECT_EQ(Read({"PTTL", "k"}), ":-1");
+  EXPECT_EQ(Members("k"), (std::vector<std::string>{"a", "b"}));
+
+  ToCold("k");
+  EXPECT_EQ(Exists("k"), ":1");
+  EXPECT_EQ(Read({"PTTL", "k"}), ":-1");
+  EXPECT_EQ(Members("k"), (std::vector<std::string>{"a", "b"}));
+
+  ASSERT_TRUE(Restart(Clocks{.wall = wall_}).has_value());
+  DrainToCold(ShardOf("k"));
+  EvictDrained();
+  ASSERT_FALSE(Resident("k"));
+  EXPECT_EQ(Members("k"), (std::vector<std::string>{"a", "b"}));
+}
+
+// A flagged add over a key cold holds past its TTL, unswept, with
+// nothing buffered and no DEL logged: the add alone determines the key,
+// so cold must not merge it into the dead one, whose TTL the next
+// sweep would apply to the new members.
+TEST_F(PropertyRegressionTest, AFlaggedAddOverAnUnsweptExpiredColdKeyReplacesIt) {
+  OpenWithClock();
+  const core::ShardId shard = ShardOf("k");
+  const int64_t ttl = now_ms_.load() + 100;
+  ASSERT_EQ(Write({"SADD", "k", "old"}), ":1");
+  ASSERT_EQ(Write({"PEXPIREAT", "k", std::to_string(ttl)}), ":1");
+  ToCold("k");
+  ASSERT_EQ(ColdSet("k"), "old, ttl " + std::to_string(ttl));
+  Advance(std::chrono::milliseconds(200));
+  // A decision that saw the key absent and logged no expiry.
+  core::QueueEntry add{
+      .appended_at = wall_(),
+      .payload = core::entry::Write{.cmd = core::RespCommand{.args = {"SADD", "k", "new"}}},
+      .replaces_state = true,
+  };
+  ASSERT_TRUE(queue_->Append(shard, std::move(add)).has_value());
+
+  DrainToCold(shard);
+  EXPECT_EQ(ColdSet("k"), "new, ttl 0");
+  ASSERT_TRUE(cold_->RunScannerTickForTesting().has_value());
+  EXPECT_EQ(ColdSet("k"), "new, ttl 0") << "the sweep took the new set at the old TTL";
+
+  ASSERT_TRUE(Restart(Clocks{.wall = wall_}).has_value());
+  DrainToCold(shard);
+  ASSERT_TRUE(cold_->RunScannerTickForTesting().has_value());
+  EXPECT_EQ(ColdSet("k"), "new, ttl 0");
+  EvictDrained();
+  ASSERT_FALSE(Resident("k"));
+  EXPECT_EQ(Members("k"), std::vector<std::string>{"new"});
+  EXPECT_EQ(Read({"PTTL", "k"}), ":-1");
 }
 
 }  // namespace

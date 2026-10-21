@@ -51,7 +51,6 @@
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/wal_queue.h"
 #include "crash_harness.h"
-#include "durability_printer.h"
 
 #endif
 

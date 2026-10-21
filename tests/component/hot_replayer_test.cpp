@@ -135,9 +135,8 @@ class HotReplayerRecoveryTest : public SequencedEngineTest {
     };
     hot_ = NewHot();
     wall_ = [now_ms] { return AtMs(now_ms); };
-    HotReplayer replayer(
-        *hot_, [](core::ShardId, core::SequenceId) { return core::Result<void>{}; },
-        HotReplayer::Config{.wall_clock = [now_ms] { return AtMs(now_ms); }});
+    HotReplayer replayer(*hot_,
+                         HotReplayer::Config{.wall_clock = [now_ms] { return AtMs(now_ms); }});
 
     const uint32_t shards = options_.shards;
     std::vector<core::SequenceId> end(shards);
@@ -231,8 +230,8 @@ TEST_F(HotReplayerRecoveryTest, AFlushMidLogLeavesNoPreFlushKey) {
 // A log three times hot's budget, the buffer's high water above all of
 // it, so cold flushes nothing on its own while replay runs. Cold is fed
 // first, so every frame hot holds is drained, and evicting keeps replay
-// within the backpressure ratio without a forced drain; the sweep then
-// brings hot under its budget.
+// within the backpressure ratio; the sweep then brings hot under its
+// budget.
 TEST_F(HotReplayerRecoveryTest, ALogThreeTimesTheBudgetReplaysWithinTheRatio) {
   constexpr size_t kBudget = size_t{1} << 20;
   Open(Options{.shards = 1,
@@ -252,11 +251,38 @@ TEST_F(HotReplayerRecoveryTest, ALogThreeTimesTheBudgetReplaysWithinTheRatio) {
   EXPECT_LE(static_cast<double>(peak_hot_bytes_), 1.25 * static_cast<double>(kBudget))
       << "replay passed the backpressure ratio";
   EXPECT_LE(hot_->Stats()->used_bytes, kBudget) << "the sweep left hot over its budget";
-  EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kRecoveryColdDrainRequestsTotal)
-                .value_or(0.0),
-            static_cast<double>(drain_requests_));
-  EXPECT_EQ(drain_requests_, 0U) << "cold was fed first, so nothing hot held was undrained";
   EXPECT_EQ(Read({"GET", "k0"}), std::string(200, 'a'));
+}
+
+// An entry cold cannot parse pins its drained seq below it, so hot can
+// evict nothing replayed after it. Recovery fails loudly at twice the
+// backpressure limit, naming the cause, rather than outgrow memory.
+TEST_F(HotReplayerRecoveryTest, APoisonPinnedColdFailsRecoveryPastTwiceTheLimit) {
+  constexpr size_t kBudget = size_t{1} << 20;
+  Open(Options{.shards = 1,
+               .segment_size_bytes = size_t{16} << 20,
+               .hot_memory_bytes = kBudget,
+               .buffer_high_water_bytes = size_t{256} << 20});
+  const core::SequenceId poison = Append(0, Frame({}, false));
+  size_t logged = 0;
+  for (int i = 0; logged < 4 * kBudget; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    std::string value(200, 'v');
+    logged += key.size() + value.size();
+    Append(0, Frame({"SET", key, std::move(value)}, true));
+  }
+
+  auto recovered = Restart();
+  ASSERT_FALSE(recovered.has_value()) << "replay grew hot without bound";
+  EXPECT_EQ(recovered.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_NE(recovered.error().message().find("drained seq is pinned"), std::string::npos)
+      << recovered.error().message();
+  EXPECT_EQ(pool_->ConsumerFor(0).LatestDrainedSeq(), poison - 1);
+  EXPECT_GE(metrics::testing::GetCounterValue(metrics::names::kColdParsePoisonTotal).value_or(0.0),
+            1.0);
+  const auto used = static_cast<double>(hot_->Stats()->used_bytes);
+  EXPECT_GT(used, 2 * 1.25 * static_cast<double>(kBudget));
+  EXPECT_LT(used, 3.0 * static_cast<double>(kBudget)) << "replay ran on past the ceiling";
 }
 
 // A key whose last write is older than its eviction window when the
@@ -298,6 +324,32 @@ TEST_F(HotReplayerRecoveryTest, ARestartPastTheEvictionWindowLeavesAKeyToCold) {
   EXPECT_EQ(Write({"RENAMENX", "k", "k2"}, Flags::kNx), ":1");
   EXPECT_EQ(Members("k2"), (std::vector<std::string>{"a", "b"}));
   EXPECT_EQ(Members("k"), std::vector<std::string>{});
+}
+
+// The same on a host up for less than the eviction window: k's link
+// maps below the steady epoch. Never read, it is due by that link; an
+// unread stamp is not a read at steady 0.
+TEST_F(HotReplayerRecoveryTest, AHostUpLessThanTheWindowStillLeavesAKeyToCold) {
+  Open();
+  const int64_t t0 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         core::WallClock::now().time_since_epoch())
+                         .count();
+  const int64_t window =
+      std::chrono::duration_cast<std::chrono::milliseconds>(policy_.Resolve("k")).count();
+  std::atomic<int64_t> now{t0};
+  wall_ = [&now] { return core::WallTime{std::chrono::milliseconds{now.load()}}; };
+  EXPECT_EQ(Write({"SADD", "k", "a"}), ":1");
+  now = t0 + window;
+  EXPECT_EQ(Write({"SET", "fresh", "v"}), "OK");
+
+  // Ten seconds after boot, two minutes past k's window.
+  now = t0 + window + 120'000;
+  const core::SteadyTime booted{std::chrono::seconds{10}};
+  ASSERT_TRUE(Restart(Clocks{.steady = [booted] { return booted; }, .wall = wall_}).has_value());
+
+  EXPECT_FALSE(Resident("k")) << "a link below the steady epoch kept k past its window";
+  EXPECT_TRUE(Resident("fresh"));
+  EXPECT_EQ(Members("k"), (std::vector<std::string>{"a"}));
 }
 
 // The same log, replayed with the wall clock an hour behind, on time and
