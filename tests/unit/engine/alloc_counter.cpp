@@ -13,11 +13,13 @@ std::atomic<std::size_t> g_allocs{0};
 std::atomic<std::size_t> g_big_allocs{0};
 std::atomic<std::size_t> g_big_frees{0};
 std::atomic<std::size_t> g_frees{0};
+thread_local std::size_t t_allocs = 0;
 // Live big allocations, so a free can tell it is one.
 std::array<std::atomic<void*>, 256> g_big_live{};
 
 void NoteAlloc(void* ptr, std::size_t size) {
   g_allocs.fetch_add(1, std::memory_order_relaxed);
+  ++t_allocs;
   if (size < kBigAllocBytes) return;
   g_big_allocs.fetch_add(1, std::memory_order_relaxed);
   for (auto& slot : g_big_live) {
@@ -40,6 +42,7 @@ void NoteFree(void* ptr) {
 }  // namespace
 
 std::size_t Allocs() { return g_allocs.load(); }
+std::size_t ThreadAllocs() { return t_allocs; }
 std::size_t BigAllocs() { return g_big_allocs.load(); }
 std::size_t BigFrees() { return g_big_frees.load(); }
 std::size_t Frees() { return g_frees.load(); }
@@ -55,6 +58,16 @@ void* operator new(std::size_t size) {
   return ptr;
 }
 void* operator new[](std::size_t size) { return operator new(size); }
+// The nothrow forms too: the library's, freed by the delete below,
+// would otherwise be a new/free mismatch (stable_sort's buffer).
+void* operator new(std::size_t size, const std::nothrow_t& /*tag*/) noexcept {
+  void* ptr = std::malloc(size > 0 ? size : 1);
+  if (ptr != nullptr) abyss::testing::NoteAlloc(ptr, size);
+  return ptr;
+}
+void* operator new[](std::size_t size, const std::nothrow_t& tag) noexcept {
+  return operator new(size, tag);
+}
 void operator delete(void* ptr) noexcept {
   if (ptr == nullptr) return;
   abyss::testing::NoteFree(ptr);
@@ -63,4 +76,6 @@ void operator delete(void* ptr) noexcept {
 void operator delete[](void* ptr) noexcept { operator delete(ptr); }
 void operator delete(void* ptr, std::size_t /*size*/) noexcept { operator delete(ptr); }
 void operator delete[](void* ptr, std::size_t /*size*/) noexcept { operator delete(ptr); }
+void operator delete(void* ptr, const std::nothrow_t& /*tag*/) noexcept { operator delete(ptr); }
+void operator delete[](void* ptr, const std::nothrow_t& /*tag*/) noexcept { operator delete(ptr); }
 // NOLINTEND(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory,readability-inconsistent-declaration-parameter-name)

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "abyss/core/types.h"
+#include "hot_bytes.h"
 #include "test_clock.h"
 
 namespace abyss::hot {
@@ -20,11 +21,15 @@ class SingleShardStoreTest : public ::testing::Test {
  protected:
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::TestClock clock_;
+  // Sized for every key a test writes, so its buckets hold still.
   SingleShardStore store_{SingleShardConfig{
       .max_memory_bytes = 1024UL * 1024,
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
+      .reserve_keys = 64,
   }};
+  // What the empty store holds: its map's buckets.
+  const uint64_t empty_bytes_ = store_.Stats().used_bytes;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr core::EvictionTTL kEviction{86400};
 
@@ -547,12 +552,12 @@ TEST_F(SingleShardStoreTest, TtlFutureKeyFound) {
 TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   auto before = store_.Stats();
   EXPECT_EQ(before.key_count, 0U);
-  EXPECT_EQ(before.used_bytes, 0U);
+  EXPECT_EQ(before.used_bytes, empty_bytes_);
 
   SetString("k", "v");
   auto after_insert = store_.Stats();
   EXPECT_EQ(after_insert.key_count, 1U);
-  EXPECT_GT(after_insert.used_bytes, 0U);
+  EXPECT_GT(after_insert.used_bytes, empty_bytes_);
 
   core::ops::Del del_op{.keys = {"k"}};
   auto del_result = store_.Apply(core::ops::WriteOp{del_op}, kEviction);
@@ -561,7 +566,7 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   // The delete leaves a tombstone, so a small footprint remains until
   // GcTombstones reclaims the entry (proven separately). It is never larger
   // than the live entry — the value is released (modulo small-string capacity).
-  EXPECT_GT(after_delete.used_bytes, 0U);
+  EXPECT_GT(after_delete.used_bytes, empty_bytes_);
   EXPECT_LE(after_delete.used_bytes, after_insert.used_bytes);
 }
 
@@ -746,7 +751,8 @@ TEST_F(SingleShardStoreTest, TombstoneResurrectThenCreateBalancedBytes) {
 }
 
 TEST_F(SingleShardStoreTest, AccountingInvariantUnderRandomOps) {
-  // After a delete+GC of every key, used_bytes_ must return to exactly 0 — any
+  // After a delete+GC of every key, used_bytes_ must return to exactly the
+  // empty store's — any
   // unbalanced Track pair would leave residue (or clamp at 0 hiding an
   // over-count, which the per-step monotonic checks below would catch).
   ASSERT_TRUE(store_
@@ -772,7 +778,7 @@ TEST_F(SingleShardStoreTest, AccountingInvariantUnderRandomOps) {
                     .has_value());
   }
   store_.GcTombstones(seq);
-  EXPECT_EQ(store_.Stats().used_bytes, 0U) << "used_bytes did not return to baseline";
+  EXPECT_EQ(store_.Stats().used_bytes, empty_bytes_) << "used_bytes did not return to baseline";
   EXPECT_EQ(store_.Stats().key_count, 0U);
 }
 
@@ -790,9 +796,9 @@ TEST_F(SingleShardStoreTest, ZsetAccountsScoreMembersIndex) {
     score += 1.0;
   }
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set_add}, kEviction).has_value());
-  const auto set_bytes = store_.Stats().used_bytes;
+  const auto set_bytes = store_.Stats().used_bytes - empty_bytes_;
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{zset_add}, kEviction).has_value());
-  const auto total_bytes = store_.Stats().used_bytes;
+  const auto total_bytes = store_.Stats().used_bytes - empty_bytes_;
   const auto zset_bytes = total_bytes - set_bytes;
 
   EXPECT_GT(zset_bytes, set_bytes)
@@ -933,30 +939,16 @@ TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
 
 // --- Memory-pressure LRU eviction (HOT-1) ---
 
-// Measures the footprint of a single string entry of the given key/value, so
-// budgets can be sized relative to the real per-entry cost rather than guessed.
-uint64_t MeasureStringEntryBytes(std::string_view key, const std::string& value) {
-  abyss::testing::TestClock clock;
-  SingleShardStore probe{SingleShardConfig{
-      .steady_clock = clock.SteadyFn(),
-      .wall_clock = clock.WallFn(),
-  }};
-  EXPECT_TRUE(probe
-                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = value}},
-                         core::EvictionTTL{86400})
-                  .has_value());
-  return probe.Stats().used_bytes;
-}
-
 TEST(SingleShardStoreMemoryTest, ApplyEvictsLruToFitUnderBudget) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringEntryBytes("a", value);
+  const uint64_t per_entry = abyss::testing::StringEntryBytes("a", value);
   // Budget holds 2 entries but not 3.
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = (per_entry * 2) + (per_entry / 2),
+      .max_memory_bytes = abyss::testing::EmptyStoreBytes(8) + (per_entry * 2) + (per_entry / 2),
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 8,
   }};
   const core::EvictionTTL eviction{86400};
 
@@ -983,7 +975,7 @@ TEST(SingleShardStoreMemoryTest, ApplyEvictsLruToFitUnderBudget) {
 
 TEST(SingleShardStoreMemoryTest, ApplyReturnsResourceExhaustedWhenNoVictims) {
   abyss::testing::TestClock clock;
-  const uint64_t small_entry = MeasureStringEntryBytes("k", "v");
+  const uint64_t small_entry = abyss::testing::StringEntryBytes("k", "v");
   // Budget below a single real value, no other evictable keys.
   SingleShardStore store{SingleShardConfig{
       .max_memory_bytes = small_entry,
@@ -1003,7 +995,7 @@ TEST(SingleShardStoreMemoryTest, ApplyReturnsResourceExhaustedWhenNoVictims) {
 // brings the store back under.
 TEST(SingleShardStoreMemoryTest, OverBudgetWritesApplyUntilColdDrains) {
   abyss::testing::TestClock clock;
-  const uint64_t entry = MeasureStringEntryBytes("k0", std::string(256, 'x'));
+  const uint64_t entry = abyss::testing::StringEntryBytes("k0", std::string(256, 'x'));
   SingleShardStore store{SingleShardConfig{
       .max_memory_bytes = 3 * entry,
       .steady_clock = clock.SteadyFn(),
@@ -1210,6 +1202,71 @@ TEST(SingleShardRehashTest, AMapSizedForItsKeysNeverRehashes) {
 
 TEST(SingleShardRehashTest, AnUnsizedMapReportsEachRehash) {
   EXPECT_GT(RehashesInserting(/*reserve=*/0, /*keys=*/4000), 0U);
+}
+
+// A map sized up front holds its buckets from the start, so they count
+// in used bytes; a Flush that buries the map sizes its successor.
+TEST(SingleShardRehashTest, ASizedMapCountsItsBucketsAndKeepsThemAcrossAFlush) {
+  size_t rehashes = 0;
+  SingleShardStore store{SingleShardConfig{
+      .reserve_keys = 4096, .on_rehash = [&rehashes](double /*seconds*/) { ++rehashes; }}};
+  const uint64_t empty = store.Stats().used_bytes;
+  EXPECT_GE(empty, 4096 * sizeof(void*));
+  Graveyard graveyard;
+  store.SetGraveyard(&graveyard);
+  store.Wipe(core::kFirstSeq);
+  store.SetGraveyard(nullptr);
+  EXPECT_EQ(store.Stats().used_bytes, empty);
+  for (size_t i = 0; i < 4000; ++i) {
+    const std::string key = "key:" + std::to_string(i);
+    ASSERT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}},
+                           core::EvictionTTL{86400})
+                    .has_value());
+  }
+  EXPECT_EQ(rehashes, 0U) << "the map after the Flush was not sized";
+}
+
+// A map's buckets count whether or not it was sized up front.
+TEST(SingleShardRehashTest, AnUnsizedMapCountsItsBucketsAsItGrows) {
+  constexpr size_t kKeys = 1000;
+  SingleShardStore store{SingleShardConfig{}};
+  for (size_t i = 0; i < kKeys; ++i) {
+    const std::string digits = std::to_string(i);
+    const std::string key = "key:" + std::string(4 - digits.size(), '0') + digits;
+    ASSERT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}},
+                           core::EvictionTTL{86400})
+                    .has_value());
+  }
+  const uint64_t entries = kKeys * abyss::testing::StringEntryBytes("key:0000", "v");
+  EXPECT_GE(store.Stats().used_bytes - entries, kKeys * sizeof(void*))
+      << "its buckets went uncounted";
+}
+
+// The stub index is sized for its cap up front, its buckets counted
+// with its stubs; a load batch that grows it past them is counted too.
+TEST(SingleShardRehashTest, AStubIndexCountsItsBucketsWithItsStubs) {
+  constexpr size_t kCap = 8;
+  SingleShardStore store{SingleShardConfig{.stub_max_entries = kCap}};
+  const auto empty = store.Stats();
+  EXPECT_GE(empty.stub_bytes, kCap * sizeof(void*));
+  EXPECT_EQ(empty.used_bytes, empty.stub_bytes + abyss::testing::EmptyStoreBytes(0));
+
+  constexpr size_t kBatch = 64;
+  std::vector<LoadCompletion> loads;
+  uint64_t stubs = 0;
+  for (size_t i = 0; i < kBatch; ++i) {
+    std::string key = "k" + std::to_string(i);
+    const auto token = store.BeginLoad(key);
+    ASSERT_TRUE(token.has_value());
+    stubs += kStubBytes + key.size();
+    loads.push_back(
+        {.key = std::move(key), .token = token.value_or(LoadToken{}), .result = LoadedExists{}});
+  }
+  ASSERT_EQ(store.CompleteLoads(loads, core::EvictionPolicy{}), kBatch);
+  EXPECT_GE(store.Stats().stub_bytes, stubs + (kBatch * sizeof(void*)))
+      << "the grown index went uncounted";
 }
 
 }  // namespace

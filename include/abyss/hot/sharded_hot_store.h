@@ -28,7 +28,7 @@ struct ShardedHotStoreConfig {
   uint32_t shard_count = 64;
   // Sizes each shard's entry map for max_memory_bytes at this many bytes
   // per key, so steady state never rehashes it under the lock. 0 sizes
-  // nothing; the server sets it, tests leave it.
+  // nothing.
   size_t reserve_bytes_per_key = 0;
   // Share of max_memory_bytes for stubs, at kStubBytes each.
   double stub_memory_fraction = 0.02;
@@ -71,7 +71,8 @@ class ShardLocks {
   void AbortLoad(std::string_view key, LoadToken token);
   std::vector<core::RespValue> ApplyEffects(core::ShardId shard, std::span<core::Effect> effects,
                                             core::SequenceId first_seq, core::WallTime appended_at);
-  void Wipe(core::ShardId shard, core::SequenceId seq);
+  // `fresh` from ShardedHotStore::ReservedMaps, built before the hold.
+  void Wipe(core::ShardId shard, core::SequenceId seq, FreshMaps fresh);
   bool OverBackpressure(core::ShardId shard) const;
   core::WallTime LastAppendedAt(core::ShardId shard) const;
   void RaiseAppendedAt(core::ShardId shard, core::WallTime at);
@@ -118,7 +119,7 @@ class ShardedHotStore : public core::HotStore {
   core::HotKeyPresence Probe(std::string_view key) override;
   core::Result<core::MemoryStats> Stats() override;
   core::Result<void> Wipe(core::ShardId shard, core::SequenceId seq) override;
-  // Replay's apply: see Replay.
+  // Replay's apply: see Replay. Its kCorruption is fatal here.
   std::optional<core::RespValue> ApplyLogged(core::ShardId shard, core::QueueEntry& entry) override;
   void RaiseAppendedAt(core::ShardId shard, core::WallTime at) override;
 
@@ -130,8 +131,6 @@ class ShardedHotStore : public core::HotStore {
   ShardMemory Memory(core::ShardId shard) const;
 
   struct Replayed {
-    // The hot shard the frame applied to, or would have.
-    core::ShardId shard = 0;
     bool applied = false;
     // That shard is over its backpressure limit after it.
     bool over_backpressure = false;
@@ -144,7 +143,8 @@ class ShardedHotStore : public core::HotStore {
   // otherwise drops the key's stub, which it made stale. A written key
   // is linked at the frame's appended_at read as steady ticks, so
   // replay reads no clock; ShiftReplayedLinks maps the links after.
-  Replayed Replay(core::ShardId shard, core::QueueEntry& entry);
+  // kCorruption for a Write whose key is not `shard`'s.
+  core::Result<Replayed> Replay(core::ShardId shard, core::QueueEntry& entry);
   // Moves each replayed link at appended_at t to steady_now minus
   // (wall_now - t), never past steady_now.
   void ShiftReplayedLinks(core::SteadyTime steady_now, core::WallTime wall_now);
@@ -195,6 +195,10 @@ class ShardedHotStore : public core::HotStore {
   bool AwaitLoad(std::string_view key, core::SteadyTime deadline);
   bool LoadPending(std::string_view key);
   bool RetainsStubs() const { return shards_.front()->store.RetainsStubs(); }
+  // SingleShardStore::ReservedMaps: it takes no lock.
+  FreshMaps ReservedMaps(core::ShardId shard) const {
+    return shards_.at(shard)->store.ReservedMaps();
+  }
 
   std::optional<Stub> FindStub(std::string_view key);
   bool DropStub(std::string_view key);
@@ -230,6 +234,12 @@ class ShardedHotStore : public core::HotStore {
   using HoldObserver = std::function<void(metrics::MaintenancePass,
                                           core::SteadyClock::duration held, size_t examined)>;
   void SetHoldObserverForTesting(HoldObserver observer) { hold_observer_ = std::move(observer); }
+  // Called with true once a write hold has its locks, and with false
+  // just before it lets them go.
+  using WriteHoldObserver = std::function<void(bool held)>;
+  void SetWriteHoldObserverForTesting(WriteHoldObserver observer) {
+    write_hold_observer_ = std::move(observer);
+  }
   // A shared hold on `shard`, as a read takes.
   std::shared_lock<std::shared_mutex> LockSharedForTesting(core::ShardId shard) {
     return std::shared_lock(shards_.at(shard)->mutex);
@@ -262,8 +272,8 @@ class ShardedHotStore : public core::HotStore {
   core::Result<core::RespValue> ExecExists(const core::ops::Exists& op);
   core::Result<core::RespValue> ApplyDel(const core::ops::Del& op, core::SequenceId seq);
   // Replay, with the frame's reply when it applied.
-  Replayed ReplayFrame(core::ShardId shard, core::QueueEntry& entry,
-                       std::optional<core::RespValue>& reply);
+  core::Result<Replayed> ReplayFrame(core::ShardId shard, core::QueueEntry& entry,
+                                     std::optional<core::RespValue>& reply);
   // Runs `step(store, horizon, budget)` on shard `index` in capped
   // exclusive holds until it is done or `more(budget)` declines another.
   template <typename Step, typename More>
@@ -282,6 +292,7 @@ class ShardedHotStore : public core::HotStore {
   metrics::HistogramHandle expiry_sweep_seconds_;
   metrics::HistogramHandle rehash_seconds_;
   HoldObserver hold_observer_;
+  WriteHoldObserver write_hold_observer_;
   // The TTL pass's place in its sweep of the shards.
   std::mutex ttl_mu_;
   core::ShardId ttl_next_shard_ ABYSS_GUARDED_BY(ttl_mu_) = 0;

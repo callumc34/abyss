@@ -84,7 +84,7 @@ TEST_F(ShardLocksTest, AWipeSetsTheFloorAViewReads) {
   Apply(0, {"SET", key, "v"}, 1);
   {
     auto locks = store_->LockExclusive(std::vector<core::ShardId>{0});
-    locks.Wipe(0, 4);
+    locks.Wipe(0, 4, store_->ReservedMaps(0));
   }
   {
     auto locks = store_->LockExclusive(std::vector<core::ShardId>{0});
@@ -152,7 +152,7 @@ TEST_F(ShardLocksTest, AReadFencesOnWhatAnswers) {
 
   {
     auto locks = store_->LockExclusive(std::vector<core::ShardId>{1});
-    locks.Wipe(1, 9);
+    locks.Wipe(1, 9, store_->ReservedMaps(1));
   }
   const auto floor = store_->Read(ops::ReadOp{ops::SetCard{.key = KeyOn(1, 3)}});
   ASSERT_TRUE(floor.result.has_value()) << "under the floor a miss is absent";

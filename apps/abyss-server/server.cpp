@@ -34,9 +34,10 @@ namespace abyss::server {
 namespace {
 
 // The hot entry map is sized for max_memory_bytes at this many bytes
-// per key: about 1.6% of the budget in buckets, against a rehash of a
-// whole shard under its lock (#186 removes the need).
-constexpr size_t kMapReserveBytesPerKey = 512;
+// per key, a small value's measured 245: about 3% of the budget in
+// buckets, counted in hot's used bytes, against a rehash of a whole
+// shard under its lock (#186 removes the need).
+constexpr size_t kMapReserveBytesPerKey = 256;
 constexpr std::chrono::milliseconds kStopPollInterval{100};
 }  // namespace
 

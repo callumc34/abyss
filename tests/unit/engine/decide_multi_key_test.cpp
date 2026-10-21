@@ -307,6 +307,8 @@ class DecideApplyTest : public ::testing::Test {
   hot::SingleShardStore store_{hot::SingleShardConfig{}};
   core::EvictionPolicy policy_;
   core::SequenceId next_seq_ = 1;
+  // The last DecideAndApply's effects, each + if flagged, else -.
+  std::string last_flags_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
   void Seed(const ops::WriteOp& op) {
@@ -352,11 +354,71 @@ class DecideApplyTest : public ::testing::Test {
                             policy_, hot::kAllDrained);
     next_seq_ += d.effects.size();
     ExpectFlagsTruthful(logged);
+    last_flags_.clear();
+    for (const auto& effect : logged) {
+      last_flags_ += effect.cmd.args[0] + (effect.replaces_state ? "+ " : "- ");
+    }
     if (d.reply.has_value()) return Describe(d.reply);
     EXPECT_FALSE(replies.empty()) << "an empty reply needs an effect to give it";
     return replies.empty() ? "" : Describe(replies.back());
   }
 };
+
+// Cold drops what it buffered for a key at a flagged effect, so a flag
+// where the key's earlier state still counts loses that state. Each
+// emitter that flags, each flag truthful.
+TEST_F(DecideApplyTest, EveryEmitterFlagsOnlyEffectsThatRebuildTheirKey) {
+  for (const std::string_view key : {"s", "z", "hs", "hm", "hn", "n", "m1", "m2", "x1", "x2"}) {
+    Seed(ops::Del{.keys = {key}});
+  }
+  // Creating adds.
+  EXPECT_EQ(DecideAndApply({"SADD", "s", "a", "b"}), ":2");
+  EXPECT_EQ(last_flags_, "SADD+ ");
+  EXPECT_EQ(DecideAndApply({"ZADD", "z", "1", "m"}), ":1");
+  EXPECT_EQ(last_flags_, "ZADD+ ");
+  EXPECT_EQ(DecideAndApply({"HSET", "hs", "f", "v"}), ":1");
+  EXPECT_EQ(last_flags_, "HSET+ ");
+  EXPECT_EQ(DecideAndApply({"HMSET", "hm", "f", "v"}), "+OK");
+  EXPECT_EQ(last_flags_, "HMSET+ ");
+  EXPECT_EQ(DecideAndApply({"HSETNX", "hn", "f", "v"}), ":1");
+  EXPECT_EQ(last_flags_, "HSET+ ");
+  // Adds to a present key are not flagged.
+  EXPECT_EQ(DecideAndApply({"SADD", "s", "c"}), ":1");
+  EXPECT_EQ(last_flags_, "SADD- ");
+
+  // Strings.
+  EXPECT_EQ(DecideAndApply({"SET", "k", "v"}), "+OK");
+  EXPECT_EQ(last_flags_, "SET+ ");
+  EXPECT_EQ(DecideAndApply({"SETNX", "n", "v"}), ":1");
+  EXPECT_EQ(last_flags_, "SET+ ");
+  EXPECT_EQ(DecideAndApply({"MSET", "m1", "a", "m2", "b"}), "+OK");
+  EXPECT_EQ(last_flags_, "SET+ SET+ ");
+  EXPECT_EQ(DecideAndApply({"MSETNX", "x1", "a", "x2", "b"}), ":1");
+  EXPECT_EQ(last_flags_, "SET+ SET+ ");
+
+  // Deletes: DEL, a SET or EXPIRE already past, an observed expiry.
+  EXPECT_EQ(DecideAndApply({"DEL", "k"}), ":1");
+  EXPECT_EQ(last_flags_, "DEL+ ");
+  const std::string past = std::to_string(kNow - 1);
+  Seed(ops::StringSet{.key = "p", .value = "v"});
+  EXPECT_EQ(DecideAndApply({"SET", "p", "w", "PXAT", past}), "+OK");
+  EXPECT_EQ(last_flags_, "DEL+ ");
+  Seed(ops::SetAdd{.key = "e", .members = {"a"}});
+  EXPECT_EQ(DecideAndApply({"PEXPIREAT", "e", past}), ":1");
+  EXPECT_EQ(last_flags_, "DEL+ ");
+  Seed(ops::ZsetAdd{.key = "ze", .entries = {{.score = 1, .member = "m"}}});
+  Seed(ops::Expire{.key = "ze", .abs_ttl_ms = kNow - 1});
+  EXPECT_EQ(DecideAndApply({"HSET", "ze", "f", "v"}), ":1");
+  EXPECT_EQ(last_flags_, "DEL+ HSET+ ");
+
+  // A removal that empties a key deletes it unflagged; the add of
+  // another type that follows creates it.
+  Seed(ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}});
+  EXPECT_EQ(DecideAndApply({"HDEL", "h", "f"}), ":1");
+  EXPECT_EQ(last_flags_, "HDEL- ");
+  EXPECT_EQ(DecideAndApply({"SADD", "h", "a"}), ":1");
+  EXPECT_EQ(last_flags_, "SADD+ ");
+}
 
 TEST_F(DecideApplyTest, ApplyAnswersWhenTheDecisionLeavesTheReply) {
   Seed(ops::SetAdd{.key = "s", .members = {"a"}});
@@ -494,6 +556,56 @@ TEST_F(DecideApplyTest, RenamenxAndCopyRecreateEveryType) {
         }
       }
     }
+  }
+}
+
+// The command Recreate logs to add `source`'s value.
+std::string AddOf(const Source& source) {
+  if (source.name == "String") return "SET";
+  if (source.name == "Set") return "SADD";
+  if (source.name == "Zset") return "ZADD";
+  return "HSET";
+}
+
+// Recreate's emitters, as EveryEmitterFlagsOnlyEffectsThatRebuildTheirKey
+// pins the others: a delete and the add flagged, a collection's TTL not.
+TEST_F(DecideApplyTest, EveryRecreateFlagsItsDeletesAndAddButNotItsTtl) {
+  for (const auto& source : Sources()) {
+    SCOPED_TRACE(source.name);
+    // The add, flagged, then a collection's TTL, not.
+    std::string recreated = AddOf(source) + "+ ";
+    if (source.name != "String") recreated += "PEXPIREAT- ";
+    const ops::WriteOp other =
+        source.name == "Set"
+            ? ops::WriteOp{ops::HashSet{.key = "dst", .fields = {{.field = "f", .value = "v"}}}}
+            : ops::WriteOp{ops::SetAdd{.key = "dst", .members = {"x"}}};
+    const auto seed_source = [&] {
+      store_.Wipe(core::kFirstSeq);
+      Seed(source.op);
+      Seed(ops::Expire{.key = "src", .abs_ttl_ms = kTtl});
+    };
+
+    seed_source();
+    Seed(ops::Del{.keys = {"dst"}});
+    EXPECT_EQ(DecideAndApply({"RENAMENX", "src", "dst"}, PredicateFlags::kNx), ":1");
+    EXPECT_EQ(last_flags_, "DEL+ " + recreated) << "onto an absent key";
+
+    seed_source();
+    Seed(ops::HashSet{.key = "dst", .fields = {{.field = "f", .value = "v"}}});
+    EXPECT_EQ(DecideAndApply({"HDEL", "dst", "f"}), ":1");
+    EXPECT_EQ(DecideAndApply({"RENAMENX", "src", "dst"}, PredicateFlags::kNx), ":1");
+    EXPECT_EQ(last_flags_, "DEL+ " + recreated) << "onto a key a removal emptied";
+
+    seed_source();
+    Seed(other);
+    Seed(ops::Expire{.key = "dst", .abs_ttl_ms = kNow - 1});
+    EXPECT_EQ(DecideAndApply({"RENAMENX", "src", "dst"}, PredicateFlags::kNx), ":1");
+    EXPECT_EQ(last_flags_, "DEL+ DEL+ " + recreated) << "onto another type, expired";
+
+    seed_source();
+    Seed(other);
+    EXPECT_EQ(DecideAndApply({"COPY", "src", "dst", "REPLACE"}), ":1");
+    EXPECT_EQ(last_flags_, "DEL+ " + recreated) << "copied over another type";
   }
 }
 

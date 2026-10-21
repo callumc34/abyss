@@ -256,6 +256,7 @@ add_executable(abyss_sequencer_alloc_tests
   engine/alloc_counter.cpp
   engine/sequencer_alloc_test.cpp
   engine/lookup_alloc_test.cpp
+  engine/hold_alloc_test.cpp
 )
 
 target_link_libraries(abyss_sequencer_alloc_tests PRIVATE

@@ -17,6 +17,7 @@
 #include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
+#include "hot_bytes.h"
 #include "latch.h"
 #include "on_exit.h"
 #include "test_clock.h"
@@ -29,6 +30,10 @@ namespace ops = core::ops;
 
 constexpr core::EvictionTTL kShortEviction{1};
 constexpr core::EvictionTTL kLongEviction{86400};
+// A fixture store's map is sized for every key a test writes.
+constexpr size_t kSizedKeys = 64;
+using abyss::testing::EmptyStoreBytes;
+using abyss::testing::StringEntryBytes;
 
 int64_t WallMs(const abyss::testing::TestClock& clock) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(clock.WallNow().time_since_epoch())
@@ -57,7 +62,11 @@ class ResidencyTest : public ::testing::Test {
       .stub_max_entries = 4,
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
+      .reserve_keys = kSizedKeys,
   }};
+  // What the empty store holds: its map's and stub index's buckets.
+  const core::MemoryStats empty_ = store_.Stats();
+  const uint64_t empty_bytes_ = empty_.used_bytes;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
   void Write(const ops::WriteOp& op, core::SequenceId seq,
@@ -223,21 +232,15 @@ TEST_F(ResidencyTest, LruEvictionWaitsForDrain) {
   EXPECT_FALSE(Resident("b"));
 }
 
-uint64_t MeasureStringBytes(std::string_view key, const std::string& value) {
-  SingleShardStore probe{SingleShardConfig{}};
-  EXPECT_TRUE(probe.Apply(ops::WriteOp{ops::StringSet{.key = key, .value = value}}, kLongEviction)
-                  .has_value());
-  return probe.Stats().used_bytes;
-}
-
 TEST(ResidencyMemoryTest, ApplyMakesRoomOnlyFromDrainedKeys) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringBytes("a", value);
+  const uint64_t per_entry = StringEntryBytes("a", value);
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = (per_entry * 2) + (per_entry / 2),
+      .max_memory_bytes = EmptyStoreBytes(8) + (per_entry * 2) + (per_entry / 2),
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 8,
   }};
   const auto write = [&](std::string_view key, core::SequenceId seq, core::SequenceId horizon) {
     clock.Advance(10ms);
@@ -267,7 +270,7 @@ TEST(ResidencyMemoryTest, ApplyMakesRoomOnlyFromDrainedKeys) {
 TEST(ResidencyMemoryTest, ValueLargerThanBudgetStillExhaustsWhenUndrained) {
   abyss::testing::TestClock clock;
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = MeasureStringBytes("k", "v"),
+      .max_memory_bytes = StringEntryBytes("k", "v"),
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
@@ -380,7 +383,7 @@ TEST_F(ResidencyTest, DelOfNonResidentKeyLeavesTombstoneUntilDrained) {
   EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kTombstoned);
   EXPECT_EQ(store_.GcTombstones(5), 2U);
   EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
-  EXPECT_EQ(store_.Stats().used_bytes, 0U);
+  EXPECT_EQ(store_.Stats().used_bytes, empty_bytes_);
 }
 
 TEST_F(ResidencyTest, StubBytesCountTowardUsedBytes) {
@@ -389,11 +392,12 @@ TEST_F(ResidencyTest, StubBytesCountTowardUsedBytes) {
   EvictAfterDeadline(kAllDrained);
   const auto stats = store_.Stats();
   EXPECT_EQ(stats.key_count, 0U);
-  EXPECT_EQ(stats.stub_bytes, kStubBytes + key.size());
-  EXPECT_EQ(stats.used_bytes, stats.stub_bytes);
+  EXPECT_EQ(stats.stub_bytes, empty_.stub_bytes + kStubBytes + key.size());
+  EXPECT_EQ(stats.used_bytes - stats.stub_bytes, empty_bytes_ - empty_.stub_bytes)
+      << "nothing but stubs past the empty store";
 
   ASSERT_TRUE(store_.DropStub(key));
-  EXPECT_EQ(store_.Stats().used_bytes, 0U);
+  EXPECT_EQ(store_.Stats().used_bytes, empty_bytes_);
   EXPECT_EQ(store_.Stats().stub_drops, 0U) << "an explicit drop is not a cap drop";
 }
 
@@ -662,7 +666,7 @@ TEST_F(ResidencyTest, WipeClearsEntriesStubsAndPlaceholders) {
   const auto stats = store_.Stats();
   EXPECT_EQ(stats.key_count, 0U);
   EXPECT_EQ(stats.stub_entries, 0U);
-  EXPECT_EQ(stats.used_bytes, 0U);
+  EXPECT_EQ(stats.used_bytes, empty_bytes_);
   EXPECT_EQ(store_.FindStub("evicted"), nullptr);
   EXPECT_FALSE(store_.LoadPending("loading"));
   EXPECT_FALSE(Resident("live"));
@@ -683,12 +687,14 @@ TEST_F(ResidencyTest, KnownAbsentUntilColdDrainsTheFlush) {
 TEST(ResidencyMemoryTest, UndrainedStoreOverItsRatioIsBackpressured) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringBytes("k0", value);
+  const uint64_t per_entry = StringEntryBytes("k0", value);
+  const uint64_t empty = EmptyStoreBytes(8);
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = per_entry * 4,
+      .max_memory_bytes = empty + (per_entry * 4),
       .backpressure_ratio = 1.5,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 8,
   }};
   const auto write = [&](int i) {
     const std::string key = "k" + std::to_string(i);
@@ -704,7 +710,7 @@ TEST(ResidencyMemoryTest, UndrainedStoreOverItsRatioIsBackpressured) {
   for (int i = 5; i < 7; ++i) ASSERT_TRUE(write(i).has_value());
   auto stats = store.Stats();
   EXPECT_TRUE(stats.backpressured);
-  EXPECT_EQ(stats.unevictable_bytes, stats.used_bytes) << "every key is undrained";
+  EXPECT_EQ(stats.unevictable_bytes, stats.used_bytes - empty) << "every key is undrained";
 
   store.EvictLru(store.Stats().max_bytes, kAllDrained);
   stats = store.Stats();
@@ -741,12 +747,14 @@ std::string NumberedKey(int i) {
 TEST(ResidencyMemoryTest, BoundaryWriteEvictsInOrderOfWhatItEvicts) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringBytes(NumberedKey(0), value);
+  const uint64_t per_entry = StringEntryBytes(NumberedKey(0), value);
   constexpr int kFits = 1000;
+  const uint64_t empty = EmptyStoreBytes(2048);
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = per_entry * kFits,
+      .max_memory_bytes = empty + (per_entry * kFits),
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 2048,
   }};
   const auto write = [&](int i) {
     return store.Apply(ops::WriteOp{ops::StringSet{.key = NumberedKey(i), .value = value}},
@@ -758,8 +766,10 @@ TEST(ResidencyMemoryTest, BoundaryWriteEvictsInOrderOfWhatItEvicts) {
 
   // One over: evict down to 95% of the budget, visiting only victims.
   ASSERT_TRUE(write(kFits).has_value());
+  const uint64_t budget = store.Stats().max_bytes;
+  const uint64_t over = empty + ((kFits + 1) * per_entry) - (budget - (budget / 20));
   const uint64_t evicted = store.Stats().eviction_count;
-  EXPECT_EQ(evicted, static_cast<uint64_t>((kFits / 20) + 1));
+  EXPECT_EQ(evicted, (over + per_entry - 1) / per_entry);
   EXPECT_EQ(store.LruVisitsForTesting(), evicted);
 
   // The headroom absorbs the next writes without another walk.
@@ -772,12 +782,13 @@ TEST(ResidencyMemoryTest, BoundaryWriteEvictsInOrderOfWhatItEvicts) {
 TEST(ResidencyMemoryTest, UndrainedStoreDoesNotRewalkUntilColdAdvances) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringBytes(NumberedKey(0), value);
+  const uint64_t per_entry = StringEntryBytes(NumberedKey(0), value);
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = per_entry * 10,
+      .max_memory_bytes = EmptyStoreBytes(32) + (per_entry * 10),
       .backpressure_ratio = 10.0,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 32,
   }};
   const auto write = [&](int i, core::SequenceId horizon) {
     return store.Apply(ops::WriteOp{ops::StringSet{.key = NumberedKey(i), .value = value}},
@@ -849,11 +860,14 @@ class ShardedResidencyTest : public ::testing::Test {
   ShardedHotStore store_{ShardedHotStoreConfig{
       .max_memory_bytes = 1024UL * 1024,
       .shard_count = 4,
+      .reserve_bytes_per_key = 256,
       .drained = [this](core::ShardId) { return horizon_.load(); },
       .eviction_policy = &policy_,
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
   }};
+  // Each shard's map is sized for 1024 keys, so these hold still.
+  const core::MemoryStats empty_ = store_.Stats().value();
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
   void Set(std::string_view key, core::SequenceId seq) {
@@ -924,7 +938,7 @@ TEST(ShardedResidencyMemoryTest, MemoryTargetAndInlineEvictionWaitForDrain) {
   abyss::testing::TestClock clock;
   core::EvictionPolicy policy{kLongEviction};
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringBytes("k0", value);
+  const uint64_t per_entry = StringEntryBytes("k0", value);
   core::SequenceId horizon = 0;
   ShardedHotStore store{ShardedHotStoreConfig{
       .max_memory_bytes = per_entry * 3,
@@ -964,7 +978,7 @@ TEST_F(ShardedResidencyTest, StubCapComesFromTheMemoryFraction) {
   EXPECT_EQ(stats->stub_entries, per_shard * 4) << "every shard evicted past its cap";
   EXPECT_EQ(stats->stub_entries + stats->stub_drops, static_cast<uint64_t>(kKeys));
   EXPECT_GT(stats->stub_drops, 0U);
-  EXPECT_EQ(stats->used_bytes, stats->stub_bytes);
+  EXPECT_EQ(stats->used_bytes - stats->stub_bytes, empty_.used_bytes - empty_.stub_bytes);
 }
 
 TEST_F(ShardedResidencyTest, LoadForwardsInstallUnderTheShardLock) {

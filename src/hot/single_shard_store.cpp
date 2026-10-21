@@ -8,6 +8,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -217,20 +218,36 @@ bool HoldBudget::Take() {
 }
 
 void SeqHeap::Push(Entry& entry) {
-  heap_.push_back(&entry);
-  entry.heap_slot = static_cast<uint32_t>(heap_.size() - 1);
-  SiftUp(heap_.size() - 1);
+  if (size_ == chunks_.size() * kChunkSlots) {
+    chunks_.push_back(std::make_unique<Chunk>());
+  }
+  const size_t slot = size_++;
+  Place(slot, &entry);
+  SiftUp(slot);
 }
 
 void SeqHeap::Erase(Entry& entry) {
   const size_t slot = entry.heap_slot;
   entry.heap_slot = Entry::kNoSlot;
-  Entry* last = heap_.back();
-  heap_.pop_back();
-  if (slot == heap_.size()) return;
+  Entry* last = At(--size_);
+  // Up to two spare chunks kept, so a size at a boundary does not churn.
+  if ((chunks_.size() * kChunkSlots) - size_ > 2 * kChunkSlots) chunks_.pop_back();
+  if (slot == size_) return;
   Place(slot, last);
   SiftUp(slot);
   SiftDown(last->heap_slot);
+}
+
+void SeqHeap::Clear() {
+  chunks_.clear();
+  size_ = 0;
+}
+
+SeqHeap SeqHeap::Release() {
+  SeqHeap released;
+  released.chunks_.swap(chunks_);
+  released.size_ = std::exchange(size_, 0);
+  return released;
 }
 
 void SeqHeap::Update(Entry& entry) {
@@ -238,32 +255,35 @@ void SeqHeap::Update(Entry& entry) {
   SiftDown(entry.heap_slot);
 }
 
+Entry*& SeqHeap::At(size_t slot) {
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index): slot < size_.
+  return (*chunks_[slot / kChunkSlots])[slot % kChunkSlots];
+}
+
 void SeqHeap::Place(size_t slot, Entry* entry) {
-  heap_[slot] = entry;
+  At(slot) = entry;
   entry->heap_slot = static_cast<uint32_t>(slot);
 }
 
 void SeqHeap::SiftUp(size_t slot) {
-  Entry* entry = heap_[slot];
+  Entry* entry = At(slot);
   while (slot > 0) {
     const size_t parent = (slot - 1) / 2;
-    if (heap_[parent]->latest_seq <= entry->latest_seq) break;
-    Place(slot, heap_[parent]);
+    if (At(parent)->latest_seq <= entry->latest_seq) break;
+    Place(slot, At(parent));
     slot = parent;
   }
   Place(slot, entry);
 }
 
 void SeqHeap::SiftDown(size_t slot) {
-  Entry* entry = heap_[slot];
+  Entry* entry = At(slot);
   for (;;) {
     size_t child = (2 * slot) + 1;
-    if (child >= heap_.size()) break;
-    if (child + 1 < heap_.size() && heap_[child + 1]->latest_seq < heap_[child]->latest_seq) {
-      ++child;
-    }
-    if (entry->latest_seq <= heap_[child]->latest_seq) break;
-    Place(slot, heap_[child]);
+    if (child >= size_) break;
+    if (child + 1 < size_ && At(child + 1)->latest_seq < At(child)->latest_seq) ++child;
+    if (entry->latest_seq <= At(child)->latest_seq) break;
+    Place(slot, At(child));
     slot = child;
   }
   Place(slot, entry);
@@ -355,6 +375,17 @@ size_t KeyView::collection_size() const {
       *value);
 }
 
+StubCache::StubCache(size_t max_entries)
+    : max_entries_(max_entries), index_(ReservedIndex(max_entries)) {}
+
+StubCache::Index StubCache::ReservedIndex(size_t max_entries) {
+  // Sized for the cap, and the stubs a load batch keeps past it, so a
+  // Put in a maintenance hold never rehashes the index.
+  Index index;
+  if (max_entries > 0) index.reserve(max_entries + (max_entries / 8) + 1);
+  return index;
+}
+
 const Stub* StubCache::Find(std::string_view key) const {
   if (index_.empty()) return nullptr;
   const auto it = index_.find(key);
@@ -377,12 +408,14 @@ void StubCache::Put(std::string_view key, const Stub& stub, bool trim) {
   }
 }
 
-StubCache StubCache::Release() {
-  StubCache released(max_entries_);
+StubCache StubCache::Release(Index fresh) {
+  ABYSS_DCHECK(fresh.empty(), "a stub cache released into an index holding stubs");
+  // Uncapped, so it reserves nothing: it is only ever freed.
+  StubCache released(0);
   released.order_.swap(order_);
   released.index_.swap(index_);
-  released.bytes_ = bytes_;
-  bytes_ = 0;
+  released.bytes_ = std::exchange(bytes_, 0);
+  index_ = std::move(fresh);
   return released;
 }
 
@@ -410,7 +443,7 @@ SingleShardStore::SingleShardStore(SingleShardConfig config)
     : config_(std::move(config)),
       governor_(config_.max_memory_bytes),
       stubs_(config_.stub_max_entries) {
-  if (config_.reserve_keys > 0) entries_.reserve(config_.reserve_keys);
+  ReserveMap();
 }
 
 // --- Read operations (const) ---
@@ -1428,20 +1461,48 @@ core::MemoryStats SingleShardStore::Stats() const {
 }
 
 void SingleShardStore::Wipe(core::SequenceId seq) {
-  ABYSS_DCHECK(seq >= core::kFirstSeq, "a Flush at seq 0, which names no entry");
   if (graveyard_ != nullptr) {
     graveyard_->entries.push_back(std::move(entries_));
-    graveyard_->stubs.push_back(stubs_.Release());
-    graveyard_->ttl_indexes.push_back(std::move(ttl_index_));
+    graveyard_->stubs.push_back(stubs_.Release(StubCache::ReservedIndex(config_.stub_max_entries)));
   }
   entries_.clear();
+  // A map moved to the graveyard took its buckets with it.
+  ReserveMap();
+  stubs_.Clear();
+  WipeAllButMaps(seq);
+}
+
+void SingleShardStore::Wipe(core::SequenceId seq, FreshMaps fresh) {
+  ABYSS_DCHECK(fresh.entries.empty(), "a Flush swapped in an entry map holding keys");
+  StubCache stubs = stubs_.Release(std::move(fresh.stubs));
+  if (graveyard_ != nullptr) {
+    graveyard_->entries.push_back(std::move(entries_));
+    graveyard_->stubs.push_back(std::move(stubs));
+  }
+  entries_ = std::move(fresh.entries);
+  map_bucket_bytes_ = entries_.bucket_count() * sizeof(void*);
+  WipeAllButMaps(seq);
+}
+
+FreshMaps SingleShardStore::ReservedMaps() const {
+  FreshMaps fresh{.stubs = StubCache::ReservedIndex(config_.stub_max_entries)};
+  if (config_.reserve_keys > 0) fresh.entries.reserve(config_.reserve_keys);
+  return fresh;
+}
+
+void SingleShardStore::WipeAllButMaps(core::SequenceId seq) {
+  ABYSS_DCHECK(seq >= core::kFirstSeq, "a Flush at seq 0, which names no entry");
+  if (graveyard_ != nullptr) {
+    graveyard_->ttl_indexes.push_back(std::move(ttl_index_));
+    graveyard_->heaps.push_back(tombstones_.Release());
+    graveyard_->heaps.push_back(parked_.Release());
+  }
   ttl_index_.clear();
   lru_lists_.clear();
   tombstones_.Clear();
   parked_.Clear();
   parked_bytes_ = 0;
   lru_dry_ = false;
-  stubs_.Clear();
   loading_.clear();
   negatives_.clear();
   negative_entries_ = 0;
@@ -1626,16 +1687,9 @@ void SingleShardStore::RaiseAppendedAt(core::WallTime at) {
 }
 
 void SingleShardStore::ShiftLinks(core::SteadyClock::duration shift, core::SteadyTime now) {
-  const auto moved = [shift, now](core::SteadyTime at) { return std::min(at + shift, now); };
   for (LruList& list : lru_lists_) {
     for (Entry* entry = list.oldest; entry != nullptr; entry = entry->lru_newer) {
-      entry->linked_at = moved(entry->linked_at);
-      const std::atomic_ref<core::SteadyTime::rep> stamp(entry->accessed);
-      const auto accessed = stamp.load(std::memory_order_relaxed);
-      if (accessed != 0) {
-        stamp.store(moved(AccessedAt(*entry)).time_since_epoch().count(),
-                    std::memory_order_relaxed);
-      }
+      entry->linked_at = std::min(entry->linked_at + shift, now);
     }
   }
 }
@@ -1690,12 +1744,20 @@ EntryMap::iterator SingleShardStore::EmplaceEntry(std::string_view key) {
   const auto buckets = static_cast<double>(entries_.bucket_count());
   const bool rehashes =
       static_cast<double>(entries_.size() + 1) > entries_.max_load_factor() * buckets;
-  if (!rehashes || !config_.on_rehash) return entries_.try_emplace(std::string(key)).first;
+  if (!rehashes) return entries_.try_emplace(std::string(key)).first;
   const auto start = std::chrono::steady_clock::now();
   const auto it = entries_.try_emplace(std::string(key)).first;
-  config_.on_rehash(
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  if (config_.on_rehash) {
+    config_.on_rehash(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  }
+  map_bucket_bytes_ = entries_.bucket_count() * sizeof(void*);
   return it;
+}
+
+void SingleShardStore::ReserveMap() {
+  if (config_.reserve_keys > 0) entries_.reserve(config_.reserve_keys);
+  map_bucket_bytes_ = entries_.bucket_count() * sizeof(void*);
 }
 
 Entry& SingleShardStore::GetOrCreateEntry(std::string_view key, Entry::Type type,
@@ -1902,19 +1964,20 @@ void SingleShardStore::Bury(Value& value) {
   if (graveyard_ != nullptr) graveyard_->values.push_back(std::move(value));
 }
 
-SingleShardStore::LruList& SingleShardStore::ListFor(core::EvictionTTL eviction) {
-  for (LruList& list : lru_lists_) {
-    if (list.eviction == eviction) return list;
+uint16_t SingleShardStore::ListFor(core::EvictionTTL eviction) {
+  for (size_t i = 0; i < lru_lists_.size(); ++i) {
+    if (lru_lists_[i].eviction == eviction) return static_cast<uint16_t>(i);
   }
   if (lru_lists_.size() > std::numeric_limits<uint16_t>::max()) {
     core::Fatal("more eviction classes than a hot shard can list");
   }
-  return lru_lists_.emplace_back(LruList{.eviction = eviction});
+  lru_lists_.push_back(LruList{.eviction = eviction});
+  return static_cast<uint16_t>(lru_lists_.size() - 1);
 }
 
 void SingleShardStore::LruLink(Entry& entry, core::SteadyTime at) {
-  LruList& list = ListFor(entry.eviction);
-  entry.lru_list = static_cast<uint16_t>(&list - &lru_lists_.front());
+  entry.lru_list = ListFor(entry.eviction);
+  LruList& list = lru_lists_[entry.lru_list];
   entry.linked_at = list.newest != nullptr ? std::max(at, list.newest->linked_at) : at;
   entry.lru_older = list.newest;
   entry.lru_newer = nullptr;

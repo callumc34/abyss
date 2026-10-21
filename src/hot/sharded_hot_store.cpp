@@ -207,9 +207,13 @@ core::Result<void> ShardedHotStore::Wipe(core::ShardId shard,
                                        "hot shard " + std::to_string(shard) + " out of range"});
   }
   Shard& target = *shards_[shard];
+  FreshMaps fresh = target.store.ReservedMaps();
+  Graveyard wiped;
   {
     const std::unique_lock lock(target.mutex);
-    target.store.Wipe(seq);
+    target.store.SetGraveyard(&wiped);
+    target.store.Wipe(seq, std::move(fresh));
+    target.store.SetGraveyard(nullptr);
   }
   target.load_cv.notify_all();
   return {};
@@ -218,21 +222,33 @@ core::Result<void> ShardedHotStore::Wipe(core::ShardId shard,
 std::optional<core::RespValue> ShardedHotStore::ApplyLogged(core::ShardId shard,
                                                             core::QueueEntry& entry) {
   std::optional<core::RespValue> reply;
-  ReplayFrame(shard, entry, reply);
+  if (auto replayed = ReplayFrame(shard, entry, reply); !replayed.has_value()) {
+    core::Fatal(replayed.error().message());
+  }
   return reply;
 }
 
-ShardedHotStore::Replayed ShardedHotStore::Replay(core::ShardId shard, core::QueueEntry& entry) {
+core::Result<ShardedHotStore::Replayed> ShardedHotStore::Replay(core::ShardId shard,
+                                                                core::QueueEntry& entry) {
   std::optional<core::RespValue> reply;
   return ReplayFrame(shard, entry, reply);
 }
 
-ShardedHotStore::Replayed ShardedHotStore::ReplayFrame(core::ShardId shard, core::QueueEntry& entry,
-                                                       std::optional<core::RespValue>& reply)
-    ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+core::Result<ShardedHotStore::Replayed> ShardedHotStore::ReplayFrame(
+    core::ShardId shard, core::QueueEntry& entry,
+    std::optional<core::RespValue>& reply) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   auto* write = std::get_if<core::entry::Write>(&entry.payload);
-  // A Write applies on its key's shard, the stream's in any real log.
-  if (write != nullptr && write->cmd.args.size() > 1) shard = ShardIndex(write->cmd.args[1]);
+  // A Write is logged on its key's stream; elsewhere it is corrupt, and
+  // replaying it would give the key another stream's seq.
+  if (write != nullptr && write->cmd.args.size() > 1) {
+    if (const core::ShardId owner = ShardIndex(write->cmd.args[1]); owner != shard) {
+      return std::unexpected(core::Error{
+          core::ErrorCode::kCorruption,
+          "replayed frame at seq " + std::to_string(entry.seq) + " on shard " +
+              std::to_string(shard) + " writes a key of shard " + std::to_string(owner) +
+              " (key_hash " + std::to_string(log::KeyHash(write->cmd.args[1])) + ")"});
+    }
+  }
   // Read before the lock: never a cold call under a shard lock.
   const auto horizon = Horizon(shard);
   const core::SteadyTime linked_at(std::chrono::duration_cast<core::SteadyClock::duration>(
@@ -263,7 +279,6 @@ ShardedHotStore::Replayed ShardedHotStore::ReplayFrame(core::ShardId shard, core
     core::Fatal("only Write and Flush entries apply to hot as logged");
   }
   const Replayed replayed{
-      .shard = shard,
       .applied = reply.has_value(),
       .over_backpressure = target.store.OverBackpressure(),
       .memory = {.used_bytes = target.store.UsedBytes(),
@@ -577,8 +592,9 @@ ShardLocks::ShardLocks(ShardedHotStore& hot, std::span<const core::ShardId> shar
                "hot shards locked by a thread holding a reservation");
   ABYSS_DCHECK(std::ranges::adjacent_find(shards_, std::greater_equal<>{}) == shards_.end(),
                "hot shards must be locked sorted and distinct");
-  Lock();
   horizons_.reserve(shards_.size());
+  Lock();
+  if (hot_->write_hold_observer_) hot_->write_hold_observer_(true);
   for (const core::ShardId shard : shards_) {
     // An atomic read, not a cold call. Taken under the locks, it is no
     // older than any eviction a view's miss reflects.
@@ -600,6 +616,7 @@ ShardLocks::ShardLocks(ShardLocks&& other) noexcept
   }
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): only a test's hold observer can throw.
 ShardLocks::~ShardLocks() { Unlock(); }
 
 void ShardLocks::Lock() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
@@ -609,6 +626,7 @@ void ShardLocks::Lock() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
 
 Graveyard ShardLocks::Unlock() ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   if (!held_) return {};
+  if (hot_->write_hold_observer_) hot_->write_hold_observer_(false);
   for (const core::ShardId shard : shards_) hot_->shards_[shard]->store.SetGraveyard(nullptr);
   for (const core::ShardId shard : std::views::reverse(shards_)) {
     hot_->shards_[shard]->mutex.unlock();
@@ -679,10 +697,10 @@ std::vector<core::RespValue> ShardLocks::ApplyEffects(core::ShardId shard,
   return replies;
 }
 
-void ShardLocks::Wipe(core::ShardId shard, core::SequenceId seq) {
+void ShardLocks::Wipe(core::ShardId shard, core::SequenceId seq, FreshMaps fresh) {
   SingleShardStore& store = Store(shard);
   const size_t before = store.PendingLoads();
-  store.Wipe(seq);
+  store.Wipe(seq, std::move(fresh));
   NoteLoads(shard, before);
 }
 

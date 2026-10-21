@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -32,6 +34,13 @@ namespace abyss::hot {
 
 // A drain horizon past every seq: nothing is held back for cold.
 inline constexpr core::SequenceId kAllDrained = std::numeric_limits<core::SequenceId>::max();
+
+// A read stamp before every link, so it reads as no read. No clock
+// gives it, and no replayed link reaches it: a link maps to at least
+// steady_now - wall_now, and may be below the steady epoch. Narrowing
+// `accessed` to coarse 32-bit ticks would need a new sentinel with it.
+inline constexpr core::SteadyTime::rep kNeverRead =
+    std::numeric_limits<core::SteadyTime::rep>::min();
 
 struct SingleShardConfig {
   size_t max_memory_bytes = 0;
@@ -89,12 +98,13 @@ struct Entry {
   // When it last joined its LRU list's warm end, never before the
   // entry ahead of it, so the list is in linked_at order.
   core::SteadyTime linked_at{};
-  // The coarse time of its last read, as SteadyTime ticks. Hits store
-  // it under the shared lock, so it is accessed through atomic_ref.
+  // The coarse time of its last read, as SteadyTime ticks; kNeverRead
+  // before one. Hits store it under the shared lock, so it is accessed
+  // through atomic_ref.
   // Not Caffeine's striped read buffers: a stamp needs no lock,
   // allocation or key copy, and second chance over the intrusive list
   // is SIEVE's result.
-  mutable core::SteadyTime::rep accessed = 0;
+  mutable core::SteadyTime::rep accessed = kNeverRead;
   // The map node's key.
   const std::string* key = nullptr;
   // Live entries form their class's LRU list; tombstones are not on it.
@@ -173,13 +183,25 @@ struct KeyView {
 
 // Bounded stub cache that drops its oldest stub.
 class StubCache {
+  struct Node {
+    std::string key;
+    Stub stub;
+  };
+  using Order = std::list<Node>;
+
  public:
-  explicit StubCache(size_t max_entries) : max_entries_(max_entries) {}
+  // Keys view the nodes' own strings.
+  using Index = std::unordered_map<std::string_view, Order::iterator>;
+
+  explicit StubCache(size_t max_entries);
   StubCache(const StubCache&) = delete;
   StubCache& operator=(const StubCache&) = delete;
   StubCache(StubCache&&) = default;
   StubCache& operator=(StubCache&&) = default;
   ~StubCache() = default;
+
+  // An empty index sized as the constructor sizes it for `max_entries`.
+  static Index ReservedIndex(size_t max_entries);
 
   const Stub* Find(std::string_view key) const;
   // Drops the oldest stubs past the cap, unless `trim` is false: a load
@@ -187,28 +209,56 @@ class StubCache {
   void Put(std::string_view key, const Stub& stub, bool trim = true);
   bool Erase(std::string_view key);
   void Clear();
-  // Moves every stub out, keeping the cap and the drop count.
-  StubCache Release();
+  // Moves every stub out, keeping the cap and the drop count; `fresh`,
+  // from ReservedIndex, becomes the index, so a hold sizes none.
+  StubCache Release(Index fresh);
 
   size_t size() const { return index_.size(); }
-  uint64_t bytes() const { return bytes_; }
+  // Its stubs, and its index's buckets, held for the cap from the start
+  // and recounted if a load batch grows them.
+  uint64_t bytes() const { return bytes_ + IndexBytes(); }
   uint64_t drops() const { return drops_; }
 
  private:
-  struct Node {
-    std::string key;
-    Stub stub;
-  };
-  using Order = std::list<Node>;
-
   void EraseNode(Order::iterator node);
+  uint64_t IndexBytes() const {
+    return max_entries_ > 0 ? index_.bucket_count() * sizeof(void*) : 0;
+  }
 
   size_t max_entries_;
-  // Most recent first. Index keys view the nodes' own strings.
+  // Most recent first.
   Order order_;
-  std::unordered_map<std::string_view, Order::iterator> index_;
+  Index index_;
   uint64_t bytes_ = 0;
   uint64_t drops_ = 0;
+};
+
+// A min-heap of entries by latest_seq, each knowing its slot.
+class SeqHeap {
+ public:
+  void Push(Entry& entry);
+  void Erase(Entry& entry);
+  // After `entry`'s latest_seq changed.
+  void Update(Entry& entry);
+  Entry* Top() const { return size_ == 0 ? nullptr : (*chunks_.front())[0]; }
+  void Clear();
+  // Empties the heap, handing back its chunks to free later.
+  SeqHeap Release();
+  size_t size() const { return size_; }
+
+ private:
+  // Fixed chunks, on every standard library: growth allocates one and
+  // copies only the chunk index, never a shard's pointers in a hold.
+  static constexpr size_t kChunkSlots = 512;
+  using Chunk = std::array<Entry*, kChunkSlots>;
+
+  Entry*& At(size_t slot);
+  void Place(size_t slot, Entry* entry);
+  void SiftUp(size_t slot);
+  void SiftDown(size_t slot);
+
+  std::vector<std::unique_ptr<Chunk>> chunks_;
+  size_t size_ = 0;
 };
 
 // What applies under an exclusive hold replaced or removed, freed once
@@ -220,6 +270,14 @@ struct Graveyard {
   std::vector<EntryMap> entries;
   std::vector<StubCache> stubs;
   std::vector<TtlIndex> ttl_indexes;
+  std::vector<SeqHeap> heaps;
+};
+
+// A Flush's new entry map and stub index, sized before its hold, which
+// then neither allocates nor zeroes a bucket array.
+struct FreshMaps {
+  EntryMap entries;
+  StubCache::Index stubs;
 };
 
 // Caps the maintenance one exclusive hold may do: kHoldEntries entries
@@ -243,25 +301,6 @@ class HoldBudget {
   bool timed_ = true;
   core::SteadyTime until_{};
   size_t examined_ = 0;
-};
-
-// A min-heap of entries by latest_seq, each knowing its slot.
-class SeqHeap {
- public:
-  void Push(Entry& entry);
-  void Erase(Entry& entry);
-  // After `entry`'s latest_seq changed.
-  void Update(Entry& entry);
-  Entry* Top() const { return heap_.empty() ? nullptr : heap_.front(); }
-  void Clear() { heap_.clear(); }
-  size_t size() const { return heap_.size(); }
-
- private:
-  void Place(size_t slot, Entry* entry);
-  void SiftUp(size_t slot);
-  void SiftDown(size_t slot);
-
-  std::vector<Entry*> heap_;
 };
 
 struct LoadToken {
@@ -454,6 +493,11 @@ class SingleShardStore {
   core::MemoryStats Stats() const;
   // Clears entries, stubs and placeholders for a Flush at `seq`.
   void Wipe(core::SequenceId seq);
+  // As Wipe, swapping in `fresh` from ReservedMaps().
+  void Wipe(core::SequenceId seq, FreshMaps fresh);
+  // Sized as the store sizes its own. It reads only the config, so it
+  // is built without the shard's lock.
+  FreshMaps ReservedMaps() const;
   // A miss is absent until cold drains the last Flush; with none,
   // flush_seq_ is 0 and no horizon is below it.
   bool KnownAbsentAfterFlush(core::SequenceId horizon) const { return horizon < flush_seq_; }
@@ -479,14 +523,15 @@ class SingleShardStore {
   bool HasEntry(std::string_view key) const { return FindEntry(key) != nullptr; }
   void RaiseAppendedAt(core::WallTime at);
   uint64_t UsedBytes() const {
-    return entry_bytes_ + stubs_.bytes() + (ttl_index_.size() * kTtlBucketBytes);
+    return entry_bytes_ + stubs_.bytes() + (ttl_index_.size() * kTtlBucketBytes) +
+           map_bucket_bytes_;
   }
   // Over max_memory_bytes times the backpressure ratio, as of now.
   bool OverBackpressure() const;
   // That product in bytes; 0 when the shard has no budget.
   uint64_t BackpressureLimit() const;
-  // Moves every live entry's link and read stamp by `shift`, capped at
-  // `now`. Monotone, so each list keeps its order.
+  // Moves every live entry's link by `shift`, capped at `now`. Monotone,
+  // so each list keeps its order. Read stamps are steady times already.
   void ShiftLinks(core::SteadyClock::duration shift, core::SteadyTime now);
 
   // Entries the LRU walk has examined.
@@ -570,6 +615,10 @@ class SingleShardStore {
   // Removes a live entry, leaving a stub unless it expired by TTL.
   // Inserts `key`'s entry, timing it when the insert will rehash.
   EntryMap::iterator EmplaceEntry(std::string_view key);
+  // Sizes the entry map for reserve_keys, and counts its buckets.
+  void ReserveMap();
+  // Wipe's work beyond the entry map and the stubs.
+  void WipeAllButMaps(core::SequenceId seq);
   void Evict(EntryMap::iterator it, bool leave_stub);
   // Into the graveyard, if one is set: a free can stall.
   void Erase(EntryMap::iterator it);
@@ -579,7 +628,9 @@ class SingleShardStore {
   void Detach(Entry& entry);
   // A DEL of a key with no entry leaves it resident as absent.
   void InsertTombstone(std::string_view key, core::SequenceId seq);
-  LruList& ListFor(core::EvictionTTL eviction);
+  // The index of `eviction`'s list, added if new. Never pointer
+  // arithmetic: a deque's elements are not one array.
+  uint16_t ListFor(core::EvictionTTL eviction);
   // Links a live entry at its class's warm end, at `at` or the newest
   // link if later.
   void LruLink(Entry& entry, core::SteadyTime at);
@@ -624,8 +675,9 @@ class SingleShardStore {
   // Live entries due but not yet drained.
   SeqHeap parked_;
   uint64_t parked_bytes_ = 0;
-  // What a read hit stamps, as SteadyTime ticks.
-  std::atomic<core::SteadyTime::rep> access_now_{0};
+  // What a read hit stamps, as SteadyTime ticks; kNeverRead until the
+  // first SetAccessTime, so a read stamps nothing.
+  std::atomic<core::SteadyTime::rep> access_now_{kNeverRead};
   core::StringMap<LoadToken> loading_;
   uint64_t next_load_id_ = 0;
   uint64_t load_discards_ = 0;
@@ -641,6 +693,8 @@ class SingleShardStore {
   core::WallTime last_appended_at_{};
   Graveyard* graveyard_ = nullptr;
   uint64_t entry_bytes_ = 0;
+  // The entry map's buckets, used or not, recounted as it grows.
+  uint64_t map_bucket_bytes_ = 0;
   // The part of entry_bytes_ that is live, not tombstones.
   uint64_t live_bytes_ = 0;
   uint64_t key_count_ = 0;

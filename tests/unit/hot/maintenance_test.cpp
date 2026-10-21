@@ -9,12 +9,15 @@
 
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/queue_entry.h"
+#include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "hot_bytes.h"
 #include "test_clock.h"
 
 namespace abyss::hot {
@@ -290,20 +293,90 @@ TEST_F(MaintenanceTest, EachEvictionClassIsWalkedOnItsOwn) {
   EXPECT_TRUE(Resident("l:0"));
 }
 
+// Each class's list is found by its index, however many there are. A
+// deque's elements are not one array, so the index is not their
+// addresses' distance: MSVC holds one list a block, libstdc++ ten.
+TEST_F(MaintenanceTest, EveryOneOfManyEvictionClassesKeepsItsOwnList) {
+  constexpr int kClasses = 100;
+  std::vector<core::EvictionRule> rules;
+  rules.reserve(kClasses);
+  for (int i = 0; i < kClasses; ++i) {
+    rules.push_back({.prefix = Key("c", i) + ":", .eviction = core::EvictionTTL{i + 1}});
+  }
+  policy_ = core::EvictionPolicy{kLongEviction, std::move(rules)};
+  for (int i = 0; i < kClasses; ++i) Set(Key("c", i) + ":k", core::kFirstSeq);
+  // Rewritten, so each unlinks from its list and links again.
+  for (int i = 0; i < kClasses; ++i) Set(Key("c", i) + ":k", core::kFirstSeq + 1);
+
+  clock_.Advance(50'500ms);
+  EXPECT_EQ(store_.EvictExpired(clock_.SteadyNow()).by_deadline, 50U);
+  for (int i = 0; i < kClasses; ++i) {
+    EXPECT_EQ(Resident(Key("c", i) + ":k"), i >= 50) << "class " << i;
+  }
+  clock_.Advance(60s);
+  EXPECT_EQ(store_.EvictExpired(clock_.SteadyNow()).by_deadline, 50U);
+  EXPECT_EQ(store_.Stats()->key_count, 0U);
+}
+
+// Replay links at appended_at read as steady ticks, and the shift maps
+// them to steady. On a host up for less than the window, a key written
+// over a window ago maps below the steady epoch. Unread, it is due by
+// that link; read since, it is kept until a window after the read.
+TEST(ReplayedLinkTest, ALinkBelowTheSteadyEpochIsJudgedByItAndItsReads) {
+  abyss::testing::TestClock clock(core::SteadyTime{10s});
+  clock.SetWall(core::WallTime{std::chrono::hours{500'000}});
+  core::EvictionPolicy policy{core::EvictionTTL{3600}};
+  ShardedHotStore store{ShardedHotStoreConfig{
+      .shard_count = 1,
+      .eviction_policy = &policy,
+      .steady_clock = clock.SteadyFn(),
+      .wall_clock = clock.WallFn(),
+  }};
+  core::SequenceId seq = 0;
+  const auto replay = [&](const std::string& key, std::chrono::minutes ago) {
+    core::QueueEntry entry{
+        .seq = ++seq,
+        .appended_at = clock.WallNow() - ago,
+        .payload = core::entry::Write{.cmd = core::RespCommand{.args = {"SET", key, "v"}}},
+        .replaces_state = true,
+    };
+    const auto replayed = store.Replay(0, entry);
+    ASSERT_TRUE(replayed.has_value() && replayed->applied) << key;
+  };
+  replay("idle", 61min);
+  replay("read", 59min);
+  replay("fresh", 1min);
+  store.ShiftReplayedLinks(clock.SteadyNow(), clock.WallNow());
+  store.SetAccessTime(clock.SteadyNow());
+  ASSERT_TRUE(store.Exec(ops::ReadOp{ops::StringGet{.key = "read"}}).has_value());
+  const auto resident = [&store](std::string_view key) {
+    return store.Exec(ops::ReadOp{ops::Exists{.keys = {key}}})->AsInteger() == 1;
+  };
+
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).by_deadline, 1U)
+      << "an unread key was taken as read at steady 0";
+  EXPECT_FALSE(resident("idle"));
+  // Due by its link, but read at 10 s.
+  clock.Advance(2min);
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).by_deadline, 0U);
+  EXPECT_TRUE(resident("read"));
+  EXPECT_TRUE(resident("fresh"));
+  clock.Advance(60min);
+  EXPECT_EQ(store.EvictExpired(clock.SteadyNow()).by_deadline, 2U);
+}
+
 // --- Memory ---
 
 TEST(MemoryWalkTest, PassesUndrainedKeysOnceAHorizon) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  SingleShardStore probe{SingleShardConfig{}};
-  ASSERT_TRUE(
-      probe.Apply(ops::WriteOp{ops::StringSet{.key = "k000", .value = value}}, kLongEviction)
-          .has_value());
-  const uint64_t per_entry = probe.Stats().used_bytes;
+  const uint64_t per_entry = abyss::testing::StringEntryBytes("k000", value);
+  const uint64_t empty = abyss::testing::EmptyStoreBytes(1024);
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = per_entry * 1000,
+      .max_memory_bytes = empty + (per_entry * 1000),
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 1024,
   }};
   // Undrained keys at the cold end, drained ones behind them; written
   // while nothing has drained, so the writes evict none.
@@ -329,23 +402,19 @@ TEST(MemoryWalkTest, PassesUndrainedKeysOnceAHorizon) {
   };
 
   const uint64_t before = store.LruVisitsForTesting();
-  EXPECT_EQ(walk_to(per_entry * 950), 50U);
+  EXPECT_EQ(walk_to(empty + (per_entry * 950)), 50U);
   EXPECT_EQ(store.LruVisitsForTesting() - before, 150U) << "100 passed, 50 evicted";
 
   const uint64_t again = store.LruVisitsForTesting();
-  EXPECT_EQ(walk_to(per_entry * 900), 50U);
+  EXPECT_EQ(walk_to(empty + (per_entry * 900)), 50U);
   EXPECT_EQ(store.LruVisitsForTesting() - again, 50U) << "the undrained ones not again";
 }
 
 TEST(MemoryWalkTest, AnApplyEvictsAtMostOneHold) {
   const std::string value(64, 'v');
-  SingleShardStore probe{SingleShardConfig{}};
-  ASSERT_TRUE(
-      probe.Apply(ops::WriteOp{ops::StringSet{.key = "k000", .value = value}}, kLongEviction)
-          .has_value());
-  const uint64_t per_entry = probe.Stats().used_bytes;
-  const size_t budget = per_entry * 1000;
-  SingleShardStore store{SingleShardConfig{.max_memory_bytes = budget}};
+  const uint64_t per_entry = abyss::testing::StringEntryBytes("k000", value);
+  const size_t budget = abyss::testing::EmptyStoreBytes(1024) + (per_entry * 1000);
+  SingleShardStore store{SingleShardConfig{.max_memory_bytes = budget, .reserve_keys = 1024}};
   for (int i = 0; i < 1000; ++i) {
     ASSERT_TRUE(store
                     .Apply(ops::WriteOp{ops::StringSet{.key = Key("k", 100 + i), .value = value}},
