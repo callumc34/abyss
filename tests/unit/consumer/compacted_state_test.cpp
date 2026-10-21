@@ -2,8 +2,12 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <random>
 #include <string>
+#include <string_view>
 #include <variant>
+#include <vector>
 
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
@@ -558,6 +562,63 @@ TEST_F(CompactedStateTest, StringOverStringDoesNotEmitLeadingDel) {
   ASSERT_TRUE(std::holds_alternative<StringSet>(ops[0]));
 }
 
+// --- Replace: an op logged kReplacesState ----------------------------
+
+// HDEL emptied the hash, so the key was absent when SADD made it a
+// set. Absorbed, the add over a hash is dropped.
+TEST_F(CompactedStateTest, ReplaceAfterAnEmptyingRemovalTakesTheNewType) {
+  state_.Absorb(WriteOp{HashSet{.key = "k", .fields = {{.field = "f", .value = "v"}}}});
+  state_.Absorb(WriteOp{Expire{.key = "k", .abs_ttl_ms = 99000}});
+  state_.Absorb(WriteOp{HashDel{.key = "k", .fields = {"f"}}});
+  state_.Replace(WriteOp{SetAdd{.key = "k", .members = {"a", "b"}}});
+
+  EXPECT_EQ(state_.Type(), CompactedState::DataType::kSet);
+  EXPECT_FALSE(state_.IsTombstone());
+  EXPECT_EQ(state_.Invalidation(), CompactedState::BaseInvalidation::kDeleteAll);
+  EXPECT_EQ(state_.Ttl(), CompactedState::TtlIntent::kUnchanged);
+  EXPECT_TRUE(state_.HashRemovedFields().empty());
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 2);
+  ASSERT_TRUE(std::holds_alternative<Del>(ops[0]));
+  ASSERT_TRUE(std::holds_alternative<SetAdd>(ops[1]));
+  EXPECT_EQ(std::get<SetAdd>(ops[1]).members.size(), 2U);
+}
+
+// Same type: the old members go, not only those the window removed.
+TEST_F(CompactedStateTest, ReplaceOfTheSameTypeDropsWhatCameBefore) {
+  state_.Absorb(WriteOp{SetAdd{.key = "k", .members = {"x"}}});
+  state_.Absorb(WriteOp{SetRem{.key = "k", .members = {"x"}}});
+  state_.Replace(WriteOp{SetAdd{.key = "k", .members = {"a"}}});
+
+  EXPECT_TRUE(state_.SetRemovedMembers().empty());
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 2);
+  ASSERT_TRUE(std::holds_alternative<Del>(ops[0]));
+  ASSERT_TRUE(std::holds_alternative<SetAdd>(ops[1]));
+}
+
+// Nothing absorbed, but cold may hold the key past its TTL, unswept.
+TEST_F(CompactedStateTest, ReplaceOfAFreshStateStillEmitsALeadingDel) {
+  state_.Replace(WriteOp{HashSet{.key = "k", .fields = {{.field = "f", .value = "v"}}}});
+
+  EXPECT_EQ(state_.Invalidation(), CompactedState::BaseInvalidation::kDeleteAll);
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 2);
+  ASSERT_TRUE(std::holds_alternative<Del>(ops[0]));
+  ASSERT_TRUE(std::holds_alternative<HashSet>(ops[1]));
+}
+
+// A SET replaces as it absorbs, and cold's SET clears the rest itself.
+TEST_F(CompactedStateTest, ReplaceByASetOverAStringEmitsNoLeadingDel) {
+  state_.Absorb(WriteOp{StringSet{.key = "k", .value = "v1"}});
+  state_.Replace(WriteOp{StringSet{.key = "k", .value = "v2"}});
+
+  auto ops = state_.Emit();
+  ASSERT_EQ(ops.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<StringSet>(ops[0]));
+  EXPECT_EQ(std::get<StringSet>(ops[0]).value, "v2");
+}
+
 // --- Determinism (invariant 4): no second TTL clock --------------------------
 // Compaction must reproduce the SAME absolute TTL the hot apply derives from the
 // same WAL slice. Both read the parser-computed abs_ttl_ms from the SAME
@@ -602,6 +663,88 @@ TEST_F(CompactedStateTest, EmitReproducesParserAbsTtlForStringFold) {
   ASSERT_EQ(ops.size(), 1);
   ASSERT_TRUE(std::holds_alternative<StringSet>(ops[0]));
   EXPECT_EQ(std::get<StringSet>(ops[0]).abs_ttl_ms, hot_abs_ttl);
+}
+
+// The buffer reads the figure on every absorb, so it is kept as the
+// elements change, and must stay what a walk of them gives.
+TEST(CompactedStateBytesTest, TheRunningFigureMatchesARecountAfterAnyOps) {
+  constexpr int kNames = 12;
+  std::vector<std::string> names;
+  names.reserve(kNames);
+  for (int i = 0; i < kNames; ++i) {
+    names.push_back((i % 2 == 0 ? "m" : "a member name past any inline buffer ") +
+                    std::to_string(i));
+  }
+  const std::vector<std::string> values{"",
+                                        "v",
+                                        std::string(15, 'x'),
+                                        std::string(16, 'y'),
+                                        std::string(23, 'z'),
+                                        std::string(40, 'w')};
+  for (uint32_t seed = 1; seed <= 50; ++seed) {
+    std::mt19937 rng(seed);
+    const auto pick = [&rng](const std::vector<std::string>& from) -> std::string_view {
+      return from[std::uniform_int_distribution<size_t>(0, from.size() - 1)(rng)];
+    };
+    CompactedState state;
+    for (int step = 0; step < 300; ++step) {
+      std::vector<std::string_view> some;
+      const size_t count = std::uniform_int_distribution<size_t>(1, 4)(rng);
+      some.reserve(count);
+      for (size_t i = 0; i < count; ++i) some.push_back(pick(names));
+      std::vector<ZsetAdd::Entry> entries;
+      std::vector<HashSet::FieldValue> fields;
+      for (const auto m : some) {
+        entries.push_back({.score = static_cast<double>(step), .member = m});
+        fields.push_back({.field = m, .value = pick(values)});
+      }
+      WriteOp op;
+      switch (std::uniform_int_distribution<int>(0, 10)(rng)) {
+        case 0:
+          op = StringSet{.key = "k", .value = pick(values)};
+          break;
+        case 1:
+          op = Del{.keys = {"k"}};
+          break;
+        case 2:
+          op = Expire{.key = "k", .abs_ttl_ms = 5};
+          break;
+        case 3:
+          op = Persist{.key = "k"};
+          break;
+        case 4:
+          op = SetAdd{.key = "k", .members = some};
+          break;
+        case 5:
+          op = SetRem{.key = "k", .members = some};
+          break;
+        case 6:
+          op = ZsetAdd{.key = "k", .entries = entries};
+          break;
+        case 7:
+          op = ZsetRem{.key = "k", .members = some};
+          break;
+        case 8:
+          op = HashSet{.key = "k", .fields = fields};
+          break;
+        case 9:
+          op = HashMSet{.key = "k", .fields = fields};
+          break;
+        default:
+          op = HashDel{.key = "k", .fields = some};
+          break;
+      }
+      if (rng() % 4 == 0) {
+        state.Replace(op);
+      } else {
+        state.Absorb(op);
+      }
+      ASSERT_EQ(state.EstimatedBytes(), state.RecountBytesForTesting())
+          << "seed " << seed << ", step " << step << ", op " << op.index();
+    }
+    state.Reset();
+    EXPECT_EQ(state.EstimatedBytes(), 0U);
+  }
 }
 
 }  // namespace

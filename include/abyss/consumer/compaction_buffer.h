@@ -33,10 +33,11 @@ class CompactionBuffer {
 
   explicit CompactionBuffer(core::SteadyClockFn clock = core::DefaultSteadyClock);
 
-  // `seq` and `appended_at_ms` are the log entry's, absorbed in seq
-  // order.
+  // `seq`, `appended_at_ms` and `replaces_state` are the log entry's,
+  // absorbed in seq order.
   void Absorb(const std::string& key, const core::ops::WriteOp& op, core::EvictionTTL eviction,
-              core::SequenceId seq, uint64_t appended_at_ms) ABYSS_EXCLUDES(mutex_);
+              core::SequenceId seq, uint64_t appended_at_ms, bool replaces_state = false)
+      ABYSS_EXCLUDES(mutex_);
 
   // A copy of `key`'s compacted delta, TTL unjudged; nullopt if none.
   std::optional<CompactedState> Snapshot(std::string_view key) const ABYSS_EXCLUDES(mutex_);
@@ -96,7 +97,9 @@ class CompactionBuffer {
   // Per-live-heap-entry overhead charged into BytesEstimate so the flush heap's
   // own memory drives the high-water/aggressive trigger (COLDC-4); a key whose
   // quiet deadline keeps sliding can no longer accumulate heap entries silently.
-  static constexpr size_t kHeapEntryOverhead = 64;
+  // Two slots: a doubling vector is up to half empty. Its key's heap
+  // block is charged with it.
+  static constexpr size_t kHeapEntryOverhead = 2 * sizeof(HeapEntry);
 
   // Pushes a heap entry for `key` scheduled at `scheduled`, charging the heap
   // overhead. Records the scheduled time on the entry for dedup on re-absorb.

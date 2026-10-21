@@ -95,6 +95,10 @@ class RocksdbStore : public core::ColdStore {
   // Every record in both column families, in key order, from one
   // snapshot.
   std::vector<RawRecord> RecordsForTesting() const;
+  // Records, and of them tombstones, in the default column family's
+  // memtables.
+  uint64_t MemtableEntriesForTesting() const;
+  uint64_t MemtableDeletesForTesting() const;
 
  private:
   struct Impl;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -27,10 +28,17 @@ class CompactedState {
   enum class TtlIntent : uint8_t { kUnchanged, kSetTo, kCleared };
 
   void Absorb(const core::ops::WriteOp& op);
+  // An op logged kReplacesState: it alone determines the key, so
+  // nothing absorbed before it, of any type, survives it. Absorb would
+  // drop an add over another type, as when a removal emptied the key.
+  void Replace(const core::ops::WriteOp& op);
   std::vector<core::ops::WriteOp> Emit() const;
   void Reset();
 
-  size_t EstimatedBytes() const;
+  // What its containers and strings hold on the heap, beyond itself.
+  size_t EstimatedBytes() const { return heap_bytes_; }
+  // The same figure walked from every element.
+  size_t RecountBytesForTesting() const;
 
   bool IsTombstone() const { return is_tombstone_; }
   DataType Type() const { return type_; }
@@ -73,6 +81,9 @@ class CompactedState {
   core::StringSet zset_removed_members_;
 
   bool is_tombstone_ = false;
+  // Kept as elements change: a recount is O(members), and the buffer
+  // asks on every absorb.
+  size_t heap_bytes_ = 0;
 
   // Window-collapse bookkeeping (over already-absolute, parser-derived TTLs).
   // `abs_ttl_ms_` is the kSetTo payload; neither field introduces a TTL clock.

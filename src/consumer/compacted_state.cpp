@@ -1,13 +1,36 @@
 #include "abyss/consumer/compacted_state.h"
 
+#include <cstddef>
 #include <string>
+#include <utility>
 #include <variant>
+
+#include "abyss/consumer/heap_bytes.h"
 
 namespace abyss::consumer {
 
 const std::string CompactedState::kEmpty;
 
 namespace {
+
+// Each element: its node, its strings' heap blocks and its bucket.
+constexpr size_t kMemberBytes = AllocBytes(kHashNodeLinks + sizeof(std::string)) + sizeof(void*);
+constexpr size_t kScoredBytes =
+    AllocBytes(kHashNodeLinks + sizeof(std::string) + sizeof(double)) + sizeof(void*);
+constexpr size_t kFieldBytes =
+    AllocBytes(kHashNodeLinks + (2 * sizeof(std::string))) + sizeof(void*);
+
+size_t MemberBytes(const std::string& member) {
+  return kMemberBytes + StringHeapBytes(member.size());
+}
+
+size_t ScoredBytes(const std::string& member) {
+  return kScoredBytes + StringHeapBytes(member.size());
+}
+
+size_t FieldBytes(const std::string& field, const std::string& value) {
+  return kFieldBytes + StringHeapBytes(field.size()) + StringHeapBytes(value.size());
+}
 
 struct AbsorbVisitor {
   CompactedState::DataType& type;
@@ -22,6 +45,27 @@ struct AbsorbVisitor {
   core::StringSet& hash_removed_fields;
   CompactedState::BaseInvalidation& base_invalidation;
   CompactedState::TtlIntent& ttl_intent;
+  size_t& heap_bytes;
+
+  void Insert(core::StringSet& set, std::string member) {
+    const size_t bytes = MemberBytes(member);
+    if (set.insert(std::move(member)).second) heap_bytes += bytes;
+  }
+
+  void Erase(core::StringSet& set, const std::string& member) {
+    if (set.erase(member) != 0) heap_bytes -= MemberBytes(member);
+  }
+
+  void ClearAll() {
+    string_value.reset();
+    set_members.clear();
+    set_removed_members.clear();
+    zset_members.clear();
+    zset_removed_members.clear();
+    hash_fields.clear();
+    hash_removed_fields.clear();
+    heap_bytes = 0;
+  }
 
   void operator()(const core::ops::StringSet& s) {
     // SET overrides any existing type. A SET over a cold-resident collection or
@@ -33,17 +77,13 @@ struct AbsorbVisitor {
     }
     type = CompactedState::DataType::kString;
     is_tombstone = false;
+    ClearAll();
     string_value = std::string(s.value);
+    heap_bytes = StringHeapBytes(string_value->size());
     abs_ttl_ms = s.abs_ttl_ms;
     // SET carries its own TTL inline; reset the trailing-op intent so a prior
     // EXPIRE/PERSIST in this window does not double-encode over the new value.
     ttl_intent = CompactedState::TtlIntent::kUnchanged;
-    set_members.clear();
-    set_removed_members.clear();
-    zset_members.clear();
-    zset_removed_members.clear();
-    hash_fields.clear();
-    hash_removed_fields.clear();
   }
 
   void operator()(const core::ops::Del& /*unused*/) {
@@ -55,14 +95,8 @@ struct AbsorbVisitor {
     is_tombstone = true;
     base_invalidation = CompactedState::BaseInvalidation::kDeleteAll;
     ttl_intent = CompactedState::TtlIntent::kUnchanged;
-    string_value.reset();
     abs_ttl_ms = 0;
-    set_members.clear();
-    set_removed_members.clear();
-    zset_members.clear();
-    zset_removed_members.clear();
-    hash_fields.clear();
-    hash_removed_fields.clear();
+    ClearAll();
   }
 
   void operator()(const core::ops::Expire& e) {
@@ -83,8 +117,8 @@ struct AbsorbVisitor {
     is_tombstone = false;
     for (auto m : s.members) {
       auto key = std::string(m);
-      set_removed_members.erase(key);
-      set_members.insert(std::move(key));
+      Erase(set_removed_members, key);
+      Insert(set_members, std::move(key));
     }
   }
 
@@ -95,8 +129,8 @@ struct AbsorbVisitor {
     type = CompactedState::DataType::kSet;
     for (auto m : s.members) {
       auto key = std::string(m);
-      set_members.erase(key);
-      set_removed_members.insert(std::move(key));
+      Erase(set_members, key);
+      Insert(set_removed_members, std::move(key));
     }
   }
 
@@ -108,8 +142,13 @@ struct AbsorbVisitor {
     is_tombstone = false;
     for (const auto& e : z.entries) {
       auto key = std::string(e.member);
-      zset_removed_members.erase(key);
-      zset_members[std::move(key)] = e.score;
+      Erase(zset_removed_members, key);
+      auto [it, inserted] = zset_members.try_emplace(std::move(key), e.score);
+      if (inserted) {
+        heap_bytes += ScoredBytes(it->first);
+      } else {
+        it->second = e.score;
+      }
     }
   }
 
@@ -120,8 +159,11 @@ struct AbsorbVisitor {
     type = CompactedState::DataType::kZset;
     for (auto m : z.members) {
       auto key = std::string(m);
-      zset_members.erase(key);
-      zset_removed_members.insert(std::move(key));
+      if (auto it = zset_members.find(key); it != zset_members.end()) {
+        heap_bytes -= ScoredBytes(it->first);
+        zset_members.erase(it);
+      }
+      Insert(zset_removed_members, std::move(key));
     }
   }
 
@@ -135,8 +177,11 @@ struct AbsorbVisitor {
     is_tombstone = false;
     for (const auto& fv : fields) {
       auto field = std::string(fv.field);
-      hash_removed_fields.erase(field);
-      hash_fields[std::move(field)] = std::string(fv.value);
+      Erase(hash_removed_fields, field);
+      auto [it, inserted] = hash_fields.try_emplace(std::move(field));
+      if (!inserted) heap_bytes -= FieldBytes(it->first, it->second);
+      it->second = std::string(fv.value);
+      heap_bytes += FieldBytes(it->first, it->second);
     }
   }
 
@@ -151,8 +196,11 @@ struct AbsorbVisitor {
     type = CompactedState::DataType::kHash;
     for (auto f : h.fields) {
       auto field = std::string(f);
-      hash_fields.erase(field);
-      hash_removed_fields.insert(std::move(field));
+      if (auto it = hash_fields.find(field); it != hash_fields.end()) {
+        heap_bytes -= FieldBytes(it->first, it->second);
+        hash_fields.erase(it);
+      }
+      Insert(hash_removed_fields, std::move(field));
     }
   }
 };
@@ -173,8 +221,17 @@ void CompactedState::Absorb(const core::ops::WriteOp& op) {
       .hash_removed_fields = hash_removed_fields_,
       .base_invalidation = base_invalidation_,
       .ttl_intent = ttl_intent_,
+      .heap_bytes = heap_bytes_,
   };
   std::visit(visitor, op);
+}
+
+void CompactedState::Replace(const core::ops::WriteOp& op) {
+  // Even with nothing absorbed: cold may still hold the key past its
+  // TTL, unswept. A SET absorbs as a replacement already, and cold's
+  // SET clears every other type and the old TTL itself.
+  if (!std::holds_alternative<core::ops::StringSet>(op)) Absorb(core::ops::Del{});
+  Absorb(op);
 }
 
 std::vector<core::ops::WriteOp> CompactedState::Emit() const {
@@ -277,32 +334,15 @@ std::vector<core::ops::WriteOp> CompactedState::Emit() const {
   return result;
 }
 
-size_t CompactedState::EstimatedBytes() const {
-  switch (type_) {
-    case DataType::kNone:
-      return 0;
-    case DataType::kString:
-      return string_value_.has_value() ? string_value_->size() : 0;
-    case DataType::kSet: {
-      size_t bytes = 0;
-      for (const auto& m : set_members_) bytes += m.size();
-      for (const auto& m : set_removed_members_) bytes += m.size();
-      return bytes;
-    }
-    case DataType::kZset: {
-      size_t bytes = 0;
-      for (const auto& [m, _] : zset_members_) bytes += m.size() + sizeof(double);
-      for (const auto& m : zset_removed_members_) bytes += m.size();
-      return bytes;
-    }
-    case DataType::kHash: {
-      size_t bytes = 0;
-      for (const auto& [f, v] : hash_fields_) bytes += f.size() + v.size();
-      for (const auto& f : hash_removed_fields_) bytes += f.size();
-      return bytes;
-    }
+size_t CompactedState::RecountBytesForTesting() const {
+  size_t bytes = string_value_.has_value() ? StringHeapBytes(string_value_->size()) : 0;
+  for (const core::StringSet* set :
+       {&set_members_, &set_removed_members_, &zset_removed_members_, &hash_removed_fields_}) {
+    for (const auto& m : *set) bytes += MemberBytes(m);
   }
-  return 0;
+  for (const auto& [m, _] : zset_members_) bytes += ScoredBytes(m);
+  for (const auto& [f, v] : hash_fields_) bytes += FieldBytes(f, v);
+  return bytes;
 }
 
 std::optional<std::string> CompactedState::HashFieldValue(std::string_view field) const {
@@ -332,6 +372,7 @@ void CompactedState::Reset() {
   is_tombstone_ = false;
   base_invalidation_ = BaseInvalidation::kNone;
   ttl_intent_ = TtlIntent::kUnchanged;
+  heap_bytes_ = 0;
 }
 
 }  // namespace abyss::consumer

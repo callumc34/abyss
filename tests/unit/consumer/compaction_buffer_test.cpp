@@ -4,13 +4,31 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "abyss/core/string_hash.h"
 #include "buffer_read.h"
 #include "test_clock.h"
+
+#ifdef __has_feature
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define ABYSS_TEST_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define ABYSS_TEST_SANITIZED 1
+#endif
+
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#elifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 namespace abyss::consumer {
 namespace {
@@ -165,6 +183,91 @@ TEST_F(CompactionBufferTest, BytesEstimateDecreasesOnDel) {
   auto after_del = buffer_.BytesEstimate();
 
   EXPECT_LT(after_del, before_del);
+}
+
+// What the allocator holds, process wide, where it can say and no
+// sanitizer's allocator stands in for it.
+#if defined(ABYSS_TEST_SANITIZED) || defined(_WIN32)
+constexpr bool kHeapStats = false;
+size_t HeapInUse() { return 0; }
+#elifdef __APPLE__
+constexpr bool kHeapStats = true;
+size_t HeapInUse() {
+  malloc_statistics_t stats{};
+  malloc_zone_statistics(nullptr, &stats);
+  return stats.size_in_use;
+}
+#elifdef __GLIBC__
+constexpr bool kHeapStats = true;
+size_t HeapInUse() {
+  // Blocks past the mmap threshold are counted apart.
+  const struct mallinfo2 info = mallinfo2();
+  return info.uordblks + info.hblkhd;
+}
+#else
+constexpr bool kHeapStats = false;
+size_t HeapInUse() { return 0; }
+#endif
+
+struct Shape {
+  std::string name;
+  std::function<WriteOp(const std::string& key)> op;
+};
+
+// The high water judges the buffer by its estimate, so it must track
+// what the allocator holds: 2x under, cold flushed 2x late.
+TEST(CompactionBufferMemoryTest, TheEstimateTracksTheAllocatorWithinAFifth) {
+  if (!kHeapStats) GTEST_SKIP() << "no allocator statistics here";
+  constexpr int kKeys = 20000;
+  const std::string value(100, 'v');
+  const std::string field_value(32, 'f');
+  const std::vector<std::string_view> members{"member:00", "member:01", "member:02", "member:03",
+                                              "member:04", "member:05", "member:06", "member:07"};
+  const std::vector<Shape> shapes{
+      {"string",
+       [&value](const std::string& key) { return WriteOp{StringSet{.key = key, .value = value}}; }},
+      {"short string",
+       [](const std::string& key) { return WriteOp{StringSet{.key = key, .value = "v"}}; }},
+      {"set",
+       [&members](const std::string& key) {
+         return WriteOp{SetAdd{.key = key, .members = members}};
+       }},
+      {"hash",
+       [&field_value](const std::string& key) {
+         return WriteOp{HashSet{.key = key,
+                                .fields = {{.field = "field:0", .value = field_value},
+                                           {.field = "field:1", .value = field_value},
+                                           {.field = "field:2", .value = field_value},
+                                           {.field = "field:3", .value = field_value}}}};
+       }},
+      {"zset",
+       [&members](const std::string& key) {
+         std::vector<core::ops::ZsetAdd::Entry> entries;
+         entries.reserve(members.size());
+         for (const auto member : members) entries.push_back({.score = 1.0, .member = member});
+         return WriteOp{core::ops::ZsetAdd{.key = key, .entries = std::move(entries)}};
+       }},
+  };
+  for (const Shape& shape : shapes) {
+    for (const bool long_keys : {false, true}) {
+      SCOPED_TRACE(shape.name + (long_keys ? ", long keys" : ", short keys"));
+      testing::TestClock clock;
+      CompactionBuffer buffer(FlushStrategy{}, clock.SteadyFn(), kTestSeed);
+      const size_t before = HeapInUse();
+      for (int i = 0; i < kKeys; ++i) {
+        const std::string key =
+            long_keys ? "buffer:key:" + std::string(13 - std::to_string(i).size(), '0') +
+                            std::to_string(i)
+                      : "k" + std::to_string(i);
+        buffer.Absorb(key, shape.op(key), kDefaultEviction, static_cast<core::SequenceId>(i) + 1,
+                      0);
+      }
+      const auto held = static_cast<double>(HeapInUse() - before);
+      const auto estimate = static_cast<double>(buffer.BytesEstimate());
+      EXPECT_NEAR(estimate / held, 1.0, 0.2)
+          << "estimate " << estimate / kKeys << " B/key, allocator " << held / kKeys << " B/key";
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

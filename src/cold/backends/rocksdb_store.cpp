@@ -102,6 +102,11 @@ rocksdb::ColumnFamilyOptions MakeCfOptions(const RocksdbConfig& config) {
   }
 
   rocksdb::BlockBasedTableOptions table_opts;
+  // ProbeString, and so a DEL, is cheap only while each SST's filter is
+  // in memory: held by its table reader (cache_index_and_filter_blocks
+  // false) with every table open (max_open_files -1), both defaults.
+  // Change either and a probe can need I/O, so is kMaybe: still
+  // correct, but the DEL writes a tombstone.
   table_opts.filter_policy.reset(
       rocksdb::NewBloomFilterPolicy(static_cast<double>(config.bloom_filter_bits_per_key)));
   cf_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
@@ -112,6 +117,14 @@ rocksdb::ColumnFamilyOptions MakeCfOptions(const RocksdbConfig& config) {
 rocksdb::Slice ToSlice(std::string_view sv) { return {sv.data(), sv.size()}; }
 
 std::string_view ToSv(const rocksdb::Slice& s) { return {s.data(), s.size()}; }
+
+// A presence probe of a record a write usually finds absent, which the
+// bloom filter answers: kept out of the block cache.
+rocksdb::ReadOptions ProbeOptions() {
+  rocksdb::ReadOptions ro;
+  ro.fill_cache = false;
+  return ro;
+}
 
 // Computes the exclusive upper bound for a byte-prefix scan.
 std::string LexicographicSuccessor(std::string_view prefix) {
@@ -248,6 +261,16 @@ struct RocksdbStore::Impl : public TtlScannerBackend {
   core::Result<std::optional<fmt::MetaValue>> ReadMetaForWrite(rocksdb::WriteBatchWithIndex& wb,
                                                                uint8_t inner_type,
                                                                std::string_view key) const;
+  core::Result<std::optional<fmt::MetaValue>> ReadMetaForWrite(
+      rocksdb::WriteBatchWithIndex& wb, uint8_t inner_type, std::string_view key,
+      const rocksdb::ReadOptions& ro) const;
+  // Whether the string record `string_key` exists, from the batch,
+  // memtables, bloom filters and cache, never a data block from disk: a
+  // DEL must not read the value it deletes. kMaybe when only a disk read
+  // could tell. Unlike KeyMayExist, an error is not taken as absent.
+  enum class Probed : uint8_t { kAbsent, kMaybe, kPresent };
+  core::Result<Probed> ProbeString(rocksdb::WriteBatchWithIndex& wb,
+                                   const std::string& string_key) const;
 
   // Applies `delta` to the cardinality of (inner_type, key)'s meta record.
   core::Result<void> ApplyMetaDelta(rocksdb::WriteBatchWithIndex& wb, uint8_t inner_type,
@@ -549,6 +572,26 @@ core::Result<SweepReport> RocksdbStore::RunScannerTickForTesting() {
 TtlScanner::Snapshot RocksdbStore::ScannerSnapshot() const {
   if (impl_->ttl_scanner == nullptr) return TtlScanner::Snapshot{};
   return impl_->ttl_scanner->CurrentSnapshot();
+}
+
+uint64_t RocksdbStore::MemtableEntriesForTesting() const {
+  uint64_t active = 0;
+  uint64_t immutable = 0;
+  impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.num-entries-active-mem-table",
+                            &active);
+  impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.num-entries-imm-mem-tables",
+                            &immutable);
+  return active + immutable;
+}
+
+uint64_t RocksdbStore::MemtableDeletesForTesting() const {
+  uint64_t active = 0;
+  uint64_t immutable = 0;
+  impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.num-deletes-active-mem-table",
+                            &active);
+  impl_->db->GetIntProperty(impl_->default_cf.get(), "rocksdb.num-deletes-imm-mem-tables",
+                            &immutable);
+  return active + immutable;
 }
 
 std::vector<RocksdbStore::RawRecord> RocksdbStore::RecordsForTesting() const {
@@ -857,13 +900,21 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::StringSet& op,
 
 core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Del& op,
                                              rocksdb::WriteBatchWithIndex& wb) const {
+  // Probed first, as ClearOtherTypeSlices does: a DEL ahead of a created
+  // key, the common case, then writes no tombstone.
+  const rocksdb::ReadOptions probe = ProbeOptions();
   for (auto key : op.keys) {
     const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
-    auto s = wb.Delete(default_cf.get(), string_key);
-    if (!s.ok()) return std::unexpected(FromStatus(s, "DEL string"));
+    auto probed = ProbeString(wb, string_key);
+    if (!probed.has_value()) return std::unexpected(probed.error());
+    // Unsure is deleted: a needless tombstone costs less than a read.
+    if (*probed != Probed::kAbsent) {
+      auto s = wb.Delete(default_cf.get(), string_key);
+      if (!s.ok()) return std::unexpected(FromStatus(s, "DEL string"));
+    }
 
     for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
-      auto meta = ReadMetaForWrite(wb, inner_type, key);
+      auto meta = ReadMetaForWrite(wb, inner_type, key, probe);
       if (!meta.has_value()) return std::unexpected(meta.error());
       if (!meta->has_value()) continue;
       auto r = IterateAndDeleteCollection(wb, inner_type, key);
@@ -1112,14 +1163,35 @@ core::Result<void> RocksdbStore::Impl::Apply(const core::ops::Persist& op,
 
 core::Result<std::optional<fmt::MetaValue>> RocksdbStore::Impl::ReadMetaForWrite(
     rocksdb::WriteBatchWithIndex& wb, uint8_t inner_type, std::string_view key) const {
+  return ReadMetaForWrite(wb, inner_type, key, rocksdb::ReadOptions());
+}
+
+core::Result<std::optional<fmt::MetaValue>> RocksdbStore::Impl::ReadMetaForWrite(
+    rocksdb::WriteBatchWithIndex& wb, uint8_t inner_type, std::string_view key,
+    const rocksdb::ReadOptions& ro) const {
   const auto encoded = fmt::EncodeMetaKey(inner_type, key, config.shard_count);
   std::string raw;
-  auto s = wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), encoded, &raw);
+  auto s = wb.GetFromBatchAndDB(db.get(), ro, default_cf.get(), encoded, &raw);
   if (s.IsNotFound()) return std::optional<fmt::MetaValue>{};
   if (!s.ok()) return std::unexpected(FromStatus(s, "read meta (batch)"));
   auto decoded = fmt::DecodeMetaValue(raw);
   if (!decoded.has_value()) return std::unexpected(decoded.error());
   return std::optional<fmt::MetaValue>{*decoded};
+}
+
+core::Result<RocksdbStore::Impl::Probed> RocksdbStore::Impl::ProbeString(
+    rocksdb::WriteBatchWithIndex& wb, const std::string& string_key) const {
+  // The batch answers first, a delete in it included; then memtables
+  // and cached blocks, where a key a bloom filter cannot rule out, in an
+  // uncached block, is Incomplete rather than read.
+  rocksdb::ReadOptions ro = ProbeOptions();
+  ro.read_tier = rocksdb::kBlockCacheTier;
+  rocksdb::PinnableSlice found;
+  const auto s = wb.GetFromBatchAndDB(db.get(), ro, default_cf.get(), string_key, &found);
+  if (s.ok()) return Probed::kPresent;
+  if (s.IsNotFound()) return Probed::kAbsent;
+  if (s.IsIncomplete()) return Probed::kMaybe;
+  return std::unexpected(FromStatus(s, "string probe"));
 }
 
 core::Result<void> RocksdbStore::Impl::ApplyMetaDelta(rocksdb::WriteBatchWithIndex& wb,
@@ -1205,23 +1277,31 @@ core::Result<bool> RocksdbStore::Impl::ClearOtherTypeSlices(rocksdb::WriteBatchW
   // common type-establish path write-free (no tombstone pollution of the LSM)
   // and only runs the full collection sweep on the rare cross-window change.
   bool cleared = false;
+  const rocksdb::ReadOptions probe = ProbeOptions();
   if (kept_type != fmt::kTypeString) {
     const auto string_key = fmt::EncodeStringKey(key, config.shard_count);
-    std::string raw;
-    auto s =
-        wb.GetFromBatchAndDB(db.get(), rocksdb::ReadOptions(), default_cf.get(), string_key, &raw);
-    if (s.ok()) {
+    auto probed = ProbeString(wb, string_key);
+    if (!probed.has_value()) return std::unexpected(probed.error());
+    if (*probed == Probed::kMaybe) {
+      // Only now read it: a clear is reported as a conflict, so it must
+      // be real, and a foreign string here is rare.
+      std::string raw;
+      auto s = wb.GetFromBatchAndDB(db.get(), probe, default_cf.get(), string_key, &raw);
+      if (!s.ok() && !s.IsNotFound()) {
+        return std::unexpected(FromStatus(s, "clear other-type string probe"));
+      }
+      probed = s.ok() ? Probed::kPresent : Probed::kAbsent;
+    }
+    if (*probed == Probed::kPresent) {
       auto del = wb.Delete(default_cf.get(), string_key);
       if (!del.ok()) return std::unexpected(FromStatus(del, "clear other-type string slice"));
       cleared = true;
-    } else if (!s.IsNotFound()) {
-      return std::unexpected(FromStatus(s, "clear other-type string probe"));
     }
   }
 
   for (auto inner_type : {fmt::kTypeHashField, fmt::kTypeSetMember, fmt::kTypeZsetMember}) {
     if (inner_type == kept_type) continue;
-    auto meta = ReadMetaForWrite(wb, inner_type, key);
+    auto meta = ReadMetaForWrite(wb, inner_type, key, probe);
     if (!meta.has_value()) return std::unexpected(meta.error());
     if (!meta->has_value()) continue;
     auto r = IterateAndDeleteCollection(wb, inner_type, key);

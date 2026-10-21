@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 
+#include "abyss/consumer/heap_bytes.h"
 #include "abyss/core/fatal.h"
 #include "abyss/core/thread_annotations.h"
 
@@ -14,11 +15,15 @@ namespace abyss::consumer {
 
 namespace {
 
-// Approximate per-entry overhead.
-constexpr size_t kEntryOverhead = 128;
+// A buffered key's fixed cost: its map node, holding the key and the
+// entry, its bucket, and its slot in the pending order.
+constexpr size_t kEntryFixedBytes =
+    AllocBytes(kHashNodeLinks + sizeof(std::string) + sizeof(BufferEntry)) + sizeof(void*) +
+    sizeof(BufferEntry*);
 
 size_t EntryBytes(const BufferEntry& entry) {
-  return entry.key.size() + kEntryOverhead + entry.state.EstimatedBytes();
+  // The key is held twice: the map's, and the entry's own.
+  return kEntryFixedBytes + (2 * StringHeapBytes(entry.key.size())) + entry.state.EstimatedBytes();
 }
 
 }  // namespace
@@ -34,7 +39,8 @@ CompactionBuffer::CompactionBuffer(core::SteadyClockFn clock)
 
 void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& op,
                               core::EvictionTTL eviction, core::SequenceId seq,
-                              uint64_t appended_at_ms) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
+                              uint64_t appended_at_ms,
+                              bool replaces_state) ABYSS_NO_THREAD_SAFETY_ANALYSIS {
   ABYSS_DCHECK(seq >= core::kFirstSeq, "absorbed an effect at seq 0, which names no entry");
   const std::unique_lock lock(mutex_);
   // A selected batch is applied by reference; changing it would let
@@ -73,7 +79,11 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
 
   entry.last_seq = std::max(entry.last_seq, seq);
   entry.eviction = eviction;
-  entry.state.Absorb(op);
+  if (replaces_state) {
+    entry.state.Replace(op);
+  } else {
+    entry.state.Absorb(op);
+  }
   entry.last_modified = clock_();
   ++entry.write_count;
 
@@ -95,7 +105,7 @@ void CompactionBuffer::Absorb(const std::string& key, const core::ops::WriteOp& 
 
 void CompactionBuffer::PushHeapEntry(BufferEntry& entry, core::SteadyTime scheduled) {
   entry.scheduled_in_heap_ = scheduled;
-  heap_overhead_bytes_ += kHeapEntryOverhead + entry.key.size();
+  heap_overhead_bytes_ += kHeapEntryOverhead + StringHeapBytes(entry.key.size());
   flush_heap_.push({scheduled, entry.key});
 }
 
@@ -160,7 +170,7 @@ FlushBatch CompactionBuffer::FlushReady(core::SteadyTime now,
     flush_heap_.pop();
     // Charge the pop against the heap budget regardless of whether the entry is
     // accepted below — every push had a matching charge (COLDC-4).
-    heap_overhead_bytes_ -= kHeapEntryOverhead + heap_key.size();
+    heap_overhead_bytes_ -= kHeapEntryOverhead + StringHeapBytes(heap_key.size());
 
     BufferEntry* entry = SelectLocked(heap_key, heap_time);
     if (entry != nullptr) result.emplace_back(*entry);
@@ -183,7 +193,7 @@ FlushBatch CompactionBuffer::FlushOldest(size_t target_bytes,
     auto heap_time = flush_heap_.top().scheduled_time;
     auto heap_key = flush_heap_.top().key;
     flush_heap_.pop();
-    heap_overhead_bytes_ -= kHeapEntryOverhead + heap_key.size();
+    heap_overhead_bytes_ -= kHeapEntryOverhead + StringHeapBytes(heap_key.size());
 
     BufferEntry* entry = SelectLocked(heap_key, heap_time);
     if (entry == nullptr) continue;
