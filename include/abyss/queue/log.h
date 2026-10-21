@@ -97,15 +97,21 @@ class Log {
   // changed, when the frame needs a segment that is not ready yet: wait
   // with WaitForSpare outside any lock and retry.
   core::Result<Reservation> Reserve(uint32_t size);
+  // Whether Reserve(size) would succeed now. Exact only while no one
+  // else can reserve, as when every stream of the log is locked.
+  bool CanReserve(uint32_t size) const;
   // False at the deadline, or once the log is shutting down.
   bool WaitForSpare(core::SteadyTime deadline);
 
+  // Commits the frame EncodeEntryInto wrote at the reservation's dst,
+  // whose body is `len` bytes: seals its CRC for the reservation's gen
+  // and salt, stores the commit word with release ordering, then
+  // advances the filled prefix past every frame already filled. A
+  // batch reserves once and commits each frame through its own slice
+  // {pos + off, size, gen, salt, dst + off} of the reservation.
+  void CommitInPlace(const Reservation& reservation, uint32_t len);
   // Copies `frame` (one EncodeEntry output, sized to the reservation)
-  // into the log: everything after the commit word, the CRC sealed for
-  // the reservation's gen, then the commit word with release ordering;
-  // then advances the filled prefix past every frame already filled.
-  // A batch reserves once and commits each frame through its own slice
-  // {pos + off, size, gen, dst + off} of the reservation.
+  // to dst after its commit word, then CommitInPlace.
   void Commit(const Reservation& reservation, std::span<const std::byte> frame);
   // Spins, then yields, until the filled prefix reaches `end`.
   void AwaitFilled(LogPosition end) const;
@@ -192,6 +198,10 @@ class Log {
   // Open fails right after `step`, leaving the disk as a crash would.
   enum class OpenStep : uint8_t { kNone, kPastEndRenamed, kTailSynced };
   static void CrashOpenAfterForTesting(OpenStep step);
+  // Called after each directory sync any log makes; an error it
+  // returns is the sync's. Null for none.
+  static void SetDirSyncHookForTesting(
+      std::function<core::Result<void>(const std::filesystem::path&)> hook);
 
  private:
   explicit Log(LogConfig config);

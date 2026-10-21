@@ -1,5 +1,6 @@
 add_library(abyss_perf_probe_common STATIC
   common.cpp
+  workload_shape.cpp
 )
 add_library(abyss::perf_probe_common ALIAS abyss_perf_probe_common)
 

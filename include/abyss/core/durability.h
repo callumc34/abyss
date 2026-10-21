@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>
 #include <optional>
 #include <string_view>
 
@@ -16,5 +17,7 @@ enum class Durability : uint8_t { kProcessCrash, kPowerLoss };
 // spell it.
 std::string_view DurabilityName(Durability durability) noexcept;
 std::optional<Durability> ParseDurability(std::string_view name) noexcept;
+// For gtest, beside the enum so every test prints it alike.
+void PrintTo(Durability durability, std::ostream* os);
 
 }  // namespace abyss::core

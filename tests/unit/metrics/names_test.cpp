@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <set>
 #include <string_view>
 
@@ -15,6 +16,9 @@ TEST(Names, LabelKeyStringSpellings) {
   EXPECT_EQ(ToStringView(LabelKey::kReason), "reason");
   EXPECT_EQ(ToStringView(LabelKey::kStatus), "status");
   EXPECT_EQ(ToStringView(LabelKey::kOp), "op");
+  EXPECT_EQ(ToStringView(LabelKey::kOutcome), "outcome");
+  EXPECT_EQ(ToStringView(LabelKey::kPass), "pass");
+  EXPECT_EQ(ToStringView(LabelKey::kPhase), "phase");
 }
 
 TEST(Names, TierEnumSpellings) {
@@ -34,6 +38,47 @@ TEST(Names, FlushReasonSpellings) {
   EXPECT_EQ(ToStringView(FlushReason::kPressure), "pressure");
 }
 
+TEST(Names, RedecideReasonSpellings) {
+  EXPECT_EQ(ToStringView(RedecideReason::kAdmission), "admission");
+  EXPECT_EQ(ToStringView(RedecideReason::kSpare), "spare");
+  EXPECT_EQ(ToStringView(RedecideReason::kLoad), "load");
+  EXPECT_EQ(ToStringView(RedecideReason::kBackpressure), "backpressure");
+  static_assert(LabelKeyOf<RedecideReason>::value == LabelKey::kReason);
+}
+
+TEST(Names, FillOutcomeSpellings) {
+  EXPECT_EQ(ToStringView(FillOutcome::kInstalled), "installed");
+  EXPECT_EQ(ToStringView(FillOutcome::kDiscarded), "discarded");
+  EXPECT_EQ(ToStringView(FillOutcome::kSkippedBackpressure), "skipped_backpressure");
+  EXPECT_EQ(ToStringView(FillOutcome::kSkippedSize), "skipped_size");
+  EXPECT_EQ(ToStringView(FillOutcome::kSkippedEvictCap), "skipped_evict_cap");
+  EXPECT_EQ(ToStringView(FillOutcome::kFailed), "failed");
+  static_assert(LabelKeyOf<FillOutcome>::value == LabelKey::kOutcome);
+}
+
+TEST(Names, MaintenancePassSpellings) {
+  EXPECT_EQ(ToStringView(MaintenancePass::kTombstones), "tombstones");
+  EXPECT_EQ(ToStringView(MaintenancePass::kParked), "parked");
+  EXPECT_EQ(ToStringView(MaintenancePass::kTtl), "ttl");
+  EXPECT_EQ(ToStringView(MaintenancePass::kDeadline), "deadline");
+  EXPECT_EQ(ToStringView(MaintenancePass::kMemory), "memory");
+  static_assert(LabelKeyOf<MaintenancePass>::value == LabelKey::kPass);
+}
+
+TEST(Names, WritePhaseSpellings) {
+  EXPECT_EQ(ToStringView(WritePhase::kAdmit), "admit");
+  EXPECT_EQ(ToStringView(WritePhase::kLockWait), "lock_wait");
+  EXPECT_EQ(ToStringView(WritePhase::kDecide), "decide");
+  EXPECT_EQ(ToStringView(WritePhase::kLoad), "load");
+  EXPECT_EQ(ToStringView(WritePhase::kEntries), "entries");
+  EXPECT_EQ(ToStringView(WritePhase::kReserve), "reserve");
+  EXPECT_EQ(ToStringView(WritePhase::kApply), "apply");
+  EXPECT_EQ(ToStringView(WritePhase::kComplete), "complete");
+  EXPECT_EQ(ToStringView(WritePhase::kDurable), "durable");
+  static_assert(static_cast<size_t>(WritePhase::kDurable) + 1 == kWritePhaseCount);
+  static_assert(LabelKeyOf<WritePhase>::value == LabelKey::kPhase);
+}
+
 TEST(Names, LabelKeyOfMapping) {
   static_assert(LabelKeyOf<Tier>::value == LabelKey::kTier);
   static_assert(LabelKeyOf<FlushStatus>::value == LabelKey::kStatus);
@@ -44,9 +89,6 @@ TEST(Names, LabelKeyOfMapping) {
 
 TEST(Names, CatalogueNamesAreUnique) {
   constexpr std::array kAllNames = {
-      names::kHotOpDurationSeconds.name,
-      names::kColdOpDurationSeconds.name,
-      names::kBufferOpDurationSeconds.name,
       names::kRespRequestDurationSeconds.name,
       names::kWalFlushDurationSeconds.name,
       names::kWalFlushBatchEntries.name,
@@ -55,6 +97,7 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kWalUnflushedBytes.name,
       names::kWalDurabilityLagSeconds.name,
       names::kWalFillWaitSeconds.name,
+      names::kWalPublishWaitSeconds.name,
       names::kWalSpareSegments.name,
       names::kWalFreeSegments.name,
       names::kWalSegmentsGrownTotal.name,
@@ -65,13 +108,18 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kWalScanBytesTotal.name,
       names::kQueueOffsetPersistDurationSeconds.name,
       names::kColdFlushBatchSize.name,
-      names::kHotConsumerLagEntries.name,
+      names::kColdDurabilityWaitsTotal.name,
       names::kColdConsumerLagEntries.name,
       names::kColdBufferOldestEntryAgeSeconds.name,
-      names::kHotConsumerSeq.name,
-      names::kColdConsumerSeq.name,
       names::kHotMemoryBytes.name,
       names::kHotKeys.name,
+      names::kHotStubEntries.name,
+      names::kHotNegativeEntries.name,
+      names::kHotFillsTotal.name,
+      names::kHotUnevictableBytes.name,
+      names::kHotMaintenanceHoldSeconds.name,
+      names::kHotExpirySweepSeconds.name,
+      names::kHotRehashSeconds.name,
       names::kColdDiskBytes.name,
       names::kColdKeys.name,
       names::kQueueDepth.name,
@@ -84,10 +132,25 @@ TEST(Names, CatalogueNamesAreUnique) {
       names::kColdFlushTotal.name,
       names::kColdFlushReasonTotal.name,
       names::kTtlExpiredTotal.name,
+      names::kColdApplyTypeConflictsTotal.name,
       names::kEvictedTotal.name,
-      names::kPromotionsTotal.name,
+      names::kHotStubDropsTotal.name,
+      names::kHotLoadDiscardsTotal.name,
+      names::kHotBackpressureWaitsTotal.name,
+      names::kHotBackpressureRejectionsTotal.name,
+      names::kSequencerLockedCopyBytesTotal.name,
+      names::kSequencerRedecidesTotal.name,
+      names::kSequencerLockHoldSeconds.name,
+      names::kSequencerPhaseSeconds.name,
       names::kQueueOffsetPersistFailuresTotal.name,
       names::kQueueReadOutOfRangeTotal.name,
+      names::kRecoveryPhase.name,
+      names::kRecoveryColdEntriesReplayed.name,
+      names::kRecoveryColdEntriesTarget.name,
+      names::kRecoveryHotEntriesReplayed.name,
+      names::kRecoveryHotEntriesTarget.name,
+      names::kRecoveryHotSkippedFramesTotal.name,
+      names::kRecoveryDurationSeconds.name,
   };
   std::set<std::string_view> seen;
   for (const auto name : kAllNames) {

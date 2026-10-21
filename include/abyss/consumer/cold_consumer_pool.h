@@ -9,11 +9,8 @@
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
-#include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
 namespace abyss::consumer {
@@ -35,7 +32,6 @@ class ColdConsumerPool : public CompactionBufferRouter {
     uint64_t entries_expired_abs_ttl = 0;
     uint64_t apply_failures = 0;
     uint64_t retry_attempts = 0;
-    uint64_t durability_waits_timed_out = 0;
     uint64_t parse_failures = 0;
     uint32_t shards_in_aggressive_mode = 0;
     // Max over shards, not a sum: the worst-lagging shard is the one racing the
@@ -44,20 +40,15 @@ class ColdConsumerPool : public CompactionBufferRouter {
   };
 
   ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
-                   const core::EvictionPolicy& eviction_policy, core::ConsumerRpc& rpc,
-                   const core::SteadyClockFn& steady_clock = core::DefaultSteadyClock,
-                   const core::WallClockFn& wall_clock = core::DefaultWallClock);
+                   const core::EvictionPolicy& eviction_policy,
+                   const core::SteadyClockFn& steady_clock = core::DefaultSteadyClock);
   ~ColdConsumerPool() override;
   ColdConsumerPool(const ColdConsumerPool&) = delete;
   ColdConsumerPool& operator=(const ColdConsumerPool&) = delete;
   ColdConsumerPool(ColdConsumerPool&&) = delete;
   ColdConsumerPool& operator=(ColdConsumerPool&&) = delete;
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override;
-  core::Result<core::RespValue> Read(std::string_view key) const override;
-  BufferKeyPresence Probe(std::string_view key) const override;
-  HashOverlay HashOverlayFor(std::string_view key) const override;
+  std::optional<CompactedState> Snapshot(core::ShardId shard, std::string_view key) const override;
   bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                          std::chrono::milliseconds timeout) override;
 
@@ -78,6 +69,9 @@ class ColdConsumerPool : public CompactionBufferRouter {
 
   ColdConsumer& ConsumerFor(core::ShardId shard) { return *consumers_[shard]; }
   const ColdConsumer& ConsumerFor(core::ShardId shard) const { return *consumers_[shard]; }
+
+  // `shard`'s log clock, by which cold expires its keys. Any thread.
+  uint64_t LogClockMs(core::ShardId shard) const { return consumers_[shard]->LogClockMs(); }
 
   AggregateMetrics Snapshot() const;
 

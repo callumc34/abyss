@@ -8,9 +8,11 @@
 #include <chrono>
 #include <ctime>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <random>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "scheduler.h"
@@ -56,6 +58,7 @@ struct WorkerState {
   std::map<std::string, uint64_t> counts;
   std::map<std::string, uint64_t> errors;
   Histogram send_lag;
+  Histogram backlog;
   std::chrono::steady_clock::time_point last_done{};
   std::chrono::nanoseconds cpu{0};
 };
@@ -118,6 +121,7 @@ RunLoopResult MergeWorkerStates(const OpSelector& selector, std::vector<WorkerSt
       result.per_op_errors[name] += state.errors[name];
     }
     result.send_lag.Merge(state.send_lag);
+    result.backlog.Merge(state.backlog);
     result.driver_cpu += state.cpu;
     end = std::max(end, state.last_done);
   }
@@ -133,6 +137,29 @@ void TightenTimerSlack() {
   prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
 #endif
 }
+
+// Runs `hook` on its own thread at `at`, joined on destruction.
+class MeasureStart {
+ public:
+  MeasureStart(const std::function<void()>& hook, std::chrono::steady_clock::time_point at) {
+    if (hook) {
+      thread_ = std::thread([&hook, at] {
+        std::this_thread::sleep_until(at);
+        hook();
+      });
+    }
+  }
+  ~MeasureStart() {
+    if (thread_.joinable()) thread_.join();
+  }
+  MeasureStart(const MeasureStart&) = delete;
+  MeasureStart& operator=(const MeasureStart&) = delete;
+  MeasureStart(MeasureStart&&) = delete;
+  MeasureStart& operator=(MeasureStart&&) = delete;
+
+ private:
+  std::thread thread_;
+};
 
 void RecordOutcome(WorkerState& state, const std::string& op_name, bool ok,
                    std::chrono::steady_clock::time_point reference,
@@ -212,6 +239,7 @@ RunLoopResult RunLoop(const RunLoopConfig& config, const OpFn& op) {
 
   const OpSelector selector = BuildSelector(config.mix);
   auto worker_states = MakeWorkerStates(static_cast<size_t>(config.workers), selector);
+  const MeasureStart measure_start(config.at_measure_start, warmup_end);
 
   std::vector<std::thread> threads;
   threads.reserve(static_cast<size_t>(config.workers));
@@ -231,6 +259,9 @@ RunLoopResult RunLoop(const RunLoopConfig& config, const OpFn& op) {
       auto key_dist = MakeKeyDistribution(kd, config.key_count);
       std::mt19937_64 op_rng{kd.seed ^ 0x9E3779B97F4A7C15ULL};
       std::uniform_real_distribution<double> op_uniform{0.0, 1.0};
+      // A slot that passed before the previous op ended waited on the
+      // system under test, not on the driver.
+      Clock::time_point previous_done = start_time;
 
       for (uint64_t op_index = 0;; ++op_index) {
         Clock::time_point intended_send_time = start_time;
@@ -251,11 +282,18 @@ RunLoopResult RunLoop(const RunLoopConfig& config, const OpFn& op) {
         const bool ok = op(w, op_name, key_index);
         const auto t_done = Clock::now();
 
+        const auto busy_until = std::exchange(previous_done, t_done);
+
         // Every slot is issued, so a late op carries its own wait.
         const auto reference = open_loop ? intended_send_time : t_send;
         if (reference < warmup_end) continue;
         RecordOutcome(state, op_name, ok, reference, t_done);
-        if (open_loop) state.send_lag.Record(ElapsedNs(intended_send_time, t_send));
+        if (!open_loop) continue;
+        if (busy_until > intended_send_time) {
+          state.backlog.Record(ElapsedNs(intended_send_time, busy_until));
+        } else {
+          state.send_lag.Record(ElapsedNs(intended_send_time, t_send));
+        }
       }
     });
   }
@@ -277,6 +315,7 @@ RunLoopResult RunPipelinedLoop(const RunLoopConfig& config, int pipeline_depth, 
 
   const OpSelector selector = BuildSelector(config.mix);
   auto worker_states = MakeWorkerStates(connections.size(), selector);
+  const MeasureStart measure_start(config.at_measure_start, warmup_end);
 
   std::vector<std::thread> threads;
   threads.reserve(connections.size());
@@ -310,6 +349,9 @@ RunLoopResult RunPipelinedLoop(const RunLoopConfig& config, int pipeline_depth, 
       std::vector<Clock::time_point> slots_sent;
       uint64_t next_index = 0;
       bool sending = true;
+      // When a full window last gained room: a slot that passed before
+      // then waited on the server, not on the driver.
+      Clock::time_point room_since = start_time;
 
       while (true) {
         const auto now = Clock::now();
@@ -325,7 +367,13 @@ RunLoopResult RunPipelinedLoop(const RunLoopConfig& config, int pipeline_depth, 
               break;
             }
             if (reference > now) break;
-            if (slot_of(next_index) == next_index) slots_sent.push_back(reference);
+            if (slot_of(next_index) == next_index) {
+              if (room_since <= reference) {
+                slots_sent.push_back(reference);
+              } else if (reference >= warmup_end) {
+                state.backlog.Record(ElapsedNs(reference, room_since));
+              }
+            }
           } else if (now >= run_end) {
             sending = false;
             break;
@@ -358,6 +406,7 @@ RunLoopResult RunPipelinedLoop(const RunLoopConfig& config, int pipeline_depth, 
         if (status == PipelinedConnection::Await::kTimeout) continue;
 
         const auto t_done = Clock::now();
+        if (in_flight.size() == depth) room_since = t_done;
         const InFlight done = in_flight.front();
         in_flight.pop_front();
         if (done.reference < warmup_end) continue;

@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "abyss/core/ops.h"
+#include "abyss/core/queue_entry.h"
 #include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
@@ -23,11 +24,25 @@ struct MemoryStats {
   // Configured memory budget; 0 means unlimited. Lets the exporter publish the
   // ceiling alongside usage (HOT-1 observability).
   uint64_t max_bytes = 0;
+  // Stub bytes are part of used_bytes.
+  uint64_t stub_entries = 0;
+  uint64_t stub_bytes = 0;
+  uint64_t stub_drops = 0;
+  // Keys held as loaded absent.
+  uint64_t negative_entries = 0;
+  uint64_t load_discards = 0;
+  // Live bytes held for cold: every live byte once an LRU walk found
+  // nothing to evict, else those of keys due but not yet drained.
+  uint64_t unevictable_bytes = 0;
+  // The TTL index's own bytes, part of used_bytes.
+  uint64_t ttl_index_bytes = 0;
+  // Over the backpressure ratio of max_bytes after an eviction pass.
+  bool backpressured = false;
 };
 
 // Existence verdict for a key in the hot tier. kTombstoned is an authoritative
 // delete the caller must honour; kAbsent means hot is unaware and the caller
-// should fall through. Mirrors consumer::BufferKeyPresence.
+// should fall through.
 enum class HotKeyPresence : uint8_t { kAbsent, kTombstoned, kPresent };
 
 class HotStore : public Reader {
@@ -54,16 +69,19 @@ class HotStore : public Reader {
   // Existence probe distinguishing a recent-delete tombstone from a true miss.
   virtual HotKeyPresence Probe(std::string_view key) = 0;
 
-  // Suppresses memory-pressure eviction while a consumer replays the queue, so
-  // the rebuilt hot view does not depend on memory timing (deterministic
-  // replay, invariant 4). Default no-op for stores without a memory budget.
-  virtual void SetReplayMode(bool /*replaying*/) {}
-
   virtual Result<MemoryStats> Stats() = 0;
-  // Clears one shard. A Flush reaches every shard's stream, and each
-  // shard's consumer wipes only its own, so one shard's Flush never
-  // drops another's later writes.
-  virtual Result<void> Wipe(ShardId shard) = 0;
+  // Clears one shard for a Flush at `seq`. A Flush reaches every shard's
+  // stream, and each shard's consumer wipes only its own, so one shard's
+  // Flush never drops another's later writes.
+  virtual Result<void> Wipe(ShardId shard, SequenceId seq) = 0;
+  // Applies a logged Write as decided, judging no TTL, or a Flush, as
+  // recovery replays it; the entry's appended_at raises the shard's
+  // clock. A Write not flagged replaces_state applies only to a key hot
+  // holds, an entry or a tombstone, so replay never builds a key from
+  // part of its history; nullopt when it did not apply.
+  virtual std::optional<RespValue> ApplyLogged(ShardId shard, QueueEntry& entry) = 0;
+  // Raises the shard's clock to `at`, for a logged entry not applied.
+  virtual void RaiseAppendedAt(ShardId shard, WallTime at) = 0;
 };
 
 }  // namespace abyss::core

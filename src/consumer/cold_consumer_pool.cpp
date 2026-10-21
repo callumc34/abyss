@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/log/log.h"
 
@@ -14,15 +15,14 @@ namespace abyss::consumer {
 
 ColdConsumerPool::ColdConsumerPool(core::Queue& queue, core::ColdStore& cold_store, Config config,
                                    const core::EvictionPolicy& eviction_policy,
-                                   core::ConsumerRpc& rpc, const core::SteadyClockFn& steady_clock,
-                                   const core::WallClockFn& wall_clock) {
+                                   const core::SteadyClockFn& steady_clock) {
   if (config.shard_count == 0) {
     throw std::invalid_argument("ColdConsumerPool requires shard_count >= 1");
   }
   consumers_.reserve(config.shard_count);
   for (uint32_t shard = 0; shard < config.shard_count; ++shard) {
-    consumers_.push_back(std::make_unique<ColdConsumer>(
-        queue, cold_store, shard, config.consumer, eviction_policy, rpc, steady_clock, wall_clock));
+    consumers_.push_back(std::make_unique<ColdConsumer>(queue, cold_store, shard, config.consumer,
+                                                        eviction_policy, steady_clock));
   }
 }
 
@@ -67,48 +67,19 @@ bool ColdConsumerPool::IsRunning() const {
   return false;
 }
 
-core::Result<core::RespValue> ColdConsumerPool::Exec(const core::ops::ReadOp& op,
-                                                     std::optional<core::Duration> /*deadline*/) {
-  if (const auto* exists = std::get_if<core::ops::Exists>(&op)) {
-    int64_t total = 0;
-    for (auto key : exists->keys) {
-      auto sub = consumers_[ShardForKey(key)]->Buffer().Exec(
-          core::ops::ReadOp{core::ops::Exists{.keys = {key}}});
-      if (!sub.has_value()) {
-        if (sub.error().code() == core::ErrorCode::kNotFound) continue;
-        return std::unexpected(sub.error());
-      }
-      total += sub->AsInteger();
-    }
-    return core::RespValue::Integer(total);
+std::optional<CompactedState> ColdConsumerPool::Snapshot(core::ShardId shard,
+                                                         std::string_view key) const {
+  if (shard >= consumers_.size() || ShardForKey(key) != shard) {
+    core::Fatal("buffer snapshot asked of a shard that does not own the key");
   }
-  const auto key = core::ops::PrimaryKey(op);
-  if (key.empty()) {
-    return std::unexpected(core::Error(core::ErrorCode::kInternal, "empty primary key"));
-  }
-  return consumers_[ShardForKey(key)]->Buffer().Exec(op);
-}
-
-core::Result<core::RespValue> ColdConsumerPool::Read(std::string_view key) const {
-  const auto shard = ShardForKey(key);
-  return consumers_[shard]->Buffer().Read(std::string(key));
-}
-
-BufferKeyPresence ColdConsumerPool::Probe(std::string_view key) const {
-  const auto shard = ShardForKey(key);
-  return consumers_[shard]->Buffer().Probe(key);
-}
-
-HashOverlay ColdConsumerPool::HashOverlayFor(std::string_view key) const {
-  const auto shard = ShardForKey(key);
-  return consumers_[shard]->Buffer().HashOverlayFor(key);
+  return consumers_[shard]->Buffer().Snapshot(key);
 }
 
 bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
                                          std::chrono::milliseconds timeout) {
   if (shard >= consumers_.size()) return false;
   // Signal-driven wait on the owning consumer — the drain loop wakes us when it
-  // advances past the target, so a hot-miss read never busy-polls the reactor.
+  // advances past the target, so a waiting write never busy-polls.
   return consumers_[shard]->WaitForDrainedSeq(target_seq, timeout);
 }
 
@@ -129,7 +100,6 @@ ColdConsumerPool::AggregateMetrics ColdConsumerPool::Snapshot() const {
     agg.entries_expired_abs_ttl += m.entries_expired_abs_ttl;
     agg.apply_failures += m.apply_failures;
     agg.retry_attempts += m.retry_attempts;
-    agg.durability_waits_timed_out += m.durability_waits_timed_out;
     agg.parse_failures += m.parse_failures;
     agg.oldest_unflushed_age = std::max(agg.oldest_unflushed_age, m.oldest_unflushed_age);
     if (m.mode == ColdConsumer::Mode::kAggressive) ++agg.shards_in_aggressive_mode;

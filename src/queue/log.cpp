@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/thread_annotations.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/metrics.h"
@@ -33,11 +34,8 @@
 #include "abyss/platform/random.h"
 #include "binary_io.h"
 #include "commit_word.h"
+#include "cpu_relax.h"
 #include "segment_header_v2.h"
-
-#if defined(_M_X64) || defined(_M_IX86)
-#include <intrin.h>
-#endif
 
 ABYSS_LOG_COMPONENT("abyss.queue.log")
 
@@ -54,7 +52,6 @@ constexpr std::size_t kFreePool = 2;
 constexpr std::size_t kMinRingSlots = 16;
 constexpr std::size_t kCompletionSlots = 1024;
 constexpr std::size_t kWaitingReserve = 1024;
-constexpr std::size_t kBodyAt = frame::kCommitBytes + frame::kCrcBytes;
 constexpr uint64_t kMaxFrameSpace = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kMaxShards = uint32_t{1} << 16;
 constexpr auto kSpinFor = std::chrono::microseconds(2);
@@ -68,16 +65,6 @@ constexpr std::string_view kTmpSuffix = ".seg.tmp";
 constexpr std::string_view kFreePrefix = "free-";
 
 uint32_t Gen(uint64_t ordinal) noexcept { return static_cast<uint32_t>(ordinal); }
-
-void CpuRelax() noexcept {
-#if defined(_M_X64) || defined(_M_IX86)
-  _mm_pause();
-#elif defined(__x86_64__) || defined(__i386__)
-  __builtin_ia32_pause();
-#elifdef __aarch64__
-  __asm__ __volatile__("yield");
-#endif
-}
 
 std::string Padded(uint64_t ordinal) {
   const std::string digits = std::to_string(ordinal);
@@ -119,6 +106,10 @@ core::Error UnknownKind(uint32_t log_id, uint64_t ordinal, uint64_t offset, Kind
                       std::to_string(static_cast<unsigned>(kind)));
 }
 
+std::mutex g_dir_sync_hook_mu;
+std::function<core::Result<void>(const std::filesystem::path&)> g_dir_sync_hook;
+std::atomic<bool> g_dir_sync_hooked{false};
+
 core::Result<void> SyncDir(const std::filesystem::path& dir) {
   auto out = pfs::FsyncDir(dir);
   if (!out.has_value()) return std::unexpected(out.error());
@@ -127,6 +118,10 @@ core::Result<void> SyncDir(const std::filesystem::path& dir) {
         core::Error{core::ErrorCode::kFailedPrecondition,
                     "WAL directory durability unsupported on volume '" + dir.string() +
                         "'; a segment's directory entry cannot be made durable"});
+  }
+  if (g_dir_sync_hooked.load(std::memory_order_acquire)) {
+    const std::scoped_lock lock(g_dir_sync_hook_mu);
+    if (g_dir_sync_hook) return g_dir_sync_hook(dir);
   }
   return {};
 }
@@ -867,6 +862,15 @@ core::Result<void> Log::Impl::RecycleReady(std::unique_lock<std::mutex>& lock) {
     if (const auto& pooled = *removed; pooled.has_value()) {
       recycled.push_back(PoolEntry{.path = *pooled, .last = work[done].ordinal});
     }
+    // A power loss may lose any directory change since the last sync,
+    // in any subset, and a lost removal below a kept one leaves a gap
+    // recovery refuses: so each removal is synced before the next. A
+    // failed sync is fatal, as a failed flush is: a retry could report
+    // success for a change the device dropped.
+    if (auto synced = SyncDir(log.config_.dir); !synced.has_value()) {
+      core::Fatal("WAL directory sync failed after reclaiming " + work[done].path.string() + ": " +
+                  synced.error().message());
+    }
   }
 
   lock.lock();
@@ -1129,27 +1133,25 @@ core::Result<void> Log::Impl::Adopt(OnDisk& disk, Replayed& replayed) {
           it->second.path.string() + " holds frames, but is not a segment recovery can read"));
     }
   }
+  // Each move is synced before the next, so a power loss that loses
+  // one leaves the moves before it, highest first, in place.
   const std::scoped_lock lock(mu);
-  bool moved_any = false;
   for (auto it = disk.found.rbegin(); it != disk.found.rend() && it->first >= active; ++it) {
     Found& seg = it->second;
     seg.map.Unmap();
     seg.file.Close();
-    moved_any = true;
     const std::optional<uint64_t> last = seg.header.has_value() ? seg.header->ordinal : seg.named;
     if (!seg.right_size || !last.has_value()) {
       if (auto unlinked = pfs::Unlink(seg.path); !unlinked.has_value()) {
         return std::unexpected(unlinked.error());
       }
-      continue;
+    } else {
+      const std::filesystem::path dest = config.dir / FreeName(next_free_name++);
+      if (auto moved = pfs::Rename(seg.path, dest); !moved.has_value()) {
+        return std::unexpected(moved.error());
+      }
+      pool.push_back(PoolEntry{.path = dest, .last = *last});
     }
-    const std::filesystem::path dest = config.dir / FreeName(next_free_name++);
-    if (auto moved = pfs::Rename(seg.path, dest); !moved.has_value()) {
-      return std::unexpected(moved.error());
-    }
-    pool.push_back(PoolEntry{.path = dest, .last = *last});
-  }
-  if (moved_any) {
     if (auto dir = SyncDir(config.dir); !dir.has_value()) return std::unexpected(dir.error());
   }
   if (auto crashed = CrashPoint(Log::OpenStep::kPastEndRenamed); !crashed.has_value()) {
@@ -1325,6 +1327,18 @@ core::Result<Log::Reservation> Log::Reserve(uint32_t size) {
   }
 }
 
+bool Log::CanReserve(uint32_t size) const {
+  const Impl& impl = *impl_;
+  const uint64_t space = impl.frame_space;
+  if (size < frame::kMinFrameBytes || size % frame::kAlign != 0) return false;
+  if (size > space || (size < space && space - size < frame::kMinFrameBytes)) return false;
+  const LogPosition at = impl.tail.load(std::memory_order_seq_cst);
+  const uint64_t ordinal = at / space;
+  const uint64_t room = space - (at - impl.Start(ordinal));
+  const bool fits = size == room || size + frame::kMinFrameBytes <= room;
+  return impl.published_end.load(std::memory_order_acquire) > (fits ? ordinal : ordinal + 1);
+}
+
 bool Log::WaitForSpare(core::SteadyTime deadline) {
   Impl& impl = *impl_;
   impl.spare_waits.Increment();
@@ -1335,15 +1349,21 @@ bool Log::WaitForSpare(core::SteadyTime deadline) {
   return ready && !impl.stopping;
 }
 
-void Log::Commit(const Reservation& reservation, std::span<const std::byte> frame) {
-  const uint64_t word =
-      frame::CommitWord(frame::CommitLen(binary::LoadLE<uint64_t>(frame.data())), reservation.gen);
-  const auto body_crc = binary::LoadLE<uint32_t>(frame.data() + frame::kCommitBytes);
-  binary::StoreLE(reservation.dst + frame::kCommitBytes,
-                  frame::SealCrc(body_crc, reservation.salt, word));
-  std::memcpy(reservation.dst + kBodyAt, frame.data() + kBodyAt, frame.size() - kBodyAt);
+// The bytes before the commit word were written in place, unordered.
+// Readers and recovery trust a frame only through its commit word (its
+// gen) and its CRC, so that is as safe as a copy made first would be.
+void Log::CommitInPlace(const Reservation& reservation, uint32_t len) {
+  const uint64_t word = frame::CommitWord(len, reservation.gen);
+  std::byte* crc = reservation.dst + frame::kCommitBytes;
+  binary::StoreLE(crc, frame::SealCrc(binary::LoadLE<uint32_t>(crc), reservation.salt, word));
   frame::StoreCommitWord(reservation.dst, word);
-  impl_->Complete(Completion{.pos = reservation.pos, .end = reservation.pos + frame.size()});
+  impl_->Complete(Completion{.pos = reservation.pos, .end = reservation.pos + reservation.size});
+}
+
+void Log::Commit(const Reservation& reservation, std::span<const std::byte> frame) {
+  std::memcpy(reservation.dst + frame::kCommitBytes, frame.data() + frame::kCommitBytes,
+              frame.size() - frame::kCommitBytes);
+  CommitInPlace(reservation, frame::CommitLen(binary::LoadLE<uint64_t>(frame.data())));
 }
 
 void Log::AwaitFilled(LogPosition end) const {
@@ -1612,6 +1632,13 @@ void Log::ResumeCombinerForTesting() { impl_->combining.store(false, std::memory
 
 void Log::CrashOpenAfterForTesting(OpenStep step) {
   g_crash_after.store(step, std::memory_order_relaxed);
+}
+
+void Log::SetDirSyncHookForTesting(
+    std::function<core::Result<void>(const std::filesystem::path&)> hook) {
+  const std::scoped_lock lock(g_dir_sync_hook_mu);
+  g_dir_sync_hooked.store(static_cast<bool>(hook), std::memory_order_release);
+  g_dir_sync_hook = std::move(hook);
 }
 
 void Log::InjectRemoveErrorForTesting(core::Error error) {

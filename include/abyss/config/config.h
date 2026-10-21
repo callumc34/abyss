@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "abyss/cold/ttl_scanner.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/result.h"
 #include "abyss/log/log.h"
@@ -26,6 +25,20 @@ struct HotConfig {
   size_t max_memory_bytes = 4294967296;
   std::chrono::seconds default_eviction{86400};
   std::chrono::milliseconds eviction_tick{1000};
+  // Share of max_memory_bytes kept for evicted keys' stubs.
+  double stub_memory_fraction = 0.02;
+  // Over max_memory_bytes times this, hot reports backpressure.
+  double backpressure_ratio = 1.25;
+  // A read miss fills hot only on the key's second miss in a window
+  // (TinyLFU's doorkeeper); off, every miss fills.
+  bool fill_doorkeeper = true;
+  // A member point read (SISMEMBER, HGET...) fills a collection only
+  // below this many members.
+  uint64_t fill_max_members = 1024;
+  // A fill larger than this share of a shard's budget is never made.
+  double fill_max_fraction = 0.0625;
+  // Keys held as loaded absent, a negative cache, across shards.
+  size_t negative_max_entries = 65536;
   // Queue and consumer pools are opened with the same count.
   uint32_t shard_count = 64;
   std::vector<EvictionOverride> eviction_overrides;
@@ -68,11 +81,6 @@ struct QueueConfig {
   std::chrono::milliseconds durability_window{1000};
 };
 
-struct HotConsumerConfig {
-  size_t read_batch_size = 256;
-  std::chrono::milliseconds read_timeout{100};
-};
-
 struct ColdConsumerConfig {
   std::chrono::seconds quiet_threshold{30};
   std::chrono::seconds safety_margin{300};
@@ -103,22 +111,10 @@ struct ColdConsumerConfig {
 };
 
 struct RecoveryConfig {
-  // Concurrent shard-replay tasks scheduled at startup. Capped operationally
-  // to keep thread count below shard count on small pods. Per-shard threads
-  // resume normal independent operation after recovery completes.
+  // Workers the recovery Scan reads and replays shards on, at most one
+  // per shard. Capped operationally to keep thread count below shard
+  // count on small pods.
   uint32_t replay_parallelism = 4;
-
-  // Bigger batches than steady-state amortise queue Read syscalls during a
-  // long catch-up backlog. Steady-state batch sizes (hot_consumer.read_batch_size,
-  // cold_consumer.queue_read_max_count) are tuned for low-latency tailing,
-  // not bulk drain.
-  size_t hot_replay_batch_size = 10000;
-  size_t cold_replay_batch_size = 50000;
-
-  // Internal default — not exposed in YAML. The resolver scan is CPU-bound
-  // cache updates on the common path; tuning won't materially move recovery
-  // latency.
-  size_t resolver_replay_batch_size = 5000;
 };
 
 struct NetConfig {
@@ -138,19 +134,10 @@ struct NetConfig {
   std::chrono::milliseconds reaper_tick{1000};
 };
 
-using ConsumerRpcConfig = core::ConsumerRpcConfig;
-
 struct EngineConfig {
+  // A write's whole budget: admission, loads, backpressure and its
+  // durable wait. Also bounds a read's wait for what it saw.
   std::chrono::milliseconds write_timeout{5000};
-
-  // Lower bound on the consumer-apply budget after the durable wait completes.
-  // Prevents a slow fsync from starving the RPC wait to ~0ms. The total write
-  // latency is therefore bounded by `write_timeout * (1 + min_rpc_wait_fraction)`.
-  double min_rpc_wait_fraction = 0.5;
-
-  // Bounds how long DispatchHashRead waits for the cold consumer to catch up
-  // to hot's settled seq before snapshotting the buffer overlay.
-  std::chrono::milliseconds buffer_consistency_wait_timeout{100};
 };
 
 struct MetricsConfig {
@@ -190,9 +177,7 @@ struct Config {
   HotConfig hot;
   ColdConfig cold;
   QueueConfig queue;
-  HotConsumerConfig hot_consumer;
   ColdConsumerConfig cold_consumer;
-  ConsumerRpcConfig consumer_rpc;
   EngineConfig engine;
   RecoveryConfig recovery;
   NetConfig net;

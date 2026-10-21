@@ -32,7 +32,7 @@ The cold store opens two column families:
 
 Single-CF for primary data keeps the hot path simple and lets WriteBatch atomicity hold across all primary types in one structure. The score index is split out because its access pattern (range scans by score) differs fundamentally from primary lookups (point lookups by member) and would otherwise pollute the default CF's block cache and bloom-filter selectivity.
 
-There is deliberately no TTL-sorted secondary index. [ADP-003](003-cold-store.md) §TTL Expiry specifies active expiry as **random sampling with adaptive rate**, not deterministic sweep over a sorted index. A `ttl_idx` CF would impose a per-write index update on every TTL'd key (a measurable steady-state cost) to enable a strategy ADP-003 explicitly did not adopt. Lazy expiry consults the TTL fields already present in the primary record (inline for strings, meta record for collections), so no separate structure is needed for the read path either.
+There is deliberately no TTL-sorted secondary index. [ADP-003](003-cold-store.md) §TTL Expiry specifies active expiry as **random sampling with adaptive rate**, not deterministic sweep over a sorted index. A `ttl_idx` CF would impose a per-write index update on every TTL'd key (a measurable steady-state cost) to enable a strategy ADP-003 explicitly did not adopt. Read-time expiry consults the TTL fields already present in the primary record (inline for strings, meta record for collections), so no separate structure is needed for the read path either.
 
 RocksDB `WriteBatch` operations span column families atomically, so the invariant "primary record + score-index entries flushed together" holds across CFs.
 
@@ -209,7 +209,7 @@ The format-version record (`0xFF`, no shard slot) lies outside every per-shard d
 
 #### Expiry Workflow (per ADP-003)
 
-**Lazy expiry (#18)**: every cold-store read consults the TTL field of the primary record (inline for strings, meta for collections). If `flags.bit0` is set and `abs_ttl_ms <= now`, the read deletes the key (per the Tombstones rules above) and returns nil. No additional storage is consulted — the TTL is already on the read path.
+**Read-time expiry (#18)**: every cold-store read consults the TTL field of the primary record (inline for strings, meta for collections). If `flags.bit0` is set and `abs_ttl_ms <= now` by the wall clock, the read returns nil. It never deletes: only the TTL scanner deletes, by the shard's log clock ([ADP-003](003-cold-store.md) §TTL Expiry). No additional storage is consulted — the TTL is already on the read path.
 
 **Active expiry (#19)**: a background thread samples N random keys from the keyspace and deletes any that have expired. Sampling is restricted to the `0x01` (string) and `0x02` (collection-meta) ranges, since these are the only types that carry a TTL. RocksDB iterators seeded from a randomised start position satisfy the "random sample" requirement; sampled keys without a TTL flag count as "not expired" for the adaptive-rate hit-ratio calculation. The adaptive sampling and disk-pressure-mode logic is fully specified in ADP-003 §TTL Expiry.
 
@@ -285,12 +285,12 @@ zset_score_idx CF:  0x06 0x03 "z:1" <sortable(2.5)> "b"        →  ∅
 4. Length-prefix composite keys make prefix scans tight: iterating `<type><keylen><key>` yields only entries for `<key>`, regardless of what user bytes follow.
 5. The format-version record is read on every `open()`. A mismatch fails the open with a migration-required error rather than reading data with the wrong decoder.
 6. Type bytes are immutable. Once allocated, a type byte's meaning never changes. New types take new bytes from the reserved range.
-7. TTL is sourced exclusively from the primary record (inline for strings, meta for collections). No separate TTL index exists; lazy and active expiry both consult the primary record per ADP-003.
+7. TTL is sourced exclusively from the primary record (inline for strings, meta for collections). No separate TTL index exists; read-time and active expiry both consult the primary record per ADP-003.
 8. Every data key carries a 2-byte shard slot immediately after the type byte, equal to `ComputeShard(key, shard_count)`. The slot is a pure function of the Redis key (never the field/member), so all records of a key share one slot, and read/write/wipe agree on a key's slice by construction. A per-shard wipe deletes exactly the slices whose slot equals that shard and no others. The format-version record (`0xFF`) carries no slot.
 
 ## Trade-offs
 
-**TTL-sorted secondary index vs. inline TTL only.** Rejected the secondary index. ADP-003 §TTL Expiry specifies active expiry as random sampling with adaptive rate, deliberately matching Redis's probabilistic model. A `ttl_idx` CF would have enabled deterministic expiry-order iteration, but at the cost of an extra index write on every TTL'd key write, every TTL update, every `PERSIST`, every expiry, and every `DEL` of a TTL'd key. That is a measurable steady-state write amplification to enable a strategy ADP-003 explicitly did not adopt. Inline TTL on the primary record covers both lazy expiry (already on the read path) and active expiry (random sampling consults the same field). If a future ADP revisits ADP-003 and the random-sampling model proves inadequate, a TTL index can be added under a new type byte without changing the primary-record layout.
+**TTL-sorted secondary index vs. inline TTL only.** Rejected the secondary index. ADP-003 §TTL Expiry specifies active expiry as random sampling with adaptive rate, deliberately matching Redis's probabilistic model. A `ttl_idx` CF would have enabled deterministic expiry-order iteration, but at the cost of an extra index write on every TTL'd key write, every TTL update, every `PERSIST`, every expiry, and every `DEL` of a TTL'd key. That is a measurable steady-state write amplification to enable a strategy ADP-003 explicitly did not adopt. Inline TTL on the primary record covers both read-time expiry (already on the read path) and active expiry (random sampling consults the same field). If a future ADP revisits ADP-003 and the random-sampling model proves inadequate, a TTL index can be added under a new type byte without changing the primary-record layout.
 
 **Per-member vs. blob-per-key.** Resolved in favour of per-member: amortises with the compaction buffer, supports unbounded collection sizes without read-modify-write, and keeps `HGETALL`/`SMEMBERS` as a single prefix scan. Cost: more KV pairs in RocksDB. Acceptable; RocksDB is designed for this scale.
 

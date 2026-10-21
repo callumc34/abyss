@@ -16,24 +16,23 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_pool.h"
-#include "abyss/consumer/resolver_pool.h"
-#include "abyss/core/apply_notifier.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
-#include "abyss/log/testing.h"
+#include "abyss/hot/sharded_hot_store.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 #include "inline_shard_scheduler.h"
 #include "mock_cold_store.h"
-#include "mock_hot_store.h"
 #include "mock_queue.h"
 
 namespace abyss::engine {
@@ -46,17 +45,24 @@ using ::testing::Return;
 using ::testing::UnorderedElementsAreArray;
 
 constexpr uint32_t kShards = 2;
-constexpr std::string_view kMissed = "replay after the recovery scan found entries it missed";
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 
+// A key on `shard`, as the sequencer logs a write only on its key's.
 std::string KeyOf(core::ShardId shard, core::SequenceId seq) {
-  return "s" + std::to_string(shard) + ":" + std::to_string(seq);
+  for (int i = 0;; ++i) {
+    std::string key =
+        "s" + std::to_string(shard) + ":" + std::to_string(seq) + ":" + std::to_string(i);
+    if (core::ComputeShard(key, kShards) == shard) return key;
+  }
 }
 
+// A SET replaces its key's state, so the sequencer flags it.
 core::QueueEntry Write(core::ShardId shard, core::SequenceId seq) {
   return core::QueueEntry{
       .seq = seq,
       .appended_at = core::WallClock::now(),
       .payload = core::entry::Write{.cmd = core::RespCommand{{"SET", KeyOf(shard, seq), "v"}}},
+      .replaces_state = true,
   };
 }
 
@@ -116,9 +122,9 @@ std::vector<std::string> Concat(std::vector<std::string> a, const std::vector<st
   return a;
 }
 
-// A queue each shard of which holds entries 0..size-1, with first
-// retained seqs and cold commits the test picks. The resolver has
-// committed everything, so its phase replays nothing.
+// A queue each shard of which holds entries from kFirstSeq, with first
+// retained seqs and cold commits the test picks, recovered into a real
+// hot store.
 class RecoveryCoordinatorTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -132,29 +138,17 @@ class RecoveryCoordinatorTest : public ::testing::Test {
       return core::Result<core::SequenceId>(first_[shard]);
     });
     ON_CALL(queue_, DurableEnd(_, _)).WillByDefault([this](core::ShardId shard, core::Durability) {
-      return core::Result<core::SequenceId>(logs_[shard].size());
+      return core::Result<core::SequenceId>(kFirst + logs_[shard].size());
     });
     ON_CALL(queue_, TailSeq(_)).WillByDefault([this](core::ShardId shard) {
-      return core::Result<core::SequenceId>(logs_[shard].empty() ? 0 : logs_[shard].size() - 1);
+      return core::Result<core::SequenceId>(kFirst + logs_[shard].size() - 1);
     });
     ON_CALL(queue_, CommittedOffset(core::kColdConsumer, _))
         .WillByDefault([this](core::ConsumerId, core::ShardId shard) {
           return core::Result<std::optional<core::SequenceId>>(cold_commit_[shard]);
         });
-    ON_CALL(queue_, CommittedOffset(core::kResolverConsumer, _))
-        .WillByDefault([this](core::ConsumerId, core::ShardId shard) {
-          const auto& log = logs_[shard];
-          return core::Result<std::optional<core::SequenceId>>(
-              log.empty() ? std::nullopt : std::optional<core::SequenceId>(log.size() - 1));
-        });
     ON_CALL(queue_, CommitOffset(_, _, _)).WillByDefault(Return(core::Result<void>{}));
 
-    ON_CALL(hot_, Apply(_, _))
-        .WillByDefault([this](const core::ops::WriteOp& op, core::SequenceId) {
-          hot_applied_.Add(core::ops::PrimaryKey(op));
-          return core::Result<core::RespValue>(core::RespValue::SimpleString("OK"));
-        });
-    ON_CALL(hot_, Wipe(_)).WillByDefault(Return(core::Result<void>{}));
     ON_CALL(cold_, ApplyBatch(_, _))
         .WillByDefault([this](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
           for (const auto& op : ops) cold_applied_.Add(core::ops::PrimaryKey(op));
@@ -164,23 +158,18 @@ class RecoveryCoordinatorTest : public ::testing::Test {
   }
 
   void Fill(core::ShardId shard, core::SequenceId count) {
-    for (core::SequenceId seq = 0; seq < count; ++seq) logs_[shard].push_back(Write(shard, seq));
+    for (core::SequenceId seq = kFirst; seq < kFirst + count; ++seq) {
+      logs_[shard].push_back(Write(shard, seq));
+    }
   }
 
   RecoveryCoordinator& Coordinator() {
     cold_pool_ = std::make_unique<consumer::ColdConsumerPool>(
         queue_, cold_,
         consumer::ColdConsumerPool::Config{.shard_count = kShards, .consumer = cold_config_},
-        policy_, rpc_);
-    hot_pool_ = std::make_unique<consumer::HotConsumerPool>(
-        queue_, hot_, rpc_, notifier_, consumer::HotConsumerPool::Config{.shard_count = kShards},
         policy_);
-    resolver_pool_ = std::make_unique<consumer::ResolverPool>(
-        queue_, cold_, *cold_pool_, rpc_, notifier_,
-        consumer::ResolverPool::Config{.shard_count = kShards});
-    coordinator_ =
-        std::make_unique<RecoveryCoordinator>(queue_, *resolver_pool_, *cold_pool_, *hot_pool_,
-                                              scheduler_, RecoveryConfig{.replay_parallelism = 2});
+    coordinator_ = std::make_unique<RecoveryCoordinator>(queue_, *cold_pool_, hot_, scheduler_,
+                                                         RecoveryConfig{.replay_parallelism = 2});
     return *coordinator_;
   }
 
@@ -196,34 +185,34 @@ class RecoveryCoordinatorTest : public ::testing::Test {
     return run.get();
   }
 
-  static std::vector<log::testing::CapturedRecord> Missed(const log::testing::CapturingSink& logs) {
-    std::vector<log::testing::CapturedRecord> out;
-    for (auto& record : logs.Records()) {
-      if (record.msg == kMissed) out.push_back(std::move(record));
+  // The keys of `keys` hot holds.
+  std::vector<std::string> HotHolds(const std::vector<std::string>& keys) {
+    std::vector<std::string> held;
+    for (const auto& key : keys) {
+      auto read = hot_.Exec(core::ops::ReadOp{core::ops::StringGet{.key = key}});
+      if (read.has_value() && read->IsBulkString()) held.push_back(key);
     }
-    return out;
+    return held;
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   std::vector<std::vector<core::QueueEntry>> logs_ =
       std::vector<std::vector<core::QueueEntry>>(kShards);
-  std::vector<core::SequenceId> first_ = std::vector<core::SequenceId>(kShards, 0);
+  std::vector<core::SequenceId> first_ = std::vector<core::SequenceId>(kShards, kFirst);
   std::vector<std::optional<core::SequenceId>> cold_commit_ =
       std::vector<std::optional<core::SequenceId>>(kShards);
   consumer::ColdConsumer::Config cold_config_;
   NiceMock<ScanQueue> queue_;
-  NiceMock<testing::MockHotStore> hot_;
+  hot::ShardedHotStore hot_{hot::ShardedHotStoreConfig{
+      .max_memory_bytes = size_t{64} << 20,
+      .shard_count = kShards,
+  }};
   NiceMock<testing::MockColdStore> cold_;
-  Applied hot_applied_;
   Applied cold_applied_;
   core::EvictionPolicy policy_{core::EvictionTTL{3600}};
-  core::ConsumerRpc rpc_;
-  core::ApplyNotifier notifier_{core::AppliedSeqNotifierConfig{.shard_count = kShards}};
   testing::InlineShardScheduler scheduler_;
   std::atomic<bool> cancel_{false};
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
-  std::unique_ptr<consumer::HotConsumerPool> hot_pool_;
-  std::unique_ptr<consumer::ResolverPool> resolver_pool_;
   std::unique_ptr<RecoveryCoordinator> coordinator_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
@@ -232,81 +221,81 @@ class RecoveryCoordinatorTest : public ::testing::Test {
 // gets what is at or past FirstSeq, cold what is past its commit.
 TEST_F(RecoveryCoordinatorTest, OneScanFeedsHotFromFirstSeqAndColdPastItsCommit) {
   Fill(0, 10);
-  first_[0] = 2;
-  cold_commit_[0] = 5;
+  first_[0] = kFirst + 2;
+  cold_commit_[0] = kFirst + 5;
   Fill(1, 4);
-  const log::testing::CapturingSink logs;
 
   ASSERT_TRUE(RunBounded().has_value());
 
-  EXPECT_EQ(queue_.ScannedFrom(), (std::vector<core::SequenceId>{2, 0}));
-  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{10, 4}));
-  EXPECT_THAT(hot_applied_.Keys(),
-              UnorderedElementsAreArray(Concat(KeysOf(0, 2, 10), KeysOf(1, 0, 4))));
+  EXPECT_EQ(queue_.ScannedFrom(), (std::vector<core::SequenceId>{kFirst + 2, kFirst}));
+  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{kFirst + 10, kFirst + 4}));
+  const auto all = Concat(KeysOf(0, kFirst, kFirst + 10), KeysOf(1, kFirst, kFirst + 4));
+  EXPECT_THAT(HotHolds(all), UnorderedElementsAreArray(Concat(KeysOf(0, kFirst + 2, kFirst + 10),
+                                                              KeysOf(1, kFirst, kFirst + 4))));
   EXPECT_THAT(cold_applied_.Keys(),
-              UnorderedElementsAreArray(Concat(KeysOf(0, 6, 10), KeysOf(1, 0, 4))));
-  EXPECT_TRUE(Missed(logs).empty());
-  EXPECT_EQ(cold_pool_->ConsumerFor(0).LatestDrainedSeq(), 9U);
-  EXPECT_EQ(hot_pool_->ConsumerFor(1).HighestSettledSeq(), 3U);
+              UnorderedElementsAreArray(
+                  Concat(KeysOf(0, kFirst + 6, kFirst + 10), KeysOf(1, kFirst, kFirst + 4))));
+  EXPECT_EQ(cold_pool_->ConsumerFor(0).LatestDrainedSeq(), kFirst + 9);
+  EXPECT_EQ(coordinator_->Replayer().Replayed(), 12U);
 }
 
 // Cold trails behind hot's start, so the scan starts at cold's cursor
 // and hot skips what precedes its own.
 TEST_F(RecoveryCoordinatorTest, AColdCommitBehindFirstSeqStartsTheScanAtCold) {
   Fill(0, 8);
-  first_[0] = 6;
-  cold_commit_[0] = 2;
+  first_[0] = kFirst + 6;
+  cold_commit_[0] = kFirst + 2;
 
   ASSERT_TRUE(RunBounded().has_value());
 
-  EXPECT_EQ(queue_.ScannedFrom()[0], 3U);
-  EXPECT_THAT(hot_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, 6, 8)));
-  EXPECT_THAT(cold_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, 3, 8)));
+  EXPECT_EQ(queue_.ScannedFrom()[0], kFirst + 3);
+  EXPECT_THAT(HotHolds(KeysOf(0, kFirst, kFirst + 8)),
+              UnorderedElementsAreArray(KeysOf(0, kFirst + 6, kFirst + 8)));
+  EXPECT_THAT(cold_applied_.Keys(), UnorderedElementsAreArray(KeysOf(0, kFirst + 3, kFirst + 8)));
 }
 
-// A scan that misses entries is caught by the trailing ReplayUntil,
-// which applies them and warns, naming the tier, shard and count.
-TEST_F(RecoveryCoordinatorTest, TheTrailingReplayWarnsAboutWhatTheScanMissed) {
+// A Scan that returns without delivering every frame fails recovery:
+// replay must reach each shard's end, not stop short of it.
+TEST_F(RecoveryCoordinatorTest, AScanThatMissesFramesFailsRecovery) {
   Fill(0, 10);
-  first_[0] = 2;
-  cold_commit_[0] = 5;
   Fill(1, 4);
   queue_.instead = [] { return core::Result<void>{}; };
-  const log::testing::CapturingSink logs;
 
-  ASSERT_TRUE(RunBounded().has_value());
-
-  std::vector<std::string> warned;
-  for (const auto& record : Missed(logs)) {
-    std::string line;
-    for (const auto& [key, value] : record.fields)
-      line.append(key).append("=").append(value).append(" ");
-    warned.push_back(line);
-  }
-  EXPECT_THAT(warned, UnorderedElementsAreArray(
-                          {"tier=cold shard=0 entries=4 ", "tier=hot shard=0 entries=8 ",
-                           "tier=cold shard=1 entries=4 ", "tier=hot shard=1 entries=4 "}));
-  EXPECT_THAT(hot_applied_.Keys(),
-              UnorderedElementsAreArray(Concat(KeysOf(0, 2, 10), KeysOf(1, 0, 4))));
+  auto run = RunBounded();
+  ASSERT_FALSE(run.has_value());
+  EXPECT_EQ(run.error().code(), core::ErrorCode::kInternal);
+  EXPECT_THAT(run.error().message(), ::testing::HasSubstr("short of its end"));
+  EXPECT_FALSE(coordinator_->IsRecovering());
 }
 
-// A shard with nothing written gets no trailing ReplayUntil, which
-// would only wait out a read timeout.
-TEST_F(RecoveryCoordinatorTest, AnEmptyShardGetsNoTrailingReplay) {
-  Fill(0, 3);
-  const log::testing::CapturingSink logs;
+// The progress counts every frame from each shard's first retained seq
+// to its end, the last included: target and replayed agree when done.
+TEST_F(RecoveryCoordinatorTest, ProgressCountsEveryFrameToTheEnd) {
+  Fill(0, 10);
+  first_[0] = kFirst + 2;
+  cold_commit_[0] = kFirst + 5;
+  Fill(1, 4);
 
   ASSERT_TRUE(RunBounded().has_value());
 
-  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{3, 0}));
-  std::vector<std::string> started;
-  for (const auto& record : logs.Records()) {
-    if (record.msg != "hot replay starting" && record.msg != "cold replay starting") continue;
-    for (const auto& [key, value] : record.fields) {
-      if (key == "shard") started.push_back(value);
-    }
-  }
-  EXPECT_THAT(started, UnorderedElementsAreArray({"0", "0"}));
+  const auto snap = coordinator_->Snapshot();
+  EXPECT_EQ(snap.phase, RecoverySnapshot::Phase::kComplete);
+  EXPECT_EQ(snap.hot_entries_target, 12U);
+  EXPECT_EQ(snap.hot_entries_replayed, 12U);
+  EXPECT_EQ(snap.cold_entries_target, 8U);
+  EXPECT_EQ(snap.cold_entries_replayed, 8U);
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kRecoveryHotEntriesTarget), 12.0);
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kRecoveryHotEntriesReplayed), 12.0);
+}
+
+TEST_F(RecoveryCoordinatorTest, AnEmptyShardRecovers) {
+  Fill(0, 3);
+
+  ASSERT_TRUE(RunBounded().has_value());
+
+  EXPECT_EQ(queue_.ScannedEnd(), (std::vector<core::SequenceId>{kFirst + 3, kFirst}));
+  EXPECT_EQ(coordinator_->Snapshot().hot_entries_target, 3U);
+  EXPECT_EQ(coordinator_->Replayer().Replayed(), 3U);
 }
 
 TEST_F(RecoveryCoordinatorTest, AScanErrorFailsRecovery) {
@@ -339,7 +328,7 @@ TEST_F(RecoveryCoordinatorTest, ACancelDuringTheScanReturnsUnavailable) {
 // A wipe that never succeeds stops the scan once drain_grace is spent,
 // and recovery fails rather than hanging on it.
 TEST_F(RecoveryCoordinatorTest, AColdWipeThatAlwaysFailsFailsRecoveryWithinDrainGrace) {
-  logs_[0] = {Write(0, 0), Flush(1), Write(0, 2)};
+  logs_[0] = {Write(0, kFirst), Flush(kFirst + 1), Write(0, kFirst + 2)};
   cold_config_.drain_grace = 50ms;
   cold_config_.loop_max_backoff = 10ms;
   EXPECT_CALL(cold_, Wipe(0))
@@ -350,7 +339,7 @@ TEST_F(RecoveryCoordinatorTest, AColdWipeThatAlwaysFailsFailsRecoveryWithinDrain
   ASSERT_FALSE(run.has_value());
   EXPECT_EQ(run.error().code(), core::ErrorCode::kTimeout);
   EXPECT_THAT(run.error().message(), ::testing::HasSubstr("shard 0"));
-  EXPECT_THAT(run.error().message(), ::testing::HasSubstr("seq 1"));
+  EXPECT_THAT(run.error().message(), ::testing::HasSubstr("seq " + std::to_string(kFirst + 1)));
   EXPECT_FALSE(cancel_.load()) << "recovery returned only once cancelled";
 }
 

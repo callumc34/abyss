@@ -55,18 +55,6 @@ core::QueueEntry Write(core::SequenceId seq, const std::string& key) {
   return At(seq, core::entry::Write{.cmd = core::RespCommand{{"SET", key, "v"}}});
 }
 
-core::QueueEntry Conditional(core::SequenceId seq) {
-  return At(seq, core::entry::Conditional{.cmd = core::RespCommand{{"SETNX", "c", "v"}},
-                                          .flags = core::PredicateFlags::kNx});
-}
-
-core::QueueEntry Resolved(core::SequenceId seq, core::SequenceId ref) {
-  return At(seq, core::entry::Resolved{.ref = ref,
-                                       .decision = core::Decision::kApply,
-                                       .materialised_ops = {core::RespCommand{{"SET", "c", "v"}}},
-                                       .return_value = core::RespValue::Integer(1)});
-}
-
 core::QueueEntry Flush(core::SequenceId seq) { return At(seq, core::entry::Flush{}); }
 
 // Consecutive frames reserved as one batch, CRCs not yet sealed.
@@ -139,8 +127,6 @@ bool Emit(const std::filesystem::path& dir, const std::string& name, const Bytes
 std::vector<std::pair<std::string, Bytes>> DecoderSeeds() {
   std::vector<std::pair<std::string, Bytes>> seeds;
   seeds.emplace_back("write", Sealed(Write(3, "key")));
-  seeds.emplace_back("conditional", Sealed(Conditional(4)));
-  seeds.emplace_back("resolved", Sealed(Resolved(5, 4)));
   seeds.emplace_back("flush", Sealed(Flush(6)));
 
   Bytes padding(frame::kMinFrameBytes + 16);
@@ -166,6 +152,12 @@ std::vector<std::pair<std::string, Bytes>> DecoderSeeds() {
   unknown[kBodyAt + kKindAt] = std::byte{9};
   seeds.emplace_back("unknown_kind",
                      DecoderSeed(frame::CommitWord(LenOf(unknown), kGen), unknown, kModeSeal));
+
+  // 0x01 and 0x02 were the conditional and resolved types; reserved now.
+  Bytes reserved = Frame(Write(3, "key"), 1);
+  reserved[kBodyAt + kKindAt + 1] = std::byte{0x01};
+  seeds.emplace_back("reserved_type",
+                     DecoderSeed(frame::CommitWord(LenOf(reserved), kGen), reserved, kModeSeal));
 
   Bytes garbled = Frame(Write(3, "key"), 1);
   garbled[kBodyAt + frame::kHeaderBytes + 1] = std::byte{0xff};

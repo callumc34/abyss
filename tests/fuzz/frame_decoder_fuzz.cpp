@@ -1,4 +1,4 @@
-// libFuzzer harness for the WAL format 2 frame codec.
+// libFuzzer harness for the WAL frame codec.
 //
 // Input: commit word u64, gen u32, salt u64 and a mode byte, then the
 // frame bytes. With kModeSeal the harness writes the correct CRC for

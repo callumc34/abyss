@@ -12,6 +12,7 @@
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/result.h"
+#include "abyss/core/types.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "common.h"
 #include "workload.h"
@@ -96,7 +97,7 @@ int main(int argc, char** argv) {
         .abs_ttl_ms = 0,
     };
     abyss::core::ops::WriteOp op = set_op;
-    auto rc = hot.Apply(op, /*seq=*/0);
+    auto rc = hot.Apply(op, /*seq=*/abyss::core::kFirstSeq);
     if (!rc.has_value()) {
       std::cerr << "preload failed at key " << i << ": " << rc.error().message() << '\n';
       return 1;
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
           .abs_ttl_ms = 0,
       };
       abyss::core::ops::WriteOp write = set_op;
-      return hot.Apply(write, /*seq=*/0).has_value();
+      return hot.Apply(write, /*seq=*/abyss::core::kFirstSeq).has_value();
     }
   };
 

@@ -75,8 +75,13 @@ TEST(CoordinatedOmissionTest, StallIsChargedToEveryDelayedOp) {
   // Every slot of the second is issued, and sampled once.
   EXPECT_EQ(ops, 1000U);
   EXPECT_EQ(hist.Count(), static_cast<int64_t>(ops));
-  EXPECT_EQ(result.send_lag.Count(), static_cast<int64_t>(ops));
   EXPECT_GE(hist.MaxNs(), kStallNs);
+
+  // The slots that fell due during the stall are the op's backlog, not
+  // the driver's lag.
+  EXPECT_EQ(result.send_lag.Count() + result.backlog.Count(), static_cast<int64_t>(ops));
+  EXPECT_GE(result.backlog.Count(), kStallIntervals - 1);
+  EXPECT_GE(result.backlog.MaxNs(), kStallNs * 4 / 5);
 
   // The ~49 ops behind the stall drain the backlog with waits falling
   // from ~49ms to ~1ms. Measured from the actual send, only the stalled
@@ -87,6 +92,57 @@ TEST(CoordinatedOmissionTest, StallIsChargedToEveryDelayedOp) {
 
   // The rest of the schedule keeps its unstalled latency.
   EXPECT_LT(hist.PercentileNs(50.0), kIntervalNs);
+}
+
+// A slot that falls due while the previous op still runs waits on the
+// op, so it counts as backlog; driver lag is only the scheduler's own.
+TEST(RunLoopTest, SlotsBehindASlowOpAreBacklogNotSendLag) {
+  RunLoopConfig cfg;
+  cfg.workers = 1;
+  cfg.duration = std::chrono::seconds{1};
+  cfg.target_rate_ops = 200;  // 5ms schedule
+  cfg.key_count = 10;
+  cfg.mix.weights["X"] = 1.0;
+
+  // Every op outlasts its slot, so each later slot finds it running.
+  OpFn op = [&](int, std::string_view, uint64_t) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{7});
+    return true;
+  };
+  const auto result = RunLoop(cfg, op);
+
+  EXPECT_EQ(result.send_lag.Count() + result.backlog.Count(), 200);
+  EXPECT_LE(result.send_lag.Count(), 1) << "only the first slot finds the worker free";
+  EXPECT_GE(result.backlog.MaxNs(), 100'000'000) << "the backlog grows 2ms a slot";
+}
+
+// The hook runs once, when the warmup ends and before the run does.
+TEST(RunLoopTest, MeasureStartHookRunsWhenTheWarmupEnds) {
+  using Clock = std::chrono::steady_clock;
+  RunLoopConfig cfg;
+  cfg.workers = 1;
+  cfg.warmup = std::chrono::seconds{1};
+  cfg.duration = std::chrono::seconds{1};
+  cfg.key_count = 10;
+  cfg.mix.weights["X"] = 1.0;
+  std::atomic<int> calls{0};
+  std::atomic<int64_t> hook_at{0};
+  cfg.at_measure_start = [&] {
+    calls.fetch_add(1);
+    hook_at.store(Clock::now().time_since_epoch().count());
+  };
+  const auto before = Clock::now();
+  OpFn op = [](int, std::string_view, uint64_t) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    return true;
+  };
+  (void)RunLoop(cfg, op);
+  const auto after = Clock::now();
+
+  EXPECT_EQ(calls.load(), 1);
+  const Clock::time_point at{Clock::duration{hook_at.load()}};
+  EXPECT_GE(at - before, cfg.warmup);
+  EXPECT_GE(after - at, std::chrono::milliseconds{900});
 }
 
 TEST(RunLoopTest, ResultExposesMeasuredDuration) {

@@ -1,15 +1,19 @@
+#include <sys/resource.h>
+
 #include <CLI/CLI.hpp>
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -20,18 +24,17 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/config/config.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_pool.h"
-#include "abyss/consumer/resolver_pool.h"
-#include "abyss/core/apply_notifier.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
-#include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
+#include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
@@ -44,6 +47,7 @@
 #include "metrics_scraper.h"
 #include "temp_dir.h"
 #include "workload.h"
+#include "workload_shape.h"
 
 namespace {
 
@@ -54,6 +58,7 @@ using abyss::core::Result;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::string_view kOpWrite = "write_ack";
+constexpr std::string_view kOpRead = "read";
 constexpr std::string_view kOpFlush = "device_flush";
 constexpr std::string_view kOpFlushConcurrent = "device_flush_concurrent";
 constexpr size_t kFlushBlockBytes = 4096;
@@ -64,14 +69,27 @@ constexpr int64_t kOverheadP99Us = 20;
 // W2 (power_loss): twice the device flush p99 plus this headroom.
 constexpr int64_t kDurableHeadroomUs = 50;
 constexpr size_t kPrefillBatch = 1024;
+// The server's kMapReserveBytesPerKey (apps/abyss-server/server.cpp).
+constexpr size_t kMapReserveBytesPerKey = 256;
 constexpr std::chrono::minutes kPrefillDrainTimeout{10};
-
-std::string KeyFor(uint64_t idx) {
-  std::array<char, 32> buf{};
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-  std::snprintf(buf.data(), buf.size(), "k%020llu", static_cast<unsigned long long>(idx));
-  return buf.data();
-}
+// Keys whose TTL is read, at most, to measure the share carrying one.
+constexpr uint64_t kTtlSamples = 20'000;
+// --count-faults: a write slower than this counts as slow.
+constexpr std::chrono::microseconds kSlowWrite{100};
+// --hold-wal-flushes raises the durability window to its limits, and
+// the run must end before unflushed data outlives the age bound.
+constexpr std::chrono::milliseconds kHeldWindow{60'000};
+constexpr uint64_t kHeldWindowBytes = uint64_t{4} << 30;
+constexpr std::chrono::seconds kHeldRunLimit{50};
+#ifdef __linux__
+// Workers write inline: the writing thread's own faults.
+constexpr int kFaultScope = RUSAGE_THREAD;
+constexpr std::string_view kFaultScopeName = "thread";
+#else
+// macOS has no per-thread fault count: every thread's faults count.
+constexpr int kFaultScope = RUSAGE_SELF;
+constexpr std::string_view kFaultScopeName = "process";
+#endif
 
 // Recovery is not run, so the directory must hold no prior state.
 Result<void> PrepareFreshDirectory(const std::filesystem::path& dir) {
@@ -167,12 +185,13 @@ Result<FlushCalibration> FlushFilesConcurrently(const std::filesystem::path& dir
   return out;
 }
 
-// The RESP pipeline's unconditional SET, minus the wire codec.
-Result<abyss::core::RespCommand> CanonicalSet(std::string key, const std::string& value) {
-  const abyss::core::RespCommand cmd{.args = {"SET", std::move(key), value}};
-  auto parsed = abyss::core::ops::ParseWriteOp("SET", cmd);
-  if (!parsed.has_value()) return std::unexpected(parsed.error());
-  return abyss::core::ops::CanonicalCommand(*parsed);
+// The RESP pipeline's write, minus the wire codec: parsed to validate
+// it, then dispatched as sent.
+Result<void> Validate(const abyss::core::RespCommand& cmd) {
+  if (auto parsed = abyss::core::ops::ParseWriteOp(cmd.args.front(), cmd); !parsed.has_value()) {
+    return std::unexpected(parsed.error());
+  }
+  return {};
 }
 
 abyss::perf::WorkloadTargets DeriveTargets(abyss::core::Durability durability,
@@ -193,14 +212,13 @@ struct WritePath {
   std::unique_ptr<abyss::core::EvictionPolicy> eviction_policy;
   std::unique_ptr<abyss::hot::ShardedHotStore> hot_store;
   std::unique_ptr<abyss::queue::WalQueue> queue;
-  std::unique_ptr<abyss::core::ConsumerRpc> consumer_rpc;
-  std::unique_ptr<abyss::core::ApplyNotifier> apply_notifier;
   std::unique_ptr<abyss::core::ColdStore> cold_store;
   std::unique_ptr<abyss::consumer::ColdConsumerPool> cold_pool;
-  std::unique_ptr<abyss::consumer::HotConsumerPool> hot_pool;
+  std::unique_ptr<abyss::engine::Loader> loader;
+  std::unique_ptr<abyss::engine::Sequencer> sequencer;
+  std::unique_ptr<abyss::engine::ReadPath> reads;
   std::unique_ptr<abyss::engine::TieringEngine> engine;
   std::unique_ptr<abyss::hot::EvictionWorker> hot_eviction_worker;
-  std::unique_ptr<abyss::consumer::ResolverPool> resolver_pool;
 };
 
 Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& config) {
@@ -218,6 +236,15 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   wp->hot_store = std::make_unique<abyss::hot::ShardedHotStore>(abyss::hot::ShardedHotStoreConfig{
       .max_memory_bytes = config.hot.max_memory_bytes,
       .shard_count = config.hot.shard_count,
+      .reserve_bytes_per_key = kMapReserveBytesPerKey,
+      .stub_memory_fraction = config.hot.stub_memory_fraction,
+      .negative_max_entries = config.hot.negative_max_entries,
+      .fill_max_fraction = config.hot.fill_max_fraction,
+      .backpressure_ratio = config.hot.backpressure_ratio,
+      // The cold pool is built later; until then nothing has drained.
+      .drained = [path = wp.get()](abyss::core::ShardId shard) -> abyss::core::SequenceId {
+        return path->cold_pool ? path->cold_pool->ConsumerFor(shard).LatestDrainedSeq() : 0;
+      },
       .eviction_policy = wp->eviction_policy.get(),
   });
   const uint32_t shards = wp->hot_store->shard_count();
@@ -234,7 +261,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       .durability_window = config.queue.durability_window,
       .admission_timeout = config.engine.write_timeout,
       .min_retention = config.queue.min_retention,
-      .retention_consumers = {abyss::core::kColdConsumer, abyss::core::kResolverConsumer},
+      .retention_consumers = {abyss::core::kColdConsumer},
       .offset_fsync_interval = config.queue.offset_fsync_interval,
   });
   if (!queue.has_value()) return std::unexpected(queue.error());
@@ -243,14 +270,13 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   }
   wp->queue = std::move(*queue);
 
-  wp->consumer_rpc = std::make_unique<abyss::core::ConsumerRpc>(config.consumer_rpc);
-  wp->apply_notifier = std::make_unique<abyss::core::ApplyNotifier>(
-      abyss::core::AppliedSeqNotifierConfig{.shard_count = shards});
-
   auto cold = abyss::cold::backends::RocksdbStore::Create(abyss::cold::backends::RocksdbConfig{
       .data_path = config.cold.data_path,
       .shard_count = shards,
       .write_buffer_size_bytes = config.cold.write_buffer_size_bytes,
+      .log_clock = [path = wp.get()](abyss::core::ShardId shard) -> uint64_t {
+        return path->cold_pool ? path->cold_pool->LogClockMs(shard) : 0;
+      },
       .ttl_scanner = config.cold.ttl_scanner,
   });
   if (!cold.has_value()) return std::unexpected(cold.error());
@@ -270,7 +296,6 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
                   .buffer_low_water_bytes = cc.buffer_low_water_bytes,
                   .max_flush_batch_size = cc.max_flush_batch_size,
                   .queue_read_max_count = cc.queue_read_max_count,
-                  .replay_batch_size = config.recovery.cold_replay_batch_size,
                   .queue_read_timeout = cc.queue_read_timeout,
                   .retry_initial_backoff = cc.retry_initial_backoff,
                   .retry_max_backoff = cc.retry_max_backoff,
@@ -281,57 +306,34 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
                   .drain_grace = cc.drain_grace,
               },
       },
-      *wp->eviction_policy, *wp->consumer_rpc);
-
-  wp->hot_pool = std::make_unique<consumer::HotConsumerPool>(
-      *wp->queue, *wp->hot_store, *wp->consumer_rpc, *wp->apply_notifier,
-      consumer::HotConsumerPool::Config{
-          .shard_count = shards,
-          .consumer =
-              consumer::HotConsumer::Config{
-                  .read_batch_size = config.hot_consumer.read_batch_size,
-                  .replay_batch_size = config.recovery.hot_replay_batch_size,
-                  .read_timeout = config.hot_consumer.read_timeout,
-              },
-      },
       *wp->eviction_policy);
 
-  wp->engine = std::make_unique<abyss::engine::TieringEngine>(
-      *wp->queue, *wp->hot_store, *wp->cold_store, *wp->cold_pool, *wp->hot_pool, *wp->consumer_rpc,
-      abyss::engine::TieringEngineConfig{
-          .shard_count = shards,
+  wp->loader =
+      std::make_unique<abyss::engine::Loader>(*wp->hot_store, *wp->cold_pool, *wp->cold_store);
+  wp->sequencer = std::make_unique<abyss::engine::Sequencer>(
+      *wp->hot_store, *wp->queue, *wp->loader, *wp->cold_pool,
+      abyss::engine::SequencerConfig{
           .write_timeout = config.engine.write_timeout,
-          .min_rpc_wait_fraction = config.engine.min_rpc_wait_fraction,
-          .buffer_consistency_wait_timeout = config.engine.buffer_consistency_wait_timeout,
       });
+  wp->reads =
+      std::make_unique<abyss::engine::ReadPath>(*wp->hot_store, *wp->loader, *wp->sequencer,
+                                                abyss::engine::ReadPathConfig{
+                                                    .write_timeout = config.engine.write_timeout,
+                                                    .fill_doorkeeper = config.hot.fill_doorkeeper,
+                                                    .fill_max_members = config.hot.fill_max_members,
+                                                });
+  wp->engine = std::make_unique<abyss::engine::TieringEngine>(*wp->reads, *wp->sequencer);
 
   wp->hot_eviction_worker = std::make_unique<abyss::hot::EvictionWorker>(
-      *wp->hot_store, abyss::hot::EvictionWorker::Config{
-                          .tick = config.hot.eviction_tick,
-                          .tombstone_horizon =
-                              [pool = wp->cold_pool.get()](abyss::core::ShardId shard) {
-                                return pool->ConsumerFor(shard).LatestDrainedSeq();
-                              },
-                      });
+      *wp->hot_store, abyss::hot::EvictionWorker::Config{.tick = config.hot.eviction_tick});
 
-  wp->resolver_pool = std::make_unique<consumer::ResolverPool>(
-      *wp->queue, *wp->cold_store, *wp->cold_pool, *wp->consumer_rpc, *wp->apply_notifier,
-      consumer::ResolverPool::Config{
-          .shard_count = shards,
-          .consumer =
-              consumer::Resolver::Config{
-                  .replay_batch_size = config.recovery.resolver_replay_batch_size,
-              },
-      });
   return wp;
 }
 
 // Server::Run's start order once recovery has completed.
 void StartWritePath(WritePath& wp) {
   wp.hot_eviction_worker->Start();
-  wp.resolver_pool->Start();
   wp.cold_pool->Start();
-  wp.hot_pool->Start();
   if (auto rc = wp.cold_store->Start(); !rc.has_value()) {
     std::cerr << "write_probe: cold store start failed: " << rc.error().message() << '\n';
   }
@@ -341,42 +343,65 @@ void StartWritePath(WritePath& wp) {
 void StopWritePath(WritePath& wp, std::chrono::seconds drain_grace) {
   wp.hot_eviction_worker->Stop();
   wp.cold_pool->Stop(std::chrono::duration_cast<std::chrono::milliseconds>(drain_grace));
-  wp.hot_pool->Stop();
-  wp.resolver_pool->Stop();
   if (auto rc = wp.cold_store->Stop(); !rc.has_value()) {
     std::cerr << "write_probe: cold store stop failed: " << rc.error().message() << '\n';
   }
 }
 
-// Appends `entries` canonical SETs straight to the WAL in batches, the
-// layout acknowledged writes would leave, then waits until every
-// consumer has drained them so the measured window has no backlog.
+bool Write(WritePath& wp, abyss::core::RespCommand cmd) {
+  if (!Validate(cmd).has_value()) return false;
+  const std::string name = cmd.args.front();
+  auto reply = wp.engine->DispatchWrite(name, std::move(cmd), abyss::core::PredicateFlags::kNone);
+  return reply.has_value() && !reply->IsError();
+}
+
+bool Read(WritePath& wp, const abyss::core::RespCommand& cmd) {
+  auto reply = wp.engine->DispatchRead(cmd.args.front(), cmd);
+  return reply.has_value() && !reply->IsError();
+}
+
+// Writes `entries` keys through the engine, then waits until cold has
+// drained them so the measured window has no backlog. A fixed shape
+// writes one MSET of a shard's keys at a time; a trace shape creates
+// each key as its type, one write each.
 Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
-                     const std::string& value) {
+                     const abyss::perf::probe::WorkloadShape& shape, bool trace,
+                     const std::string& value, uint64_t seed) {
   const uint32_t shards = wp.hot_store->shard_count();
-  std::vector<std::vector<abyss::core::QueueEntry>> pending(shards);
-  const auto append = [&](uint32_t shard) -> Result<void> {
-    auto& batch = pending[shard];
-    if (batch.empty()) return {};
-    auto appended = wp.queue->AppendBatch(shard, batch);
-    batch.clear();
-    if (!appended.has_value()) return std::unexpected(appended.error());
-    return appended->durable.get();
+  std::mt19937_64 rng{seed};
+  for (uint64_t i = 0; trace && i < entries; ++i) {
+    for (auto& cmd : shape.Create(i % key_count, rng)) {
+      if (!Write(wp, std::move(cmd))) {
+        return std::unexpected(Error(ErrorCode::kInternal, "a prefill write failed"));
+      }
+    }
+  }
+  if (trace) entries = 0;
+  std::vector<abyss::core::RespCommand> pending(shards);
+  const auto write = [&](uint32_t shard) -> Result<void> {
+    auto& mset = pending[shard];
+    if (mset.args.empty()) return {};
+    auto reply = wp.engine->DispatchFanOut(abyss::core::MultiKeyKind::kMset, std::move(mset));
+    mset = {};
+    if (!reply.has_value()) return std::unexpected(reply.error());
+    if (reply->IsError()) {
+      return std::unexpected(Error(ErrorCode::kInternal, std::string(reply->ErrorMessage())));
+    }
+    return {};
   };
   for (uint64_t i = 0; i < entries; ++i) {
-    auto cmd = CanonicalSet(KeyFor(i % key_count), value);
-    if (!cmd.has_value()) return std::unexpected(cmd.error());
-    const auto shard = abyss::core::ComputeShard(cmd->args[1], shards);
-    pending[shard].push_back({
-        .appended_at = abyss::core::WallClock::now(),
-        .payload = abyss::core::entry::Write{.cmd = std::move(*cmd)},
-    });
-    if (pending[shard].size() == kPrefillBatch) {
-      if (auto r = append(shard); !r.has_value()) return r;
+    std::string key = shape.Key(i % key_count);
+    const auto shard = abyss::core::ComputeShard(key, shards);
+    auto& mset = pending[shard];
+    if (mset.args.empty()) mset.args.emplace_back("MSET");
+    mset.args.push_back(std::move(key));
+    mset.args.push_back(value);
+    if ((mset.args.size() - 1) / 2 == kPrefillBatch) {
+      if (auto r = write(shard); !r.has_value()) return r;
     }
   }
   for (uint32_t shard = 0; shard < shards; ++shard) {
-    if (auto r = append(shard); !r.has_value()) return r;
+    if (auto r = write(shard); !r.has_value()) return r;
   }
 
   const auto deadline = Clock::now() + kPrefillDrainTimeout;
@@ -384,9 +409,7 @@ Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
     const auto tail = wp.queue->TailSeq(shard);
     if (!tail.has_value()) return std::unexpected(tail.error());
     const auto drained = [&] {
-      return wp.hot_pool->HighestSettledSeq(shard) >= *tail &&
-             wp.cold_pool->ConsumerFor(shard).LatestDrainedSeq() >= *tail &&
-             wp.resolver_pool->ConsumerFor(shard).GetSnapshot().latest_drained_seq >= *tail;
+      return wp.cold_pool->ConsumerFor(shard).LatestDrainedSeq() >= *tail;
     };
     while (!drained()) {
       if (Clock::now() > deadline) {
@@ -398,6 +421,99 @@ Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
   return {};
 }
 
+// How many of up to kTtlSamples keys, spread over the key space, carry
+// a TTL, read through the read path as PTTL.
+struct TtlShare {
+  uint64_t with_ttl = 0;
+  uint64_t without = 0;
+  uint64_t missing = 0;
+};
+
+TtlShare SampleTtls(WritePath& wp, const abyss::perf::probe::WorkloadShape& shape,
+                    uint64_t key_count) {
+  TtlShare share;
+  const uint64_t n = std::min(key_count, kTtlSamples);
+  for (uint64_t i = 0; i < n; ++i) {
+    const abyss::core::RespCommand cmd{.args = {"PTTL", shape.Key(i * key_count / n)}};
+    const auto reply = wp.engine->DispatchRead("PTTL", cmd);
+    if (!reply.has_value() || !reply->IsInteger()) continue;
+    if (reply->AsInteger() >= 0) {
+      ++share.with_ttl;
+    } else if (reply->AsInteger() == -1) {
+      ++share.without;
+    } else {
+      ++share.missing;
+    }
+  }
+  return share;
+}
+
+void RecordTtlShare(abyss::perf::RunReport& report, const std::string& when,
+                    const TtlShare& share) {
+  const uint64_t present = share.with_ttl + share.without;
+  report.measured["ttl_share_" + when] =
+      present > 0 ? static_cast<double>(share.with_ttl) / static_cast<double>(present) : 0.0;
+  report.measured["ttl_keys_sampled_" + when] = static_cast<double>(present + share.missing);
+  report.measured["ttl_keys_missing_" + when] = static_cast<double>(share.missing);
+}
+
+// Page faults around each measured write, from getrusage.
+struct FaultTally {
+  uint64_t writes = 0;
+  uint64_t faulted = 0;
+  uint64_t minor = 0;
+  uint64_t major = 0;
+  uint64_t slow = 0;
+  uint64_t slow_faulted = 0;
+  uint64_t slow_minor = 0;
+
+  void Add(const FaultTally& other) {
+    writes += other.writes;
+    faulted += other.faulted;
+    minor += other.minor;
+    major += other.major;
+    slow += other.slow;
+    slow_faulted += other.slow_faulted;
+    slow_minor += other.slow_minor;
+  }
+};
+
+bool CountedWrite(WritePath& wp, abyss::core::RespCommand cmd, FaultTally& tally) {
+  rusage before{};
+  getrusage(kFaultScope, &before);
+  const auto start = Clock::now();
+  const bool ok = Write(wp, std::move(cmd));
+  const auto elapsed = Clock::now() - start;
+  rusage after{};
+  getrusage(kFaultScope, &after);
+  const auto minor = static_cast<uint64_t>(after.ru_minflt - before.ru_minflt);
+  const auto major = static_cast<uint64_t>(after.ru_majflt - before.ru_majflt);
+  const bool slow = elapsed > kSlowWrite;
+  ++tally.writes;
+  tally.faulted += minor + major > 0 ? 1 : 0;
+  tally.minor += minor;
+  tally.major += major;
+  tally.slow += slow ? 1 : 0;
+  tally.slow_faulted += slow && minor + major > 0 ? 1 : 0;
+  tally.slow_minor += slow ? minor : 0;
+  return ok;
+}
+
+// Holds every WAL flush until opened: --hold-wal-flushes.
+struct FlushGate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+
+  void Open() {
+    {
+      const std::scoped_lock lock(mu);
+      open = true;
+    }
+    cv.notify_all();
+  }
+};
+
 // The server's io_threads default; workers emulate its reactors, each
 // blocking in DispatchWrite.
 int ReactorCount() {
@@ -405,11 +521,10 @@ int ReactorCount() {
   return static_cast<int>(std::clamp<uint32_t>(hw == 0 ? 1U : hw, 1U, 16U));
 }
 
-abyss::perf::MetricSnapshot SnapshotRegistry(std::string phase) {
+abyss::perf::MetricSnapshot SnapshotOf(std::string phase, const std::string& scrape) {
   return {
       .phase = std::move(phase),
-      .metrics =
-          abyss::perf::MetricsScraper::ParseMetrics(abyss::metrics::Registry::Instance().Scrape()),
+      .metrics = abyss::perf::MetricsScraper::ParseMetrics(scrape),
   };
 }
 
@@ -429,6 +544,12 @@ int main(int argc, char** argv) {
   uint64_t flush_samples = 1000;
   uint32_t flush_concurrency = 0;
   uint64_t prefill_entries = 0;
+  std::string metrics_out;
+  std::string shape_name = "fixed";
+  double large_fraction = 0.0;
+  double collection_fraction = 0.2;
+  bool count_faults = false;
+  bool hold_wal_flushes = false;
   auto quiet_threshold_s = static_cast<uint64_t>(config.cold_consumer.quiet_threshold.count());
   app.add_option("--wal-path", wal_path, "WAL directory; must be empty or absent (default: temp)");
   app.add_option("--cold-path", cold_path,
@@ -436,11 +557,31 @@ int main(int argc, char** argv) {
   app.add_option("--durability", durability_name,
                  "process_crash (evaluates W1) | power_loss (evaluates W2)");
   app.add_option("--shards", config.hot.shard_count, "Shard count");
+  app.add_option("--hot-max-memory-bytes", config.hot.max_memory_bytes, "Hot store memory budget");
+  app.add_option("--fill-doorkeeper", config.hot.fill_doorkeeper,
+                 "Fill hot from a read only on a key's second miss");
   app.add_option("--segment-size-bytes", config.queue.segment_size_bytes, "WAL segment size");
   app.add_option("--log-count", config.queue.log_count, "Physical WAL logs, a power of two");
   app.add_option("--quiet-threshold-s", quiet_threshold_s, "Cold consumer quiet threshold");
   app.add_option("--prefill-entries", prefill_entries,
                  "WAL entries appended and drained before measuring");
+  app.add_option("--shape", shape_name,
+                 "fixed (one value size, no TTL, strings) | trace (cache-trace keys, values, "
+                 "TTLs and types)")
+      ->check(CLI::IsMember({"fixed", "trace"}));
+  app.add_option("--large-fraction", large_fraction, "fixed shape: share of values of 16-64 KiB")
+      ->check(CLI::Range(0.0, 1.0));
+  app.add_option("--collection-fraction", collection_fraction,
+                 "trace shape: share of keys that are sets and sorted sets, half each")
+      ->check(CLI::Range(0.0, 1.0));
+  app.add_flag("--count-faults", count_faults,
+               "Diagnostic: count page faults around each measured write, the writing "
+               "thread's on Linux and the whole process's on macOS (getrusage)");
+  app.add_flag("--hold-wal-flushes", hold_wal_flushes,
+               "Diagnostic, process_crash only: the WAL flushes nothing during the run, "
+               "so cold, which persists only power-durable entries, persists nothing");
+  app.add_option("--metrics-out", metrics_out,
+                 "Also write the raw registry scrapes to <path>.start.prom and <path>.end.prom");
   app.add_option("--flush-samples", flush_samples, "Device flush calibration samples")
       ->check(CLI::PositiveNumber);
   app.add_option("--flush-concurrency", flush_concurrency,
@@ -466,12 +607,30 @@ int main(int argc, char** argv) {
   mix.weights[std::string{kOpWrite}] = 1.0;
   if (!args.mix_spec.empty()) {
     auto parsed = abyss::perf::probe::ParseMixSpec(args.mix_spec);
-    if (!parsed.has_value() || parsed->weights.size() != 1 ||
-        !parsed->weights.contains(std::string{kOpWrite})) {
-      std::cerr << "invalid mix: the write probe runs " << kOpWrite << " only\n";
+    if (!parsed.has_value() || !parsed->weights.contains(std::string{kOpWrite}) ||
+        std::ranges::any_of(parsed->weights, [](const auto& weight) {
+          return weight.first != kOpWrite && weight.first != kOpRead;
+        })) {
+      std::cerr << "invalid mix: the write probe runs " << kOpWrite << ", and optionally "
+                << kOpRead << '\n';
       return 2;
     }
+    mix = *std::move(parsed);
   }
+  if (hold_wal_flushes) {
+    if (*durability != abyss::core::Durability::kProcessCrash) {
+      std::cerr << "write_probe: --hold-wal-flushes needs --durability process_crash\n";
+      return 2;
+    }
+    if (args.warmup + args.duration > kHeldRunLimit) {
+      std::cerr << "write_probe: --hold-wal-flushes needs --warmup plus --duration of at most "
+                << kHeldRunLimit.count() << " s\n";
+      return 2;
+    }
+    config.queue.durability_window = kHeldWindow;
+    config.queue.durability_window_bytes = kHeldWindowBytes;
+  }
+  const bool trace = shape_name == "trace";
 
   std::unique_ptr<abyss::testing::TempDir> tmp_owner;
   if (wal_path.empty() || cold_path.empty()) {
@@ -519,26 +678,60 @@ int main(int argc, char** argv) {
   auto& wp = **write_path;
   StartWritePath(wp);
 
+  const abyss::perf::probe::WorkloadShape shape{{.trace = trace,
+                                                 .value_bytes = args.value_size_bytes,
+                                                 .large_fraction = large_fraction,
+                                                 .collection_fraction = collection_fraction},
+                                                args.key_count};
   const std::string prefill_value(args.value_size_bytes, 'x');
-  if (auto prefilled = Prefill(wp, prefill_entries, args.key_count, prefill_value);
+  if (auto prefilled =
+          Prefill(wp, prefill_entries, args.key_count, shape, trace, prefill_value, args.seed);
       !prefilled.has_value()) {
     std::cerr << "write_probe: prefill failed: " << prefilled.error().message() << '\n';
     StopWritePath(wp, config.cold_consumer.drain_grace);
     return 1;
   }
 
-  std::vector<std::string> values(static_cast<size_t>(args.workers),
-                                  std::string(args.value_size_bytes, 'x'));
-  abyss::perf::OpFn op_fn = [&](int worker_id, std::string_view /*op_name*/, uint64_t key_index) {
-    auto cmd = CanonicalSet(KeyFor(key_index), values[static_cast<size_t>(worker_id)]);
-    if (!cmd.has_value()) return false;
-    auto reply = wp.engine->DispatchWrite("SET", std::move(*cmd));
-    return reply.has_value() && !reply->IsError();
+  std::vector<std::mt19937_64> rngs;
+  rngs.reserve(static_cast<size_t>(args.workers));
+  for (int w = 0; w < args.workers; ++w) {
+    rngs.emplace_back(args.seed + (static_cast<uint64_t>(w) * 7919));
+  }
+  const TtlShare ttl_after_prefill = trace ? SampleTtls(wp, shape, args.key_count) : TtlShare{};
+  std::vector<FaultTally> faults(static_cast<size_t>(args.workers));
+  std::atomic<bool> measuring{false};
+  abyss::perf::OpFn op_fn = [&](int worker_id, std::string_view op_name, uint64_t key_index) {
+    auto& rng = rngs[static_cast<size_t>(worker_id)];
+    if (op_name == kOpRead) return Read(wp, shape.Read(key_index, rng));
+    if (count_faults && measuring.load(std::memory_order_relaxed)) {
+      return CountedWrite(wp, shape.Write(key_index, rng), faults[static_cast<size_t>(worker_id)]);
+    }
+    return Write(wp, shape.Write(key_index, rng));
   };
 
-  auto server_start = SnapshotRegistry("start");
-  auto result = abyss::perf::RunLoop(abyss::perf::probe::MakeRunLoopConfig(args, mix), op_fn);
-  auto server_end = SnapshotRegistry("end");
+  const auto gate = std::make_shared<FlushGate>();
+  if (hold_wal_flushes) {
+    wp.queue->SetFlushHookForTesting([gate](uint32_t /*log*/) -> Result<void> {
+      std::unique_lock lock(gate->mu);
+      gate->cv.wait(lock, [&gate] { return gate->open; });
+      return {};
+    });
+  }
+  // Scraped as the warmup ends, so server histograms cover what the
+  // client's latencies do.
+  std::string scrape_start;
+  abyss::consumer::ColdConsumerPool::AggregateMetrics cold_start;
+  auto run_config = abyss::perf::probe::MakeRunLoopConfig(args, mix);
+  run_config.at_measure_start = [&] {
+    scrape_start = abyss::metrics::Registry::Instance().Scrape();
+    cold_start = wp.cold_pool->Snapshot();
+    measuring.store(true, std::memory_order_relaxed);
+  };
+  auto result = abyss::perf::RunLoop(run_config, op_fn);
+  const std::string scrape_end = abyss::metrics::Registry::Instance().Scrape();
+  const auto cold_end = wp.cold_pool->Snapshot();
+  gate->Open();
+  const TtlShare ttl_at_end = trace ? SampleTtls(wp, shape, args.key_count) : TtlShare{};
 
   const auto workload = abyss::perf::probe::MakeWorkloadConfig(args, mix, targets);
   auto report = abyss::perf::probe::BuildReport(args, workload, result);
@@ -549,10 +742,17 @@ int main(int argc, char** argv) {
   report.config = {
       {"durability", std::string{abyss::core::DurabilityName(config.queue.durability)}},
       {"shard_count", std::to_string(config.hot.shard_count)},
+      {"hot_max_memory_bytes", std::to_string(config.hot.max_memory_bytes)},
+      {"fill_doorkeeper", config.hot.fill_doorkeeper ? "true" : "false"},
       {"segment_size_bytes", std::to_string(config.queue.segment_size_bytes)},
       {"log_count", std::to_string(config.queue.log_count)},
       {"cold_quiet_threshold_s", std::to_string(quiet_threshold_s)},
       {"value_size_bytes", std::to_string(args.value_size_bytes)},
+      {"shape", shape_name},
+      {"large_fraction", std::to_string(large_fraction)},
+      {"collection_fraction", std::to_string(collection_fraction)},
+      {"hold_wal_flushes", hold_wal_flushes ? "true" : "false"},
+      {"durability_window_ms", std::to_string(config.queue.durability_window.count())},
       {"prefill_entries", std::to_string(prefill_entries)},
       {"workers", std::to_string(args.workers)},
       {"workers_model", "reactor"},
@@ -563,7 +763,38 @@ int main(int argc, char** argv) {
       calibration->histogram, calibration->samples, calibration->elapsed);
   report.operations[std::string{kOpFlushConcurrent}] = abyss::perf::StatsFromHistogram(
       concurrent->histogram, concurrent->samples, concurrent->elapsed);
-  report.server_metrics = {std::move(server_start), std::move(server_end)};
+  const double measured_s = std::chrono::duration<double>(result.measured_duration).count();
+  if (measured_s > 0) {
+    const auto flushes = [](const abyss::consumer::ColdConsumerPool::AggregateMetrics& m) {
+      return m.flushes_quiet + m.flushes_deadline + m.flushes_aggressive;
+    };
+    report.measured["cold_ops_flushed_per_s"] =
+        static_cast<double>(cold_end.ops_flushed - cold_start.ops_flushed) / measured_s;
+    report.measured["cold_flushes_per_s"] =
+        static_cast<double>(flushes(cold_end) - flushes(cold_start)) / measured_s;
+  }
+  if (trace) {
+    RecordTtlShare(report, "after_prefill", ttl_after_prefill);
+    RecordTtlShare(report, "at_end", ttl_at_end);
+  }
+  if (count_faults) {
+    FaultTally total;
+    for (const FaultTally& tally : faults) total.Add(tally);
+    report.config["fault_scope"] = std::string{kFaultScopeName};
+    report.measured["fault_writes"] = static_cast<double>(total.writes);
+    report.measured["fault_writes_faulted"] = static_cast<double>(total.faulted);
+    report.measured["fault_minor"] = static_cast<double>(total.minor);
+    report.measured["fault_major"] = static_cast<double>(total.major);
+    report.measured["fault_slow_writes"] = static_cast<double>(total.slow);
+    report.measured["fault_slow_writes_faulted"] = static_cast<double>(total.slow_faulted);
+    report.measured["fault_slow_minor"] = static_cast<double>(total.slow_minor);
+  }
+  report.server_metrics = {SnapshotOf("start", scrape_start), SnapshotOf("end", scrape_end)};
+  report.server_histograms = abyss::perf::SummariseHistograms(scrape_start, scrape_end);
+  if (!metrics_out.empty()) {
+    std::ofstream(metrics_out + ".start.prom") << scrape_start;
+    std::ofstream(metrics_out + ".end.prom") << scrape_end;
+  }
   result.per_op_histograms.insert_or_assign(std::string{kOpFlush},
                                             std::move(calibration->histogram));
   result.per_op_histograms.insert_or_assign(std::string{kOpFlushConcurrent},

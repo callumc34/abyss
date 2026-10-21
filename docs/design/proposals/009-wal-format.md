@@ -2,9 +2,9 @@
 
 **Status:** Accepted
 **Created:** 2026-04-15
-**Updated:** 2026-10-02
+**Updated:** 2026-10-09
 
-> **Format 2.** This revision replaces format 1's per-shard segment files with the physical log of [ADP-015](015-write-path-and-durability.md) §Log durability pipeline: one log per data volume carrying every shard's stream, in fixed-size, recycled, memory-mapped segments. A data directory in the format 1 layout refuses to start; there is no migration, because no format 1 WAL exists outside development. Entries will carry decided effects in Phase 2 of ADP-015.
+> **Format 3.** Format 2 replaced format 1's per-shard segment files with the physical log of [ADP-015](015-write-path-and-durability.md) §Log durability pipeline: one log per data volume carrying every shard's stream, in fixed-size, recycled, memory-mapped segments. Format 3 keeps that layout and changes what an entry means: entries carry decided effects (ADP-015 §Sequenced write path), the `Conditional` and `Resolved` entry types are retired, and `kReplacesState` (below) marks an effect that alone determines its key. A format 2 frame read as format 3 would replay wrongly, so the major changed. A data directory in the format 1 layout, or holding any file of format 2, refuses to start, naming the file and both majors; there is no migration, because neither exists outside development.
 
 ## Context
 
@@ -14,7 +14,7 @@ The format must:
 
 - **Commit lock-free.** Many appenders on different shards share one log. Each fills its own reserved range, and a single store makes a frame visible.
 - **Make the end of the log unambiguous** after a crash or power loss, including in a recycled segment that still holds the frames of its previous life.
-- **Decode quickly** on the hot consumer's critical path, and let a reader skip other shards' frames by reading headers only.
+- **Decode quickly** on the read and replay paths, and let a reader skip other shards' frames by reading headers only.
 - **Support additive schema changes** without a major version bump or a data migration.
 - **Add no heavy build dependencies**, and stay inspectable with `xxd` or `hexdump`.
 
@@ -55,7 +55,7 @@ One 4 KiB block, so frames start page-aligned. Little-endian throughout.
 | Field | Type | Description |
 |---|---|---|
 | `magic` | 4 bytes | Identifies an Abyss WAL segment |
-| `format_major` | u8 | 2 |
+| `format_major` | u8 | 3 |
 | `format_minor` | u8 | 0 |
 | reserved | u16 | Zero |
 | `log_id` | u32 | The log this segment belongs to |
@@ -82,7 +82,7 @@ Every frame starts 8-byte aligned.
 | `kind` | u8 | `1` entry, `2` padding. Any other kind under a valid CRC is corruption (a newer format) |
 | `type` | u8 | The entry type (below) |
 | `shard` | u16 | The shard whose stream the entry belongs to |
-| reserved | u32 | Zero |
+| `flags` | u32 | Bit 0 is `kReplacesState` (below). Every other bit is zero; an unknown bit under a valid CRC is corruption |
 | `seq` | u64 | The entry's sequence id within its shard |
 | `batch_rest` | u64 | Bytes from this frame's start to the end of its batch. A single entry's equals its own frame size |
 | `appended_at_us` | i64 | Wall-clock microseconds |
@@ -95,11 +95,21 @@ The fixed overhead is 44 bytes plus padding, against format 1's 37. It buys lock
 
 | `type` | Meaning | Payload |
 |---|---|---|
-| `0` | `Write`: an unconditional RESP command | `arg_count` u32, then each arg as `len` u32 plus bytes |
-| `1` | `Conditional`: a command with a predicate ([ADP-011](011-conditional-writes-and-consumer-rpc.md)) | flags u16, then the command as for `Write` |
-| `2` | `Resolved`: the decision for a prior `Conditional` | ref seq u64, decision u8, op count u32, each materialised op as a command, then the return value (RESP2, length-prefixed) |
+| `0` | `Write`: one decided effect, as a canonical RESP command | `arg_count` u32, then each arg as `len` u32 plus bytes |
+| `1`, `2` | Reserved: the retired `Conditional` and `Resolved` types | |
 | `3` | `Flush`: a FLUSHDB / FLUSHALL tombstone ([ADP-006](006-read-write-paths.md) §Broadcast write path) | None |
 | `4–255` | Reserved | |
+
+The log carries only decided effects ("decide-then-log", ADP-015 §Sequenced write path). The sequencer decides a conditional command (`SET NX`, `ZADD GT`, `RENAMENX` and so on) against the key's complete state in hot, and logs what it decided as plain `Write` frames, or nothing when the decision has no effect. Replay applies effects and re-decides nothing, so no entry type carries a predicate or a decision.
+
+Types `1` and `2` belonged to `Conditional` (a command with a predicate) and `Resolved` (the decision for a prior `Conditional`, [ADP-011](011-conditional-writes-and-consumer-rpc.md)). They are retired in format 3, so no format 3 log holds them (a format 2 log refuses by its major, before any entry is read), and the bytes stay reserved so they are never reused with another meaning. A frame whose type is not `0` or `3`, or whose flags hold an unknown bit, is corruption under a valid CRC: a positioned read that meets one fail-stops, naming the shard and seq, and the recovery scan fails. It is never skipped as a poison entry.
+
+**`kReplacesState`.** The sequencer sets this flag on a `Write` whose effect alone determines its key's whole state:
+- `SET` and `DEL`;
+- an `SADD`, `HSET` or `ZADD` that creates its key;
+- the effect that recreates `RENAMENX`'s or `COPY`'s destination from the source's whole value (a `SET`, `SADD`, `ZADD` or `HSET`). The `EXPIRE` that follows a recreated collection is not flagged.
+
+The hot replayer uses it to rebuild only complete keys ([ADP-007](007-recovery.md) §Hot replay): a flagged frame makes its key resident and a `Flush` wipes its shard, while any other frame applies only to a key the rebuild already holds. The cold consumer discards what the key's buffered delta held before a flagged frame ([ADP-004](004-cold-consumer.md) §Compaction Semantics): a removal that empties a collection deletes its key without a `DEL`, so an add of another type may follow it in one compaction window.
 
 ### Writing a frame
 
@@ -184,7 +194,7 @@ The minor-version guarantee rests on three layout rules:
 - removing, renaming, retyping or reordering a field;
 - adding an entry type or frame kind that older readers cannot safely skip.
 
-`Flush` and the `Conditional`/`Resolved` pairing are skip-unsafe.
+`Flush` and the `kReplacesState` flag are skip-unsafe: an older reader that skipped either would rebuild the wrong state.
 
 Each minor bump ships with a round-trip compatibility test in both directions.
 
@@ -194,10 +204,10 @@ Each minor bump ships with a round-trip compatibility test in both directions.
 2. Every byte below the filled prefix `P` belongs to a filled frame. An append acknowledged at `process_crash` lies below `P`; one acknowledged at `power_loss` lies below `D`.
 3. A frame left over from a segment's previous life never reads as filled: its generation is smaller. The filled prefix never depends on bytes read from the mapping.
 4. The end of the log is the first frame that is unfilled or fails its CRC. No frame past it is ever replayed.
-5. Within a shard, sequence ids are contiguous and their positions increase. Per-shard seq order is log order.
+5. Within a shard, sequence ids start at 1, are contiguous, and their positions increase. Per-shard seq order is log order. Seq 0 names no entry, so a frame that carries it is corruption.
 6. After recovery, every batch is present in full or not at all.
-7. A reader refuses a log with an unsupported `format_major` in any of its files, an unknown frame kind, or a header that does not verify on a segment holding frames. Recovery deletes no segment that holds frames of its own generation. Past the recovered end such frames are unacknowledged, and their segment is renumbered.
-8. Every `Write` entry holds a command that parses. Unconditional writes are canonicalised before the append ([ADP-006](006-read-write-paths.md) §Canonical form on the write path). A parse failure on a `Write` is therefore a corruption signal, or a command whose parser is absent from the reading build.
+7. A reader refuses a log with an unsupported `format_major` in any of its files, an unknown frame kind, entry type or flag bit, or a header that does not verify on a segment holding frames. Recovery deletes no segment that holds frames of its own generation. Past the recovered end such frames are unacknowledged, and their segment is renumbered.
+8. Every `Write` entry holds a command that parses. Decided effects are canonicalised before the append ([ADP-006](006-read-write-paths.md) §Canonical form on the write path). A parse failure on a `Write` is therefore a corruption signal, or a command whose parser is absent from the reading build.
 
 ## Trade-offs
 
@@ -211,7 +221,7 @@ With concurrent appenders, a length prefix written first cannot say whether the 
 Zero-filling every segment writes each byte twice. On a 125 MiB/s volume that halves WAL bandwidth. Recycling writes each byte once in steady state; the generation makes stale frames inert. New segments are zero-filled only when the pool has to grow (ADP-015).
 
 **Why a relative `batch_rest` instead of a batch's last sequence id?**
-Batch closure by position is independent of shards, so ADP-015 Phase 2's cross-shard batch (consecutive frames of several shards in one reservation) needs no format change. A relative length is also known at encode time, before the frame is reserved.
+Batch closure by position is independent of shards, so a cross-shard batch (consecutive frames of several shards in one reservation, ADP-015 §Cross-shard atomic commands) needs no format change. A relative length is also known at encode time, before the frame is reserved.
 
 **Why fixed u32 lengths instead of varints?**
 They are branchless and simple. Disk is cheap relative to decode latency.

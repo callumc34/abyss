@@ -127,6 +127,43 @@ TEST(ReporterTest, JsonRecordsServerIdentityAndPipelineDepth) {
   EXPECT_NE(json.find(R"("schema_version":1)"), std::string::npos);
 }
 
+TEST(ReporterTest, ServerHistogramsAreReportedOnlyWhenPresent) {
+  auto report = MakeFixtureReport();
+  std::ostringstream without;
+  WriteReportJson(report, without);
+  EXPECT_EQ(without.str().find("server_histograms"), std::string::npos);
+
+  report.server_histograms.push_back({.series = R"(h_seconds{phase="a"})",
+                                      .count = 4,
+                                      .mean_us = 1.5,
+                                      .p50_us = {.le = 1, .samples = 4},
+                                      .p99_us = {.le = 2, .samples = 1},
+                                      .p999_us = {.le = 2, .beyond = true, .samples = 1}});
+  std::ostringstream with;
+  WriteReportJson(report, with);
+  EXPECT_NE(with.str().find(R"("server_histograms":[{"series":"h_seconds{phase=\"a\"}","count":4,)"
+                            R"("mean_us":1.5,"p50":{"le_us":1,"beyond":false,"samples":4},)"
+                            R"("p99":{"le_us":2,"beyond":false,"samples":1},)"
+                            R"("p999":{"le_us":2,"beyond":true,"samples":1}}])"),
+            std::string::npos)
+      << with.str();
+}
+
+TEST(ReporterTest, JsonRecordsTheSourceTreeAndWhatTheProbeMeasured) {
+  auto report = MakeFixtureReport();
+  report.build.source_tree = "abc+dirty.123";
+  std::ostringstream without;
+  WriteReportJson(report, without);
+  EXPECT_NE(without.str().find(R"("source_tree":"abc+dirty.123")"), std::string::npos);
+  EXPECT_EQ(without.str().find(R"("measured")"), std::string::npos);
+
+  report.measured["ttl_share"] = 0.5;
+  std::ostringstream with;
+  WriteReportJson(report, with);
+  EXPECT_NE(with.str().find(R"("measured":{"ttl_share":0.5})"), std::string::npos) << with.str();
+  EXPECT_FALSE(CurrentBuildInfo().source_tree.empty());
+}
+
 TEST(ReporterTest, JsonRecordsErrorsConfigAndDriver) {
   auto report = MakeFixtureReport();
   OperationStats set_stats;
@@ -136,8 +173,10 @@ TEST(ReporterTest, JsonRecordsErrorsConfigAndDriver) {
   report.config["appendfsync"] = "always";
   Histogram lag;
   lag.Record(80'000);
-  report.driver = MakeDriverStats(lag, true, std::chrono::seconds{1}, std::chrono::seconds{2},
-                                  report.workload.targets);
+  Histogram backlog;
+  backlog.Record(900'000);
+  report.driver = MakeDriverStats(lag, backlog, true, std::chrono::seconds{1},
+                                  std::chrono::seconds{2}, report.workload.targets);
 
   std::ostringstream out;
   WriteReportJson(report, out);
@@ -146,6 +185,7 @@ TEST(ReporterTest, JsonRecordsErrorsConfigAndDriver) {
   EXPECT_NE(json.find(R"("config":{"appendfsync":"always"})"), std::string::npos);
   EXPECT_NE(json.find(R"("lagging":true)"), std::string::npos);
   EXPECT_NE(json.find(R"("send_lag_us":{"count":1)"), std::string::npos);
+  EXPECT_NE(json.find(R"("backlog_us":{"count":1,"p50":)"), std::string::npos);
 }
 
 TEST(ReporterTest, DriverLagIsJudgedAgainstTargets) {
@@ -155,20 +195,34 @@ TEST(ReporterTest, DriverLagIsJudgedAgainstTargets) {
   lag.Record(20'000);  // under 50us, but over 10% of the 100us target
   const std::chrono::nanoseconds cpu{0};
   const std::chrono::nanoseconds wall{std::chrono::seconds{1}};
-  EXPECT_TRUE(MakeDriverStats(lag, true, cpu, wall, targets).lagging);
-  EXPECT_FALSE(MakeDriverStats(lag, true, cpu, wall, WorkloadTargets{}).lagging);
-  EXPECT_FALSE(MakeDriverStats(Histogram{}, false, cpu, wall, targets).lagging);
+  EXPECT_TRUE(MakeDriverStats(lag, {}, true, cpu, wall, targets).lagging);
+  EXPECT_FALSE(MakeDriverStats(lag, {}, true, cpu, wall, WorkloadTargets{}).lagging);
+  EXPECT_FALSE(MakeDriverStats(Histogram{}, {}, false, cpu, wall, targets).lagging);
+}
+
+// A system that falls behind is backlog, which never makes the driver
+// lagging however long it gets.
+TEST(ReporterTest, BacklogIsNotDriverLag) {
+  WorkloadTargets targets;
+  targets.per_op["SET"].p99_us = 20;
+  Histogram backlog;
+  for (int i = 0; i < 100; ++i) backlog.Record(5'000'000);
+  const auto stats = MakeDriverStats(Histogram{}, backlog, true, std::chrono::nanoseconds{0},
+                                     std::chrono::seconds{1}, targets);
+  EXPECT_FALSE(stats.lagging);
+  EXPECT_EQ(stats.backlog_count, 100U);
+  EXPECT_GE(stats.backlog_p99_ns, 4'990'000);
 }
 
 // The overload threshold is the larger of one core and 10% of the host.
 TEST(ReporterTest, DriverOverloadIsJudgedAgainstTheHost) {
   const std::chrono::nanoseconds wall{std::chrono::seconds{10}};
-  const auto idle = MakeDriverStats(Histogram{}, true, std::chrono::seconds{1}, wall, {});
+  const auto idle = MakeDriverStats(Histogram{}, {}, true, std::chrono::seconds{1}, wall, {});
   EXPECT_DOUBLE_EQ(idle.cpu_per_wall_second, 0.1);
   EXPECT_GE(idle.overload_threshold_cores, 1.0);
   EXPECT_FALSE(idle.overloaded);
 
-  const auto busy = MakeDriverStats(Histogram{}, true, std::chrono::seconds{2000}, wall, {});
+  const auto busy = MakeDriverStats(Histogram{}, {}, true, std::chrono::seconds{2000}, wall, {});
   EXPECT_DOUBLE_EQ(busy.cpu_per_wall_second, 200.0);
   EXPECT_TRUE(busy.overloaded);
 }

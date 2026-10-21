@@ -27,7 +27,7 @@ using namespace std::chrono_literals;
 //           cold lazy-expiry bumps kTtlExpiredTotal{cold} on read.
 //   integration (this file) — the engine routes correctly through the queue,
 //           hot store, compaction buffer, and cold store for each scenario,
-//           for strings + every collection that has a promotion-or-read path.
+//           for strings + every collection.
 //   system — same scenarios end-to-end through the abyss-server binary.
 class TwoTtlIntegrationTest : public ::testing::Test {
  protected:
@@ -74,7 +74,9 @@ class TwoTtlIntegrationTest : public ::testing::Test {
 
 TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesStringToCold) {
   ASSERT_TRUE(
-      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "ev_short:s", "v"})).has_value());
+      harness_.Engine()
+          .DispatchWrite("SET", MakeCmd({"SET", "ev_short:s", "v"}), core::PredicateFlags::kNone)
+          .has_value());
   auto hot = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ev_short:s"}));
   ASSERT_TRUE(hot.has_value()) << hot.error().message();
   EXPECT_EQ(hot->AsString(), "v");
@@ -93,7 +95,8 @@ TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesStringToCold) {
 
 TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesSetToCold) {
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("SADD", MakeCmd({"SADD", "ev_short:set", "a", "b", "c"}))
+                  .DispatchWrite("SADD", MakeCmd({"SADD", "ev_short:set", "a", "b", "c"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   EXPECT_EQ(
       harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "ev_short:set"}))->AsInteger(), 3);
@@ -115,7 +118,8 @@ TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesSetToCold) {
 
 TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesHashToCold) {
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("HSET", MakeCmd({"HSET", "ev_short:h", "f1", "v1", "f2", "v2"}))
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "ev_short:h", "f1", "v1", "f2", "v2"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "ev_short:h"}))->AsInteger(),
             2);
@@ -135,7 +139,8 @@ TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesHashToCold) {
 
 TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesZsetToCold) {
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("ZADD", MakeCmd({"ZADD", "ev_short:z", "1", "x", "2.5", "y"}))
+                  .DispatchWrite("ZADD", MakeCmd({"ZADD", "ev_short:z", "1", "x", "2.5", "y"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("ZCARD", MakeCmd({"ZCARD", "ev_short:z"}))->AsInteger(),
             2);
@@ -159,7 +164,8 @@ TEST_F(TwoTtlIntegrationTest, S1_EvictionMovesZsetToCold) {
 TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesStringFromAllTiers) {
   const auto ttl_ms = WallMs() + 3000;
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("SET", MakeCmd({"SET", "s2", "v", "PXAT", std::to_string(ttl_ms)}))
+                  .DispatchWrite("SET", MakeCmd({"SET", "s2", "v", "PXAT", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "s2"}))->AsString(), "v");
 
@@ -177,12 +183,15 @@ TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesStringFromAllTiers) {
 
 TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesSetFromAllTiers) {
   ASSERT_TRUE(
-      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "s2set", "a", "b"})).has_value());
-  const auto ttl_ms = WallMs() + 3000;
-  ASSERT_TRUE(
       harness_.Engine()
-          .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "s2set", std::to_string(ttl_ms)}))
+          .DispatchWrite("SADD", MakeCmd({"SADD", "s2set", "a", "b"}), core::PredicateFlags::kNone)
           .has_value());
+  const auto ttl_ms = WallMs() + 3000;
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("PEXPIREAT",
+                                 MakeCmd({"PEXPIREAT", "s2set", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
+                  .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "s2set"}))->AsInteger(), 2);
 
   DrainAndFlushCold("s2set");
@@ -200,11 +209,13 @@ TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesSetFromAllTiers) {
 
 TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesHashFromAllTiers) {
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("HSET", MakeCmd({"HSET", "s2h", "f1", "v1", "f2", "v2"}))
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "s2h", "f1", "v1", "f2", "v2"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   const auto ttl_ms = WallMs() + 3000;
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "s2h", std::to_string(ttl_ms)}))
+                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "s2h", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "s2h"}))->AsInteger(), 2);
 
@@ -221,11 +232,13 @@ TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesHashFromAllTiers) {
 
 TEST_F(TwoTtlIntegrationTest, S2_AbsoluteTtlDeletesZsetFromAllTiers) {
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("ZADD", MakeCmd({"ZADD", "s2z", "1", "x", "2", "y"}))
+                  .DispatchWrite("ZADD", MakeCmd({"ZADD", "s2z", "1", "x", "2", "y"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   const auto ttl_ms = WallMs() + 3000;
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "s2z", std::to_string(ttl_ms)}))
+                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "s2z", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("ZCARD", MakeCmd({"ZCARD", "s2z"}))->AsInteger(), 2);
 
@@ -246,7 +259,8 @@ TEST_F(TwoTtlIntegrationTest, S3_StringEvictsThenTtlExpires) {
   const auto ttl_ms = WallMs() + 5000;
   ASSERT_TRUE(
       harness_.Engine()
-          .DispatchWrite("SET", MakeCmd({"SET", "ev_short:k", "v", "PXAT", std::to_string(ttl_ms)}))
+          .DispatchWrite("SET", MakeCmd({"SET", "ev_short:k", "v", "PXAT", std::to_string(ttl_ms)}),
+                         core::PredicateFlags::kNone)
           .has_value());
   EXPECT_EQ(harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ev_short:k"}))->AsString(), "v");
 
@@ -262,29 +276,27 @@ TEST_F(TwoTtlIntegrationTest, S3_StringEvictsThenTtlExpires) {
   ASSERT_TRUE(r2.has_value());
   EXPECT_EQ(r2->AsString(), "v") << "evicted key still readable from cold";
 
-  // Drain the promotion's queue entry through to cold so the next eviction
-  // pass can find any promoted hot residue. (Strings have a promotion path;
-  // collections currently do not — see RocksdbStore::GetPromotionCommand.)
   DrainAndFlushCold("ev_short:k");
 
   // Advance further. Total wall = 6s, past the 5s TTL. Total steady = 6s,
-  // past the eviction window (refreshed by the promotion-induced re-apply
-  // in hot, but TTL is unmoved).
+  // past the eviction window; a cache fill keeps the key's TTL.
   harness_.Clock().Advance(3s);
 
   auto r3 = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "ev_short:k"}));
   ASSERT_TRUE(r3.has_value());
-  EXPECT_TRUE(r3->IsNull()) << "TTL must take the key entirely after promotion+TTL elapsed";
+  EXPECT_TRUE(r3->IsNull()) << "TTL must take the key entirely once it elapsed";
 }
 
 TEST_F(TwoTtlIntegrationTest, S3_SetEvictsThenTtlExpires) {
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("SADD", MakeCmd({"SADD", "ev_short:s3set", "a", "b"}))
+                  .DispatchWrite("SADD", MakeCmd({"SADD", "ev_short:s3set", "a", "b"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   const auto ttl_ms = WallMs() + 5000;
   ASSERT_TRUE(harness_.Engine()
                   .DispatchWrite("PEXPIREAT",
-                                 MakeCmd({"PEXPIREAT", "ev_short:s3set", std::to_string(ttl_ms)}))
+                                 MakeCmd({"PEXPIREAT", "ev_short:s3set", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   DrainAndFlushCold("ev_short:s3set");
 
@@ -312,16 +324,19 @@ TEST_F(TwoTtlIntegrationTest, S3_SetEvictsThenTtlExpires) {
 TEST_F(TwoTtlIntegrationTest, COLDC2_StandaloneExpireOnAlreadyColdSetReachesCold) {
   // Window 1: build the set and flush it to cold with NO TTL.
   ASSERT_TRUE(
-      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c2set", "a", "b"})).has_value());
+      harness_.Engine()
+          .DispatchWrite("SADD", MakeCmd({"SADD", "c2set", "a", "b"}), core::PredicateFlags::kNone)
+          .has_value());
   DrainAndFlushCold("c2set");
   EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c2set"}))->AsInteger(), 2);
 
   // Window 2 (a fresh compaction window): EXPIRE only — no member-bearing op.
   const auto ttl_ms = WallMs() + 3000;
-  ASSERT_TRUE(
-      harness_.Engine()
-          .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2set", std::to_string(ttl_ms)}))
-          .has_value());
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("PEXPIREAT",
+                                 MakeCmd({"PEXPIREAT", "c2set", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
+                  .has_value());
   DrainAndFlushCold("c2set");
 
   // The standalone Expire must have rewritten cold's meta TTL: past the TTL the
@@ -336,15 +351,21 @@ TEST_F(TwoTtlIntegrationTest, COLDC2_StandaloneExpireOnAlreadyColdSetReachesCold
 TEST_F(TwoTtlIntegrationTest, COLDC2_StandalonePersistOnAlreadyColdSetClearsTtl) {
   // Window 1: build a set WITH a TTL and flush to cold.
   ASSERT_TRUE(
-      harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c2p", "a", "b"})).has_value());
+      harness_.Engine()
+          .DispatchWrite("SADD", MakeCmd({"SADD", "c2p", "a", "b"}), core::PredicateFlags::kNone)
+          .has_value());
   const auto ttl_ms = WallMs() + 3000;
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2p", std::to_string(ttl_ms)}))
+                  .DispatchWrite("PEXPIREAT", MakeCmd({"PEXPIREAT", "c2p", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   DrainAndFlushCold("c2p");
 
   // Window 2: PERSIST only — clears the TTL on the already-cold set.
-  ASSERT_TRUE(harness_.Engine().DispatchWrite("PERSIST", MakeCmd({"PERSIST", "c2p"})).has_value());
+  ASSERT_TRUE(
+      harness_.Engine()
+          .DispatchWrite("PERSIST", MakeCmd({"PERSIST", "c2p"}), core::PredicateFlags::kNone)
+          .has_value());
   DrainAndFlushCold("c2p");
 
   // Past the original TTL the set must still be live — the PERSIST window
@@ -361,20 +382,26 @@ TEST_F(TwoTtlIntegrationTest, COLDC2_StandalonePersistOnAlreadyColdSetClearsTtl)
 TEST_F(TwoTtlIntegrationTest, COLDC3_DelThenReaddDoesNotResurrectColdSetMembers) {
   // Window 1: set {a,b,c} flushed to cold.
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "a", "b", "c"}))
+                  .DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "a", "b", "c"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   DrainAndFlushCold("c3set");
   EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 3);
 
   // Window 2: DEL then re-add a single different member. Emit prepends a Del so
   // cold wipes a/b/c before the re-add lands.
-  ASSERT_TRUE(harness_.Engine().DispatchWrite("DEL", MakeCmd({"DEL", "c3set"})).has_value());
-  ASSERT_TRUE(harness_.Engine().DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "x"})).has_value());
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("DEL", MakeCmd({"DEL", "c3set"}), core::PredicateFlags::kNone)
+                  .has_value());
+  ASSERT_TRUE(
+      harness_.Engine()
+          .DispatchWrite("SADD", MakeCmd({"SADD", "c3set", "x"}), core::PredicateFlags::kNone)
+          .has_value());
   DrainAndFlushCold("c3set");
 
   // Drive the key out of hot so SCARD/SISMEMBER resolve against cold.
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, core::kFirstSeq).has_value());
   }
 
   EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 1)
@@ -394,15 +421,18 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
   // COLDC-3 case the leading-Del covers: Emit prepends a Del so cold never
   // receives the stale hash slices in the first place.
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("HSET", MakeCmd({"HSET", "c3t", "f1", "v1", "f2", "v2"}))
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "c3t", "f1", "v1", "f2", "v2"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   // Same compaction window — no DrainAndFlushCold between the two writes.
-  ASSERT_TRUE(
-      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c3t", "now-a-string"})).has_value());
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("SET", MakeCmd({"SET", "c3t", "now-a-string"}),
+                                 core::PredicateFlags::kNone)
+                  .has_value());
   DrainAndFlushCold("c3t");
 
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, core::kFirstSeq).has_value());
   }
 
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}));
@@ -432,18 +462,21 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
 // An absolute TTL that lapses while the write is still buffered must
 // delete the key from cold, or the older cold value resurfaces.
 TEST_F(TwoTtlIntegrationTest, ExpiredBufferedWriteDeletesTheOlderColdValue) {
-  ASSERT_TRUE(harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "rk", "old"})).has_value());
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("SET", MakeCmd({"SET", "rk", "old"}), core::PredicateFlags::kNone)
+                  .has_value());
   DrainAndFlushCold("rk");
 
   const uint64_t ttl_ms = WallMs() + 1000;
-  ASSERT_TRUE(
-      harness_.Engine()
-          .DispatchWrite("SET", MakeCmd({"SET", "rk", "new", "PXAT", std::to_string(ttl_ms)}))
-          .has_value());
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("SET",
+                                 MakeCmd({"SET", "rk", "new", "PXAT", std::to_string(ttl_ms)}),
+                                 core::PredicateFlags::kNone)
+                  .has_value());
   harness_.Clock().Advance(2s);
   DrainAndFlushCold("rk");
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, core::kFirstSeq).has_value());
   }
 
   auto got = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "rk"}));
@@ -463,19 +496,22 @@ TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
 
   // Window 1: hash flushed to cold on its own.
   ASSERT_TRUE(harness_.Engine()
-                  .DispatchWrite("HSET", MakeCmd({"HSET", "c6t", "f1", "v1", "f2", "v2"}))
+                  .DispatchWrite("HSET", MakeCmd({"HSET", "c6t", "f1", "v1", "f2", "v2"}),
+                                 core::PredicateFlags::kNone)
                   .has_value());
   DrainAndFlushCold("c6t");
   EXPECT_EQ(harness_.Engine().DispatchRead("HLEN", MakeCmd({"HLEN", "c6t"}))->AsInteger(), 2);
 
   // Window 2 (separate flush): SET the same key to a string.
-  ASSERT_TRUE(
-      harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c6t", "now-a-string"})).has_value());
+  ASSERT_TRUE(harness_.Engine()
+                  .DispatchWrite("SET", MakeCmd({"SET", "c6t", "now-a-string"}),
+                                 core::PredicateFlags::kNone)
+                  .has_value());
   DrainAndFlushCold("c6t");
 
   // Drive the key out of hot so the reads resolve against the buffer/cold tiers.
   for (core::ShardId shard = 0; shard < harness_.ShardedHot().shard_count(); ++shard) {
-    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard).has_value());
+    ASSERT_TRUE(harness_.ShardedHot().Wipe(shard, core::kFirstSeq).has_value());
   }
 
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c6t"}));

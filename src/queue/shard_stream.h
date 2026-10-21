@@ -27,6 +27,7 @@
 #include "abyss/queue/group_commit.h"
 #include "abyss/queue/log.h"
 #include "abyss/queue/pending_append.h"
+#include "abyss/queue/reservation.h"
 
 namespace abyss::queue {
 
@@ -44,6 +45,11 @@ struct LogUnit {
   // Commit thread only: shards whose power end the current flush moved.
   std::vector<core::ShardId> touched;
   std::vector<bool> is_touched;
+  // Commit thread only: each shard's highest seq in the batch the flush
+  // walk is inside.
+  std::vector<std::pair<core::ShardId, core::SequenceId>> batch;
+  // Reservations not yet completed.
+  std::atomic<uint64_t> ready_to_complete{0};
 };
 
 struct ShardStreamConfig {
@@ -58,10 +64,11 @@ struct ShardStreamConfig {
 };
 
 // One shard's stream of frames in its log (ADP-015 §Shard streams).
-// next_seq_ is under the append lock, which a PendingAppend holds until
-// it publishes. Readers locate frames lock-free through the offset
-// ring, then through the position hints, then from a sparse index
-// point.
+// next_seq_ is under the append lock. A PendingAppend holds it until it
+// publishes; a Reservation releases it at once and publishes in
+// Complete. Either publishes only after every earlier seq has. Readers
+// locate frames lock-free through the offset ring, then through the
+// position hints, then from a sparse index point.
 class ShardStream {
  public:
   explicit ShardStream(ShardStreamConfig config);
@@ -84,6 +91,18 @@ class ShardStream {
   core::Result<PendingAppend> BeginAppend(core::QueueEntry entry, core::SteadyTime admit_by);
   core::Result<PendingBatchAppend> BeginAppendBatch(std::span<const core::QueueEntry> entries,
                                                     core::SteadyTime admit_by);
+  // One log's share of a reservation: the parts' streams, the parts,
+  // and every entry's frame size, in order.
+  struct LogParts {
+    std::span<ShardStream* const> streams;
+    std::span<const ShardEntries> parts;
+    std::span<const uint32_t> sizes;
+  };
+  // WalQueue::Reserve and ReserveFlush once their checks pass, never
+  // waiting: every stream locked in (log, shard) order, then one batch
+  // per log, as one Reservation that Complete fills in log order.
+  static core::Result<Reservation> Reserve(std::span<const LogParts> logs)
+      ABYSS_NO_THREAD_SAFETY_ANALYSIS;
   core::Result<std::vector<core::QueueEntry>> Read(core::SequenceId from, std::size_t max_count,
                                                    core::Duration timeout,
                                                    core::Durability visible);
@@ -95,9 +114,9 @@ class ShardStream {
                     core::Duration timeout) const;
 
   // Commit thread, in the flush walk, before the log's durable prefix
-  // moves. True iff the frame closed its batch and that moved the power
-  // end, which never passes the published end.
-  bool Durable(const frame::Header& header, uint32_t size) noexcept;
+  // moves: a batch that ends this shard's seqs at `end` is durable. True
+  // iff that moved the power end, which never passes the published end.
+  bool Durable(core::SequenceId end) noexcept;
   // After the power end moved: resolves append futures below it and
   // wakes its waiters.
   void PowerAdvanced();
@@ -114,6 +133,7 @@ class ShardStream {
 
   // Stops admission and wakes readers.
   void Shutdown();
+  bool stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
   // After the committer stopped: what still waits resolves
   // kUnavailable.
   void CommitterStopped();
@@ -150,12 +170,25 @@ class ShardStream {
     std::unique_ptr<AppendPublisher> publisher;
   };
   class Publisher;
+  class Filler;
+  class MultiFiller;
+
+  // Reserve's batch on one log, under every stream's append lock.
+  // `locked` counts the bytes encoded under the caller's locks so far.
+  static core::Result<std::unique_ptr<ReservationFiller>> ReserveLocked(
+      const LogParts& group, uint64_t total, std::size_t& locked,
+      std::vector<ReservedRange>& ranges, DurableFutures& durable) ABYSS_NO_THREAD_SAFETY_ANALYSIS;
 
   Log& log() const noexcept { return *config_.unit->log; }
 
   core::Result<Begun> Begin(std::span<core::QueueEntry> entries, core::SteadyTime admit_by);
   void Record(core::SequenceId seq, LogPosition pos, uint32_t size) ABYSS_REQUIRES(append_mu_);
   DurabilityFuture WhenPowerDurable(core::SequenceId seq);
+  // Until every seq below `first` is published.
+  void AwaitPublished(core::SequenceId first) noexcept;
+  // Complete's publish of [first, end).
+  void PublishInOrder(core::SequenceId first, core::SequenceId end) noexcept;
+  void WakeReaders() const noexcept;
   void Published(LogPosition end_pos) noexcept;
   bool WaitForEnd(core::SequenceId seq, core::Durability durability, core::Duration timeout) const;
 
@@ -172,11 +205,13 @@ class ShardStream {
 
   ShardStreamConfig config_;
   metrics::CounterHandle appended_;
+  metrics::HistogramHandle publish_wait_;
   metrics::GaugeHandle index_gauge_;
   metrics::GaugeHandle ring_gauge_;
+  mutable metrics::CounterHandle read_out_of_range_;
 
   mutable std::mutex append_mu_;
-  core::SequenceId next_seq_ ABYSS_GUARDED_BY(append_mu_) = 0;
+  core::SequenceId next_seq_ ABYSS_GUARDED_BY(append_mu_) = core::kFirstSeq;
   // Frame bytes since the last index point this stream appended.
   uint64_t since_point_ ABYSS_GUARDED_BY(append_mu_) = 0;
   bool has_point_ ABYSS_GUARDED_BY(append_mu_) = false;
@@ -192,11 +227,12 @@ class ShardStream {
   mutable std::mutex index_mu_;
   std::deque<IndexPoint> index_ ABYSS_GUARDED_BY(index_mu_);
 
-  std::atomic<core::SequenceId> first_seq_{0};
-  std::atomic<core::SequenceId> published_end_{0};
+  // Exclusive ends, so an empty stream's are kFirstSeq.
+  std::atomic<core::SequenceId> first_seq_{core::kFirstSeq};
+  std::atomic<core::SequenceId> published_end_{core::kFirstSeq};
   // Batch ends the flush walk has found durable, published or not.
-  std::atomic<core::SequenceId> flushed_end_{0};
-  std::atomic<core::SequenceId> power_end_{0};
+  std::atomic<core::SequenceId> flushed_end_{core::kFirstSeq};
+  std::atomic<core::SequenceId> power_end_{core::kFirstSeq};
 
   // Readers of published_end_, Dekker-counted so a publish notifies
   // only when someone waits.

@@ -5,6 +5,22 @@ hot:
   max_memory_bytes: 4294967296
   default_eviction_seconds: 86400
   eviction_tick_ms: 1000
+  # Shards; the queue and the cold consumers use the same count.
+  shard_count: 64
+  # Share of max_memory_bytes kept for evicted keys' stubs, about 80 B each.
+  stub_memory_fraction: 0.02
+  # Per shard: once a shard is over max_memory_bytes / shard_count times this,
+  # writes to it that grow memory wait for cold to drain, then fail with OOM.
+  # Under skew one shard can OOM while total hot memory is under the limit.
+  backpressure_ratio: 1.25
+  # A read miss fills hot only on the key's second miss in a window.
+  fill_doorkeeper: true
+  # A member read (SISMEMBER, HGET...) fills a collection only below this.
+  fill_max_members: 1024
+  # A fill larger than this share of a shard's budget is never made.
+  fill_max_fraction: 0.0625
+  # Keys held as loaded absent, a negative cache, across shards.
+  negative_max_entries: 65536
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
@@ -55,10 +71,6 @@ queue:
   # Oldest unflushed entry's age per log before appends wait, 10..60000 ms.
   durability_window_ms: 1000
 
-hot_consumer:
-  read_batch_size: 256
-  read_timeout_ms: 100
-
 cold_consumer:
   quiet_threshold_seconds: 30
   safety_margin_seconds: 300
@@ -83,9 +95,8 @@ cold_consumer:
   drain_grace_seconds: 15
 
 recovery:
+  # Workers the one recovery Scan replays shards on.
   replay_parallelism: 4
-  hot_replay_batch_size: 10000
-  cold_replay_batch_size: 50000
 
 net:
   bind: 0.0.0.0

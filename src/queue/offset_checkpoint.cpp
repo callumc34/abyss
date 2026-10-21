@@ -110,7 +110,7 @@ SlotState ParseSlot(std::span<const std::byte> slot, ParsedSlot& out) {
   for (size_t i = 0; i < out.encoded.size(); ++i) {
     const std::byte* entry = entries + (i * kEntryBytes);
     const auto flags = static_cast<uint8_t>(entry[kEntryFlagsOffset]);
-    out.encoded[i] = (flags & kCommittedFlag) != 0 ? GetU64(entry) + 1 : 0;
+    out.encoded[i] = (flags & kCommittedFlag) != 0 ? GetU64(entry) : 0;
   }
   return SlotState::kValid;
 }
@@ -131,7 +131,7 @@ void EncodeSlot(std::span<std::byte> slot, uint64_t epoch, uint32_t shard_count,
   for (size_t i = 0; i < encoded.size(); ++i) {
     if (encoded[i] == 0) continue;
     std::byte* entry = entries + (i * kEntryBytes);
-    PutU64(entry, encoded[i] - 1);
+    PutU64(entry, encoded[i]);
     entry[kEntryFlagsOffset] = std::byte{kCommittedFlag};
   }
   const size_t payload = PayloadBytes(shard_count, consumers.size());
@@ -172,8 +172,9 @@ core::Result<void> RejectLegacyLayout(const std::filesystem::path& dir) {
 
 // Created under a temporary name and renamed into place, so the checkpoint
 // file, once visible, always holds at least one valid slot.
-core::Result<void> CreateFile(const std::filesystem::path& path, size_t slot_bytes,
-                              uint32_t shard_count, std::span<const core::ConsumerId> consumers) {
+core::Result<void> CreateCheckpointFile(const std::filesystem::path& path, size_t slot_bytes,
+                                        uint32_t shard_count,
+                                        std::span<const core::ConsumerId> consumers) {
   auto tmp = path;
   tmp += ".tmp";
   std::error_code ec;
@@ -240,7 +241,8 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
         core::Error{core::ErrorCode::kInternal, "stat offset checkpoint: " + ec.message()});
   }
   if (!exists) {
-    if (auto r = CreateFile(path, expected_slot_bytes, config.shard_count, config.consumers);
+    if (auto r =
+            CreateCheckpointFile(path, expected_slot_bytes, config.shard_count, config.consumers);
         !r.has_value()) {
       return std::unexpected(r.error());
     }
@@ -307,9 +309,14 @@ core::Result<std::unique_ptr<OffsetCheckpoint>> OffsetCheckpoint::Open(
   auto chosen_sorted = chosen.consumers;
   std::ranges::sort(chosen_sorted);
   if (chosen_sorted != sorted_consumers) {
-    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
-                                       "offset checkpoint '" + path.string() +
-                                           "' was written for a different retention consumer set"});
+    // Only builds before a release change the set, and the WAL format
+    // is unreleased, so wiping is the remedy, not a migration.
+    return std::unexpected(core::Error{
+        core::ErrorCode::kFailedPrecondition,
+        "offset checkpoint '" + path.string() +
+            "' was written for a different retention consumer set, by an earlier build of an "
+            "unreleased WAL format: delete the data directory (queue.wal_path and "
+            "cold.data_path) and start empty"});
   }
   if (slot_bytes != expected_slot_bytes) {
     return std::unexpected(

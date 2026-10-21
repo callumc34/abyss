@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -9,7 +10,19 @@
 namespace abyss::metrics {
 
 // Closed whitelist of permitted label keys.
-enum class LabelKey : uint8_t { kTier, kShard, kCmd, kReason, kStatus, kOp, kProto, kSubject };
+enum class LabelKey : uint8_t {
+  kTier,
+  kShard,
+  kCmd,
+  kReason,
+  kStatus,
+  kOp,
+  kProto,
+  kSubject,
+  kOutcome,
+  kPass,
+  kPhase,
+};
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
   switch (k) {
@@ -29,6 +42,12 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "proto";
     case LabelKey::kSubject:
       return "subject";
+    case LabelKey::kOutcome:
+      return "outcome";
+    case LabelKey::kPass:
+      return "pass";
+    case LabelKey::kPhase:
+      return "phase";
   }
   return {};
 }
@@ -170,6 +189,108 @@ constexpr std::string_view ToStringView(TtlSubject s) noexcept {
   return {};
 }
 
+// Why the sequencer decided a write again.
+enum class RedecideReason : uint8_t { kAdmission, kSpare, kLoad, kBackpressure };
+
+constexpr std::string_view ToStringView(RedecideReason r) noexcept {
+  switch (r) {
+    case RedecideReason::kAdmission:
+      return "admission";
+    case RedecideReason::kSpare:
+      return "spare";
+    case RedecideReason::kLoad:
+      return "load";
+    case RedecideReason::kBackpressure:
+      return "backpressure";
+  }
+  return {};
+}
+
+// What became of a read's cache fill.
+enum class FillOutcome : uint8_t {
+  kInstalled,
+  kDiscarded,
+  kSkippedBackpressure,
+  kSkippedSize,
+  kSkippedEvictCap,
+  kFailed,
+};
+
+constexpr std::string_view ToStringView(FillOutcome o) noexcept {
+  switch (o) {
+    case FillOutcome::kInstalled:
+      return "installed";
+    case FillOutcome::kDiscarded:
+      return "discarded";
+    case FillOutcome::kSkippedBackpressure:
+      return "skipped_backpressure";
+    case FillOutcome::kSkippedSize:
+      return "skipped_size";
+    case FillOutcome::kSkippedEvictCap:
+      return "skipped_evict_cap";
+    case FillOutcome::kFailed:
+      return "failed";
+  }
+  return {};
+}
+
+// A hot store maintenance pass, each run in capped exclusive holds.
+enum class MaintenancePass : uint8_t { kTombstones, kParked, kTtl, kDeadline, kMemory };
+
+constexpr std::string_view ToStringView(MaintenancePass p) noexcept {
+  switch (p) {
+    case MaintenancePass::kTombstones:
+      return "tombstones";
+    case MaintenancePass::kParked:
+      return "parked";
+    case MaintenancePass::kTtl:
+      return "ttl";
+    case MaintenancePass::kDeadline:
+      return "deadline";
+    case MaintenancePass::kMemory:
+      return "memory";
+  }
+  return {};
+}
+
+// A stage of one sequenced write, in the order a write passes them.
+enum class WritePhase : uint8_t {
+  kAdmit,
+  kLockWait,
+  kDecide,
+  kLoad,
+  kEntries,
+  kReserve,
+  kApply,
+  kComplete,
+  kDurable,
+};
+inline constexpr size_t kWritePhaseCount = 9;
+
+constexpr std::string_view ToStringView(WritePhase p) noexcept {
+  switch (p) {
+    case WritePhase::kAdmit:
+      return "admit";
+    case WritePhase::kLockWait:
+      return "lock_wait";
+    case WritePhase::kDecide:
+      return "decide";
+    case WritePhase::kLoad:
+      return "load";
+    case WritePhase::kEntries:
+      return "entries";
+    case WritePhase::kReserve:
+      return "reserve";
+    case WritePhase::kApply:
+      return "apply";
+    case WritePhase::kComplete:
+      return "complete";
+    case WritePhase::kDurable:
+      return "durable";
+  }
+  return {};
+}
+
 // Command-name label value. Values are expected to be views into the command
 // registry; never client-supplied strings.
 struct CmdLabel {
@@ -212,6 +333,22 @@ struct LabelKeyOf<RejectReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<RedecideReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
+struct LabelKeyOf<FillOutcome> {
+  static constexpr LabelKey value = LabelKey::kOutcome;
+};
+template <>
+struct LabelKeyOf<MaintenancePass> {
+  static constexpr LabelKey value = LabelKey::kPass;
+};
+template <>
+struct LabelKeyOf<WritePhase> {
+  static constexpr LabelKey value = LabelKey::kPhase;
+};
+template <>
 struct LabelKeyOf<CmdLabel> {
   static constexpr LabelKey value = LabelKey::kCmd;
 };
@@ -240,6 +377,10 @@ inline std::string ToLabelString(FlushReason r) { return std::string(ToStringVie
 inline std::string ToLabelString(BackoffReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(RedecideReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(FillOutcome o) { return std::string(ToStringView(o)); }
+inline std::string ToLabelString(MaintenancePass p) { return std::string(ToStringView(p)); }
+inline std::string ToLabelString(WritePhase p) { return std::string(ToStringView(p)); }
 inline std::string ToLabelString(CmdLabel c) { return std::string(c.value); }
 inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
@@ -284,30 +425,25 @@ inline constexpr std::array<double, 14> kLatencySeconds{0.00001, 0.000025, 0.000
 inline constexpr std::array<double, 13> kFlushLatencySeconds{
     0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0};
 
+// Exclusive lock holds: 250ns to 100ms, where W1's budget lies, finer
+// past 1ms so a stall's tail is not one bucket wide.
+inline constexpr std::array<double, 21> kLockHoldSeconds{
+    0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025,
+    0.00005,    0.0001,    0.00025,  0.0005,    0.001,    0.0015,  0.002,
+    0.003,      0.005,     0.0075,   0.01,      0.025,    0.05,    0.1};
+
+// Stages of a write: sub-microsecond steps up to a durable wait.
+inline constexpr std::array<double, 23> kWritePhaseSeconds{
+    0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005,
+    0.0001,     0.00025,   0.0005,   0.001,     0.0015,   0.002,   0.003,    0.005,
+    0.0075,     0.01,      0.025,    0.05,      0.1,      0.25,    1.0};
+
 // Power-of-ten buckets for batch sizes.
 inline constexpr std::array<double, 5> kBatchSize{1, 10, 100, 1000, 10000};
 
 }  // namespace buckets
 
 namespace names {
-
-inline constexpr HistogramDesc<CmdLabel> kHotOpDurationSeconds{
-    .name = "abyss_hot_op_duration_seconds",
-    .help = "Hot store operation latency per command.",
-    .buckets = buckets::kLatencySeconds,
-};
-
-inline constexpr HistogramDesc<CmdLabel> kColdOpDurationSeconds{
-    .name = "abyss_cold_op_duration_seconds",
-    .help = "Cold store operation latency per command.",
-    .buckets = buckets::kLatencySeconds,
-};
-
-inline constexpr HistogramDesc<CmdLabel> kBufferOpDurationSeconds{
-    .name = "abyss_buffer_op_duration_seconds",
-    .help = "Compaction buffer read latency per command.",
-    .buckets = buckets::kLatencySeconds,
-};
 
 inline constexpr HistogramDesc<CmdLabel> kRespRequestDurationSeconds{
     .name = "abyss_resp_request_duration_seconds",
@@ -359,6 +495,14 @@ inline constexpr HistogramDesc<> kWalFillWaitSeconds{
     .help =
         "Time an append waited for earlier WAL reservations to be filled; recorded only "
         "when the wait outlasted a short spin.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr HistogramDesc<> kWalPublishWaitSeconds{
+    .name = "abyss_wal_publish_wait_seconds",
+    .help =
+        "Time a shard's publish waited for an earlier reservation on the shard to publish; "
+        "recorded only when the wait outlasted a short spin.",
     .buckets = buckets::kLatencySeconds,
 };
 
@@ -421,11 +565,6 @@ inline constexpr GaugeDesc<> kFsDurableDirSupported{
         "to start the WAL under either durability class.",
 };
 
-inline constexpr GaugeDesc<> kHotConsumerLagEntries{
-    .name = "abyss_hot_consumer_lag_entries",
-    .help = "Entries between hot consumer position and queue head.",
-};
-
 inline constexpr GaugeDesc<> kColdConsumerLagEntries{
     .name = "abyss_cold_consumer_lag_entries",
     .help = "Entries between cold consumer position and queue head.",
@@ -434,16 +573,6 @@ inline constexpr GaugeDesc<> kColdConsumerLagEntries{
 inline constexpr GaugeDesc<> kColdBufferOldestEntryAgeSeconds{
     .name = "abyss_cold_buffer_oldest_entry_age_seconds",
     .help = "Age of the oldest un-flushed compaction-buffer entry.",
-};
-
-inline constexpr GaugeDesc<> kHotConsumerSeq{
-    .name = "abyss_hot_consumer_seq",
-    .help = "Hot consumer current sequence position.",
-};
-
-inline constexpr GaugeDesc<> kColdConsumerSeq{
-    .name = "abyss_cold_consumer_seq",
-    .help = "Cold consumer current sequence position.",
 };
 
 inline constexpr GaugeDesc<> kHotMemoryBytes{
@@ -461,9 +590,44 @@ inline constexpr GaugeDesc<> kHotMaxMemoryBytes{
     .help = "Configured hot store memory budget in bytes; 0 means unlimited.",
 };
 
-inline constexpr GaugeDesc<> kHotAccessBufferDepth{
-    .name = "abyss_hot_access_buffer_depth",
-    .help = "Total depth of the per-shard deferred read-access refresh buffers.",
+inline constexpr GaugeDesc<> kHotStubEntries{
+    .name = "abyss_hot_stub_entries",
+    .help = "Stubs the hot store holds for evicted keys.",
+};
+
+inline constexpr CounterDesc<FillOutcome> kHotFillsTotal{
+    .name = "abyss_hot_fills_total",
+    .help = "Cache fills on read misses, by what became of each.",
+};
+
+inline constexpr GaugeDesc<> kHotNegativeEntries{
+    .name = "abyss_hot_negative_entries",
+    .help = "Keys the hot store holds as loaded absent, a negative cache.",
+};
+
+inline constexpr HistogramDesc<MaintenancePass> kHotMaintenanceHoldSeconds{
+    .name = "abyss_hot_maintenance_hold_seconds",
+    .help = "Time a hot maintenance pass held a shard exclusively, per capped hold.",
+    .buckets = buckets::kLockHoldSeconds,
+};
+
+inline constexpr HistogramDesc<> kHotExpirySweepSeconds{
+    .name = "abyss_hot_expiry_sweep_seconds",
+    .help = "Time for the TTL pass to reach every key due when its sweep began.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr HistogramDesc<> kHotRehashSeconds{
+    .name = "abyss_hot_rehash_seconds",
+    .help =
+        "Time an insert spent rehashing a hot shard's entry map under the shard's exclusive "
+        "lock; its count is the number of rehashes.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr GaugeDesc<> kHotUnevictableBytes{
+    .name = "abyss_hot_unevictable_bytes",
+    .help = "Hot store bytes held because cold has not drained their latest write.",
 };
 
 inline constexpr GaugeDesc<> kColdDiskBytes{
@@ -503,7 +667,7 @@ inline constexpr GaugeDesc<> kWalUnflushedBytes{
 
 inline constexpr GaugeDesc<> kWalDurabilityLagSeconds{
     .name = "abyss_wal_durability_lag_seconds",
-    .help = "Age of the oldest WAL entry not yet power-durable, worst shard.",
+    .help = "Age bound of the oldest WAL entry not yet power-durable, worst log.",
 };
 
 inline constexpr CounterDesc<> kQueueOffsetPersistFailuresTotal{
@@ -596,6 +760,21 @@ inline constexpr CounterDesc<> kColdParsePoisonTotal{
         "retention below the poison seq for the shard until operator intervention (fail-closed).",
 };
 
+inline constexpr CounterDesc<> kColdDurabilityWaitsTotal{
+    .name = "abyss_cold_durability_waits_total",
+    .help =
+        "Cold flushes and wipes held a queue read timeout because their entries were not yet "
+        "power-durable in the WAL.",
+};
+
+inline constexpr CounterDesc<> kColdApplyTypeConflictsTotal{
+    .name = "abyss_cold_apply_type_conflicts_total",
+    .help =
+        "Logged SADD, HSET or ZADD effects that found the key holding another type in cold. The "
+        "write path decides against the key's full state, so this means it and cold disagree. "
+        "Cold drops the other type and applies the effect as logged.",
+};
+
 // Tier domain for this metric is limited to {kHot, kCold}; kBuffer is invalid.
 inline constexpr CounterDesc<Tier> kTtlExpiredTotal{
     .name = "abyss_ttl_expired_total",
@@ -612,19 +791,51 @@ inline constexpr CounterDesc<> kHotMemoryEvictedTotal{
     .help = "Keys evicted from the hot store under memory pressure (LRU tier transition).",
 };
 
-inline constexpr CounterDesc<> kHotAccessBufferDroppedTotal{
-    .name = "abyss_hot_access_buffer_dropped_total",
-    .help = "Deferred read-access refreshes dropped past the access-buffer high-water cap.",
-};
-
 inline constexpr CounterDesc<> kHotTombstonesReclaimedTotal{
     .name = "abyss_hot_tombstones_reclaimed_total",
     .help = "Delete tombstones reclaimed from the hot store after the cold consumer caught up.",
 };
 
-inline constexpr CounterDesc<> kPromotionsTotal{
-    .name = "abyss_promotions_total",
-    .help = "Cold hits promoted back to the hot store.",
+inline constexpr CounterDesc<> kHotStubDropsTotal{
+    .name = "abyss_hot_stub_drops_total",
+    .help = "Stubs dropped, least recently written first, past the stub cap.",
+};
+
+inline constexpr CounterDesc<> kHotBackpressureWaitsTotal{
+    .name = "abyss_hot_backpressure_waits_total",
+    .help = "Writes that waited for cold to drain because hot memory was over its limit.",
+};
+
+inline constexpr CounterDesc<> kHotBackpressureRejectionsTotal{
+    .name = "abyss_hot_backpressure_rejections_total",
+    .help = "Writes rejected with OOM after waiting the write timeout for cold to drain.",
+};
+
+inline constexpr CounterDesc<> kSequencerLockedCopyBytesTotal{
+    .name = "abyss_sequencer_locked_copy_bytes_total",
+    .help = "Bytes of written values the sequencer copied into log entries under hot locks.",
+};
+
+inline constexpr CounterDesc<RedecideReason> kSequencerRedecidesTotal{
+    .name = "abyss_sequencer_redecides_total",
+    .help = "Writes the sequencer decided again, by what sent it back.",
+};
+
+inline constexpr HistogramDesc<> kSequencerLockHoldSeconds{
+    .name = "abyss_sequencer_lock_hold_seconds",
+    .help = "Time the sequencer held a write's hot shard locks; about one write in 64 is sampled.",
+    .buckets = buckets::kLockHoldSeconds,
+};
+
+inline constexpr HistogramDesc<WritePhase> kSequencerPhaseSeconds{
+    .name = "abyss_sequencer_phase_seconds",
+    .help = "Time a successful write spent in each sequencer stage; about one in 64 is sampled.",
+    .buckets = buckets::kWritePhaseSeconds,
+};
+
+inline constexpr CounterDesc<> kHotLoadDiscardsTotal{
+    .name = "abyss_hot_load_discards_total",
+    .help = "Key loads discarded because a write or flush superseded them.",
 };
 
 // A cold collection scan (SMEMBERS/ZRANGE/HGETALL/HKEYS/HVALS) exceeded the
@@ -750,38 +961,10 @@ inline constexpr GaugeDesc<> kColdTtlDiskPressureActive{
 // ---------------------------------------------------------------------------
 
 // Encoded as the underlying value of engine::RecoverySnapshot::Phase:
-// 0=queue_open, 1=resolver_replay, 2=cold_hot_replay, 3=complete.
+// 0=queue_open, 1=cold_hot_replay, 2=complete.
 inline constexpr GaugeDesc<> kRecoveryPhase{
     .name = "abyss_recovery_phase",
-    .help =
-        "Current recovery phase (0=queue_open, 1=resolver_replay, "
-        "2=cold_hot_replay, 3=complete).",
-};
-
-// Per-consumer counters live under separate metric names rather than a Tier
-// label because the resolver is not a tier and the closed Tier enum should
-// not be widened just for recovery observability.
-inline constexpr GaugeDesc<> kRecoveryResolverEntriesReplayed{
-    .name = "abyss_recovery_resolver_entries_replayed",
-    .help = "Live entries scanned by the resolver during recovery, all shards.",
-};
-
-inline constexpr GaugeDesc<> kRecoveryResolverEntriesTarget{
-    .name = "abyss_recovery_resolver_entries_target",
-    .help = "Total entries the resolver must scan during recovery, all shards.",
-};
-
-// Conditional-write durability pressure: the resolver could not confirm a
-// self-emitted Resolved's WAL fsync within its budget before fulfilling the
-// client (steady state) or before advancing the recovery commit past a re-decided
-// dangling. A non-zero rate means conditional acks are stalling/erroring on
-// durable-layer latency, not silently losing writes (the Resolved stays in the
-// WAL and applies on catch-up). Surfaces XDUR-2 / HOTC-5 (no silent degradation).
-inline constexpr CounterDesc<> kResolverDurableWaitTimeoutsTotal{
-    .name = "abyss_resolver_durable_wait_timeouts_total",
-    .help =
-        "Resolver self-emitted Resolved durability waits that timed out before "
-        "the conditional ack (steady-state) or the recovery commit barrier.",
+    .help = "Current recovery phase (0=queue_open, 1=cold_hot_replay, 2=complete).",
 };
 
 inline constexpr GaugeDesc<> kRecoveryColdEntriesReplayed{
@@ -796,12 +979,19 @@ inline constexpr GaugeDesc<> kRecoveryColdEntriesTarget{
 
 inline constexpr GaugeDesc<> kRecoveryHotEntriesReplayed{
     .name = "abyss_recovery_hot_entries_replayed",
-    .help = "Live entries settled by the hot consumer during recovery, all shards.",
+    .help = "Log entries the hot replayer applied or skipped during recovery, all shards.",
 };
 
 inline constexpr GaugeDesc<> kRecoveryHotEntriesTarget{
     .name = "abyss_recovery_hot_entries_target",
-    .help = "Total entries the hot consumer must settle during recovery, all shards.",
+    .help = "Log entries the hot replayer must apply or skip during recovery, all shards.",
+};
+
+inline constexpr CounterDesc<> kRecoveryHotSkippedFramesTotal{
+    .name = "abyss_recovery_hot_skipped_frames_total",
+    .help =
+        "Replayed log entries hot left to buffer and cold: a partial effect on a key "
+        "it does not hold.",
 };
 
 inline constexpr GaugeDesc<> kRecoveryDurationSeconds{

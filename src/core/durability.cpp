@@ -1,5 +1,7 @@
 #include "abyss/core/durability.h"
 
+#include <ostream>
+
 namespace abyss::core {
 
 namespace {
@@ -24,5 +26,7 @@ std::optional<Durability> ParseDurability(std::string_view name) noexcept {
   if (name == kPowerLossName) return Durability::kPowerLoss;
   return std::nullopt;
 }
+
+void PrintTo(Durability durability, std::ostream* os) { *os << DurabilityName(durability); }
 
 }  // namespace abyss::core

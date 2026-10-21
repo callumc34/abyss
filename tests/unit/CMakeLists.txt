@@ -1,8 +1,6 @@
 add_executable(abyss_core_tests
   core/result_test.cpp
   core/resp_types_test.cpp
-  core/consumer_rpc_test.cpp
-  core/apply_notifier_test.cpp
   core/fire_and_forget_test.cpp
   core/ops_test.cpp
   core/ops_set_test.cpp
@@ -36,6 +34,7 @@ add_executable(abyss_queue_tests
   queue/log_stress_test.cpp
   queue/queue_scan_test.cpp
   queue/shard_stream_test.cpp
+  queue/reservation_test.cpp
 )
 
 target_include_directories(abyss_queue_tests PRIVATE
@@ -57,6 +56,7 @@ add_executable(abyss_resp_tests
   resp/request_pipeline_test.cpp
   resp/node_identity_test.cpp
   resp/cluster_test.cpp
+  resp/predicate_extractor_test.cpp
 )
 
 target_link_libraries(abyss_resp_tests PRIVATE
@@ -69,6 +69,10 @@ add_executable(abyss_hot_tests
   hot/single_shard_store_test.cpp
   hot/sharded_hot_store_test.cpp
   hot/eviction_worker_test.cpp
+  hot/residency_test.cpp
+  hot/apply_effects_test.cpp
+  hot/shard_locks_test.cpp
+  hot/maintenance_test.cpp
 )
 
 target_link_libraries(abyss_hot_tests PRIVATE
@@ -97,7 +101,11 @@ if(ABYSS_WITH_ROCKSDB)
     cold/backends/rocksdb_store_ttl_test.cpp
     cold/backends/rocksdb_store_sweep_test.cpp
     cold/backends/rocksdb_store_wipe_test.cpp
+    cold/backends/rocksdb_store_load_test.cpp
+    cold/backends/rocksdb_store_sync_failure_test.cpp
   )
+  # The reads these tests check are answered as hot answers them.
+  target_link_libraries(abyss_cold_tests PRIVATE abyss::hot)
   target_include_directories(abyss_cold_tests SYSTEM PRIVATE
     $<TARGET_PROPERTY:RocksDB::rocksdb,INTERFACE_INCLUDE_DIRECTORIES>
   )
@@ -109,8 +117,6 @@ add_executable(abyss_consumer_tests
   consumer/compaction_buffer_test.cpp
   consumer/cold_consumer_test.cpp
   consumer/cold_consumer_pool_test.cpp
-  consumer/existence_cache_test.cpp
-  consumer/resolver_test.cpp
 )
 
 target_link_libraries(abyss_consumer_tests PRIVATE
@@ -132,6 +138,7 @@ add_executable(abyss_config_tests
 
 target_compile_definitions(abyss_config_tests PRIVATE
   ABYSS_EXAMPLE_CONFIG_PATH="${PROJECT_SOURCE_DIR}/config/abyss.example.yaml"
+  ABYSS_DEPLOYMENT_DOC_PATH="${PROJECT_SOURCE_DIR}/docs/operations/deployment.md"
 )
 
 target_link_libraries(abyss_config_tests PRIVATE
@@ -225,10 +232,37 @@ target_link_libraries(abyss_admin_tests PRIVATE
 add_executable(abyss_engine_tests
   engine/shard_scheduler_test.cpp
   engine/recovery_coordinator_test.cpp
+  engine/decide_test.cpp
+  engine/decide_multi_key_test.cpp
+  engine/decide_registry_test.cpp
+  engine/doorkeeper_test.cpp
+  engine/hot_replayer_test.cpp
+  engine/loader_merge_test.cpp
+  engine/loader_test.cpp
+  engine/sequencer_test.cpp
 )
 
 target_link_libraries(abyss_engine_tests PRIVATE
   abyss::engine
+  abyss::queue
+  abyss::resp
+  abyss::test_support
+  GTest::gtest_main
+)
+
+# Replaces the global allocator to count copies and frees, so it is a
+# binary of its own.
+add_executable(abyss_sequencer_alloc_tests
+  engine/alloc_counter.cpp
+  engine/sequencer_alloc_test.cpp
+  engine/lookup_alloc_test.cpp
+  engine/hold_alloc_test.cpp
+)
+
+target_link_libraries(abyss_sequencer_alloc_tests PRIVATE
+  abyss::consumer
+  abyss::engine
+  abyss::hot
   abyss::queue
   abyss::test_support
   GTest::gtest_main
@@ -269,5 +303,6 @@ abyss_discover_tests(abyss_metrics_tests  "unit\;unit-metrics")
 abyss_discover_tests(abyss_net_tests      "unit\;unit-net")
 abyss_discover_tests(abyss_admin_tests    "unit\;unit-admin")
 abyss_discover_tests(abyss_engine_tests   "unit\;unit-engine")
+abyss_discover_tests(abyss_sequencer_alloc_tests "unit\;unit-engine")
 abyss_discover_tests(abyss_branding_tests "unit\;unit-branding")
 abyss_discover_tests(abyss_platform_tests "unit\;unit-platform")

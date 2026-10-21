@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 namespace abyss::perf {
 namespace {
@@ -87,4 +89,30 @@ TEST(MakeKeyDistributionTest, ConstructsEachKind) {
 }
 
 }  // namespace
+TEST(ZipfRejectionInversionTest, SkewsAboveOneTowardsKeyZero) {
+  constexpr uint64_t kKeys = 1'000'000;
+  constexpr int kDraws = 200'000;
+  KeyDistConfig cfg;
+  cfg.kind = KeyDistConfig::Kind::kZipfian;
+  cfg.theta = 1.2;
+  cfg.seed = 7;
+  auto dist = MakeKeyDistribution(cfg, kKeys);
+  std::vector<int> head(10, 0);
+  for (int i = 0; i < kDraws; ++i) {
+    const uint64_t k = dist->Next();
+    ASSERT_LT(k, kKeys);
+    if (k < head.size()) ++head[k];
+  }
+  // P(0) = 1 / H(N, 1.2), about 0.19 for a million keys; P(1) is 2^-1.2
+  // of that.
+  const double top = static_cast<double>(head[0]) / kDraws;
+  EXPECT_NEAR(top, 0.19, 0.02);
+  EXPECT_NEAR(static_cast<double>(head[1]) / head[0], std::pow(2.0, -1.2), 0.05);
+  EXPECT_GT(head[1], head[9]);
+}
+
+TEST(ZipfRejectionInversionTest, RejectsANonPositiveExponent) {
+  EXPECT_THROW(ZipfRejectionInversion(10, 0.0, 0), std::invalid_argument);
+}
+
 }  // namespace abyss::perf

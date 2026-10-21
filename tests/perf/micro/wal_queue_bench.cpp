@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -8,11 +9,15 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "abyss/core/durability.h"
+#include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
+#include "abyss/queue/frame.h"
+#include "abyss/queue/reservation.h"
 #include "abyss/queue/wal_queue.h"
 
 namespace abyss::queue {
@@ -94,6 +99,75 @@ void BM_AppendProcessCrash(benchmark::State& state) {
   BM_AppendAndWaitDurable(state, core::Durability::kProcessCrash);
 }
 BENCHMARK(BM_AppendProcessCrash)->Arg(64)->Arg(1024);
+
+// One segment holds a whole run, so no frame waits for a spare; the
+// iteration counts below keep each run inside it.
+constexpr size_t kWholeRunSegment = size_t{64} << 20;
+
+std::unique_ptr<WalQueue> MakeWholeRunQueue(const std::string& dir) {
+  auto result = WalQueue::Open({
+      .wal_path = dir,
+      .segment_size_bytes = kWholeRunSegment,
+      .shard_count = 1,
+      .min_retention = 1s,
+  });
+  if (!result.has_value()) std::abort();
+  return std::move(*result);
+}
+
+// One frame per iteration through Reserve and Complete at
+// process_crash. Rebuilding a value Reserve moved out is untimed.
+void BM_ReserveComplete(benchmark::State& state) {
+  TempDir tmp;
+  auto queue = MakeWholeRunQueue(tmp.path());
+  const auto value_size = static_cast<size_t>(state.range(0));
+  std::vector<core::QueueEntry> entries{MakeEntry(value_size)};
+  const std::array parts{ShardEntries{.shard = 0, .entries = entries}};
+  const bool moved = frame::EntryFrameSize(entries[0]) > core::kLockHoldFrameBytes;
+  for ([[maybe_unused]] auto _ : state) {
+    auto reserved = queue->Reserve(parts);
+    if (!reserved.has_value()) {
+      state.SkipWithError("reserve failed");
+      break;
+    }
+    benchmark::DoNotOptimize(queue->Complete(std::move(*reserved)));
+    if (moved) {
+      state.PauseTiming();
+      entries[0] = MakeEntry(value_size);
+      state.ResumeTiming();
+    }
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * value_size));
+}
+BENCHMARK(BM_ReserveComplete)->Arg(200)->Iterations(100000);
+BENCHMARK(BM_ReserveComplete)->Arg(16 << 10)->Iterations(3000);
+BENCHMARK(BM_ReserveComplete)->Arg(1 << 20)->Iterations(50);
+
+// The same through BeginAppend, which takes the entry: its rebuild is
+// untimed.
+void BM_AppendMovedEntry(benchmark::State& state) {
+  TempDir tmp;
+  auto queue = MakeWholeRunQueue(tmp.path());
+  const auto value_size = static_cast<size_t>(state.range(0));
+  core::QueueEntry entry = MakeEntry(value_size);
+  for ([[maybe_unused]] auto _ : state) {
+    auto appended = queue->Append(0, std::move(entry));
+    if (!appended.has_value()) {
+      state.SkipWithError("append failed");
+      break;
+    }
+    benchmark::DoNotOptimize(appended->seq);
+    state.PauseTiming();
+    entry = MakeEntry(value_size);
+    state.ResumeTiming();
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * value_size));
+}
+BENCHMARK(BM_AppendMovedEntry)->Arg(200)->Iterations(100000);
+BENCHMARK(BM_AppendMovedEntry)->Arg(16 << 10)->Iterations(3000);
+BENCHMARK(BM_AppendMovedEntry)->Arg(1 << 20)->Iterations(50);
 
 // One queue and shard shared by every thread of a run; Setup opens it
 // before the threads start and Teardown closes it after they finish.

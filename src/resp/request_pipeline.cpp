@@ -169,8 +169,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         return finish(std::move(*result));
       }
 
-    case Dispatch::kWritePath:
-    case Dispatch::kConditionalWrite: {
+    case Dispatch::kWritePath: {
       if (deps_.dispatcher == nullptr) {
         return finish(InternalServerError("dispatcher missing for write path", parent.name));
       }
@@ -185,41 +184,21 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
         flags = *extracted;
       }
       // Arity alone is a weaker check than the parser: `HSET k f v f` and
-      // `SET k v BOGUS` both satisfy the registry and are still malformed.
-      // Queueing either would durably record a command no tier can materialise,
-      // so the parser decides before anything reaches the queue. Commands with
-      // no parser are exempt: that is a capability gap, not malformed input, and
-      // the registry stays the sole authority for them.
-      const bool unconditional =
-          flags == core::PredicateFlags::kNone && parent.dispatch == Dispatch::kWritePath;
-      const bool parseable = core::ops::HasWriteParser(parent.name);
-
-      std::optional<RespCommand> canonical;
-      if (parseable) {
+      // `SET k v BOGUS` both satisfy the registry and are still malformed,
+      // so the parser replies before dispatch. Commands with no parser are
+      // exempt: that is a capability gap, not malformed input, and the
+      // registry stays the sole authority for them.
+      if (core::ops::HasWriteParser(parent.name)) {
         auto parsed = core::ops::ParseWriteOp(parent.name, cmd);
         if (!parsed.has_value()) {
           return finish(RespValue::Error(MapErrorCode(parsed.error().code()),
                                          std::string{parsed.error().message()}));
         }
-        // Unconditional writes are logged in canonical form -- aliases collapsed,
-        // TTLs already absolute -- so hot, cold and recovery all read one
-        // spelling and cannot derive different meanings from it. Conditionals
-        // keep the client's spelling: the resolver reads its predicate from the
-        // command text, not from the entry's flags.
-        if (unconditional) canonical = core::ops::CanonicalCommand(*parsed);
       }
 
-      core::Result<RespValue> result;
-      if (unconditional) {
-        // parent.name, not the canonical name: it is registry-owned and stable,
-        // and no dispatcher reads it -- passing canonical.Name() here would race
-        // the move below on unspecified argument evaluation order.
-        result = canonical.has_value()
-                     ? deps_.dispatcher->DispatchWrite(parent.name, *std::move(canonical))
-                     : deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd));
-      } else {
-        result = deps_.dispatcher->DispatchConditional(parent.name, RespCommand(cmd), flags);
-      }
+      // The client's spelling: the engine logs the canonical effect it
+      // decides, its TTLs made absolute at the instant it decides at.
+      auto result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd), flags);
       if (!result.has_value()) {
         ABYSS_LOG_WARN("engine write error", {"client_id", state_.client_id},
                        {"cmd", std::string_view{parent.name}},
@@ -230,7 +209,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       return finish(std::move(*result));
     }
 
-    case Dispatch::kConsumerRpc:
+    case Dispatch::kAdmin:
       if (parent.name == "DBSIZE") {
         if (deps_.stats == nullptr) {
           return finish(InternalServerError("stats missing for DBSIZE", parent.name));
@@ -243,7 +222,7 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
           label.push_back('|');
           label.append(resolved.subcommand->name);
         }
-        std::string msg = "consumer RPC commands are not supported in this build (";
+        std::string msg = "not supported in this build (";
         msg.append(label);
         msg.append("); tracked in abyss#97");
         return finish(RespValue::Error(ErrorPrefix::kErr, std::move(msg)));

@@ -15,6 +15,9 @@ target_include_directories(abyss_perf_framework PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_dependencies(abyss_perf_framework abyss_perf_source_tree)
+target_include_directories(abyss_perf_framework PRIVATE ${ABYSS_PERF_GENERATED_DIR})
+
 target_link_libraries(abyss_perf_framework PUBLIC
   abyss::compiler_options
   abyss::core

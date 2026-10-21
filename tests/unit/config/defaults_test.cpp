@@ -17,6 +17,12 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_GT(defaults.hot.max_memory_bytes, 0U);
   EXPECT_GT(defaults.hot.default_eviction.count(), 0);
   EXPECT_GT(defaults.hot.eviction_tick.count(), 0);
+  EXPECT_DOUBLE_EQ(defaults.hot.stub_memory_fraction, 0.02);
+  EXPECT_DOUBLE_EQ(defaults.hot.backpressure_ratio, 1.25);
+  EXPECT_TRUE(defaults.hot.fill_doorkeeper);
+  EXPECT_EQ(defaults.hot.fill_max_members, 1024U);
+  EXPECT_DOUBLE_EQ(defaults.hot.fill_max_fraction, 0.0625);
+  EXPECT_EQ(defaults.hot.negative_max_entries, 65536U);
   EXPECT_TRUE(defaults.hot.eviction_overrides.empty());
 
   EXPECT_EQ(defaults.cold.backend, "builtin_rocksdb");
@@ -29,9 +35,6 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.queue.offset_fsync_interval, std::chrono::milliseconds{1000});
   EXPECT_EQ(defaults.queue.log_count, 1U);
   EXPECT_EQ(defaults.queue.ring_entries, 65536U);
-
-  EXPECT_GT(defaults.hot_consumer.read_batch_size, 0U);
-  EXPECT_GT(defaults.hot_consumer.read_timeout.count(), 0);
 
   EXPECT_GT(defaults.cold_consumer.quiet_threshold.count(), 0);
   // ADP-004 §Flush Machinery Design Decisions §3: default jitter_fraction = 0.1.
@@ -53,8 +56,6 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_EQ(defaults.cold_consumer.loop_max_backoff, std::chrono::milliseconds{1000});
 
   EXPECT_GT(defaults.recovery.replay_parallelism, 0U);
-  EXPECT_GT(defaults.recovery.hot_replay_batch_size, 0U);
-  EXPECT_GT(defaults.recovery.cold_replay_batch_size, 0U);
 
   EXPECT_EQ(defaults.net.port, 6379);
   EXPECT_EQ(defaults.metrics.port, 9090);

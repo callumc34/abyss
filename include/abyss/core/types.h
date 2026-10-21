@@ -10,6 +10,9 @@ using ShardId = uint32_t;
 using SequenceId = uint64_t;
 using ConsumerId = uint32_t;
 
+// A shard's first seq. 0 names no entry: "none", "nothing drained".
+inline constexpr SequenceId kFirstSeq = 1;
+
 using SteadyClock = std::chrono::steady_clock;
 using SteadyTime = SteadyClock::time_point;
 using WallClock = std::chrono::system_clock;
@@ -24,8 +27,7 @@ using WallClockFn = std::function<WallTime()>;
 inline SteadyTime DefaultSteadyClock() { return SteadyClock::now(); }
 inline WallTime DefaultWallClock() { return WallClock::now(); }
 
-inline constexpr ConsumerId kHotConsumer = 0;
+// The only consumer that commits offsets; 0 and 2 are retired.
 inline constexpr ConsumerId kColdConsumer = 1;
-inline constexpr ConsumerId kResolverConsumer = 2;
 
 }  // namespace abyss::core

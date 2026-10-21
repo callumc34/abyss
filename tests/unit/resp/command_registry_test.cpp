@@ -1,5 +1,6 @@
 #include "abyss/resp/command_registry.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <array>
@@ -20,21 +21,22 @@ using Status = CommandRegistry::ResolveStatus;
 // registry and the parser table have to agree, so assert it rather than trust
 // two hand-maintained lists to stay in step.
 //
-// Fan-out writes are exempt: the engine decomposes them into per-key commands
-// before anything is queued, so MSET never needs a parser of its own.
-// Conditional writes are exempt: the resolver materialises them into concrete
-// ops, which is the only correct home for read-modify-write commands here.
-TEST(CommandRegistryTest, EveryUnconditionalWriteCommandHasAParser) {
+// Fan-out writes are exempt: the sequencer decides them into per-key
+// effects, so MSET never needs a parser of its own. The writes that are
+// always conditional are exempt too: the sequencer decides them whole,
+// and logs effects that do parse.
+TEST(CommandRegistryTest, EveryWriteHasAParserButTheAlwaysConditionalOnes) {
   CommandRegistry reg;
   std::vector<std::string> missing;
   for (const auto& spec : reg.All()) {
     if (spec.dispatch != Dispatch::kWritePath) continue;
     if (spec.multi_key_kind != core::MultiKeyKind::kNone) continue;
-    if (!core::ops::HasWriteParser(spec.name)) missing.emplace_back(spec.name);
+    if (core::ops::HasWriteParser(spec.name)) continue;
+    missing.emplace_back(spec.name);
+    EXPECT_NE(spec.predicate, nullptr) << spec.name << " is unconditional with no parser";
   }
-  EXPECT_TRUE(missing.empty())
-      << "registered as an unconditional write but no core::ops parser exists: "
-      << ::testing::PrintToString(missing);
+  EXPECT_THAT(missing,
+              ::testing::UnorderedElementsAre("SETNX", "MSETNX", "RENAMENX", "COPY", "HSETNX"));
 }
 
 TEST(CommandRegistryTest, FindsKnownCommand) {
@@ -82,12 +84,16 @@ TEST(CommandRegistryTest, FlushallAndFlushdbAreRegisteredAsFlushDispatch) {
   EXPECT_FALSE(flushall->loading_safe);
 }
 
-TEST(CommandRegistryTest, ConditionalWritesAreMarked) {
+// Conditional writes take the write path, and keep their predicate
+// extraction.
+TEST(CommandRegistryTest, ConditionalWritesTakeTheWritePathWithTheirPredicates) {
   CommandRegistry reg;
-  EXPECT_EQ(reg.Find("SETNX")->dispatch, Dispatch::kConditionalWrite);
-  EXPECT_EQ(reg.Find("MSETNX")->dispatch, Dispatch::kConditionalWrite);
-  EXPECT_EQ(reg.Find("RENAMENX")->dispatch, Dispatch::kConditionalWrite);
-  EXPECT_EQ(reg.Find("COPY")->dispatch, Dispatch::kConditionalWrite);
+  for (const std::string_view name : {"SETNX", "MSETNX", "RENAMENX", "COPY", "HSETNX"}) {
+    const auto* spec = reg.Find(name);
+    ASSERT_NE(spec, nullptr) << name;
+    EXPECT_EQ(spec->dispatch, Dispatch::kWritePath) << name;
+    EXPECT_NE(spec->predicate, nullptr) << name;
+  }
 }
 
 TEST(CommandRegistryTest, SetHasWritePathBaseDispatch) {
@@ -96,9 +102,9 @@ TEST(CommandRegistryTest, SetHasWritePathBaseDispatch) {
   EXPECT_EQ(reg.Find("ZADD")->dispatch, Dispatch::kWritePath);
 }
 
-TEST(CommandRegistryTest, ConsumerRpcCommands) {
+TEST(CommandRegistryTest, AdminCommands) {
   CommandRegistry reg;
-  EXPECT_EQ(reg.Find("DBSIZE")->dispatch, Dispatch::kConsumerRpc);
+  EXPECT_EQ(reg.Find("DBSIZE")->dispatch, Dispatch::kAdmin);
 }
 
 TEST(CommandRegistryTest, StatelessAdminCommands) {
@@ -198,7 +204,7 @@ TEST(CommandRegistryTest, ObjectSubcommandsHaveDistinctDispatch) {
   ASSERT_NE(enc, nullptr);
   ASSERT_NE(idle, nullptr);
   EXPECT_EQ(enc->dispatch, Dispatch::kTieredRead);
-  EXPECT_EQ(idle->dispatch, Dispatch::kConsumerRpc);
+  EXPECT_EQ(idle->dispatch, Dispatch::kAdmin);
 }
 
 TEST(CommandRegistryTest, ConfigOnlyExposesGetSubcommand) {

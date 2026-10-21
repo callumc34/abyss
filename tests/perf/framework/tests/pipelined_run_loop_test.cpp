@@ -117,6 +117,11 @@ TEST(PipelinedRunLoopTest, OpenLoopStallIsChargedToEverySlotItHeldBack) {
   // ~30 held-back slots waited >= 20ms. From the actual send only the 4
   // in-window requests would, leaving p98 near the service time.
   EXPECT_GE(hist.PercentileNs(98.0), kStallNs * 2 / 5);
+
+  // Slots held back by the full window are the server's backlog.
+  EXPECT_EQ(result.send_lag.Count() + result.backlog.Count(), kSlots);
+  EXPECT_GE(result.backlog.Count(), 40);
+  EXPECT_GE(result.backlog.MaxNs(), kStallNs / 2);
 }
 
 TEST(PipelinedRunLoopTest, ClosedLoopKeepsTheWindowFull) {

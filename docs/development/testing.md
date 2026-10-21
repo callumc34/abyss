@@ -32,7 +32,7 @@ Micro-benchmarks are not run via ctest. Build with the `bench` preset and run th
 
 **P2 — Tests own time.** Components that take a clock function inject `abyss::testing::TestClock` in tests. Real wall-clock sleeps are a code smell: they make tests slow, flaky, or both.
 
-**P3 — Events, not durations.** When waiting for an observable effect, wait for the signal (atomic flag, `std::future`, condition variable, `ConsumerRpc::PendingCount`) rather than sleeping for "long enough". The one legitimate exception is `TestServer::WaitForReady`, which polls the server's stdout for a single real external event.
+**P3 — Events, not durations.** When waiting for an observable effect, wait for the signal (atomic flag, `std::future`, condition variable, `ColdConsumer::WaitForDrainedSeq`) rather than sleeping for "long enough". The one legitimate exception is `TestServer::WaitForReady`, which polls the server's stdout for a single real external event.
 
 **P4 — Lifecycle is proportional.** Unit tests hold no external state. Integration tests use per-test temp dirs. System tests share a server across a suite when the test neither restarts nor asserts against server-wide baselines; otherwise `IsolatedServerTest` spawns a fresh server per test.
 
@@ -50,6 +50,24 @@ Micro-benchmarks are not run via ctest. Build with the `bench` preset and run th
 | Fuzz | Parser, format decoders | libFuzzer | Fuzz build | Out of ctest |
 
 The 30-second default `TIMEOUT` is a safety net for runaway tests, not a target. A component test that creeps toward 30s is a design problem to investigate.
+
+### Property and crash tests
+
+`abyss_property_tests` (label `component`) checks the engine against a reference model of Redis semantics (`tests/support/redis_model.h`), driving the real request pipeline, sequencer, read path, hot store, log and RocksDB cold store in-process:
+
+- `DifferentialTest`: a seeded command stream over a small overlapping keyspace, interleaved with eviction pressure, cold absorbs and flushes, loads raced by evictions and blind writes, segment starvation and restarts. Every reply is compared with the model, and every key the command touched in hot, or in buffer plus cold when not resident. Each seed also fixes the configuration (shards, logs, durability class, memory, stubs, doorkeeper and so on).
+- `LinearizabilityTest`: concurrent clients on fixed key groups, each group's history checked for linearizability against the model (`tests/support/linearizability.h`).
+- `CrashTest`: power loss that keeps an arbitrary subset of unflushed pages, with bit flips, and kill -9 of a victim process; the recovered log must be a prefix that explains every reply, and holds every acknowledged write after a kill -9, or after a power loss under `power_loss`. A cross-shard batch is cut at every frame.
+
+The bounded tiers take about 20 s locally (Debug), and run in CI; under a sanitizer they shrink to stay inside the 30 s test timeout. A failure prints its seed and configuration; replay it alone with `ABYSS_PROPERTY_SEED=<n>` (add `ABYSS_PROPERTY_TRACE=1` for every step), `ABYSS_LINEARIZABILITY_SEED=<n>` or `ABYSS_CRASH_SEED=<n>`. The long tiers are opt-in and local only:
+
+```bash
+ABYSS_PROPERTY_SEEDS=60 ABYSS_PROPERTY_OPS=1500 build/default/tests/component/abyss_property_tests --gtest_filter='DifferentialTest.LongTier'
+ABYSS_PROPERTY_KILLS=20 build/default/tests/component/abyss_property_tests --gtest_filter='DifferentialTest.LongTierKillNine'
+ABYSS_LINEARIZABILITY_SEEDS=30 build/default/tests/component/abyss_property_tests --gtest_filter='LinearizabilityTest.LongTier'
+ABYSS_CRASH_KILLS=20 build/default/tests/component/abyss_property_tests --gtest_filter='CrashTest.KillNine*'
+ABYSS_CRASH_POWER_LOSSES=40 build/default/tests/component/abyss_property_tests --gtest_filter='CrashTest.PowerLoss*'
+```
 
 ## Fixtures
 

@@ -25,6 +25,8 @@ struct RunLoopConfig {
   KeyDistConfig key_distribution;
   uint64_t value_size_bytes = 64;
   OperationMix mix;
+  // Called once, on its own thread, when the measured window opens.
+  std::function<void()> at_measure_start;
 };
 
 // Samples belong to the measured window by intended send time (open
@@ -34,8 +36,12 @@ struct RunLoopResult {
   // Successful measured ops; a failed op is counted, never timed.
   std::map<std::string, uint64_t> per_op_counts;
   std::map<std::string, uint64_t> per_op_errors;
-  // Open loop only: actual minus intended send time, one per slot.
+  // Open loop only, one sample per slot. send_lag: actual minus
+  // intended send time, for a slot whose previous op had finished (or
+  // whose window had room) by its intended time. backlog: for every
+  // other slot, how long past its intended time that op ran.
   Histogram send_lag;
+  Histogram backlog;
   bool open_loop = false;
   // CPU of the driver threads over the measured window.
   std::chrono::nanoseconds driver_cpu{0};

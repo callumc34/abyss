@@ -9,12 +9,12 @@
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
 
-// WAL format 2 frames (ADP-009). Every frame starts 8-byte aligned:
+// WAL format 3 frames (ADP-009). Every frame starts 8-byte aligned:
 //
 //   commit word   u64   {len: low u32, gen: high u32}, stored last
 //   crc32c        u32   over body[0, covered), the segment's salt, then
 //                       the commit word
-//   body          len   kind u8, type u8, shard u16, reserved u32,
+//   body          len   kind u8, type u8, shard u16, flags u32,
 //                       seq u64, batch_rest u64, appended_at_us i64,
 //                       then the entry payload
 //   pad                 zeros up to the next 8-byte boundary
@@ -39,9 +39,14 @@ inline constexpr std::size_t kMinFrameBytes = 48;
 
 enum class Kind : uint8_t { kEntry = 1, kPadding = 2 };
 
+// Header::flags bits. An unknown bit is corruption.
+inline constexpr uint32_t kReplacesState = 1U << 0;
+
 struct Header {
   Kind kind = Kind::kEntry;
   core::ShardId shard = 0;
+  // Formerly reserved; ADP-009's frame table predates it.
+  uint32_t flags = 0;
   core::SequenceId seq = 0;
   uint64_t batch_rest = 0;
   // Zero for padding.
@@ -57,10 +62,21 @@ inline uint32_t CommitGen(uint64_t word) noexcept { return static_cast<uint32_t>
 // Bytes a frame with a `len`-byte body occupies, padding included.
 std::size_t FrameSize(std::size_t len) noexcept;
 
-// Appends `entry`'s frame to `out` and returns its size. CloseBatch
-// then finishes it; the commit word holds only len until Log::Commit.
+// The append path's encoder. Writes `entry`'s frame into `out`, its
+// reserved span, as the frame `batch_rest` bytes from its batch's end:
+// the body, zeroed padding and the body CRC. The commit word is left
+// for Log::CommitInPlace, which takes the returned body length. Fatal
+// unless the frame fills `out` exactly.
+uint32_t EncodeEntryInto(const core::QueueEntry& entry, core::ShardId shard,
+                         std::span<std::byte> out, uint64_t batch_rest);
+
+// Appends `entry`'s frame to `out` as a batch of one and returns its
+// size; the commit word holds only len until Log::Commit. CloseBatch
+// re-closes consecutive frames as one batch.
 std::size_t EncodeEntry(const core::QueueEntry& entry, core::ShardId shard,
                         std::vector<std::byte>& out);
+// The size of `entry`'s frame, without encoding it.
+std::size_t EntryFrameSize(const core::QueueEntry& entry);
 
 // Closes `frames`, consecutive EncodeEntry outputs reserved together,
 // as one batch: writes each frame's batch_rest, then its body CRC into

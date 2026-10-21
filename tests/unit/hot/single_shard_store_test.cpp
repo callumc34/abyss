@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include "abyss/core/types.h"
+#include "hot_bytes.h"
 #include "test_clock.h"
 
 namespace abyss::hot {
@@ -19,11 +21,15 @@ class SingleShardStoreTest : public ::testing::Test {
  protected:
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::TestClock clock_;
+  // Sized for every key a test writes, so its buckets hold still.
   SingleShardStore store_{SingleShardConfig{
       .max_memory_bytes = 1024UL * 1024,
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
+      .reserve_keys = 64,
   }};
+  // What the empty store holds: its map's buckets.
+  const uint64_t empty_bytes_ = store_.Stats().used_bytes;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
   static constexpr core::EvictionTTL kEviction{86400};
 
@@ -438,11 +444,11 @@ TEST_F(SingleShardStoreTest, EvictExpiredRemovesOldKeys) {
   auto short_eviction = core::EvictionTTL{1};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
-  auto before = store_.EvictExpired(clock_.SteadyNow());
+  auto before = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(before.Total(), 0U);
 
   clock_.Advance(1100ms);
-  auto after = store_.EvictExpired(clock_.SteadyNow());
+  auto after = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(after.Total(), 1U);
   EXPECT_EQ(after.by_deadline, 1U);
   EXPECT_EQ(after.by_ttl, 0U);
@@ -451,16 +457,17 @@ TEST_F(SingleShardStoreTest, EvictExpiredRemovesOldKeys) {
   EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(SingleShardStoreTest, RefreshAccessExtendsDeadline) {
+TEST_F(SingleShardStoreTest, AReadExtendsTheDeadline) {
   core::ops::StringSet op{.key = "k", .value = "v"};
   auto short_eviction = core::EvictionTTL{1};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, short_eviction).has_value());
 
   clock_.Advance(500ms);
-  store_.RefreshAccess("k", clock_.SteadyNow());
+  store_.SetAccessTime(clock_.SteadyNow());
+  ASSERT_TRUE(GetString("k").has_value());
 
   clock_.Advance(700ms);
-  auto evicted = store_.EvictExpired(clock_.SteadyNow());
+  auto evicted = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(evicted.Total(), 0U);
 }
 
@@ -472,12 +479,12 @@ TEST_F(SingleShardStoreTest, EvictExpiredAttributesTtlReason) {
           .count();
   SetString("k", "v", static_cast<uint64_t>(now_ms + 1000));
 
-  auto before = store_.EvictExpired(clock_.SteadyNow());
+  auto before = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(before.by_ttl, 0U);
   EXPECT_EQ(before.by_deadline, 0U);
 
   clock_.Advance(1500ms);
-  auto after = store_.EvictExpired(clock_.SteadyNow());
+  auto after = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(after.by_ttl, 1U) << "abs TTL drove removal";
   EXPECT_EQ(after.by_deadline, 0U) << "eviction deadline is far in the future";
 }
@@ -495,19 +502,18 @@ TEST_F(SingleShardStoreTest, EvictExpiredTtlWinsWhenBothApply) {
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
 
   clock_.Advance(1500ms);
-  auto report = store_.EvictExpired(clock_.SteadyNow());
+  auto report = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(report.by_ttl, 1U);
   EXPECT_EQ(report.by_deadline, 0U);
 }
 
 TEST_F(SingleShardStoreTest, EvictLruRemovesOldest) {
   SetString("old", std::string(512, 'x'));
-  store_.RefreshAccess("old", clock_.SteadyNow() - 100s);
-
+  clock_.Advance(1s);
   SetString("new", std::string(512, 'y'));
 
   auto target = store_.Stats().used_bytes * 3 / 4;
-  auto evicted = store_.EvictLru(target);
+  auto evicted = store_.EvictLru(target, kAllDrained);
   EXPECT_GE(evicted, 1U);
 
   auto old_result = GetString("old");
@@ -546,12 +552,12 @@ TEST_F(SingleShardStoreTest, TtlFutureKeyFound) {
 TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   auto before = store_.Stats();
   EXPECT_EQ(before.key_count, 0U);
-  EXPECT_EQ(before.used_bytes, 0U);
+  EXPECT_EQ(before.used_bytes, empty_bytes_);
 
   SetString("k", "v");
   auto after_insert = store_.Stats();
   EXPECT_EQ(after_insert.key_count, 1U);
-  EXPECT_GT(after_insert.used_bytes, 0U);
+  EXPECT_GT(after_insert.used_bytes, empty_bytes_);
 
   core::ops::Del del_op{.keys = {"k"}};
   auto del_result = store_.Apply(core::ops::WriteOp{del_op}, kEviction);
@@ -560,7 +566,7 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
   // The delete leaves a tombstone, so a small footprint remains until
   // GcTombstones reclaims the entry (proven separately). It is never larger
   // than the live entry — the value is released (modulo small-string capacity).
-  EXPECT_GT(after_delete.used_bytes, 0U);
+  EXPECT_GT(after_delete.used_bytes, empty_bytes_);
   EXPECT_LE(after_delete.used_bytes, after_insert.used_bytes);
 }
 
@@ -569,7 +575,7 @@ TEST_F(SingleShardStoreTest, StatsTrackInsertAndDelete) {
 TEST_F(SingleShardStoreTest, WipeClearsAll) {
   SetString("a", "1");
   SetString("b", "2");
-  store_.Wipe();
+  store_.Wipe(core::kFirstSeq);
 
   EXPECT_EQ(store_.Stats().key_count, 0U);
   auto result = GetString("a");
@@ -745,7 +751,8 @@ TEST_F(SingleShardStoreTest, TombstoneResurrectThenCreateBalancedBytes) {
 }
 
 TEST_F(SingleShardStoreTest, AccountingInvariantUnderRandomOps) {
-  // After a delete+GC of every key, used_bytes_ must return to exactly 0 — any
+  // After a delete+GC of every key, used_bytes_ must return to exactly the
+  // empty store's — any
   // unbalanced Track pair would leave residue (or clamp at 0 hiding an
   // over-count, which the per-step monotonic checks below would catch).
   ASSERT_TRUE(store_
@@ -771,7 +778,7 @@ TEST_F(SingleShardStoreTest, AccountingInvariantUnderRandomOps) {
                     .has_value());
   }
   store_.GcTombstones(seq);
-  EXPECT_EQ(store_.Stats().used_bytes, 0U) << "used_bytes did not return to baseline";
+  EXPECT_EQ(store_.Stats().used_bytes, empty_bytes_) << "used_bytes did not return to baseline";
   EXPECT_EQ(store_.Stats().key_count, 0U);
 }
 
@@ -789,9 +796,9 @@ TEST_F(SingleShardStoreTest, ZsetAccountsScoreMembersIndex) {
     score += 1.0;
   }
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{set_add}, kEviction).has_value());
-  const auto set_bytes = store_.Stats().used_bytes;
+  const auto set_bytes = store_.Stats().used_bytes - empty_bytes_;
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{zset_add}, kEviction).has_value());
-  const auto total_bytes = store_.Stats().used_bytes;
+  const auto total_bytes = store_.Stats().used_bytes - empty_bytes_;
   const auto zset_bytes = total_bytes - set_bytes;
 
   EXPECT_GT(zset_bytes, set_bytes)
@@ -846,6 +853,48 @@ TEST_F(SingleShardStoreTest, ZsetRangeMalformedScoreReturnsInvalidArgument) {
   EXPECT_EQ(ok2->AsArray().size(), 2U);
 }
 
+// Redis's score ranges: "(" excludes a bound, REV gives the maximum
+// first, and a minimum above the maximum is empty.
+TEST_F(SingleShardStoreTest, ZsetRangeByScoreHonoursExclusiveBoundsAndOrder) {
+  core::ops::ZsetAdd add{.key = "z",
+                         .entries = {{.score = 1.0, .member = "a"},
+                                     {.score = 2.0, .member = "b"},
+                                     {.score = 3.0, .member = "c"}}};
+  ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
+  const auto members = [this](std::string_view min, std::string_view max, bool rev) {
+    core::ops::ZsetRange op{.key = "z", .min = min, .max = max, .by_score = true, .rev = rev};
+    auto r = store_.Exec(core::ops::ReadOp{op});
+    std::vector<std::string> out;
+    if (!r.has_value()) {
+      ADD_FAILURE() << r.error().message();
+      return out;
+    }
+    for (const auto& v : r->AsArray()) out.push_back(v.AsString());
+    return out;
+  };
+  using V = std::vector<std::string>;
+  EXPECT_EQ(members("(1", "3", false), (V{"b", "c"}));
+  EXPECT_EQ(members("1", "(3", false), (V{"a", "b"}));
+  EXPECT_EQ(members("(1", "(3", false), (V{"b"}));
+  EXPECT_EQ(members("-inf", "(2", false), (V{"a"}));
+  EXPECT_EQ(members("(2", "+inf", false), (V{"c"}));
+  EXPECT_EQ(members("3", "1", false), V{}) << "minimum above maximum";
+  EXPECT_EQ(members("(2", "2", false), V{}) << "an equal pair, one end exclusive";
+  EXPECT_EQ(members("3", "(1", true), (V{"c", "b"})) << "REV: the maximum first";
+  EXPECT_EQ(members("1", "3", true), V{}) << "REV: a minimum given first is empty";
+
+  core::ops::ZsetRange lex_rev{.key = "z", .min = "[c", .max = "(a", .by_lex = true, .rev = true};
+  auto lex = store_.Exec(core::ops::ReadOp{lex_rev});
+  ASSERT_TRUE(lex.has_value());
+  ASSERT_EQ(lex->AsArray().size(), 2U) << "BYLEX REV: the maximum first";
+  EXPECT_EQ(lex->AsArray()[0].AsString(), "c");
+
+  core::ops::ZsetRange bad{.key = "z", .min = "(", .max = "2", .by_score = true};
+  auto r = store_.Exec(core::ops::ReadOp{bad});
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().message(), "min or max is not a float");
+}
+
 TEST_F(SingleShardStoreTest, ZsetRangeArbitraryBytesNeverThrow) {
   core::ops::ZsetAdd add{.key = "z", .entries = {{.score = 1.0, .member = "a"}}};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{add}, kEviction).has_value());
@@ -873,7 +922,7 @@ TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
           .count();
   SetString("ttl", "v", static_cast<uint64_t>(now_ms + 500));
   clock_.Advance(1000ms);
-  store_.EvictExpired(clock_.SteadyNow());
+  store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   auto after_ttl = store_.Stats();
   EXPECT_EQ(after_ttl.expired_count, 1U);
   EXPECT_EQ(after_ttl.eviction_count, 0U);
@@ -882,7 +931,7 @@ TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
   core::ops::StringSet op{.key = "ev", .value = "v"};
   ASSERT_TRUE(store_.Apply(core::ops::WriteOp{op}, core::EvictionTTL{1}).has_value());
   clock_.Advance(1100ms);
-  store_.EvictExpired(clock_.SteadyNow());
+  store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   auto after_deadline = store_.Stats();
   EXPECT_EQ(after_deadline.expired_count, 1U) << "TTL count unchanged by a deadline eviction";
   EXPECT_EQ(after_deadline.eviction_count, 1U);
@@ -890,30 +939,16 @@ TEST_F(SingleShardStoreTest, TtlExpiryCountsExpiredNotEviction) {
 
 // --- Memory-pressure LRU eviction (HOT-1) ---
 
-// Measures the footprint of a single string entry of the given key/value, so
-// budgets can be sized relative to the real per-entry cost rather than guessed.
-uint64_t MeasureStringEntryBytes(std::string_view key, const std::string& value) {
-  abyss::testing::TestClock clock;
-  SingleShardStore probe{SingleShardConfig{
-      .steady_clock = clock.SteadyFn(),
-      .wall_clock = clock.WallFn(),
-  }};
-  EXPECT_TRUE(probe
-                  .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = value}},
-                         core::EvictionTTL{86400})
-                  .has_value());
-  return probe.Stats().used_bytes;
-}
-
 TEST(SingleShardStoreMemoryTest, ApplyEvictsLruToFitUnderBudget) {
   abyss::testing::TestClock clock;
   const std::string value(64, 'v');
-  const uint64_t per_entry = MeasureStringEntryBytes("a", value);
+  const uint64_t per_entry = abyss::testing::StringEntryBytes("a", value);
   // Budget holds 2 entries but not 3.
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = (per_entry * 2) + (per_entry / 2),
+      .max_memory_bytes = abyss::testing::EmptyStoreBytes(8) + (per_entry * 2) + (per_entry / 2),
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
+      .reserve_keys = 8,
   }};
   const core::EvictionTTL eviction{86400};
 
@@ -940,7 +975,7 @@ TEST(SingleShardStoreMemoryTest, ApplyEvictsLruToFitUnderBudget) {
 
 TEST(SingleShardStoreMemoryTest, ApplyReturnsResourceExhaustedWhenNoVictims) {
   abyss::testing::TestClock clock;
-  const uint64_t small_entry = MeasureStringEntryBytes("k", "v");
+  const uint64_t small_entry = abyss::testing::StringEntryBytes("k", "v");
   // Budget below a single real value, no other evictable keys.
   SingleShardStore store{SingleShardConfig{
       .max_memory_bytes = small_entry,
@@ -955,31 +990,29 @@ TEST(SingleShardStoreMemoryTest, ApplyReturnsResourceExhaustedWhenNoVictims) {
   EXPECT_EQ(r.error().code(), core::ErrorCode::kResourceExhausted);
 }
 
-TEST(SingleShardStoreMemoryTest, ReplayModeSuppressesMemoryEviction) {
+// Eviction waits for cold, in replay as in steady state: writes past the
+// budget all apply while nothing has drained, and once it has, eviction
+// brings the store back under.
+TEST(SingleShardStoreMemoryTest, OverBudgetWritesApplyUntilColdDrains) {
   abyss::testing::TestClock clock;
-  const uint64_t small_entry = MeasureStringEntryBytes("k", "v");
+  const uint64_t entry = abyss::testing::StringEntryBytes("k0", std::string(256, 'x'));
   SingleShardStore store{SingleShardConfig{
-      .max_memory_bytes = small_entry,
+      .max_memory_bytes = 3 * entry,
       .steady_clock = clock.SteadyFn(),
       .wall_clock = clock.WallFn(),
   }};
-  store.SetReplayMode(true);
-  // Over-budget writes must all apply during replay: no eviction, no
-  // kResourceExhausted (deterministic replay, invariant 4).
   for (int i = 0; i < 5; ++i) {
     auto r = store.Apply(core::ops::WriteOp{core::ops::StringSet{.key = "k" + std::to_string(i),
                                                                  .value = std::string(256, 'x')}},
-                         core::EvictionTTL{86400});
-    ASSERT_TRUE(r.has_value()) << "replay write " << i << " should not be rejected";
+                         core::EvictionTTL{86400}, static_cast<core::SequenceId>(i) + 1,
+                         /*horizon=*/0);
+    ASSERT_TRUE(r.has_value()) << "write " << i << " should not be rejected";
   }
   EXPECT_EQ(store.Stats().eviction_count, 0U);
   EXPECT_EQ(store.Stats().key_count, 5U);
-  EXPECT_GT(store.Stats().used_bytes, store.Stats().max_bytes)
-      << "over budget during replay (enforced only after)";
+  EXPECT_GT(store.Stats().used_bytes, store.Stats().max_bytes);
 
-  // After replay, the ceiling is enforced by EvictLru.
-  store.SetReplayMode(false);
-  store.EvictLru(store.Stats().max_bytes);
+  store.EvictLru(store.Stats().max_bytes, kAllDrained);
   EXPECT_LE(store.Stats().used_bytes, store.Stats().max_bytes);
 }
 
@@ -1070,7 +1103,7 @@ TEST_F(SingleShardStoreTest, ExpirePersistOnTombstoneDoNotPerturbEvictionCounter
       store_.Apply(core::ops::WriteOp{core::ops::Persist{.key = "k"}}, kEviction, 3).has_value());
 
   clock_.Advance(1500ms);
-  auto report = store_.EvictExpired(clock_.SteadyNow());
+  auto report = store_.EvictExpired(clock_.SteadyNow(), kAllDrained);
   EXPECT_EQ(report.by_ttl, 0U) << "tombstone is skipped, never counted as a TTL expiry";
   EXPECT_EQ(report.by_deadline, 0U) << "tombstone is skipped, never counted as an eviction";
   // The tombstone survives until GC, not the eviction deadline.
@@ -1081,7 +1114,7 @@ TEST_F(SingleShardStoreTest, ExpirePersistAfterTombstoneGcStillAbsent) {
   SetString("k", "v");
   ASSERT_TRUE(
       store_.Apply(core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, kEviction, 5).has_value());
-  // GC reclaims the tombstone (horizon >= tombstone_seq), so the key is now
+  // GC reclaims the tombstone (horizon >= latest_seq), so the key is now
   // fully absent and the entries_.end() guard returns 0.
   EXPECT_EQ(store_.GcTombstones(5), 1U);
   EXPECT_EQ(store_.Probe("k"), core::HotKeyPresence::kAbsent);
@@ -1131,7 +1164,9 @@ TEST_F(SingleShardStoreTest, HotZrangeByLexAppliesBounds) {
   EXPECT_EQ(collect("[b", "(d"), (std::vector<std::string>{"b", "c"}));
   EXPECT_EQ(collect("-", "+"), (std::vector<std::string>{"a", "b", "c", "d"}));
   EXPECT_EQ(collect("(a", "[c"), (std::vector<std::string>{"b", "c"}));
-  EXPECT_EQ(collect("-", "+", /*rev=*/true), (std::vector<std::string>{"d", "c", "b", "a"}));
+  // With REV the maximum comes first, as ZRANGE z + - BYLEX REV.
+  EXPECT_EQ(collect("+", "-", /*rev=*/true), (std::vector<std::string>{"d", "c", "b", "a"}));
+  EXPECT_TRUE(collect("-", "+", /*rev=*/true).empty());
 }
 
 TEST_F(SingleShardStoreTest, HotZrangeByLexMalformedBoundIsCleanError) {
@@ -1143,6 +1178,95 @@ TEST_F(SingleShardStoreTest, HotZrangeByLexMalformedBoundIsCleanError) {
       core::ops::ReadOp{core::ops::ZsetRange{.key = "z", .min = "a", .max = "+", .by_lex = true}});
   ASSERT_FALSE(r.has_value());
   EXPECT_EQ(r.error().code(), core::ErrorCode::kInvalidArgument);
+}
+
+// A rehash moves every node under the shard's exclusive lock; a map
+// sized up front for the keys it will hold never does one.
+size_t RehashesInserting(size_t reserve, size_t keys) {
+  size_t rehashes = 0;
+  SingleShardStore store{SingleShardConfig{
+      .reserve_keys = reserve, .on_rehash = [&rehashes](double /*seconds*/) { ++rehashes; }}};
+  for (size_t i = 0; i < keys; ++i) {
+    const std::string key = "key:" + std::to_string(i);
+    EXPECT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}},
+                           core::EvictionTTL{86400})
+                    .has_value());
+  }
+  return rehashes;
+}
+
+TEST(SingleShardRehashTest, AMapSizedForItsKeysNeverRehashes) {
+  EXPECT_EQ(RehashesInserting(/*reserve=*/4096, /*keys=*/4000), 0U);
+}
+
+TEST(SingleShardRehashTest, AnUnsizedMapReportsEachRehash) {
+  EXPECT_GT(RehashesInserting(/*reserve=*/0, /*keys=*/4000), 0U);
+}
+
+// A map sized up front holds its buckets from the start, so they count
+// in used bytes; a Flush that buries the map sizes its successor.
+TEST(SingleShardRehashTest, ASizedMapCountsItsBucketsAndKeepsThemAcrossAFlush) {
+  size_t rehashes = 0;
+  SingleShardStore store{SingleShardConfig{
+      .reserve_keys = 4096, .on_rehash = [&rehashes](double /*seconds*/) { ++rehashes; }}};
+  const uint64_t empty = store.Stats().used_bytes;
+  EXPECT_GE(empty, 4096 * sizeof(void*));
+  Graveyard graveyard;
+  store.SetGraveyard(&graveyard);
+  store.Wipe(core::kFirstSeq);
+  store.SetGraveyard(nullptr);
+  EXPECT_EQ(store.Stats().used_bytes, empty);
+  for (size_t i = 0; i < 4000; ++i) {
+    const std::string key = "key:" + std::to_string(i);
+    ASSERT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}},
+                           core::EvictionTTL{86400})
+                    .has_value());
+  }
+  EXPECT_EQ(rehashes, 0U) << "the map after the Flush was not sized";
+}
+
+// A map's buckets count whether or not it was sized up front.
+TEST(SingleShardRehashTest, AnUnsizedMapCountsItsBucketsAsItGrows) {
+  constexpr size_t kKeys = 1000;
+  SingleShardStore store{SingleShardConfig{}};
+  for (size_t i = 0; i < kKeys; ++i) {
+    const std::string digits = std::to_string(i);
+    const std::string key = "key:" + std::string(4 - digits.size(), '0') + digits;
+    ASSERT_TRUE(store
+                    .Apply(core::ops::WriteOp{core::ops::StringSet{.key = key, .value = "v"}},
+                           core::EvictionTTL{86400})
+                    .has_value());
+  }
+  const uint64_t entries = kKeys * abyss::testing::StringEntryBytes("key:0000", "v");
+  EXPECT_GE(store.Stats().used_bytes - entries, kKeys * sizeof(void*))
+      << "its buckets went uncounted";
+}
+
+// The stub index is sized for its cap up front, its buckets counted
+// with its stubs; a load batch that grows it past them is counted too.
+TEST(SingleShardRehashTest, AStubIndexCountsItsBucketsWithItsStubs) {
+  constexpr size_t kCap = 8;
+  SingleShardStore store{SingleShardConfig{.stub_max_entries = kCap}};
+  const auto empty = store.Stats();
+  EXPECT_GE(empty.stub_bytes, kCap * sizeof(void*));
+  EXPECT_EQ(empty.used_bytes, empty.stub_bytes + abyss::testing::EmptyStoreBytes(0));
+
+  constexpr size_t kBatch = 64;
+  std::vector<LoadCompletion> loads;
+  uint64_t stubs = 0;
+  for (size_t i = 0; i < kBatch; ++i) {
+    std::string key = "k" + std::to_string(i);
+    const auto token = store.BeginLoad(key);
+    ASSERT_TRUE(token.has_value());
+    stubs += kStubBytes + key.size();
+    loads.push_back(
+        {.key = std::move(key), .token = token.value_or(LoadToken{}), .result = LoadedExists{}});
+  }
+  ASSERT_EQ(store.CompleteLoads(loads, core::EvictionPolicy{}), kBatch);
+  EXPECT_GE(store.Stats().stub_bytes, stubs + (kBatch * sizeof(void*)))
+      << "the grown index went uncounted";
 }
 
 }  // namespace

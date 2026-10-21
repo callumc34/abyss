@@ -142,8 +142,8 @@ RunReport BuildReport(const ProbeArgs& args, const WorkloadConfig& workload,
     report.operations[name] = StatsFromHistogram(hist, count, result.measured_duration);
     report.operations[name].errors = result.per_op_errors.at(name);
   }
-  report.driver = MakeDriverStats(result.send_lag, result.open_loop, result.driver_cpu,
-                                  result.measured_duration, workload.targets);
+  report.driver = MakeDriverStats(result.send_lag, result.backlog, result.open_loop,
+                                  result.driver_cpu, result.measured_duration, workload.targets);
   EvaluateTargets(report);
   return report;
 }

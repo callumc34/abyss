@@ -25,7 +25,6 @@ MetricsSnapshotter::MetricsSnapshotter(const StatusProvider& provider) : provide
   cold_buffer_bytes_ = registry.Gauge(metrics::names::kColdBufferBytes);
   cold_buffer_oldest_entry_age_seconds_ =
       registry.Gauge(metrics::names::kColdBufferOldestEntryAgeSeconds);
-  hot_consumer_lag_entries_ = registry.Gauge(metrics::names::kHotConsumerLagEntries);
   cold_consumer_lag_entries_ = registry.Gauge(metrics::names::kColdConsumerLagEntries);
   net_read_buffer_high_water_bytes_ = registry.Gauge(metrics::names::kNetReadBufferHighWaterBytes);
 }
@@ -49,7 +48,6 @@ void MetricsSnapshotter::Observe() {
   cold_buffer_bytes_.Set(static_cast<double>(s.cold.buffer.bytes));
   cold_buffer_oldest_entry_age_seconds_.Set(MillisToSeconds(s.cold.buffer.oldest_entry_age_ms));
 
-  hot_consumer_lag_entries_.Set(static_cast<double>(s.lag.hot_max_entries));
   cold_consumer_lag_entries_.Set(static_cast<double>(s.lag.cold_max_entries));
 
   net_read_buffer_high_water_bytes_.Set(

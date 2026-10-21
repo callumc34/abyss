@@ -26,15 +26,16 @@
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/cold_consumer_pool.h"
-#include "abyss/consumer/hot_consumer_progress.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/loader.h"
+#include "abyss/engine/read_path.h"
+#include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/names.h"
@@ -42,7 +43,8 @@
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/wal_queue.h"
-#include "durability_printer.h"
+#include "cold_read.h"
+#include "cold_replay.h"
 #include "latch.h"
 #include "on_exit.h"
 #include "temp_dir.h"
@@ -54,6 +56,7 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr auto kWait = 5s;
+constexpr core::SequenceId kFirst = core::kFirstSeq;
 
 // Holds every WAL flush until released, but for those allowed through.
 class FlushStall {
@@ -105,16 +108,10 @@ class FlushStall {
 // Runs `on_apply` around every ApplyBatch: before it lands and after.
 class ApplyHookColdStore : public core::ColdStore {
  public:
-  using PromotionCommand = core::Result<std::optional<core::RespCommand>>;
-
   explicit ApplyHookColdStore(core::ColdStore& inner) : inner_(inner) {}
 
   void SetOnApply(std::function<void()> on_apply) { on_apply_ = std::move(on_apply); }
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override {
-    return inner_.Exec(op, deadline);
-  }
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
     if (on_apply_) on_apply_();
@@ -128,18 +125,27 @@ class ApplyHookColdStore : public core::ColdStore {
   core::Result<void> Wipe(core::ShardId shard) override { return inner_.Wipe(shard); }
   core::Result<core::StorageStats> Stats() override { return inner_.Stats(); }
   core::Result<void> Compact() override { return inner_.Compact(); }
-  PromotionCommand GetPromotionCommand(std::string_view key) override {
-    return inner_.GetPromotionCommand(key);
+  core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
+                                                          core::SteadyTime deadline) override {
+    return inner_.LoadKey(key, deadline);
+  }
+  core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
+                                                      core::SteadyTime deadline) override {
+    return inner_.ProbeKey(key, deadline);
+  }
+  core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
+                                                        core::SteadyTime deadline) override {
+    return inner_.LoadKeyAs(key, type, deadline);
+  }
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override {
+    return inner_.LoadMembers(key, type, members, deadline);
   }
 
  private:
   core::ColdStore& inner_;
   std::function<void()> on_apply_;
-};
-
-class NullHotProgress : public HotConsumerProgress {
- public:
-  core::SequenceId HighestSettledSeq(core::ShardId /*shard*/) const override { return 0; }
 };
 
 core::RespCommand Cmd(std::vector<std::string> args) {
@@ -151,21 +157,8 @@ core::QueueEntry WriteEntry(std::vector<std::string> args) {
                           .payload = core::entry::Write{.cmd = Cmd(std::move(args))}};
 }
 
-core::QueueEntry ConditionalEntry(std::vector<std::string> args) {
-  return core::QueueEntry{.appended_at = core::WallClock::now(),
-                          .payload = core::entry::Conditional{.cmd = Cmd(std::move(args))}};
-}
-
-// What the resolver appends for an applied Conditional.
-core::QueueEntry ResolvedEntry(core::SequenceId ref, std::vector<std::string> args) {
-  core::entry::Resolved resolved{.ref = ref, .decision = core::Decision::kApply};
-  resolved.materialised_ops.push_back(Cmd(std::move(args)));
-  return core::QueueEntry{.appended_at = core::WallClock::now(), .payload = std::move(resolved)};
-}
-
 std::optional<std::string> ReadCold(core::ColdStore& cold, const std::string& key) {
-  const core::ops::ReadOp op = core::ops::StringGet{.key = key};
-  auto value = cold.Exec(op);
+  auto value = testing::ColdRead(cold, core::ops::StringGet{.key = key});
   EXPECT_TRUE(value.has_value()) << value.error().message();
   if (!value.has_value() || value->IsNull()) return std::nullopt;
   return value->AsString();
@@ -235,8 +228,7 @@ class ColdPersistenceGateTest : public ::testing::Test {
   }
 
   ColdConsumer& AddConsumer(core::ShardId shard, const ColdConsumer::Config& cfg) {
-    consumers_.push_back(
-        std::make_unique<ColdConsumer>(*queue_, *cold_, shard, cfg, policy_, rpc_));
+    consumers_.push_back(std::make_unique<ColdConsumer>(*queue_, *cold_, shard, cfg, policy_));
     return *consumers_.back();
   }
 
@@ -273,7 +265,6 @@ class ColdPersistenceGateTest : public ::testing::Test {
   std::unique_ptr<queue::WalQueue> queue_;
   std::unique_ptr<cold::backends::RocksdbStore> cold_;
   core::EvictionPolicy policy_{core::EvictionTTL{86400}};
-  core::ConsumerRpc rpc_;
   FlushStall stall_;
   std::vector<std::unique_ptr<ColdConsumer>> consumers_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -298,7 +289,7 @@ TEST_F(ColdPersistenceGateTest, StalledFlushKeepsAbsorbedWritesOutOfCold) {
     return consumer.Snapshot().durability_waits_timed_out >= 2;
   })) << "the aggressive flush never reached the persistence gate";
 
-  EXPECT_EQ(PowerEnd(0), 0U);
+  EXPECT_EQ(PowerEnd(0), kFirst);
   EXPECT_EQ(consumer.Buffer().Size(), static_cast<size_t>(kKeys));
   for (int i = 0; i < kKeys; ++i) {
     EXPECT_EQ(ReadCold(*cold_, "k" + std::to_string(i)), std::nullopt)
@@ -373,31 +364,6 @@ TEST_F(ColdPersistenceGateTest, RewrittenKeyNeverPersistsAboveThePowerDurableEnd
   EXPECT_GT(checks, 0);
 }
 
-// The Conditional X is durable, its Resolved Y is not. Y carries the
-// effect, so the effect must not reach cold until Y is power-durable.
-TEST_F(ColdPersistenceGateTest, ConditionalEffectWaitsForItsResolved) {
-  ASSERT_NO_FATAL_FAILURE(OpenWal(core::Durability::kProcessCrash));
-  ASSERT_NO_FATAL_FAILURE(OpenCold());
-  auto& consumer = AddConsumer(0, AggressiveConfig());
-
-  const core::SequenceId x = Append(0, ConditionalEntry({"SET", "k", "v"}));
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, x));
-  queue_->SetFlushHookForTesting(stall_.Hook());
-  const core::SequenceId y = Append(0, ResolvedEntry(x, {"SET", "k", "v"}));
-
-  EXPECT_EQ(consumer.Drain(), 2U);
-  EXPECT_EQ(consumer.LatestDrainedSeq(), y);
-  EXPECT_EQ(consumer.Flush(), ColdConsumer::FlushOutcome::kDurabilityPending);
-  EXPECT_EQ(PowerEnd(0), x + 1);
-  EXPECT_EQ(ReadCold(*cold_, "k"), std::nullopt) << "persisted a Resolved a power loss could drop";
-  EXPECT_EQ(ColdCommit(0), std::nullopt) << "committed past the Conditional";
-
-  stall_.Release();
-  ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(0, y));
-  EXPECT_EQ(consumer.Flush(), ColdConsumer::FlushOutcome::kProgress);
-  EXPECT_EQ(ReadCold(*cold_, "k"), "v");
-}
-
 // A buffered key absent from hot is served from the buffer, never from
 // cold's older state, while its batch is selected, held and applied.
 TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight) {
@@ -407,14 +373,15 @@ TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight)
   ColdConsumer::Config cfg = AggressiveConfig();
   cfg.queue_read_timeout = 100ms;
   ColdConsumerPool pool(*queue_, cold, ColdConsumerPool::Config{.shard_count = 1, .consumer = cfg},
-                        policy_, rpc_);
+                        policy_);
   hot::ShardedHotStore hot(hot::ShardedHotStoreConfig{
       .max_memory_bytes = 16UL * 1024UL * 1024UL,
       .shard_count = 1,
   });
-  NullHotProgress hot_progress;
-  engine::TieringEngine engine(*queue_, hot, cold, pool, hot_progress, rpc_,
-                               engine::TieringEngineConfig{.shard_count = 1});
+  engine::Loader loader(hot, pool, cold);
+  engine::Sequencer sequencer(hot, *queue_, loader, pool, engine::SequencerConfig{});
+  engine::ReadPath read_path(hot, loader, sequencer, engine::ReadPathConfig{});
+  engine::TieringEngine engine(read_path, sequencer);
   const auto get = [&engine] {
     auto read = engine.DispatchRead("GET", Cmd({"GET", "k"}));
     if (!read.has_value()) return std::string("<error>");
@@ -505,13 +472,12 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
   queue_->SetFlushHookForTesting(stall_.Hook());
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     Append(shard, WriteEntry({"SET", key("b", shard), "b"}));
-    const core::SequenceId x = Append(shard, ConditionalEntry({"SET", key("c", shard), "c"}));
-    Append(shard, ResolvedEntry(x, {"SET", key("c", shard), "c"}));
+    const core::SequenceId c = Append(shard, WriteEntry({"SET", key("c", shard), "c"}));
     auto& consumer = *consumers_[shard];
     consumer.Drain();
     const auto outcome = consumer.Flush();
     if (GetParam() == core::Durability::kProcessCrash) {
-      EXPECT_EQ(consumer.LatestDrainedSeq(), x + 1) << "cold absorbs at the ack class";
+      EXPECT_EQ(consumer.LatestDrainedSeq(), c) << "cold absorbs at the ack class";
       EXPECT_EQ(outcome, ColdConsumer::FlushOutcome::kDurabilityPending);
     } else {
       EXPECT_EQ(outcome, ColdConsumer::FlushOutcome::kIdle) << "absorbed an unflushed entry";
@@ -530,7 +496,7 @@ TEST_P(ColdPowerLossTest, ColdHoldsNothingAboveTheRecoveredLog) {
   ASSERT_NO_FATAL_FAILURE(OpenCold(kShards));
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     EXPECT_EQ(PowerEnd(shard), durable_end[shard]) << "shard " << shard;
-    auto recovered = queue_->Read(shard, 0, 16, 0ms, core::Durability::kPowerLoss);
+    auto recovered = queue_->Read(shard, kFirst, 16, 0ms, core::Durability::kPowerLoss);
     ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
     EXPECT_EQ(recovered->size(), 2U) << "shard " << shard;
     EXPECT_EQ(ReadCold(*cold_, key("a", shard)), "a");
@@ -584,7 +550,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     return "k" + std::to_string(shard) + "_" + std::to_string(seq % kKeys);
   };
   const auto next_entry = [&](core::ShardId shard, char tag) {
-    const core::SequenceId seq = written[shard].size();
+    const core::SequenceId seq = kFirst + written[shard].size();
     const std::string digits = std::to_string(values++);
     std::string value = tag + std::string(8 - digits.size(), '0') + digits;
     written[shard].push_back(value);
@@ -593,12 +559,12 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   const auto append_rows = [&](size_t rows) {
     for (size_t r = 0; r < rows; ++r) {
       for (core::ShardId shard = 0; shard < kShards; ++shard) {
-        const core::SequenceId seq = written[shard].size();
+        const core::SequenceId seq = kFirst + written[shard].size();
         ASSERT_EQ(Append(shard, next_entry(shard, 'w')), seq);
       }
     }
     for (core::ShardId shard = 0; shard < kShards; ++shard) {
-      ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, written[shard].size() - 1));
+      ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, kFirst + written[shard].size() - 1));
     }
   };
   // Cold takes in and commits everything durable; retention then
@@ -607,7 +573,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     for (auto& consumer : consumers_) {
       consumer->Drain();
       EXPECT_EQ(consumer->Flush(), ColdConsumer::FlushOutcome::kProgress);
-      ASSERT_EQ(ColdCommit(consumer->Shard()), written[consumer->Shard()].size() - 1);
+      ASSERT_EQ(ColdCommit(consumer->Shard()), kFirst + written[consumer->Shard()].size() - 1);
     }
     ASSERT_TRUE(queue_->FlushOffsets().has_value());
     ASSERT_TRUE(queue_->FlushOffsets().has_value());
@@ -624,7 +590,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     ASSERT_NO_FATAL_FAILURE(append_rows(step));
   }
   ASSERT_NO_FATAL_FAILURE(absorb_and_reclaim());
-  ASSERT_GT(queue_->FirstSeq(0).value(), 0U) << "retention reclaimed nothing";
+  ASSERT_GT(queue_->FirstSeq(0).value(), kFirst) << "retention reclaimed nothing";
 
   // Each segment end crossed from here is reclaimed at once, so the
   // pool never runs dry and every spare prepared is a recycled file.
@@ -651,7 +617,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   const core::SequenceId x = Append(1, next_entry(1, 'w'));
   ASSERT_TRUE(stall_.AwaitEntered(1));
   const core::SequenceId y = Append(2, next_entry(2, 'w'));
-  const core::SequenceId batch_first = written[0].size();
+  const core::SequenceId batch_first = kFirst + written[0].size();
   std::vector<core::QueueEntry> batch_entries;
   batch_entries.reserve(5);
   for (int i = 0; i < 5; ++i) batch_entries.push_back(next_entry(0, 'w'));
@@ -677,7 +643,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   ASSERT_EQ(extent.offset, before.offset + (3 * frame_bytes)) << "D is not inside the batch";
   std::vector<core::SequenceId> durable_end(kShards);
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
-    durable_end[shard] = shard == 0 ? batch_first : written[shard].size();
+    durable_end[shard] = shard == 0 ? batch_first : kFirst + written[shard].size();
   }
 
   // Everything past D is a frame of an earlier generation, lined up
@@ -752,17 +718,20 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     for (const auto& entry : *recovered) {
       const auto* write = std::get_if<core::entry::Write>(&entry.payload);
       ASSERT_NE(write, nullptr) << "seq " << entry.seq;
-      const std::vector<std::string> want{"SET", key(shard, entry.seq), written[shard][entry.seq]};
+      const std::vector<std::string> want{"SET", key(shard, entry.seq),
+                                          written[shard][entry.seq - kFirst]};
       EXPECT_EQ(write->cmd.args, want) << "seq " << entry.seq;
     }
 
     auto& consumer = AddConsumer(shard, AggressiveConfig());
-    auto replayed = consumer.ReplayUntil(end - 1, cancel);
+    auto replayed = testing::ReplayCold(*queue_, consumer, end, cancel);
     ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+    std::vector<std::optional<std::string>> want(kKeys);
+    for (core::SequenceId seq = kFirst; seq < end; ++seq) {
+      want[seq % kKeys] = written[shard][seq - kFirst];
+    }
     for (core::SequenceId k = 0; k < kKeys; ++k) {
-      std::optional<std::string> want;
-      for (core::SequenceId seq = k; seq < end; seq += kKeys) want = written[shard][seq];
-      EXPECT_EQ(ReadCold(*cold_, key(shard, k)), want) << key(shard, k);
+      EXPECT_EQ(ReadCold(*cold_, key(shard, k)), want[k]) << key(shard, k);
     }
     const auto committed = ColdCommit(shard);
     EXPECT_TRUE(committed.has_value() && *committed < end);

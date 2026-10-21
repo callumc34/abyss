@@ -42,12 +42,12 @@ TEST(ColdDurabilityTest, ColdCommittedPrefixSurvivesKillWithoutWalReplay) {
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abyss/cold/backends/rocksdb_store.h"
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
@@ -56,10 +56,14 @@ TEST(ColdDurabilityTest, ColdCommittedPrefixSurvivesKillWithoutWalReplay) {
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
 #include "abyss/queue/wal_queue.h"
+#include "cold_replay.h"
 #include "crash_harness.h"
 
 namespace abyss::cold {
 namespace {
+
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
 
 using namespace std::chrono_literals;
 
@@ -96,7 +100,7 @@ queue::WalConfig MakeWalConfig(const std::filesystem::path& dir) {
       .durability = core::Durability::kPowerLoss,
       // Long enough that the reaper cannot remove a segment mid-test.
       .min_retention = std::chrono::seconds{3600},
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {kTestConsumer, core::kColdConsumer},
   };
 }
 
@@ -113,10 +117,11 @@ std::string ValueFor(uint64_t index) { return "v" + std::to_string(index); }
 // Reads a key straight out of cold's stable storage: no hot tier, no compaction
 // buffer, no queue replay. This is the only view that can see the loss.
 std::optional<std::string> ReadCold(core::ColdStore& cold, const std::string& key) {
-  const core::ops::ReadOp op = core::ops::StringGet{.key = key};
-  auto value = cold.Exec(op);
-  if (!value.has_value() || value->IsNull()) return std::nullopt;
-  return value->AsString();
+  auto loaded = cold.LoadKey(key, core::SteadyClock::now() + 10s);
+  if (!loaded.has_value() || !loaded->has_value()) return std::nullopt;
+  const auto* value = std::get_if<std::string>(&(*loaded)->value);
+  if (value == nullptr) return std::nullopt;
+  return *value;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,14 +134,8 @@ std::optional<std::string> ReadCold(core::ColdStore& cold, const std::string& ke
 // assertions look like when the contract is broken.
 class NoCheckpointColdStore : public core::ColdStore {
  public:
-  using PromotionCommand = core::Result<std::optional<core::RespCommand> >;
-
   explicit NoCheckpointColdStore(core::ColdStore& inner) : inner_(inner) {}
 
-  core::Result<core::RespValue> Exec(const core::ops::ReadOp& op,
-                                     std::optional<core::Duration> deadline) override {
-    return inner_.Exec(op, deadline);
-  }
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
     return inner_.ApplyBatch(ops, highest_wal_seq);
@@ -148,8 +147,22 @@ class NoCheckpointColdStore : public core::ColdStore {
   core::Result<void> Wipe(core::ShardId shard) override { return inner_.Wipe(shard); }
   core::Result<core::StorageStats> Stats() override { return inner_.Stats(); }
   core::Result<void> Compact() override { return inner_.Compact(); }
-  PromotionCommand GetPromotionCommand(std::string_view key) override {
-    return inner_.GetPromotionCommand(key);
+  core::Result<std::optional<core::ColdKeyState> > LoadKey(std::string_view key,
+                                                           core::SteadyTime deadline) override {
+    return inner_.LoadKey(key, deadline);
+  }
+  core::Result<std::optional<core::KeyMeta> > ProbeKey(std::string_view key,
+                                                       core::SteadyTime deadline) override {
+    return inner_.ProbeKey(key, deadline);
+  }
+  core::Result<std::optional<core::LoadedAs> > LoadKeyAs(std::string_view key, core::KeyType type,
+                                                         core::SteadyTime deadline) override {
+    return inner_.LoadKeyAs(key, type, deadline);
+  }
+  core::Result<std::vector<std::optional<core::MemberValue> > > LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override {
+    return inner_.LoadMembers(key, type, members, deadline);
   }
 
  private:
@@ -159,7 +172,7 @@ class NoCheckpointColdStore : public core::ColdStore {
 // Appends `count` SETs, then drives a real ColdConsumer through
 // drain -> flush -> checkpoint -> commit against `cold`.
 void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, int count,
-            const core::EvictionPolicy& eviction, core::ConsumerRpc& rpc, ArmReport* out) {
+            const core::EvictionPolicy& eviction, ArmReport* out) {
   std::vector<core::QueueEntry> entries;
   entries.reserve(static_cast<size_t>(count));
   for (int i = 0; i < count; ++i) {
@@ -183,10 +196,10 @@ void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, 
   config.checkpoint_min_interval = 0ms;
   config.queue_read_timeout = 50ms;
   config.rng_seed = 1;
-  consumer::ColdConsumer cold_consumer(queue, cold, kShard, config, eviction, rpc);
+  consumer::ColdConsumer cold_consumer(queue, cold, kShard, config, eviction);
 
   const std::atomic<bool> cancel{false};
-  auto replay = cold_consumer.ReplayUntil(appended->last_seq, cancel);
+  auto replay = abyss::testing::ReplayCold(queue, cold_consumer, appended->last_seq + 1, cancel);
   ASSERT_TRUE(replay.has_value()) << replay.error().message();
 
   auto committed = queue.CommittedOffset(core::kColdConsumer, kShard);
@@ -215,7 +228,6 @@ TEST(ColdDurabilityVictim, Run) {
   }
 
   const core::EvictionPolicy eviction{core::EvictionTTL{86400}};
-  core::ConsumerRpc rpc;
 
   auto durable_queue = queue::WalQueue::Open(MakeWalConfig(dir / "wal_durable"));
   ASSERT_TRUE(durable_queue.has_value()) << durable_queue.error().message();
@@ -230,9 +242,9 @@ TEST(ColdDurabilityVictim, Run) {
 
   VictimReport report;
   ASSERT_NO_FATAL_FAILURE(
-      RunArm(**durable_queue, **durable_cold, "a", kDurableKeys, eviction, rpc, &report.durable));
+      RunArm(**durable_queue, **durable_cold, "a", kDurableKeys, eviction, &report.durable));
   ASSERT_NO_FATAL_FAILURE(
-      RunArm(**mutant_queue, stubbed_cold, "b", kMutantKeys, eviction, rpc, &report.mutant));
+      RunArm(**mutant_queue, stubbed_cold, "b", kMutantKeys, eviction, &report.mutant));
   // Committed offsets persist lazily; checkpoint them so the kill tests the
   // cold store's durability, not the offset cadence.
   ASSERT_TRUE((*durable_queue)->FlushOffsets().has_value());

@@ -51,7 +51,6 @@
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/wal_queue.h"
 #include "crash_harness.h"
-#include "durability_printer.h"
 
 #endif
 
@@ -71,6 +70,9 @@ TEST(WalCrashTest, AcknowledgedWritesOnEveryShardSurviveKillNine) {
 #else
 
 using namespace std::chrono_literals;
+
+// A committing consumer besides cold; the queue treats ids alike.
+constexpr core::ConsumerId kTestConsumer = 0;
 
 constexpr const char* kVictimDirEnv = "ABYSS_WAL_CRASH_VICTIM_DIR";
 constexpr const char* kReadyFile = "wal_victim.ready";
@@ -102,7 +104,7 @@ WalConfig VictimConfig(const std::filesystem::path& dir, core::Durability durabi
       .shard_count = 1,
       .durability = durability,
       .min_retention = 1s,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {kTestConsumer, core::kColdConsumer},
   };
 }
 
@@ -197,7 +199,7 @@ WalConfig ShardsConfig(const std::filesystem::path& dir, core::Durability durabi
       .ring_entries = 4096,
       .durability = durability,
       .min_retention = 1s,
-      .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
+      .retention_consumers = {kTestConsumer, core::kColdConsumer},
   };
 }
 
@@ -361,7 +363,7 @@ TEST_P(WalCrashTest, ConfirmedWritesSurviveKillNine) {
   auto queue = WalQueue::Open(VictimConfig(tmp_dir_, GetParam()));
   ASSERT_TRUE(queue.has_value()) << queue.error().message();
 
-  auto read = (*queue)->Read(0, 0, 10000, 100ms, core::Durability::kPowerLoss);
+  auto read = (*queue)->Read(0, core::kFirstSeq, 10000, 100ms, core::Durability::kPowerLoss);
   ASSERT_TRUE(read.has_value()) << read.error().message();
   const auto& entries = *read;
 
@@ -372,13 +374,13 @@ TEST_P(WalCrashTest, ConfirmedWritesSurviveKillNine) {
       << "recovery lost a write whose durability future had already resolved OK";
 
   // (2) The recovered log is structurally sound wherever it was truncated:
-  // seq ids start at 0 and are strictly contiguous. A gap would mean recovery
+  // seq ids start at kFirstSeq and are strictly contiguous. A gap would mean recovery
   // exposed an entry past a hole (unreachable data below it); a duplicate would
   // mean the tail was replayed twice. The old assertion only spot-checked the
   // confirmed prefix by index and could not see either.
   for (size_t i = 0; i < entries.size(); ++i) {
-    ASSERT_EQ(entries[i].seq, static_cast<core::SequenceId>(i))
-        << "sequence ids are not contiguous from 0 at index " << i << " (gap or duplicate)";
+    ASSERT_EQ(entries[i].seq, core::kFirstSeq + i)
+        << "sequence ids are not contiguous from the first at index " << i << " (gap or duplicate)";
   }
 
   // (3) No partial batch survived. Every batch is 5 entries appended together;
@@ -432,7 +434,7 @@ TEST_P(WalCrashTest, AcknowledgedWritesOnEveryShardSurviveKillNine) {
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     SCOPED_TRACE("shard " + std::to_string(shard));
     const core::SequenceId first = (*queue)->FirstSeq(shard).value();
-    ASSERT_EQ(first, 0U) << "nothing was committed, so nothing may be reclaimed";
+    ASSERT_EQ(first, core::kFirstSeq) << "nothing was committed, so nothing may be reclaimed";
     const core::SequenceId end = (*queue)->DurableEnd(shard, core::Durability::kPowerLoss).value();
     // Open synced the recovered log, so it is all power-durable.
     ASSERT_EQ(end, (*queue)->TailSeq(shard).value() + 1);

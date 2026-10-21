@@ -28,13 +28,8 @@ class EchoDispatcher : public core::CommandDispatcher {
                                              const core::RespCommand& /*cmd*/) override {
     return core::RespValue::BulkString(read_payload);
   }
-  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/,
-                                              core::RespCommand /*cmd*/) override {
-    return core::RespValue::SimpleString("OK");
-  }
-  core::Result<core::RespValue> DispatchConditional(std::string_view /*name*/,
-                                                    core::RespCommand /*cmd*/,
-                                                    core::PredicateFlags /*flags*/) override {
+  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/, core::RespCommand /*cmd*/,
+                                              core::PredicateFlags /*flags*/) override {
     return core::RespValue::SimpleString("OK");
   }
   core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
@@ -55,10 +50,10 @@ class ConnectionLazyArmTest : public ::testing::Test {
   // without triggering the pause/resume path (covered separately).
   static ConnectionConfig WideBackpressureConfig() {
     return ConnectionConfig{
-        .max_read_buffer_bytes = 1024 * 1024,
-        .write_backpressure_bytes = 1024 * 1024,
-        .write_resume_bytes = 512 * 1024,
-        .write_hard_limit_bytes = 4 * 1024 * 1024,
+        .max_read_buffer_bytes = size_t{1024} * 1024,
+        .write_backpressure_bytes = size_t{1024} * 1024,
+        .write_resume_bytes = size_t{512} * 1024,
+        .write_hard_limit_bytes = size_t{4} * 1024 * 1024,
         .idle_timeout = std::chrono::seconds{60},
     };
   }
@@ -96,7 +91,7 @@ TEST_F(ConnectionLazyArmTest, ArmsWritableWhenOutputPending) {
   EchoDispatcher dispatcher;
   // 256 KiB stays well under WideBackpressureConfig::write_backpressure_bytes
   // (1 MiB) so the pause path is not exercised here.
-  dispatcher.read_payload.assign(256 * 1024, 'x');
+  dispatcher.read_payload.assign(size_t{256} * 1024, 'x');
   NetMetrics metrics;
 
   Connection conn(Fd{pair->ReleaseRead()}, 0, 0, 1, poller, resp::GlobalRegistry(),
@@ -123,7 +118,7 @@ TEST_F(ConnectionLazyArmTest, DropsWritableAfterFullDrain) {
   ASSERT_TRUE(pair.has_value()) << pair.error().message();
   testing::FakePoller poller;
   EchoDispatcher dispatcher;
-  dispatcher.read_payload.assign(256 * 1024, 'y');
+  dispatcher.read_payload.assign(size_t{256} * 1024, 'y');
   NetMetrics metrics;
 
   Connection conn(Fd{pair->ReleaseRead()}, 0, 0, 1, poller, resp::GlobalRegistry(),
@@ -139,7 +134,7 @@ TEST_F(ConnectionLazyArmTest, DropsWritableAfterFullDrain) {
 
   // Drain everything from the peer side so each OnWritable can make progress
   // until the connection's write buffer is empty.
-  std::string sink(64 * 1024, '\0');
+  std::string sink(size_t{64} * 1024, '\0');
   while (conn.HasPendingWrites()) {
     const auto n = pnet::Recv(pair->Write(), sink.data(), sink.size(), 0);
     if (n <= 0) break;

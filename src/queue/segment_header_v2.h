@@ -10,7 +10,7 @@
 
 namespace abyss::queue {
 
-inline constexpr uint8_t kLogFormatMajor = 2;
+inline constexpr uint8_t kLogFormatMajor = 3;
 inline constexpr uint8_t kLogFormatMinor = 0;
 // One block, so frames start page-aligned.
 inline constexpr std::size_t kLogSegmentHeaderBytes = 4096;

@@ -16,6 +16,12 @@ hot:
   backend: builtin_hashmap
   max_memory_bytes: 4294967296
   default_eviction_seconds: 86400
+  stub_memory_fraction: 0.05
+  backpressure_ratio: 1.5
+  fill_doorkeeper: false
+  fill_max_members: 64
+  fill_max_fraction: 0.25
+  negative_max_entries: 100
   eviction_overrides:
     - prefix: "session:"
       eviction_seconds: 3600
@@ -39,10 +45,6 @@ queue:
   durability_window_bytes: 2097152
   durability_window_ms: 500
 
-hot_consumer:
-  read_batch_size: 128
-  read_timeout_ms: 50
-
 cold_consumer:
   quiet_threshold_seconds: 30
   safety_margin_seconds: 300
@@ -62,8 +64,6 @@ cold_consumer:
 
 recovery:
   replay_parallelism: 4
-  hot_replay_batch_size: 10000
-  cold_replay_batch_size: 50000
 
 net:
   bind: 0.0.0.0
@@ -98,6 +98,12 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->hot.backend, "builtin_hashmap");
   EXPECT_EQ(cfg->hot.max_memory_bytes, 4294967296U);
   EXPECT_EQ(cfg->hot.default_eviction, std::chrono::seconds{86400});
+  EXPECT_DOUBLE_EQ(cfg->hot.stub_memory_fraction, 0.05);
+  EXPECT_DOUBLE_EQ(cfg->hot.backpressure_ratio, 1.5);
+  EXPECT_FALSE(cfg->hot.fill_doorkeeper);
+  EXPECT_EQ(cfg->hot.fill_max_members, 64U);
+  EXPECT_DOUBLE_EQ(cfg->hot.fill_max_fraction, 0.25);
+  EXPECT_EQ(cfg->hot.negative_max_entries, 100U);
   ASSERT_EQ(cfg->hot.eviction_overrides.size(), 2U);
   EXPECT_EQ(cfg->hot.eviction_overrides[0].prefix, "session:");
   EXPECT_EQ(cfg->hot.eviction_overrides[0].eviction, std::chrono::seconds{3600});
@@ -119,9 +125,6 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->queue.durability_window_bytes, 2097152U);
   EXPECT_EQ(cfg->queue.durability_window, std::chrono::milliseconds{500});
 
-  EXPECT_EQ(cfg->hot_consumer.read_batch_size, 128U);
-  EXPECT_EQ(cfg->hot_consumer.read_timeout, std::chrono::milliseconds{50});
-
   EXPECT_EQ(cfg->cold_consumer.quiet_threshold, std::chrono::seconds{30});
   EXPECT_EQ(cfg->cold_consumer.safety_margin, std::chrono::seconds{300});
   EXPECT_DOUBLE_EQ(cfg->cold_consumer.jitter_fraction, 0.25);
@@ -139,8 +142,6 @@ TEST(ConfigParse, ParsesFullDocumentFaithfully) {
   EXPECT_EQ(cfg->cold_consumer.drain_grace, std::chrono::seconds{20});
 
   EXPECT_EQ(cfg->recovery.replay_parallelism, 4U);
-  EXPECT_EQ(cfg->recovery.hot_replay_batch_size, 10000U);
-  EXPECT_EQ(cfg->recovery.cold_replay_batch_size, 50000U);
 
   EXPECT_EQ(cfg->net.bind, "0.0.0.0");
   EXPECT_EQ(cfg->net.port, 6379);

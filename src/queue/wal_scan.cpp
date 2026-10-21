@@ -163,13 +163,14 @@ core::Result<void> WalQueue::Scan(std::span<const core::SequenceId> from,
       return std::unexpected(
           Invalid("scan of shard " + std::to_string(shard) + " starts past its end"));
     }
-    if (from[shard] == end[shard]) continue;
+    // Even an empty range: a from of 0 names no entry.
     if (const core::SequenceId first = streams_[shard]->first_seq(); from[shard] < first) {
       return std::unexpected(core::Error{core::ErrorCode::kOutOfRange,
                                          "scan of shard " + std::to_string(shard) + " from seq " +
                                              std::to_string(from[shard]) +
                                              " below first retained seq " + std::to_string(first)});
     }
+    if (from[shard] == end[shard]) continue;
     if (const core::SequenceId readable = streams_[shard]->DurableEnd(visible);
         end[shard] > readable) {
       return std::unexpected(Invalid("scan of shard " + std::to_string(shard) + " to seq " +

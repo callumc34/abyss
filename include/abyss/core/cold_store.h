@@ -3,12 +3,15 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <variant>
+#include <vector>
 
 #include "abyss/core/ops.h"
-#include "abyss/core/reader.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 
 namespace abyss::core {
@@ -18,17 +21,46 @@ struct StorageStats {
   uint64_t key_count = 0;
 };
 
-class ColdStore : public Reader {
+// In the order of ColdValue's alternatives.
+enum class KeyType : uint8_t { kString, kSet, kHash, kZset };
+
+// A key's type and TTL (0: none), without its value.
+struct KeyMeta {
+  KeyType type = KeyType::kString;
+  int64_t abs_ttl_ms = 0;
+  // Members or fields; 1 for a string.
+  uint64_t cardinality = 0;
+
+  bool operator==(const KeyMeta&) const = default;
+};
+
+// A string, a set's members, a hash's fields, or a zset's scores.
+using ColdValue = std::variant<std::string, StringSet, StringMap<std::string>, StringMap<double>>;
+
+struct ColdKeyState {
+  KeyType type = KeyType::kString;
+  ColdValue value;
+  int64_t abs_ttl_ms = 0;
+
+  bool operator==(const ColdKeyState&) const = default;
+};
+
+// A set member's presence, a hash field's value or a zset score.
+using MemberValue = std::variant<std::monostate, std::string, double>;
+
+// A key loaded as one type: its whole state when it holds that type,
+// else only its meta.
+using LoadedAs = std::variant<KeyMeta, ColdKeyState>;
+
+// Reads are loads: the engine answers from what they return.
+class ColdStore {
  public:
   ColdStore() = default;
-  ~ColdStore() override = default;
+  virtual ~ColdStore() = default;
   ColdStore(const ColdStore&) = delete;
   ColdStore& operator=(const ColdStore&) = delete;
   ColdStore(ColdStore&&) = delete;
   ColdStore& operator=(ColdStore&&) = delete;
-
-  Result<RespValue> Exec(const ops::ReadOp& op,
-                         std::optional<Duration> deadline = std::nullopt) override = 0;
 
   // Applies a compacted batch. `highest_wal_seq` is the highest WAL sequence
   // this batch materialises. The write is a non-durable (memtable-only) write;
@@ -51,10 +83,24 @@ class ColdStore : public Reader {
   virtual Result<StorageStats> Stats() = 0;
   virtual Result<void> Compact() = 0;
 
-  // Returns the RESP command that reconstructs `key`'s hot-side view from
-  // cold, or nullopt if the key does not exist or its type isn't promotable
-  // in this implementation. Preserves absolute TTL.
-  virtual Result<std::optional<RespCommand>> GetPromotionCommand(std::string_view key) = 0;
+  // The loads below judge no TTL and delete nothing: an expired key is
+  // returned with its TTL. Each reads one consistent view, and fails
+  // kTimeout once `deadline` passes.
+
+  // `key`'s whole state, or nullopt when cold does not hold it.
+  virtual Result<std::optional<ColdKeyState>> LoadKey(std::string_view key,
+                                                      SteadyTime deadline) = 0;
+  // LoadKey, reading members only when `key` holds `type`. A string's
+  // value comes with its meta, in one read.
+  virtual Result<std::optional<LoadedAs>> LoadKeyAs(std::string_view key, KeyType type,
+                                                    SteadyTime deadline) = 0;
+  // `key`'s type and TTL, reading none of its members.
+  virtual Result<std::optional<KeyMeta>> ProbeKey(std::string_view key, SteadyTime deadline) = 0;
+  // Members or fields of `key` as `type`, in one batch, each nullopt
+  // when absent.
+  virtual Result<std::vector<std::optional<MemberValue>>> LoadMembers(
+      std::string_view key, KeyType type, std::span<const std::string_view> members,
+      SteadyTime deadline) = 0;
 
   // Server calls Start() once after recovery completes to enable any
   // backend-internal background work (TTL sweeping, prefetch, etc.). Stop()

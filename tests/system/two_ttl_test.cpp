@@ -64,10 +64,6 @@ queue:
   segment_size_bytes: 134217728
   min_retention_seconds: 30
 
-hot_consumer:
-  read_batch_size: 64
-  read_timeout_ms: 10
-
 cold_consumer:
   quiet_threshold_seconds: 1
   safety_margin_seconds: 1
@@ -82,8 +78,6 @@ cold_consumer:
 
 recovery:
   replay_parallelism: 2
-  hot_replay_batch_size: 1000
-  cold_replay_batch_size: 5000
 
 net:
   bind: 127.0.0.1

@@ -11,17 +11,20 @@ namespace abyss::hot {
 
 EvictionWorker::EvictionWorker(ShardedHotStore& store, Config config,
                                core::SteadyClockFn steady_clock)
-    : store_(store), config_(std::move(config)), steady_clock_(std::move(steady_clock)) {
+    : store_(store), config_(config), steady_clock_(std::move(steady_clock)) {
   auto& reg = metrics::Registry::Instance();
   evicted_total_ = reg.Counter(metrics::names::kEvictedTotal);
   ttl_expired_total_ = reg.Counter(metrics::names::kTtlExpiredTotal, metrics::Tier::kHot);
   tombstones_reclaimed_total_ = reg.Counter(metrics::names::kHotTombstonesReclaimedTotal);
   memory_evicted_total_ = reg.Counter(metrics::names::kHotMemoryEvictedTotal);
-  access_buffer_dropped_total_ = reg.Counter(metrics::names::kHotAccessBufferDroppedTotal);
+  stub_drops_total_ = reg.Counter(metrics::names::kHotStubDropsTotal);
+  load_discards_total_ = reg.Counter(metrics::names::kHotLoadDiscardsTotal);
   hot_memory_bytes_ = reg.Gauge(metrics::names::kHotMemoryBytes);
   hot_keys_ = reg.Gauge(metrics::names::kHotKeys);
   hot_max_memory_bytes_ = reg.Gauge(metrics::names::kHotMaxMemoryBytes);
-  hot_access_buffer_depth_ = reg.Gauge(metrics::names::kHotAccessBufferDepth);
+  hot_stub_entries_ = reg.Gauge(metrics::names::kHotStubEntries);
+  hot_negative_entries_ = reg.Gauge(metrics::names::kHotNegativeEntries);
+  hot_unevictable_bytes_ = reg.Gauge(metrics::names::kHotUnevictableBytes);
 }
 
 EvictionWorker::~EvictionWorker() { Stop(); }
@@ -44,8 +47,10 @@ void EvictionWorker::Stop() {
 
 void EvictionWorker::TickOnce() {
   const auto now = steady_clock_();
-  store_.DrainAccessBuffers(now);
-  const auto report = store_.EvictExpired(now);
+  // What reads stamp until the next tick.
+  store_.SetAccessTime(now);
+  // TTL expiry gets a quarter of the tick, as Valkey's slow cycle does.
+  const auto report = store_.EvictExpired(now, config_.tick / 4);
   if (report.by_deadline > 0) {
     evicted_total_.Increment(static_cast<double>(report.by_deadline));
   }
@@ -64,11 +69,9 @@ void EvictionWorker::TickOnce() {
   // Reclaim delete tombstones the cold consumer has now absorbed. Bounded by
   // cold's drained seq per shard so a tombstone never outlives the window in
   // which a lagging buffer/cold could still serve the pre-delete state.
-  if (config_.tombstone_horizon) {
-    const size_t reclaimed = store_.GcTombstones(config_.tombstone_horizon);
-    if (reclaimed > 0) {
-      tombstones_reclaimed_total_.Increment(static_cast<double>(reclaimed));
-    }
+  const size_t reclaimed = store_.GcTombstones();
+  if (reclaimed > 0) {
+    tombstones_reclaimed_total_.Increment(static_cast<double>(reclaimed));
   }
 
   // Publish hot-tier usage/budget/backlog so memory pressure is observable
@@ -78,13 +81,18 @@ void EvictionWorker::TickOnce() {
     hot_memory_bytes_.Set(static_cast<double>(stats->used_bytes));
     hot_keys_.Set(static_cast<double>(stats->key_count));
     hot_max_memory_bytes_.Set(static_cast<double>(stats->max_bytes));
-  }
-  const auto access = store_.AccessBufferSnapshot();
-  hot_access_buffer_depth_.Set(static_cast<double>(access.depth));
-  if (access.dropped > reported_access_dropped_) {
-    access_buffer_dropped_total_.Increment(
-        static_cast<double>(access.dropped - reported_access_dropped_));
-    reported_access_dropped_ = access.dropped;
+    hot_stub_entries_.Set(static_cast<double>(stats->stub_entries));
+    hot_negative_entries_.Set(static_cast<double>(stats->negative_entries));
+    hot_unevictable_bytes_.Set(static_cast<double>(stats->unevictable_bytes));
+    if (stats->stub_drops > reported_stub_drops_) {
+      stub_drops_total_.Increment(static_cast<double>(stats->stub_drops - reported_stub_drops_));
+      reported_stub_drops_ = stats->stub_drops;
+    }
+    if (stats->load_discards > reported_load_discards_) {
+      load_discards_total_.Increment(
+          static_cast<double>(stats->load_discards - reported_load_discards_));
+      reported_load_discards_ = stats->load_discards;
+    }
   }
 }
 

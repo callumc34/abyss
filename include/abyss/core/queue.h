@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -13,8 +14,14 @@
 #include "abyss/core/types.h"
 #include "abyss/queue/append_result.h"
 #include "abyss/queue/pending_append.h"
+#include "abyss/queue/reservation.h"
 
 namespace abyss::core {
+
+// Reserve commits frames up to this size under the caller's locks and
+// leaves larger ones to Complete; the sequencer copies arguments above
+// it before locking.
+inline constexpr std::size_t kLockHoldFrameBytes = std::size_t{16} << 10;
 
 struct QueueStats {
   uint64_t total_entries = 0;
@@ -35,9 +42,11 @@ struct QueueStats {
 // read cursor and passes it to Read; CommitOffset only records where it is
 // safe to resume and, for retention, how far the WAL may be reclaimed.
 //
-// Durable ends are exclusive: seqs below DurableEnd(shard, d) are durable
-// at d; 0 means none is. DurableEnd(kPowerLoss) never passes
-// DurableEnd(kProcessCrash): nothing is visible before it is published.
+// A shard's seqs start at kFirstSeq; 0 names no entry. Durable ends are
+// exclusive: seqs below DurableEnd(shard, d) are durable at d, so an
+// empty shard's is kFirstSeq and 0 is always below it.
+// DurableEnd(kPowerLoss) never passes DurableEnd(kProcessCrash): nothing
+// is visible before it is published.
 class Queue {
  public:
   Queue() = default;
@@ -58,6 +67,37 @@ class Queue {
   virtual Result<queue::AppendBatchResult> AppendBatch(ShardId shard,
                                                        std::span<const QueueEntry> entries,
                                                        SteadyTime admit_by) = 0;
+
+  // The sequencer's append (ADP-015 §Sequenced write path): Admit and
+  // WaitForSpare wait under no lock, Reserve runs under the hot shard
+  // locks and never waits, and Complete runs once they are released.
+  //
+  // Waits for room in `shard`'s durability window, as an append's
+  // admission does.
+  virtual Result<void> Admit(ShardId shard, SteadyTime admit_by) = 0;
+  // Waits for a spare segment on `shard`'s log; false at the deadline
+  // or on shutdown.
+  virtual bool WaitForSpare(ShardId shard, SteadyTime deadline) = 0;
+  // Assigns each part's seqs and reserves every part as one batch.
+  // Parts are sorted by shard and distinct. It takes the entries it
+  // leaves to Complete; on an error none is taken and no seq is used:
+  //   kResourceExhausted: the window is full; Admit, then decide again.
+  //   kUnavailable: no spare segment, or shutting down; WaitForSpare,
+  //     then decide again.
+  //   kInvalidArgument starting "CROSSSLOT": the shards span logs.
+  //   kValueTooLarge: an entry or the batch exceeds what a frame or a
+  //     segment holds.
+  virtual Result<queue::Reservation> Reserve(std::span<const queue::ShardEntries> parts) = 0;
+  // Reserve of one Flush per shard, every shard in order, across every
+  // log: one batch per log, in one Reservation that Complete fills log
+  // by log. Atomic to readers holding the hot locks, but not across a
+  // crash: each log's batch survives or not on its own.
+  virtual Result<queue::Reservation> ReserveFlush(std::span<const queue::ShardEntries> parts) = 0;
+  // The log `shard`'s stream is on; a Reserve stays within one.
+  virtual uint32_t LogOf(ShardId shard) const = 0;
+  // Fills what Reserve left, then publishes each shard once its earlier
+  // seqs are published.
+  virtual queue::DurableFutures Complete(queue::Reservation&& reservation) = 0;
 
   // Up to `max_count` contiguous entries with seq >= `from_seq` that are
   // durable at `visible`. Waits up to `timeout` when none is yet.
@@ -96,7 +136,9 @@ class Queue {
   // for one shard. An error stops the scan and is returned from it.
   using ScanSink = std::function<Result<void>(ShardId, std::vector<QueueEntry>&)>;
   // Delivers every shard's entries in [from[s], end[s]) to `sink`, up to
-  // `parallelism` shards at a time; every one of them must be readable.
+  // `parallelism` shards at a time; every one of them must be readable:
+  // kOutOfRange for a from below FirstSeq, and for a from of 0 even in an
+  // empty range.
   // A log-structured queue reads each log once; this default reads each
   // shard in turn. kUnavailable once `cancel` is set.
   virtual Result<void> Scan(std::span<const SequenceId> from, std::span<const SequenceId> end,

@@ -13,6 +13,7 @@ add_library(abyss_queue
   offset_checkpoint.cpp
   segment_reaper.cpp
   pending_append.cpp
+  reservation.cpp
 )
 add_library(abyss::queue ALIAS abyss_queue)
 
@@ -22,5 +23,5 @@ target_include_directories(abyss_queue
 
 target_link_libraries(abyss_queue
   PUBLIC abyss::core abyss::metrics
-  PRIVATE Crc32c::crc32c abyss::resp abyss::log abyss::platform
+  PRIVATE Crc32c::crc32c abyss::log abyss::platform
 )

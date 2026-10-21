@@ -10,17 +10,14 @@
 #include <optional>
 #include <span>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/flush_strategy.h"
 #include "abyss/core/cold_store.h"
-#include "abyss/core/consumer_rpc.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
-#include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/consumer_metrics.h"
 #include "abyss/metrics/metrics.h"
@@ -37,14 +34,10 @@ class ColdConsumer {
     size_t buffer_low_water_bytes = 0;
     size_t max_flush_batch_size = 10000;
     size_t queue_read_max_count = 1024;
-    // Used by ReplayUntil(); larger than queue_read_max_count to amortise
-    // queue reads while draining a long catch-up backlog.
-    size_t replay_batch_size = 50000;
     // Also bounds each wait for a flush or wipe to become power-durable.
     std::chrono::milliseconds queue_read_timeout{50};
     std::chrono::milliseconds retry_initial_backoff{50};
     std::chrono::milliseconds retry_max_backoff{30000};
-    std::chrono::milliseconds block_and_scan_timeout{1000};
     // Bounded checkpoint cadence (decision 3): the cold store is fsynced
     // (Checkpoint) at most once every `checkpoint_max_flushes` applied batches
     // or `checkpoint_min_interval`, whichever comes first — never per tiny
@@ -107,9 +100,8 @@ class ColdConsumer {
   // `eviction_policy` is borrowed; the server owns the single instance and
   // outlives every consumer.
   ColdConsumer(core::Queue& queue, core::ColdStore& cold_store, core::ShardId shard, Config config,
-               const core::EvictionPolicy& eviction_policy, core::ConsumerRpc& rpc,
-               core::SteadyClockFn steady_clock = core::DefaultSteadyClock,
-               core::WallClockFn wall_clock = core::DefaultWallClock);
+               const core::EvictionPolicy& eviction_policy,
+               core::SteadyClockFn steady_clock = core::DefaultSteadyClock);
   ~ColdConsumer();
   ColdConsumer(const ColdConsumer&) = delete;
   ColdConsumer& operator=(const ColdConsumer&) = delete;
@@ -138,24 +130,17 @@ class ColdConsumer {
   // pair to avoid O(N * queue_read_timeout) serial teardown.
   void Stop();
 
-  // Synchronous replay drive. Drains entries from the queue into the buffer
-  // until `target` is reached, then flushes the buffer to the cold store so
-  // post-recovery reads do not hit a cold-store-on-disk that lags the WAL.
-  // Returns when caught up (with the entries it consumed), cancelled,
-  // or on unrecoverable error. Must NOT be called while Start() is
-  // running on the same instance.
-  core::Result<uint64_t> ReplayUntil(core::SequenceId target, const std::atomic<bool>& cancel);
-
-  // ReplayUntil fed by the caller, e.g. from a queue Scan; not while
-  // Start() runs. BeginReplay seeds the cursor and returns the first seq
-  // it needs; each batch must start at the cursor. A wipe that keeps
-  // failing gives up after drain_grace with an error, so a dead cold
-  // store fails recovery rather than hanging it. FinishReplay flushes
-  // the buffer and checkpoints.
+  // Replay fed by recovery's queue Scan; not while Start() runs.
+  // BeginReplay seeds the cursor and returns the first seq it needs;
+  // each batch must start at the cursor. A wipe that keeps failing
+  // gives up after drain_grace with an error, so a dead cold store
+  // fails recovery rather than hanging it. FinishReplay fails unless
+  // the cursor reached `end`, then flushes the buffer and checkpoints,
+  // so reads after recovery never meet a cold store behind the log.
   core::Result<core::SequenceId> BeginReplay();
   core::Result<void> ApplyReplayBatch(std::span<const core::QueueEntry> batch,
                                       const std::atomic<bool>& cancel);
-  core::Result<void> FinishReplay(const std::atomic<bool>& cancel);
+  core::Result<void> FinishReplay(core::SequenceId end, const std::atomic<bool>& cancel);
 
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
@@ -187,6 +172,9 @@ class ColdConsumer {
     return latest_drained_seq_.load(std::memory_order_acquire);
   }
 
+  // The shard's log clock (CompactionBuffer::LogClockMs). Any thread.
+  uint64_t LogClockMs() const { return buffer_.LogClockMs(); }
+
   // Blocks until this consumer drains through `target` (true) or `timeout`
   // elapses (false). Signal-driven by the drain loop, not a poll.
   bool WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout);
@@ -214,16 +202,14 @@ class ColdConsumer {
   // A structurally undecodable op is recorded through RecordPoison; the
   // drain loop clamps the drained/commit frontier below it (XERR-5).
   void HandleWrite(const core::QueueEntry& entry, const core::entry::Write& write);
-  void HandleConditional(const core::QueueEntry& entry, const core::entry::Conditional& cond);
-  void HandleResolved(const core::QueueEntry& entry, const core::entry::Resolved& resolved);
   // False if the wipe failed: the Flush is retried, never passed.
   bool HandleFlush(const core::QueueEntry& entry);
 
-  // `wall_now_ms` must be the entry's appended_at so hot and cold materialise
-  // identical absolute TTLs from PX/EX args. See CompactionBuffer::Absorb for
-  // `position` and `carrier`.
-  void AbsorbResolvedOp(const core::RespCommand& cmd, core::SequenceId position,
-                        core::SequenceId carrier, uint64_t wall_now_ms);
+  // `appended_at_ms` is the entry's appended_at, so hot and cold
+  // materialise identical absolute TTLs from PX/EX args.
+  // `replaces_state` is its kReplacesState flag.
+  void AbsorbOp(const core::RespCommand& cmd, core::SequenceId seq, uint64_t appended_at_ms,
+                bool replaces_state);
 
   // True once `seq` is power-durable, waiting up to queue_read_timeout.
   bool AwaitPowerDurable(core::SequenceId seq);
@@ -232,14 +218,11 @@ class ColdConsumer {
   // oldest_poison_seq_ so TryAdvanceCommit pins the commit below it.
   void RecordPoison(core::SequenceId seq, std::string_view reason);
 
-  std::optional<core::SequenceId> OldestPendingConditional() const ABYSS_EXCLUDES(pending_mu_);
-  void CheckBlockAndScanTimeout();
-
   // Erases the batch on success; otherwise reschedules it, and the RunLoop
   // retries after a backoff. kProgress on success, kPoisoned on a terminal
   // error, kBackpressure on a retriable one.
   FlushOutcome ApplyBatchWithRetry(const FlushBatch& entries, core::SequenceId highest_wal_seq,
-                                   core::WallTime wall_now);
+                                   uint64_t log_now_ms);
 
   // Shared implementation between Flush() and FlushUnscheduled() — once a
   // batch has been selected from the buffer, the apply path is identical.
@@ -264,9 +247,10 @@ class ColdConsumer {
 
   std::vector<core::ops::WriteOp> BuildBatchOps(const FlushBatch& entries,
                                                 std::vector<core::ops::Del>& del_storage,
-                                                core::WallTime wall_now) const;
+                                                uint64_t log_now_ms) const;
 
-  bool AbsTtlExpired(const BufferEntry& entry, core::WallTime wall_now) const;
+  // By the log clock, never the wall clock: see LogClockMs.
+  static bool AbsTtlExpired(const BufferEntry& entry, uint64_t log_now_ms);
   size_t LowWaterBytes() const;
   void UpdateMode(size_t current_bytes);
   // `force_checkpoint` bypasses the bounded cadence so the post-recovery /
@@ -277,12 +261,10 @@ class ColdConsumer {
 
   core::Queue& queue_;
   core::ColdStore& cold_store_;
-  core::ConsumerRpc& rpc_;
   core::ShardId shard_;
   Config config_;
   const core::EvictionPolicy& eviction_policy_;
   core::SteadyClockFn steady_clock_;
-  core::WallClockFn wall_clock_;
   FlushStrategy strategy_;
   CompactionBuffer buffer_;
 
@@ -291,10 +273,10 @@ class ColdConsumer {
   // (a bounded final flush + checkpoint + commit) instead of dropping the buffer.
   std::atomic<bool> draining_{false};
   std::atomic<bool> running_{false};
-  // Set by a reader blocked on the read-consistency gate to cut short the idle
-  // backoff. Signalled under stop_mu_ so the loop's wait predicate cannot miss
-  // it; atomic so the loop can clear it without re-locking. Grouped with the
-  // other flags to avoid opening a padding hole next to stop_cv_.
+  // Set by a write waiting on hot's memory backpressure to cut short the
+  // idle backoff. Signalled under stop_mu_ so the loop's wait predicate
+  // cannot miss it; atomic so the loop can clear it without re-locking.
+  // Grouped with the other flags to avoid a padding hole by stop_cv_.
   std::atomic<bool> drain_wake_requested_{false};
   // Deadline for the graceful drain; only read when draining_ is set.
   std::chrono::steady_clock::time_point drain_deadline_{};
@@ -314,14 +296,13 @@ class ColdConsumer {
   bool wipe_awaits_durability_ = false;
   // Set by the first timed-out durability wait of a run of them.
   bool durability_wait_logged_ = false;
-  core::SequenceId next_read_seq_ = 0;
+  core::SequenceId next_read_seq_ = core::kFirstSeq;
   std::optional<core::SequenceId> committed_;
 
+  // 0 until something drains.
   std::atomic<core::SequenceId> latest_drained_seq_{0};
   // Mirror of committed_ for Snapshot(); 0 when nothing is committed.
   std::atomic<core::SequenceId> last_commit_seq_{0};
-  // Highest seq of an applied `entry::Flush`; gates Resolveds whose ref was wiped.
-  std::atomic<core::SequenceId> latest_flush_seq_{0};
   // Highest WAL seq materialised by an ApplyBatch but not yet made durable by a
   // Checkpoint, and the highest seq a successful Checkpoint has made durable.
   // The cold commit target is clamped to last_checkpointed_seq_ so it can
@@ -333,18 +314,9 @@ class ColdConsumer {
   std::chrono::steady_clock::time_point last_checkpoint_at_{};
   std::atomic<uint64_t> flushes_applied_{0};
 
-  // Guards the read-consistency wait.
+  // Guards WaitForDrainedSeq.
   std::mutex drain_wait_mu_;
   std::condition_variable drain_wait_cv_;
-
-  struct PendingConditional {
-    core::SequenceId seq = 0;
-    std::chrono::steady_clock::time_point received_at;
-  };
-  mutable std::mutex pending_mu_;
-  std::unordered_map<core::SequenceId, PendingConditional> pending_conditionals_
-      ABYSS_GUARDED_BY(pending_mu_);
-  bool block_and_scan_warning_emitted_ = false;
 
   // Lowest seq of a structurally-undecodable op the cold consumer could
   // not materialise (XERR-5). The commit/drain frontier is pinned below it
@@ -374,6 +346,8 @@ class ColdConsumer {
   metrics::CounterHandle drain_truncated_;
   metrics::CounterHandle flush_total_success_;
   metrics::CounterHandle flush_total_failure_;
+  metrics::HistogramHandle flush_batch_size_;
+  metrics::CounterHandle durability_waits_total_;
   metrics::CounterHandle checkpoint_total_success_;
   metrics::CounterHandle checkpoint_total_failure_;
   metrics::HistogramHandle checkpoint_duration_;

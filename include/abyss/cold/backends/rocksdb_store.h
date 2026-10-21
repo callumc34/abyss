@@ -6,15 +6,21 @@
 #endif
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "abyss/cold/ttl_scanner.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/types.h"
+
+namespace rocksdb {
+class Env;
+}  // namespace rocksdb
 
 namespace abyss::cold::backends {
 
@@ -31,10 +37,18 @@ struct RocksdbConfig {
   uint32_t max_write_buffer_number = 4;
   uint32_t bloom_filter_bits_per_key = 10;
   CompactionStyle compaction_style = CompactionStyle::kLevel;
-  core::WallClockFn wall_clock = core::DefaultWallClock;
+  // A shard's log clock in ms (ColdConsumerPool::LogClockMs). The TTL
+  // scanner deletes a key only once its TTL is at or below its shard's
+  // clock. Unset, nothing is deleted.
+  std::function<uint64_t(core::ShardId)> log_clock;
+  // Judges the loads' deadlines.
+  core::SteadyClockFn steady_clock = core::DefaultSteadyClock;
   TtlScanner::Config ttl_scanner;
   std::optional<TtlScanner::Hooks> ttl_scanner_hooks;
   std::optional<TtlScanner::ExecutionMode> ttl_scanner_mode;
+  // The Env RocksDB runs on, borrowed; null for its default. Tests
+  // inject file-system faults through it.
+  rocksdb::Env* env = nullptr;
 };
 
 // RocksDB-backed cold store.
@@ -49,24 +63,42 @@ class RocksdbStore : public core::ColdStore {
   RocksdbStore(RocksdbStore&&) = delete;
   RocksdbStore& operator=(RocksdbStore&&) = delete;
 
-  core::Result<core::RespValue> Exec(
-      const core::ops::ReadOp& op, std::optional<core::Duration> deadline = std::nullopt) override;
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override;
   core::Result<void> Checkpoint(core::ShardId shard, core::SequenceId up_to_wal_seq) override;
   core::Result<void> Wipe(core::ShardId shard) override;
   core::Result<core::StorageStats> Stats() override;
   core::Result<void> Compact() override;
-  core::Result<std::optional<core::RespCommand>> GetPromotionCommand(std::string_view key) override;
-
-  // DEL returns the count of keys that existed before deletion.
-  core::Result<core::RespValue> ExecDel(const core::ops::Del& op);
+  core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
+                                                          core::SteadyTime deadline) override;
+  core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
+                                                        core::SteadyTime deadline) override;
+  core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
+                                                      core::SteadyTime deadline) override;
+  core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
+      std::string_view key, core::KeyType type, std::span<const std::string_view> members,
+      core::SteadyTime deadline) override;
 
   core::Result<void> Start() override;
   core::Result<void> Stop() override;
 
   core::Result<SweepReport> RunScannerTickForTesting();
   TtlScanner::Snapshot ScannerSnapshot() const;
+
+  struct RawRecord {
+    std::string column_family;
+    std::string key;
+    std::string value;
+
+    bool operator==(const RawRecord&) const = default;
+  };
+  // Every record in both column families, in key order, from one
+  // snapshot.
+  std::vector<RawRecord> RecordsForTesting() const;
+  // Records, and of them tombstones, in the default column family's
+  // memtables.
+  uint64_t MemtableEntriesForTesting() const;
+  uint64_t MemtableDeletesForTesting() const;
 
  private:
   struct Impl;

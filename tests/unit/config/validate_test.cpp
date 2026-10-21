@@ -8,6 +8,8 @@
 
 #include "abyss/config/config.h"
 #include "abyss/core/durability.h"
+#include "abyss/log/log.h"
+#include "abyss/log/testing.h"
 
 namespace abyss::config {
 namespace {
@@ -57,6 +59,45 @@ TEST(ConfigValidate, RejectsNonPositiveHotEvictionTick) {
   EXPECT_NE(cfg.error().message().find("hot.eviction_tick_ms"), std::string::npos);
 }
 
+TEST(ConfigValidate, HotStubMemoryFractionRange) {
+  for (const char* bad : {"-0.01", "0.6", ".nan"}) {
+    SCOPED_TRACE(bad);
+    auto cfg = Config::ParseFromYaml(std::string("hot:\n  stub_memory_fraction: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value());
+    EXPECT_NE(cfg.error().message().find("hot.stub_memory_fraction"), std::string::npos);
+  }
+  for (const char* good : {"0", "0.5"}) {
+    SCOPED_TRACE(good);
+    EXPECT_TRUE(Config::ParseFromYaml(std::string("hot:\n  stub_memory_fraction: ") + good + "\n"));
+  }
+}
+
+TEST(ConfigValidate, HotFillMaxFractionRange) {
+  for (const char* bad : {"0", "-0.1", "1.5", ".nan"}) {
+    SCOPED_TRACE(bad);
+    auto cfg = Config::ParseFromYaml(std::string("hot:\n  fill_max_fraction: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value());
+    EXPECT_NE(cfg.error().message().find("hot.fill_max_fraction"), std::string::npos);
+  }
+  for (const char* good : {"0.001", "1"}) {
+    SCOPED_TRACE(good);
+    EXPECT_TRUE(Config::ParseFromYaml(std::string("hot:\n  fill_max_fraction: ") + good + "\n"));
+  }
+}
+
+TEST(ConfigValidate, HotBackpressureRatioRange) {
+  for (const char* bad : {"0.99", "10.5", ".nan"}) {
+    SCOPED_TRACE(bad);
+    auto cfg = Config::ParseFromYaml(std::string("hot:\n  backpressure_ratio: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value());
+    EXPECT_NE(cfg.error().message().find("hot.backpressure_ratio"), std::string::npos);
+  }
+  for (const char* good : {"1", "10"}) {
+    SCOPED_TRACE(good);
+    EXPECT_TRUE(Config::ParseFromYaml(std::string("hot:\n  backpressure_ratio: ") + good + "\n"));
+  }
+}
+
 TEST(ConfigValidate, RejectsNegativeJitterRatio) {
   auto cfg = Config::ParseFromYaml("cold_consumer:\n  jitter_fraction: -0.1\n");
   ASSERT_FALSE(cfg.has_value());
@@ -69,16 +110,47 @@ TEST(ConfigValidate, RejectsJitterRatioAboveOne) {
   EXPECT_NE(cfg.error().message().find("jitter_fraction"), std::string::npos);
 }
 
-TEST(ConfigValidate, RejectsZeroHotConsumerBatchSize) {
-  auto cfg = Config::ParseFromYaml("hot_consumer:\n  read_batch_size: 0\n");
-  ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("hot_consumer.read_batch_size"), std::string::npos);
+// The hot consumer and the consumer RPC registry are gone; a config
+// that still names them fails, saying what replaced them.
+TEST(ConfigValidate, RemovedSectionsNameWhatReplacedThem) {
+  const std::array<std::pair<const char*, const char*>, 2> removed = {{
+      {"hot_consumer:\n  read_batch_size: 128\n", "the sequencer applies each write to hot"},
+      {"consumer_rpc:\n  default_timeout_ms: 100\n", "no consumer apply to wait for"},
+  }};
+  for (const auto& [yaml, reason] : removed) {
+    auto cfg = Config::ParseFromYaml(yaml);
+    ASSERT_FALSE(cfg.has_value()) << yaml;
+    const std::string section(yaml, std::string_view(yaml).find(':'));
+    EXPECT_NE(cfg.error().message().find(section), std::string::npos) << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find(reason), std::string::npos) << cfg.error().message();
+  }
 }
 
-TEST(ConfigValidate, RejectsNonPositiveHotConsumerReadTimeout) {
-  auto cfg = Config::ParseFromYaml("hot_consumer:\n  read_timeout_ms: 0\n");
-  ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("hot_consumer.read_timeout_ms"), std::string::npos);
+TEST(ConfigValidate, RemovedRecoveryBatchSizesNameTheScan) {
+  for (const char* key : {"hot_replay_batch_size", "cold_replay_batch_size"}) {
+    auto cfg = Config::ParseFromYaml(std::string("recovery:\n  ") + key + ": 100\n");
+    ASSERT_FALSE(cfg.has_value()) << key;
+    EXPECT_NE(cfg.error().message().find(std::string("recovery.") + key), std::string::npos)
+        << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find("the Scan's batches"), std::string::npos)
+        << cfg.error().message();
+  }
+}
+
+// More than one log is valid but narrows what one atomic batch spans,
+// so the validator says so (#169).
+TEST(ConfigValidate, SeveralLogsWarnOfCrossSlotAndFlushdb) {
+  const log::testing::CapturingSink sink;
+  auto one = Config::ParseFromYaml("queue:\n  log_count: 1\n");
+  ASSERT_TRUE(one.has_value()) << one.error().message();
+  EXPECT_EQ(sink.Size(), 0U);
+  auto two = Config::ParseFromYaml("queue:\n  log_count: 2\n");
+  ASSERT_TRUE(two.has_value()) << two.error().message();
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 1U);
+  EXPECT_EQ(records[0].level, log::Level::kWarn);
+  EXPECT_NE(records[0].msg.find("CROSSSLOT"), std::string::npos) << records[0].msg;
+  EXPECT_NE(records[0].msg.find("FLUSHDB across logs"), std::string::npos) << records[0].msg;
 }
 
 TEST(ConfigValidate, RejectsColdConsumerLowWaterAboveHigh) {
@@ -303,27 +375,19 @@ TEST(ConfigValidate, SegmentSizeHoldsTheHeaderAndOneMaxSizeFrame) {
   EXPECT_TRUE(fits.has_value()) << fits.error().message();
 }
 
-// Cold's pause for power durability freezes the frontier that buffer
-// consistency waits on, so it must end well before that wait does.
-TEST(ConfigValidate, ColdReadTimeoutIsAtMostHalfTheConsistencyWait) {
-  auto over = Config::ParseFromYaml(R"YAML(
-cold_consumer:
-  queue_read_timeout_ms: 51
-engine:
-  buffer_consistency_wait_timeout_ms: 100
-)YAML");
-  ASSERT_FALSE(over.has_value());
-  EXPECT_NE(over.error().message().find("cold_consumer.queue_read_timeout_ms"), std::string::npos);
-  EXPECT_NE(over.error().message().find("engine.buffer_consistency_wait_timeout_ms"),
-            std::string::npos);
-
-  auto half = Config::ParseFromYaml(R"YAML(
-cold_consumer:
-  queue_read_timeout_ms: 50
-engine:
-  buffer_consistency_wait_timeout_ms: 100
-)YAML");
-  EXPECT_TRUE(half.has_value()) << half.error().message();
+TEST(ConfigValidate, RemovedEngineKeysNameTheirReason) {
+  const std::array<std::pair<const char*, const char*>, 2> removed = {{
+      {"min_rpc_wait_fraction: 0.5", "no consumer apply to wait for"},
+      {"buffer_consistency_wait_timeout_ms: 100", "no longer waits for the cold consumer"},
+  }};
+  for (const auto& [line, reason] : removed) {
+    auto cfg = Config::ParseFromYaml(std::string("engine:\n  ") + line + "\n");
+    ASSERT_FALSE(cfg.has_value()) << line;
+    const std::string key(line, std::string_view(line).find(':'));
+    EXPECT_NE(cfg.error().message().find("engine." + key), std::string::npos)
+        << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find(reason), std::string::npos) << cfg.error().message();
+  }
 }
 
 TEST(ConfigValidate, RejectsEmptyDataPath) {

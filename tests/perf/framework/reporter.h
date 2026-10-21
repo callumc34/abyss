@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "histogram.h"
+#include "metrics_scraper.h"
 #include "server_identity.h"
 #include "sweep.h"
 #include "workload.h"
@@ -16,7 +17,10 @@
 namespace abyss::perf {
 
 struct BuildInfo {
+  // Configure time, so possibly stale; `source_tree` is the tree the
+  // binary was built from: HEAD, plus a hash of any changes.
   std::string commit;
+  std::string source_tree;
   std::string preset;
   std::string compiler;
   std::string build_type;
@@ -69,9 +73,16 @@ struct DriverStats {
   int64_t send_lag_p50_ns = 0;
   int64_t send_lag_p99_ns = 0;
   int64_t send_lag_max_ns = 0;
+  // Slots late because the previous op (or a full window) still held
+  // the worker: the measured system's backlog, kept out of send lag.
+  uint64_t backlog_count = 0;
+  int64_t backlog_p50_ns = 0;
+  int64_t backlog_p99_ns = 0;
+  int64_t backlog_max_ns = 0;
   // Send lag too large for the latency figures to be trusted.
   bool lagging = false;
-  // Driver threads only, over the measured window.
+  // Worker threads over the measured window. An in-process probe's
+  // workers run the engine inline, so there it is engine CPU too.
   double cpu_seconds = 0.0;
   double cpu_per_wall_second = 0.0;
   double overload_threshold_cores = 0.0;
@@ -95,10 +106,14 @@ struct RunReport {
   std::optional<ServerIdentity> server;
   // Effective configuration of the measured system, as key/value strings.
   std::map<std::string, std::string> config;
+  // What a probe measured of its own workload, such as the TTL share.
+  std::map<std::string, double> measured;
   WorkloadConfig workload;
   std::map<std::string, OperationStats> operations;
   DriverStats driver;
   std::vector<MetricSnapshot> server_metrics;
+  // In-process probes: what each server histogram series recorded.
+  std::vector<HistogramSummary> server_histograms;
   // Non-empty: targets are listed unevaluated and pass stays false.
   std::string targets_not_evaluated;
   std::vector<TargetEvaluation> targets;
@@ -112,10 +127,11 @@ OperationStats StatsFromHistogram(const Histogram& h, uint64_t count,
 
 void EvaluateTargets(RunReport& report);
 
-// Lagging when send-lag p99 exceeds 50us or 10% of a per-op p99 target.
-// Overloaded when driver CPU per wall-second exceeds the larger of one
-// core and 10% of the host's hardware threads.
-DriverStats MakeDriverStats(const Histogram& send_lag, bool open_loop,
+// Lagging when send-lag p99 exceeds 50us or 10% of a per-op p99 target;
+// backlog never makes a run lagging. Overloaded when worker CPU per
+// wall-second exceeds the larger of one core and 10% of the host's
+// hardware threads.
+DriverStats MakeDriverStats(const Histogram& send_lag, const Histogram& backlog, bool open_loop,
                             std::chrono::nanoseconds driver_cpu,
                             std::chrono::nanoseconds measured_duration,
                             const WorkloadTargets& targets);

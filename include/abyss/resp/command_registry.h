@@ -22,9 +22,11 @@ enum class CommandClass : uint8_t {
 enum class Dispatch : uint8_t {
   kStateless,
   kTieredRead,
+  // A write, decided by the sequencer; its predicate flags, if any, are
+  // extracted per call.
   kWritePath,
-  kConditionalWrite,
-  kConsumerRpc,
+  // Answered from server state, not the data path.
+  kAdmin,
   kFlush,
 };
 
@@ -68,7 +70,7 @@ struct CommandSpec {
 
   std::span<const SubcommandSpec> subcommands{};
 
-  // nullptr if the command is never conditional. See ADP-011.
+  // nullptr if the command is never conditional. See ADP-015.
   PredicateExtractor predicate = nullptr;
 };
 

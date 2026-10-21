@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -85,9 +86,19 @@ struct Exists {
   std::vector<std::string_view> keys;
 };
 
+// TTL, or PTTL when `millis`.
+struct Ttl {
+  std::string_view key;
+  bool millis = false;
+};
+
+struct Type {
+  std::string_view key;
+};
+
 using ReadOp = std::variant<StringGet, SetIsMember, SetMembers, SetCard, ZsetScore, ZsetCard,
                             ZsetRange, HashGet, HashGetAll, HashMultiGet, HashFieldExists, HashKeys,
-                            HashVals, HashLen, Exists>;
+                            HashVals, HashLen, Exists, Ttl, Type>;
 
 // --- Writes ---
 
@@ -182,6 +193,9 @@ bool HasWriteParser(std::string_view name);
 // original spelling. HMSET therefore stays HMSET: it is a distinct WriteOp
 // carrying a distinct reply, not a spelling of HSET.
 RespCommand CanonicalCommand(const WriteOp& op);
+
+// A score's canonical form: the shortest that parses back bit-for-bit.
+std::string ScoreToString(double score);
 
 std::string_view PrimaryKey(const ReadOp& op);
 std::string_view PrimaryKey(const WriteOp& op);
