@@ -31,7 +31,7 @@ StatusSnapshot MakeMinimalSnapshot() {
   s.server.ready = true;
   s.config.profile = "embedded";
   s.config.shard_count = 4;
-  s.config.fsync_policy = "group_commit";
+  s.config.durability = "power_loss";
   s.config.default_eviction_seconds = 86400;
   s.endpoints.resp = StatusEndpoint{.bind = "0.0.0.0", .port = 6379};
   s.endpoints.admin =
@@ -78,17 +78,30 @@ TEST(StatusHandlerTest, BodyHasAllTopLevelKeys) {
                                          }));
 }
 
-// Renaming queue.tail_seq and consumers.*.last_ack_seq_* broke the
-// schema: version 2, with no aliases for the old keys.
-TEST(StatusHandlerTest, SchemaVersionTwoHasOnlyRenamedKeys) {
+// Renaming queue.tail_seq, consumers.*.last_ack_seq_* and
+// config.fsync_policy broke the schema: no aliases for the old keys.
+TEST(StatusHandlerTest, SchemaVersionThreeHasOnlyRenamedKeys) {
   FakeProvider provider(MakeMinimalSnapshot());
   StatusHandler handler(&provider);
   HttpRequest request;
   const auto response = handler.Handle(request);
-  EXPECT_TRUE(ContainsAll(response.body, {"\"schema_version\":2", "\"first_seq\"",
-                                          "\"last_commit_seq_min\"", "\"last_commit_seq_max\""}));
+  EXPECT_TRUE(ContainsAll(response.body,
+                          {"\"schema_version\":3", "\"durability\":\"power_loss\"", "\"first_seq\"",
+                           "\"last_commit_seq_min\"", "\"last_commit_seq_max\""}));
   EXPECT_FALSE(response.body.contains("\"tail_seq\""));
   EXPECT_FALSE(response.body.contains("last_ack_seq"));
+  EXPECT_FALSE(response.body.contains("fsync_policy"));
+}
+
+TEST(StatusHandlerTest, QueueReportsTheDurabilityWindow) {
+  StatusSnapshot s = MakeMinimalSnapshot();
+  s.queue.unflushed_bytes = 4096;
+  s.queue.durability_lag_ms = 12;
+  FakeProvider provider(s);
+  StatusHandler handler(&provider);
+  HttpRequest request;
+  const auto response = handler.Handle(request);
+  EXPECT_TRUE(ContainsAll(response.body, {"\"unflushed_bytes\":4096", "\"durability_lag_ms\":12"}));
 }
 
 TEST(StatusHandlerTest, IncludesNodeIdAndVersion) {

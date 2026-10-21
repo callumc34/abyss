@@ -37,7 +37,7 @@ core::QueueEntry MakeWrite(core::SequenceId seq) {
 class ColdConsumerPoolWaitTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ON_CALL(queue_, Read(_, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
+    ON_CALL(queue_, Read(_, _, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
     ON_CALL(queue_, CommitOffset(_, _, _)).WillByDefault(Return(core::Result<void>{}));
     ON_CALL(cold_, ApplyBatch(_, _)).WillByDefault(Return(core::Result<void>{}));
   }
@@ -69,7 +69,7 @@ TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenTargetIsZero) {
 TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenAlreadyPastTarget) {
   auto pool = MakePool(/*shard_count=*/1);
   std::vector<core::QueueEntry> first_batch{MakeWrite(5), MakeWrite(7)};
-  EXPECT_CALL(queue_, Read(0, _, _, _))
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
       .WillOnce(Return(first_batch))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
   pool->ConsumerFor(0).Drain();
@@ -94,7 +94,7 @@ TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueWhenConsumerAdvancesDuringWait) {
   auto pool = MakePool(/*shard_count=*/1);
   // Pre-register the Read sequence so gmock isn't mutated from another thread
   // while the main thread polls the pool. The advancer just triggers Drain.
-  EXPECT_CALL(queue_, Read(0, _, _, _))
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWrite(3)}))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
   std::thread advancer([&] {
@@ -115,7 +115,7 @@ TEST_F(ColdConsumerPoolWaitTest, OutOfRangeShardReturnsFalse) {
 class ColdConsumerPoolMetricsTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ON_CALL(queue_, Read(_, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
+    ON_CALL(queue_, Read(_, _, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
     ON_CALL(queue_, CommitOffset(_, _, _)).WillByDefault(Return(core::Result<void>{}));
     ON_CALL(cold_, ApplyBatch(_, _)).WillByDefault(Return(core::Result<void>{}));
   }
@@ -144,10 +144,10 @@ TEST_F(ColdConsumerPoolMetricsTest, OldestUnflushedAgeIsZeroWhenAllBuffersEmpty)
 
 TEST_F(ColdConsumerPoolMetricsTest, OldestUnflushedAgeAggregatesMaxAcrossShards) {
   auto pool = MakePool(/*shard_count=*/2);
-  EXPECT_CALL(queue_, Read(0, _, _, _))
+  EXPECT_CALL(queue_, Read(0, _, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWrite(1)}))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
-  EXPECT_CALL(queue_, Read(1, _, _, _))
+  EXPECT_CALL(queue_, Read(1, _, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWrite(2)}))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 

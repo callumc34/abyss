@@ -55,16 +55,22 @@ Abyss acknowledges a write when it has reached a configured durability class. Th
 A configuration that still names a removed setting fails to load. The error names the setting and its replacement; nothing is mapped silently.
 
 **Two rules keep the classes principled:**
-- **No persisted derived state runs ahead of the power-durable log.** The cold consumer absorbs only entries at or below the fdatasync watermark, whatever the acknowledgement class. Otherwise a power loss would leave cold holding writes the log no longer has.
-- **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. The bound's configuration keys and defaults are defined with the durability pipeline (#159).
+- **No persisted derived state runs ahead of the power-durable log.**
+  - The cold consumer may absorb entries into its volatile compaction buffer at the acknowledgement class. It writes to the cold store, by flush or wipe, only effects whose entries are at or below the fdatasync watermark, whatever the acknowledgement class. Otherwise a power loss would leave cold holding writes the log no longer has.
+  - Committed offsets are gated the same way.
+  - Gating absorption itself would make every collection read wait for a device flush (ADP-004 §Persisting at the power-durable log).
+  - What is absorbed but not yet persistable is bounded by the durability window below.
+- **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. It is set by `queue.durability_window_bytes` (default 64 MiB, volume-wide) and `queue.durability_window_ms` (default 1000, the age of a shard's oldest unflushed entry); an append over either bound waits, then is rejected after the write timeout.
 
-Two consequences follow from the absorption cap, and both are accepted:
+Two consequences follow from the persistence cap, and both are accepted:
 - Anything whose acknowledgement waits on cold applying an entry (FLUSHDB) pays `power_loss` latency in every class.
 - A flush stall delays cold, which delays hot eviction (§Residency invariant). This surfaces as bounded memory backpressure on writes, never as unbounded hot growth.
 
 ### Log durability pipeline
 
-**Natural-batching group commit.** A flush starts as soon as the device is idle. Appends that arrive while a flush is in flight form the next batch, capped by bytes. There is no timer, and durability is signalled by callback. This is the leader/follower commit used by RocksDB, and by PostgreSQL with `commit_delay = 0`. At low load the latency is one flush; under load each flush covers more writes.
+**Natural-batching group commit.** A flush starts as soon as the device is idle. Appends that arrive while a flush is in flight form the next batch. There is no timer, and durability is signalled by callback. This is the leader/follower commit used by RocksDB, and by PostgreSQL with `commit_delay = 0`. At low load the latency is one flush; under load each flush covers more writes.
+
+There is no batch byte cap. A natural batch is limited by how long the previous flush took, and appenders write their own frames, so a flush is one data sync of the file whatever the batch holds. RocksDB caps its write group only because its leader copies the group's data. The bound that matters is the durability window.
 
 **Preallocated, zero-filled segments, flushed with `fdatasync`.** The next segment is created off the hot path, so a flush syncs data only. Recycled segments would need a per-frame epoch to stop stale frames being replayed past a torn tail (RocksDB's recyclable record format); zero-filling avoids that format change.
 
@@ -170,6 +176,7 @@ A hot miss implies that buffer plus cold is current, so the read path needs no c
 No reply, to a read or a write, reflects a write that a failure in the configured class could lose. A command whose key's latest sequence number is above the class watermark waits for the watermark to pass, without blocking a thread. This includes replies that reveal prior state, such as `SET … GET`, `INCR` and a `DEL` count.
 - Under `process_crash`, frames are filled before the critical section ends, so the wait fires only for frames still being filled.
 - The wait matters under `power_loss`.
+- Until the sequencer lands, hot is applied by its consumer. That consumer reads only entries durable at the acknowledgement class, which gives the same guarantee without a fence.
 
 ### Asynchronous request execution
 
@@ -206,14 +213,14 @@ Recovery is a single demultiplexing pass over each log.
 
 | Document | Change | Phase |
 |----------|--------|-------|
-| ADP-001 | Read takes a position, and positions below the oldest retained entry are out of range. Acks become committed offsets, persisted lazily in one dual-slot checkpoint. Volatile consumers are removed. Group commit and fsync policies are replaced by natural batching and durability classes. The entry taxonomy loses `Conditional` and `Resolved`. | 1a, 1b, 2 |
+| ADP-001 | Read takes a position, and positions below the oldest retained entry are out of range. Acks become committed offsets, persisted lazily in one dual-slot checkpoint. Volatile consumers are removed. Group commit and fsync policies are replaced by natural batching and durability classes. Segments move to one mapped physical log per volume. The entry taxonomy loses `Conditional` and `Resolved`. | 1a, 1b, 1c, 2 |
 | ADP-002 | Hot is applied by the sequencer. Residency invariant, droppable stubs, eviction gated on cold drain. | 2 |
-| ADP-004 | Consumer loop reads by position, and a poison entry pins the commit offset while reads pass it. Absorption is capped at the power-durable watermark. Pooled workers. | 1a, 1b |
+| ADP-004 | Consumer loop reads by position, and a poison entry pins the commit offset while reads pass it. Writes to the cold store are capped at the power-durable watermark. Pooled workers. | 1a, 1b, 1c |
 | ADP-005 | Asynchronous completion. The blocking head-of-line trade-off is removed. Conditional dispatch becomes sequenced writes. | 2, 3 |
 | ADP-006 | Sequenced write path, read fence, cache-fill promotion, no read-consistency wait. The Flush acknowledgement no longer requires a persisted consumer offset: the Flush entry's own durability suffices, Wipe stays synced, and a replayed Flush is idempotent per shard. | 1a, 2 |
 | ADP-007 | Resolver phase removed. Recovery syncs the log before replay. | 1b, 2 |
 | ADP-008 | A broker-backed log requires producer fencing so an outgoing shard owner cannot interleave effects during resharding. | 2 |
-| ADP-009 | Sparse in-memory index. Preallocated segments, where a zero length marks the end of the log. Physical log per volume with per-shard streams. Effect frames. | 1a, 1b, 2 |
+| ADP-009 | Sparse in-memory index. Preallocated segments, where a zero length marks the end of the log. Physical log per volume with per-shard streams. Effect frames. | 1a, 1c, 2 |
 | ADP-011 | Resolver, entry pair and block-and-scan superseded. Consumer RPC is reduced to admin and flush use. | 2 |
 | ADP-013 | Target-to-substrate map, write probe, comparative drivers and matrix, load-driver pipelining. | 0 |
 
@@ -228,7 +235,8 @@ Recovery is a single demultiplexing pass over each log.
 |-------|-------|---------|
 | 0 | #157 | Measurement: write probe with device-flush calibration, flush metrics, read-position micro-benchmark, a pipelining load driver, server-identified comparative runs. Targets in `requirements.md`. |
 | 1a | #158 | Read and acknowledgement contract: consumer-owned positions, explicit out-of-range, sparse index with header-only skip, lazy dual-slot offset checkpoint. |
-| 1b | #159 | Durability pipeline: natural batching, durability classes, mapped preallocated segments on the per-volume log, cold absorption ceiling, bounded durability window, fail-stop, recovery-time sync. |
+| 1b | #159 | Durability semantics on the existing per-shard segments: natural batching, durability classes, cold persistence ceiling, bounded durability window, fail-stop, recovery-time sync. |
+| 1c | #175 | Physical log: mapped, preallocated, zero-filled segments in one log per volume with per-shard streams and an atomic-reserve tail; offset rings; the demultiplexing recovery pass; pooled cold workers. Delivers W2 under concurrency and W3, which 1b's per-shard flushes cannot, because they serialise on the device. |
 | 2 | #160 | Sequenced write path, residency invariant, read visibility, cross-shard atomic commands, shard-lock measurement under skew; resolver removal. |
 | 3 | #161 | Asynchronous request execution and asynchronous cold I/O. |
 | Later | #162, #170, #88 | Blob lane, atomic multi-key reads, io_uring with several flushes in flight (watermark at the contiguous completed prefix), hot-table and allocator work driven by profiles. |

@@ -482,8 +482,13 @@ void TieringEngine::PromoteThroughQueue(std::string_view key) {
   };
   const core::ShardId shard = core::ComputeShard(key, config_.shard_count);
   promotions_.Increment();
-  // Best-effort: client already has the cold value; never block the read path.
-  auto appended = queue_.Append(shard, std::move(entry));
+  // Best-effort: client already has the cold value; never block the read
+  // path, so a full durability window skips the promotion.
+  auto appended = queue_.Append(shard, std::move(entry), core::SteadyClock::now());
+  if (!appended.has_value() && appended.error().code() == core::ErrorCode::kResourceExhausted) {
+    promotions_skipped_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   if (!appended.has_value()) {
     promotion_append_failures_.fetch_add(1, std::memory_order_relaxed);
     ABYSS_LOG_WARN("promotion append failed", {"shard", static_cast<int64_t>(shard)},
@@ -495,6 +500,7 @@ void TieringEngine::PromoteThroughQueue(std::string_view key) {
 TieringEngineMetrics TieringEngine::Snapshot() const {
   return TieringEngineMetrics{
       .promotion_append_failures = promotion_append_failures_.load(std::memory_order_relaxed),
+      .promotions_skipped = promotions_skipped_.load(std::memory_order_relaxed),
       .flush_total = flush_total_.load(std::memory_order_relaxed),
       .flush_durable_failures = flush_durable_failures_.load(std::memory_order_relaxed),
       .flush_consumer_timeouts = flush_consumer_timeouts_.load(std::memory_order_relaxed),
@@ -525,6 +531,9 @@ core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*t
 
   std::vector<ShardWait> waits;
   waits.reserve(config_.shard_count);
+  // One budget for the whole command: admission of every shard's Flush
+  // entry, then its durability, then the consumers' applies.
+  const auto deadline = std::chrono::steady_clock::now() + config_.write_timeout;
 
   for (core::ShardId shard = 0; shard < config_.shard_count; ++shard) {
     core::QueueEntry entry{
@@ -532,7 +541,7 @@ core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*t
         .appended_at = core::WallClock::now(),
         .payload = core::entry::Flush{},
     };
-    auto pending = queue_.BeginAppend(shard, std::move(entry));
+    auto pending = queue_.BeginAppend(shard, std::move(entry), deadline);
     if (!pending.has_value()) {
       flush_append_failures_.fetch_add(1, std::memory_order_relaxed);
       cancel_all(waits);
@@ -551,8 +560,6 @@ core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*t
     pending->Publish();
     waits.push_back(std::move(w));
   }
-
-  const auto deadline = std::chrono::steady_clock::now() + config_.write_timeout;
 
   // Every shard's durable wait must succeed before any consumer applies; on
   // timeout, surface one error and cancel — FLUSHDB retry is idempotent.
@@ -647,7 +654,9 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyWrite(core::RespCo
       .payload = core::entry::Write{.cmd = std::move(cmd)},
   };
 
-  auto pending = queue_.BeginAppend(shard, std::move(entry));
+  // Admission, durability and apply all share the command's budget.
+  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
+  auto pending = queue_.BeginAppend(shard, std::move(entry), durable_deadline);
   if (!pending.has_value()) {
     return std::unexpected(pending.error());
   }
@@ -656,8 +665,6 @@ core::Result<core::RespValue> TieringEngine::DispatchSingleKeyWrite(core::RespCo
   auto rpc_future = rpc_.Register(rpc_id);
   queue::DurabilityFuture durable_future = std::move(pending->durable());
   pending->Publish();
-
-  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
 
   // fsync first: a durable-layer failure takes precedence over consumer error.
   if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
@@ -754,6 +761,9 @@ core::Result<core::RespValue> TieringEngine::FanOutWrite(
 
   std::vector<InFlight> in_flight;
   in_flight.reserve(subs.size());
+  // Shared deadline: fan-out doesn't widen the single-key write_timeout,
+  // admission of every sub included.
+  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
 
   // Per-sub Begin → Register → Publish. BeginAppend returns with the per-shard
   // append mutex held; two subs hashing to the same shard would deadlock if we
@@ -764,7 +774,7 @@ core::Result<core::RespValue> TieringEngine::FanOutWrite(
         .appended_at = core::WallClock::now(),
         .payload = core::entry::Write{.cmd = sub},
     };
-    auto pending = queue_.BeginAppend(shard, std::move(entry));
+    auto pending = queue_.BeginAppend(shard, std::move(entry), durable_deadline);
     if (!pending.has_value()) {
       for (auto& f : in_flight) rpc_.Cancel(f.rpc_id);
       return std::unexpected(pending.error());
@@ -781,8 +791,6 @@ core::Result<core::RespValue> TieringEngine::FanOutWrite(
     pending->Publish();
   }
 
-  // Shared deadline: fan-out doesn't widen the single-key write_timeout.
-  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
   auto cancel_remaining = [&](size_t from) {
     for (size_t j = from; j < in_flight.size(); ++j) rpc_.Cancel(in_flight[j].rpc_id);
   };
@@ -842,7 +850,8 @@ core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_vie
       .payload = core::entry::Conditional{.cmd = std::move(cmd), .flags = flags},
   };
 
-  auto pending = queue_.BeginAppend(shard, std::move(entry));
+  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
+  auto pending = queue_.BeginAppend(shard, std::move(entry), durable_deadline);
   if (!pending.has_value()) {
     return std::unexpected(pending.error());
   }
@@ -851,8 +860,6 @@ core::Result<core::RespValue> TieringEngine::DispatchConditional(std::string_vie
   auto rpc_future = rpc_.Register(rpc_id);
   queue::DurabilityFuture durable_future = std::move(pending->durable());
   pending->Publish();
-
-  const auto durable_deadline = std::chrono::steady_clock::now() + config_.write_timeout;
   if (durable_future.wait_until(durable_deadline) == std::future_status::timeout) {
     rpc_.Cancel(rpc_id);
     return core::RespValue::Error(

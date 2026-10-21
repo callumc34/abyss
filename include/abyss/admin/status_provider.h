@@ -26,7 +26,7 @@ struct StatusServerInfo {
 struct StatusConfigInfo {
   std::string profile;
   uint32_t shard_count = 0;
-  std::string fsync_policy;
+  std::string durability;
   uint64_t default_eviction_seconds = 0;
 };
 
@@ -54,6 +54,9 @@ struct StatusQueueInfo {
   uint64_t reaper_failures = 0;
   // Zero when nothing eligible is stuck; rises while retention reclamation stalls.
   uint64_t oldest_eligible_unreaped_age_ms = 0;
+  // Published but not yet power-durable; zero when nothing is unflushed.
+  uint64_t unflushed_bytes = 0;
+  uint64_t durability_lag_ms = 0;
 };
 
 struct StatusHotInfo {
@@ -137,7 +140,7 @@ struct StatusRecoveryInfo {
 // schema_version bump. Unset/inapplicable fields render as JSON null or as
 // the type's neutral value (0, "", false), never as missing keys.
 struct StatusSnapshot {
-  uint32_t schema_version = 2;
+  uint32_t schema_version = 3;
   StatusBuildInfo build;
   StatusServerInfo server;
   StatusConfigInfo config;

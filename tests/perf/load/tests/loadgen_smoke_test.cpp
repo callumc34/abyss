@@ -109,7 +109,7 @@ TEST_F(LoadgenFixture, RunsAgainstRealServerAndEmitsReport) {
   EXPECT_FALSE(report["server"]["version"].as<std::string>().empty());
   EXPECT_EQ(report["workload"]["pipeline_depth"].as<int>(), 1);
   EXPECT_EQ(report["operations"]["SET"]["errors"].as<uint64_t>(), 0U);
-  EXPECT_FALSE(report["config"]["wal-fsync-policy"].as<std::string>().empty());
+  EXPECT_FALSE(report["config"]["wal-durability"].as<std::string>().empty());
   EXPECT_FALSE(report["driver"]["open_loop"].as<bool>());
 }
 

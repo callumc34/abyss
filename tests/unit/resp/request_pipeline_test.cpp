@@ -93,7 +93,10 @@ std::string ToStr(const std::vector<uint8_t>& v) {
 
 core::RespValue ParseResponse(const std::vector<uint8_t>& bytes) {
   auto r = Parser::Parse(std::span<const uint8_t>(bytes.data(), bytes.size()));
-  EXPECT_TRUE(r.has_value());
+  if (!r.has_value()) {
+    ADD_FAILURE() << "unparseable response";
+    return core::RespValue::Null();
+  }
   return r->value;
 }
 

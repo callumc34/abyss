@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #include "abyss/config/config.h"
+#include "abyss/core/durability.h"
 
 namespace abyss::config {
 namespace {
@@ -185,10 +189,90 @@ TEST(ConfigValidate, OffsetFsyncIntervalBounds) {
   }
 }
 
-TEST(ConfigValidate, RejectsUnknownFsyncPolicy) {
-  auto cfg = Config::ParseFromYaml("queue:\n  wal_fsync_policy: fsync_sometimes\n");
-  ASSERT_FALSE(cfg.has_value());
-  EXPECT_NE(cfg.error().message().find("wal_fsync_policy"), std::string::npos);
+TEST(ConfigValidate, RemovedQueueKeysNameTheirReplacement) {
+  const std::array<std::pair<const char*, const char*>, 3> removed = {{
+      {"wal_fsync_policy: group_commit", "queue.durability (process_crash | power_loss)"},
+      {"group_commit_interval_us: 1000", "a flush starts as soon as the previous one ends"},
+      {"group_commit_max_bytes: 1048576", "queue.durability_window_bytes"},
+  }};
+  for (const auto& [line, replacement] : removed) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  ") + line + "\n");
+    ASSERT_FALSE(cfg.has_value()) << line;
+    const std::string key(line, std::string_view(line).find(':'));
+    EXPECT_NE(cfg.error().message().find("queue." + key), std::string::npos)
+        << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find(replacement), std::string::npos) << cfg.error().message();
+  }
+}
+
+TEST(ConfigValidate, DurabilityAcceptsBothClasses) {
+  for (const auto& [name, durability] :
+       {std::pair{"process_crash", core::Durability::kProcessCrash},
+        std::pair{"power_loss", core::Durability::kPowerLoss}}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  durability: ") + name + "\n");
+    ASSERT_TRUE(cfg.has_value()) << name << ": " << cfg.error().message();
+    EXPECT_EQ(cfg->queue.durability, durability);
+  }
+}
+
+TEST(ConfigValidate, RejectsUnknownDurability) {
+  for (const char* bad : {"group_commit", "fsync_none", "PowerLoss", "\"\""}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  durability: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value()) << bad;
+    EXPECT_NE(cfg.error().message().find("queue.durability"), std::string::npos)
+        << cfg.error().message();
+    EXPECT_NE(cfg.error().message().find("process_crash, power_loss"), std::string::npos)
+        << cfg.error().message();
+  }
+}
+
+TEST(ConfigValidate, DurabilityWindowBytesBounds) {
+  for (const char* bad : {"1048575", "4294967297"}) {
+    auto cfg =
+        Config::ParseFromYaml(std::string("queue:\n  durability_window_bytes: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value()) << bad;
+    EXPECT_NE(cfg.error().message().find("queue.durability_window_bytes"), std::string::npos);
+  }
+  for (const char* good : {"1048576", "4294967296"}) {
+    auto cfg =
+        Config::ParseFromYaml(std::string("queue:\n  durability_window_bytes: ") + good + "\n");
+    EXPECT_TRUE(cfg.has_value()) << good << ": " << cfg.error().message();
+  }
+}
+
+TEST(ConfigValidate, DurabilityWindowMsBounds) {
+  for (const char* bad : {"9", "60001"}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  durability_window_ms: ") + bad + "\n");
+    ASSERT_FALSE(cfg.has_value()) << bad;
+    EXPECT_NE(cfg.error().message().find("queue.durability_window_ms"), std::string::npos);
+  }
+  for (const char* good : {"10", "60000"}) {
+    auto cfg = Config::ParseFromYaml(std::string("queue:\n  durability_window_ms: ") + good + "\n");
+    EXPECT_TRUE(cfg.has_value()) << good << ": " << cfg.error().message();
+  }
+}
+
+// Cold's pause for power durability freezes the frontier that buffer
+// consistency waits on, so it must end well before that wait does.
+TEST(ConfigValidate, ColdReadTimeoutIsAtMostHalfTheConsistencyWait) {
+  auto over = Config::ParseFromYaml(R"YAML(
+cold_consumer:
+  queue_read_timeout_ms: 51
+engine:
+  buffer_consistency_wait_timeout_ms: 100
+)YAML");
+  ASSERT_FALSE(over.has_value());
+  EXPECT_NE(over.error().message().find("cold_consumer.queue_read_timeout_ms"), std::string::npos);
+  EXPECT_NE(over.error().message().find("engine.buffer_consistency_wait_timeout_ms"),
+            std::string::npos);
+
+  auto half = Config::ParseFromYaml(R"YAML(
+cold_consumer:
+  queue_read_timeout_ms: 50
+engine:
+  buffer_consistency_wait_timeout_ms: 100
+)YAML");
+  EXPECT_TRUE(half.has_value()) << half.error().message();
 }
 
 TEST(ConfigValidate, RejectsEmptyDataPath) {

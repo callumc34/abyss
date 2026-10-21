@@ -10,10 +10,9 @@
 #include <thread>
 #include <vector>
 
+#include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
-#include "abyss/queue/fsync_policy.h"
-#include "abyss/queue/group_commit.h"
 #include "abyss/queue/wal_queue.h"
 
 namespace abyss::queue {
@@ -53,12 +52,12 @@ core::QueueEntry MakeEntry(size_t value_size) {
   return e;
 }
 
-std::unique_ptr<WalQueue> MakeQueue(const std::string& dir, FsyncPolicy policy) {
+std::unique_ptr<WalQueue> MakeQueue(const std::string& dir, core::Durability durability) {
   auto result = WalQueue::Open({
       .wal_path = dir,
       .segment_size_bytes = size_t{16} * 1024 * 1024,
       .shard_count = 1,
-      .commit = {.policy = policy, .interval = 1ms, .max_bytes = size_t{1024} * 1024},
+      .durability = durability,
       .min_retention = 1s,
   });
   if (!result.has_value()) std::abort();
@@ -70,9 +69,11 @@ bool AppendDurably(WalQueue& queue, size_t value_size) {
   return appended.has_value() && appended->durable.get().has_value();
 }
 
-void BM_AppendAndWaitDurable(benchmark::State& state, FsyncPolicy policy) {
+// The ack each class gives: at publish under process_crash, after the
+// covering flush under power_loss.
+void BM_AppendAndWaitDurable(benchmark::State& state, core::Durability durability) {
   TempDir tmp;
-  auto queue = MakeQueue(tmp.path(), policy);
+  auto queue = MakeQueue(tmp.path(), durability);
   const auto value_size = static_cast<size_t>(state.range(0));
 
   for ([[maybe_unused]] auto _ : state) {
@@ -84,18 +85,15 @@ void BM_AppendAndWaitDurable(benchmark::State& state, FsyncPolicy policy) {
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
 }
 
-void BM_AppendPerWrite(benchmark::State& state) {
-  BM_AppendAndWaitDurable(state, FsyncPolicy::kPerWrite);
+void BM_AppendPowerLoss(benchmark::State& state) {
+  BM_AppendAndWaitDurable(state, core::Durability::kPowerLoss);
 }
-BENCHMARK(BM_AppendPerWrite)->Arg(64)->Arg(1024);
+BENCHMARK(BM_AppendPowerLoss)->Arg(64)->Arg(1024);
 
-void BM_AppendGroupCommit(benchmark::State& state) {
-  BM_AppendAndWaitDurable(state, FsyncPolicy::kGroupCommit);
+void BM_AppendProcessCrash(benchmark::State& state) {
+  BM_AppendAndWaitDurable(state, core::Durability::kProcessCrash);
 }
-BENCHMARK(BM_AppendGroupCommit)->Arg(64)->Arg(1024);
-
-void BM_AppendNone(benchmark::State& state) { BM_AppendAndWaitDurable(state, FsyncPolicy::kNone); }
-BENCHMARK(BM_AppendNone)->Arg(64)->Arg(1024);
+BENCHMARK(BM_AppendProcessCrash)->Arg(64)->Arg(1024);
 
 // One queue and shard shared by every thread of a run; Setup opens it
 // before the threads start and Teardown closes it after they finish.
@@ -109,10 +107,10 @@ SharedQueue& Shared() {
   return shared;
 }
 
-void OpenShared(FsyncPolicy policy) {
+void OpenShared(core::Durability durability) {
   auto& shared = Shared();
   shared.dir = std::make_unique<TempDir>();
-  shared.queue = MakeQueue(shared.dir->path(), policy);
+  shared.queue = MakeQueue(shared.dir->path(), durability);
 }
 
 void CloseShared(const benchmark::State& /*state*/) {
@@ -134,8 +132,8 @@ void BM_ConcurrentAppend(benchmark::State& state) {
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
 }
 BENCHMARK(BM_ConcurrentAppend)
-    ->Name("BM_ConcurrentAppendGroupCommit")
-    ->Setup([](const benchmark::State&) { OpenShared(FsyncPolicy::kGroupCommit); })
+    ->Name("BM_ConcurrentAppendPowerLoss")
+    ->Setup([](const benchmark::State&) { OpenShared(core::Durability::kPowerLoss); })
     ->Teardown(CloseShared)
     ->Arg(64)
     ->Threads(1)
@@ -143,8 +141,8 @@ BENCHMARK(BM_ConcurrentAppend)
     ->Threads(8)
     ->UseRealTime();
 BENCHMARK(BM_ConcurrentAppend)
-    ->Name("BM_ConcurrentAppendNone")
-    ->Setup([](const benchmark::State&) { OpenShared(FsyncPolicy::kNone); })
+    ->Name("BM_ConcurrentAppendProcessCrash")
+    ->Setup([](const benchmark::State&) { OpenShared(core::Durability::kProcessCrash); })
     ->Teardown(CloseShared)
     ->Arg(64)
     ->Threads(1)
@@ -166,7 +164,7 @@ void BM_ReadAtSegmentPosition(benchmark::State& state) {
       .wal_path = tmp.path(),
       .segment_size_bytes = kPositionSegmentBytes,
       .shard_count = 1,
-      .commit = {.policy = FsyncPolicy::kNone},
+      .durability = core::Durability::kProcessCrash,
       .min_retention = 1s,
   });
   if (!opened.has_value()) {
@@ -189,7 +187,7 @@ void BM_ReadAtSegmentPosition(benchmark::State& state) {
   }
 
   for ([[maybe_unused]] auto _ : state) {
-    auto read = queue.Read(0, n - 1, 256, core::Duration{0});
+    auto read = queue.Read(0, n - 1, 256, core::Duration{0}, core::Durability::kProcessCrash);
     if (!read.has_value() || read->size() != 1) {
       state.SkipWithError("tail read failed");
       return;

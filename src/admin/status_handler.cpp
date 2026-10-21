@@ -83,8 +83,8 @@ std::string Render(const StatusSnapshot& s) {
     w.String(s.config.profile);
     w.Key("shard_count");
     w.UInt(s.config.shard_count);
-    w.Key("fsync_policy");
-    w.String(s.config.fsync_policy);
+    w.Key("durability");
+    w.String(s.config.durability);
     w.Key("default_eviction_seconds");
     w.UInt(s.config.default_eviction_seconds);
     w.EndObject();
@@ -119,6 +119,10 @@ std::string Render(const StatusSnapshot& s) {
     w.UInt(s.queue.reaper_failures);
     w.Key("oldest_eligible_unreaped_age_ms");
     w.UInt(s.queue.oldest_eligible_unreaped_age_ms);
+    w.Key("unflushed_bytes");
+    w.UInt(s.queue.unflushed_bytes);
+    w.Key("durability_lag_ms");
+    w.UInt(s.queue.durability_lag_ms);
     w.EndObject();
   }
 

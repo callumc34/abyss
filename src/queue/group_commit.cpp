@@ -1,9 +1,11 @@
 #include "abyss/queue/group_commit.h"
 
-#include <algorithm>
 #include <chrono>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "abyss/core/fatal.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
 
@@ -13,7 +15,7 @@ namespace abyss::queue {
 
 namespace {
 
-constexpr std::chrono::milliseconds kSlowFsyncThreshold{50};
+constexpr std::chrono::milliseconds kSlowFlushThreshold{50};
 
 DurabilityFuture MakeReadyFuture(core::Result<void> value) {
   std::promise<core::Result<void>> p;
@@ -21,195 +23,148 @@ DurabilityFuture MakeReadyFuture(core::Result<void> value) {
   return p.get_future();
 }
 
+core::Error StoppedError() {
+  return core::Error{core::ErrorCode::kUnavailable, "WAL group committer stopped"};
+}
+
 }  // namespace
 
-GroupCommitter::GroupCommitter(GroupCommitConfig config, FsyncFn fsync_fn)
-    : config_(config), fsync_fn_(std::move(fsync_fn)) {
-  auto& reg = metrics::Registry::Instance();
-  flush_duration_ = reg.Histogram(metrics::names::kWalFlushDurationSeconds);
-  flush_batch_entries_ = reg.Histogram(metrics::names::kWalFlushBatchEntries);
-  if (config_.policy == FsyncPolicy::kGroupCommit) {
-    thread_ = std::thread([this] { Run(); });
+GroupCommitter::GroupCommitter(Extent durable, FlushFn flush, FlushedFn on_flushed)
+    : flush_(std::move(flush)),
+      on_flushed_(std::move(on_flushed)),
+      flush_duration_(
+          metrics::Registry::Instance().Histogram(metrics::names::kWalFlushDurationSeconds)),
+      flush_batch_entries_(
+          metrics::Registry::Instance().Histogram(metrics::names::kWalFlushBatchEntries)),
+      published_end_(durable.end),
+      durable_end_(durable.end),
+      durable_(durable),
+      thread_([this] { Run(); }) {}
+
+// Only a std::system_error from a lock or the join can escape, and
+// terminating on that at teardown is the right outcome.
+// NOLINTNEXTLINE(bugprone-exception-escape)
+GroupCommitter::~GroupCommitter() { Stop(/*final_flush=*/true); }
+
+void GroupCommitter::Published(core::SequenceId end) noexcept {
+  core::SequenceId current = published_end_.load(std::memory_order_relaxed);
+  while (end > current && !published_end_.compare_exchange_weak(
+                              current, end, std::memory_order_seq_cst, std::memory_order_relaxed)) {
+  }
+  if (idle_.load(std::memory_order_seq_cst)) {
+    const std::scoped_lock lock(wake_mu_);
+    wake_cv_.notify_one();
   }
 }
 
-GroupCommitter::~GroupCommitter() { Stop(); }
-
-DurabilityFuture GroupCommitter::Submit(size_t bytes, size_t entries,
-                                        core::SequenceId batch_last_seq) {
-  switch (config_.policy) {
-    case FsyncPolicy::kNone:
-      // No durability barrier, but advance the watermark to the published seq
-      // so the retention-commit gate is a correct no-op (Decision 1). The
-      // operator is warned at startup that durability is disabled.
-      PublishDurable(batch_last_seq);
-      return MakeReadyFuture({});
-
-    case FsyncPolicy::kPerWrite: {
-      const auto start = std::chrono::steady_clock::now();
-      auto result = fsync_fn_();
-      RecordFlush(std::chrono::steady_clock::now() - start, entries);
-      if (result.has_value()) {
-        PublishDurable(batch_last_seq);
-      }
-      return MakeReadyFuture(std::move(result));
-    }
-
-    case FsyncPolicy::kGroupCommit: {
-      std::promise<core::Result<void>> promise;
-      auto future = promise.get_future();
-      {
-        const std::scoped_lock lock(mu_);
-        if (stopped_) {
-          return MakeReadyFuture(std::unexpected(
-              core::Error{core::ErrorCode::kUnavailable, "group committer stopped"}));
-        }
-        pending_.push_back(
-            {.promise = std::move(promise), .bytes = bytes, .batch_last_seq = batch_last_seq});
-        pending_bytes_ += bytes;
-        pending_entries_ += entries;
-        batch_high_seq_ = std::max(batch_high_seq_, batch_last_seq);
-        if (pending_bytes_ >= config_.max_bytes) {
-          flush_requested_ = true;
-        }
-      }
-      cv_.notify_one();
-      return future;
-    }
-  }
-  return MakeReadyFuture(
-      std::unexpected(core::Error{core::ErrorCode::kInternal, "unknown fsync policy"}));
+DurabilityFuture GroupCommitter::WhenDurable(core::SequenceId seq) {
+  const std::scoped_lock lock(durable_mu_);
+  if (seq < durable_end_.load(std::memory_order_relaxed)) return MakeReadyFuture({});
+  if (stopped_) return MakeReadyFuture(std::unexpected(StoppedError()));
+  std::promise<core::Result<void>> promise;
+  auto future = promise.get_future();
+  waiters_.emplace_back(seq, std::move(promise));
+  return future;
 }
 
 bool GroupCommitter::AwaitDurable(core::SequenceId seq, std::chrono::nanoseconds timeout) const {
-  const auto ready = [this, seq] { return HasDurable() && DurableSeq() >= seq; };
-  if (ready()) return true;
+  if (seq < DurableEnd()) return true;
   std::unique_lock lock(durable_mu_);
-  return durable_cv_.wait_for(lock, timeout, ready);
+  durable_cv_.wait_for(lock, timeout, [this, seq] ABYSS_REQUIRES(durable_mu_) {
+    return stopped_ || seq < DurableEnd();
+  });
+  return seq < DurableEnd();
 }
 
-void GroupCommitter::PublishDurable(core::SequenceId seq) {
-  // The first published seq makes the watermark meaningful even at value 0.
-  has_durable_.store(true, std::memory_order_release);
-  // Monotonic CAS-max: never regress, and wake awaiters only when we advance.
-  core::SequenceId current = durable_seq_.load(std::memory_order_relaxed);
-  while (seq > current) {
-    if (durable_seq_.compare_exchange_weak(current, seq, std::memory_order_acq_rel,
-                                           std::memory_order_relaxed)) {
-      const std::scoped_lock lock(durable_mu_);
-      durable_cv_.notify_all();
-      return;
-    }
-  }
-  // seq did not advance the watermark (e.g. a smaller seq, or seq 0 when the
-  // watermark is already 0). Still wake awaiters: HasDurable just became true.
-  const std::scoped_lock lock(durable_mu_);
-  durable_cv_.notify_all();
-}
-
-void GroupCommitter::RecordFlush(std::chrono::steady_clock::duration elapsed,
-                                 size_t entries) noexcept {
-  flush_duration_.Observe(std::chrono::duration<double>(elapsed).count());
-  // A Drain-only flush covers no entries; 0 would blur the le=1 bucket.
-  if (entries > 0) flush_batch_entries_.Observe(static_cast<double>(entries));
-}
-
-core::Result<void> GroupCommitter::Drain() {
-  if (config_.policy == FsyncPolicy::kNone) {
-    return {};
-  }
-  if (config_.policy == FsyncPolicy::kPerWrite) {
-    const auto start = std::chrono::steady_clock::now();
-    auto result = fsync_fn_();
-    RecordFlush(std::chrono::steady_clock::now() - start, 0);
-    return result;
-  }
-
-  std::promise<core::Result<void>> promise;
-  auto future = promise.get_future();
-  {
-    const std::scoped_lock lock(mu_);
-    if (stopped_) {
-      return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "group committer stopped"});
-    }
-    pending_.push_back({.promise = std::move(promise), .bytes = 0});
-    flush_requested_ = true;
-  }
-  cv_.notify_one();
-  return future.get();
-}
-
-void GroupCommitter::Stop() {
-  {
-    const std::scoped_lock lock(mu_);
-    if (stopped_) return;
-    stopped_ = true;
-    flush_requested_ = true;
-  }
-  cv_.notify_all();
+void GroupCommitter::Stop(bool final_flush) {
+  const std::scoped_lock stop_lock(stop_mu_);
   if (thread_.joinable()) {
+    {
+      const std::scoped_lock lock(wake_mu_);
+      stop_ = true;
+      final_flush_ = final_flush;
+    }
+    wake_cv_.notify_one();
     thread_.join();
   }
+
+  std::deque<std::pair<core::SequenceId, std::promise<core::Result<void>>>> orphaned;
+  {
+    const std::scoped_lock lock(durable_mu_);
+    stopped_ = true;
+    orphaned.swap(waiters_);
+  }
+  durable_cv_.notify_all();
+  for (auto& [seq, promise] : orphaned) promise.set_value(std::unexpected(StoppedError()));
 }
 
 void GroupCommitter::Run() {
-  std::unique_lock lock(mu_);
   while (true) {
-    cv_.wait(lock, [this] { return !pending_.empty() || stopped_; });
-
-    if (pending_.empty()) {
-      // stopped_ must be true here.
-      return;
+    {
+      std::unique_lock lock(wake_mu_);
+      if (!stop_ && published_end_.load(std::memory_order_seq_cst) <= durable_.end) {
+        idle_.store(true, std::memory_order_seq_cst);
+        wake_cv_.wait(lock, [this] ABYSS_REQUIRES(wake_mu_) {
+          return stop_ || published_end_.load(std::memory_order_seq_cst) > durable_.end;
+        });
+        idle_.store(false, std::memory_order_relaxed);
+      }
+      if (stop_) {
+        const bool final_flush = final_flush_;
+        lock.unlock();
+        if (final_flush && published_end_.load(std::memory_order_acquire) > durable_.end) {
+          FlushOnce();
+        }
+        return;
+      }
     }
-
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    const bool should_coalesce =
-        !stopped_ && config_.interval.count() > 0 && pending_bytes_ < config_.max_bytes;
-    if (should_coalesce) {
-      cv_.wait_for(lock, config_.interval, [this] {
-        return stopped_ || flush_requested_ || pending_bytes_ >= config_.max_bytes;
-      });
-    }
-
-    auto batch = std::exchange(pending_, {});
-    const size_t batch_bytes = pending_bytes_;
-    const size_t batch_entries = std::exchange(pending_entries_, 0);
-    const core::SequenceId flushed_high_seq = batch_high_seq_;
-    pending_bytes_ = 0;
-    batch_high_seq_ = 0;
-    flush_requested_ = false;
-    auto fsync_fn = fsync_fn_;
-    lock.unlock();
-
-    const auto start = std::chrono::steady_clock::now();
-    core::Result<void> result = fsync_fn();
-    const auto elapsed = std::chrono::steady_clock::now() - start;
-    // Before the promises resolve, so a woken writer sees this flush.
-    RecordFlush(elapsed, batch_entries);
-
-    if (!result.has_value()) {
-      ABYSS_LOG_ERROR("fsync failed", {"batch", static_cast<uint64_t>(batch.size())},
-                      {"bytes", static_cast<uint64_t>(batch_bytes)},
-                      {"err", std::string_view{result.error().message()}});
-    } else if (elapsed > kSlowFsyncThreshold) {
-      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-      ABYSS_LOG_WARN("slow fsync", {"batch", static_cast<uint64_t>(batch.size())},
-                     {"bytes", static_cast<uint64_t>(batch_bytes)},
-                     {"duration_ms", static_cast<int64_t>(ms)});
-    }
-
-    // Advance the durable watermark only after the fsync that covers these
-    // bytes has landed (invariant: durable_seq never leads stable media).
-    if (result.has_value()) {
-      PublishDurable(flushed_high_seq);
-    }
-
-    for (auto& entry : batch) {
-      entry.promise.set_value(result);
-    }
-
-    lock.lock();
+    FlushOnce();
   }
+}
+
+void GroupCommitter::FlushOnce() {
+  const auto start = std::chrono::steady_clock::now();
+  auto flushed = flush_();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  if (!flushed.has_value()) {
+    core::Fatal("WAL flush failed: " + flushed.error().message());
+  }
+  const uint64_t entries = flushed->end > durable_.end ? flushed->end - durable_.end : 0;
+  RecordFlush(elapsed, entries);
+  if (elapsed > kSlowFlushThreshold) {
+    const uint64_t bytes = flushed->bytes > durable_.bytes ? flushed->bytes - durable_.bytes : 0;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    ABYSS_LOG_WARN("slow WAL flush", {"entries", entries}, {"bytes", bytes},
+                   {"duration_ms", static_cast<int64_t>(ms)});
+  }
+  Advance(*flushed);
+}
+
+void GroupCommitter::Advance(Extent flushed) {
+  const Extent previous = durable_;
+  if (flushed.end <= previous.end) return;
+  durable_ = flushed;
+  // Before the new end is visible, so its observers see the shard's
+  // accounting already settled.
+  if (on_flushed_) on_flushed_(previous, flushed);
+
+  std::vector<std::promise<core::Result<void>>> ready;
+  {
+    const std::scoped_lock lock(durable_mu_);
+    durable_end_.store(flushed.end, std::memory_order_release);
+    while (!waiters_.empty() && waiters_.front().first < flushed.end) {
+      ready.push_back(std::move(waiters_.front().second));
+      waiters_.pop_front();
+    }
+  }
+  durable_cv_.notify_all();
+  for (auto& promise : ready) promise.set_value({});
+}
+
+void GroupCommitter::RecordFlush(std::chrono::steady_clock::duration elapsed,
+                                 uint64_t entries) noexcept {
+  flush_duration_.Observe(std::chrono::duration<double>(elapsed).count());
+  if (entries > 0) flush_batch_entries_.Observe(static_cast<double>(entries));
 }
 
 }  // namespace abyss::queue

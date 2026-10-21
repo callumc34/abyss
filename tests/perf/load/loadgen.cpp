@@ -148,7 +148,7 @@ std::string QueryInfoServer(redisContext* ctx) {
 // Best effort: keys a server does not expose are left out.
 std::map<std::string, std::string> QueryServerConfig(redisContext* ctx, std::string_view kind) {
   std::vector<std::string> patterns{"appendonly", "appendfsync", "io-threads"};
-  if (kind == "abyss") patterns = {"wal-fsync-policy", "shard-count", "wal-segment-size-bytes"};
+  if (kind == "abyss") patterns = {"wal-durability", "shard-count", "wal-segment-size-bytes"};
   if (kind == "dragonfly") patterns = {"*"};
   std::map<std::string, std::string> config;
   for (const auto& pattern : patterns) {

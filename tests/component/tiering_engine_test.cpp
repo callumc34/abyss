@@ -123,7 +123,7 @@ TEST_F(TieringEngineTest, ReadHotMissBufferHitReturnsBufferValue) {
   auto engine = MakeEngine();
 
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "buffered"}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -144,6 +144,33 @@ TEST_F(TieringEngineTest, ReadHotMissBufferMissColdHitReturnsColdValue) {
   auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsString(), "cold_value");
+}
+
+// A promotion is best-effort: with the durability window full it is
+// skipped at once, never waited for on the read path.
+TEST_F(TieringEngineTest, PromotionNeverWaitsForTheDurabilityWindow) {
+  auto engine = MakeEngine();
+  EXPECT_CALL(hot_, Exec(_, _))
+      .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
+  EXPECT_CALL(cold_, Exec(_, _)).WillOnce(Return(core::RespValue::BulkString("cold_value")));
+  EXPECT_CALL(cold_, GetPromotionCommand(std::string_view{"key"}))
+      .WillOnce(Return(std::optional<core::RespCommand>{MakeCmd({"SET", "key", "cold_value"})}));
+  core::SteadyTime admit_by{};
+  core::SteadyTime called_at{};
+  EXPECT_CALL(queue_, Append(_, _, _))
+      .WillOnce([&](core::ShardId, const core::QueueEntry&,
+                    core::SteadyTime deadline) -> core::Result<queue::AppendResult> {
+        called_at = core::SteadyClock::now();
+        admit_by = deadline;
+        return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"});
+      });
+
+  auto result = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->AsString(), "cold_value");
+  EXPECT_LE(admit_by, called_at) << "a promotion must not wait for admission";
+  EXPECT_EQ(engine.Snapshot().promotions_skipped, 1U);
+  EXPECT_EQ(engine.Snapshot().promotion_append_failures, 0U);
 }
 
 TEST_F(TieringEngineTest, ReadAllTiersMissReturnsColdError) {
@@ -174,9 +201,9 @@ TEST_F(TieringEngineTest, ReadBufferTombstoneReturnsNull) {
   auto engine = MakeEngine();
 
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::StringSet{.key = "key", .value = "v"}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("key", core::ops::WriteOp{core::ops::Del{.keys = {"key"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -220,9 +247,9 @@ TEST_F(TieringEngineTest, HashGetAllMergesColdAndBufferOverlay) {
       "h",
       core::ops::WriteOp{core::ops::HashSet{
           .key = "h", .fields = {{.field = "a", .value = "buf"}, {.field = "b", .value = "new"}}}},
-      core::EvictionTTL{86400});
+      core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -246,8 +273,9 @@ TEST_F(TieringEngineTest, HashGetAllTombstoneShortCircuitsCold) {
   buffer_.Absorb(
       "h",
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "a", .value = "v"}}}},
-      core::EvictionTTL{86400});
-  buffer_.Absorb("h", core::ops::WriteOp{core::ops::Del{.keys = {"h"}}}, core::EvictionTTL{86400});
+      core::EvictionTTL{86400}, 0, 0);
+  buffer_.Absorb("h", core::ops::WriteOp{core::ops::Del{.keys = {"h"}}}, core::EvictionTTL{86400},
+                 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -264,7 +292,7 @@ TEST_F(TieringEngineTest, HashGetAllWrongTypeOverlayReturnsError) {
   auto engine = MakeEngine();
   // Buffer was re-typed to a string after a prior hash.
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "now_a_string"}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -296,9 +324,9 @@ TEST_F(TieringEngineTest, HashLenMergedCardinality) {
       "h",
       core::ops::WriteOp{core::ops::HashSet{
           .key = "h", .fields = {{.field = "a", .value = "buf"}, {.field = "b", .value = "new"}}}},
-      core::EvictionTTL{86400});
+      core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"c"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -316,7 +344,7 @@ TEST_F(TieringEngineTest, HashKeysAndValsProjectMergedSet) {
   buffer_.Absorb("h",
                  core::ops::WriteOp{core::ops::HashSet{
                      .key = "h", .fields = {{.field = "buf_only", .value = "x"}}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .Times(2)
@@ -343,9 +371,9 @@ TEST_F(TieringEngineTest, HmgetMixedBufferAndColdFields) {
   buffer_.Absorb("h",
                  core::ops::WriteOp{core::ops::HashSet{
                      .key = "h", .fields = {{.field = "buf_known", .value = "from_buf"}}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"buf_removed"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -368,7 +396,7 @@ TEST_F(TieringEngineTest, HexistsBufferKnownDoesNotCallCold) {
   buffer_.Absorb(
       "h",
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
-      core::EvictionTTL{86400});
+      core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -384,9 +412,9 @@ TEST_F(TieringEngineTest, HexistsBufferRemovedFieldReturnsZero) {
   buffer_.Absorb(
       "h",
       core::ops::WriteOp{core::ops::HashSet{.key = "h", .fields = {{.field = "f", .value = "v"}}}},
-      core::EvictionTTL{86400});
+      core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("h", core::ops::WriteOp{core::ops::HashDel{.key = "h", .fields = {"f"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -404,9 +432,9 @@ TEST_F(TieringEngineTest, ScardReadsBufferDeltaNotStaleCold) {
   // The set was flushed to cold with {a,b,c}; a partial SREM landed only in the
   // buffer. The buffer overlay must win: SCARD reflects 2, not cold's 3.
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"a", "b", "c"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -421,9 +449,9 @@ TEST_F(TieringEngineTest, ScardReadsBufferDeltaNotStaleCold) {
 TEST_F(TieringEngineTest, SismemberReflectsBufferedRemoval) {
   auto engine = MakeEngine();
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetAdd{.key = "s", .members = {"a", "b"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("s", core::ops::WriteOp{core::ops::SetRem{.key = "s", .members = {"b"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .Times(2)
@@ -444,9 +472,9 @@ TEST_F(TieringEngineTest, ZsetScalarBufferOverridesColdResidual) {
   buffer_.Absorb("z",
                  core::ops::WriteOp{
                      core::ops::ZsetAdd{.key = "z", .entries = {{.score = 1.0, .member = "m"}}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
   buffer_.Absorb("z", core::ops::WriteOp{core::ops::ZsetRem{.key = "z", .members = {"m"}}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .Times(2)
@@ -483,7 +511,7 @@ TEST_F(TieringEngineTest, CollectionScalarWrongTypeFromBufferShortCircuits) {
   auto engine = MakeEngine();
   // Buffer holds a string for "k"; SCARD must surface WRONGTYPE without cold.
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kNotFound, ""))));
@@ -561,9 +589,11 @@ TEST_F(TieringEngineTest, WriteSuccessReturnsConsumerResult) {
 
   constexpr core::SequenceId kSeq = 42;
   const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
-  EXPECT_CALL(queue_, BeginAppend(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
+      .WillOnce([](core::ShardId, core::QueueEntry, core::SteadyTime) {
+        return MakePending(kSeq, true);
+      });
 
   std::thread fulfiller([this, kRpcId]() {
     while (rpc_.PendingCount() == 0) std::this_thread::yield();
@@ -584,9 +614,11 @@ TEST_F(TieringEngineTest, WriteConsumerErrorPropagates) {
 
   constexpr core::SequenceId kSeq = 43;
   const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
-  EXPECT_CALL(queue_, BeginAppend(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(kSeq, true); });
+      .WillOnce([](core::ShardId, core::QueueEntry, core::SteadyTime) {
+        return MakePending(kSeq, true);
+      });
 
   std::thread fulfiller([this, kRpcId]() {
     while (rpc_.PendingCount() == 0) std::this_thread::yield();
@@ -606,7 +638,7 @@ TEST_F(TieringEngineTest, WriteConsumerErrorPropagates) {
 TEST_F(TieringEngineTest, WriteQueueFailureReturnsError) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(queue_, BeginAppend(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kResourceExhausted, "full"))));
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
@@ -618,9 +650,10 @@ TEST_F(TieringEngineTest, WriteQueueFailureReturnsError) {
 TEST_F(TieringEngineTest, WriteFsyncFailureCancelsRpcAndPropagates) {
   auto engine = MakeEngine();
 
-  EXPECT_CALL(queue_, BeginAppend(_, _))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(99, false); });
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
+      .WillOnce([](core::ShardId, const core::QueueEntry&, core::SteadyTime) {
+        return MakePending(99, false);
+      });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
   ASSERT_FALSE(result.has_value());
@@ -632,9 +665,10 @@ TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
   TieringEngineConfig fast{.shard_count = kShardCount, .write_timeout = 50ms};
   TieringEngine engine(queue_, hot_, cold_, router_, hot_progress_, rpc_, fast);
 
-  EXPECT_CALL(queue_, BeginAppend(_, _))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(100, true); });
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
+      .WillOnce([](core::ShardId, const core::QueueEntry&, core::SteadyTime) {
+        return MakePending(100, true);
+      });
 
   auto result = engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}));
   ASSERT_TRUE(result.has_value());
@@ -652,7 +686,7 @@ TEST_F(TieringEngineTest, WriteTimeoutReturnsErrorAndCancelsRpc) {
 TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
   auto engine = MakeEngine();
   buffer_.Absorb("b", core::ops::WriteOp{core::ops::StringSet{.key = "b", .value = "from_buf"}},
-                 core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
 
   EXPECT_CALL(hot_, Exec(_, _))
       .WillOnce(Return(core::RespValue::BulkString("from_hot")))                        // a
@@ -668,8 +702,9 @@ TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
   const core::ShardId c_shard = core::ComputeShard("c", kShardCount);
   EXPECT_CALL(cold_, GetPromotionCommand(std::string_view{"c"}))
       .WillOnce(Return(std::optional<core::RespCommand>{MakeCmd({"SET", "c", "from_cold"})}));
-  EXPECT_CALL(queue_, Append(c_shard, _))
-      .WillOnce([](core::ShardId, const core::QueueEntry&) -> core::Result<queue::AppendResult> {
+  EXPECT_CALL(queue_, Append(c_shard, _, _))
+      .WillOnce([](core::ShardId, const core::QueueEntry&,
+                   core::SteadyTime) -> core::Result<queue::AppendResult> {
         return queue::AppendResult{.seq = 1};
       });
 
@@ -701,8 +736,9 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
   auto engine = MakeEngine();
   // Buffer holds a SET then a DEL — tombstone state for "k".
   buffer_.Absorb("k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v"}},
-                 core::EvictionTTL{86400});
-  buffer_.Absorb("k", core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, core::EvictionTTL{86400});
+                 core::EvictionTTL{86400}, 0, 0);
+  buffer_.Absorb("k", core::ops::WriteOp{core::ops::Del{.keys = {"k"}}}, core::EvictionTTL{86400},
+                 0, 0);
 
   // Hot has no record; cold is never consulted because the buffer probe is
   // authoritative on the tombstone.
@@ -732,9 +768,9 @@ TEST_F(TieringEngineTest, MsetAppendsOneEntryPerKeyToOwningShard) {
   std::mutex mu;
   auto seq = std::make_shared<std::atomic<core::SequenceId>>(500);
 
-  EXPECT_CALL(queue_, BeginAppend(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
       .Times(3)
-      .WillRepeatedly([&, seq](core::ShardId shard, core::QueueEntry entry) {
+      .WillRepeatedly([&, seq](core::ShardId shard, core::QueueEntry entry, core::SteadyTime) {
         const auto next = seq->fetch_add(1);
         std::string key;
         const auto* write = std::get_if<core::entry::Write>(&entry.payload);
@@ -800,17 +836,21 @@ TEST_F(TieringEngineTest, DelFanOutSumsPerKeyIntegerReplies) {
   std::vector<core::RpcId> rpc_ids;
   std::mutex mu;
   auto seq = std::make_shared<std::atomic<core::SequenceId>>(700);
+  std::vector<core::SteadyTime> deadlines;
 
-  EXPECT_CALL(queue_, BeginAppend(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
       .Times(3)
-      .WillRepeatedly([&, seq](core::ShardId shard, const core::QueueEntry&) {
-        const auto next = seq->fetch_add(1);
-        {
-          std::scoped_lock lock(mu);
-          rpc_ids.push_back(core::MakeRpcId(shard, next));
-        }
-        return MakePending(next, true);
-      });
+      .WillRepeatedly(
+          [&, seq](core::ShardId shard, const core::QueueEntry&, core::SteadyTime admit_by) {
+            const auto next = seq->fetch_add(1);
+            {
+              std::scoped_lock lock(mu);
+              rpc_ids.push_back(core::MakeRpcId(shard, next));
+              deadlines.push_back(admit_by);
+            }
+            return MakePending(next, true);
+          });
+  const auto start = core::SteadyClock::now();
 
   // Two keys existed, one didn't; the per-key hot consumer fulfils with 1/0.
   std::thread fulfiller([&]() {
@@ -842,6 +882,33 @@ TEST_F(TieringEngineTest, DelFanOutSumsPerKeyIntegerReplies) {
   ASSERT_TRUE(result->IsInteger());
   EXPECT_EQ(result->AsInteger(), 2);
   EXPECT_EQ(rpc_.PendingCount(), 0U);
+  // One admission deadline for the whole command, not one per sub.
+  ASSERT_EQ(deadlines.size(), 3U);
+  EXPECT_EQ(deadlines[0], deadlines[1]);
+  EXPECT_EQ(deadlines[1], deadlines[2]);
+  EXPECT_GE(deadlines[0], start + kWriteTimeout);
+  EXPECT_LT(deadlines[0], start + kWriteTimeout + 1s);
+}
+
+TEST_F(TieringEngineTest, FlushAdmitsEveryShardWithinOneDeadline) {
+  auto engine = MakeEngine();
+  std::vector<core::SteadyTime> deadlines;
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
+      .WillOnce([&](core::ShardId, const core::QueueEntry&, core::SteadyTime admit_by) {
+        deadlines.push_back(admit_by);
+        return MakePending(1, true);
+      })
+      .WillOnce([&](core::ShardId, const core::QueueEntry&,
+                    core::SteadyTime admit_by) -> core::Result<queue::PendingAppend> {
+        deadlines.push_back(admit_by);
+        return std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"});
+      });
+
+  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
+  ASSERT_EQ(deadlines.size(), 2U);
+  EXPECT_EQ(deadlines[0], deadlines[1]);
 }
 
 TEST_F(TieringEngineTest, FanOutPartialBeginAppendFailureSurfacesError) {
@@ -849,9 +916,10 @@ TEST_F(TieringEngineTest, FanOutPartialBeginAppendFailureSurfacesError) {
   // First sub succeeds (auto-publishes on scope exit), second fails. Per
   // ADP-005 the partially-published sub may still apply — we cancel its RPC
   // registration and return the error to the client.
-  EXPECT_CALL(queue_, BeginAppend(_, _))
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([](core::ShardId, core::QueueEntry) { return MakePending(900, true); })
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
+      .WillOnce([](core::ShardId, const core::QueueEntry&, core::SteadyTime) {
+        return MakePending(900, true);
+      })
       .WillOnce(Return(std::unexpected(core::Error(core::ErrorCode::kResourceExhausted, "full"))));
 
   auto result =
@@ -882,9 +950,9 @@ TEST_F(TieringEngineTest, SlowDurableDoesNotStarveRpcBudget) {
   const core::RpcId kRpcId = core::MakeRpcId(core::ComputeShard("key", kShardCount), kSeq);
   std::promise<core::Result<void>> durable_p;
   auto durable_fut = durable_p.get_future();
-  EXPECT_CALL(queue_, BeginAppend(_, _))
+  EXPECT_CALL(queue_, BeginAppend(_, _, _))
       // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      .WillOnce([&durable_fut](core::ShardId, core::QueueEntry) {
+      .WillOnce([&durable_fut](core::ShardId, core::QueueEntry, core::SteadyTime) {
         return queue::PendingAppend{kSeq, std::move(durable_fut),
                                     std::make_unique<testing::NoopAppendPublisher>()};
       });

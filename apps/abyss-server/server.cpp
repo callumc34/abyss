@@ -115,25 +115,16 @@ bool Server::Initialize() {
       .eviction_policy = eviction_policy_.get(),
   });
 
-  auto fsync_policy = queue::FsyncPolicyFromString(config_.queue.fsync_policy);
-  if (!fsync_policy.has_value()) {
-    ABYSS_LOG_CRITICAL("invalid fsync_policy",
-                       {"value", std::string_view{config_.queue.fsync_policy}},
-                       {"err", std::string_view{fsync_policy.error().message()}});
-    return false;
-  }
-
   auto queue_result = queue::WalQueue::Open(queue::WalConfig{
       .wal_path = config_.queue.wal_path,
       .segment_size_bytes = config_.queue.segment_size_bytes,
       .max_value_size_bytes = config_.queue.max_value_size_bytes,
       .shard_count = hot_store_->shard_count(),
-      .commit =
-          {
-              .policy = *fsync_policy,
-              .interval = std::chrono::microseconds{config_.queue.group_commit_interval_us},
-              .max_bytes = config_.queue.group_commit_max_bytes,
-          },
+      .durability = config_.queue.durability,
+      .durability_window_bytes = config_.queue.durability_window_bytes,
+      .durability_window = config_.queue.durability_window,
+      // A write that cannot be admitted within the client's budget fails.
+      .admission_timeout = config_.engine.write_timeout,
       .min_retention = config_.queue.min_retention,
       // Cold and resolver commit offsets and gate retention; hot commits none
       // and rebuilds from the queue on restart (ADP-002 §"Eviction refresh vs
@@ -329,6 +320,14 @@ bool Server::Initialize() {
         if (queue_ptr == nullptr) return 0;
         const auto age = queue_ptr->OldestEligibleUnreapedAge();
         return static_cast<uint64_t>(age.value_or(core::Duration::zero()).count());
+      },
+      .unflushed_bytes =
+          [queue_ptr = queue_.get()] {
+            return queue_ptr != nullptr ? queue_ptr->UnflushedBytes() : uint64_t{0};
+          },
+      .durability_lag_ms = [queue_ptr = queue_.get()]() -> uint64_t {
+        if (queue_ptr == nullptr) return 0;
+        return static_cast<uint64_t>(queue_ptr->DurabilityLag().count());
       },
       .read_buffer_high_water_bytes = [server_ptr = tcp_server_.get()]() -> uint64_t {
         return server_ptr != nullptr ? server_ptr->MaxReadBufferHighWaterBytes() : uint64_t{0};

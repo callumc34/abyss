@@ -9,10 +9,8 @@
 #include <vector>
 
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
-#include "abyss/log/log.h"
-
-ABYSS_LOG_COMPONENT("abyss.config.validator")
 
 namespace abyss::config::internal {
 
@@ -38,6 +36,13 @@ constexpr std::chrono::milliseconds kMaxCheckpointMinInterval{60000};
 // crash replays, and retention trails, by more than a minute of commits.
 constexpr std::chrono::milliseconds kMinOffsetFsyncInterval{10};
 constexpr std::chrono::milliseconds kMaxOffsetFsyncInterval{60000};
+// Below the floor the window admits too little to batch a flush; above
+// the ceiling a power loss under process_crash loses more than operators
+// size for.
+constexpr uint64_t kMinDurabilityWindowBytes = uint64_t{1} << 20;
+constexpr uint64_t kMaxDurabilityWindowBytes = uint64_t{4} << 30;
+constexpr std::chrono::milliseconds kMinDurabilityWindow{10};
+constexpr std::chrono::milliseconds kMaxDurabilityWindow{60000};
 
 // Snapshot gauges scraped less often than this stop being an alerting signal:
 // Prometheus would sample a value already stale by more than a scrape interval.
@@ -208,26 +213,22 @@ core::Result<void> ValidateQueue(const QueueConfig& q) {
                        std::to_string(kMaxOffsetFsyncInterval.count()) + "] milliseconds"));
   }
 
-  if (!OneOf(q.fsync_policy, {"fsync_per_write", "group_commit", "fsync_none"})) {
-    return std::unexpected(InvalidArg("queue.wal_fsync_policy",
-                                      "must be one of: fsync_per_write, group_commit, fsync_none"));
+  if (q.durability != core::Durability::kProcessCrash &&
+      q.durability != core::Durability::kPowerLoss) {
+    return std::unexpected(
+        InvalidArg("queue.durability", "must be one of: process_crash, power_loss"));
   }
-
-  if (q.fsync_policy == "group_commit") {
-    if (auto r = RequirePositive("queue.group_commit_interval_us", q.group_commit_interval_us); !r)
-      return r;
-    if (auto r = RequirePositive("queue.group_commit_max_bytes", q.group_commit_max_bytes); !r)
-      return r;
+  if (q.durability_window_bytes < kMinDurabilityWindowBytes ||
+      q.durability_window_bytes > kMaxDurabilityWindowBytes) {
+    return std::unexpected(InvalidArg("queue.durability_window_bytes",
+                                      "must be in [" + std::to_string(kMinDurabilityWindowBytes) +
+                                          ", " + std::to_string(kMaxDurabilityWindowBytes) + "]"));
   }
-
-  // Under fsync_none there is no durability barrier: the WAL durable watermark
-  // tracks the published seq so the retention-commit gate is a correct
-  // no-op, but a crash can lose acknowledged writes. Surface this loudly
-  // (Decision 1).
-  if (q.fsync_policy == "fsync_none") {
-    ABYSS_LOG_CRITICAL(
-        "queue.wal_fsync_policy=fsync_none: WAL durability is DISABLED; acknowledged writes can be "
-        "lost on crash and the retention-commit durability gate is a no-op");
+  if (q.durability_window < kMinDurabilityWindow || q.durability_window > kMaxDurabilityWindow) {
+    return std::unexpected(
+        InvalidArg("queue.durability_window_ms",
+                   "must be in [" + std::to_string(kMinDurabilityWindow.count()) + ", " +
+                       std::to_string(kMaxDurabilityWindow.count()) + "] milliseconds"));
   }
   return {};
 }
@@ -440,6 +441,19 @@ core::Result<void> ValidateRetentionVsEviction(const Config& c) {
   return {};
 }
 
+// Cold pauses absorption while it waits for a batch to become power
+// durable, which freezes the frontier buffer-consistency reads wait on.
+// Half leaves room for the apply and the next drain.
+core::Result<void> ValidateColdReadVsConsistencyWait(const Config& c) {
+  if (c.cold_consumer.queue_read_timeout * 2 > c.engine.buffer_consistency_wait_timeout) {
+    return std::unexpected(
+        InvalidArg("cold_consumer.queue_read_timeout_ms",
+                   "must be at most half of engine.buffer_consistency_wait_timeout_ms (" +
+                       std::to_string(c.engine.buffer_consistency_wait_timeout.count()) + " ms)"));
+  }
+  return {};
+}
+
 // NOLINTNEXTLINE(misc-unused-parameters)
 core::Result<void> ValidatePortCollisions(const Config& c) {
   const std::vector<std::pair<uint16_t, std::string_view>> ports = {
@@ -481,6 +495,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidateLog(config.log); !r) return r;
   if (auto r = ValidatePortCollisions(config); !r) return r;
   if (auto r = ValidateRetentionVsEviction(config); !r) return r;
+  if (auto r = ValidateColdReadVsConsistencyWait(config); !r) return r;
   return {};
 }
 

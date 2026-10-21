@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <thread>
@@ -59,10 +60,56 @@ core::QueueEntry MakeResolvedEntry(core::SequenceId seq, core::Decision decision
   };
 }
 
+core::QueueEntry MakeConditionalEntry(core::SequenceId seq) {
+  return core::QueueEntry{
+      .seq = seq,
+      .appended_at = core::WallClock::now(),
+      .payload = core::entry::Conditional{.cmd = core::RespCommand{.args = {"SET", "k", "v"}}},
+  };
+}
+
+// A power-durable end the test moves. AwaitDurable records each seq and
+// answers at once; with `catch_up` set, the wait itself advances the end.
+class PowerDurableLog {
+ public:
+  explicit PowerDurableLog(core::SequenceId end, bool catch_up = false)
+      : end_(end), catch_up_(catch_up) {}
+
+  void Install(testing::MockQueue& queue) {
+    ON_CALL(queue, DurableEnd(_, core::Durability::kPowerLoss))
+        .WillByDefault([this](core::ShardId, core::Durability) {
+          return core::Result<core::SequenceId>(end_.load());
+        });
+    ON_CALL(queue, AwaitDurable(_, _, core::Durability::kPowerLoss, _))
+        .WillByDefault(
+            [this](core::ShardId, core::SequenceId seq, core::Durability, core::Duration) {
+              {
+                const std::scoped_lock lock(mu_);
+                awaited_.push_back(seq);
+              }
+              if (catch_up_) SetEnd(std::max(end_.load(), seq + 1));
+              return core::Result<bool>(seq < end_.load());
+            });
+  }
+
+  void SetEnd(core::SequenceId end) { end_.store(end); }
+
+  std::vector<core::SequenceId> Awaited() const {
+    const std::scoped_lock lock(mu_);
+    return awaited_;
+  }
+
+ private:
+  std::atomic<core::SequenceId> end_;
+  const bool catch_up_;
+  mutable std::mutex mu_;
+  std::vector<core::SequenceId> awaited_;
+};
+
 class ColdConsumerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ON_CALL(queue_, Read(_, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
+    ON_CALL(queue_, Read(_, _, _, _, _)).WillByDefault(Return(std::vector<core::QueueEntry>{}));
     ON_CALL(queue_, CommitOffset(_, _, _)).WillByDefault(Return(core::Result<void>{}));
     ON_CALL(cold_, ApplyBatch(_, _)).WillByDefault(Return(core::Result<void>{}));
   }
@@ -92,7 +139,7 @@ TEST_F(ColdConsumerTest, DrainAbsorbsWriteEntriesIntoBuffer) {
   entries.push_back(MakeWriteEntry(1, {"SET", "ka", "va"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "kb", "vb"}));
 
-  EXPECT_CALL(queue_, Read(kShard, _, _, _))
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -112,7 +159,7 @@ TEST_F(ColdConsumerTest, DrainHandlesResolvedApplyDecision) {
   entries.push_back(
       MakeResolvedEntry(5, core::Decision::kApply, std::vector<std::string>{"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -128,7 +175,7 @@ TEST_F(ColdConsumerTest, DrainSkipsResolvedSkipDecision) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeResolvedEntry(5, core::Decision::kSkip, std::nullopt));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -153,7 +200,7 @@ TEST_F(ColdConsumerTest, ParsePoisonDoesNotAdvanceCommitPastUnabsorbedSeq) {
   entries.push_back(MakeWriteEntry(1, {"HSET", "h", "f"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -213,12 +260,12 @@ TEST_F(ColdConsumerTest, ParsePoisonPinsCommitWithoutRedelivery) {
   const std::vector<core::QueueEntry> log{MakeWriteEntry(5, {"HSET", "h", "f"}),
                                           MakeWriteEntry(6, {"SET", "k", "v"})};
   std::atomic<int> read_calls{0};
-  EXPECT_CALL(queue_, Read(_, _, _, _))
-      .WillRepeatedly(
-          [&log, &read_calls](core::ShardId, core::SequenceId from, size_t max, core::Duration) {
-            read_calls.fetch_add(1, std::memory_order_relaxed);
-            return testing::ReadFromLog(log, from, max);
-          });
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillRepeatedly([&log, &read_calls](core::ShardId, core::SequenceId from, size_t max,
+                                          core::Duration, core::Durability) {
+        read_calls.fetch_add(1, std::memory_order_relaxed);
+        return testing::ReadFromLog(log, from, max);
+      });
 
   std::atomic<core::SequenceId> max_commit{0};
   EXPECT_CALL(queue_, CommitOffset(_, _, _))
@@ -256,10 +303,9 @@ TEST_F(ColdConsumerTest, DrainAdvancesPastCommitPinnedByBufferedKey) {
   for (core::SequenceId seq = 0; seq <= kTail; ++seq) {
     log.push_back(MakeWriteEntry(seq, {"SET", "k" + std::to_string(seq), "v"}));
   }
-  EXPECT_CALL(queue_, Read(kShard, _, _, _))
-      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration) {
-        return testing::ReadFromLog(log, from, max);
-      });
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) { return testing::ReadFromLog(log, from, max); });
   EXPECT_CALL(queue_, CommitOffset(_, _, _)).Times(0);
 
   for (int i = 0; i < 2 * static_cast<int>(kTail) && c->LatestDrainedSeq() < kTail; ++i) {
@@ -275,9 +321,9 @@ TEST_F(ColdConsumerTest, CursorResumesAfterCommittedOffset) {
   auto c = MakeConsumer();
   EXPECT_CALL(queue_, CommittedOffset(core::kColdConsumer, kShard))
       .WillRepeatedly(Return(core::Result<std::optional<core::SequenceId>>(41)));
-  EXPECT_CALL(queue_, Read(kShard, 42, _, _))
+  EXPECT_CALL(queue_, Read(kShard, 42, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(42, {"SET", "k", "v"})}));
-  EXPECT_CALL(queue_, Read(kShard, 43, _, _))
+  EXPECT_CALL(queue_, Read(kShard, 43, _, _, _))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
   c->Drain();
@@ -295,7 +341,7 @@ TEST_F(ColdConsumerTest, ReadBelowFirstRetainedSeqIsFatal) {
   auto c = MakeConsumer();
   EXPECT_CALL(queue_, CommittedOffset(core::kColdConsumer, kShard))
       .WillRepeatedly(Return(core::Result<std::optional<core::SequenceId>>(4)));
-  EXPECT_CALL(queue_, Read(kShard, 5, _, _))
+  EXPECT_CALL(queue_, Read(kShard, 5, _, _, _))
       .WillRepeatedly(Return(core::Result<std::vector<core::QueueEntry>>(
           std::unexpected(core::Error{core::ErrorCode::kOutOfRange, "below first retained seq"}))));
   EXPECT_CALL(queue_, FirstSeq(kShard)).WillRepeatedly(Return(core::Result<core::SequenceId>(100)));
@@ -326,8 +372,9 @@ TEST_F(ColdConsumerTest, IdleBackoffIsInterruptedByAReaderWaitingToDrain) {
 
   // Idle until the entry appears, so the loop climbs to its backoff ceiling.
   std::atomic<bool> release{false};
-  EXPECT_CALL(queue_, Read(_, _, _, _))
-      .WillRepeatedly([&release](core::ShardId, core::SequenceId from, size_t, core::Duration) {
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillRepeatedly([&release](core::ShardId, core::SequenceId from, size_t, core::Duration,
+                                 core::Durability) {
         std::vector<core::QueueEntry> out;
         if (release.load(std::memory_order_acquire) && from <= 9) {
           out.push_back(MakeWriteEntry(9, {"SET", "k", "v"}));
@@ -365,7 +412,7 @@ TEST_F(ColdConsumerTest, WriteWithNoParserIsSkippedNotPoisoned) {
   entries.push_back(MakeWriteEntry(1, {"INCR", "counter"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -398,7 +445,7 @@ TEST_F(ColdConsumerTest, ResolvedMaterialisedOpPoisonClampsCommit) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(
       MakeResolvedEntry(7, core::Decision::kApply, std::vector<std::string>{"HSET", "h", "f"}));
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -433,7 +480,7 @@ TEST_F(ColdConsumerTest, QuietWindowElapsedTriggersApplyBatch) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -469,7 +516,7 @@ TEST_F(ColdConsumerTest, TombstoneFlushesAsDelToCold) {
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
   entries.push_back(MakeWriteEntry(2, {"DEL", "k"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -505,7 +552,7 @@ TEST_F(ColdConsumerTest, FlushRetriesOnTransientApplyFailure) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -531,7 +578,7 @@ TEST_F(ColdConsumerTest, FlushRetriesOnTransientApplyFailure) {
   EXPECT_EQ(snap.ops_flushed, 1U);
 }
 
-TEST_F(ColdConsumerTest, AbsTtlExpiredEntryIsDroppedWithoutApply) {
+TEST_F(ColdConsumerTest, AbsTtlExpiredEntryFlushesAsDelete) {
   // ParseWriteOp("SET EX ...") reads real wall-clock, so we bypass RESP parsing.
   ColdConsumer::Config cfg;
   cfg.quiet_threshold = 30s;
@@ -545,15 +592,30 @@ TEST_F(ColdConsumerTest, AbsTtlExpiredEntryIsDroppedWithoutApply) {
 
   c->Buffer().Absorb(
       "k", core::ops::WriteOp{core::ops::StringSet{.key = "k", .value = "v", .abs_ttl_ms = ttl_ms}},
-      core::EvictionTTL{3600}, /*seq=*/1);
+      core::EvictionTTL{3600}, /*position=*/1, /*carrier=*/1);
 
-  EXPECT_CALL(cold_, ApplyBatch(_, _)).Times(0);
+  // Cold may hold an older value of "k"; only a delete keeps it gone.
+  std::vector<std::string> observed_dels;
+  size_t observed_ops = 0;
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillOnce([&](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
+        observed_ops = ops.size();
+        for (const auto& op : ops) {
+          if (const auto* d = std::get_if<core::ops::Del>(&op)) {
+            for (auto k : d->keys) observed_dels.emplace_back(k);
+          }
+        }
+        return core::Result<void>{};
+      });
 
   clock_.Advance(60s);
   c->Drain();
   c->Flush();
 
-  EXPECT_EQ(c->Snapshot().entries_dropped_abs_ttl, 1U);
+  EXPECT_EQ(observed_ops, 1U);
+  EXPECT_EQ(observed_dels, std::vector<std::string>{"k"});
+  EXPECT_EQ(c->Snapshot().entries_expired_abs_ttl, 1U);
+  EXPECT_EQ(c->Buffer().Size(), 0U);
 }
 
 // --- Mode hysteresis ---------------------------------------------------------
@@ -571,7 +633,7 @@ TEST_F(ColdConsumerTest, HighWaterTriggersAggressiveMode) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k1", big_value}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -597,40 +659,48 @@ core::QueueEntry MakeFlushEntry(core::SequenceId seq) {
   };
 }
 
-// FLUSHDB +OK rests on the synced per-shard Wipe, not on the committed
-// offset reaching the Flush seq (ADP-006): the engine already awaited the
-// Flush entry's WAL durability, and a replayed Flush re-wipes the shard.
-// So the RPC is OK even while the WAL durable tail lags the Flush seq.
-TEST_F(ColdConsumerTest, FlushFulfilsOkWhileWalDurabilityLags) {
+// The Wipe is persisted state, so it waits for the Flush entry to be
+// power-durable. A timeout holds the Flush, unreplied and uncounted as a
+// failure, and the next drain retries it.
+TEST_F(ColdConsumerTest, FlushWipeWaitsForPowerDurability) {
   auto c = MakeConsumer();
 
   constexpr core::SequenceId kFlushSeq = 7;
   auto fut = rpc_.Register(core::MakeFlushRpcId(core::kColdConsumer, kShard, kFlushSeq));
-
-  EXPECT_CALL(queue_, DurableSeq(kShard))
-      .WillRepeatedly(Return(core::Result<core::SequenceId>(kFlushSeq - 1)));
-  EXPECT_CALL(queue_, AwaitDurable(_, _, _)).WillRepeatedly(Return(core::Result<bool>(false)));
+  PowerDurableLog wal(kFlushSeq);
+  wal.Install(queue_);
   core::SequenceId max_commit = 0;
   EXPECT_CALL(queue_, CommitOffset(_, _, _))
       .WillRepeatedly([&max_commit](core::ConsumerId, core::ShardId, core::SequenceId s) {
         max_commit = std::max(max_commit, s);
         return core::Result<void>{};
       });
-  EXPECT_CALL(cold_, Wipe(kShard)).WillOnce([&fut](core::ShardId) {
+  int wipes = 0;
+  EXPECT_CALL(cold_, Wipe(kShard)).WillRepeatedly([&wipes, &fut](core::ShardId) {
     EXPECT_NE(fut.wait_for(0ms), std::future_status::ready) << "Flush RPC fulfilled before Wipe";
+    ++wipes;
     return core::Result<void>{};
   });
-  EXPECT_CALL(queue_, Read(kShard, _, _, _))
-      .WillOnce(Return(std::vector<core::QueueEntry>{MakeFlushEntry(kFlushSeq)}))
-      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+  const std::vector<core::QueueEntry> log{MakeFlushEntry(kFlushSeq)};
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) { return testing::ReadFromLog(log, from, max); });
 
-  c->Drain();
+  EXPECT_EQ(c->Drain(), 0U);
+  EXPECT_EQ(wipes, 0) << "wiped before the Flush was power-durable";
+  EXPECT_EQ(wal.Awaited(), std::vector<core::SequenceId>{kFlushSeq});
+  EXPECT_NE(fut.wait_for(0ms), std::future_status::ready);
+  EXPECT_LT(c->LatestDrainedSeq(), kFlushSeq);
+  EXPECT_EQ(c->Snapshot().durability_waits_timed_out, 1U);
+  EXPECT_EQ(c->Snapshot().apply_failures, 0U);
 
-  ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready) << "Flush RPC not fulfilled after Drain";
-  auto reply = fut.get();
-  ASSERT_TRUE(reply.IsSimpleString()) << reply.AsString();
-  EXPECT_EQ(reply.AsString(), "OK");
-  EXPECT_LT(max_commit, kFlushSeq) << "committed past the durable WAL tail";
+  wal.SetEnd(kFlushSeq + 1);
+  EXPECT_EQ(c->Drain(), 1U);
+  EXPECT_EQ(wipes, 1);
+  ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+  EXPECT_EQ(fut.get().AsString(), "OK");
+  EXPECT_EQ(max_commit, kFlushSeq);
+  EXPECT_EQ(c->Snapshot().durability_waits_timed_out, 1U);
 }
 
 // The Flush still advances the committed offset when the WAL allows it.
@@ -642,7 +712,7 @@ TEST_F(ColdConsumerTest, FlushCommitsOffsetWhenDurable) {
   EXPECT_CALL(queue_, CommitOffset(core::kColdConsumer, kShard, kFlushSeq))
       .WillOnce(Return(core::Result<void>{}));
   EXPECT_CALL(cold_, Wipe(kShard)).WillOnce(Return(core::Result<void>{}));
-  EXPECT_CALL(queue_, Read(kShard, _, _, _))
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeFlushEntry(kFlushSeq)}))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -668,12 +738,12 @@ TEST_F(ColdConsumerTest, FailedWipeHoldsTheFlushUntilARetrySucceeds) {
       MakeWriteEntry(3, {"SET", "b", "v"}),
   };
   std::vector<core::SequenceId> read_from;
-  EXPECT_CALL(queue_, Read(_, _, _, _))
-      .WillRepeatedly(
-          [&log, &read_from](core::ShardId, core::SequenceId from, size_t max, core::Duration) {
-            read_from.push_back(from);
-            return testing::ReadFromLog(log, from, max);
-          });
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillRepeatedly([&log, &read_from](core::ShardId, core::SequenceId from, size_t max,
+                                         core::Duration, core::Durability) {
+        read_from.push_back(from);
+        return testing::ReadFromLog(log, from, max);
+      });
   EXPECT_CALL(cold_, Wipe(kShard))
       .WillOnce(Return(core::Result<void>(
           std::unexpected(core::Error{core::ErrorCode::kInternal, "wipe failed (test)"}))))
@@ -723,10 +793,9 @@ TEST_F(ColdConsumerTest, FlushReleasesEarlierPoisonPinOnly) {
       MakeWriteEntry(kLatePoisonSeq, {"HSET", "h", "f"}),
       MakeWriteEntry(6, {"SET", "c", "v"}),
   };
-  EXPECT_CALL(queue_, Read(_, _, _, _))
-      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration) {
-        return testing::ReadFromLog(log, from, max);
-      });
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) { return testing::ReadFromLog(log, from, max); });
   EXPECT_CALL(cold_, Wipe(kShard)).WillOnce(Return(core::Result<void>{}));
   core::SequenceId max_commit = 0;
   EXPECT_CALL(queue_, CommitOffset(_, _, _))
@@ -754,7 +823,7 @@ TEST_F(ColdConsumerTest, CommitAdvancesToDrainedSeqWhenBufferEmpty) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -788,7 +857,7 @@ TEST_F(ColdConsumerTest, CommitBoundedByOldestPendingSeq) {
   std::vector<core::QueueEntry> second;
   second.push_back(MakeWriteEntry(2, {"SET", "second", "v2"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(first))
       .WillOnce(Return(second))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
@@ -825,7 +894,7 @@ TEST_F(ColdConsumerTest, CommitGatedOnCheckpointBeforeAdvancing) {
 
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -864,7 +933,7 @@ TEST_F(ColdConsumerTest, CommitBlockedWhenCheckpointFails) {
 
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -883,7 +952,7 @@ TEST_F(ColdConsumerTest, CommitBlockedWhenCheckpointFails) {
   EXPECT_EQ(c->Snapshot().last_commit_seq, 0U) << "commit advanced despite a failed checkpoint";
 }
 
-TEST_F(ColdConsumerTest, CommitClampedToDurableSeq) {
+TEST_F(ColdConsumerTest, CommitClampedToPowerDurableEnd) {
   ColdConsumer::Config cfg;
   cfg.quiet_threshold = 30s;
   cfg.jitter_fraction = 0.0;
@@ -893,13 +962,14 @@ TEST_F(ColdConsumerTest, CommitClampedToDurableSeq) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "a", "v"}));
   entries.push_back(MakeWriteEntry(2, {"SET", "b", "v"}));
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
   // Only seq 1 is durable in the WAL; the cold commit must clamp to it even though
   // both seqs were drained, checkpointed, and otherwise committable.
-  EXPECT_CALL(queue_, DurableSeq(kShard)).WillRepeatedly(Return(core::Result<core::SequenceId>(1)));
+  EXPECT_CALL(queue_, DurableEnd(kShard, core::Durability::kPowerLoss))
+      .WillRepeatedly(Return(core::Result<core::SequenceId>(2)));
   core::SequenceId commit_seq = 0;
   EXPECT_CALL(queue_, CommitOffset(core::kColdConsumer, kShard, _))
       .WillRepeatedly([&commit_seq](core::ConsumerId, core::ShardId, core::SequenceId s) {
@@ -916,6 +986,196 @@ TEST_F(ColdConsumerTest, CommitClampedToDurableSeq) {
   EXPECT_EQ(commit_seq, 1U) << "commit advanced past the durable WAL tail";
 }
 
+// --- Persistence gate ---------------------------------------------------------
+
+TEST_F(ColdConsumerTest, BatchWaitsUntilItsLastSeqIsPowerDurable) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(1, {"SET", "a", "v"}),
+                                                     MakeWriteEntry(2, {"SET", "b", "v"})}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+  PowerDurableLog wal(2);
+  wal.Install(queue_);
+  int applies = 0;
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([&applies](std::span<const core::ops::WriteOp>, core::SequenceId) {
+        ++applies;
+        return core::Result<void>{};
+      });
+  std::vector<core::SequenceId> commits;
+  EXPECT_CALL(queue_, CommitOffset(_, _, _))
+      .WillRepeatedly([&commits](core::ConsumerId, core::ShardId, core::SequenceId s) {
+        commits.push_back(s);
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kDurabilityPending);
+  EXPECT_EQ(wal.Awaited(), std::vector<core::SequenceId>{2});
+  EXPECT_EQ(applies, 0) << "applied a batch above the power-durable end";
+  EXPECT_EQ(c->Buffer().Size(), 2U);
+  EXPECT_EQ(c->Buffer().HeapDepth(), 2U) << "the held batch was not rescheduled";
+  EXPECT_TRUE(c->Buffer().Read("a").has_value());
+
+  // Rescheduled, so the next pass selects and waits on it again.
+  EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kDurabilityPending);
+  EXPECT_EQ(wal.Awaited().size(), 2U);
+  EXPECT_TRUE(commits.empty()) << "committed past a held batch";
+
+  wal.SetEnd(3);
+  EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kProgress);
+  EXPECT_EQ(applies, 1);
+  EXPECT_EQ(c->Buffer().Size(), 0U);
+  EXPECT_EQ(commits, std::vector<core::SequenceId>{2});
+  const auto snap = c->Snapshot();
+  EXPECT_EQ(snap.durability_waits_timed_out, 2U);
+  EXPECT_EQ(snap.apply_failures, 0U);
+  EXPECT_EQ(snap.retry_attempts, 0U);
+}
+
+// Absorption pauses while the gate waits, so the target is the selected
+// batch's last_seq, not the log end: a key rewritten faster than one flush
+// still flushes on every pass.
+TEST_F(ColdConsumerTest, HotKeyFlushesOncePowerDurablePastItsSelectedWrites) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  std::vector<core::QueueEntry> log;
+  const auto rewrite = [&log] {
+    for (int i = 0; i < 5; ++i) {
+      const auto seq = static_cast<core::SequenceId>(log.size()) + 1;
+      log.push_back(MakeWriteEntry(seq, {"SET", "hot", "v" + std::to_string(seq)}));
+    }
+  };
+  rewrite();
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillRepeatedly([&log](core::ShardId, core::SequenceId from, size_t max, core::Duration,
+                             core::Durability) { return testing::ReadFromLog(log, from, max); });
+  PowerDurableLog wal(1, /*catch_up=*/true);
+  wal.Install(queue_);
+  std::vector<std::string> applied;
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly(
+          [&applied, &rewrite](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
+            for (const auto& op : ops) {
+              if (const auto* set = std::get_if<core::ops::StringSet>(&op)) {
+                applied.emplace_back(set->value);
+              }
+            }
+            rewrite();  // the writer outruns every flush
+            return core::Result<void>{};
+          });
+
+  for (int pass = 0; pass < 3; ++pass) {
+    c->Drain();
+    EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kProgress) << "pass " << pass;
+  }
+  EXPECT_EQ(applied, (std::vector<std::string>{"v5", "v10", "v15"}));
+  EXPECT_EQ(wal.Awaited(), (std::vector<core::SequenceId>{5, 10, 15}));
+  EXPECT_EQ(c->Snapshot().durability_waits_timed_out, 0U);
+}
+
+// A Resolved's effect is carried by the Resolved, not its Conditional: it
+// must not persist while the Resolved could still be lost.
+TEST_F(ColdConsumerTest, ResolvedEffectWaitsForTheResolvedNotItsConditional) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  auto c = MakeConsumer(cfg);
+
+  constexpr core::SequenceId kConditional = 3;
+  constexpr core::SequenceId kResolved = 5;
+  auto resolved = MakeResolvedEntry(kResolved, core::Decision::kApply,
+                                    std::vector<std::string>{"SET", "k", "v"});
+  std::get<core::entry::Resolved>(resolved.payload).ref = kConditional;
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeConditionalEntry(kConditional), resolved}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+  PowerDurableLog wal(kConditional + 1);
+  wal.Install(queue_);
+  std::vector<std::string> applied_keys;
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([&applied_keys](std::span<const core::ops::WriteOp> ops, core::SequenceId) {
+        for (const auto& op : ops) applied_keys.emplace_back(core::ops::PrimaryKey(op));
+        return core::Result<void>{};
+      });
+
+  c->Drain();
+  EXPECT_EQ(c->Buffer().OldestPendingSeq(), std::optional<core::SequenceId>{kConditional})
+      << "the effect must commit no further than its Conditional";
+  EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kDurabilityPending);
+  EXPECT_EQ(wal.Awaited(), std::vector<core::SequenceId>{kResolved});
+  EXPECT_TRUE(applied_keys.empty()) << "persisted an effect whose Resolved is not durable";
+
+  wal.SetEnd(kResolved);
+  EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kDurabilityPending)
+      << "the end must pass the Resolved itself";
+  EXPECT_TRUE(applied_keys.empty());
+
+  wal.SetEnd(kResolved + 1);
+  EXPECT_EQ(c->Flush(), ColdConsumer::FlushOutcome::kProgress);
+  EXPECT_EQ(applied_keys, std::vector<std::string>{"k"});
+}
+
+// The wait paces a held batch, so the loop retries on the next pass rather
+// than sleeping on the no-progress backoff ladder.
+TEST_F(ColdConsumerTest, DurabilityPendingRetriesWithoutTheBackoffLadder) {
+  ColdConsumer::Config cfg;
+  cfg.quiet_threshold = 0s;
+  cfg.jitter_fraction = 0.0;
+  cfg.queue_read_timeout = 5ms;
+  cfg.loop_initial_backoff = 50ms;
+  cfg.loop_max_backoff = 1000ms;
+  auto c = MakeConsumer(cfg);
+
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
+      .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(1, {"SET", "k", "v"})}))
+      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
+  std::atomic<core::SequenceId> end{1};
+  std::atomic<int> waits{0};
+  EXPECT_CALL(queue_, DurableEnd(_, core::Durability::kPowerLoss))
+      .WillRepeatedly([&end](core::ShardId, core::Durability) {
+        return core::Result<core::SequenceId>(end.load());
+      });
+  EXPECT_CALL(queue_, AwaitDurable(_, _, core::Durability::kPowerLoss, _))
+      .WillRepeatedly([&end, &waits](core::ShardId, core::SequenceId seq, core::Durability,
+                                     core::Duration timeout) {
+        std::this_thread::sleep_for(timeout);
+        waits.fetch_add(1);
+        return core::Result<bool>(seq < end.load());
+      });
+  std::atomic<int> applies{0};
+  EXPECT_CALL(cold_, ApplyBatch(_, _))
+      .WillRepeatedly([&applies](std::span<const core::ops::WriteOp>, core::SequenceId) {
+        applies.fetch_add(1);
+        return core::Result<void>{};
+      });
+
+  const auto start = std::chrono::steady_clock::now();
+  c->Start();
+  // Ten 5 ms waits take ~50 ms; the 50 ms-doubling ladder would take seconds.
+  while (waits.load() < 10 && std::chrono::steady_clock::now() - start < 1500ms) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_GE(waits.load(), 10);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 1000ms) << "the held batch backed off";
+  EXPECT_EQ(applies.load(), 0);
+
+  end.store(2);
+  while (applies.load() == 0 && std::chrono::steady_clock::now() - start < 5s) {
+    std::this_thread::sleep_for(1ms);
+  }
+  c->Stop();
+  EXPECT_EQ(applies.load(), 1);
+  EXPECT_EQ(c->Snapshot().apply_failures, 0U);
+}
+
 // --- Loop backoff (XRES-5) ---------------------------------------------------
 
 TEST_F(ColdConsumerTest, PoisonedBatchBacksOffInsteadOfBusySpin) {
@@ -929,7 +1189,7 @@ TEST_F(ColdConsumerTest, PoisonedBatchBacksOffInsteadOfBusySpin) {
 
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -960,10 +1220,10 @@ TEST_F(ColdConsumerTest, QueueReadUnavailableStopsLoop) {
   auto c = MakeConsumer();
 
   std::atomic<int> read_call_count{0};
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillRepeatedly([&read_call_count](
-                          core::ShardId, core::SequenceId, size_t,
-                          core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+                          core::ShardId, core::SequenceId, size_t, core::Duration,
+                          core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
         read_call_count.fetch_add(1, std::memory_order_relaxed);
         return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
       });
@@ -981,7 +1241,7 @@ TEST_F(ColdConsumerTest, QueueReadUnavailableStopsLoop) {
 TEST_F(ColdConsumerTest, QueueReadTransientErrorIncrementsCounter) {
   auto c = MakeConsumer();
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(std::unexpected(core::Error{core::ErrorCode::kInternal, "transient"})))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1001,7 +1261,7 @@ TEST_F(ColdConsumerTest, FlushDoesNotRetryOnTerminalError) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1035,7 +1295,7 @@ TEST_F(ColdConsumerTest, QuietFlushIncrementsQuietCounter) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1064,7 +1324,7 @@ TEST_F(ColdConsumerTest, DeadlineFlushIncrementsDeadlineCounter) {
   std::vector<core::QueueEntry> entries;
   entries.push_back(MakeWriteEntry(1, {"SET", "k", "v"}));
 
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1129,7 +1389,7 @@ TEST_F(ColdConsumerTest, DrainAndFlushPersistsBufferOnGracefulStop) {
   }
   // Deliver the batch once, then nothing — the loop absorbs all kWrites into the
   // buffer and (quiet=3600s) leaves them unflushed.
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1151,6 +1411,9 @@ TEST_F(ColdConsumerTest, DrainAndFlushPersistsBufferOnGracefulStop) {
         commit_seq.store(s);
         return core::Result<void>{};
       });
+  // Nothing is power-durable until the drain waits; the flusher catches up.
+  PowerDurableLog wal(1, /*catch_up=*/true);
+  wal.Install(queue_);
 
   c->Start();
   // Let the loop absorb the batch.
@@ -1171,6 +1434,8 @@ TEST_F(ColdConsumerTest, DrainAndFlushPersistsBufferOnGracefulStop) {
   // NOT need to replay these seqs.
   EXPECT_EQ(commit_seq.load(), static_cast<core::SequenceId>(kWrites));
   EXPECT_EQ(c->Snapshot().last_commit_seq, static_cast<core::SequenceId>(kWrites));
+  EXPECT_FALSE(wal.Awaited().empty()) << "the drain persisted without the power gate";
+  EXPECT_EQ(c->Snapshot().durability_waits_timed_out, 0U);
 }
 
 TEST_F(ColdConsumerTest, DrainDeadlineTruncatesAndReportsWithoutBlocking) {
@@ -1190,7 +1455,7 @@ TEST_F(ColdConsumerTest, DrainDeadlineTruncatesAndReportsWithoutBlocking) {
     entries.push_back(MakeWriteEntry(static_cast<core::SequenceId>(i) + 1,
                                      {"SET", "k" + std::to_string(i), "v"}));
   }
-  EXPECT_CALL(queue_, Read(_, _, _, _))
+  EXPECT_CALL(queue_, Read(_, _, _, _, _))
       .WillOnce(Return(entries))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1230,7 +1495,7 @@ TEST_F(ColdConsumerTest, OldestUnflushedAgeIsZeroWhenBufferEmpty) {
 TEST_F(ColdConsumerTest, OldestUnflushedAgePopulated) {
   auto c = MakeConsumer();
 
-  EXPECT_CALL(queue_, Read(kShard, _, _, _))
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(1, {"SET", "ka", "va"})}))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 
@@ -1245,7 +1510,7 @@ TEST_F(ColdConsumerTest, OldestUnflushedAgePopulated) {
 TEST_F(ColdConsumerTest, OldestUnflushedAgeTracksNextOldestAfterFlush) {
   auto c = MakeConsumer();
 
-  EXPECT_CALL(queue_, Read(kShard, _, _, _))
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(1, {"SET", "ka", "va"})}))
       .WillOnce(Return(std::vector<core::QueueEntry>{MakeWriteEntry(2, {"SET", "kb", "vb"})}))
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));

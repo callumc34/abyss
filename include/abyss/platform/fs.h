@@ -62,9 +62,12 @@ core::Result<void> Ftruncate(const File& f, std::uint64_t size);
 
 // Durability intent for Fsync. kDurable guarantees the bytes are on stable
 // media after a successful return on every supported OS (macOS F_FULLFSYNC,
-// Linux fsync, Windows FlushFileBuffers). kFlushOnly is the legacy drive-cache
-// flush, for callers that explicitly do not need power-loss durability.
-enum class SyncMode : std::uint8_t { kDurable, kFlushOnly };
+// Linux fsync, Windows FlushFileBuffers). kDurableData is as strong for the
+// data and the metadata needed to read it back, but skips unrelated metadata
+// such as mtime (Linux fdatasync; identical to kDurable elsewhere).
+// kFlushOnly is the legacy drive-cache flush, for callers that explicitly do
+// not need power-loss durability.
+enum class SyncMode : std::uint8_t { kDurable, kDurableData, kFlushOnly };
 
 // The stable-media barrier kDurable resolves to on this platform.
 enum class FsyncBackend : std::uint8_t { kFullFsync, kFsync, kFlushFileBuffers };

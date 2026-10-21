@@ -34,6 +34,7 @@ class PendingAppend {
   PendingAppend& operator=(const PendingAppend&) = delete;
 
   core::SequenceId seq() const noexcept { return seq_; }
+  // Resolves once the entry is durable at the queue's AckDurability().
   DurabilityFuture& durable() noexcept { return durable_; }
 
   // Idempotent after the first call; destructor auto-calls if still pending.

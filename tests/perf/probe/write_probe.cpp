@@ -24,6 +24,7 @@
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
@@ -35,7 +36,6 @@
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/metrics.h"
 #include "abyss/platform/fs.h"
-#include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
 #include "common.h"
 #include "histogram.h"
@@ -55,9 +55,9 @@ constexpr std::string_view kOpWrite = "write_ack";
 constexpr std::string_view kOpFlush = "device_flush";
 constexpr std::string_view kOpFlushConcurrent = "device_flush_concurrent";
 constexpr size_t kFlushBlockBytes = 4096;
-// W1: write-path overhead with no device flush.
+// W1 (process_crash): write-path overhead; the ack waits for no flush.
 constexpr int64_t kOverheadP99Us = 20;
-// W2: twice the device flush p99 plus this headroom.
+// W2 (power_loss): twice the device flush p99 plus this headroom.
 constexpr int64_t kDurableHeadroomUs = 50;
 constexpr size_t kPrefillBatch = 1024;
 constexpr std::chrono::minutes kPrefillDrainTimeout{10};
@@ -67,18 +67,6 @@ std::string KeyFor(uint64_t idx) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
   std::snprintf(buf.data(), buf.size(), "k%020llu", static_cast<unsigned long long>(idx));
   return buf.data();
-}
-
-std::string_view ConfigSpelling(abyss::queue::FsyncPolicy policy) {
-  switch (policy) {
-    case abyss::queue::FsyncPolicy::kPerWrite:
-      return "fsync_per_write";
-    case abyss::queue::FsyncPolicy::kGroupCommit:
-      return "group_commit";
-    case abyss::queue::FsyncPolicy::kNone:
-      return "fsync_none";
-  }
-  return "";
 }
 
 // Recovery is not run, so the directory must hold no prior state.
@@ -118,7 +106,7 @@ Result<FlushCalibration> FlushFile(const std::filesystem::path& path, uint64_t s
     status = pfs::Pwrite(*file, block.data(), block.size(), i * kFlushBlockBytes);
     if (!status.has_value()) break;
     const auto t0 = Clock::now();
-    status = pfs::Fsync(*file, pfs::SyncMode::kDurable);
+    status = pfs::Fsync(*file, pfs::SyncMode::kDurableData);
     const auto t1 = Clock::now();
     if (!status.has_value()) break;
     out.histogram.Record(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -170,10 +158,10 @@ Result<abyss::core::RespCommand> CanonicalSet(std::string key, const std::string
   return abyss::core::ops::CanonicalCommand(*parsed);
 }
 
-abyss::perf::WorkloadTargets DeriveTargets(abyss::queue::FsyncPolicy policy,
+abyss::perf::WorkloadTargets DeriveTargets(abyss::core::Durability durability,
                                            const abyss::perf::Histogram& device_flush) {
   abyss::perf::TargetSpec spec;
-  spec.p99_us = policy == abyss::queue::FsyncPolicy::kNone
+  spec.p99_us = durability == abyss::core::Durability::kProcessCrash
                     ? kOverheadP99Us
                     : (2 * device_flush.PercentileNs(99.0) / 1000) + kDurableHeadroomUs;
   abyss::perf::WorkloadTargets targets;
@@ -217,19 +205,15 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   });
   const uint32_t shards = wp->hot_store->shard_count();
 
-  auto fsync_policy = abyss::queue::FsyncPolicyFromString(config.queue.fsync_policy);
-  if (!fsync_policy.has_value()) return std::unexpected(fsync_policy.error());
   auto queue = abyss::queue::WalQueue::Open(abyss::queue::WalConfig{
       .wal_path = config.queue.wal_path,
       .segment_size_bytes = config.queue.segment_size_bytes,
       .max_value_size_bytes = config.queue.max_value_size_bytes,
       .shard_count = shards,
-      .commit =
-          {
-              .policy = *fsync_policy,
-              .interval = std::chrono::microseconds{config.queue.group_commit_interval_us},
-              .max_bytes = config.queue.group_commit_max_bytes,
-          },
+      .durability = config.queue.durability,
+      .durability_window_bytes = config.queue.durability_window_bytes,
+      .durability_window = config.queue.durability_window,
+      .admission_timeout = config.engine.write_timeout,
       .min_retention = config.queue.min_retention,
       .retention_consumers = {abyss::core::kColdConsumer, abyss::core::kResolverConsumer},
       .offset_fsync_interval = config.queue.offset_fsync_interval,
@@ -421,7 +405,7 @@ int main(int argc, char** argv) {
   auto config = abyss::config::Config::Defaults();
   std::string wal_path;
   std::string cold_path;
-  std::string fsync_policy_name = "group_commit";
+  std::string durability_name{abyss::core::DurabilityName(config.queue.durability)};
   uint64_t flush_samples = 1000;
   uint32_t flush_concurrency = 0;
   uint64_t prefill_entries = 0;
@@ -429,9 +413,8 @@ int main(int argc, char** argv) {
   app.add_option("--wal-path", wal_path, "WAL directory; must be empty or absent (default: temp)");
   app.add_option("--cold-path", cold_path,
                  "Cold store directory; must be empty or absent (default: temp)");
-  app.add_option("--fsync-policy", fsync_policy_name, "group_commit | per_write | none");
-  app.add_option("--group-commit-interval-us", config.queue.group_commit_interval_us,
-                 "Group commit window");
+  app.add_option("--durability", durability_name,
+                 "process_crash (evaluates W1) | power_loss (evaluates W2)");
   app.add_option("--shards", config.hot.shard_count, "Shard count");
   app.add_option("--segment-size-bytes", config.queue.segment_size_bytes, "WAL segment size");
   app.add_option("--quiet-threshold-s", quiet_threshold_s, "Cold consumer quiet threshold");
@@ -443,9 +426,10 @@ int main(int argc, char** argv) {
                  "Files flushed in parallel for device_flush_concurrent (default: --shards)");
   CLI11_PARSE(app, argc, argv);
 
-  const auto policy = abyss::queue::FsyncPolicyFromString(fsync_policy_name);
-  if (!policy.has_value()) {
-    std::cerr << "invalid --fsync-policy: " << policy.error().message() << '\n';
+  const auto durability = abyss::core::ParseDurability(durability_name);
+  if (!durability.has_value()) {
+    std::cerr << "invalid --durability: " << durability_name
+              << " (expected process_crash or power_loss)\n";
     return 2;
   }
   // W1 and W2 are defined at a fixed fraction of saturation.
@@ -483,7 +467,7 @@ int main(int argc, char** argv) {
 
   config.queue.wal_path = wal_path;
   config.cold.data_path = cold_path;
-  config.queue.fsync_policy = ConfigSpelling(*policy);
+  config.queue.durability = *durability;
   config.cold_consumer.quiet_threshold = std::chrono::seconds{quiet_threshold_s};
   if (auto valid = config.Validate(); !valid.has_value()) {
     std::cerr << "invalid configuration: " << valid.error().message() << '\n';
@@ -504,7 +488,7 @@ int main(int argc, char** argv) {
               << concurrent.error().message() << '\n';
     return 1;
   }
-  const auto targets = DeriveTargets(*policy, calibration->histogram);
+  const auto targets = DeriveTargets(*durability, calibration->histogram);
 
   auto write_path = BuildWritePath(config);
   if (!write_path.has_value()) {
@@ -542,8 +526,7 @@ int main(int argc, char** argv) {
     abyss::perf::EvaluateTargets(report);
   }
   report.config = {
-      {"fsync_policy", config.queue.fsync_policy},
-      {"group_commit_interval_us", std::to_string(config.queue.group_commit_interval_us)},
+      {"durability", std::string{abyss::core::DurabilityName(config.queue.durability)}},
       {"shard_count", std::to_string(config.hot.shard_count)},
       {"segment_size_bytes", std::to_string(config.queue.segment_size_bytes)},
       {"cold_quiet_threshold_s", std::to_string(quiet_threshold_s)},

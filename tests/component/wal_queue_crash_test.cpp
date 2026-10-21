@@ -1,14 +1,14 @@
-// WAL durability across a kill -9, exercised under GROUP COMMIT.
+// WAL durability across a kill -9, under both durability classes.
 //
-// Group commit is the default policy and the one the durability spine was built
-// for: appends land in the segment's in-memory write watermark immediately, and
-// a batched fsync makes some prefix of them durable later. Every ack-vs-fsync
-// ordering defect the audit found lives in that window. A per-write-fsync test
-// cannot reach it -- it collapses the window to zero -- so this test drives
-// kGroupCommit and distinguishes the two classes of write explicitly:
+// Appends land in the segment's write watermark immediately, and a group
+// commit makes some prefix of them power-durable later. Every ack-vs-flush
+// ordering defect the audit found lives in that window. A kill -9 is a
+// process crash, which both classes survive, so each run distinguishes the
+// two kinds of write explicitly:
 //
 //   * CONFIRMED: the caller waited on the append's durability future and it
-//     resolved OK. The client would have been told OK. These MUST survive.
+//     resolved OK (at publish under process_crash, after the flush under
+//     power_loss). The client would have been told OK. These MUST survive.
 //   * IN-FLIGHT: appended, never awaited. These may or may not survive; the
 //     client never saw OK, so either outcome is correct.
 //
@@ -30,11 +30,12 @@
 #include <sstream>
 #include <vector>
 
+#include "abyss/core/durability.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
-#include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
 #include "crash_harness.h"
+#include "durability_printer.h"
 
 #endif
 
@@ -43,7 +44,7 @@ namespace {
 
 #ifdef _WIN32
 
-TEST(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
+TEST(WalCrashTest, ConfirmedWritesSurviveKillNine) {
   GTEST_SKIP() << "out-of-process crash simulation is POSIX-only";
 }
 
@@ -52,8 +53,12 @@ TEST(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
 using namespace std::chrono_literals;
 
 constexpr const char* kVictimDirEnv = "ABYSS_WAL_CRASH_VICTIM_DIR";
-constexpr const char* kVictimFilter = "WalCrashVictim.Run";
 constexpr const char* kReadyFile = "wal_victim.ready";
+
+const char* VictimFilter(core::Durability durability) {
+  return durability == core::Durability::kPowerLoss ? "WalCrashVictim.PowerLoss"
+                                                    : "WalCrashVictim.ProcessCrash";
+}
 
 // Confirmed one at a time so the durable watermark is unambiguous, then a burst
 // left in flight so the crash lands inside a group-commit window.
@@ -70,28 +75,25 @@ core::QueueEntry MakeWrite(std::vector<std::string> args) {
   return e;
 }
 
-WalConfig VictimConfig(const std::filesystem::path& dir) {
+WalConfig VictimConfig(const std::filesystem::path& dir, core::Durability durability) {
   return WalConfig{
       .wal_path = dir.string(),
       .segment_size_bytes = 4096,
       .shard_count = 1,
-      // The whole point: a real batching window between append and fsync.
-      .commit = {.policy = FsyncPolicy::kGroupCommit,
-                 .interval = std::chrono::microseconds{2000},
-                 .max_bytes = size_t{1024} * 1024},
+      .durability = durability,
       .min_retention = 1s,
       .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
   };
 }
 
-TEST(WalCrashVictim, Run) {
+void RunVictim(core::Durability durability) {
   bool is_victim = false;
   const auto dir = testing::VictimDirFromEnv(kVictimDirEnv, &is_victim);
   if (!is_victim) {
     GTEST_SKIP() << "crash victim; driven out-of-process by WalCrashTest";
   }
 
-  auto queue = WalQueue::Open(VictimConfig(dir));
+  auto queue = WalQueue::Open(VictimConfig(dir, durability));
   ASSERT_TRUE(queue.has_value()) << queue.error().message();
 
   // Confirmed writes: await durability, so the client would have seen OK.
@@ -139,7 +141,10 @@ TEST(WalCrashVictim, Run) {
   }
 }
 
-class WalCrashTest : public ::testing::Test {
+TEST(WalCrashVictim, ProcessCrash) { RunVictim(core::Durability::kProcessCrash); }
+TEST(WalCrashVictim, PowerLoss) { RunVictim(core::Durability::kPowerLoss); }
+
+class WalCrashTest : public ::testing::TestWithParam<core::Durability> {
  protected:
   void SetUp() override {
     auto tmpl = std::filesystem::temp_directory_path() / "abyss_wal_crash_XXXXXX";
@@ -159,9 +164,9 @@ class WalCrashTest : public ::testing::Test {
       tmp_dir_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
-TEST_F(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
+TEST_P(WalCrashTest, ConfirmedWritesSurviveKillNine) {
   const auto outcome = testing::SpawnAndKillVictim(testing::VictimSpec{
-      .gtest_filter = kVictimFilter,
+      .gtest_filter = VictimFilter(GetParam()),
       .dir_env_var = kVictimDirEnv,
       .dir = tmp_dir_,
       .ready_file_name = kReadyFile,
@@ -170,7 +175,7 @@ TEST_F(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
   ASSERT_TRUE(outcome.error.empty()) << outcome.error;
   ASSERT_TRUE(outcome.reached_ready) << "crash victim never reached its ready point";
   ASSERT_TRUE(outcome.died_by_signal)
-      << "victim must die by signal: a clean exit would fsync on the way out and the test would "
+      << "victim must die by signal: a clean exit would flush on the way out and the test would "
          "prove nothing about the group-commit window";
   EXPECT_EQ(outcome.term_signal, SIGKILL);
 
@@ -181,10 +186,10 @@ TEST_F(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
     ASSERT_FALSE(in.fail()) << "victim report unreadable: '" << outcome.ready_payload << "'";
   }
 
-  auto queue = WalQueue::Open(VictimConfig(tmp_dir_));
+  auto queue = WalQueue::Open(VictimConfig(tmp_dir_, GetParam()));
   ASSERT_TRUE(queue.has_value()) << queue.error().message();
 
-  auto read = (*queue)->Read(0, 0, 10000, 100ms);
+  auto read = (*queue)->Read(0, 0, 10000, 100ms, core::Durability::kPowerLoss);
   ASSERT_TRUE(read.has_value()) << read.error().message();
   const auto& entries = *read;
 
@@ -217,6 +222,14 @@ TEST_F(WalCrashTest, ConfirmedWritesSurviveKillNineUnderGroupCommit) {
       << "recovery exposed a partial AppendBatch (" << batch_entries
       << " batch entries is not a multiple of " << kBatchSize << ")";
 }
+
+INSTANTIATE_TEST_SUITE_P(Durability, WalCrashTest,
+                         ::testing::Values(core::Durability::kProcessCrash,
+                                           core::Durability::kPowerLoss),
+                         [](const ::testing::TestParamInfo<core::Durability>& info) {
+                           return info.param == core::Durability::kPowerLoss ? "PowerLoss"
+                                                                             : "ProcessCrash";
+                         });
 
 #endif  // !_WIN32
 

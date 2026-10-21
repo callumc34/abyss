@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -103,6 +104,12 @@ class Resolver {
   core::Result<void> SeedCursor();
   // Commits `seq`; on success it becomes committed_.
   void Commit(core::SequenceId seq);
+  // Loop thread: queues a drained position for the durable floor, which
+  // may pass it once `durable_target` is power durable.
+  void QueueFloor(core::SequenceId drained, core::SequenceId durable_target);
+  // Loop thread: advances the floor past every queued position the
+  // power-durable end now covers, and commits it. Never waits.
+  void AdvanceFloor();
   // The reaper deleted entries above the persisted offset: fail-stop.
   [[noreturn]] void FailOutOfRange(core::SequenceId requested);
   // False when a Conditional's Resolved append failed: retry the entry.
@@ -129,6 +136,8 @@ class Resolver {
   // confirms, never on publish. On timeout/error increments
   // durable_wait_timeouts_.
   bool AwaitResolvedDurable(core::SequenceId resolved_seq, std::chrono::milliseconds timeout);
+  // A full durability window fails the append; the caller's retry paces it.
+  core::SteadyTime AdmitBy() const { return core::SteadyClock::now() + config_.read_timeout; }
 
   // Sorted ascending; dedupes colliding stripes for deadlock-free multi-key.
   std::vector<uint32_t> StripeIndicesFor(const std::vector<std::string_view>& keys) const;
@@ -168,6 +177,12 @@ class Resolver {
   // drained Conditional.
   std::atomic<core::SequenceId> resolver_durable_floor_{0};
   std::atomic<core::SequenceId> highest_emitted_resolved_seq_{0};
+  struct PendingFloor {
+    core::SequenceId drained = 0;
+    core::SequenceId durable_target = 0;
+  };
+  // Loop thread only. Both fields rise front to back.
+  std::deque<PendingFloor> pending_floors_;
   // Highest seq of an observed `entry::Flush`. During replay, gates the
   // cache-only lookup path for post-Flush danglings (cold replay runs after
   // resolver replay, so cold is still pre-Flush).

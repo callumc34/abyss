@@ -89,10 +89,10 @@ Common flags across all probes:
 
 Before measuring, the probe calibrates the device. It runs `--flush-samples` iterations of a 4 KiB write followed by the WAL's own durable flush primitive on a scratch file in the WAL directory, timing the flush only. The result is reported as the `device_flush` operation, and the write target is derived from it:
 
-| Fsync policy | Target evaluated on `write_ack` |
+| Durability class | Target evaluated on `write_ack` |
 |---|---|
-| `none` | p99 ≤ 20µs (W1, write-path overhead without a device flush) |
-| `group_commit`, `per_write` | p99 ≤ 2 × measured `device_flush` p99 + 50µs (W2) |
+| `process_crash` | p99 ≤ 20µs (W1, write-path overhead; the flush runs in the background) |
+| `power_loss` | p99 ≤ 2 × measured `device_flush` p99 + 50µs (W2) |
 
 Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-path` and `--cold-path` must be empty or absent, because the probe does not run recovery; a temporary directory is used when either is omitted.
 
@@ -100,8 +100,7 @@ Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-
 |---|---|---|
 | `--wal-path` | temporary | WAL directory on the volume under test |
 | `--cold-path` | temporary | Cold store directory |
-| `--fsync-policy` | `group_commit` | `group_commit`, `per_write` or `none` |
-| `--group-commit-interval-us` | server default | Group-commit window |
+| `--durability` | `process_crash` | `process_crash` or `power_loss` |
 | `--shards` | 64 | Shard count |
 | `--segment-size-bytes` | server default | WAL segment size; must hold one maximum-size value |
 | `--flush-samples` | 1000 | Device flush calibration samples |
@@ -122,7 +121,7 @@ Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-
 **Run length.** The cold consumer starts flushing, checkpointing and acknowledging only after its quiet window (30 s by default). An authoritative run therefore lasts at least 60 s after warmup, or records a shorter `--quiet-threshold-s`. Prefill at least one deep-position run, because queue read cost depends on how far into a segment the consumers are reading.
 
 **Report contents.**
-- `config` records the effective settings: fsync policy, group-commit interval, shard count, segment size, quiet window, value size, workers and prefill.
+- `config` records the effective settings: durability class, shard count, segment size, quiet window, value size, workers and prefill.
 - `server_metrics` holds registry snapshots at `start` and `end`, so WAL flush and offset persist counts, durations and batch sizes for the run are in the same JSON.
 - The server's metrics snapshotter is not started; it takes shard locks once a second and is otherwise absent from this measurement.
 
@@ -302,7 +301,7 @@ Single file, machine-consumable, schema-versioned (`schema_version: 1`). Contain
 
 A one-line summary of the measured server or the in-process setup, its durability setting, and per-operation counts, errors and percentiles is also printed to stderr.
 
-**Comparing across versions.** Compare runs only within the same durability class: the current `fsync_none` against `process_crash`, and `group_commit` against `power_loss`. A default-against-default comparison across the change in acknowledgement point is meaningless.
+**Comparing across versions.** Compare runs only within the same durability class. A build from before durability classes running `fsync_none` compares with `process_crash`, and `group_commit` with `power_loss`. A default-against-default comparison across the change in acknowledgement point is meaningless. Report flushes per write (`rate(abyss_wal_flush_duration_seconds_count) / rate(abyss_queue_appended_total)`) alongside `power_loss` results, so a change in batching is visible apart from a change in device speed.
 
 `abyss_queue_offset_persist_duration_seconds` changes meaning across versions:
 - before lazy offset persistence, one observation is one per-acknowledgement file rewrite;
@@ -345,7 +344,7 @@ The targets in `requirements.md` are assigned to substrates by ADP-013:
 | H1 hot apply ≤ 5µs | hot probe (`hot_apply`) | micro (`hot_store_bench`) |
 | R1 hot read ≤ 100µs | hot probe (`hot_get`) | loadgen (`GET` after hot preload) |
 | R1-L read under writes | loadgen (`mixed_read_under_writes.yaml`, vs Valkey in the same run) | memtier |
-| W1 write overhead ≤ 20µs | write probe (`write_ack`, `--fsync-policy none`) | — |
+| W1 write overhead ≤ 20µs | write probe (`write_ack`, `--durability process_crash`) | — |
 | W1-L write over loopback | loadgen (`write_loopback_pipelined.yaml`, vs Valkey in the same run) | memtier |
 | W2 durable write | write probe (`write_ack` vs calibrated `device_flush`) | loadgen |
 | W3 durable write throughput > 100 000 ops/s | loadgen (`write_throughput.yaml`) | — |

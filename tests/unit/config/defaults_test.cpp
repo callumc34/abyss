@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 
 #include "abyss/config/config.h"
+#include "abyss/core/durability.h"
 
 namespace abyss::config {
 namespace {
@@ -21,8 +23,9 @@ TEST(ConfigDefaults, MatchesDefaultConstructedValues) {
   EXPECT_FALSE(defaults.cold.data_path.empty());
 
   EXPECT_EQ(defaults.queue.backend, "builtin_wal");
-  EXPECT_EQ(defaults.queue.fsync_policy, "group_commit");
-  EXPECT_GT(defaults.queue.group_commit_interval_us, 0U);
+  EXPECT_EQ(defaults.queue.durability, core::Durability::kProcessCrash);
+  EXPECT_EQ(defaults.queue.durability_window_bytes, uint64_t{64} * 1024 * 1024);
+  EXPECT_EQ(defaults.queue.durability_window, std::chrono::milliseconds{1000});
   EXPECT_EQ(defaults.queue.offset_fsync_interval, std::chrono::milliseconds{1000});
 
   EXPECT_GT(defaults.hot_consumer.read_batch_size, 0U);
@@ -67,7 +70,7 @@ TEST(ConfigDefaults, EmptyYamlEqualsDefaults) {
   const Config defaults = Config::Defaults();
   EXPECT_EQ(cfg->profile, defaults.profile);
   EXPECT_EQ(cfg->net.port, defaults.net.port);
-  EXPECT_EQ(cfg->queue.fsync_policy, defaults.queue.fsync_policy);
+  EXPECT_EQ(cfg->queue.durability, defaults.queue.durability);
 }
 
 }  // namespace

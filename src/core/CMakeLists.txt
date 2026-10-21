@@ -11,6 +11,7 @@ add_library(abyss_core
   topology_manifest.cpp
   atomic_file.cpp
   fatal.cpp
+  durability.cpp
 )
 add_library(abyss::core ALIAS abyss_core)
 

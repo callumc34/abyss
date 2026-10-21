@@ -32,6 +32,8 @@ class MetricsSnapshotter {
   metrics::GaugeHandle queue_depth_;
   metrics::GaugeHandle queue_disk_bytes_;
   metrics::GaugeHandle queue_oldest_eligible_unreaped_age_seconds_;
+  metrics::GaugeHandle wal_unflushed_bytes_;
+  metrics::GaugeHandle wal_durability_lag_seconds_;
   metrics::GaugeHandle hot_keys_;
   metrics::GaugeHandle hot_memory_bytes_;
   metrics::GaugeHandle cold_keys_;

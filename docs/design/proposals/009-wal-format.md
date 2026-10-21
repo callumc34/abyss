@@ -4,7 +4,7 @@
 **Created:** 2026-04-15
 **Updated:** 2026-04-18
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Reads use a sparse in-memory sequence-to-offset index rebuilt at open, as §Positioned reads describes. Segments become preallocated and zero-filled, with a zero body length marking the end of the log, and are organised as one physical log per volume carrying per-shard streams (Phase 1b). Entries carry decided effects (Phase 2). The format below is current until each phase lands.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Reads use a sparse in-memory sequence-to-offset index rebuilt at open, as §Positioned reads describes. Segments become preallocated and zero-filled, with a zero body length marking the end of the log, and are organised as one physical log per volume carrying per-shard streams (Phase 1c, #175). Entries carry decided effects (Phase 2). The format below is current until each phase lands.
 
 ## Context
 
@@ -167,7 +167,7 @@ Each minor-version bump ships with a round-trip compatibility test asserting bot
 
 ### Write semantics
 
-Entries are serialized into an in-memory buffer and appended to the active segment's file descriptor. The group-commit mechanism (ADP-001) batches multiple appends into a single `fsync` boundary. An entry is durable once the `fsync` covering its bytes returns.
+Entries are serialized into an in-memory buffer and appended to the active segment's file descriptor. Once written, an entry is in the page cache, which is durable at `process_crash`. Group commit (ADP-001 §Durability classes and group commit) batches entries into one fdatasync. An entry is `power_loss` durable once the fdatasync covering its bytes returns.
 
 Segment rotation:
 

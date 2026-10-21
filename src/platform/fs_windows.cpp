@@ -182,8 +182,8 @@ core::Result<void> Ftruncate(const File& f, std::uint64_t size) {
 
 core::Result<void> Fsync(const File& f, SyncMode /*mode*/) {
   // FlushFileBuffers is the strongest durability barrier Windows exposes on a
-  // file handle; it covers both kDurable and kFlushOnly. Rename durability is
-  // handled separately via MOVEFILE_WRITE_THROUGH in Rename.
+  // file handle; it covers every SyncMode. Rename durability is handled
+  // separately via MOVEFILE_WRITE_THROUGH in Rename.
   if (::FlushFileBuffers(f.get()) == 0) {
     return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "FlushFileBuffers"));
   }
@@ -220,25 +220,23 @@ core::Result<void> Rename(const std::filesystem::path& from, const std::filesyst
 }
 
 core::Result<DirSyncOutcome> FsyncDir(const std::filesystem::path& dir) {
-  // FILE_FLAG_BACKUP_SEMANTICS is required to open a directory.
-  const HANDLE h = ::CreateFileW(dir.c_str(), GENERIC_READ,
+  // FILE_FLAG_BACKUP_SEMANTICS opens a directory; FlushFileBuffers needs
+  // GENERIC_WRITE on it. Access denied is a permissions or programming
+  // error, never a missing filesystem capability.
+  const HANDLE h = ::CreateFileW(dir.c_str(), GENERIC_READ | GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (h == INVALID_HANDLE_VALUE) {
-    // NTFS supports directory flush; FAT/exFAT/network shares do not. Report
-    // that explicitly so durability-critical callers can refuse rather than
-    // silently assume the directory entry is durable.
     const DWORD err = ::GetLastError();
-    if (err == ERROR_ACCESS_DENIED || err == ERROR_NOT_SUPPORTED) {
-      return DirSyncOutcome::kUnsupported;
-    }
+    if (err == ERROR_NOT_SUPPORTED) return DirSyncOutcome::kUnsupported;
     ::SetLastError(err);
     return std::unexpected(MakeWin32Error(core::ErrorCode::kInternal, "open dir for fsync"));
   }
   if (::FlushFileBuffers(h) == 0) {
     const DWORD err = ::GetLastError();
     ::CloseHandle(h);
-    if (err == ERROR_NOT_SUPPORTED || err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION) {
+    // FAT/exFAT and some network shares cannot flush a directory.
+    if (err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_FUNCTION) {
       return DirSyncOutcome::kUnsupported;
     }
     ::SetLastError(err);

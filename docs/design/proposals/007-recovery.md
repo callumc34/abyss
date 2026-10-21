@@ -4,7 +4,7 @@
 **Created:** 2026-04-09
 **Updated:** 2026-05-03
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** The resolver replay phase is removed, because the log records decided effects that replay applies without re-deciding (Phase 2). Recovery flushes the retained log before replay so the power-durable watermark is known (Phase 1b). The process below describes current behaviour until then.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Recovery flushes the retained log before replay, so the power-durable watermark is known; step 1 below already describes this. The resolver replay phase is removed, because the log records decided effects that replay applies without re-deciding (Phase 2). Until then the process below is current.
 
 ## Context
 
@@ -21,10 +21,14 @@ Pod starts
   │
   ├─ 1. Open the queue (synchronous self-recovery)
   │     The embedded WAL backend scans segments, validates per-entry CRCs,
-  │     truncates a torn tail, and reads the offset checkpoint. External
-  │     queue backends (Kafka, NATS) typically no-op this phase. Phase
-  │     surfaces as kQueueOpen on RecoveryCoordinator::Snapshot for
-  │     consistency across backends.
+  │     truncates a torn tail, flushes the recovered tail so every retained
+  │     entry is power-durable, and loads the committed-offset checkpoint.
+  │     Both durable ends start at the recovered head, so replaying recovered
+  │     entries never waits on a flush; only entries replay itself appends
+  │     (the resolver's re-emitted Resolveds) wait for their power
+  │     durability. External queue backends (Kafka, NATS) typically no-op
+  │     this phase. Phase surfaces as kQueueOpen on
+  │     RecoveryCoordinator::Snapshot for consistency across backends.
   │
   ├─ 2. Capture initial targets and run resolver replay
   │     Coordinator captures TailSeq(s) per shard. For each shard, it
@@ -50,7 +54,7 @@ Pod starts
   │       flushing if the buffer crosses high-water, then drains the buffer
   │       to disk before declaring its shard done. Block-and-scan handles
   │       Conditional/Resolved pairs (ADP-011). Entries whose absolute TTL
-  │       has expired are dropped pre-flush.
+  │       has expired flush as deletes.
   │     - Hot applies entries in seq order. Skip-stale rules are active
   │       under replay_mode_:
   │       (a) entries whose appended_at + EvictionFor(key) < wall_now are

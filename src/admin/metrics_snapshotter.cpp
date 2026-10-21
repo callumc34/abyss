@@ -15,6 +15,8 @@ MetricsSnapshotter::MetricsSnapshotter(const StatusProvider& provider) : provide
   queue_disk_bytes_ = registry.Gauge(metrics::names::kQueueDiskBytes);
   queue_oldest_eligible_unreaped_age_seconds_ =
       registry.Gauge(metrics::names::kQueueOldestEligibleUnreapedAgeSeconds);
+  wal_unflushed_bytes_ = registry.Gauge(metrics::names::kWalUnflushedBytes);
+  wal_durability_lag_seconds_ = registry.Gauge(metrics::names::kWalDurabilityLagSeconds);
   hot_keys_ = registry.Gauge(metrics::names::kHotKeys);
   hot_memory_bytes_ = registry.Gauge(metrics::names::kHotMemoryBytes);
   cold_keys_ = registry.Gauge(metrics::names::kColdKeys);
@@ -35,6 +37,8 @@ void MetricsSnapshotter::Observe() {
   queue_disk_bytes_.Set(static_cast<double>(s.queue.total_bytes));
   queue_oldest_eligible_unreaped_age_seconds_.Set(
       MillisToSeconds(s.queue.oldest_eligible_unreaped_age_ms));
+  wal_unflushed_bytes_.Set(static_cast<double>(s.queue.unflushed_bytes));
+  wal_durability_lag_seconds_.Set(MillisToSeconds(s.queue.durability_lag_ms));
 
   hot_keys_.Set(static_cast<double>(s.hot.key_count));
   hot_memory_bytes_.Set(static_cast<double>(s.hot.memory_bytes));

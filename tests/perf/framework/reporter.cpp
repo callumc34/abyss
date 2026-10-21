@@ -413,7 +413,7 @@ void WriteSweep(std::ostream& out, const std::vector<SweepStep>& steps) {
 
 // The durability setting, whichever spelling the source reported.
 std::string DurabilitySetting(const std::map<std::string, std::string>& config) {
-  for (const char* key : {"fsync_policy", "wal-fsync-policy", "appendfsync"}) {
+  for (const char* key : {"durability", "wal-durability", "appendfsync"}) {
     if (const auto it = config.find(key); it != config.end()) return key + ("=" + it->second);
   }
   return "durability=unknown";

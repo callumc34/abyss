@@ -2,10 +2,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <variant>
@@ -13,13 +17,13 @@
 
 #include "abyss/core/apply_notifier.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/types.h"
 #include "abyss/hot/eviction_worker.h"
 #include "abyss/hot/sharded_hot_store.h"
-#include "abyss/queue/fsync_policy.h"
 #include "abyss/queue/wal_queue.h"
 #include "temp_dir.h"
 
@@ -42,9 +46,7 @@ class HotConsumerTest : public ::testing::Test {
         .wal_path = dir_->String(),
         .segment_size_bytes = 4096,
         .shard_count = 1,
-        .commit = {.policy = queue::FsyncPolicy::kGroupCommit,
-                   .interval = std::chrono::microseconds{500},
-                   .max_bytes = 1024UL * 1024UL},
+        .durability = core::Durability::kPowerLoss,
         .min_retention = 10s,
     });
     ASSERT_TRUE(queue_result.has_value()) << queue_result.error().message();
@@ -88,6 +90,14 @@ class HotConsumerTest : public ::testing::Test {
                                               policy_);
   }
 
+  // Recovery replays a log Open has already synced; under power_loss an
+  // unflushed tail would read as empty and end the replay early.
+  core::SequenceId DurableTail() {
+    const core::SequenceId tail = queue_->TailSeq(0).value();
+    EXPECT_TRUE(queue_->AwaitDurable(0, tail, core::Durability::kPowerLoss, 5s).value());
+    return tail;
+  }
+
   core::QueueEntry MakeWrite(std::vector<std::string> args) {
     core::QueueEntry e;
     e.appended_at = core::WallClock::now();
@@ -103,7 +113,10 @@ class HotConsumerTest : public ::testing::Test {
     e.appended_at = core::WallClock::now();
     e.payload = std::move(payload);
     auto pending = queue_->BeginAppend(0, std::move(e));
-    EXPECT_TRUE(pending.has_value());
+    if (!pending.has_value()) {
+      ADD_FAILURE() << pending.error().message();
+      return 0;
+    }
     const core::SequenceId seq = pending->seq();
     pending->Publish();
     EXPECT_TRUE(pending->durable().get().has_value());
@@ -113,7 +126,10 @@ class HotConsumerTest : public ::testing::Test {
   // BeginAppend → Register → Publish, matching the engine's write path.
   std::future<core::RespValue> AppendWithRpc(std::vector<std::string> args) {
     auto pending = queue_->BeginAppend(0, MakeWrite(std::move(args)));
-    EXPECT_TRUE(pending.has_value());
+    if (!pending.has_value()) {
+      ADD_FAILURE() << pending.error().message();
+      return {};
+    }
     auto future = rpc_.Register(pending->seq());
     pending->Publish();
     EXPECT_TRUE(pending->durable().get().has_value());
@@ -128,7 +144,10 @@ class HotConsumerTest : public ::testing::Test {
   };
   AppendedRpc AppendWithRpcAndSeq(std::vector<std::string> args) {
     auto pending = queue_->BeginAppend(0, MakeWrite(std::move(args)));
-    EXPECT_TRUE(pending.has_value());
+    if (!pending.has_value()) {
+      ADD_FAILURE() << pending.error().message();
+      return {};
+    }
     const core::SequenceId seq = pending->seq();
     auto future = rpc_.Register(seq);
     pending->Publish();
@@ -158,6 +177,85 @@ TEST_F(HotConsumerTest, AppliesWriteAndFulfillsOk) {
   auto read = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "key"}});
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "value");
+}
+
+// Under power_loss hot shows only flushed entries, so no reply can
+// reflect a write a power loss could drop. The flush wakes the reader.
+TEST_F(HotConsumerTest, PowerLossAppliesOnlyFlushedWrites) {
+  struct Stall {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool released = false;
+  };
+  auto stall = std::make_shared<Stall>();
+  queue_->SetFlushHookForTesting([stall](core::ShardId) -> core::Result<void> {
+    std::unique_lock lock(stall->mu);
+    stall->cv.wait(lock, [&stall] { return stall->released; });
+    return {};
+  });
+  const auto release = [&stall] {
+    {
+      const std::scoped_lock lock(stall->mu);
+      stall->released = true;
+    }
+    stall->cv.notify_all();
+  };
+  StartConsumer();
+
+  auto pending = queue_->BeginAppend(0, MakeWrite({"SET", "key", "value"}));
+  ASSERT_TRUE(pending.has_value());
+  auto reply = rpc_.Register(pending->seq());
+  pending->Publish();
+  EXPECT_EQ(reply.wait_for(100ms), std::future_status::timeout);
+  EXPECT_FALSE(hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "key"}}).has_value());
+
+  release();
+  ASSERT_EQ(reply.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(reply.get().AsString(), "OK");
+  ASSERT_TRUE(pending->durable().get().has_value());
+  auto read = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "key"}});
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->AsString(), "value");
+}
+
+// The flush wakes the power_loss reader, so a lone SET acks one flush
+// after publish, not at the reader's 100 ms timeout.
+TEST_F(HotConsumerTest, PowerLossLoneSetAckTracksTheFlushNotTheReadTimeout) {
+  policy_ = core::EvictionPolicy{core::EvictionTTL{86400}};
+  consumer_ = std::make_unique<HotConsumer>(*queue_, *hot_, rpc_, apply_notifier_,
+                                            HotConsumer::Config{.shard = 0}, policy_);
+  ASSERT_EQ(HotConsumer::Config{}.read_timeout, core::Duration{100});
+  consumer_->Start();
+
+  constexpr int kSamples = 9;
+  std::vector<std::chrono::steady_clock::duration> flushes;
+  std::vector<std::chrono::steady_clock::duration> acks;
+  for (int i = 0; i < kSamples; ++i) {
+    const auto key = "k" + std::to_string(i);
+    const auto flush_start = std::chrono::steady_clock::now();
+    auto flushed = queue_->BeginAppend(0, MakeWrite({"SET", "calibrate", key}));
+    ASSERT_TRUE(flushed.has_value());
+    flushed->Publish();
+    ASSERT_TRUE(flushed->durable().get().has_value());
+    flushes.push_back(std::chrono::steady_clock::now() - flush_start);
+
+    const auto ack_start = std::chrono::steady_clock::now();
+    auto pending = queue_->BeginAppend(0, MakeWrite({"SET", key, "v"}));
+    ASSERT_TRUE(pending.has_value());
+    auto reply = rpc_.Register(pending->seq());
+    pending->Publish();
+    ASSERT_EQ(reply.wait_for(5s), std::future_status::ready);
+    acks.push_back(std::chrono::steady_clock::now() - ack_start);
+    EXPECT_EQ(reply.get().AsString(), "OK");
+  }
+  std::ranges::sort(flushes);
+  std::ranges::sort(acks);
+  const auto flush = flushes[kSamples / 2];
+  const auto ack = acks[kSamples / 2];
+  EXPECT_LT(ack, 3 * flush + 20ms)
+      << "median ack " << std::chrono::duration_cast<std::chrono::microseconds>(ack).count()
+      << "us vs median flush "
+      << std::chrono::duration_cast<std::chrono::microseconds>(flush).count() << "us";
 }
 
 TEST_F(HotConsumerTest, AppliesEntriesInQueueOrder) {
@@ -339,7 +437,7 @@ TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesPastEvictionWindow) {
 
   BuildConsumerWithClock([] { return core::WallClock::now(); });
   std::atomic<bool> cancel{false};
-  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+  ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
 
   EXPECT_FALSE(hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "stale"}}).has_value());
   auto fresh = hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "fresh"}});
@@ -364,7 +462,7 @@ TEST_F(HotConsumerTest, ReplayUntilSkipsEntriesWithExpiredAbsoluteTtl) {
 
   BuildConsumerWithClock([] { return core::WallClock::now(); });
   std::atomic<bool> cancel{false};
-  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+  ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
 
   EXPECT_FALSE(hot_->Exec(core::ops::ReadOp{core::ops::StringGet{.key = "k"}}).has_value());
   EXPECT_EQ(consumer_->Snapshot().replay_skipped_abs_ttl, 1U);
@@ -427,7 +525,7 @@ TEST_F(HotConsumerTest, RunResumesWhereReplayStopped) {
   }
   BuildConsumerWithClock([] { return core::WallClock::now(); });
   std::atomic<bool> cancel{false};
-  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+  ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
   ASSERT_EQ(consumer_->Snapshot().applied, 3U);
 
   consumer_->Start();
@@ -502,9 +600,7 @@ TEST_F(HotConsumerTest, RebuildsFromFirstRetainedSeqAfterReclaim) {
       .wal_path = dir.String(),
       .segment_size_bytes = 256,
       .shard_count = 1,
-      .commit = {.policy = queue::FsyncPolicy::kGroupCommit,
-                 .interval = std::chrono::microseconds{500},
-                 .max_bytes = 1024UL * 1024UL},
+      .durability = core::Durability::kPowerLoss,
       .min_retention = 0s,
       .retention_consumers = {core::kColdConsumer},
   });
@@ -558,7 +654,7 @@ TEST_F(HotConsumerTest, MemoryPressureSuppressedDuringReplay) {
 
   BuildConsumerWithClock([] { return core::WallClock::now(); });
   std::atomic<bool> cancel{false};
-  ASSERT_TRUE(consumer_->ReplayUntil(queue_->TailSeq(0).value(), cancel).has_value());
+  ASSERT_TRUE(consumer_->ReplayUntil(DurableTail(), cancel).has_value());
 
   // All entries applied; none rejected for memory.
   EXPECT_EQ(consumer_->Snapshot().applied, static_cast<uint64_t>(kEntries));

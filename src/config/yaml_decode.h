@@ -12,10 +12,13 @@
 #include <type_traits>
 #include <vector>
 
+#include "abyss/core/durability.h"
 #include "abyss/core/result.h"
 
 namespace abyss::config::internal {
 
+// yaml-cpp's Node is not noexcept; only allocation failure can throw.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 class YamlCursor {
  public:
   explicit YamlCursor(const YAML::Node& root) : node_(root) {}
@@ -88,6 +91,7 @@ core::Result<T> DecodeSigned(const YamlCursor& cur) {
 core::Result<std::chrono::seconds> DecodeSeconds(const YamlCursor& cur);
 core::Result<std::chrono::milliseconds> DecodeMilliseconds(const YamlCursor& cur);
 core::Result<std::chrono::microseconds> DecodeMicroseconds(const YamlCursor& cur);
+core::Result<core::Durability> DecodeDurability(const YamlCursor& cur);
 
 // DecoderFor<T> maps a destination field type to the decoder that produces
 // it. The primary template is intentionally undefined so unsupported T
@@ -133,6 +137,10 @@ struct DecoderFor<std::chrono::microseconds> {
   static core::Result<std::chrono::microseconds> Decode(const YamlCursor& c) {
     return DecodeMicroseconds(c);
   }
+};
+template <>
+struct DecoderFor<core::Durability> {
+  static core::Result<core::Durability> Decode(const YamlCursor& c) { return DecodeDurability(c); }
 };
 
 // Fluent builder for parsing a YAML map into a typed destination struct.
@@ -213,6 +221,10 @@ class SectionDecoder {
     }
     return *this;
   }
+
+  // A key that no longer exists: its presence fails the parse with
+  // `hint`, which names what replaced it.
+  SectionDecoder& Removed(std::string_view key, std::string_view hint);
 
   core::Result<void> Finish();
 

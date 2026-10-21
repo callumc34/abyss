@@ -333,8 +333,8 @@ inline constexpr CounterDesc<ProtoLabel> kRespProtocolVersionTotal{
 inline constexpr HistogramDesc<> kWalFlushDurationSeconds{
     .name = "abyss_wal_flush_duration_seconds",
     .help =
-        "Duration of one group-commit or per-write WAL flush. Segment create and seal fsyncs "
-        "and offset syncs are not included.",
+        "Duration of one group-commit WAL flush. Segment create and seal fsyncs and offset syncs "
+        "are not included.",
     .buckets = buckets::kFlushLatencySeconds,
 };
 
@@ -342,6 +342,16 @@ inline constexpr HistogramDesc<> kWalFlushBatchEntries{
     .name = "abyss_wal_flush_batch_entries",
     .help = "WAL entries covered by one durability flush.",
     .buckets = buckets::kBatchSize,
+};
+
+inline constexpr CounterDesc<> kWalBackpressureWaitsTotal{
+    .name = "abyss_wal_backpressure_waits_total",
+    .help = "Appends that waited for room in the WAL durability window.",
+};
+
+inline constexpr CounterDesc<> kWalBackpressureRejectionsTotal{
+    .name = "abyss_wal_backpressure_rejections_total",
+    .help = "Appends rejected because the WAL durability window stayed full until their deadline.",
 };
 
 inline constexpr HistogramDesc<> kQueueOffsetPersistDurationSeconds{
@@ -359,8 +369,8 @@ inline constexpr HistogramDesc<> kColdFlushBatchSize{
 inline constexpr GaugeDesc<> kFsDurableDirSupported{
     .name = "abyss_fs_durable_dir_supported",
     .help =
-        "1 if the data volume can make directory entries durable (fsync), else 0. A 0 on a "
-        "durability-required deployment is a refuse-to-start condition.",
+        "1 if the data volume can make directory entries durable (fsync), else 0. A 0 refuses "
+        "to start the WAL under either durability class.",
 };
 
 inline constexpr GaugeDesc<> kHotConsumerLagEntries{
@@ -436,6 +446,16 @@ inline constexpr CounterDesc<> kQueueReaperFailuresTotal{
 inline constexpr GaugeDesc<> kQueueOldestEligibleUnreapedAgeSeconds{
     .name = "abyss_queue_oldest_eligible_unreaped_age_seconds",
     .help = "Age of the oldest reap-eligible segment still on disk; rises when reaping stalls.",
+};
+
+inline constexpr GaugeDesc<> kWalUnflushedBytes{
+    .name = "abyss_wal_unflushed_bytes",
+    .help = "WAL bytes published but not yet power-durable, across shards.",
+};
+
+inline constexpr GaugeDesc<> kWalDurabilityLagSeconds{
+    .name = "abyss_wal_durability_lag_seconds",
+    .help = "Age of the oldest WAL entry not yet power-durable, worst shard.",
 };
 
 inline constexpr CounterDesc<> kQueueOffsetPersistFailuresTotal{

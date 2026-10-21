@@ -48,6 +48,7 @@ TEST(ColdDurabilityTest, ColdCommittedPrefixSurvivesKillWithoutWalReplay) {
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/core/cold_store.h"
 #include "abyss/core/consumer_rpc.h"
+#include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/queue.h"
@@ -91,6 +92,8 @@ queue::WalConfig MakeWalConfig(const std::filesystem::path& dir) {
       .wal_path = dir.string(),
       .segment_size_bytes = size_t{1} << 20U,
       .shard_count = kShardCount,
+      // The append future then means power-durable, so cold may commit it.
+      .durability = core::Durability::kPowerLoss,
       // Long enough that the reaper cannot remove a segment mid-test.
       .min_retention = std::chrono::seconds{3600},
       .retention_consumers = {core::kHotConsumer, core::kColdConsumer},
@@ -168,7 +171,7 @@ void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, 
     entries.push_back(std::move(entry));
   }
 
-  auto appended = queue.AppendBatch(kShard, entries);
+  auto appended = queue.AppendBatch(kShard, entries, core::SteadyClock::now() + 10s);
   ASSERT_TRUE(appended.has_value()) << appended.error().message();
   auto wal_durable = appended->durable.get();
   ASSERT_TRUE(wal_durable.has_value()) << wal_durable.error().message();

@@ -4,7 +4,13 @@
 **Created:** 2026-04-09
 **Updated:** 2026-04-18
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Read takes an explicit consumer-owned position, and acknowledgements are committed offsets persisted lazily in one dual-slot checkpoint; §Interface and §Offset persistence already describe this. Group commit becomes natural batching with named durability classes, `process_crash` by default and `power_loss` opt-in, on preallocated mapped segments in one physical log per volume (Phase 1b). The entry taxonomy loses `Conditional` and `Resolved` (Phase 2). Those sections describe current behaviour until each phase lands.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** These sections already describe the amended behaviour:
+> - **§Interface and §Offset persistence:** reads take an explicit consumer-owned position, and acknowledgements are committed offsets persisted lazily in one dual-slot checkpoint.
+> - **§Durability classes and group commit:** writes are acknowledged at a named durability class, `process_crash` by default and `power_loss` opt-in, and flushed by natural batching.
+>
+> Still to land, with the current behaviour described below until each does:
+> - preallocated, memory-mapped segments in one physical log per volume (Phase 1c, #175);
+> - the entry taxonomy losing `Conditional` and `Resolved` (Phase 2).
 
 ## Context
 
@@ -33,14 +39,15 @@ The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wa
 
 The queue interface offers two append flavours:
 
-- **Two-phase** — `BeginAppend` / `BeginAppendBatch` allocate a sequence id, encode the entry, and submit it to the group-commit fsync window, but leave the entry invisible to consumers until the caller runs `Publish()` on the returned RAII handle. The handle holds the per-shard append mutex for the duration of the window, bounding the critical section to the caller's per-seq setup (e.g. registering a Consumer RPC promise). The destructor auto-publishes if the caller drops the handle without calling `Publish()`, so a forgotten publish degrades to a latency bug, never a lost write.
+- **Two-phase** — `BeginAppend` / `BeginAppendBatch` allocate a sequence id and write the encoded entry to the segment, but leave it invisible to consumers until the caller runs `Publish()` on the returned RAII handle. The handle's durability future resolves when the entry reaches the configured durability class (§Durability classes and group commit). The handle holds the per-shard append mutex for the duration of the window, bounding the critical section to the caller's per-seq setup (e.g. registering a Consumer RPC promise). The destructor auto-publishes if the caller drops the handle without calling `Publish()`, so a forgotten publish degrades to a latency bug, never a lost write.
 - **One-shot** — `Append` / `AppendBatch` are `BeginAppend` + `Publish()` inline. Safe only for fire-and-forget callers that do not register per-seq state before publication. Used by cold-hit promotion and by the Resolver when emitting `Resolved` entries.
 
 Callers that await consumer apply (the tiering engine's write path) MUST use the two-phase primitive. Publishing before the producer has registered its RPC promise would race with the consumer's Fulfill — the producer could miss the response. Two-phase closes this structurally by letting the producer register under the same lock that gates visibility.
 
 **Read position and committed offset are separate**, as a Kafka fetch position and committed offset are.
-- **Read.** A consumer owns its read position and passes it to `Read`, which returns the contiguous published entries at or after that sequence. A position below the oldest retained entry is an explicit out-of-range error, never silently moved forward.
-- **Commit.** `CommitOffset` records how far a retention consumer has processed. It takes effect in memory at once, never passes the durable WAL tail, and is persisted lazily (see "Offset persistence" below).
+- **Read.** A consumer owns its read position and passes it to `Read`, together with the durability class the returned entries must have reached. `Read` returns the contiguous entries at or after that sequence that are durable at that class. A position below the oldest retained entry is an explicit out-of-range error, never silently moved forward.
+- **Commit.** `CommitOffset` records how far a retention consumer has processed. It takes effect in memory at once, never passes the power-durable end of the log, and is persisted lazily (see "Offset persistence" below).
+- **Durable ends.** `DurableEnd(shard, class)` is exclusive: every sequence below it is durable at that class, and 0 means none is. It is monotonic per shard and class. `AwaitDurable` waits for one sequence to reach a class, and `AckDurability` reports the class the queue acknowledges at.
 - **Retention.** Committed offsets govern retention and where a consumer resumes after a restart. They never govern where a running consumer reads.
 - **Hot.** The hot consumer keeps its position in memory and commits nothing. After a restart it rebuilds from the oldest retained entry.
 - **Accessors.** `FirstSeq` reports the lowest readable sequence on a shard. `CommittedOffset` reports a consumer's committed offset, or none if it has never committed.
@@ -60,7 +67,7 @@ The built-in queue implementation is an append-only WAL on the PVC.
 /data/wal/shard-0000/00000000000000065536.log
 ```
 
-- Segment size: configurable, default 64 MiB.
+- Segment size: configurable, default 128 MiB.
 - Segment cleanup runs after each round that persists committed offsets, and after every rotation. A segment is deleted when its `last_seq` is below the minimum *persisted* committed offset across retention consumers AND its age exceeds `min_retention`. The active segment is never eligible. Reclamation uses persisted offsets, never in-memory ones, so a restart never resumes a consumer below a deleted segment. See [ADP-009](009-wal-format.md) for file format details.
 - Committed offsets are persisted lazily to one checkpoint file under `{wal_path}/offsets/`. See "Offset persistence" below.
 
@@ -100,7 +107,11 @@ A persist overwrites the slot that does not hold the highest epoch, with the nex
 
 **Crash semantics.** After a crash, a consumer resumes from its last persisted offset. Entries after it are delivered again, at most one persist interval's worth; cold absorption and resolver replay are idempotent. A consumer with no committed offset starts at the first retained entry.
 
-**Recovered tail.** On open, each shard flushes the tail it recovered, so entries a crashed process left only in the page cache become durable before any consumer commits past them. One residual risk is accepted, the same one PostgreSQL accepts. Linux reports a write-back error that happened before the crash to the first flush on a new file descriptor only if the file's inode stayed cached in between. Nothing at the application level can close that gap. Under `fsync_policy: none`, a power loss can drop entries the checkpoint already named. That policy accepts the loss, so such an offset is clamped to the recovered tail, with a warning, rather than refusing to start.
+**Recovered tail.** On open, each shard flushes the tail it recovered, so entries a crashed process left only in the page cache become power-durable before any consumer reads or commits past them. Both durable ends then start at the recovered head.
+
+One residual risk is accepted, the same one PostgreSQL accepts. Linux reports a write-back error that happened before the crash to the first flush on a new file descriptor only if the file's inode stayed cached in between. Nothing at the application level can close that gap.
+
+A committed offset never passes the power-durable end, so a persisted offset at or past the recovered head is corruption under either class, and opening refuses.
 
 **Failures.** A failed persist is logged and counted, and retried on the next round. Persisted offsets stay where they were, so retention waits, visibly. Nothing is lost.
 
@@ -112,30 +123,42 @@ A persist overwrites the slot that does not hold the highest epoch, with the nex
 
 `WalQueue::IsRecovering()` returns `true` while the queue is being opened (segment scan, torn-tail truncation, offset load) and `false` once those steps finish. Open is synchronous today so the flag is only ever observed `false` by external callers — but the shape of the API lets the server gate RESP LOADING on a single uniform check regardless of whether the queue or a consumer is still catching up ([ADP-005](005-resp-frontend.md), [ADP-007](007-recovery.md)).
 
-### Group Commit
+### Durability classes and group commit
 
-The embedded WAL's fsync strategy determines the trade-off between write throughput and durability.
+A write's durability future resolves when its entry reaches the class set by `queue.durability` ([ADP-015](015-write-path-and-durability.md) §Durability classes):
 
-Abyss batches all appends within a configurable window into a single fsync. Write handlers block until their batch is fsynced. The hot consumer can read from the in-memory buffer immediately, but the client promise is not fulfilled until both the fsync completes and the hot consumer applies — these happen in parallel.
+| Class | Resolves when | Survives |
+|-------|---------------|----------|
+| `process_crash` (default) | The entry is published: written to its segment, so it is in the page cache | Process crash, OOM kill, container restart. A power loss loses at most the durability window. |
+| `power_loss` | The fdatasync (`F_FULLFSYNC` on macOS) covering it has completed | Power loss |
 
-```
-Writer A ──append──┐
-Writer B ──append──┤──▶ [batch buffer] ──fsync──▶ batch complete
-Writer C ──append──┘         │
-                             ├──▶ hot consumer reads from buffer concurrently
-                             │
-                      promise fulfilled when BOTH fsync + hot apply done
-```
+The write path still waits for the hot consumer to apply the entry before replying (ADP-006).
 
-Three fsync policies are supported:
+**Natural batching.**
+- Each shard has a commit thread. A flush starts as soon as the previous one ends, and covers every entry published while it ran. There is no timer and no batch cap.
+- At low load a write waits for one flush; under load each flush covers more writes. This is the leader/follower commit of RocksDB, and of PostgreSQL with `commit_delay = 0`, except that a dedicated thread flushes so appenders never make the system call.
+- Each flush snapshots the active segment and the published end under the shard's append lock, then runs fdatasync outside it. A rotation seals the old segment with its own fdatasync before switching, so every entry below the snapshot's end is covered.
 
-| Policy | Throughput | Max Data Loss on Crash | Use Case |
-|--------|-----------|----------------------|----------|
-| `fsync_per_write` | ~1K ops/s | 0 | Safety-critical |
-| `group_commit` (default) | ~50-100K ops/s | Up to `group_commit_interval` of un-ACKed writes | Most workloads |
-| `fsync_none` | ~500K+ ops/s | All un-flushed WAL data | Ephemeral data |
+**Who reads at which class.**
+- Every materialised view reads at the acknowledgement class: hot, the resolver, and the cold consumer's in-memory compaction buffer.
+- Persisted derived state is gated at `power_loss`: cold-store writes and wipes ([ADP-004](004-cold-consumer.md)) and committed offsets.
+- Under `power_loss`, no reply can therefore reflect an entry a power loss could drop.
+- Under `process_crash`, persisted state still never runs ahead of the power-durable log.
 
-The key guarantee: any write the client received OK for is durable. Group commit only risks losing writes that were in the batch buffer at crash time and hadn't been fsynced or ACKed to the client yet. The client never saw OK for those, so it can retry.
+**Bounded window.**
+- Acknowledged-but-not-power-durable data is bounded by `queue.durability_window_bytes` (volume-wide unflushed bytes) and `queue.durability_window_ms` (the age of a shard's oldest unflushed entry).
+- Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.write_timeout`, it is rejected with an error saying the device is not keeping up.
+- An empty window always admits, so a single value larger than the window cannot deadlock.
+- `abyss_wal_unflushed_bytes`, `abyss_wal_durability_lag_seconds` and the backpressure counters report it.
+
+**Failures.**
+- Before an entry is published, failures reject the write cleanly. These include encoding, admission, creating the next segment (including a full disk) and the segment write itself.
+- After publication, a failed flush or segment seal terminates the process. The kernel may already have dropped the dirty pages and cleared the error, so a later successful flush would advance the durable end over lost data. Recovery rebuilds from the log.
+
+**Removed settings.** `wal_fsync_policy`, `group_commit_interval_us` and `group_commit_max_bytes` fail to load, with an error naming the replacement.
+- Natural batching makes a per-write fsync pointless.
+- "No fsync" was a weaker `process_crash` with an unbounded power-loss window.
+- A batch byte cap has no meaning once appenders write their own entries and a flush is one fdatasync of the file; the durability window is the real bound.
 
 ### External Broker Mapping
 
@@ -152,17 +175,17 @@ Since we always partition by key hash, ordering within a key is guaranteed by ev
 queue:
   backend: builtin_wal
   wal_path: /data/wal
-  segment_size_bytes: 67108864        # 64 MiB
+  segment_size_bytes: 134217728       # 128 MiB
   min_retention_seconds: 86400        # 24 hours
   offset_fsync_interval_ms: 1000      # committed-offset checkpoint cadence, 10–60000
-  wal_fsync_policy: group_commit
-  group_commit_interval_us: 1000      # 1ms batch window
-  group_commit_max_bytes: 1048576     # Or flush at 1 MiB, whichever first
+  durability: process_crash           # or power_loss
+  durability_window_bytes: 67108864   # unflushed bytes across shards, 1 MiB–4 GiB
+  durability_window_ms: 1000          # oldest unflushed entry per shard, 10–60000
 ```
 
 ## Invariants
 
-1. Any `Append` operation returning OK means the entry is durable (for group commit: the batch containing this entry has been fsynced).
+1. An append's durability future resolving OK means the entry is durable at the configured class: published (`process_crash`) or covered by a completed fdatasync (`power_loss`).
 2. `Read` returns entries in sequence order. No gaps, no reordering.
 3. The queue retains every entry above the minimum persisted committed offset across retention consumers.
 4. Each consumer owns its read position. No consumer's progress, and no committed offset, affects where another consumer reads.
@@ -175,4 +198,6 @@ queue:
 
 **Why an append-only log instead of direct writes to stores?** A single ordered log eliminates dual-write consistency problems. Recovery is trivial: replay the log. The downside is write amplification, data is written to the WAL, then to hot (in memory), then eventually to cold (on disk). But the cold consumer's compaction buffer mitigates this by collapsing intermediate writes before they hit disk.
 
-**Why group commit as default?** Per-write fsync limits throughput to ~1K ops/s (bounded by disk latency). Group commit batches multiple writes into a single fsync, achieving 50-100K ops/s while maintaining the guarantee that acknowledged writes are durable. The trade-off is latency: writes wait up to the batch interval (default 1ms). For most workloads this is acceptable.
+**Why `process_crash` as default?** A write cannot be acknowledged at `power_loss` faster than the device can flush. Acknowledging from the page cache survives the failure that dominates on Kubernetes, a process crash or restart. A power loss loses at most the bounded durability window, because the flush runs continuously. This is stronger than Redis `appendfsync everysec` ([ADP-015](015-write-path-and-durability.md) §Durability classes). Workloads that must survive power loss opt into `power_loss`.
+
+**Why natural batching rather than a commit window?** A fixed window adds its full length to every write at low load and batches no better under load. A flush that starts as soon as the device is idle gives one flush of latency at low load and grows the batch with concurrency.

@@ -113,7 +113,8 @@ void HotConsumer::Run() {
 }
 
 core::Result<std::vector<core::QueueEntry>> HotConsumer::ReadFromCursor(size_t max_count) {
-  auto read = queue_.Read(config_.shard, next_read_seq_, max_count, config_.read_timeout);
+  auto read = queue_.Read(config_.shard, next_read_seq_, max_count, config_.read_timeout,
+                          queue_.AckDurability());
   if (read.has_value() || read.error().code() != core::ErrorCode::kOutOfRange) return read;
 
   auto first = queue_.FirstSeq(config_.shard);
@@ -131,7 +132,8 @@ core::Result<std::vector<core::QueueEntry>> HotConsumer::ReadFromCursor(size_t m
                    {"first_seq", static_cast<uint64_t>(*first)});
   }
   next_read_seq_ = *first;
-  return queue_.Read(config_.shard, next_read_seq_, max_count, config_.read_timeout);
+  return queue_.Read(config_.shard, next_read_seq_, max_count, config_.read_timeout,
+                     queue_.AckDurability());
 }
 
 void HotConsumer::ProcessBatch(std::vector<core::QueueEntry>& batch) {

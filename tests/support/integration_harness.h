@@ -149,23 +149,24 @@ class IntegrationHarness {
   void InstallQueueMocks() {
     // NOLINTBEGIN(performance-unnecessary-value-param) — gmock forces by-value
     // lambda params to match the MOCK_METHOD signature.
-    ON_CALL(queue_, BeginAppend(::testing::_, ::testing::_))
-        .WillByDefault([this](core::ShardId shard, core::QueueEntry entry) {
+    ON_CALL(queue_, BeginAppend(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault([this](core::ShardId shard, core::QueueEntry entry, core::SteadyTime) {
           std::promise<core::Result<void>> p;
           p.set_value(core::Result<void>{});
           const auto seq = AppendToLog(shard, std::move(entry));
           return queue::PendingAppend{seq, p.get_future(), std::make_unique<NoopAppendPublisher>()};
         });
-    ON_CALL(queue_, Append(::testing::_, ::testing::_))
-        .WillByDefault([this](core::ShardId shard, core::QueueEntry entry) {
+    ON_CALL(queue_, Append(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault([this](core::ShardId shard, core::QueueEntry entry, core::SteadyTime) {
           std::promise<core::Result<void>> p;
           p.set_value(core::Result<void>{});
           const auto seq = AppendToLog(shard, std::move(entry));
           return queue::AppendResult{.seq = seq, .durable = p.get_future()};
         });
-    ON_CALL(queue_, Read(::testing::_, ::testing::_, ::testing::_, ::testing::_))
+    ON_CALL(queue_, Read(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
         .WillByDefault([this](core::ShardId shard, core::SequenceId from_seq, size_t max_count,
-                              core::Duration) -> core::Result<std::vector<core::QueueEntry>> {
+                              core::Duration,
+                              core::Durability) -> core::Result<std::vector<core::QueueEntry>> {
           const std::scoped_lock lock(queue_mutex_);
           return ReadFromLog(log_.at(shard), from_seq, max_count);
         });

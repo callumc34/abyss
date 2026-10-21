@@ -373,7 +373,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_DelThenReaddDoesNotResurrectColdSetMembers)
   DrainAndFlushCold("c3set");
 
   // Drive the key out of hot so SCARD/SISMEMBER resolve against cold.
-  (void)harness_.ShardedHot().Wipe();
+  ASSERT_TRUE(harness_.ShardedHot().Wipe().has_value());
 
   EXPECT_EQ(harness_.Engine().DispatchRead("SCARD", MakeCmd({"SCARD", "c3set"}))->AsInteger(), 1)
       << "DEL-then-readd resurrected stale cold members (COLDC-3)";
@@ -399,7 +399,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
       harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "c3t", "now-a-string"})).has_value());
   DrainAndFlushCold("c3t");
 
-  (void)harness_.ShardedHot().Wipe();
+  ASSERT_TRUE(harness_.ShardedHot().Wipe().has_value());
 
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c3t"}));
   ASSERT_TRUE(getv.has_value());
@@ -425,6 +425,26 @@ TEST_F(TwoTtlIntegrationTest, COLDC3_WithinWindowTypeChangeDropsPriorSlices) {
   }
 }
 
+// An absolute TTL that lapses while the write is still buffered must
+// delete the key from cold, or the older cold value resurfaces.
+TEST_F(TwoTtlIntegrationTest, ExpiredBufferedWriteDeletesTheOlderColdValue) {
+  ASSERT_TRUE(harness_.Engine().DispatchWrite("SET", MakeCmd({"SET", "rk", "old"})).has_value());
+  DrainAndFlushCold("rk");
+
+  const uint64_t ttl_ms = WallMs() + 1000;
+  ASSERT_TRUE(
+      harness_.Engine()
+          .DispatchWrite("SET", MakeCmd({"SET", "rk", "new", "PXAT", std::to_string(ttl_ms)}))
+          .has_value());
+  harness_.Clock().Advance(2s);
+  DrainAndFlushCold("rk");
+  ASSERT_TRUE(harness_.ShardedHot().Wipe().has_value());
+
+  auto got = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "rk"}));
+  ASSERT_TRUE(got.has_value());
+  EXPECT_TRUE(got->IsNull()) << "expired write resurrected the older cold value";
+}
+
 // --- COLDC-6: cross-window implicit type change drops prior cold slices -----
 
 TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
@@ -448,7 +468,7 @@ TEST_F(TwoTtlIntegrationTest, COLDC6_CrossWindowTypeChangeDropsPriorSlices) {
   DrainAndFlushCold("c6t");
 
   // Drive the key out of hot so the reads resolve against the buffer/cold tiers.
-  (void)harness_.ShardedHot().Wipe();
+  ASSERT_TRUE(harness_.ShardedHot().Wipe().has_value());
 
   auto getv = harness_.Engine().DispatchRead("GET", MakeCmd({"GET", "c6t"}));
   ASSERT_TRUE(getv.has_value());

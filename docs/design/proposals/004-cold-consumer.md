@@ -3,7 +3,11 @@
 **Status:** Accepted
 **Created:** 2026-04-09
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** The consumer loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain; the loop below already describes this. Absorption is capped at the power-durable watermark, and consumers run as a pool sized to cores (Phase 1b). Until then the loop absorbs up to the published tail, one thread per shard.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** These parts already describe the amended behaviour:
+> - **§Consumer Thread Loop:** the loop reads by its own position, so the persisted acknowledgement no longer limits what it can drain.
+> - **§Persisting at the power-durable log:** writes to the cold store never run ahead of the power-durable log.
+>
+> Still to land: consumers run as a pool sized to cores (Phase 1c, #175). Until then each shard has its own thread.
 
 ## Context
 
@@ -72,27 +76,32 @@ Each per-shard thread loop is:
 
 ```
 loop:
-    1. Drain: queue.Read(shard, next_read_seq, max_count, short_timeout)
+    1. Drain: queue.Read(shard, next_read_seq, max_count, short_timeout,
+                         ack durability class)
        - next_read_seq is the consumer's own position: committed offset + 1
          on start, then one past the last entry read
        - Decode each QueueEntry (Write / Conditional / Resolved-apply)
        - Parse its RESP command into a typed WriteOp
        - Expand multi-key ops (DEL, MSET) into per-key absorbs
-       - buffer.Absorb(key, op, eviction, seq)
+       - buffer.Absorb(key, op, eviction, position, carrier)
 
-    2. Flush: under normal mode, pop entries whose scheduled_time ≤ now
+    2. Flush: under normal mode, select entries whose scheduled_time ≤ now
        (quiet window or eviction-deadline fired). Under aggressive mode
-       (see Memory Management), pop by deadline order irrespective of now.
-       - Drop entries whose absolute TTL has expired before cold is contacted
+       (see Memory Management), select by deadline order irrespective of now.
+       Selected entries stay in the buffer, readable, until the apply lands.
+       - Entries whose absolute TTL has expired are written as deletes
+       - Wait, bounded, until every selected entry's last_seq is
+         power-durable (see Persisting at the power-durable log)
        - Emit typed ops (tombstones become DEL, live states emit per-type ops)
        - cold_store.ApplyBatch(ops)
-         - Success: the flushed entries vanish from the buffer
-         - Failure: retain entries, back off exponentially, retry
+         - Success: the flushed entries are removed from the buffer
+         - Failure: retain and reschedule them, back off exponentially, retry
+         - Durability still pending: retain and reschedule, retry next pass
 
     3. Commit: advance the committed offset to min(latest_drained_seq,
        oldest_pending_seq - 1), clamped to the cold checkpoint and the
-       durable WAL tail. This low-water-mark commit keeps the WAL retaining
-       any un-flushed writes, so a crash replays them from the queue.
+       power-durable end of the log. This low-water-mark commit keeps the
+       WAL retaining any un-flushed writes, so a crash replays them.
 ```
 
 **Commit policy — low-water per shard.** A compacted buffer entry absorbs many seqs. The consumer must not commit past any seq whose writes have not yet been flushed. The committed offset governs retention and restart position only. The read position is separate, so a key that stays in the buffer for hours pins retention without stopping the consumer from draining everything after it. Because each shard's consumer owns its own buffer and queue partition, the watermark is computed locally: the smallest `first_seen_seq` across the buffer entries, minus one, bounded by the latest drained seq. No cross-shard coordination is required.
@@ -101,9 +110,34 @@ loop:
 
 **Failure policy.** Apply failures hold the flusher on that shard — it keeps retrying with exponential backoff and records `apply_failures` / `retry_attempts`. Back-pressure is deliberate: if the cold store is unwritable, the WAL retains data and we prefer stalling over silent drops. Drain on other shards is unaffected.
 
-**Post-flush:** When flushed, the entry is removed from the buffer. If a new write arrives for the same key later, it re-enters with a fresh `first_seen` and `first_seen_seq`.
+**Post-flush:** When its apply succeeds, the entry is removed from the buffer. Until then it stays readable, so a read of a key hot has evicted never falls through to the cold store's older state while the batch is in flight. If a new write arrives for the same key later, it re-enters with a fresh `first_seen` and `first_seen_seq`.
 
-**Absolute TTL interaction:** If a key's absolute `ttl` has expired by flush time, the entry is dropped without writing to cold.
+### Persisting at the power-durable log
+
+No persisted derived state runs ahead of the power-durable log ([ADP-015](015-write-path-and-durability.md) §Durability classes). The consumer splits that rule in two:
+- **Absorb at the acknowledgement class.** It reads and absorbs at the class the queue acknowledges at. The buffer is volatile, so it can never hold more than hot can show.
+- **Persist at `power_loss`.** It writes to the cold store only effects whose entries are power-durable.
+
+Gating absorption itself would break reads. A collection read waits until the buffer has drained to hot's settled position (ADP-006). Under `process_crash`, hot runs at the published end, so every collection read on a written shard would wait for a device flush.
+
+**Position and carrier.** Each absorb carries two sequence numbers:
+- **Position** is the entry the consumer must resume from to re-derive the effect. It feeds `first_seen_seq` and so the commit low-water mark.
+- **Carrier** is the entry that holds the effect. It feeds the buffer entry's `last_seq`, the maximum over everything absorbed into it.
+
+For a `Write` the two are the same. For a `Resolved`, the position is its `Conditional` and the carrier is the `Resolved` itself. Its effect must not reach the cold store while the `Resolved` could still be lost: after a power loss the resolver would decide again, possibly differently.
+
+**The gate.** Before `ApplyBatch`, the consumer waits until the largest `last_seq` in the batch is below the power-durable end. The wait is bounded by `queue_read_timeout`.
+- **Absorption is paused while it waits,** because absorbing and flushing share one thread. The target cannot move, so a healthy wait lasts at most two device flushes.
+- **Skipping entries instead of waiting would starve keys.** A key written faster than one flush would never become eligible, and its `first_seen_seq` would pin the commit and WAL retention.
+- **On timeout,** the batch stays buffered and rescheduled. Nothing is counted as a failure, and the loop retries after the next drain. A stalled device then shows up as WAL durability lag.
+- **The gate sits at `ApplyBatch`, not at the cold checkpoint,** because the cold store can persist an applied batch in the background before any checkpoint.
+- **The wait is shorter than the read-consistency timeout.** While the consumer waits, its drained position is frozen, and collection reads on keys hot has evicted wait on it. The configuration validator therefore requires `cold_consumer.queue_read_timeout` to be at most half of `engine.buffer_consistency_wait_timeout`.
+
+**Wipes.** A `Flush` entry's wipe waits for that entry to be power-durable, through the same hold-and-retry as a failed wipe. FLUSHDB therefore pays `power_loss` latency in every class.
+
+**Bounded.** What is absorbed but not yet persistable is bounded by the WAL durability window (ADP-001 §Durability classes and group commit). Under a flush stall it stays bounded and observable (invariant 3).
+
+**Absolute TTL interaction:** If a key's absolute `ttl` has expired by flush time, the entry is written to cold as a delete. Dropping it instead would let an older value of the key, flushed in an earlier window, resurface once hot no longer holds the key.
 
 ### Memory Management
 

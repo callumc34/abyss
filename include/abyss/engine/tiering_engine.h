@@ -53,6 +53,8 @@ struct TieringEngineConfig {
 
 struct TieringEngineMetrics {
   uint64_t promotion_append_failures = 0;
+  // Promotions not appended because the WAL durability window was full.
+  uint64_t promotions_skipped = 0;
   uint64_t flush_total = 0;
   uint64_t flush_durable_failures = 0;
   uint64_t flush_consumer_timeouts = 0;
@@ -136,6 +138,7 @@ class TieringEngine : public core::CommandDispatcher {
   TieringEngineConfig config_;
 
   std::atomic<uint64_t> promotion_append_failures_{0};
+  std::atomic<uint64_t> promotions_skipped_{0};
   std::atomic<uint64_t> flush_total_{0};
   std::atomic<uint64_t> flush_durable_failures_{0};
   std::atomic<uint64_t> flush_consumer_timeouts_{0};
