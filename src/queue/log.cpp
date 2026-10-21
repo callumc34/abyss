@@ -267,10 +267,14 @@ struct Found {
   std::filesystem::path path;
   pfs::File file;
   pfs::MappedFile map;
+  // A valid header that names this file's ordinal.
   std::optional<LogSegmentHeader> header;
+  // The ordinal a valid header names instead of this one.
+  std::optional<uint64_t> named;
   // The header's, once it is valid.
   uint64_t salt = 0;
   bool right_size = false;
+  // Its first frame is of its own gen, whatever the header says.
   bool holds_frames = false;
 
   bool usable() const noexcept { return header.has_value() && map.valid(); }
@@ -313,13 +317,22 @@ core::Result<WalkStop> Walk(const std::map<uint64_t, Found>& found, uint64_t low
   }
 }
 
-std::optional<LogSegmentHeader> ReadHeader(const pfs::File& file) {
+// A found file's header, or nullopt if it is short or damaged. A
+// header of another format major refuses: a newer writer was here.
+core::Result<std::optional<LogSegmentHeader>> ReadHeader(const pfs::File& file,
+                                                         const std::filesystem::path& path,
+                                                         uint32_t log_id) {
   std::vector<std::byte> bytes(kLogSegmentHeaderBytes);
   auto read = pfs::Pread(file, bytes.data(), bytes.size(), 0);
-  if (!read.has_value() || *read != bytes.size()) return std::nullopt;
+  if (!read.has_value()) return std::unexpected(read.error());
+  bytes.resize(*read);
   auto header = DecodeLogSegmentHeader(bytes);
-  if (!header.has_value()) return std::nullopt;
-  return *header;
+  if (header.has_value()) return *header;
+  if (header.error().code() == core::ErrorCode::kFailedPrecondition) {
+    return std::unexpected(LogError(core::ErrorCode::kFailedPrecondition, log_id,
+                                    path.string() + ": " + header.error().message()));
+  }
+  return std::nullopt;
 }
 
 // The `.seg` files Open found, and what their headers say.
@@ -841,8 +854,8 @@ core::Result<void> Log::Impl::RecycleReady(std::unique_lock<std::mutex>& lock) {
   std::vector<PoolEntry> recycled;
   std::size_t done = 0;
   for (; done < work.size(); ++done) {
-    // Unmaps and closes it. The last reference's drop is acq_rel, so
-    // every reader's use happens before the unmap.
+    // Unmaps and closes it. The last owner's drop acquires every
+    // reader's release, so their uses happen before the unmap.
     work[done].segment.reset();
     auto removed = RemoveFile(work[done], dests[done]);
     if (!removed.has_value()) {
@@ -941,40 +954,29 @@ core::Result<OnDisk> Log::Impl::LoadFiles() {
       }
     }
   }
+  // Every refusal comes before the first file is removed.
   for (const auto& path : leftovers) {
-    ABYSS_LOG_WARN("discarding an interrupted WAL segment preparation", {"path", path.string()});
-    if (auto unlinked = pfs::Unlink(path); !unlinked.has_value()) {
-      return std::unexpected(unlinked.error());
+    auto file = pfs::Open(path, {.mode = pfs::OpenMode::kRead});
+    if (!file.has_value()) return std::unexpected(file.error());
+    if (auto header = ReadHeader(*file, path, id()); !header.has_value()) {
+      return std::unexpected(header.error());
     }
   }
 
   std::ranges::sort(frees_found);
-  {
-    const std::scoped_lock lock(mu);
-    for (const auto& [n, path] : frees_found) {
-      next_free_name = std::max(next_free_name, n + 1);
-      auto file = pfs::Open(path, {.mode = pfs::OpenMode::kRead});
-      if (!file.has_value()) return std::unexpected(file.error());
-      auto size = pfs::FileSize(*file);
-      if (!size.has_value()) return std::unexpected(size.error());
-      if (*size != config.segment_size_bytes) {
-        file->Close();
-        if (auto unlinked = pfs::Unlink(path); !unlinked.has_value()) {
-          return std::unexpected(unlinked.error());
-        }
-        continue;
-      }
-      // Without its last ordinal it cannot be safely renumbered.
-      const auto header = ReadHeader(*file);
-      if (!header.has_value()) {
-        file->Close();
-        if (auto unlinked = pfs::Unlink(path); !unlinked.has_value()) {
-          return std::unexpected(unlinked.error());
-        }
-        continue;
-      }
-      pool.push_back(PoolEntry{.path = path, .last = header->ordinal});
-    }
+  // Each pool file's last ordinal, or nullopt to unlink it: without
+  // that ordinal it cannot be safely renumbered.
+  std::vector<std::optional<uint64_t>> free_last;
+  for (const auto& [n, path] : frees_found) {
+    auto file = pfs::Open(path, {.mode = pfs::OpenMode::kRead});
+    if (!file.has_value()) return std::unexpected(file.error());
+    auto size = pfs::FileSize(*file);
+    if (!size.has_value()) return std::unexpected(size.error());
+    auto header = ReadHeader(*file, path, id());
+    if (!header.has_value()) return std::unexpected(header.error());
+    free_last.push_back(*size == config.segment_size_bytes && header->has_value()
+                            ? std::optional<uint64_t>((*header)->ordinal)
+                            : std::nullopt);
   }
 
   for (auto& [ordinal, seg] : disk.found) {
@@ -984,35 +986,46 @@ core::Result<OnDisk> Log::Impl::LoadFiles() {
     auto size = pfs::FileSize(seg.file);
     if (!size.has_value()) return std::unexpected(size.error());
     seg.right_size = *size == config.segment_size_bytes;
-    auto header = ReadHeader(seg.file);
-    if (header.has_value() && header->ordinal == ordinal) {
-      if (header->log_id != config.log_id) {
-        return std::unexpected(
-            LogError(core::ErrorCode::kFailedPrecondition, id(),
-                     seg.path.string() + " belongs to log " + std::to_string(header->log_id)));
-      }
-      if (header->shard_count != config.shard_count) {
-        return std::unexpected(
-            LogError(core::ErrorCode::kFailedPrecondition, id(),
-                     "the log was created for " + std::to_string(header->shard_count) +
-                         " shards, but " + std::to_string(config.shard_count) + " are configured"));
-      }
-      seg.header = header;
-      seg.salt = header->salt;
-      disk.window = std::max(disk.window, header->durability_window_bytes);
-    }
-    if (seg.header.has_value() && seg.right_size) {
-      auto map = pfs::MappedFile::Map(seg.file, config.segment_size_bytes);
-      if (!map.has_value()) return std::unexpected(map.error());
-      seg.map = std::move(*map);
-    }
-    if (seg.header.has_value() && *size >= kLogSegmentHeaderBytes + frame::kCommitBytes) {
+    auto header = ReadHeader(seg.file, seg.path, id());
+    if (!header.has_value()) return std::unexpected(header.error());
+    // Header damage does not reach the frames, and a recycled or torn
+    // spare carries an older gen or zeros.
+    if (*size >= kLogSegmentHeaderBytes + frame::kCommitBytes) {
       std::array<std::byte, frame::kCommitBytes> first{};
       auto read = pfs::Pread(seg.file, first.data(), first.size(), kLogSegmentHeaderBytes);
       if (!read.has_value()) return std::unexpected(read.error());
       const auto word = binary::LoadLE<uint64_t>(first.data());
       seg.holds_frames = *read == first.size() && frame::CommitGen(word) == Gen(ordinal) &&
                          frame::CommitLen(word) != 0;
+    }
+    if (header->has_value() && (*header)->ordinal != ordinal) seg.named = (*header)->ordinal;
+    if (seg.holds_frames && !header->has_value()) {
+      return std::unexpected(LogError(core::ErrorCode::kCorruption, id(),
+                                      seg.path.string() + " holds frames, but its header is "
+                                                          "short or damaged"));
+    }
+    if (seg.holds_frames && seg.named.has_value()) {
+      return std::unexpected(
+          LogError(core::ErrorCode::kCorruption, id(),
+                   seg.path.string() + " holds frames of segment " + std::to_string(ordinal) +
+                       ", but its header names segment " + std::to_string(*seg.named)));
+    }
+    if (header->has_value() && !seg.named.has_value()) {
+      const LogSegmentHeader& own = **header;
+      if (own.log_id != config.log_id) {
+        return std::unexpected(
+            LogError(core::ErrorCode::kFailedPrecondition, id(),
+                     seg.path.string() + " belongs to log " + std::to_string(own.log_id)));
+      }
+      if (own.shard_count != config.shard_count) {
+        return std::unexpected(
+            LogError(core::ErrorCode::kFailedPrecondition, id(),
+                     "the log was created for " + std::to_string(own.shard_count) +
+                         " shards, but " + std::to_string(config.shard_count) + " are configured"));
+      }
+      seg.header = own;
+      seg.salt = own.salt;
+      disk.window = std::max(disk.window, own.durability_window_bytes);
     }
     if (seg.holds_frames) disk.last_holding = ordinal;
     if (seg.holds_frames && !seg.right_size) {
@@ -1021,6 +1034,30 @@ core::Result<OnDisk> Log::Impl::LoadFiles() {
           seg.path.string() + " holds frames but is " + std::to_string(*size) +
               " bytes, not queue.segment_size_bytes " + std::to_string(config.segment_size_bytes) +
               "; the segment size cannot change while the log holds data"));
+    }
+    if (seg.header.has_value() && seg.right_size) {
+      auto map = pfs::MappedFile::Map(seg.file, config.segment_size_bytes);
+      if (!map.has_value()) return std::unexpected(map.error());
+      seg.map = std::move(*map);
+    }
+  }
+
+  for (const auto& path : leftovers) {
+    ABYSS_LOG_WARN("discarding an interrupted WAL segment preparation", {"path", path.string()});
+    if (auto unlinked = pfs::Unlink(path); !unlinked.has_value()) {
+      return std::unexpected(unlinked.error());
+    }
+  }
+  {
+    const std::scoped_lock lock(mu);
+    for (std::size_t i = 0; i < frees_found.size(); ++i) {
+      const auto& [n, path] = frees_found[i];
+      next_free_name = std::max(next_free_name, n + 1);
+      if (free_last[i].has_value()) {
+        pool.push_back(PoolEntry{.path = path, .last = *free_last[i]});
+      } else if (auto unlinked = pfs::Unlink(path); !unlinked.has_value()) {
+        return std::unexpected(unlinked.error());
+      }
     }
   }
   disk.lowest = disk.found.empty() ? 0 : disk.found.begin()->first;
@@ -1083,6 +1120,15 @@ core::Result<void> Log::Impl::Adopt(OnDisk& disk, Replayed& replayed) {
   // crash midway leaves the ordinals contiguous. This comes before the
   // tail is padded: until the padding lands the hole stops a later
   // walk, and after it the next segment is gone.
+  for (auto it = disk.found.lower_bound(active); it != disk.found.end(); ++it) {
+    // Only frames in a segment the walk could enter are known to lie
+    // past the end; no other file holding its own gen is removed.
+    if (it->second.holds_frames && !it->second.usable()) {
+      return std::unexpected(LogError(
+          core::ErrorCode::kCorruption, id(),
+          it->second.path.string() + " holds frames, but is not a segment recovery can read"));
+    }
+  }
   const std::scoped_lock lock(mu);
   bool moved_any = false;
   for (auto it = disk.found.rbegin(); it != disk.found.rend() && it->first >= active; ++it) {
@@ -1090,7 +1136,8 @@ core::Result<void> Log::Impl::Adopt(OnDisk& disk, Replayed& replayed) {
     seg.map.Unmap();
     seg.file.Close();
     moved_any = true;
-    if (!seg.right_size || !seg.header.has_value()) {
+    const std::optional<uint64_t> last = seg.header.has_value() ? seg.header->ordinal : seg.named;
+    if (!seg.right_size || !last.has_value()) {
       if (auto unlinked = pfs::Unlink(seg.path); !unlinked.has_value()) {
         return std::unexpected(unlinked.error());
       }
@@ -1100,7 +1147,7 @@ core::Result<void> Log::Impl::Adopt(OnDisk& disk, Replayed& replayed) {
     if (auto moved = pfs::Rename(seg.path, dest); !moved.has_value()) {
       return std::unexpected(moved.error());
     }
-    pool.push_back(PoolEntry{.path = dest, .last = seg.header->ordinal});
+    pool.push_back(PoolEntry{.path = dest, .last = *last});
   }
   if (moved_any) {
     if (auto dir = SyncDir(config.dir); !dir.has_value()) return std::unexpected(dir.error());

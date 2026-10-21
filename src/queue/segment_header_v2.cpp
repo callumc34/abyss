@@ -47,20 +47,27 @@ void EncodeLogSegmentHeader(const LogSegmentHeader& header, std::span<std::byte>
 
 core::Result<LogSegmentHeader> DecodeLogSegmentHeader(std::span<const std::byte> bytes) {
   using namespace binary;
-  if (bytes.size() < kFieldBytes + sizeof(uint32_t)) {
-    return std::unexpected(HeaderError("truncated"));
-  }
+  if (bytes.size() < kLogSegmentMagic.size() + 1) return std::unexpected(HeaderError("truncated"));
   if (!std::equal(kLogSegmentMagic.begin(), kLogSegmentMagic.end(), bytes.begin())) {
     return std::unexpected(HeaderError("bad magic"));
   }
-  std::span<const std::byte> cursor = bytes.subspan(kLogSegmentMagic.size());
+  // Before the CRC and the length: a newer major may change both.
+  const auto major = static_cast<uint8_t>(bytes[kLogSegmentMagic.size()]);
+  if (major != kLogFormatMajor) {
+    return std::unexpected(core::Error{core::ErrorCode::kFailedPrecondition,
+                                       "log segment header: format major " + std::to_string(major) +
+                                           " is not supported; this build reads major " +
+                                           std::to_string(kLogFormatMajor)});
+  }
+  if (bytes.size() < kFieldBytes + sizeof(uint32_t)) {
+    return std::unexpected(HeaderError("truncated"));
+  }
+  std::span<const std::byte> cursor = bytes.subspan(kLogSegmentMagic.size() + 1);
   LogSegmentHeader header;
-  uint8_t major = 0;
   uint16_t reserved = 0;
   uint32_t stored_crc = 0;
   int64_t created_us = 0;
   // Fixed-width reads cannot fail: the size was checked above.
-  ReadU8(cursor, major);
   ReadU8(cursor, header.format_minor);
   ReadU16LE(cursor, reserved);
   ReadU32LE(cursor, header.log_id);
@@ -70,9 +77,6 @@ core::Result<LogSegmentHeader> DecodeLogSegmentHeader(std::span<const std::byte>
   ReadU64LE(cursor, header.durability_window_bytes);
   ReadU64LE(cursor, header.salt);
   ReadU32LE(cursor, stored_crc);
-  if (major != kLogFormatMajor) {
-    return std::unexpected(HeaderError("unsupported format major"));
-  }
   if (Crc32c(bytes.first(kFieldBytes)) != stored_crc) {
     return std::unexpected(HeaderError("CRC mismatch"));
   }

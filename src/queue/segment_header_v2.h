@@ -34,6 +34,9 @@ struct LogSegmentHeader {
 void EncodeLogSegmentHeader(const LogSegmentHeader& header, std::span<std::byte> out);
 
 // kCorruption for a bad magic, an unknown major or a CRC mismatch.
+// kFailedPrecondition if the magic is ours but the format major is not
+// (a newer writer's, or damage that cannot be told from one); else
+// kCorruption.
 core::Result<LogSegmentHeader> DecodeLogSegmentHeader(std::span<const std::byte> bytes);
 
 }  // namespace abyss::queue

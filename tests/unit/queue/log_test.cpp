@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -193,6 +194,27 @@ class LogTest : public ::testing::Test {
     }
     std::ranges::sort(names);
     return names;
+  }
+
+  // Every file in the log directory, by name, with its contents.
+  std::map<std::string, std::string> Snapshot() const {
+    std::map<std::string, std::string> files;
+    for (const auto& entry : std::filesystem::directory_iterator(Config().dir)) {
+      std::ifstream in(entry.path(), std::ios::binary);
+      files[entry.path().filename().string()] =
+          std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    return files;
+  }
+
+  std::vector<std::byte> HeaderOf(uint64_t ordinal) const {
+    std::vector<std::byte> header(kLogSegmentHeaderBytes);
+    auto file = pfs::Open(SegPath(ordinal), {.mode = pfs::OpenMode::kRead});
+    EXPECT_TRUE(file.has_value());
+    if (file.has_value()) {
+      EXPECT_TRUE(pfs::Pread(*file, header.data(), header.size(), 0).has_value());
+    }
+    return header;
   }
 
  private:
@@ -932,6 +954,27 @@ TEST_F(LogTest, AFileNeverRegainsAGenItHeldAcrossTwoRecoveries) {
   }
 }
 
+// The torn-spare path again, over stale frames of an older gen.
+TEST_F(RecycledLogTest, ADamagedHeaderOverStaleFramesIsUnlinked) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    BuildRecycled(*log);
+    if (HasFatalFailure()) return;
+  }
+  FlipByte(SegPath(4), 20);
+
+  std::vector<RecoveredFrame> recovered;
+  auto log = OpenLog(&recovered);
+  ASSERT_NE(log, nullptr);
+  ASSERT_EQ(recovered.size(), 9U);
+  EXPECT_EQ(recovered.back().header.seq, 11U);
+  EXPECT_EQ(log->FilledPrefix(), 4 * kSpace);
+  auto header = DecodeLogSegmentHeader(HeaderOf(4));
+  ASSERT_TRUE(header.has_value()) << header.error().message();
+  EXPECT_EQ(header->ordinal, 4U);
+}
+
 TEST_F(LogTest, AFrameForgedWithoutTheSegmentSaltIsATornTail) {
   {
     auto log = OpenLog();
@@ -1131,6 +1174,148 @@ TEST_F(LogTest, AnOrdinalGapIsCorruption) {
   EXPECT_NE(log.error().message().find("segment 1"), std::string::npos) << log.error().message();
 }
 
+// Frames of segment 0's gen fill segments 0 and 1; 2 and 3 are spares.
+// A newer writer's major on every file must not read as an empty log.
+TEST_F(LogTest, ANewerFormatMajorRefusesAndTouchesNothing) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+  }
+  const std::array newer{static_cast<std::byte>(kLogFormatMajor + 1)};
+  for (const auto& name : FilesWith(".seg")) PatchFile(Config().dir / name, 4, newer);
+  std::ofstream(Config().dir / (Padded(9) + ".seg.tmp")) << "partial";
+  const auto before = Snapshot();
+
+  auto log = Log::Open(Config(), {});
+  ASSERT_FALSE(log.has_value());
+  EXPECT_EQ(log.error().code(), core::ErrorCode::kFailedPrecondition);
+  const std::string& message = log.error().message();
+  EXPECT_NE(message.find(Padded(0) + ".seg"), std::string::npos) << message;
+  EXPECT_NE(message.find("major " + std::to_string(kLogFormatMajor + 1)), std::string::npos)
+      << message;
+  EXPECT_NE(message.find("reads major " + std::to_string(kLogFormatMajor)), std::string::npos)
+      << message;
+  EXPECT_EQ(Snapshot(), before);
+}
+
+TEST_F(LogTest, ANewerFormatMajorInThePoolRefuses) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    Append(*log, 0, 0, 64);
+  }
+  const std::filesystem::path pooled = Config().dir / "free-7.seg";
+  std::filesystem::copy_file(SegPath(2), pooled);
+  PatchFile(pooled, 4, std::array{static_cast<std::byte>(kLogFormatMajor + 1)});
+  const auto before = Snapshot();
+
+  auto log = Log::Open(Config(), {});
+  ASSERT_FALSE(log.has_value());
+  EXPECT_EQ(log.error().code(), core::ErrorCode::kFailedPrecondition);
+  EXPECT_NE(log.error().message().find("free-7.seg"), std::string::npos) << log.error().message();
+  EXPECT_EQ(Snapshot(), before);
+}
+
+TEST_F(LogTest, ADamagedHeaderOverFramesRefusesAndTouchesNothing) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+  }
+  FlipByte(SegPath(1), 20);
+  const auto before = Snapshot();
+
+  auto log = Log::Open(Config(), {});
+  ASSERT_FALSE(log.has_value());
+  EXPECT_EQ(log.error().code(), core::ErrorCode::kCorruption);
+  EXPECT_NE(log.error().message().find(Padded(1) + ".seg"), std::string::npos)
+      << log.error().message();
+  EXPECT_EQ(Snapshot(), before);
+}
+
+TEST_F(LogTest, ADamagedHeaderMidLogRefusesNamingTheFile) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 7; ++seq) Append(*log, 0, seq, 20000);
+  }
+  FlipByte(SegPath(1), 20);
+  const auto before = Snapshot();
+
+  auto log = Log::Open(Config(), {});
+  ASSERT_FALSE(log.has_value());
+  EXPECT_EQ(log.error().code(), core::ErrorCode::kCorruption);
+  EXPECT_NE(log.error().message().find(Padded(1) + ".seg"), std::string::npos)
+      << log.error().message();
+  EXPECT_EQ(Snapshot(), before);
+}
+
+TEST_F(LogTest, AShortFileWithADamagedHeaderOverFramesRefuses) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+  }
+  FlipByte(SegPath(1), 20);
+  std::filesystem::resize_file(SegPath(1), kSegmentBytes / 2);
+  const auto before = Snapshot();
+
+  auto log = Log::Open(Config(), {});
+  ASSERT_FALSE(log.has_value());
+  EXPECT_EQ(log.error().code(), core::ErrorCode::kCorruption);
+  EXPECT_NE(log.error().message().find(Padded(1) + ".seg"), std::string::npos)
+      << log.error().message();
+  EXPECT_EQ(Snapshot(), before);
+}
+
+TEST_F(LogTest, AHeaderNamingAnotherOrdinalOverFramesRefuses) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    for (core::SequenceId seq = 0; seq < 4; ++seq) Append(*log, 0, seq, 20000);
+  }
+  PatchFile(SegPath(1), 0, HeaderOf(3));
+  const auto before = Snapshot();
+
+  auto log = Log::Open(Config(), {});
+  ASSERT_FALSE(log.has_value());
+  EXPECT_EQ(log.error().code(), core::ErrorCode::kCorruption);
+  const std::string& message = log.error().message();
+  EXPECT_NE(message.find(Padded(1) + ".seg"), std::string::npos) << message;
+  EXPECT_NE(message.find("names segment 3"), std::string::npos) << message;
+  EXPECT_EQ(Snapshot(), before);
+}
+
+// Its frames can only be of the ordinal its header names, so it may
+// take any ordinal above that one.
+TEST_F(LogTest, AHeaderNamingAnotherOrdinalWithoutFramesIsRecycled) {
+  {
+    auto log = OpenLog();
+    ASSERT_NE(log, nullptr);
+    Append(*log, 0, 0, 64);
+  }
+  PatchFile(SegPath(2), 0, HeaderOf(1));
+  const double grown_before =
+      metrics::testing::GetCounterValue(metrics::names::kWalSegmentsGrownTotal).value_or(0);
+
+  std::vector<RecoveredFrame> recovered;
+  auto log = OpenLog(&recovered);
+  ASSERT_NE(log, nullptr);
+  EXPECT_EQ(recovered.size(), 1U);
+  // Both old spares last held ordinal 1: segment 1 is grown, and they
+  // become segments 2 and 3.
+  EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kWalSegmentsGrownTotal).value_or(0),
+            grown_before + 1);
+  EXPECT_EQ(log->spare_count(), 2U);
+  EXPECT_TRUE(FilesWith("free-").empty());
+  for (uint64_t ordinal = 1; ordinal < 4; ++ordinal) {
+    auto header = DecodeLogSegmentHeader(HeaderOf(ordinal));
+    ASSERT_TRUE(header.has_value()) << ordinal;
+    EXPECT_EQ(header->ordinal, ordinal);
+  }
+}
+
 TEST_F(LogTest, AShardCountMismatchIsRefused) {
   {
     auto log = OpenLog();
@@ -1163,10 +1348,36 @@ TEST(LogSegmentHeaderTest, RoundTripsAndRejectsDamage) {
   EXPECT_EQ(decoded->salt, header.salt);
 
   bytes[20] ^= std::byte{0x01};
-  EXPECT_FALSE(DecodeLogSegmentHeader(bytes).has_value());
+  auto damaged = DecodeLogSegmentHeader(bytes);
+  ASSERT_FALSE(damaged.has_value());
+  EXPECT_EQ(damaged.error().code(), core::ErrorCode::kCorruption);
   bytes[20] ^= std::byte{0x01};
-  bytes[4] = std::byte{1};
-  EXPECT_FALSE(DecodeLogSegmentHeader(bytes).has_value()) << "format 1 is not a log segment";
+  bytes[0] ^= std::byte{0x01};
+  auto foreign = DecodeLogSegmentHeader(bytes);
+  ASSERT_FALSE(foreign.has_value());
+  EXPECT_EQ(foreign.error().code(), core::ErrorCode::kCorruption);
+  bytes[0] ^= std::byte{0x01};
+}
+
+// The major is read before the CRC and the length, which it may change.
+TEST(LogSegmentHeaderTest, AnotherMajorIsAFailedPreconditionNotDamage) {
+  std::vector<std::byte> bytes(kLogSegmentHeaderBytes);
+  EncodeLogSegmentHeader(LogSegmentHeader{.log_id = 1, .ordinal = 5}, bytes);
+  for (const uint8_t major : {uint8_t{1}, static_cast<uint8_t>(kLogFormatMajor + 1)}) {
+    bytes[4] = static_cast<std::byte>(major);
+    auto decoded = DecodeLogSegmentHeader(bytes);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code(), core::ErrorCode::kFailedPrecondition);
+    EXPECT_NE(decoded.error().message().find("major " + std::to_string(major)), std::string::npos)
+        << decoded.error().message();
+    auto prefix = DecodeLogSegmentHeader(std::span(bytes).first(5));
+    ASSERT_FALSE(prefix.has_value());
+    EXPECT_EQ(prefix.error().code(), core::ErrorCode::kFailedPrecondition);
+  }
+  bytes[4] = static_cast<std::byte>(kLogFormatMajor);
+  auto truncated = DecodeLogSegmentHeader(std::span(bytes).first(5));
+  ASSERT_FALSE(truncated.has_value());
+  EXPECT_EQ(truncated.error().code(), core::ErrorCode::kCorruption);
 }
 
 }  // namespace
