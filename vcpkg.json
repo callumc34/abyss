@@ -2,7 +2,7 @@
   "name": "abyss",
   "version": "0.1.0",
   "description": "Redis-compatible hot-cold tiered KV store",
-  "builtin-baseline": "d13fa75214c258099923cf25a5e6311e58c07f3b",
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     "cli11",
     "cpp-httplib",
