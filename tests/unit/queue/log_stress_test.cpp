@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -182,6 +184,15 @@ TEST(LogStressTest, ConcurrentAppendersAndAFlusherAgree) {
 
 // Retention reclaims sealed segments while appenders roll and readers
 // hold frames: deferred recycling and the hazard check under load.
+// Where each thread of the reclaim race is, so a hang names its wait.
+enum class Step : int { kReserve, kSpare, kFill, kFlush, kReclaim, kRead, kDone };
+
+const char* StepName(int step) {
+  static constexpr std::array kNames{"reserve", "spare", "fill", "flush",
+                                     "reclaim", "read",  "done"};
+  return kNames.at(static_cast<std::size_t>(step));
+}
+
 TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
   const testing::TempDir dir("log_reclaim_stress");
   auto opened = Log::Open(Config(dir), {});
@@ -191,12 +202,46 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
   constexpr int kWriters = 4;
   constexpr int kFrames = 600;
   std::atomic<int> done{0};
+  std::array<std::atomic<int>, kWriters + 2> steps{};
+  std::array<std::atomic<int>, kWriters> appended{};
+  const auto mark = [&steps](int who, Step step) {
+    steps.at(static_cast<std::size_t>(who)).store(static_cast<int>(step));
+  };
+  constexpr int kFlusher = kWriters;
+  constexpr int kReader = kWriters + 1;
+
+  // Before ctest's timeout: a hang reports every thread's wait.
+  std::atomic<bool> finished{false};
+  std::thread watchdog([&] {
+    const auto until = std::chrono::steady_clock::now() + 20s;
+    while (!finished.load() && std::chrono::steady_clock::now() < until) {
+      std::this_thread::sleep_for(10ms);
+    }
+    if (finished.load()) return;
+    std::string state = "hung: filled " + std::to_string(log.FilledPrefix()) + " reserved " +
+                        std::to_string(log.ReservedTail()) + " durable " +
+                        std::to_string(log.DurablePrefix()) + " spares " +
+                        std::to_string(log.spare_count()) + " free " +
+                        std::to_string(log.free_count());
+    for (int t = 0; t < kWriters; ++t) {
+      state += "; writer " + std::to_string(t) + " at " +
+               StepName(steps.at(static_cast<std::size_t>(t)).load()) + " after " +
+               std::to_string(appended.at(static_cast<std::size_t>(t)).load());
+    }
+    state += std::string("; flusher at ") + StepName(steps.at(kFlusher).load()) + "; reader at " +
+             StepName(steps.at(kReader).load());
+    std::cerr << state << "\n" << std::flush;
+    ADD_FAILURE() << state;
+  });
+
   std::thread flusher([&] {
     while (done.load(std::memory_order_acquire) < kWriters) {
+      mark(kFlusher, Step::kFlush);
       if (auto result = log.Flush({}); !result.has_value()) {
         ADD_FAILURE() << result.error().message();
         return;
       }
+      mark(kFlusher, Step::kReclaim);
       for (const auto& segment : log.SealedSegments(64)) {
         if (auto reclaimed = log.Reclaim(segment.ordinal); !reclaimed.has_value()) {
           ADD_FAILURE() << reclaimed.error().message();
@@ -204,12 +249,14 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
         }
       }
     }
+    mark(kFlusher, Step::kDone);
   });
   std::thread reader([&] {
     // A fixed seed keeps a failure reproducible.
     std::mt19937_64 rng(7);  // NOLINT(bugprone-random-generator-seed)
     std::vector<FrameRef> held;
     while (done.load(std::memory_order_acquire) < kWriters) {
+      mark(kReader, Step::kRead);
       // Every segment starts with a frame.
       const auto sealed = log.SealedSegments(64);
       const LogPosition start = !sealed.empty() && (rng() % 2) == 0
@@ -238,21 +285,42 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
       }
       if (held.size() > 32 || (rng() % 4) == 0) held.clear();
     }
+    mark(kReader, Step::kDone);
   });
   std::vector<std::thread> writers;
   writers.reserve(kWriters);
   for (int t = 0; t < kWriters; ++t) {
     writers.emplace_back([&, t] {
       for (int seq = 0; seq < kFrames; ++seq) {
-        AppendFrame(log,
-                    Frame(static_cast<core::ShardId>(t), static_cast<core::SequenceId>(seq), 4096));
+        const auto bytes =
+            Frame(static_cast<core::ShardId>(t), static_cast<core::SequenceId>(seq), 4096);
+        for (;;) {
+          mark(t, Step::kReserve);
+          auto reservation = log.Reserve(static_cast<uint32_t>(bytes.size()));
+          if (reservation.has_value()) {
+            log.Commit(*reservation, bytes);
+            mark(t, Step::kFill);
+            log.AwaitFilled(reservation->pos + reservation->size);
+            break;
+          }
+          EXPECT_EQ(reservation.error().code(), core::ErrorCode::kUnavailable);
+          mark(t, Step::kSpare);
+          if (!log.WaitForSpare(std::chrono::steady_clock::now() + 10s)) {
+            ADD_FAILURE() << "no spare segment within 10s";
+            return;
+          }
+        }
+        appended.at(static_cast<std::size_t>(t)).fetch_add(1);
       }
+      mark(t, Step::kDone);
       done.fetch_add(1, std::memory_order_release);
     });
   }
   for (auto& writer : writers) writer.join();
   flusher.join();
   reader.join();
+  finished.store(true);
+  watchdog.join();
   EXPECT_EQ(log.FilledPrefix(), log.ReservedTail());
   EXPECT_LE(log.free_count(), 2U);
 }
