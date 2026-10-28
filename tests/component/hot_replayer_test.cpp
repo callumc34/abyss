@@ -30,6 +30,7 @@
 #include "abyss/hot/single_shard_store.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "queue_append.h"
 #include "sequenced_engine_fixture.h"
 
 namespace abyss::engine {
@@ -86,9 +87,9 @@ std::string Canonical(const hot::Value& value) {
 class HotReplayerRecoveryTest : public SequencedEngineTest {
  protected:
   core::SequenceId Append(core::ShardId shard, core::QueueEntry entry) {
-    auto appended = queue_->Append(shard, std::move(entry));
+    auto appended = abyss::testing::Append(*queue_, shard, std::move(entry));
     EXPECT_TRUE(appended.has_value()) << appended.error().message();
-    return appended.has_value() ? appended->seq : 0;
+    return appended.value_or(0);
   }
 
   // Each key's entry as hot holds it: presence, type, TTL, latest_seq

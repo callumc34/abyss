@@ -33,13 +33,12 @@ The log records decided effects, not intents ([ADP-015](015-write-path-and-durab
 
 The queue entry (`QueueEntry`) is a struct with common metadata (sequence ID, wall-clock timestamp) and a payload variant that discriminates the entry types. Common fields are direct field accesses — no visitor needed just to read a sequence number. Type dispatch uses the variant only when consumers need to act on the payload.
 
-The queue interface offers two append paths:
+The queue has one append path, the sequencer's ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). Every write the server takes goes through it, in four steps:
 
-- **The sequencer's append** ([ADP-015](015-write-path-and-durability.md) §Sequenced write path). Every write the server takes goes through it, in three steps:
-  - `Admit` waits for room in the durability window (volume-wide bytes, and the age of the shard's log), and `WaitForSpare` for a prepared segment, under no lock.
-  - `Reserve` runs under the hot shard locks and never waits. It assigns each involved shard's seqs and reserves every part as one batch in one log, committing its frames in place until their total reaches 16 KiB. On failure nothing is taken and no seq is used: the window is full, no spare is ready, an entry is too large, or the shards span logs (`CROSSSLOT`). `ReserveFlush` reserves one `Flush` per shard, one batch per log.
-  - `Complete` runs once the locks are released. It fills the reservation's remaining frames, publishes each shard once its earlier seqs are published, and returns the durability futures, which resolve when the entries reach the configured durability class (§Durability classes and group commit).
-- **Two-phase and one-shot** — `BeginAppend` / `BeginAppendBatch` return a handle that publishes the entry when the caller publishes it, or on destruction if the caller drops it, so a forgotten publish degrades to a latency bug, never a lost write. `Append` / `AppendBatch` publish inline. The server's write path no longer uses them.
+- The write waits for room in the durability window (volume-wide bytes, and the age of the shard's log) and for a prepared segment, under no lock. Each wait registers a waiter, which a flush that frees room or a newly prepared segment wakes.
+- `Reserve` runs under the hot shard locks and never waits. It assigns each involved shard's seqs and reserves every part as one batch in one log, committing its frames in place until their total reaches 16 KiB. On failure nothing is taken and no seq is used: the window is full, no spare is ready, an entry is too large, or the shards span logs (`CROSSSLOT`). `ReserveFlush` reserves one `Flush` per shard, one batch per log.
+- `Complete` runs once the locks are released. It fills the reservation's remaining frames, publishes each shard once its earlier seqs are published, and returns each shard's range of seqs.
+- The durable wait follows. The write is acknowledged once the last seq of each range reaches the configured durability class (§Durability classes and group commit). Its waiter registers against the shard's durable end and is posted when the end passes its seq.
 
 **Read position and committed offset are separate**, as a Kafka fetch position and committed offset are.
 - **Read.** A consumer owns its read position and passes it to `Read`, together with the durability class the returned entries must have reached. `Read` returns the contiguous entries at or after that sequence that are durable at that class. A position below the oldest retained entry is an explicit out-of-range error, never silently moved forward.
@@ -51,7 +50,7 @@ The queue interface offers two append paths:
 
 The sequencer creates every entry. The cold consumer and recovery's scan are read-only against the queue.
 
-See `include/abyss/core/queue.h`, `include/abyss/core/queue_entry.h`, and `include/abyss/queue/pending_append.h` for the current interface.
+See `include/abyss/core/queue.h`, `include/abyss/core/queue_entry.h`, and `include/abyss/queue/reservation.h` for the current interface.
 
 ### Embedded WAL
 
@@ -120,7 +119,7 @@ A committed offset never passes the power-durable end, so a persisted offset at 
 
 ### Batch atomicity
 
-A batch (an `AppendBatch`, or one `Reserve` of several shards' entries in one log) is atomic across crashes: every entry in it is either present in the WAL after recovery, or none is.
+A batch (one `Reserve`'s entries in one log, from one shard or several) is atomic across crashes: every entry in it is either present in the WAL after recovery, or none is.
 - A batch is reserved as one contiguous range of its log, and each frame records the bytes to its batch's end.
 - Recovery drops a trailing batch whose end lies past the recovered end of the log.
 - A shard's `power_loss` durable end advances only at batch ends.
@@ -135,14 +134,14 @@ The queue reports that it is recovering while it is being opened (log scan, torn
 
 ### Durability classes and group commit
 
-A write's durability future resolves when its entry reaches the class set by `queue.durability` ([ADP-015](015-write-path-and-durability.md) §Durability classes):
+A write is acknowledged when its entry reaches the class set by `queue.durability` ([ADP-015](015-write-path-and-durability.md) §Durability classes):
 
-| Class | Resolves when | Survives |
+| Class | Acknowledged when | Survives |
 |-------|---------------|----------|
 | `process_crash` (default) | The entry is published: filled into its log's mapped segment, below the log's filled prefix, so it is in the page cache | Process crash, OOM kill, container restart. A power loss loses at most the durability window. |
 | `power_loss` | The fdatasync (`F_FULLFSYNC` on macOS) covering it has completed | Power loss |
 
-The sequencer applies the entry's effect to hot before the entry is published, and the write replies once its future resolves (ADP-006).
+The sequencer applies the entry's effect to hot before the entry is published, and the write replies once the entry reaches the class (ADP-006).
 
 **Natural batching.**
 - Each log has a commit thread. A flush starts as soon as the previous one ends, and covers every entry published while it ran. There is no timer and no batch cap.
@@ -200,7 +199,7 @@ queue:
 
 ## Invariants
 
-1. An append's durability future resolving OK means the entry is durable at the configured class: published (`process_crash`) or covered by a completed fdatasync (`power_loss`).
+1. A write is acknowledged only once its entry is durable at the configured class: published (`process_crash`) or covered by a completed fdatasync (`power_loss`).
 2. `Read` returns entries in sequence order. No gaps, no reordering.
 3. The queue retains every entry above the minimum persisted committed offset across retention consumers.
 4. Each consumer owns its read position. No consumer's progress, and no committed offset, affects where another consumer reads.

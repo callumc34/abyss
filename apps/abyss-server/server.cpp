@@ -141,8 +141,6 @@ bool Server::Initialize() {
       .durability = config_.queue.durability,
       .durability_window_bytes = config_.queue.durability_window_bytes,
       .durability_window = config_.queue.durability_window,
-      // A write that cannot be admitted within the client's budget fails.
-      .admission_timeout = config_.engine.write_timeout,
       .min_retention = config_.queue.min_retention,
       // Only cold commits offsets and gates retention; hot commits none
       // and rebuilds from the queue on restart (ADP-002 §"Eviction refresh vs

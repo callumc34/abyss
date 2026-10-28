@@ -24,24 +24,6 @@ class ForwardingQueue : public core::Queue {
  public:
   explicit ForwardingQueue(core::Queue& queue) : queue_(queue) {}
 
-  core::Result<queue::PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry,
-                                                 core::SteadyTime admit_by) override {
-    return queue_.BeginAppend(shard, std::move(entry), admit_by);
-  }
-  core::Result<queue::PendingBatchAppend> BeginAppendBatch(
-      core::ShardId shard, std::span<const core::QueueEntry> entries,
-      core::SteadyTime admit_by) override {
-    return queue_.BeginAppendBatch(shard, entries, admit_by);
-  }
-  core::Result<queue::AppendResult> Append(core::ShardId shard, core::QueueEntry entry,
-                                           core::SteadyTime admit_by) override {
-    return queue_.Append(shard, std::move(entry), admit_by);
-  }
-  core::Result<queue::AppendBatchResult> AppendBatch(core::ShardId shard,
-                                                     std::span<const core::QueueEntry> entries,
-                                                     core::SteadyTime admit_by) override {
-    return queue_.AppendBatch(shard, entries, admit_by);
-  }
   bool Admissible(core::ShardId shard) override { return queue_.Admissible(shard); }
   std::optional<core::Result<void>> WhenReady(core::QueueWait wait, core::ShardId shard,
                                               core::Waiter& waiter, bool first) override {

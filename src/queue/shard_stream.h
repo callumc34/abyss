@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,12 +20,10 @@
 #include "abyss/core/thread_annotations.h"
 #include "abyss/core/types.h"
 #include "abyss/metrics/metrics.h"
-#include "abyss/queue/append_result.h"
 #include "abyss/queue/durability_window.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/group_commit.h"
 #include "abyss/queue/log.h"
-#include "abyss/queue/pending_append.h"
 #include "abyss/queue/reservation.h"
 
 namespace abyss::queue {
@@ -57,19 +54,16 @@ struct ShardStreamConfig {
   core::ShardId shard = 0;
   // A power of two.
   std::size_t ring_entries = std::size_t{1} << 16;
-  std::size_t max_value_size_bytes = std::size_t{64} << 20;
-  core::Durability ack_durability = core::Durability::kProcessCrash;
   // Both outlive the stream.
   DurabilityWindow* window = nullptr;
   LogUnit* unit = nullptr;
 };
 
 // One shard's stream of frames in its log (ADP-015 §Shard streams).
-// next_seq_ is under the append lock. A PendingAppend holds it until it
-// publishes; a Reservation releases it at once and publishes in
-// Complete. Either publishes only after every earlier seq has. Readers
-// locate frames lock-free through the offset ring, then through the
-// position hints, then from a sparse index point.
+// next_seq_ is under the append lock. A Reservation releases it at
+// once and publishes in Complete, only after every earlier seq has.
+// Readers locate frames lock-free through the offset ring, then through
+// the position hints, then from a sparse index point.
 class ShardStream {
  public:
   explicit ShardStream(ShardStreamConfig config);
@@ -89,9 +83,6 @@ class ShardStream {
   // `next`, which is at least recovered_next().
   void FinishRecovery(core::SequenceId next);
 
-  core::Result<PendingAppend> BeginAppend(core::QueueEntry entry, core::SteadyTime admit_by);
-  core::Result<PendingBatchAppend> BeginAppendBatch(std::span<const core::QueueEntry> entries,
-                                                    core::SteadyTime admit_by);
   // One log's share of a reservation: the parts' streams, the parts,
   // and every entry's frame size, in order.
   struct LogParts {
@@ -183,13 +174,6 @@ class ShardStream {
     std::atomic<LogPosition> pos{0};
   };
 
-  struct Begun {
-    core::SequenceId first = 0;
-    core::SequenceId last = 0;
-    DurabilityFuture durable;
-    std::unique_ptr<AppendPublisher> publisher;
-  };
-  class Publisher;
   class Filler;
   class MultiFiller;
 
@@ -201,10 +185,7 @@ class ShardStream {
 
   Log& log() const noexcept { return *config_.unit->log; }
 
-  core::Result<Begun> Begin(std::span<core::QueueEntry> entries, core::SteadyTime admit_by);
   void Record(core::SequenceId seq, LogPosition pos, uint32_t size) ABYSS_REQUIRES(append_mu_);
-  // An append's future, resolved by power_waiters_.
-  DurabilityFuture PowerDurableFuture(core::SequenceId last);
   // Until every seq below `first` is published.
   void AwaitPublished(core::SequenceId first) noexcept;
   // Complete's publish of [first, end).

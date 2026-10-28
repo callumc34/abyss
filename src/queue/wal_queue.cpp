@@ -222,8 +222,6 @@ core::Result<void> WalQueue::Initialize() {
     streams_.push_back(std::make_unique<ShardStream>(ShardStreamConfig{
         .shard = shard,
         .ring_entries = config_.ring_entries,
-        .max_value_size_bytes = config_.max_value_size_bytes,
-        .ack_durability = config_.durability,
         .window = &window_,
         .unit = logs_[shard % config_.log_count].get(),
     }));
@@ -572,38 +570,6 @@ core::Result<void> WalQueue::ValidateShard(core::ShardId shard) const {
   return {};
 }
 
-core::SteadyTime WalQueue::DefaultAdmitBy() const {
-  return core::SteadyClock::now() + config_.admission_timeout;
-}
-
-core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry,
-                                                  core::SteadyTime admit_by) {
-  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL append by a thread holding a reservation");
-  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return streams_[shard]->BeginAppend(std::move(entry), admit_by);
-}
-
-core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
-    core::ShardId shard, std::span<const core::QueueEntry> entries, core::SteadyTime admit_by) {
-  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL append by a thread holding a reservation");
-  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return streams_[shard]->BeginAppendBatch(entries, admit_by);
-}
-
-core::Result<void> WalQueue::Admit(core::ShardId shard, core::SteadyTime admit_by) {
-  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL admission wait by a thread holding a reservation");
-  if (auto v = ValidateShard(shard); !v.has_value()) return std::unexpected(v.error());
-  return window_.Admit(shard % config_.log_count, admit_by);
-}
-
-bool WalQueue::WaitForSpare(core::ShardId shard, core::SteadyTime deadline) {
-  ABYSS_DCHECK(ReservationsHeld() == 0, "WAL spare wait by a thread holding a reservation");
-  // A stopping queue refuses Reserve, so a ready spare must not invite
-  // another attempt.
-  if (shard >= config_.shard_count || streams_[shard]->stopping()) return false;
-  return logs_[shard % config_.log_count]->log->WaitForSpare(deadline);
-}
-
 bool WalQueue::Admissible(core::ShardId shard) {
   return shard < config_.shard_count && window_.Admissible(shard % config_.log_count);
 }
@@ -743,46 +709,6 @@ std::vector<ReservedRange> WalQueue::Complete(Reservation&& reservation) {
 
 uint64_t WalQueue::ReadyToComplete(uint32_t log) const {
   return logs_.at(log)->ready_to_complete.load(std::memory_order_acquire);
-}
-
-core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry,
-                                            core::SteadyTime admit_by) {
-  auto pending = BeginAppend(shard, std::move(entry), admit_by);
-  if (!pending.has_value()) return std::unexpected(pending.error());
-  const core::SequenceId seq = pending->seq();
-  DurabilityFuture durable = std::move(pending->durable());
-  pending->Publish();
-  return AppendResult{.seq = seq, .durable = std::move(durable)};
-}
-
-core::Result<AppendBatchResult> WalQueue::AppendBatch(core::ShardId shard,
-                                                      std::span<const core::QueueEntry> entries,
-                                                      core::SteadyTime admit_by) {
-  auto pending = BeginAppendBatch(shard, entries, admit_by);
-  if (!pending.has_value()) return std::unexpected(pending.error());
-  const core::SequenceId first = pending->first_seq();
-  const core::SequenceId last = pending->last_seq();
-  DurabilityFuture durable = std::move(pending->durable());
-  pending->Publish();
-  return AppendBatchResult{.first_seq = first, .last_seq = last, .durable = std::move(durable)};
-}
-
-core::Result<PendingAppend> WalQueue::BeginAppend(core::ShardId shard, core::QueueEntry entry) {
-  return BeginAppend(shard, std::move(entry), DefaultAdmitBy());
-}
-
-core::Result<PendingBatchAppend> WalQueue::BeginAppendBatch(
-    core::ShardId shard, std::span<const core::QueueEntry> entries) {
-  return BeginAppendBatch(shard, entries, DefaultAdmitBy());
-}
-
-core::Result<AppendResult> WalQueue::Append(core::ShardId shard, core::QueueEntry entry) {
-  return Append(shard, std::move(entry), DefaultAdmitBy());
-}
-
-core::Result<AppendBatchResult> WalQueue::AppendBatch(core::ShardId shard,
-                                                      std::span<const core::QueueEntry> entries) {
-  return AppendBatch(shard, entries, DefaultAdmitBy());
 }
 
 core::Result<std::vector<core::QueueEntry>> WalQueue::Read(core::ShardId shard,

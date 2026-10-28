@@ -881,13 +881,6 @@ void ColdConsumer::TryAdvanceCommit(bool force_checkpoint) {
   last_commit_seq_.store(target, std::memory_order_release);
 }
 
-bool ColdConsumer::WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout) {
-  if (latest_drained_seq_.load(std::memory_order_acquire) >= target) return true;
-  RequestDrain();
-  if (drained_wait_hook_) drained_wait_hook_();
-  return drained_waiters_.AwaitEnd(latest_drained_seq_, target - 1, timeout).has_value();
-}
-
 std::optional<core::Result<void>> ColdConsumer::WhenDrained(core::SeqWaiterNode& node) {
   if (latest_drained_seq_.load(std::memory_order_acquire) > node.seq()) return core::Result<void>{};
   RequestDrain();

@@ -22,4 +22,7 @@ target_link_libraries(abyss_bench PRIVATE
   benchmark::benchmark
 )
 add_dependencies(abyss_bench abyss_perf_source_tree)
-target_include_directories(abyss_bench PRIVATE ${ABYSS_PERF_GENERATED_DIR})
+target_include_directories(abyss_bench PRIVATE
+  ${ABYSS_PERF_GENERATED_DIR}
+  ${PROJECT_SOURCE_DIR}/tests/support
+)

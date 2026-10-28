@@ -39,6 +39,7 @@
 #include "abyss/metrics/testing.h"
 #include "abyss/queue/wal_queue.h"
 #include "forwarding_queue.h"
+#include "queue_append.h"
 #include "temp_dir.h"
 
 namespace abyss::engine {
@@ -235,9 +236,9 @@ class RecoveryCoordinatorScanTest : public ::testing::Test {
 
   // The seq assigned; a failed append fails the test.
   core::SequenceId Append(queue::WalQueue& queue, core::ShardId shard, core::QueueEntry entry) {
-    auto appended = queue.Append(shard, std::move(entry));
+    auto appended = testing::Append(queue, shard, std::move(entry));
     EXPECT_TRUE(appended.has_value()) << appended.error().message();
-    return appended.has_value() ? appended->seq : 0;
+    return appended.value_or(0);
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)

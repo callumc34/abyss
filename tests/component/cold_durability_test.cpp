@@ -58,6 +58,7 @@ TEST(ColdDurabilityTest, ColdCommittedPrefixSurvivesKillWithoutWalReplay) {
 #include "abyss/queue/wal_queue.h"
 #include "cold_replay.h"
 #include "crash_harness.h"
+#include "queue_append.h"
 
 namespace abyss::cold {
 namespace {
@@ -184,9 +185,10 @@ void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, 
     entries.push_back(std::move(entry));
   }
 
-  auto appended = queue.AppendBatch(kShard, entries, core::SteadyClock::now() + 10s);
+  auto appended =
+      abyss::testing::AppendBatch(queue, kShard, entries, core::SteadyClock::now() + 10s);
   ASSERT_TRUE(appended.has_value()) << appended.error().message();
-  auto wal_durable = appended->durable.get();
+  auto wal_durable = abyss::testing::WaitAcked(queue, kShard, appended->last);
   ASSERT_TRUE(wal_durable.has_value()) << wal_durable.error().message();
 
   consumer::ColdConsumer::Config config;
@@ -199,15 +201,15 @@ void RunArm(core::Queue& queue, core::ColdStore& cold, std::string_view prefix, 
   consumer::ColdConsumer cold_consumer(queue, cold, kShard, config, eviction);
 
   const std::atomic<bool> cancel{false};
-  auto replay = abyss::testing::ReplayCold(queue, cold_consumer, appended->last_seq + 1, cancel);
+  auto replay = abyss::testing::ReplayCold(queue, cold_consumer, appended->last + 1, cancel);
   ASSERT_TRUE(replay.has_value()) << replay.error().message();
 
   auto committed = queue.CommittedOffset(core::kColdConsumer, kShard);
   ASSERT_TRUE(committed.has_value()) << committed.error().message();
   ASSERT_TRUE(committed->has_value()) << "the cold consumer committed nothing";
 
-  out->first = appended->first_seq;
-  out->last = appended->last_seq;
+  out->first = appended->first;
+  out->last = appended->last;
   out->committed = committed->value_or(0);
 }
 

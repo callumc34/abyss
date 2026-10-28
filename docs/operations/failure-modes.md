@@ -58,7 +58,7 @@ Cold store disk full
     → queue entries accumulate (cold's committed offset stops advancing)
       → queue WAL grows
         → WAL PVC fills
-          → Append() fails
+          → WAL appends are refused
             → writes return errors to clients
 ```
 

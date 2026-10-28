@@ -32,6 +32,7 @@
 #include "crash_harness.h"
 #include "latch.h"
 #include "on_exit.h"
+#include "queue_append.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -41,7 +42,9 @@ namespace {
 constexpr core::ConsumerId kTestConsumer = 0;
 
 using namespace std::chrono_literals;
+using abyss::testing::Append;
 using abyss::testing::Latch;
+using abyss::testing::WaitAcked;
 
 constexpr auto kProcess = core::Durability::kProcessCrash;
 constexpr auto kPower = core::Durability::kPowerLoss;
@@ -162,11 +165,11 @@ TEST_P(FreshShardTest, EndsStartAtTheFirstSeqAndTheFirstWriteResolves) {
   ASSERT_TRUE(scanned.has_value()) << scanned.error().message();
   EXPECT_EQ(delivered, 0U);
 
-  auto appended = queue_->Append(0, MakeWrite("a"));
+  auto appended = Append(*queue_, 0, MakeWrite("a"));
   ASSERT_TRUE(appended.has_value()) << appended.error().message();
-  EXPECT_EQ(appended->seq, core::kFirstSeq);
-  ASSERT_EQ(appended->durable.wait_for(10s), std::future_status::ready);
-  EXPECT_TRUE(appended->durable.get().has_value());
+  EXPECT_EQ(*appended, core::kFirstSeq);
+  const auto acked = WaitAcked(*queue_, 0, *appended, 10s);
+  EXPECT_TRUE(acked.has_value()) << acked.error().message();
 
   std::vector<core::QueueEntry> b{MakeWrite("b")};
   auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 1, .entries = b}});
@@ -229,9 +232,9 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchIsPowerDurableOnlyOnceItsLastFrameIs
 
   // The first flush holds a snapshot of shard 3's first frame alone;
   // the second is queued behind it.
-  ASSERT_TRUE(queue_->Append(3, MakeWrite("y0")).has_value());
+  ASSERT_TRUE(Append(*queue_, 3, MakeWrite("y0")).has_value());
   ASSERT_TRUE(first_entered->Wait());
-  ASSERT_TRUE(queue_->Append(3, MakeWrite("y1")).has_value());
+  ASSERT_TRUE(Append(*queue_, 3, MakeWrite("y1")).has_value());
   batch = std::async(std::launch::async, [this] {
     std::vector<core::QueueEntry> a{MakeWrite("a")};
     std::vector<core::QueueEntry> b{MakeWrite("b")};
@@ -276,7 +279,7 @@ TEST_F(WalQueueReserveTest, ACrossShardBatchWithATornLastFrameIsDroppedOnEverySh
   const auto config = ReserveConfig(dir_.Path(), kPower);
   OpenWith(config);
   for (core::ShardId shard = 0; shard < 4; ++shard) {
-    ASSERT_TRUE(queue_->Append(shard, MakeWrite("before")).has_value());
+    ASSERT_TRUE(Append(*queue_, shard, MakeWrite("before")).has_value());
     ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(shard, kFirst));
   }
   std::vector<core::QueueEntry> a{MakeWrite("a0"), MakeWrite("a1")};
@@ -358,9 +361,9 @@ TEST(WalReserveCrashVictim, HalfFilledBatch) {
   auto queue = WalQueue::Open(ReserveConfig(dir, kProcess));
   ASSERT_TRUE(queue.has_value()) << queue.error().message();
   for (core::ShardId shard = 0; shard < 3; ++shard) {
-    auto appended = (*queue)->Append(shard, MakeWrite("before"));
+    auto appended = Append(**queue, shard, MakeWrite("before"));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    ASSERT_TRUE(appended->durable.get().has_value());
+    ASSERT_TRUE(WaitAcked(**queue, shard, *appended).has_value());
   }
   std::vector<core::QueueEntry> a{MakeWrite("a")};
   std::vector<core::QueueEntry> b{MakeWrite("b")};
@@ -420,9 +423,9 @@ TEST_F(WalReserveCrashTest, AHalfFilledCrossShardBatchIsDroppedOnEveryShard) {
     ASSERT_TRUE(read.has_value()) << read.error().message();
     ASSERT_EQ(read->size(), 1U);
     EXPECT_EQ(KeyOf(read->front()), "before");
-    auto appended = (*queue)->Append(shard, MakeWrite("after"));
+    auto appended = Append(**queue, shard, MakeWrite("after"));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    EXPECT_EQ(appended->seq, kFirst + 1);
+    EXPECT_EQ(*appended, kFirst + 1);
   }
 }
 

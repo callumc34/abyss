@@ -13,6 +13,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
+#include "cold_drain_wait.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"
 #include "test_clock.h"
@@ -57,16 +58,8 @@ class ColdConsumerPoolWaitTest : public ::testing::Test {
   }
 };
 
-TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenTargetIsZero) {
-  auto pool = MakePool();
-  // A long timeout, so returning well inside it shows no wait, however
-  // loaded the host.
-  const auto start = std::chrono::steady_clock::now();
-  EXPECT_TRUE(pool->WaitForDrainedSeq(/*shard=*/0, /*target_seq=*/0, /*timeout=*/10s));
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
-}
-
-TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenAlreadyPastTarget) {
+// The pool routes a drain wait to `shard`'s consumer.
+TEST_F(ColdConsumerPoolWaitTest, ReadyAtOnceWhenAlreadyDrainedThrough) {
   auto pool = MakePool(/*shard_count=*/1);
   std::vector<core::QueueEntry> first_batch{MakeWrite(5), MakeWrite(7)};
   EXPECT_CALL(queue_, Read(0, _, _, _, _))
@@ -75,8 +68,8 @@ TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueImmediatelyWhenAlreadyPastTarget) {
   pool->ConsumerFor(0).Drain();
   // latest_drained_seq advanced past 7; any target <= 7 should be instant.
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 5, 10s));
-  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 7, 10s));
+  EXPECT_TRUE(testing::WaitDrained(*pool, 0, 5, 10s).has_value());
+  EXPECT_TRUE(testing::WaitDrained(*pool, 0, 7, 10s).has_value());
   EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
 }
 
@@ -84,13 +77,14 @@ TEST_F(ColdConsumerPoolWaitTest, TimesOutWhenConsumerDoesNotAdvance) {
   auto pool = MakePool(/*shard_count=*/1);
   // Read returns empty — consumer never advances past 0.
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_FALSE(pool->WaitForDrainedSeq(0, /*target_seq=*/42, 30ms));
+  EXPECT_TRUE(testing::TimedOut(testing::WaitDrained(*pool, 0, /*through=*/42, 30ms)));
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_GE(elapsed, 30ms);
   EXPECT_LT(elapsed, 5s) << "the wait outlived its timeout";
+  EXPECT_EQ(pool->ConsumerFor(0).RoomWaitersForTesting(), 0U);
 }
 
-TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueWhenConsumerAdvancesDuringWait) {
+TEST_F(ColdConsumerPoolWaitTest, WakesWhenConsumerAdvancesDuringWait) {
   auto pool = MakePool(/*shard_count=*/1);
   // Pre-register the Read sequence so gmock isn't mutated from another thread
   // while the main thread polls the pool. The advancer just triggers Drain.
@@ -101,13 +95,15 @@ TEST_F(ColdConsumerPoolWaitTest, ReturnsTrueWhenConsumerAdvancesDuringWait) {
     std::this_thread::sleep_for(20ms);
     pool->ConsumerFor(0).Drain();
   });
-  EXPECT_TRUE(pool->WaitForDrainedSeq(0, 3, 500ms));
+  EXPECT_TRUE(testing::WaitDrained(*pool, 0, 3, 500ms).has_value());
   advancer.join();
 }
 
-TEST_F(ColdConsumerPoolWaitTest, OutOfRangeShardReturnsFalse) {
+TEST_F(ColdConsumerPoolWaitTest, OutOfRangeShardIsInvalid) {
   auto pool = MakePool(/*shard_count=*/2);
-  EXPECT_FALSE(pool->WaitForDrainedSeq(/*shard=*/2, /*target_seq=*/1, 5ms));
+  const auto waited = testing::WaitDrained(*pool, /*shard=*/2, /*through=*/1, 5ms);
+  ASSERT_FALSE(waited.has_value());
+  EXPECT_EQ(waited.error().code(), core::ErrorCode::kInvalidArgument);
 }
 
 // --- COLDC-5: oldest_unflushed_age aggregation --------------------------------

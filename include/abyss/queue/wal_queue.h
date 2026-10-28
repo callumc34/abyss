@@ -55,14 +55,12 @@ struct WalConfig {
   uint32_t log_count = 1;
   // Per-shard offset ring slots, a power of two.
   size_t ring_entries = 65536;
-  // The class append futures resolve at.
+  // The class writes are acknowledged at.
   core::Durability durability = core::Durability::kProcessCrash;
   // Bounds on filled but not yet power-durable entries: bytes across
   // logs, and the oldest entry's age per log.
   uint64_t durability_window_bytes = uint64_t{64} * 1024 * 1024;
   std::chrono::milliseconds durability_window{1000};
-  // Admission wait for the appends that take no deadline.
-  std::chrono::milliseconds admission_timeout{5000};
   std::chrono::seconds min_retention{86400};
   // Consumers that commit offsets; their persisted offsets gate retention.
   std::vector<core::ConsumerId> retention_consumers;
@@ -81,17 +79,6 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   WalQueue(WalQueue&&) = delete;
   WalQueue& operator=(WalQueue&&) = delete;
 
-  core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry,
-                                          core::SteadyTime admit_by) override;
-  core::Result<PendingBatchAppend> BeginAppendBatch(core::ShardId shard,
-                                                    std::span<const core::QueueEntry> entries,
-                                                    core::SteadyTime admit_by) override;
-  core::Result<AppendResult> Append(core::ShardId shard, core::QueueEntry entry,
-                                    core::SteadyTime admit_by) override;
-  core::Result<AppendBatchResult> AppendBatch(core::ShardId shard,
-                                              std::span<const core::QueueEntry> entries,
-                                              core::SteadyTime admit_by) override;
-
   bool Admissible(core::ShardId shard) override;
   std::optional<core::Result<void>> WhenReady(core::QueueWait wait, core::ShardId shard,
                                               core::Waiter& waiter, bool first) override;
@@ -105,18 +92,6 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   uint32_t LogOf(core::ShardId shard) const override { return shard % config_.log_count; }
   std::vector<ReservedRange> Complete(Reservation&& reservation) override;
 
-  // Blocking forms of the waits above: room in `shard`'s window, and
-  // a spare on its log (false at the deadline or on shutdown).
-  core::Result<void> Admit(core::ShardId shard, core::SteadyTime admit_by);
-  bool WaitForSpare(core::ShardId shard, core::SteadyTime deadline);
-
-  // As above, admitting within WalConfig::admission_timeout.
-  core::Result<PendingAppend> BeginAppend(core::ShardId shard, core::QueueEntry entry);
-  core::Result<PendingBatchAppend> BeginAppendBatch(core::ShardId shard,
-                                                    std::span<const core::QueueEntry> entries);
-  core::Result<AppendResult> Append(core::ShardId shard, core::QueueEntry entry);
-  core::Result<AppendBatchResult> AppendBatch(core::ShardId shard,
-                                              std::span<const core::QueueEntry> entries);
   core::Result<std::vector<core::QueueEntry>> Read(core::ShardId shard, core::SequenceId from_seq,
                                                    size_t max_count, core::Duration timeout,
                                                    core::Durability visible) override;
@@ -190,9 +165,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   uint64_t SyncCountForTesting(uint32_t log) const;
   // Close without the final flush, as a power loss at teardown would.
   void SkipFinalFlushForTesting();
-  // Runs inside a batch append or reservation after each of its frames
-  // but the last is committed, with the count committed so far. It may
-  // block.
+  // Runs inside a reservation after each of its frames but the last is
+  // committed, with the count committed so far. It may block.
   void SetBatchCommitHookForTesting(const std::function<void(std::size_t committed)>& hook);
   // While paused, `log` prepares no spare segments.
   void PauseSegmentPreparerForTesting(uint32_t log, bool paused);
@@ -222,7 +196,6 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void Flushed(LogUnit& unit);
 
   core::Result<void> ValidateShard(core::ShardId shard) const;
-  core::SteadyTime DefaultAdmitBy() const;
   // Index into committed_ for a retention consumer, or nullopt.
   std::optional<size_t> OffsetIndex(core::ConsumerId consumer, core::ShardId shard) const;
 

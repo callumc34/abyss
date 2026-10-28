@@ -19,11 +19,16 @@
 #include "abyss/queue/frame.h"
 #include "abyss/queue/reservation.h"
 #include "abyss/queue/wal_queue.h"
+#include "queue_append.h"
 
 namespace abyss::queue {
 namespace {
 
 using namespace std::chrono_literals;
+using abyss::testing::Append;
+using abyss::testing::AppendBatch;
+using abyss::testing::WaitAcked;
+using abyss::testing::WaitReady;
 
 class TempDir {
  public:
@@ -70,8 +75,8 @@ std::unique_ptr<WalQueue> MakeQueue(const std::string& dir, core::Durability dur
 }
 
 bool AppendDurably(WalQueue& queue, size_t value_size) {
-  auto appended = queue.Append(0, MakeEntry(value_size));
-  return appended.has_value() && appended->durable.get().has_value();
+  auto appended = Append(queue, 0, MakeEntry(value_size));
+  return appended.has_value() && WaitAcked(queue, 0, *appended).has_value();
 }
 
 // The ack each class gives: at publish under process_crash, after the
@@ -132,7 +137,8 @@ void ReserveCompleteAt(benchmark::State& state, core::Durability durability) {
     auto reserved = queue->Reserve(parts);
     while (!reserved.has_value() &&
            reserved.error().code() == core::ErrorCode::kResourceExhausted &&
-           queue->Admit(0, core::SteadyClock::now() + 5s).has_value()) {
+           WaitReady(*queue, core::QueueWait::kAdmission, 0, core::SteadyClock::now() + 5s)
+               .has_value()) {
       reserved = queue->Reserve(parts);
     }
     if (!reserved.has_value()) {
@@ -162,31 +168,6 @@ void BM_ReserveCompletePowerLoss(benchmark::State& state) {
 }
 BENCHMARK(BM_ReserveCompletePowerLoss)->Arg(200)->Iterations(100000);
 BENCHMARK(BM_ReserveCompletePowerLoss)->Arg(16 << 10)->Iterations(3000);
-
-// The same through BeginAppend, which takes the entry: its rebuild is
-// untimed.
-void BM_AppendMovedEntry(benchmark::State& state) {
-  TempDir tmp;
-  auto queue = MakeWholeRunQueue(tmp.path());
-  const auto value_size = static_cast<size_t>(state.range(0));
-  core::QueueEntry entry = MakeEntry(value_size);
-  for ([[maybe_unused]] auto _ : state) {
-    auto appended = queue->Append(0, std::move(entry));
-    if (!appended.has_value()) {
-      state.SkipWithError("append failed");
-      break;
-    }
-    benchmark::DoNotOptimize(appended->seq);
-    state.PauseTiming();
-    entry = MakeEntry(value_size);
-    state.ResumeTiming();
-  }
-  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
-  state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * value_size));
-}
-BENCHMARK(BM_AppendMovedEntry)->Arg(200)->Iterations(100000);
-BENCHMARK(BM_AppendMovedEntry)->Arg(16 << 10)->Iterations(3000);
-BENCHMARK(BM_AppendMovedEntry)->Arg(1 << 20)->Iterations(50);
 
 // One queue and shard shared by every thread of a run; Setup opens it
 // before the threads start and Teardown closes it after they finish.
@@ -269,7 +250,7 @@ void BM_ReadAtSegmentPosition(benchmark::State& state) {
   const std::vector<core::QueueEntry> batch(kPositionFillBatch, MakeEntry(kPositionValueBytes));
   for (core::SequenceId filled = 0; filled < n; filled += kPositionFillBatch) {
     const auto count = std::min<size_t>(kPositionFillBatch, n - filled);
-    if (!queue.AppendBatch(0, std::span{batch}.first(count)).has_value()) {
+    if (!AppendBatch(queue, 0, std::span{batch}.first(count)).has_value()) {
       state.SkipWithError("fill failed");
       return;
     }
@@ -321,12 +302,12 @@ void BM_ReserveContention(benchmark::State& state) {
   const auto shard = static_cast<core::ShardId>(state.thread_index() % kContentionShards);
   const core::QueueEntry entry = MakeEntry(64);
   for ([[maybe_unused]] auto _ : state) {
-    auto appended = queue.Append(shard, entry);
+    auto appended = Append(queue, shard, entry);
     if (!appended.has_value()) {
       state.SkipWithError("append failed");
       break;
     }
-    benchmark::DoNotOptimize(appended->seq);
+    benchmark::DoNotOptimize(*appended);
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
 }
@@ -367,7 +348,7 @@ void BM_ReadInterleaved(benchmark::State& state) {
   const std::vector<core::QueueEntry> batch(kInterleavedBatch, MakeEntry(kPositionValueBytes));
   for (core::SequenceId filled = 0; filled < kInterleavedPerShard; filled += kInterleavedBatch) {
     for (core::ShardId shard = 0; shard < kInterleavedShards; ++shard) {
-      if (!queue.AppendBatch(shard, batch).has_value()) {
+      if (!AppendBatch(queue, shard, batch).has_value()) {
         state.SkipWithError("fill failed");
         return;
       }

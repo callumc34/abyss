@@ -35,6 +35,7 @@
 #include "binary_io.h"
 #include "latch.h"
 #include "on_exit.h"
+#include "queue_append.h"
 #include "shard_stream.h"
 #include "temp_dir.h"
 
@@ -45,7 +46,11 @@ namespace {
 constexpr core::ConsumerId kTestConsumer = 0;
 
 using namespace std::chrono_literals;
+using abyss::testing::Append;
+using abyss::testing::AppendBatch;
 using abyss::testing::Latch;
+using abyss::testing::TimedOut;
+using abyss::testing::WaitReady;
 
 constexpr auto kProcess = core::Durability::kProcessCrash;
 constexpr auto kPower = core::Durability::kPowerLoss;
@@ -207,7 +212,7 @@ TEST_F(ReservationTest, OneShardReservesThenPublishesOnComplete) {
 // order, and every batch_rest runs to the batch's end.
 TEST_F(ReservationTest, ThreeShardsShareOneContiguousBatch) {
   OpenWith(Config(4));
-  ASSERT_TRUE(queue_->Append(1, Write("before")).has_value());
+  ASSERT_TRUE(Append(*queue_, 1, Write("before")).has_value());
   std::vector<core::QueueEntry> zero{Write("z0"), Write("z1")};
   std::vector<core::QueueEntry> one{Write("o0", 300)};
   std::vector<core::QueueEntry> three{Write("t0"), Write("t1", kLarge), Write("t2")};
@@ -290,7 +295,7 @@ TEST_F(ReservationTest, FramesEncodedInPlaceMatchTheBufferedEncoderOnDisk) {
   frame::EncodeEntry(seq_of(appended[0], core::kFirstSeq + 1), 1, appended_batch);
   frame::EncodeEntry(seq_of(appended[1], core::kFirstSeq + 2), 1, appended_batch);
   frame::CloseBatch(appended_batch);
-  ASSERT_TRUE(queue_->AppendBatch(1, appended).has_value());
+  ASSERT_TRUE(AppendBatch(*queue_, 1, appended).has_value());
   const LogPosition appended_at =
       queue_->StreamForTesting(1).RingPositionForTesting(core::kFirstSeq + 1).value_or(kNoPosition);
   ASSERT_NE(appended_at, kNoPosition);
@@ -312,7 +317,7 @@ TEST_F(ReservationTest, AWindowRefusalConsumesNothing) {
     stalled->Wait(30s);
     return {};
   });
-  ASSERT_TRUE(queue_->Append(0, Write("first")).has_value());
+  ASSERT_TRUE(Append(*queue_, 0, Write("first")).has_value());
 
   std::vector<core::QueueEntry> entries{Write("small"), Write("large", kLarge)};
   const std::array parts{ShardEntries{.shard = 0, .entries = entries}};
@@ -325,13 +330,13 @@ TEST_F(ReservationTest, AWindowRefusalConsumesNothing) {
   EXPECT_EQ(ValueBytes(entries[1]), kLarge) << "a refused entry is not moved from";
 
   const auto start = std::chrono::steady_clock::now();
-  auto waited = queue_->Admit(0, start + 30ms);
-  ASSERT_FALSE(waited.has_value());
-  EXPECT_EQ(waited.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_TRUE(TimedOut(WaitReady(*queue_, core::QueueWait::kAdmission, 0, start + 30ms)));
   EXPECT_GE(std::chrono::steady_clock::now() - start, 30ms);
 
   stalled->Open();
-  ASSERT_TRUE(queue_->Admit(0, std::chrono::steady_clock::now() + 10s).has_value());
+  ASSERT_TRUE(
+      WaitReady(*queue_, core::QueueWait::kAdmission, 0, std::chrono::steady_clock::now() + 10s)
+          .has_value());
   auto reserved = queue_->Reserve(parts);
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   EXPECT_EQ(reserved->ranges()[0].first, core::kFirstSeq + 1);
@@ -439,9 +444,11 @@ TEST_F(ReservationTest, NoSpareRefusesWithoutConsumingASeq) {
   EXPECT_EQ(queue_->ReadyToComplete(0), 0U);
   EXPECT_EQ(ValueBytes(large[0]), kLarge) << "a refused entry is not moved from";
 
-  EXPECT_FALSE(queue_->WaitForSpare(0, std::chrono::steady_clock::now() + 30ms));
+  EXPECT_TRUE(TimedOut(
+      WaitReady(*queue_, core::QueueWait::kSpare, 0, std::chrono::steady_clock::now() + 30ms)));
   queue_->PauseSegmentPreparerForTesting(0, false);
-  ASSERT_TRUE(queue_->WaitForSpare(0, std::chrono::steady_clock::now() + 10s));
+  ASSERT_TRUE(WaitReady(*queue_, core::QueueWait::kSpare, 0, std::chrono::steady_clock::now() + 10s)
+                  .has_value());
   auto reserved = queue_->Reserve(parts);
   ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
   EXPECT_EQ(reserved->ranges()[0].first, core::kFirstSeq + accepted);
@@ -547,7 +554,7 @@ TEST_F(ReservationTest, AFlushOverSeveralLogsIsOneReservation) {
   auto config = Config(4);
   config.log_count = 2;
   OpenWith(config);
-  ASSERT_TRUE(queue_->Append(1, Write("before")).has_value());
+  ASSERT_TRUE(Append(*queue_, 1, Write("before")).has_value());
   std::vector<core::QueueEntry> flushes(4);
   std::vector<ShardEntries> parts;
   for (core::ShardId shard = 0; shard < 4; ++shard) {
@@ -624,36 +631,6 @@ TEST_F(ReservationTest, ReservationsPublishInSeqOrderWhenCompletedInReverse) {
   }
 }
 
-// An append on the old path after a reservation still in flight waits
-// for it before publishing, so the published end never passes a frame
-// not yet filled or published.
-TEST_F(ReservationTest, AnAppendAfterAnOpenReservationPublishesAfterIt) {
-  OpenWith(Config(1));
-  for (const std::size_t reserved_bytes : {std::size_t{8}, kLarge}) {
-    SCOPED_TRACE(reserved_bytes);
-    const core::SequenceId base = PublishedEnd(0);
-    std::vector<core::QueueEntry> entries{Write("reserved", reserved_bytes)};
-    auto reserved = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
-    ASSERT_TRUE(reserved.has_value()) << reserved.error().message();
-
-    auto appended = std::async(std::launch::async, [this] {
-      auto result = queue_->Append(0, Write("appended"));
-      return result.has_value() ? result->seq : core::SequenceId{0};
-    });
-    EXPECT_EQ(appended.wait_for(50ms), std::future_status::timeout);
-    EXPECT_EQ(PublishedEnd(0), base) << "the append published past the reservation";
-
-    queue_->Complete(std::move(*reserved));
-    ASSERT_EQ(appended.wait_for(10s), std::future_status::ready);
-    EXPECT_EQ(appended.get(), base + 1);
-    EXPECT_EQ(PublishedEnd(0), base + 2);
-    const auto read = ReadAll(0);
-    ASSERT_EQ(read.size(), base + 2 - core::kFirstSeq);
-    EXPECT_EQ(KeyOf(read[base - core::kFirstSeq]), "reserved");
-    EXPECT_EQ(KeyOf(read[base + 1 - core::kFirstSeq]), "appended");
-  }
-}
-
 TEST_F(ReservationTest, PowerLossFuturesResolveOncePowerDurable) {
   auto config = Config(3);
   config.durability = kPower;
@@ -689,11 +666,11 @@ TEST_F(ReservationTest, DroppingAReservationIsFatal) {
 }
 
 #ifdef NDEBUG
-TEST_F(ReservationTest, ReservingOrAppendingWhileHoldingAReservationIsADebugCheck) {
+TEST_F(ReservationTest, ReservingWhileHoldingAReservationIsADebugCheck) {
   GTEST_SKIP() << "ABYSS_DCHECK is compiled out";
 }
 #else
-TEST_F(ReservationTest, ReservingOrAppendingWhileHoldingAReservationIsADebugCheck) {
+TEST_F(ReservationTest, ReservingWhileHoldingAReservationIsADebugCheck) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   const auto hold_then = [this](const auto& blocked) {
     OpenWith(Config(2));
@@ -708,13 +685,6 @@ TEST_F(ReservationTest, ReservingOrAppendingWhileHoldingAReservationIsADebugChec
                      queue_->Reserve(std::array{ShardEntries{.shard = 1, .entries = entries}});
                }),
                "WAL reservation by a thread holding one");
-  EXPECT_DEATH(hold_then([this] { const auto appended = queue_->Append(1, Write("append")); }),
-               "WAL append by a thread holding a reservation");
-  EXPECT_DEATH(hold_then([this] {
-                 const std::vector<core::QueueEntry> entries{Write("batch")};
-                 const auto appended = queue_->AppendBatch(1, entries);
-               }),
-               "WAL append by a thread holding a reservation");
 }
 
 // The thread-local count of held reservations is the reserving
@@ -737,9 +707,9 @@ TEST_F(ReservationTest, CompletingOnAnotherThreadIsADebugCheck) {
 }
 #endif
 
-// Old and new paths on shared shards, with Completes delayed: every
-// shard's seqs stay contiguous, publish in order, and never show a
-// frame before it is filled.
+// One-shard batches and delayed multi-shard reservations on shared
+// shards: every shard's seqs stay contiguous, publish in order, and
+// never show a frame before it is filled.
 TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
   constexpr std::size_t kShards = 6;
   constexpr int kWorkers = 6;
@@ -756,7 +726,6 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
   };
   std::mutex placed_mu;
   std::vector<Placed> placed;
-  std::vector<std::future<core::Result<void>>> futures;
   std::vector<ReservedRange> completed;
   std::atomic<bool> done{false};
   std::atomic<int> failures{0};
@@ -800,7 +769,6 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
                  : std::uniform_int_distribution<std::size_t>(1, 200)(rng);
     };
     std::vector<Placed> mine;
-    std::vector<std::future<core::Result<void>>> pending;
     std::vector<ReservedRange> reserved_ranges;
     for (int op = 0; op < kOps && failures.load() == 0; ++op) {
       const std::string tag = "w" + std::to_string(id) + "-" + std::to_string(op) + "-";
@@ -810,15 +778,15 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
         const int count = std::uniform_int_distribution<int>(1, 3)(rng);
         batch.reserve(count);
         for (int i = 0; i < count; ++i) batch.push_back(Write(tag + std::to_string(i), 40));
-        auto appended = queue_->AppendBatch(shard, batch);
+        auto appended = AppendBatch(*queue_, shard, batch);
         if (!appended.has_value()) {
           fail("append: " + appended.error().message());
           break;
         }
         for (int i = 0; i < count; ++i) {
-          mine.push_back({shard, appended->first_seq + i, tag + std::to_string(i)});
+          mine.push_back({shard, appended->first + i, tag + std::to_string(i)});
         }
-        pending.push_back(std::move(appended->durable));
+        reserved_ranges.push_back(*appended);
         continue;
       }
       std::vector<core::ShardId> shards(kShards);
@@ -842,10 +810,13 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
         if (result.has_value()) {
           reserved.emplace(std::move(*result));
         } else if (result.error().code() == core::ErrorCode::kResourceExhausted) {
-          const auto admitted = queue_->Admit(shards[0], std::chrono::steady_clock::now() + 5s);
+          const auto admitted = WaitReady(*queue_, core::QueueWait::kAdmission, shards[0],
+                                          std::chrono::steady_clock::now() + 5s);
           if (!admitted.has_value()) fail("admit: " + admitted.error().message());
         } else if (result.error().code() == core::ErrorCode::kUnavailable) {
-          if (!queue_->WaitForSpare(shards[0], std::chrono::steady_clock::now() + 5s)) {
+          if (!WaitReady(*queue_, core::QueueWait::kSpare, shards[0],
+                         std::chrono::steady_clock::now() + 5s)
+                   .has_value()) {
             fail("no spare segment");
           }
         } else {
@@ -871,7 +842,6 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
     }
     const std::scoped_lock lock(placed_mu);
     std::ranges::move(mine, std::back_inserter(placed));
-    std::ranges::move(pending, std::back_inserter(futures));
     std::ranges::move(reserved_ranges, std::back_inserter(completed));
   };
 
@@ -890,10 +860,6 @@ TEST_F(ReservationTest, MixedAppendersKeepEveryShardContiguousAndInOrder) {
   ASSERT_EQ(failures.load(), 0);
 
   EXPECT_EQ(queue_->ReadyToComplete(0), 0U);
-  for (auto& future : futures) {
-    ASSERT_EQ(future.wait_for(10s), std::future_status::ready);
-    EXPECT_TRUE(future.get().has_value());
-  }
   for (const ReservedRange& range : completed) {
     EXPECT_TRUE(
         queue_->AwaitDurable(range.shard, range.last, queue_->AckDurability(), 10s).value());

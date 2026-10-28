@@ -75,14 +75,6 @@ std::optional<CompactedState> ColdConsumerPool::Snapshot(core::ShardId shard,
   return consumers_[shard]->Buffer().Snapshot(key);
 }
 
-bool ColdConsumerPool::WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
-                                         std::chrono::milliseconds timeout) {
-  if (shard >= consumers_.size()) return false;
-  // Signal-driven wait on the owning consumer — the drain loop wakes us when it
-  // advances past the target, so a waiting write never busy-polls.
-  return consumers_[shard]->WaitForDrainedSeq(target_seq, timeout);
-}
-
 std::optional<core::Result<void>> ColdConsumerPool::WhenDrainedPast(core::ShardId shard,
                                                                     core::SequenceId past,
                                                                     core::Waiter& waiter) {

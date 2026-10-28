@@ -53,10 +53,6 @@ class ColdConsumerPool : public CompactionBufferRouter {
                                                     core::Waiter& waiter) override;
   bool CancelDrainWait(core::ShardId shard, core::Waiter& waiter) noexcept override;
   void FinishDrainWait(core::ShardId shard, core::Waiter& waiter) noexcept override;
-  // Blocks until `shard`'s consumer has drained through `target_seq`;
-  // false at the timeout or once it stopped.
-  bool WaitForDrainedSeq(core::ShardId shard, core::SequenceId target_seq,
-                         std::chrono::milliseconds timeout);
 
   void Start();
   // Abrupt stop: RequestStop + Join on every consumer. The in-memory cold

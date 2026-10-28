@@ -76,18 +76,6 @@ class MockQueue : public core::Queue {
         });
   }
 
-  MOCK_METHOD(core::Result<queue::PendingAppend>, BeginAppend,
-              (core::ShardId shard, core::QueueEntry entry, core::SteadyTime admit_by), (override));
-  MOCK_METHOD(core::Result<queue::PendingBatchAppend>, BeginAppendBatch,
-              (core::ShardId shard, std::span<const core::QueueEntry> entries,
-               core::SteadyTime admit_by),
-              (override));
-  MOCK_METHOD(core::Result<queue::AppendResult>, Append,
-              (core::ShardId shard, core::QueueEntry entry, core::SteadyTime admit_by), (override));
-  MOCK_METHOD(core::Result<queue::AppendBatchResult>, AppendBatch,
-              (core::ShardId shard, std::span<const core::QueueEntry> entries,
-               core::SteadyTime admit_by),
-              (override));
   MOCK_METHOD((core::Result<std::vector<core::QueueEntry>>), Read,
               (core::ShardId shard, core::SequenceId from_seq, size_t max_count,
                core::Duration timeout, core::Durability visible),
@@ -361,11 +349,5 @@ inline std::vector<core::QueueEntry> ReadFromLog(const std::vector<core::QueueEn
   for (; it != log.end() && out.size() < max_count; ++it) out.push_back(*it);
   return out;
 }
-
-// No-op publisher used by tests that want a PendingAppend without a real WAL.
-class NoopAppendPublisher : public queue::AppendPublisher {
- public:
-  void Publish() noexcept override {}
-};
 
 }  // namespace abyss::testing

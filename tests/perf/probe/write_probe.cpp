@@ -259,7 +259,6 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
       .durability = config.queue.durability,
       .durability_window_bytes = config.queue.durability_window_bytes,
       .durability_window = config.queue.durability_window,
-      .admission_timeout = config.engine.write_timeout,
       .min_retention = config.queue.min_retention,
       .retention_consumers = {abyss::core::kColdConsumer},
       .offset_fsync_interval = config.queue.offset_fsync_interval,

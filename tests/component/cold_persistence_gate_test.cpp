@@ -40,13 +40,14 @@
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
-#include "abyss/queue/append_result.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/wal_queue.h"
+#include "cold_drain_wait.h"
 #include "cold_read.h"
 #include "cold_replay.h"
 #include "latch.h"
 #include "on_exit.h"
+#include "queue_append.h"
 #include "temp_dir.h"
 #include "wal_power_loss.h"
 
@@ -234,17 +235,16 @@ class ColdPersistenceGateTest : public ::testing::Test {
 
   // Publishes `entry`; under process_crash it is acknowledged on return.
   core::SequenceId Append(core::ShardId shard, core::QueueEntry entry) {
-    auto pending = queue_->BeginAppend(shard, std::move(entry));
-    if (!pending.has_value()) {
-      ADD_FAILURE() << pending.error().message();
+    auto appended = testing::Append(*queue_, shard, std::move(entry));
+    if (!appended.has_value()) {
+      ADD_FAILURE() << appended.error().message();
       return 0;
     }
-    pending->Publish();
     if (queue_->AckDurability() == core::Durability::kProcessCrash) {
-      EXPECT_EQ(pending->durable().wait_for(0ms), std::future_status::ready)
+      EXPECT_TRUE(testing::WaitAcked(*queue_, shard, *appended, 0ms).has_value())
           << "process_crash must acknowledge at publish";
     }
-    return pending->seq();
+    return *appended;
   }
 
   void AwaitPowerDurable(core::ShardId shard, core::SequenceId seq) {
@@ -284,7 +284,8 @@ TEST_F(ColdPersistenceGateTest, StalledFlushKeepsAbsorbedWritesOutOfCold) {
     last = Append(0, WriteEntry({"SET", "k" + std::to_string(i), "v" + std::to_string(i)}));
   }
   consumer.Start();
-  ASSERT_TRUE(consumer.WaitForDrainedSeq(last, kWait)) << "cold never absorbed the writes";
+  ASSERT_TRUE(testing::WaitDrained(consumer, last, kWait).has_value())
+      << "cold never absorbed the writes";
   ASSERT_TRUE(Eventually([&consumer] {
     return consumer.Snapshot().durability_waits_timed_out >= 2;
   })) << "the aggressive flush never reached the persistence gate";
@@ -325,7 +326,7 @@ TEST_F(ColdPersistenceGateTest, RewrittenKeyNeverPersistsAboveThePowerDurableEnd
     last = Append(0, WriteEntry({"SET", "hot", std::to_string(last + 1)}));
 
   consumer.Start();
-  ASSERT_TRUE(consumer.WaitForDrainedSeq(last, kWait));
+  ASSERT_TRUE(testing::WaitDrained(consumer, last, kWait).has_value());
   ASSERT_TRUE(
       Eventually([&consumer] { return consumer.Snapshot().durability_waits_timed_out >= 2; }));
   EXPECT_EQ(PowerEnd(0), first + 1);
@@ -433,7 +434,7 @@ TEST_F(ColdPersistenceGateTest, GracefulDrainWaitsForPowerDurabilityWithoutTimin
   consumer.Start();
   core::SequenceId last = 0;
   for (int i = 0; i < 16; ++i) last = Append(0, WriteEntry({"SET", "d" + std::to_string(i), "v"}));
-  ASSERT_TRUE(consumer.WaitForDrainedSeq(last, kWait));
+  ASSERT_TRUE(testing::WaitDrained(consumer, last, kWait).has_value());
   consumer.RequestStopAndDrain(std::chrono::steady_clock::now() + kWait);
   consumer.Join();
 
@@ -624,15 +625,16 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   auto in_batch = std::make_shared<testing::Latch>();
   auto finish_batch = std::make_shared<testing::Latch>();
   // Released before the batch's future is waited on.
-  std::future<core::Result<queue::AppendBatchResult>> batch;
+  std::future<core::Result<queue::ReservedRange>> batch;
   const testing::OnExit release_batch([finish_batch] { finish_batch->Open(); });
   queue_->SetBatchCommitHookForTesting([in_batch, finish_batch](std::size_t committed) {
     if (committed != 1) return;
     in_batch->Open();
     finish_batch->Wait();
   });
-  batch = std::async(std::launch::async,
-                     [this, &batch_entries] { return queue_->AppendBatch(0, batch_entries); });
+  batch = std::async(std::launch::async, [this, &batch_entries] {
+    return testing::AppendBatch(*queue_, 0, batch_entries);
+  });
   ASSERT_TRUE(in_batch->Wait());
   stall_.Allow(2);
   ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(1, x));
@@ -665,21 +667,20 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   ASSERT_EQ(batch.wait_for(kWait), std::future_status::ready);
   auto batched = batch.get();
   ASSERT_TRUE(batched.has_value()) << batched.error().message();
-  ASSERT_EQ(batched->first_seq, batch_first);
-  std::vector<queue::DurabilityFuture> unflushed;
-  unflushed.push_back(std::move(batched->durable));
+  ASSERT_EQ(batched->first, batch_first);
+  std::vector<queue::ReservedRange> unflushed{*batched};
   for (core::ShardId shard = 0; shard < kShards; ++shard) {
     for (int i = 0; i < 6; ++i) {
-      auto appended = queue_->Append(shard, next_entry(shard, 'L'));
+      auto appended = testing::Append(*queue_, shard, next_entry(shard, 'L'));
       ASSERT_TRUE(appended.has_value()) << appended.error().message();
-      unflushed.push_back(std::move(appended->durable));
+      unflushed.push_back({.shard = shard, .first = *appended, .last = *appended});
     }
     std::vector<core::QueueEntry> entries;
     entries.reserve(3);
     for (int i = 0; i < 3; ++i) entries.push_back(next_entry(shard, 'L'));
-    auto appended = queue_->AppendBatch(shard, entries);
+    auto appended = testing::AppendBatch(*queue_, shard, entries);
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    unflushed.push_back(std::move(appended->durable));
+    unflushed.push_back(*appended);
   }
   // At process_crash cold takes these in, and must not persist them.
   for (auto& consumer : consumers_) {
@@ -691,8 +692,9 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     EXPECT_EQ(PowerEnd(shard), durable_end[shard]) << "shard " << shard;
   }
   if (GetParam() == core::Durability::kPowerLoss) {
-    for (auto& future : unflushed) {
-      EXPECT_EQ(future.wait_for(0ms), std::future_status::timeout) << "acknowledged past D";
+    for (const queue::ReservedRange& range : unflushed) {
+      EXPECT_TRUE(testing::TimedOut(testing::WaitAcked(*queue_, range.shard, range.last, 0ms)))
+          << "acknowledged past D";
     }
   }
 

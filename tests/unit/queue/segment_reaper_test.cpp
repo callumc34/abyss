@@ -22,6 +22,7 @@
 #include "abyss/queue/memory_offset_store.h"
 #include "abyss/queue/segment_registry.h"
 #include "abyss/queue/wal_queue.h"
+#include "queue_append.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -352,7 +353,8 @@ TEST(WalQueueReaperTest, ReaperFailureSurfacedAsMetricAndRetried) {
 
   const std::string value(256, 'v');
   for (int i = 0; i < 100; ++i) {
-    auto appended = queue->Append(0, MakeWrite({"SET", "k" + std::to_string(i), value}));
+    auto appended =
+        abyss::testing::Append(*queue, 0, MakeWrite({"SET", "k" + std::to_string(i), value}));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
   }
   const auto tail = queue->TailSeq(0);

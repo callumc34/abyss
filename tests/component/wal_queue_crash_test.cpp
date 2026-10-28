@@ -6,9 +6,10 @@
 // process crash, which both classes survive, so each run distinguishes the
 // two kinds of write explicitly:
 //
-//   * CONFIRMED: the caller waited on the append's durability future and it
-//     resolved OK (at publish under process_crash, after the flush under
-//     power_loss). The client would have been told OK. These MUST survive.
+//   * CONFIRMED: the caller waited for the append to be durable at the
+//     acked class, and the wait returned OK (at publish under
+//     process_crash, after the flush under power_loss). The client would
+//     have been told OK. These MUST survive.
 //   * IN-FLIGHT: appended, never awaited. These may or may not survive; the
 //     client never saw OK, so either outcome is correct.
 //
@@ -17,7 +18,7 @@
 //
 // The recovered log must also be structurally sound regardless of where the
 // crash truncated it: sequence ids contiguous from the start, no duplicates,
-// and no partial AppendBatch (format 1.1 batch atomicity).
+// and no partial batch (format 1.1 batch atomicity).
 
 #include <gtest/gtest.h>
 
@@ -35,7 +36,6 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
-#include <future>
 #include <span>
 #include <sstream>
 #include <thread>
@@ -48,9 +48,9 @@
 #include "abyss/core/types.h"
 #include "abyss/platform/fs.h"
 #include "abyss/platform/mapped_file.h"
-#include "abyss/queue/append_result.h"
 #include "abyss/queue/wal_queue.h"
 #include "crash_harness.h"
+#include "queue_append.h"
 
 #endif
 
@@ -122,10 +122,11 @@ void RunVictim(core::Durability durability) {
   core::SequenceId highest_confirmed = 0;
   bool any_confirmed = false;
   for (int i = 0; i < kConfirmedCount; ++i) {
-    auto r = (*queue)->Append(0, MakeWrite({"SET", "confirmed", std::to_string(i)}));
+    auto r = testing::Append(**queue, 0, MakeWrite({"SET", "confirmed", std::to_string(i)}));
     ASSERT_TRUE(r.has_value()) << r.error().message();
-    ASSERT_TRUE(r->durable.get().has_value()) << "durability future reported failure";
-    highest_confirmed = r->seq;
+    const auto acked = testing::WaitAcked(**queue, 0, *r);
+    ASSERT_TRUE(acked.has_value()) << "durable wait failed: " << acked.error().message();
+    highest_confirmed = *r;
     any_confirmed = true;
   }
   ASSERT_TRUE(any_confirmed);
@@ -150,10 +151,10 @@ void RunVictim(core::Durability durability) {
       for (size_t b = 0; b < kBatchSize; ++b) {
         batch.push_back(MakeWrite({"SET", "batch", std::to_string(i) + "_" + std::to_string(b)}));
       }
-      [[maybe_unused]] auto batch_r = (*queue)->AppendBatch(0, batch);
+      [[maybe_unused]] auto batch_r = testing::AppendBatch(**queue, 0, batch);
     } else {
       [[maybe_unused]] auto r =
-          (*queue)->Append(0, MakeWrite({"SET", "flight", std::to_string(i)}));
+          testing::Append(**queue, 0, MakeWrite({"SET", "flight", std::to_string(i)}));
     }
   }
 
@@ -171,7 +172,7 @@ TEST(WalCrashVictim, PowerLoss) { RunVictim(core::Durability::kPowerLoss); }
 // batches over every shard. Each appender records the highest seq it
 // was acknowledged on each shard in a MAP_SHARED file, whose dirty
 // pages outlive the SIGKILL in the page cache. Acknowledged is the
-// append returning at process_crash, its future resolving at
+// append returning at process_crash, its durable wait returning at
 // power_loss.
 constexpr core::ShardId kShards = 64;
 constexpr size_t kAppenders = 8;
@@ -182,7 +183,7 @@ constexpr size_t kAckedSlots = kAppenders * kShards;
 constexpr uint64_t kReadyAfterOps = 20000;
 // Bounds a victim whose kill is late.
 constexpr uint64_t kMaxOpsPerAppender = 250000;
-// Unresolved power_loss futures an appender holds before it waits.
+// Unacked power_loss appends an appender holds before it waits.
 constexpr size_t kAwaitWindow = 32;
 constexpr auto kAwaitTimeout = 10s;
 
@@ -245,11 +246,10 @@ std::vector<core::QueueEntry> MakeOp(size_t appender, uint64_t op, size_t size) 
 struct Unsettled {
   core::ShardId shard = 0;
   core::SequenceId last = 0;
-  DurabilityFuture durable;
 };
 
-// Returns when its ops run out, an append fails, or a future stays
-// unresolved for kAwaitTimeout; the parent kills it long before.
+// Returns when its ops run out, an append fails, or a durable wait
+// times out at kAwaitTimeout; the parent kills it long before.
 void RunShardsAppender(WalQueue& queue, size_t appender, AckedSlots& acked,
                        std::atomic<uint64_t>& ops, const std::filesystem::path& dir) {
   uint64_t rng = (appender + 1) * 0x9e3779b97f4a7c15ULL;
@@ -257,10 +257,10 @@ void RunShardsAppender(WalQueue& queue, size_t appender, AckedSlots& acked,
   const auto settle = [&](bool wait) {
     while (!unsettled.empty()) {
       Unsettled& front = unsettled.front();
-      if (front.durable.wait_for(wait ? kAwaitTimeout : 0s) != std::future_status::ready) {
-        return !wait;
-      }
-      if (!front.durable.get().has_value()) return false;
+      const core::Result<void> waited =
+          testing::WaitAcked(queue, front.shard, front.last, wait ? kAwaitTimeout : 0s);
+      if (testing::TimedOut(waited)) return !wait;
+      if (!waited.has_value()) return false;
       acked.Record(appender, front.shard, front.last);
       unsettled.pop_front();
       wait = false;
@@ -275,13 +275,13 @@ void RunShardsAppender(WalQueue& queue, size_t appender, AckedSlots& acked,
     const size_t size = (rng >> 8) % 3 == 0 ? 1 + ((rng >> 16) % kMaxBatch) : 1;
     const auto entries = MakeOp(appender, op, size);
     if (size == 1) {
-      auto appended = queue.Append(shard, entries.front());
+      auto appended = testing::Append(queue, shard, entries.front());
       if (!appended.has_value()) return;
-      unsettled.push_back({shard, appended->seq, std::move(appended->durable)});
+      unsettled.push_back({shard, *appended});
     } else {
-      auto appended = queue.AppendBatch(shard, entries);
+      auto appended = testing::AppendBatch(queue, shard, entries);
       if (!appended.has_value()) return;
-      unsettled.push_back({shard, appended->last_seq, std::move(appended->durable)});
+      unsettled.push_back({shard, appended->last});
     }
     if (!settle(unsettled.size() > kAwaitWindow)) return;
     if (ops.fetch_add(1, std::memory_order_relaxed) + 1 == kReadyAfterOps) {
@@ -371,7 +371,7 @@ TEST_P(WalCrashTest, ConfirmedWritesSurviveKillNine) {
   // invariant 2 -- a client never receives OK for a write that is then lost.
   ASSERT_FALSE(entries.empty());
   EXPECT_GE(entries.back().seq, highest_confirmed)
-      << "recovery lost a write whose durability future had already resolved OK";
+      << "recovery lost a write whose durable wait had already returned OK";
 
   // (2) The recovered log is structurally sound wherever it was truncated:
   // seq ids start at kFirstSeq and are strictly contiguous. A gap would mean recovery
@@ -393,7 +393,7 @@ TEST_P(WalCrashTest, ConfirmedWritesSurviveKillNine) {
     if (w->cmd.args.size() >= 2 && w->cmd.args[1] == "batch") ++batch_entries;
   }
   EXPECT_EQ(batch_entries % kBatchSize, 0U)
-      << "recovery exposed a partial AppendBatch (" << batch_entries
+      << "recovery exposed a partial batch (" << batch_entries
       << " batch entries is not a multiple of " << kBatchSize << ")";
 }
 

@@ -15,7 +15,6 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
-#include "abyss/queue/append_result.h"
 #include "cold_read.h"
 #include "integration_harness.h"
 

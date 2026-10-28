@@ -26,6 +26,7 @@
 #include "abyss/queue/wal_queue.h"
 #include "latch.h"
 #include "on_exit.h"
+#include "queue_append.h"
 #include "recording_sink.h"
 #include "temp_dir.h"
 
@@ -73,9 +74,9 @@ class ShardStreamTest : public ::testing::Test {
 
   void Append(core::ShardId shard, std::size_t value_bytes) {
     const std::string key = "s" + std::to_string(shard) + "-" + std::to_string(keys_[shard].size());
-    auto appended = queue_->Append(shard, Set(key, value_bytes));
+    auto appended = abyss::testing::Append(*queue_, shard, Set(key, value_bytes));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    ASSERT_EQ(appended->seq, core::kFirstSeq + keys_[shard].size());
+    ASSERT_EQ(*appended, core::kFirstSeq + keys_[shard].size());
     keys_[shard].push_back(key);
   }
 
@@ -259,7 +260,7 @@ TEST_F(ShardStreamTest, SeqlockReadersRacingAWrappingWriter) {
   const auto deadline = std::chrono::steady_clock::now() + 10s;
   uint64_t appended = 0;
   while (appended < kAppends && std::chrono::steady_clock::now() < deadline) {
-    auto result = queue_->Append(0, Set("k", 24));
+    auto result = abyss::testing::Append(*queue_, 0, Set("k", 24));
     ASSERT_TRUE(result.has_value()) << result.error().message();
     ++appended;
   }
@@ -325,10 +326,11 @@ class StreamWaitTest : public ::testing::Test {
 // by the registration's re-check.
 TEST_F(StreamWaitTest, APublishBetweenTheCheckAndTheWaitIsNotLost) {
   Open(kNow);
-  auto pending = queue_->BeginAppend(0, Set("k", 8));
-  ASSERT_TRUE(pending.has_value()) << pending.error().message();
-  const core::SequenceId seq = pending->seq();
-  queue_->SetDurableWaitHookForTesting([&pending] { pending->Publish(); });
+  std::vector<core::QueueEntry> entries{Set("k", 8)};
+  auto held = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
+  ASSERT_TRUE(held.has_value()) << held.error().message();
+  const core::SequenceId seq = held->ranges().front().first;
+  queue_->SetDurableWaitHookForTesting([this, &held] { queue_->Complete(*std::move(held)); });
   const auto start = std::chrono::steady_clock::now();
   const auto durable = queue_->AwaitDurable(0, seq, kNow, 10s);
   EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the publish was lost";
@@ -340,9 +342,9 @@ TEST_F(StreamWaitTest, APublishBetweenTheCheckAndTheWaitIsNotLost) {
 TEST_F(StreamWaitTest, AFlushBetweenTheCheckAndTheWaitIsNotLost) {
   Open(kPower);
   HoldFlushes();
-  auto appended = queue_->Append(0, Set("k", 8));
+  const auto appended = abyss::testing::Append(*queue_, 0, Set("k", 8));
   ASSERT_TRUE(appended.has_value()) << appended.error().message();
-  const core::SequenceId seq = appended->seq;
+  const core::SequenceId seq = *appended;
   ASSERT_EQ(queue_->DurableEnd(0, kPower).value(), seq);
   queue_->SetDurableWaitHookForTesting([&] {
     release_.Open();
@@ -353,7 +355,7 @@ TEST_F(StreamWaitTest, AFlushBetweenTheCheckAndTheWaitIsNotLost) {
   EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the flush was lost";
   ASSERT_TRUE(durable.has_value()) << durable.error().message();
   EXPECT_TRUE(*durable);
-  EXPECT_TRUE(appended->durable.get().has_value());
+  EXPECT_TRUE(abyss::testing::WaitAcked(*queue_, 0, seq).has_value());
   EXPECT_EQ(Waiters(kPower), 0U);
 }
 
@@ -362,19 +364,20 @@ TEST_F(StreamWaitTest, AFlushBetweenTheCheckAndTheWaitIsNotLost) {
 TEST_F(StreamWaitTest, RetriesOnTimeoutLeaveNoWaiters) {
   Open(kPower);
   HoldFlushes();
-  auto pending = queue_->BeginAppend(0, Set("k", 8));
-  ASSERT_TRUE(pending.has_value()) << pending.error().message();
-  const core::SequenceId seq = pending->seq();
-  // The append's own future waits on the power list throughout.
-  ASSERT_EQ(Waiters(kPower), 1U);
+  std::vector<core::QueueEntry> entries{Set("k", 8)};
+  auto held = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
+  ASSERT_TRUE(held.has_value()) << held.error().message();
+  const core::SequenceId seq = held->ranges().front().first;
   for (int i = 0; i < 200; ++i) {
-    ASSERT_FALSE(queue_->AwaitDurable(0, seq, kNow, 5ms).value()) << "retry " << i;
-    ASSERT_EQ(Waiters(kNow), 0U) << "retry " << i;
+    if (queue_->AwaitDurable(0, seq, kNow, 5ms).value() || Waiters(kNow) != 0) {
+      queue_->Complete(*std::move(held));
+      FAIL() << "retry " << i;
+    }
   }
-  pending->Publish();
+  queue_->Complete(*std::move(held));
   for (int i = 0; i < 200; ++i) {
     ASSERT_FALSE(queue_->AwaitDurable(0, seq, kPower, 5ms).value()) << "retry " << i;
-    ASSERT_EQ(Waiters(kPower), 1U) << "retry " << i;
+    ASSERT_EQ(Waiters(kPower), 0U) << "retry " << i;
   }
   release_.Open();
   EXPECT_TRUE(queue_->AwaitDurable(0, seq, kPower, 10s).value());
@@ -386,19 +389,20 @@ TEST_F(StreamWaitTest, ARegisteredNodeIsPostedOnceItsClassPasses) {
   Open(kPower);
   HoldFlushes();
   abyss::testing::RecordingSink sink;
-  auto pending = queue_->BeginAppend(0, Set("k", 8));
-  ASSERT_TRUE(pending.has_value()) << pending.error().message();
-  const core::SequenceId seq = pending->seq();
+  std::vector<core::QueueEntry> entries{Set("k", 8)};
+  auto held = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
+  ASSERT_TRUE(held.has_value()) << held.error().message();
+  const core::SequenceId seq = held->ranges().front().first;
   core::SeqWaiterNode published(seq, sink.For(1));
   core::SeqWaiterNode power(seq, sink.For(2));
   core::SeqWaiterNode cancelled(seq, sink.For(3));
-  ASSERT_FALSE(queue_->WhenDurable(0, kNow, published).has_value());
-  ASSERT_FALSE(queue_->WhenDurable(0, kPower, power).has_value());
-  ASSERT_FALSE(queue_->WhenDurable(0, kPower, cancelled).has_value());
+  EXPECT_FALSE(queue_->WhenDurable(0, kNow, published).has_value());
+  EXPECT_FALSE(queue_->WhenDurable(0, kPower, power).has_value());
+  EXPECT_FALSE(queue_->WhenDurable(0, kPower, cancelled).has_value());
   EXPECT_TRUE(queue_->CancelDurable(0, kPower, cancelled));
   EXPECT_FALSE(queue_->CancelDurable(0, kPower, cancelled));
 
-  pending->Publish();
+  queue_->Complete(*std::move(held));
   ASSERT_TRUE(sink.WaitFor(1));
   EXPECT_EQ(sink.Events().front().slot_seq, 1U);
   release_.Open();

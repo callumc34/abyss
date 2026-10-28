@@ -19,6 +19,7 @@
 #include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
 #include "hot_bytes.h"
+#include "queue_append.h"
 #include "sequenced_engine_fixture.h"
 
 namespace abyss::engine {
@@ -270,7 +271,7 @@ TEST_F(PropertyRegressionTest, AFlaggedAddOverAnUnsweptExpiredColdKeyReplacesIt)
       .payload = core::entry::Write{.cmd = core::RespCommand{.args = {"SADD", "k", "new"}}},
       .replaces_state = true,
   };
-  ASSERT_TRUE(queue_->Append(shard, std::move(add)).has_value());
+  ASSERT_TRUE(abyss::testing::Append(*queue_, shard, std::move(add)).has_value());
 
   DrainToCold(shard);
   EXPECT_EQ(ColdSet("k"), "new, ttl 0");

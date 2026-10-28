@@ -28,13 +28,13 @@
 #include "abyss/core/types.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
-#include "abyss/queue/append_result.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/log.h"
 #include "abyss/queue/offset_checkpoint.h"
 #include "abyss/queue/wal_queue.h"
 #include "latch.h"
 #include "on_exit.h"
+#include "queue_append.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -95,9 +95,10 @@ class WalQueueStreamsTest : public ::testing::Test {
   // later one returns at once.
   core::SequenceId Append(core::ShardId shard, const std::string& value = "v") {
     if (HasFatalFailure()) return 0;
-    auto appended = queue_->Append(shard, MakeWrite("k" + std::to_string(shard), value));
+    auto appended =
+        abyss::testing::Append(*queue_, shard, MakeWrite("k" + std::to_string(shard), value));
     [&] { ASSERT_TRUE(appended.has_value()) << appended.error().message(); }();
-    return appended.has_value() ? appended->seq : 0;
+    return appended.value_or(0);
   }
 
   void AwaitPowerDurable(core::ShardId shard, core::SequenceId seq) {
@@ -318,20 +319,20 @@ TEST_F(WalQueueStreamsTest, ARingOverflowBetweenFlushesStillMovesThePowerEndExac
     return {};
   });
 
-  std::vector<DurabilityFuture> futures;
-  futures.reserve(100);
+  std::vector<core::SequenceId> seqs;
+  seqs.reserve(100);
   for (int i = 0; i < 100; ++i) {
-    auto appended = queue_->Append(0, MakeWrite("k", std::to_string(i)));
+    auto appended = abyss::testing::Append(*queue_, 0, MakeWrite("k", std::to_string(i)));
     ASSERT_TRUE(appended.has_value()) << appended.error().message();
-    futures.push_back(std::move(appended->durable));
+    seqs.push_back(*appended);
   }
   ASSERT_TRUE(entered->Wait());
   EXPECT_LT(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 100);
 
   held->Open();
-  for (auto& future : futures) {
-    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
-    EXPECT_TRUE(future.get().has_value());
+  for (const core::SequenceId seq : seqs) {
+    const auto acked = abyss::testing::WaitAcked(*queue_, 0, seq, 5s);
+    ASSERT_TRUE(acked.has_value()) << acked.error().message();
   }
   EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 100);
   auto read = queue_->Read(0, kFirst, 1000, 0ms, core::Durability::kPowerLoss);
@@ -352,7 +353,7 @@ TEST_F(WalQueueStreamsTest, ABatchStraddlingAFlushIsHiddenUntilItsLastFrameIsDur
   auto finish_batch = std::make_shared<Latch>();
   auto flushes = std::make_shared<std::atomic<int>>(0);
   // Released before the batch's future is waited on.
-  std::future<core::Result<AppendBatchResult>> batch;
+  std::future<core::Result<ReservedRange>> batch;
   const abyss::testing::OnExit release([=] {
     first_flush->Open();
     finish_batch->Open();
@@ -376,7 +377,7 @@ TEST_F(WalQueueStreamsTest, ABatchStraddlingAFlushIsHiddenUntilItsLastFrameIsDur
   Append(2);
   batch = std::async(std::launch::async, [this] {
     const std::vector<core::QueueEntry> entries{MakeWrite("a"), MakeWrite("b")};
-    return queue_->AppendBatch(0, entries);
+    return abyss::testing::AppendBatch(*queue_, 0, entries);
   });
   ASSERT_TRUE(in_batch->Wait());
 
@@ -393,62 +394,65 @@ TEST_F(WalQueueStreamsTest, ABatchStraddlingAFlushIsHiddenUntilItsLastFrameIsDur
   EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 2);
 }
 
-// Must-fix 5: with the preparer stopped, appends that need a new
-// segment wait for one, are rejected cleanly at their deadline, and go
-// through once a spare is ready.
-// A frame is filled, and can be flushed, before its PendingAppend is
-// published; the caller registers per-seq state in between, so nothing
-// may see it at power_loss until the publish.
+// A frame is filled, and can be flushed, before its reservation is
+// completed; the caller applies its write in between, so nothing may
+// see it at power_loss until the publish.
 TEST_F(WalQueueStreamsTest, AnUnpublishedAppendIsHiddenAtPowerLossEvenOnceFlushed) {
   auto config = Config(2);
   config.durability = core::Durability::kPowerLoss;
   OpenWith(config);
-  auto held = queue_->BeginAppend(0, MakeWrite("held"));
+  std::vector<core::QueueEntry> entries{MakeWrite("held")};
+  auto held = queue_->Reserve(std::array{ShardEntries{.shard = 0, .entries = entries}});
   ASSERT_TRUE(held.has_value()) << held.error().message();
+  const core::SequenceId seq = held->ranges().front().first;
 
   // Shard 1's frame lies after the held one, so its flush covers both.
-  auto later = queue_->Append(1, MakeWrite("later"));
-  ASSERT_TRUE(later.has_value()) << later.error().message();
-  ASSERT_EQ(later->durable.wait_for(5s), std::future_status::ready);
-  ASSERT_TRUE(later->durable.get().has_value());
+  // Its append runs elsewhere: this thread holds a reservation.
+  const auto later = std::async(std::launch::async, [this]() -> core::Result<void> {
+                       auto appended = abyss::testing::Append(*queue_, 1, MakeWrite("later"));
+                       if (!appended.has_value()) return std::unexpected(appended.error());
+                       return abyss::testing::WaitAcked(*queue_, 1, *appended, 5s);
+                     }).get();
+  EXPECT_TRUE(later.has_value()) << later.error().message();
 
   EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst);
-  EXPECT_EQ(held->durable().wait_for(0s), std::future_status::timeout);
+  EXPECT_TRUE(abyss::testing::TimedOut(abyss::testing::WaitAcked(*queue_, 0, seq, 0ms)));
   auto hidden = queue_->Read(0, kFirst, 8, 0ms, core::Durability::kPowerLoss);
-  ASSERT_TRUE(hidden.has_value()) << hidden.error().message();
-  EXPECT_TRUE(hidden->empty());
+  EXPECT_TRUE(hidden.has_value() && hidden->empty());
 
-  held->Publish();
+  queue_->Complete(*std::move(held));
   EXPECT_EQ(queue_->DurableEnd(0, core::Durability::kPowerLoss).value(), kFirst + 1)
       << "a publish after the flush raises the power end itself";
-  ASSERT_EQ(held->durable().wait_for(5s), std::future_status::ready);
-  EXPECT_TRUE(held->durable().get().has_value());
+  const auto acked = abyss::testing::WaitAcked(*queue_, 0, seq, 5s);
+  EXPECT_TRUE(acked.has_value()) << acked.error().message();
 }
 
+// Must-fix 5: with the preparer stopped, appends that need a new
+// segment wait for one, are rejected cleanly at their deadline, and go
+// through once a spare is ready.
 TEST_F(WalQueueStreamsTest, NoSpareSegmentWaitsThenRejectsCleanly) {
   OpenWith(Config(1));
-  std::future<core::Result<AppendResult>> waiting;
+  std::future<core::Result<core::SequenceId>> waiting;
   queue_->PauseSegmentPreparerForTesting(0, true);
   const abyss::testing::OnExit resume([this] { queue_->PauseSegmentPreparerForTesting(0, false); });
 
-  core::Result<PendingAppend> refused =
+  core::Result<core::SequenceId> refused =
       std::unexpected(core::Error{core::ErrorCode::kInternal, ""});
   core::SequenceId accepted = 0;
   std::chrono::steady_clock::duration waited{};
   for (int i = 0; i < 200; ++i) {
     const auto start = std::chrono::steady_clock::now();
-    auto pending = queue_->BeginAppend(0, MakeWrite("k"), start + 100ms);
-    if (!pending.has_value()) {
+    auto appended = abyss::testing::Append(*queue_, 0, MakeWrite("k"), start + 100ms);
+    if (!appended.has_value()) {
       waited = std::chrono::steady_clock::now() - start;
-      refused = std::move(pending);
+      refused = std::move(appended);
       break;
     }
-    pending->Publish();
     ++accepted;
   }
   ASSERT_FALSE(refused.has_value()) << "the spares never ran out";
   EXPECT_GT(accepted, 5U);
-  EXPECT_EQ(refused.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_EQ(refused.error().code(), core::ErrorCode::kUnavailable);
   EXPECT_NE(refused.error().message().find(
                 "no spare WAL segment ready: the disk is full or the segment preparer is behind"),
             std::string::npos)
@@ -461,14 +465,15 @@ TEST_F(WalQueueStreamsTest, NoSpareSegmentWaitsThenRejectsCleanly) {
   EXPECT_EQ(queue_->DurableEnd(0, kAck).value(), kFirst + accepted);
 
   waiting = std::async(std::launch::async, [this] {
-    return queue_->Append(0, MakeWrite("k", "after"), std::chrono::steady_clock::now() + 10s);
+    return abyss::testing::Append(*queue_, 0, MakeWrite("k", "after"),
+                                  std::chrono::steady_clock::now() + 10s);
   });
   EXPECT_EQ(waiting.wait_for(50ms), std::future_status::timeout);
   queue_->PauseSegmentPreparerForTesting(0, false);
   ASSERT_EQ(waiting.wait_for(10s), std::future_status::ready);
   auto after = waiting.get();
   ASSERT_TRUE(after.has_value()) << after.error().message();
-  EXPECT_EQ(after->seq, kFirst + accepted);
+  EXPECT_EQ(*after, kFirst + accepted);
   const auto entries = ReadAll(0, kFirst);
   ASSERT_EQ(entries.size(), accepted + 1);
 }
@@ -727,7 +732,7 @@ class WalQueueScanTest : public WalQueueStreamsTest {
       const auto shard = static_cast<core::ShardId>(((i * 37) + (i / 64)) % kShards);
       const auto entry = MakeWrite("k" + std::to_string(i), std::string(i % 200, 'v'));
       bytes += FrameBytes(entry);
-      auto appended = queue_->Append(shard, entry);
+      auto appended = abyss::testing::Append(*queue_, shard, entry);
       EXPECT_TRUE(appended.has_value()) << appended.error().message();
     }
     return bytes;
@@ -982,14 +987,10 @@ TEST_F(WalQueueStressTest, AppendersReadersRetentionAndAScanAgreeOnEveryShard) {
         entries.push_back(MakeWrite(Key(shard), Value((appender << 40) | (op << 3) | pos)));
       }
       const auto first = [&]() -> core::Result<core::SequenceId> {
-        if (size == 1) {
-          auto appended = queue_->Append(shard, entries.front());
-          if (!appended.has_value()) return std::unexpected(appended.error());
-          return appended->seq;
-        }
-        auto appended = queue_->AppendBatch(shard, entries);
+        if (size == 1) return abyss::testing::Append(*queue_, shard, entries.front());
+        auto appended = abyss::testing::AppendBatch(*queue_, shard, entries);
         if (!appended.has_value()) return std::unexpected(appended.error());
-        return appended->first_seq;
+        return appended->first;
       }();
       if (!first.has_value()) {
         ADD_FAILURE() << "append on shard " << shard << ": " << first.error().message();

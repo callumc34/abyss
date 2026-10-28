@@ -15,8 +15,6 @@
 #include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
 #include "abyss/core/wait_list.h"
-#include "abyss/queue/append_result.h"
-#include "abyss/queue/pending_append.h"
 #include "abyss/queue/reservation.h"
 
 namespace abyss::core {
@@ -55,11 +53,17 @@ class RetentionPin {
   std::function<void()> release_;
 };
 
-// Two-phase append (BeginAppend → Publish) is the race-free path for callers
-// that register per-seq state. The one-shot Append is for fire-and-forget.
-// An append's durability future resolves at AckDurability(). Admission
-// to the durability window waits at most until `admit_by`; a deadline
-// already past checks without waiting.
+// What a sequenced write waits on in the queue, off every lock.
+enum class QueueWait : uint8_t {
+  // Room in the shard's durability window.
+  kAdmission,
+  // A spare segment on the shard's log.
+  kSpare,
+};
+
+// Entries enter one way, the sequencer's: wait off every lock until
+// Reserve can succeed, Reserve, then Complete, which publishes. A write
+// is acknowledged once its last seq is durable at AckDurability().
 //
 // Read position and committed offset are separate: each consumer owns its
 // read cursor and passes it to Read; CommitOffset only records where it is
@@ -70,14 +74,6 @@ class RetentionPin {
 // empty shard's is kFirstSeq and 0 is always below it.
 // DurableEnd(kPowerLoss) never passes DurableEnd(kProcessCrash): nothing
 // is visible before it is published.
-// What a sequenced write waits on in the queue, off every lock.
-enum class QueueWait : uint8_t {
-  // Room in the shard's durability window.
-  kAdmission,
-  // A spare segment on the shard's log.
-  kSpare,
-};
-
 class Queue {
  public:
   Queue() = default;
@@ -86,18 +82,6 @@ class Queue {
   Queue& operator=(const Queue&) = delete;
   Queue(Queue&&) = delete;
   Queue& operator=(Queue&&) = delete;
-
-  virtual Result<queue::PendingAppend> BeginAppend(ShardId shard, QueueEntry entry,
-                                                   SteadyTime admit_by) = 0;
-  virtual Result<queue::PendingBatchAppend> BeginAppendBatch(ShardId shard,
-                                                             std::span<const QueueEntry> entries,
-                                                             SteadyTime admit_by) = 0;
-
-  virtual Result<queue::AppendResult> Append(ShardId shard, QueueEntry entry,
-                                             SteadyTime admit_by) = 0;
-  virtual Result<queue::AppendBatchResult> AppendBatch(ShardId shard,
-                                                       std::span<const QueueEntry> entries,
-                                                       SteadyTime admit_by) = 0;
 
   // The sequencer's append (ADP-015 §Sequenced write path): its waits
   // for admission and a spare are registered under no lock, Reserve
@@ -112,7 +96,7 @@ class Queue {
   // wake comes. Otherwise the outcome now: ok, or the error that ends
   // every wait at shutdown. A waiter woken ok registers again to
   // re-check, and one that gives up calls FinishWait. `first` counts
-  // the wait, as a blocking append's wait is counted once.
+  // the wait, so one that re-registers after a wake counts once.
   virtual std::optional<Result<void>> WhenReady(QueueWait wait, ShardId shard, Waiter& waiter,
                                                 bool first) = 0;
   // For a linked waiter. True: unlinked, and no wake comes.
@@ -159,7 +143,7 @@ class Queue {
   // Last committed offset; nullopt if `consumer` never committed on `shard`.
   virtual Result<std::optional<SequenceId>> CommittedOffset(ConsumerId consumer, ShardId shard) = 0;
 
-  // The class append futures resolve at, and replies are allowed to show.
+  // The class writes are acknowledged at, and replies are allowed to show.
   virtual Durability AckDurability() const = 0;
   // Monotonic per shard and class.
   virtual Result<SequenceId> DurableEnd(ShardId shard, Durability durability) = 0;

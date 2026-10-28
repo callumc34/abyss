@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <limits>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -27,38 +26,7 @@ constexpr auto kSpinFor = std::chrono::microseconds(2);
 // Past this a publish wait parks rather than yields.
 constexpr auto kYieldFor = std::chrono::microseconds(100);
 
-thread_local std::vector<uint32_t> t_sizes;
-
 core::Error Stopping() { return {core::ErrorCode::kUnavailable, "queue shutting down"}; }
-
-DurabilityFuture ReadyFuture(core::Result<void> value) {
-  std::promise<core::Result<void>> promise;
-  promise.set_value(std::move(value));
-  return promise.get_future();
-}
-
-// An append's power_loss future: its own node and sink, freed by the
-// one post its node gets.
-class PromiseWaiter final : public core::CompletionSink {
- public:
-  explicit PromiseWaiter(core::SequenceId seq)
-      : node_(seq, core::Completion{.sink = this, .client_id = 0, .slot_seq = seq}) {}
-
-  core::SeqWaiterNode& node() noexcept { return node_; }
-  DurabilityFuture Future() { return promise_.get_future(); }
-  void Resolve(core::Result<void> result) { promise_.set_value(std::move(result)); }
-
-  // A promise throws only on a second value, which one post rules out.
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  void Post(std::span<const core::CompletionEvent> events) noexcept override {
-    promise_.set_value(events.front().result);
-    delete this;  // NOLINT(cppcoreguidelines-owning-memory): released by its registrant.
-  }
-
- private:
-  core::SeqWaiterNode node_;
-  std::promise<core::Result<void>> promise_;
-};
 
 // Encodes `entry` straight into its reserved slice, then commits it.
 void CommitEncoded(Log& log, const core::QueueEntry& entry, core::ShardId shard,
@@ -68,36 +36,6 @@ void CommitEncoded(Log& log, const core::QueueEntry& entry, core::ShardId shard,
 }
 
 }  // namespace
-
-class ShardStream::Publisher final : public AppendPublisher {
- public:
-  Publisher(ShardStream& stream, std::unique_lock<std::mutex> lock, core::SequenceId first,
-            core::SequenceId end, LogPosition end_pos) noexcept
-      : stream_(stream), lock_(std::move(lock)), first_(first), end_(end), end_pos_(end_pos) {}
-
-  // Only allocation can throw here, and an OOM while publishing may
-  // terminate.
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  void Publish() noexcept override {
-    if (!lock_.owns_lock()) return;
-    // A reservation before this append may not have completed.
-    stream_.AwaitPublished(first_);
-    ABYSS_DCHECK(first_ >= core::kFirstSeq, "a publish from seq 0");
-    stream_.published_end_.store(end_, std::memory_order_seq_cst);
-    lock_.unlock();
-    // A flush may have covered these frames before they were published.
-    if (stream_.RaisePowerEnd()) stream_.PowerAdvanced();
-    stream_.WakePublished(end_);
-    stream_.config_.unit->committer->Published(end_pos_);
-  }
-
- private:
-  ShardStream& stream_;
-  std::unique_lock<std::mutex> lock_;
-  core::SequenceId first_;
-  core::SequenceId end_;
-  LogPosition end_pos_;
-};
 
 // A reservation's remaining work. Deadlock-free by log position: each
 // stream reserves log space inside its append lock, so a shard's
@@ -232,108 +170,6 @@ void ShardStream::Record(core::SequenceId seq, LogPosition pos, uint32_t size) {
     since_point_ = 0;
   }
   since_point_ += size;
-}
-
-core::Result<PendingAppend> ShardStream::BeginAppend(core::QueueEntry entry,
-                                                     core::SteadyTime admit_by) {
-  auto begun = Begin({&entry, 1}, admit_by);
-  if (!begun.has_value()) return std::unexpected(begun.error());
-  return PendingAppend{begun->first, std::move(begun->durable), std::move(begun->publisher)};
-}
-
-core::Result<PendingBatchAppend> ShardStream::BeginAppendBatch(
-    std::span<const core::QueueEntry> entries, core::SteadyTime admit_by) {
-  if (entries.empty()) {
-    return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument, "empty batch"});
-  }
-  std::vector<core::QueueEntry> owned(entries.begin(), entries.end());
-  auto begun = Begin(owned, admit_by);
-  if (!begun.has_value()) return std::unexpected(begun.error());
-  return PendingBatchAppend{begun->first, begun->last, std::move(begun->durable),
-                            std::move(begun->publisher)};
-}
-
-core::Result<ShardStream::Begun> ShardStream::Begin(std::span<core::QueueEntry> entries,
-                                                    core::SteadyTime admit_by) {
-  const bool batch = entries.size() > 1;
-  if (config_.window != nullptr) {
-    if (auto admitted = config_.window->Admit(config_.unit->id, admit_by); !admitted) {
-      return std::unexpected(admitted.error());
-    }
-  }
-  std::vector<uint32_t>& sizes = t_sizes;
-  sizes.clear();
-  uint64_t total = 0;
-  for (const core::QueueEntry& entry : entries) {
-    const std::size_t size = frame::EntryFrameSize(entry);
-    if (size > config_.max_value_size_bytes) {
-      return std::unexpected(core::Error{core::ErrorCode::kValueTooLarge,
-                                         std::string(batch ? "batch entry of " : "entry of ") +
-                                             std::to_string(size) +
-                                             " bytes exceeds queue.max_value_size_bytes (" +
-                                             std::to_string(config_.max_value_size_bytes) + ")"});
-    }
-    sizes.push_back(static_cast<uint32_t>(size));
-    total += size;
-  }
-  if (total > std::numeric_limits<uint32_t>::max()) {
-    return std::unexpected(
-        core::Error{core::ErrorCode::kResourceExhausted, "batch exceeds segment capacity"});
-  }
-  for (;;) {
-    std::unique_lock lock(append_mu_);
-    if (stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
-    auto reserved = log().Reserve(static_cast<uint32_t>(total));
-    if (!reserved.has_value()) {
-      const core::ErrorCode code = reserved.error().code();
-      if (code == core::ErrorCode::kUnavailable) {
-        lock.unlock();
-        if (log().WaitForSpare(admit_by)) continue;
-        if (stopping_.load(std::memory_order_acquire)) return std::unexpected(Stopping());
-        return std::unexpected(core::Error{
-            core::ErrorCode::kResourceExhausted,
-            "no spare WAL segment ready: the disk is full or the segment preparer is behind"});
-      }
-      if (code == core::ErrorCode::kResourceExhausted && batch) {
-        return std::unexpected(
-            core::Error{code, "batch exceeds segment capacity: " + reserved.error().message()});
-      }
-      return std::unexpected(reserved.error());
-    }
-
-    const Log::Reservation& at = *reserved;
-    if (config_.window != nullptr) config_.window->Add(total);
-    config_.unit->age->Start(DurabilityWindow::Clock::now());
-    const core::SequenceId first = next_seq_;
-    ABYSS_DCHECK(first >= core::kFirstSeq, "a frame assigned seq 0");
-    uint64_t off = 0;
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-      entries[i].seq = first + i;
-      const Log::Reservation slice{.pos = at.pos + off,
-                                   .size = sizes[i],
-                                   .gen = at.gen,
-                                   .salt = at.salt,
-                                   .dst = at.dst + off};
-      CommitEncoded(log(), entries[i], config_.shard, slice, total - off);
-      Record(first + i, slice.pos, sizes[i]);
-      off += sizes[i];
-      if (batch_commit_hook_ && i + 1 < entries.size()) batch_commit_hook_(i + 1);
-    }
-    const LogPosition end_pos = at.pos + total;
-    log().AwaitFilled(end_pos);
-
-    const core::SequenceId last = first + entries.size() - 1;
-    next_seq_ = last + 1;
-    appended_.Increment(static_cast<double>(entries.size()));
-    DurabilityFuture durable = config_.ack_durability == core::Durability::kPowerLoss
-                                   ? PowerDurableFuture(last)
-                                   : ReadyFuture({});
-    return Begun{
-        .first = first,
-        .last = last,
-        .durable = std::move(durable),
-        .publisher = std::make_unique<Publisher>(*this, std::move(lock), first, last + 1, end_pos)};
-  }
 }
 
 // A reservation over several logs: each log's filler, in log order.
@@ -488,18 +324,6 @@ core::Result<std::unique_ptr<ReservationFiller>> ShardStream::ReserveLocked(
                                   std::move(fill_hook), committed, group.sizes.size());
 }
 
-DurabilityFuture ShardStream::PowerDurableFuture(core::SequenceId last) {
-  auto waiter = std::make_unique<PromiseWaiter>(last);
-  DurabilityFuture future = waiter->Future();
-  if (auto ready = power_waiters_.Register(waiter->node(), power_end_)) {
-    waiter->Resolve(*std::move(ready));
-  } else {
-    // Linked: the post that resolves it frees it.
-    std::ignore = waiter.release();
-  }
-  return future;
-}
-
 // Spins, yields, then parks: the wait is a predecessor's fill and
 // publish. The acquire pairs with that publish's store, so its frames
 // are filled before this publisher's store too.
@@ -549,7 +373,8 @@ void ShardStream::AwaitPublished(core::SequenceId first) noexcept {
                "a shard's published end passed a seq not yet published");
 }
 
-// As the Publisher's, only allocation can throw here.
+// Only allocation can throw here, and an OOM while publishing may
+// terminate.
 // NOLINTNEXTLINE(bugprone-exception-escape)
 void ShardStream::PublishInOrder(core::SequenceId first, core::SequenceId end) noexcept {
   ABYSS_DCHECK(first >= core::kFirstSeq, "a publish from seq 0");
@@ -603,8 +428,8 @@ bool ShardStream::Durable(core::SequenceId end) noexcept {
 }
 
 // The power end is the flushed end, but never past the published one:
-// a frame is filled, and may be flushed, before its PendingAppend is
-// published, and nothing may see it until then. The flusher stores the
+// a frame is filled, and may be flushed, before its reservation is
+// completed, and nothing may see it until then. The flusher stores the
 // flushed end and the publisher the published end, each then reading
 // the other, all seq_cst, so the later of the two raises it. The raise
 // is seq_cst too, for PowerAdvanced's waiter count.

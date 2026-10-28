@@ -180,9 +180,6 @@ class ColdConsumer {
   // The shard's log clock (CompactionBuffer::LogClockMs). Any thread.
   uint64_t LogClockMs() const { return buffer_.LogClockMs(); }
 
-  // Blocks until this consumer drains through `target` (true) or `timeout`
-  // elapses (false). Signal-driven by the drain loop, not a poll.
-  bool WaitForDrainedSeq(core::SequenceId target, std::chrono::milliseconds timeout);
   // Registers `node`, posted once the drained seq passes its seq:
   // SeqWaiters::Register. WhenDrained also asks the loop to drain now.
   std::optional<core::Result<void>> WhenDrained(core::SeqWaiterNode& node);
@@ -193,10 +190,6 @@ class ColdConsumer {
   bool CancelDrainWait(core::Waiter& waiter) noexcept { return room_waiters_.Cancel(waiter); }
   void FinishDrainWait(core::Waiter& waiter) noexcept { room_waiters_.Finish(waiter); }
   std::size_t RoomWaitersForTesting() const noexcept { return room_waiters_.size(); }
-  // Runs in WaitForDrainedSeq between its check and its wait.
-  void SetDrainedWaitHookForTesting(std::function<void()> hook) {
-    drained_wait_hook_ = std::move(hook);
-  }
 
  private:
   void RunLoop();
@@ -338,7 +331,6 @@ class ColdConsumer {
   // passes a node's seq, so drained through seq + 1. A per-seq wait,
   // woken in seq order, has no head for a small request to pass.
   core::SeqWaiters drained_waiters_;
-  std::function<void()> drained_wait_hook_;
   // Waiters for room in hot: each advance wakes the front one, which
   // evicts again and hands on if that left the shard under its limit.
   // Waking them all would herd them on the shard's exclusive lock.

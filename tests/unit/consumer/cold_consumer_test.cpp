@@ -23,6 +23,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/seq_waiters.h"
 #include "buffer_read.h"
+#include "cold_drain_wait.h"
 #include "fatal_capture.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"
@@ -338,7 +339,7 @@ TEST_F(ColdConsumerTest, IdleBackoffIsInterruptedByAWaiterOnADrain) {
   // The waiter's deadline is far shorter than the backoff ceiling. This
   // must still succeed: waiting is what tells the consumer to stop
   // sleeping.
-  const bool drained = c->WaitForDrainedSeq(9, 500ms);
+  const bool drained = testing::WaitDrained(*c, 9, 500ms).has_value();
   c->Stop();
 
   EXPECT_TRUE(drained) << "the wait expired while the consumer slept out its idle backoff";
@@ -1656,18 +1657,6 @@ void ServeThree(NiceMock<testing::MockQueue>& queue) {
       .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
 }
 
-// A drain between WaitForDrainedSeq's check and its registration is
-// seen by the registration's re-check.
-TEST_F(ColdConsumerTest, ADrainBetweenTheCheckAndTheWaitIsNotLost) {
-  ServeThree(queue_);
-  auto c = MakeConsumer();
-  c->SetDrainedWaitHookForTesting([&c] { EXPECT_EQ(c->DrainWithBatch(16), 3U); });
-  const auto start = std::chrono::steady_clock::now();
-  EXPECT_TRUE(c->WaitForDrainedSeq(3, 10s));
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the drain was lost";
-  EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
-}
-
 TEST_F(ColdConsumerTest, ARegisteredNodeIsPostedOnceTheDrainPassesIt) {
   ServeThree(queue_);
   auto c = MakeConsumer();
@@ -1685,11 +1674,11 @@ TEST_F(ColdConsumerTest, ARegisteredNodeIsPostedOnceTheDrainPassesIt) {
   EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
 }
 
-TEST_F(ColdConsumerTest, RetriesOnTimeoutLeaveNoDrainedWaiters) {
+TEST_F(ColdConsumerTest, RetriesOnTimeoutLeaveNoDrainWaiters) {
   auto c = MakeConsumer();
   for (int i = 0; i < 200; ++i) {
-    ASSERT_FALSE(c->WaitForDrainedSeq(5, 5ms)) << "retry " << i;
-    ASSERT_EQ(c->DrainedWaitersForTesting(), 0U) << "retry " << i;
+    ASSERT_TRUE(testing::TimedOut(testing::WaitDrained(*c, 5, 5ms))) << "retry " << i;
+    ASSERT_EQ(c->RoomWaitersForTesting(), 0U) << "retry " << i;
   }
 }
 
@@ -1704,7 +1693,9 @@ TEST_F(ColdConsumerTest, StoppingFailsDrainedWaitsNowAndLater) {
   ASSERT_FALSE(event.result.has_value());
   EXPECT_EQ(event.result.error().code(), core::ErrorCode::kUnavailable);
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_FALSE(c->WaitForDrainedSeq(11, 10s));
+  const auto later = testing::WaitDrained(*c, 11, 10s);
+  ASSERT_FALSE(later.has_value());
+  EXPECT_EQ(later.error().code(), core::ErrorCode::kUnavailable);
   EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
 }
 

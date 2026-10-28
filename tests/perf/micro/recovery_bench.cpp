@@ -30,6 +30,7 @@
 #include "abyss/metrics/testing.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/wal_queue.h"
+#include "queue_append.h"
 
 namespace abyss::engine {
 namespace {
@@ -177,7 +178,7 @@ std::optional<uint64_t> PreloadQueue(const std::string& wal_path, int64_t n,
   std::vector<std::vector<core::QueueEntry>> pending(kShardCount);
   const auto append = [&queue, &pending](core::ShardId shard) {
     if (pending[shard].empty()) return true;
-    const bool ok = queue.AppendBatch(shard, pending[shard]).has_value();
+    const bool ok = abyss::testing::AppendOwned(queue, shard, pending[shard]).has_value();
     pending[shard].clear();
     return ok;
   };
