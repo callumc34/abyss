@@ -28,12 +28,6 @@ namespace {
 using metrics::RedecideReason;
 using metrics::WritePhase;
 
-constexpr std::string_view kWriteDurableTimeout =
-    "write durable wait exceeded server timeout; the write is applied and may yet become durable";
-constexpr std::string_view kFlushDurableTimeout =
-    "flush durable wait exceeded server timeout; retry to complete the wipe";
-constexpr std::string_view kFenceTimeout =
-    "durable wait exceeded server timeout; the reply would show a write not yet durable";
 constexpr std::string_view kForeignLoadTimeout = "write timed out awaiting a load of its key";
 
 core::RespValue CrossSlot() {
@@ -206,14 +200,18 @@ Sequencer::Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& load
 Step Sequencer::Attempt(PendingWrite& write) {
   ABYSS_DCHECK(write.owner_ == std::this_thread::get_id(),
                "a write attempted off its owner's thread");
-  ABYSS_DCHECK(write.phase_ != PendingWrite::Phase::kDone, "an attempt of a write that replied");
-  if (write.phase_ == PendingWrite::Phase::kDurable) return AwaitDurable(write);
+  const bool open =
+      write.phase_ != PendingWrite::Phase::kDone && write.phase_ != PendingWrite::Phase::kSequenced;
+  ABYSS_DCHECK(open, "an attempt of a write that replied or was linearised");
   if (write.waiting_) {
     const bool ended =
         write.wake_.has_value() || write.expired_ || write.wait_reason_ == WaitReason::kLoads;
     ABYSS_DCHECK(ended, "a write attempted while its wait is open");
-    // Past its deadline it is never applied, whatever woke it.
-    if (write.expired_ || core::SteadyClock::now() >= write.deadline_) return Abandon(write);
+    // Abandoned, or past its deadline, it is never applied, whatever
+    // woke it.
+    if (write.abandoned_ || write.expired_ || core::SteadyClock::now() >= write.deadline_) {
+      return Expired(write);
+    }
     write.waiting_ = false;
   }
   return write.flush_ ? FlushAttempt(write) : WriteAttempt(write);
@@ -232,38 +230,76 @@ void Sequencer::Load(PendingWrite& write) {
   }
 }
 
-bool Sequencer::Expire(PendingWrite& write) {
+void Sequencer::Unload(PendingWrite& write, const core::Error& error) {
+  AbortLoads(write);
+  if (error.code() != core::ErrorCode::kTimeout) write.load_error_ = error;
+}
+
+void Sequencer::AbortLoads(PendingWrite& write) {
+  for (const PendingWrite::Owned& load : write.owned_) hot_.AbortLoad(load.key, load.token);
+  ClearLoads(write);
+}
+
+std::optional<core::Result<core::RespValue>> Sequencer::Sequence(PendingWrite& write,
+                                                                 core::DurableWait& wait,
+                                                                 core::Completion completion) {
   ABYSS_DCHECK(write.owner_ == std::this_thread::get_id(),
-               "a write expired off its owner's thread");
-  ABYSS_DCHECK(write.waiting_, "a write expired while not waiting");
-  ABYSS_DCHECK(!write.wake_.has_value(), "a write expired with its wake in hand");
-  bool cancelled = false;
-  if (write.phase_ == PendingWrite::Phase::kDurable) {
-    const ShardSeq at = write.DurableAt(write.durable_next_);
-    cancelled = write.node_.has_value() &&
-                queue_.CancelDurable(at.shard, queue_.AckDurability(), *write.node_);
-    if (cancelled) write.node_.reset();
-  } else {
-    switch (write.wait_reason_) {
-      case WaitReason::kAdmission:
-        cancelled = queue_.CancelWait(core::QueueWait::kAdmission, write.wait_shard_, write);
-        break;
-      case WaitReason::kSpare:
-        cancelled = queue_.CancelWait(core::QueueWait::kSpare, write.wait_shard_, write);
-        break;
-      case WaitReason::kBackpressure:
-        cancelled = buffers_.CancelDrainWait(write.wait_shard_, write);
-        break;
-      case WaitReason::kForeignLoad:
-        cancelled = hot_.CancelLoadWait(write.foreign_.at(write.foreign_next_), write.load_wake_);
-        break;
-      case WaitReason::kLoads:
-        // A load in flight reports back when it lands.
-        break;
-    }
+               "a write sequenced off its owner's thread");
+  ABYSS_DCHECK(write.phase_ == PendingWrite::Phase::kSequenced, "a write sequenced twice");
+  write.phase_ = PendingWrite::Phase::kDone;
+  // The stages before its durable wait; the wait times itself.
+  const bool timed = write.record_phases_ && write.phase_times_.sampled;
+  if (timed) Phases(*this, write.phase_times_).Record();
+  core::DurableWait::Kind kind = core::DurableWait::Kind::kWrite;
+  if (write.durable_kind_ == PendingWrite::DurableKind::kFlush) {
+    kind = core::DurableWait::Kind::kFlush;
+  } else if (write.durable_kind_ == PendingWrite::DurableKind::kFence) {
+    kind = core::DurableWait::Kind::kFence;
   }
-  write.expired_ = cancelled;
-  return cancelled;
+  const size_t count = write.DurableCount();
+  wait.Begin(queue_, kind, completion, count, std::move(write.reply_), timed ? this : nullptr);
+  for (size_t i = 0; i < count; ++i) {
+    const ShardSeq at = write.DurableAt(i);
+    wait.Add(at.shard, at.seq);
+  }
+  return wait.Ready();
+}
+
+core::Result<core::RespValue> Sequencer::Abandon(PendingWrite& write) {
+  ABYSS_DCHECK(write.owner_ == std::this_thread::get_id(),
+               "a write abandoned off its owner's thread");
+  const bool waiting = write.waiting_ && !write.abandoned_;
+  ABYSS_DCHECK(waiting, "a write abandoned while not waiting");
+  ABYSS_DCHECK(!write.wake_.has_value(), "a write abandoned with its wake in hand");
+  // Its load job owns what the loads touch until it posts.
+  if (write.wait_reason_ == WaitReason::kLoads) {
+    write.abandoned_ = true;
+    return TimedOut(RedecideReason::kLoad);
+  }
+  bool cancelled = false;
+  switch (write.wait_reason_) {
+    case WaitReason::kAdmission:
+      cancelled = queue_.CancelWait(core::QueueWait::kAdmission, write.wait_shard_, write);
+      break;
+    case WaitReason::kSpare:
+      cancelled = queue_.CancelWait(core::QueueWait::kSpare, write.wait_shard_, write);
+      break;
+    case WaitReason::kBackpressure:
+      cancelled = buffers_.CancelDrainWait(write.wait_shard_, write);
+      break;
+    case WaitReason::kForeignLoad:
+      cancelled = hot_.CancelLoadWait(write.foreign_.at(write.foreign_next_), write.load_wake_);
+      break;
+    case WaitReason::kLoads:
+      break;
+  }
+  if (cancelled) {
+    write.expired_ = true;
+    return std::move(Expired(write).reply);
+  }
+  // A notifier took it: its wake comes, and finds it abandoned.
+  write.abandoned_ = true;
+  return TimeoutOf(write, std::nullopt);
 }
 
 // Deadlock-free: hot shard locks are taken ascending, then each
@@ -455,8 +491,7 @@ Step Sequencer::WriteAttempt(PendingWrite& write) {
         write.reply_ = *std::move(decision.reply);
       }
       write.durable_kind_ = PendingWrite::DurableKind::kFence;
-      write.phase_ = Phase::kDurable;
-      return AwaitDurable(write);
+      return Linearised(write);
     }
     if (write.grows_ && !judged && std::ranges::any_of(shards, [&hold](core::ShardId shard) {
           return (*hold)->OverBackpressure(shard);
@@ -631,8 +666,7 @@ Step Sequencer::WriteAttempt(PendingWrite& write) {
     }
     write.durable_kind_ = PendingWrite::DurableKind::kWrite;
     write.record_phases_ = true;
-    write.phase_ = Phase::kDurable;
-    return AwaitDurable(write);
+    return Linearised(write);
   }
 }
 
@@ -707,8 +741,7 @@ Step Sequencer::FlushAttempt(PendingWrite& write) {
     write.reply_ = core::RespValue::SimpleString("OK");
     write.durable_kind_ = PendingWrite::DurableKind::kFlush;
     write.record_phases_ = false;
-    write.phase_ = Phase::kDurable;
-    return AwaitDurable(write);
+    return Linearised(write);
   }
 }
 
@@ -843,41 +876,10 @@ std::optional<Step> Sequencer::AwaitForeignLoads(PendingWrite& write) {
 // follow everything it observed, and Complete's AwaitFilled and each
 // class's durable end are prefix-ordered by position. CROSSSLOT keeps
 // every multi-shard decision within one log.
-Step Sequencer::AwaitDurable(PendingWrite& write) {
-  const core::Durability ack = queue_.AckDurability();
-  if (write.waiting_) {
-    write.waiting_ = false;
-    if (write.expired_) return DurableTimedOut(write);
-    std::optional<core::Result<void>> wake = write.TakeWake();
-    ABYSS_DCHECK(wake.has_value(), "a durable wait resumed before its post");
-    write.node_.reset();
-    if (!wake->has_value()) return DurableFailed(write, wake->error());
-    ++write.durable_next_;
-  }
-  for (; write.durable_next_ < write.DurableCount(); ++write.durable_next_) {
-    const ShardSeq at = write.DurableAt(write.durable_next_);
-    core::SeqWaiterNode& node = write.node_.emplace(at.seq, write.completion_);
-    auto durable = queue_.WhenDurable(at.shard, ack, node);
-    if (!durable.has_value()) {
-      // Past the deadline it was checked once more; a lost Cancel
-      // means its post is on the way.
-      if (core::SteadyClock::now() < write.deadline_ ||
-          !queue_.CancelDurable(at.shard, ack, node)) {
-        write.waiting_ = true;
-        return Step{.kind = Step::Kind::kSequenced};
-      }
-      write.node_.reset();
-      return DurableTimedOut(write);
-    }
-    write.node_.reset();
-    if (!durable->has_value()) return DurableFailed(write, durable->error());
-  }
-  if (write.record_phases_) {
-    Phases phases(*this, write.phase_times_);
-    phases.Lap(WritePhase::kDurable);
-    phases.Record();
-  }
-  return Done(write, std::move(write.reply_));
+Step Sequencer::Linearised(PendingWrite& write) {
+  write.phase_ = PendingWrite::Phase::kSequenced;
+  write.waiting_ = false;
+  return Step{.kind = Step::Kind::kSequenced};
 }
 
 Step Sequencer::Waiting(PendingWrite& write, WaitReason reason, core::ShardId shard) {
@@ -891,55 +893,76 @@ Step Sequencer::Waiting(PendingWrite& write, WaitReason reason, core::ShardId sh
 
 Step Sequencer::Done(PendingWrite& write, core::Result<core::RespValue> reply) {
   ABYSS_DCHECK(write.owned_.empty(), "a write replied with a load open");
-  ABYSS_DCHECK(!write.node_.has_value(), "a write replied with a durable wait open");
   write.phase_ = PendingWrite::Phase::kDone;
   write.waiting_ = false;
   write.spare_.clear();
   return Step{.kind = Step::Kind::kReplied, .reply = std::move(reply)};
 }
 
-Step Sequencer::Abandon(PendingWrite& write) {
+Step Sequencer::Expired(PendingWrite& write) {
   const std::optional<core::Result<void>> wake = write.TakeWake();
-  const bool woken = wake.has_value();
-  const bool failed = woken && !wake->has_value();
-  const core::ShardId shard = write.wait_shard_;
   write.waiting_ = false;
   write.expired_ = false;
+  std::optional<core::Result<core::RespValue>> reply;
+  if (!write.abandoned_) reply = TimeoutOf(write, wake);
+  EndWait(write, wake);
+  if (!reply.has_value()) {
+    // Abandon gave the reply; this one goes nowhere.
+    reply = std::unexpected(core::Error{core::ErrorCode::kTimeout, "write abandoned"});
+  }
+  return Done(write, *std::move(reply));
+}
+
+void Sequencer::EndWait(PendingWrite& write, const std::optional<core::Result<void>>& wake) {
+  const bool woken = wake.has_value();
+  const core::ShardId shard = write.wait_shard_;
   switch (write.wait_reason_) {
     case WaitReason::kAdmission:
       if (woken) queue_.FinishWait(core::QueueWait::kAdmission, shard, write);
-      if (failed) return Done(write, std::unexpected(wake->error()));
-      return Done(write, std::unexpected(queue_.AdmissionTimedOut(shard)));
+      return;
     case WaitReason::kSpare:
       if (woken) queue_.FinishWait(core::QueueWait::kSpare, shard, write);
-      if (failed) return Done(write, std::unexpected(wake->error()));
-      return Done(write, std::unexpected(SpareTimedOut(write.flush_)));
+      return;
     case WaitReason::kBackpressure:
       if (woken) buffers_.FinishDrainWait(shard, write);
-      if (failed) return Done(write, std::unexpected(wake->error()));
-      backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
-      backpressure_rejections_metric_.Increment();
-      return Done(write, OutOfMemory());
+      return;
     case WaitReason::kForeignLoad:
       AbortLoads(write);
-      if (failed) return Done(write, std::unexpected(wake->error()));
-      return Done(write, std::unexpected(core::Error{core::ErrorCode::kTimeout,
-                                                     std::string(kForeignLoadTimeout)}));
+      return;
     case WaitReason::kLoads:
       if (write.load_error_.has_value()) {
-        core::Error error = *std::move(write.load_error_);
         AbortLoads(write);
-        return Done(write, std::unexpected(std::move(error)));
+      } else {
+        InstallLoads(write);
       }
-      InstallLoads(write);
-      return Done(write, TimedOut(RedecideReason::kLoad));
+      return;
   }
-  return Done(write, TimedOut(RedecideReason::kLoad));
 }
 
-void Sequencer::AbortLoads(PendingWrite& write) {
-  for (const PendingWrite::Owned& load : write.owned_) hot_.AbortLoad(load.key, load.token);
-  ClearLoads(write);
+core::Result<core::RespValue> Sequencer::TimeoutOf(PendingWrite& write,
+                                                   const std::optional<core::Result<void>>& wake) {
+  const bool failed = wake.has_value() && !wake->has_value();
+  switch (write.wait_reason_) {
+    case WaitReason::kAdmission:
+      if (failed) return std::unexpected(wake->error());
+      return std::unexpected(queue_.AdmissionTimedOut(write.wait_shard_));
+    case WaitReason::kSpare:
+      if (failed) return std::unexpected(wake->error());
+      return std::unexpected(SpareTimedOut(write.flush_));
+    case WaitReason::kBackpressure:
+      if (failed) return std::unexpected(wake->error());
+      backpressure_rejections_.fetch_add(1, std::memory_order_relaxed);
+      backpressure_rejections_metric_.Increment();
+      return OutOfMemory();
+    case WaitReason::kForeignLoad:
+      if (failed) return std::unexpected(wake->error());
+      return std::unexpected(
+          core::Error{core::ErrorCode::kTimeout, std::string(kForeignLoadTimeout)});
+    case WaitReason::kLoads:
+      if (write.load_error_.has_value()) return std::unexpected(*write.load_error_);
+      return TimedOut(RedecideReason::kLoad);
+  }
+  return TimedOut(RedecideReason::kLoad);
 }
 
 // What an abandoned write loaded still installs: its tokens judge it
@@ -967,55 +990,14 @@ void Sequencer::ClearLoads(PendingWrite& write) {
   write.load_error_.reset();
 }
 
-Step Sequencer::DurableTimedOut(PendingWrite& write) {
-  write.expired_ = false;
-  const ShardSeq at = write.DurableAt(write.durable_next_);
-  if (write.durable_kind_ == PendingWrite::DurableKind::kFence) {
-    ABYSS_LOG_WARN("fence durable wait timeout", {"shard", static_cast<int64_t>(at.shard)},
-                   {"seq", static_cast<uint64_t>(at.seq)});
-    return Done(
-        write, std::unexpected(core::Error{core::ErrorCode::kTimeout, std::string(kFenceTimeout)}));
-  }
-  const bool flush = write.durable_kind_ == PendingWrite::DurableKind::kFlush;
-  ABYSS_LOG_WARN(flush ? "flush durable wait timeout" : "write durable wait timeout",
-                 {"shard", static_cast<int64_t>(at.shard)}, {"seq", static_cast<uint64_t>(at.seq)},
-                 {"timeout_ms", static_cast<int64_t>(config_.write_timeout.count())});
-  return Done(write, std::unexpected(core::Error{
-                         core::ErrorCode::kTimeout,
-                         std::string(flush ? kFlushDurableTimeout : kWriteDurableTimeout)}));
-}
-
-Step Sequencer::DurableFailed(PendingWrite& write, const core::Error& error) {
-  if (write.durable_kind_ != PendingWrite::DurableKind::kFence) {
-    const ShardSeq at = write.DurableAt(write.durable_next_);
-    ABYSS_LOG_ERROR(
-        write.durable_kind_ == PendingWrite::DurableKind::kFlush ? "flush durable failed"
-                                                                 : "write durable failed",
-        {"shard", static_cast<int64_t>(at.shard)}, {"seq", static_cast<uint64_t>(at.seq)},
-        {"err", std::string_view{error.message()}});
-  }
-  return Done(write, std::unexpected(error));
-}
-
 void Sequencer::Again(PendingWrite& write, RedecideReason reason) {
   Redecided(reason);
   write.redecided_ = reason;
 }
 
-core::Result<void> Sequencer::Fence(std::span<const ShardSeq> fences, core::SteadyTime deadline) {
-  for (const ShardSeq& fence : fences) {
-    const auto now = core::SteadyClock::now();
-    const auto timeout =
-        now < deadline ? std::chrono::ceil<core::Duration>(deadline - now) : core::Duration::zero();
-    auto durable = queue_.AwaitDurable(fence.shard, fence.seq, queue_.AckDurability(), timeout);
-    if (!durable.has_value()) return std::unexpected(durable.error());
-    if (!*durable) {
-      ABYSS_LOG_WARN("fence durable wait timeout", {"shard", static_cast<int64_t>(fence.shard)},
-                     {"seq", static_cast<uint64_t>(fence.seq)});
-      return std::unexpected(core::Error{core::ErrorCode::kTimeout, std::string(kFenceTimeout)});
-    }
-  }
-  return {};
+void Sequencer::Waited(std::chrono::steady_clock::duration waited) noexcept {
+  constexpr auto kDurable = static_cast<size_t>(WritePhase::kDurable);
+  std::get<kDurable>(phase_seconds_).Observe(std::chrono::duration<double>(waited).count());
 }
 
 void Sequencer::Redecided(RedecideReason reason) {

@@ -452,7 +452,7 @@ TEST_F(RegressionTest, FlushDbRacingConditionalsNeverThrows) {
     });
   }
   for (int f = 0; f < 20; ++f) {
-    auto flushed = engine_->DispatchFlush(core::FlushTarget::kThisDb);
+    auto flushed = dispatch_->DispatchFlush();
     ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
     std::this_thread::sleep_for(2ms);
   }

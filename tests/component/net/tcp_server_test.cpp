@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -41,24 +42,14 @@ class StubDispatcher : public core::CommandDispatcher {
   std::atomic<int> write_calls{0};
   std::string read_payload = "value";
 
-  core::Result<core::RespValue> DispatchRead(std::string_view /*name*/,
-                                             const core::RespCommand& /*cmd*/) override {
-    read_calls.fetch_add(1);
-    return core::RespValue::BulkString(read_payload);
-  }
-  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/, core::RespCommand /*cmd*/,
-                                              core::PredicateFlags /*flags*/) override {
+  core::Outcome Dispatch(core::Request request, core::Slot& /*slot*/,
+                         std::unique_ptr<core::Task>& /*task*/) override {
+    if (request.kind == core::Request::Kind::kRead) {
+      read_calls.fetch_add(1);
+      return {.reply = core::RespValue::BulkString(read_payload)};
+    }
     write_calls.fetch_add(1);
-    return core::RespValue::SimpleString("OK");
-  }
-  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
-                                               core::RespCommand /*cmd*/) override {
-    write_calls.fetch_add(1);
-    return core::RespValue::SimpleString("OK");
-  }
-  core::Result<core::RespValue> DispatchFlush(core::FlushTarget /*target*/) override {
-    write_calls.fetch_add(1);
-    return core::RespValue::SimpleString("OK");
+    return {.reply = core::RespValue::SimpleString("OK")};
   }
 };
 

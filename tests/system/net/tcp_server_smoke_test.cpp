@@ -28,7 +28,8 @@ class TcpServerSmokeTest : public ::testing::Test {
     cfg.connection.idle_timeout = std::chrono::seconds{30};
 
     server_ = std::make_unique<TcpServer>(
-        cfg, resp::GlobalRegistry(), resp::PipelineDependencies{.dispatcher = &harness_.Engine()});
+        cfg, resp::GlobalRegistry(),
+        resp::PipelineDependencies{.dispatcher = &harness_.Dispatcher()});
     ASSERT_TRUE(server_->Start().has_value());
     ASSERT_TRUE(client_.Connect(server_->BoundPort()));
   }
@@ -38,9 +39,11 @@ class TcpServerSmokeTest : public ::testing::Test {
     server_->Stop();
   }
 
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::IntegrationHarness harness_;
   std::unique_ptr<TcpServer> server_;
   component_test::SyncRedisClient client_;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
 TEST_F(TcpServerSmokeTest, PingPongEndToEnd) { EXPECT_EQ(client_.Command({"PING"}), "+PONG\r\n"); }

@@ -31,7 +31,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
-#include "abyss/engine/blocking_driver.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
@@ -39,9 +39,11 @@
 #include "abyss/hot/single_shard_store.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "blocking_driver.h"
 #include "latch.h"
 #include "mock_queue.h"
 #include "on_exit.h"
+#include "sync_dispatch.h"
 #include "temp_dir.h"
 #include "test_clock.h"
 
@@ -220,19 +222,20 @@ std::string DescribePairs(const core::Result<core::RespValue>& reply) {
   return out + "}";
 }
 
-// Generous, so a slow runner never times a read out, and distinct, so
-// a test can tell which deadline a read used.
-constexpr std::chrono::milliseconds kPointDeadline = 5s;
-constexpr std::chrono::milliseconds kScanDeadline = 10s;
+// Every read's deadline, as every write's: generous, so a slow runner
+// never times a read out.
+constexpr std::chrono::milliseconds kCommandTimeout = 2s;
 
 class ReadPathFixture : public ::testing::Test {
  protected:
-  explicit ReadPathFixture(ReadPathConfig config = {.cold_read_deadline = kPointDeadline,
-                                                    .cold_scan_deadline = kScanDeadline,
-                                                    .fill_doorkeeper = false}) {
+  explicit ReadPathFixture(ReadPathConfig config = {.fill_doorkeeper = false},
+                           uint32_t io_threads = 2)
+      : pool_(IoPoolConfig{.threads = io_threads}) {
     config.wall_clock = clock_.WallFn();
-    reads_ = std::make_unique<ReadPath>(hot_, loader_, sequencer_, config);
+    reads_ = std::make_unique<ReadPath>(hot_, loader_, pool_, config);
   }
+  // Before what its queued fills read through goes.
+  void TearDown() override { pool_.Shutdown(); }
 
   int64_t NowMs() const {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -242,8 +245,8 @@ class ReadPathFixture : public ::testing::Test {
 
   // Through the sequencer, so hot holds the key as decided.
   void Write(std::vector<std::string> args) {
-    auto written = RunToCompletion(sequencer_, core::RespCommand{.args = std::move(args)},
-                                   core::PredicateFlags::kNone);
+    auto written = abyss::testing::RunToCompletion(
+        sequencer_, core::RespCommand{.args = std::move(args)}, core::PredicateFlags::kNone);
     ASSERT_TRUE(written.has_value()) << written.error().message();
     ASSERT_FALSE(written->IsError()) << written->AsString();
   }
@@ -257,13 +260,22 @@ class ReadPathFixture : public ::testing::Test {
     buffer_.Absorb(std::string(key), op, kEviction, seq, static_cast<uint64_t>(NowMs()));
   }
 
+  // Through the engine's dispatch; a fill it queued has run by return.
   core::Result<core::RespValue> Read(std::vector<std::string> args) {
-    const core::RespCommand cmd{.args = std::move(args)};
-    TieringEngine engine(*reads_, sequencer_);
+    core::RespCommand cmd{.args = std::move(args)};
+    TieringEngine engine(*reads_, sequencer_, pool_);
+    abyss::testing::SyncConnection connection(engine);
     const std::string name = cmd.args.front();
-    if (name == "EXISTS") return engine.DispatchFanOut(core::MultiKeyKind::kExists, cmd);
-    if (name == "MGET") return engine.DispatchFanOut(core::MultiKeyKind::kMget, cmd);
-    return engine.DispatchRead(name, cmd);
+    core::Result<core::RespValue> reply;
+    if (name == "EXISTS") {
+      reply = connection.FanOut(core::MultiKeyKind::kExists, std::move(cmd));
+    } else if (name == "MGET") {
+      reply = connection.FanOut(core::MultiKeyKind::kMget, std::move(cmd));
+    } else {
+      reply = connection.Read(name, std::move(cmd));
+    }
+    pool_.WaitIdleForTesting();
+    return reply;
   }
   // Hot holds an entry for `key`: a value read answers, if only with
   // WRONGTYPE. A stub answers meta reads alone.
@@ -290,8 +302,10 @@ class ReadPathFixture : public ::testing::Test {
       .wall_clock = clock_.WallFn(),
   }};
   Loader loader_{hot_, router_, cold_, clock_.WallFn()};
-  Sequencer sequencer_{hot_, queue_, loader_, router_,
-                       SequencerConfig{.write_timeout = 2s, .wall_clock = clock_.WallFn()}};
+  Sequencer sequencer_{
+      hot_, queue_, loader_, router_,
+      SequencerConfig{.command_timeout = kCommandTimeout, .wall_clock = clock_.WallFn()}};
+  IoPool pool_;
   std::unique_ptr<ReadPath> reads_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
@@ -597,7 +611,7 @@ TEST_F(ReadPathTest, AMissNeverWaitsForColdToDrain) {
   EXPECT_EQ(Describe(Read({"GET", "k"})), "$v");
   const auto elapsed = core::SteadyClock::now() - start;
   EXPECT_EQ(router_.drain_waits.load(), 0);
-  EXPECT_LE(cold_.LastBudget(), kPointDeadline) << "a point read's deadline";
+  EXPECT_LE(cold_.LastBudget(), kCommandTimeout) << "the command's deadline";
   EXPECT_LT(elapsed, 1s);
 }
 
@@ -630,11 +644,10 @@ bool JoinedBy(const Loader& loader, uint64_t n) {
   return true;
 }
 
-// The default fill policy, with deadlines that outlast a held load.
+// The default fill policy, with a scan lane for every concurrent scan.
 class ReadPathDefaultTest : public ReadPathFixture {
  protected:
-  ReadPathDefaultTest()
-      : ReadPathFixture(ReadPathConfig{.cold_read_deadline = 10s, .cold_scan_deadline = 10s}) {}
+  ReadPathDefaultTest() : ReadPathFixture(ReadPathConfig{}, 10) {}
 };
 
 // The doorkeeper admits none of them on a first touch, or only some:
@@ -722,8 +735,8 @@ TEST_F(ReadPathTest, AReadNeverWaitsOnAWritesLoad) {
   const double filled = fills();
   const auto write = [this](std::vector<std::string> args) {
     return std::async(std::launch::async, [this, args = std::move(args)]() mutable {
-      return RunToCompletion(sequencer_, core::RespCommand{.args = std::move(args)},
-                             core::PredicateFlags::kNone);
+      return abyss::testing::RunToCompletion(sequencer_, core::RespCommand{.args = std::move(args)},
+                                             core::PredicateFlags::kNone);
     });
   };
   cold_.HoldFullLoads();
@@ -740,7 +753,7 @@ TEST_F(ReadPathTest, AReadNeverWaitsOnAWritesLoad) {
   ASSERT_TRUE(hot_.LoadPending("k") && hot_.LoadPending("h"));
 
   EXPECT_EQ(Describe(Read({"GET", "k"})), "$v");
-  EXPECT_LE(cold_.LastBudget(), kPointDeadline) << "a point read's deadline";
+  EXPECT_LE(cold_.LastBudget(), kCommandTimeout) << "the command's deadline";
   EXPECT_EQ(DescribePairs(Read({"HGETALL", "h"})), "{f=9,g=2}");
   EXPECT_EQ(fills(), filled);
   EXPECT_EQ(loader_.JoinsForTesting(), 0U);
@@ -813,7 +826,7 @@ TEST_F(ReadPathTest, ACardinalityOfALargeColdSetReadsNoMember) {
   rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
 
   EXPECT_EQ(Describe(card), ":100000") << "within the point read's deadline";
-  EXPECT_LE(cold_.LastBudget(), kPointDeadline);
+  EXPECT_LE(cold_.LastBudget(), kCommandTimeout);
   EXPECT_EQ(nexts, 0U) << "SCARD read the set's members";
   EXPECT_EQ(seeks, 0U);
   EXPECT_EQ(cold_.loads.load(), 0);
@@ -866,7 +879,7 @@ TEST_F(ReadPathTest, AGetOfALargeColdSetIsWrongTypeAndReadsNoMembers) {
 TEST_F(ReadPathTest, AKeyWrittenAfterAFlushIsResidentToAFill) {
   drained_ = 0;
   Cold({ops::StringSet{.key = "k", .value = "pre-flush"}});
-  ASSERT_TRUE(RunFlushToCompletion(sequencer_).has_value());
+  ASSERT_TRUE(abyss::testing::RunFlushToCompletion(sequencer_).has_value());
   Write({"SET", "k", "post"});
   auto filled = loader_.Install("k", core::KeyType::kString, core::SteadyClock::now() + 1s);
   ASSERT_TRUE(filled.has_value());
@@ -886,9 +899,7 @@ TEST_F(ReadPathTest, HmgetReadsItsColdFieldsInOneBatch) {
 
 class ReadPathDoorkeeperTest : public ReadPathFixture {
  protected:
-  ReadPathDoorkeeperTest()
-      : ReadPathFixture(ReadPathConfig{.cold_read_deadline = kPointDeadline,
-                                       .cold_scan_deadline = kScanDeadline}) {}
+  ReadPathDoorkeeperTest() : ReadPathFixture(ReadPathConfig{}) {}
 };
 
 TEST_F(ReadPathDoorkeeperTest, AKeyFillsOnItsSecondMiss) {

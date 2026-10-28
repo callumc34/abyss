@@ -26,10 +26,10 @@
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
 #include "abyss/core/wait_list.h"
-#include "abyss/engine/blocking_driver.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "blocking_driver.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"
 
@@ -82,7 +82,7 @@ class SequencerFixture : public ::testing::Test {
     size_t max_memory_bytes = size_t{64} << 20;
     double stub_memory_fraction = 0.02;
     uint32_t log_count = 1;
-    std::chrono::milliseconds write_timeout{2000};
+    std::chrono::milliseconds command_timeout{2000};
     // Eviction waits for the router's drained seq; otherwise all is.
     bool drain_gated = false;
   };
@@ -139,7 +139,7 @@ class SequencerFixture : public ::testing::Test {
     loader_ = std::make_unique<Loader>(*hot_, router_, cold_, [this] { return Wall(); });
     sequencer_ = std::make_unique<Sequencer>(*hot_, queue_, *loader_, router_,
                                              SequencerConfig{
-                                                 .write_timeout = options.write_timeout,
+                                                 .command_timeout = options.command_timeout,
                                                  .wall_clock = [this] { return WallRead(); },
                                              });
   }
@@ -152,7 +152,8 @@ class SequencerFixture : public ::testing::Test {
 
   core::Result<core::RespValue> Run(std::vector<std::string> args,
                                     core::PredicateFlags flags = core::PredicateFlags::kNone) {
-    return RunToCompletion(*sequencer_, core::RespCommand{.args = std::move(args)}, flags);
+    return ::abyss::testing::RunToCompletion(*sequencer_,
+                                             core::RespCommand{.args = std::move(args)}, flags);
   }
   // A reply, failing the test on an error Result.
   std::string Reply(std::vector<std::string> args,

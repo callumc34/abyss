@@ -207,6 +207,10 @@ class MockQueue : public core::Queue {
     const std::scoped_lock lock(fake_->mu);
     fake_->durable_error = std::move(error);
   }
+  // Fails every node waiting on `shard`, as its stream stopping would.
+  void FailParked(core::ShardId shard, const core::Error& error) {
+    Shard(shard).waiters.FailAll(error);
+  }
   // AwaitDurable on later reservations' seqs waits until released.
   void HoldDurable() {
     const std::scoped_lock lock(fake_->mu);

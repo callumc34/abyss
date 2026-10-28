@@ -14,6 +14,7 @@
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
@@ -21,6 +22,7 @@
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/platform/fs.h"
 #include "mock_queue.h"
+#include "sync_dispatch.h"
 #include "test_clock.h"
 
 namespace abyss::testing {
@@ -82,15 +84,20 @@ class IntegrationHarness {
     sequencer_ =
         std::make_unique<engine::Sequencer>(*hot_, queue_, *loader_, *cold_pool_,
                                             engine::SequencerConfig{.wall_clock = clock_.WallFn()});
+    pool_ = std::make_unique<engine::IoPool>(engine::IoPoolConfig{.threads = 2});
     reads_ = std::make_unique<engine::ReadPath>(
-        *hot_, *loader_, *sequencer_, engine::ReadPathConfig{.wall_clock = clock_.WallFn()});
-    engine_ = std::make_unique<engine::TieringEngine>(*reads_, *sequencer_);
+        *hot_, *loader_, *pool_, engine::ReadPathConfig{.wall_clock = clock_.WallFn()});
+    engine_ = std::make_unique<engine::TieringEngine>(*reads_, *sequencer_, *pool_);
+    dispatch_ = std::make_unique<SyncDispatcher>(*engine_);
   }
 
   ~IntegrationHarness() {
     if (cold_pool_) cold_pool_->Stop();
+    if (pool_) pool_->Shutdown();
+    dispatch_.reset();
     engine_.reset();
     reads_.reset();
+    pool_.reset();
     sequencer_.reset();
     loader_.reset();
     cold_pool_.reset();
@@ -104,15 +111,17 @@ class IntegrationHarness {
   IntegrationHarness(IntegrationHarness&&) = delete;
   IntegrationHarness& operator=(IntegrationHarness&&) = delete;
 
-  engine::TieringEngine& Engine() { return *engine_; }
+  // The engine's dispatch, each call run to its reply.
+  SyncDispatcher& Engine() { return *dispatch_; }
+  engine::TieringEngine& Dispatcher() { return *engine_; }
   core::HotStore& Hot() { return *hot_; }
   hot::ShardedHotStore& ShardedHot() { return *hot_; }
   core::ColdStore& Cold() { return *cold_; }
 
   core::Result<core::RespValue> SeedHot(std::initializer_list<std::string> args) {
     core::RespCommand cmd{.args = std::vector<std::string>(args)};
-    return engine_->DispatchWrite(cmd.args.empty() ? std::string_view{} : cmd.args.front(),
-                                  std::move(cmd), core::PredicateFlags::kNone);
+    return dispatch_->DispatchWrite(cmd.args.empty() ? std::string_view{} : cmd.args.front(),
+                                    std::move(cmd), core::PredicateFlags::kNone);
   }
   consumer::ColdConsumerPool& ColdPool() { return *cold_pool_; }
   engine::Sequencer& Sequencer() { return *sequencer_; }
@@ -149,8 +158,10 @@ class IntegrationHarness {
   std::unique_ptr<consumer::ColdConsumerPool> cold_pool_;
   std::unique_ptr<engine::Loader> loader_;
   std::unique_ptr<engine::Sequencer> sequencer_;
+  std::unique_ptr<engine::IoPool> pool_;
   std::unique_ptr<engine::ReadPath> reads_;
   std::unique_ptr<engine::TieringEngine> engine_;
+  std::unique_ptr<SyncDispatcher> dispatch_;
 };
 
 }  // namespace abyss::testing

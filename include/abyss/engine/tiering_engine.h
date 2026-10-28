@@ -1,32 +1,34 @@
 #pragma once
 
-#include <string_view>
+#include <memory>
 
 #include "abyss/core/command_dispatcher.h"
-#include "abyss/core/resp_types.h"
-#include "abyss/core/result.h"
+#include "abyss/engine/command_task.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
 
 namespace abyss::engine {
 
 // Dispatch: every read goes through the read path, every write
-// through the sequencer.
+// through the sequencer, and every command gets the sequencer's
+// command timeout as its deadline. A hit, and a write that needs no
+// wait, reply on the caller's thread; a miss and a write's loads go
+// to the I/O pool.
 class TieringEngine : public core::CommandDispatcher {
  public:
-  TieringEngine(ReadPath& reads, Sequencer& sequencer);
+  TieringEngine(ReadPath& reads, Sequencer& sequencer, IoPool& pool);
 
-  core::Result<core::RespValue> DispatchRead(std::string_view name,
-                                             const core::RespCommand& cmd) override;
-  core::Result<core::RespValue> DispatchWrite(std::string_view name, core::RespCommand cmd,
-                                              core::PredicateFlags flags) override;
-  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind kind,
-                                               core::RespCommand cmd) override;
-  core::Result<core::RespValue> DispatchFlush(core::FlushTarget target) override;
+  core::Outcome Dispatch(core::Request request, core::Slot& slot,
+                         std::unique_ptr<core::Task>& task) override;
 
  private:
+  core::Outcome FanOut(core::Request request, core::Slot& slot, std::unique_ptr<core::Task>& task);
+  CommandTask& TaskOf(std::unique_ptr<core::Task>& task);
+
   ReadPath& reads_;
   Sequencer& sequencer_;
+  IoPool& pool_;
 };
 
 }  // namespace abyss::engine

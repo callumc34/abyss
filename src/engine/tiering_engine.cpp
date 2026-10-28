@@ -1,61 +1,75 @@
 #include "abyss/engine/tiering_engine.h"
 
+#include <optional>
 #include <span>
 #include <utility>
 
+#include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
-#include "abyss/engine/blocking_driver.h"
 
 namespace abyss::engine {
 
-TieringEngine::TieringEngine(ReadPath& reads, Sequencer& sequencer)
-    : reads_(reads), sequencer_(sequencer) {}
+TieringEngine::TieringEngine(ReadPath& reads, Sequencer& sequencer, IoPool& pool)
+    : reads_(reads), sequencer_(sequencer), pool_(pool) {}
 
-core::Result<core::RespValue> TieringEngine::DispatchRead(std::string_view name,
-                                                          const core::RespCommand& cmd) {
-  auto op = core::ops::ParseReadOp(name, cmd);
-  if (!op.has_value()) {
-    return std::unexpected(op.error());
+core::Outcome TieringEngine::Dispatch(core::Request request, core::Slot& slot,
+                                      std::unique_ptr<core::Task>& task) {
+  slot.deadline = core::SteadyClock::now() + sequencer_.config().command_timeout;
+  switch (request.kind) {
+    case core::Request::Kind::kRead: {
+      auto op = core::ops::ParseReadOp(request.name, request.cmd);
+      if (!op.has_value()) return {.reply = std::unexpected(op.error())};
+      std::optional<ReadAnswer> hit = reads_.TryHot(*op);
+      if (!hit.has_value()) return TaskOf(task).Miss(slot, request.name, std::move(request.cmd));
+      const std::span<const ShardSeq> fences = hit->fence.has_value()
+                                                   ? std::span<const ShardSeq>(&*hit->fence, 1)
+                                                   : std::span<const ShardSeq>();
+      return Fenced(sequencer_.queue(), slot, std::move(hit->reply), fences);
+    }
+    case core::Request::Kind::kWrite:
+      return TaskOf(task).Write(slot, std::move(request.cmd), request.flags);
+    case core::Request::Kind::kFanOut:
+      return FanOut(std::move(request), slot, task);
+    case core::Request::Kind::kFlush:
+      return TaskOf(task).Flush(slot);
   }
-  return reads_.Read(*op);
+  return {.reply = std::unexpected(core::Error(core::ErrorCode::kInternal, "unknown request"))};
 }
 
-core::Result<core::RespValue> TieringEngine::DispatchFlush(core::FlushTarget /*target*/) {
-  return RunFlushToCompletion(sequencer_);
-}
-
-core::Result<core::RespValue> TieringEngine::DispatchWrite(std::string_view /*name*/,
-                                                           core::RespCommand cmd,
-                                                           core::PredicateFlags flags) {
-  return RunToCompletion(sequencer_, std::move(cmd), flags);
-}
-
-core::Result<core::RespValue> TieringEngine::DispatchFanOut(core::MultiKeyKind kind,
-                                                            core::RespCommand cmd) {
+core::Outcome TieringEngine::FanOut(core::Request request, core::Slot& slot,
+                                    std::unique_ptr<core::Task>& task) {
   // See ADP-005 §Multi-Key Commands; ADP-006 §Multi-Key Fan-Out. Reads
   // stay per key (#170); writes are one atomic decision.
-  const auto keys = std::span(cmd.args).subspan(cmd.args.empty() ? 0 : 1);
-  switch (kind) {
+  const bool keyless = request.cmd.args.size() < 2;
+  switch (request.multi_key) {
     case core::MultiKeyKind::kMget:
-      if (keys.empty()) {
-        return std::unexpected(
-            core::Error(core::ErrorCode::kInvalidArgument, "MGET requires at least one key"));
+      if (keyless) {
+        return {.reply = std::unexpected(core::Error(core::ErrorCode::kInvalidArgument,
+                                                     "MGET requires at least one key"))};
       }
-      return reads_.Mget(keys);
+      return TaskOf(task).FanOut(slot, request.multi_key, std::move(request.cmd));
     case core::MultiKeyKind::kExists:
-      if (keys.empty()) {
-        return std::unexpected(
-            core::Error(core::ErrorCode::kInvalidArgument, "EXISTS requires at least one key"));
+      if (keyless) {
+        return {.reply = std::unexpected(core::Error(core::ErrorCode::kInvalidArgument,
+                                                     "EXISTS requires at least one key"))};
       }
-      return reads_.Exists(keys);
+      return TaskOf(task).FanOut(slot, request.multi_key, std::move(request.cmd));
     case core::MultiKeyKind::kMset:
     case core::MultiKeyKind::kDelete:
-      return RunToCompletion(sequencer_, std::move(cmd), core::PredicateFlags::kNone);
+      return TaskOf(task).Write(slot, std::move(request.cmd), core::PredicateFlags::kNone);
     case core::MultiKeyKind::kNone:
       break;
   }
-  return std::unexpected(
-      core::Error(core::ErrorCode::kInternal, "DispatchFanOut called with MultiKeyKind::kNone"));
+  return {.reply = std::unexpected(core::Error(core::ErrorCode::kInternal,
+                                               "a fan-out request with MultiKeyKind::kNone"))};
+}
+
+CommandTask& TieringEngine::TaskOf(std::unique_ptr<core::Task>& task) {
+  if (task == nullptr) task = std::make_unique<CommandTask>(sequencer_, reads_, pool_);
+  ABYSS_DCHECK(dynamic_cast<CommandTask*>(task.get()) != nullptr,
+               "a task this engine did not make");
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): made here.
+  return static_cast<CommandTask&>(*task);
 }
 
 }  // namespace abyss::engine

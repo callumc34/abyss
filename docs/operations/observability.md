@@ -23,6 +23,8 @@
   - `durable`: waiting for the configured durability class, or for the fence of a write that logged nothing.
 
   `lock_hold` is `decide` through `apply` of one hold. A stage a write did not pass is not recorded for it.
+- `abyss_engine_io_wait_seconds` — time a cold I/O job (a write's own loads, a read miss's answer, or a cache fill) waited in the cold I/O pool's queue, from enqueue to its start, or to its expiry when it is dequeued past its command's deadline and never runs. A rising tail means the cold volume, or `engine.cold_io_threads`, is not keeping up.
+- `abyss_engine_io_run_seconds{kind="point|scan|load|fill"}` — time a cold I/O job ran on the pool: a read's point read or probe, a read that loads a whole key (at most `engine.cold_io_threads` − 1 of these run at once, so point reads always have a thread), a write's own loads, or a cache fill.
 
 ### RESP Frontend
 
@@ -41,7 +43,7 @@
 - `abyss_misses_total` — read misses (key not found in any tier)
 - `abyss_queue_appended_total` — total entries appended to queue
 - `abyss_wal_backpressure_waits_total` — appends that waited for a WAL flush because the durability window was full
-- `abyss_wal_backpressure_rejections_total` — appends rejected after waiting `engine.write_timeout_ms` for the durability window
+- `abyss_wal_backpressure_rejections_total` — appends rejected after waiting `engine.command_timeout_ms` for the durability window
 - `abyss_queue_offset_persist_failures_total` — committed-offset checkpoint writes that failed; retried on the next round
 - `abyss_queue_read_out_of_range_total` — queue reads below the first retained entry
 - `abyss_wal_spare_waits_total` — appends that found no prepared segment ready and waited for one (a full disk, or the preparer behind)
@@ -57,13 +59,13 @@
 - `abyss_cold_apply_type_conflicts_total` — logged SADD, HSET or ZADD effects that found their key holding another type in cold. Any increase means the write path and cold disagree (see [failure-modes.md](failure-modes.md)).
 - `abyss_evicted_total` — keys evicted from hot by their eviction deadline (moved to cold-only)
 - `abyss_hot_memory_evicted_total` — keys the eviction worker's memory-pressure pass evicted, least recently used first, to bring each shard down to its budget (`hot.max_memory_bytes` ÷ `hot.shard_count`) before their eviction deadline. A tier transition, counted apart from deadline evictions; a steady rate means hot is smaller than the working set.
-- `abyss_hot_fills_total{outcome="installed|discarded|skipped_backpressure|skipped_size|skipped_evict_cap|failed"}` — cache fills on read misses: installed; discarded because a write overtook the load; skipped because the shard was over its backpressure limit, the key is over `hot.fill_max_fraction` of a shard's budget, or evicting one maintenance hold's worth (64 keys or 1 ms) did not make room for it; or failed to load from cold
+- `abyss_hot_fills_total{outcome="installed|discarded|skipped_backpressure|skipped_size|skipped_evict_cap|failed|dropped|expired"}` — cache fills on read misses: installed; discarded because a write overtook the load; skipped because the shard was over its backpressure limit, the key is over `hot.fill_max_fraction` of a shard's budget, or evicting one maintenance hold's worth (64 keys or 1 ms) did not make room for it; failed to load from cold; or, for a member or count read's fill, which runs after the reply on the cold I/O pool's background queue, dropped because that queue was full or the pool stopped, or expired past the deadline of the read that admitted it
 - `abyss_hot_maintenance_hold_seconds{pass="tombstones|parked|ttl|deadline|memory"}` (histogram) — how long one hold of a hot maintenance pass kept a shard exclusively. Every pass examines at most 64 keys or runs for about 1 ms per hold, then lets writers and readers in, so this should stay near or below 1 ms whatever the keyspace size. `parked` releases keys that were due but waited for cold to drain them.
 - `abyss_hot_rehash_seconds` (histogram) — time an insert spent rehashing a shard's entry map under that shard's exclusive lock; its count is the number of rehashes. The map is sized at startup for `hot.max_memory_bytes` at 512 bytes per key, so a steady workload should show none; a rising count means keys are smaller than that and each rehash stalls the shard (#186).
 - `abyss_hot_expiry_sweep_seconds` (histogram) — time for the TTL pass to reach every key that was past its TTL when its sweep began. The pass gets a quarter of each `hot.eviction_tick_ms`; a sweep longer than a tick means expired keys are accumulating faster than they are reclaimed.
 - `abyss_hot_backpressure_waits_total` — writes that waited for cold to drain because their hot shard was over its budget (`hot.max_memory_bytes` ÷ `hot.shard_count`) × `hot.backpressure_ratio`. The limit is per shard, so under skew one shard can wait, and reject with `-OOM`, while `abyss_hot_memory_bytes` is under `abyss_hot_max_memory_bytes`.
-- `abyss_hot_backpressure_rejections_total` — writes rejected with `-OOM` after waiting `engine.write_timeout_ms` for cold to drain (see [failure-modes.md](failure-modes.md))
-- `abyss_sequencer_redecides_total{reason="admission|spare|load|backpressure"}` — writes decided again: the durability window was full, no spare WAL segment was ready, a load was overtaken by a write, or a shard was over its memory limit. Each is bounded by `engine.write_timeout_ms`.
+- `abyss_hot_backpressure_rejections_total` — writes rejected with `-OOM` after waiting `engine.command_timeout_ms` for cold to drain (see [failure-modes.md](failure-modes.md))
+- `abyss_sequencer_redecides_total{reason="admission|spare|load|backpressure"}` — writes decided again: the durability window was full, no spare WAL segment was ready, a load was overtaken by a write, or a shard was over its memory limit. Each is bounded by `engine.command_timeout_ms`.
 - `abyss_hot_stub_drops_total` — stubs of evicted keys dropped, least recently written first, past the stub cap set by `hot.stub_memory_fraction`. Without its stub, `EXISTS`, `TYPE` or `DEL` on an evicted key loads it from cold.
 - `abyss_hot_load_discards_total` — loads of a non-resident key thrown away because a write or FLUSHDB replaced the key's load token while the load ran
 - `abyss_sequencer_locked_copy_bytes_total` — bytes of written values (string values, members, fields) copied into log entries while hot shard locks were held. Arguments over 16 KiB, or every argument of a request over 16 KiB, are copied before the locks, so large writes add nothing; `COPY` and `RENAMENX` of a large key do, since they rebuild it from hot.
@@ -94,6 +96,7 @@ Gauges:
 ### Gauges
 
 - `abyss_hot_memory_bytes` — hot store memory usage
+- `abyss_engine_io_queue_depth{queue="foreground|background"}` — cold I/O jobs queued for the pool: a write's loads and read misses (`foreground`), and cache fills (`background`), which run only while the foreground queue is empty and are dropped when their bounded queue is full
 - `abyss_hot_max_memory_bytes` — the configured hot memory budget, `hot.max_memory_bytes`; 0 means unlimited. Each shard's budget is this ÷ `hot.shard_count`.
 - `abyss_hot_keys` — number of keys in hot store
 - `abyss_hot_stub_entries` — stubs hot holds for evicted keys (type, absolute TTL and latest seq, about 80 bytes plus the key each), counted in `abyss_hot_memory_bytes`
@@ -299,6 +302,8 @@ The only permitted label keys are:
 | `status` | Operation outcome. | Enumerated per metric. |
 | `op` | Generic operation discriminator. | Reserved; enumerated per metric when used. |
 | `proto` | Negotiated RESP protocol version. | `2`, `3`. |
+| `queue` | Cold I/O pool queue. | `foreground`, `background`. |
+| `kind` | Cold I/O job kind. | `point`, `scan`, `load`, `fill`. |
 
 Label values **must not** be raw Redis keys, client identifiers, IP addresses, or any other unbounded cardinality source.
 

@@ -342,8 +342,19 @@ core::Result<void> ValidateColdConsumer(const ColdConsumerConfig& c) {
 }
 
 core::Result<void> ValidateEngine(const EngineConfig& e) {
-  if (e.write_timeout.count() <= 0) {
-    return std::unexpected(InvalidArg("engine.write_timeout_ms", "must be > 0 milliseconds"));
+  if (e.command_timeout.count() <= 0) {
+    return std::unexpected(InvalidArg("engine.command_timeout_ms", "must be > 0 milliseconds"));
+  }
+  // Scans may hold all but one thread, so one would leave point reads
+  // none; pool threads block in pread, so a second costs nothing.
+  if (e.cold_io_threads == 1) {
+    return std::unexpected(InvalidArg("engine.cold_io_threads",
+                                      "must be 0 (auto) or at least 2: scans may hold all but one "
+                                      "thread, and pool threads block in pread, so 2 cost nothing "
+                                      "even on a 1-CPU pod"));
+  }
+  if (e.cold_io_threads > 64) {
+    return std::unexpected(InvalidArg("engine.cold_io_threads", "must be <= 64"));
   }
   return {};
 }

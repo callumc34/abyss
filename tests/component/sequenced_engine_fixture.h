@@ -33,8 +33,8 @@
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
 #include "abyss/core/types.h"
-#include "abyss/engine/blocking_driver.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/recovery_coordinator.h"
@@ -42,8 +42,10 @@
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/wal_queue.h"
+#include "blocking_driver.h"
 #include "cold_read.h"
 #include "forwarding_queue.h"
+#include "sync_dispatch.h"
 #include "temp_dir.h"
 
 namespace abyss::engine {
@@ -62,10 +64,9 @@ struct Options {
   double stub_memory_fraction = 0.02;
   double backpressure_ratio = 1.25;
   uint64_t fill_max_members = 1024;
-  // Generous, so a slow runner never times a cold read out.
-  std::chrono::milliseconds cold_read_deadline{std::chrono::seconds{5}};
-  std::chrono::milliseconds cold_scan_deadline{std::chrono::seconds{10}};
-  std::chrono::milliseconds write_timeout{5000};
+  std::chrono::milliseconds command_timeout{5000};
+  uint32_t cold_io_threads = 2;
+  size_t io_background_capacity = 1024;
   // How often committed offsets persist, and so segments are reclaimed.
   std::chrono::milliseconds offset_fsync_interval{std::chrono::hours{1}};
   uint64_t durability_window_bytes = uint64_t{64} << 20;
@@ -219,6 +220,8 @@ class SequencedEngineTest : public ::testing::Test {
   }
   // The loader, sequencer and engine over hot_.
   void Rewire() {
+    // Its queued fills read through the old read path: they fail unrun.
+    io_pool_.reset();
     engine_.reset();
     reads_.reset();
     sequencer_.reset();
@@ -227,19 +230,23 @@ class SequencedEngineTest : public ::testing::Test {
                                        loader_cold_ != nullptr ? *loader_cold_ : *cold_, wall);
     sequencer_ = std::make_unique<Sequencer>(
         *hot_, *queue_, *loader_, *pool_,
-        SequencerConfig{.write_timeout = options_.write_timeout, .wall_clock = wall});
+        SequencerConfig{.command_timeout = options_.command_timeout, .wall_clock = wall});
+    io_pool_ = std::make_unique<IoPool>(IoPoolConfig{
+        .threads = options_.cold_io_threads,
+        .background_capacity = options_.io_background_capacity,
+    });
     reads_ =
-        std::make_unique<ReadPath>(*hot_, *loader_, *sequencer_,
-                                   ReadPathConfig{.write_timeout = options_.write_timeout,
-                                                  .cold_read_deadline = options_.cold_read_deadline,
-                                                  .cold_scan_deadline = options_.cold_scan_deadline,
-                                                  .fill_doorkeeper = options_.fill_doorkeeper,
+        std::make_unique<ReadPath>(*hot_, *loader_, *io_pool_,
+                                   ReadPathConfig{.fill_doorkeeper = options_.fill_doorkeeper,
                                                   .fill_max_members = options_.fill_max_members,
                                                   .wall_clock = wall});
-    engine_ = std::make_unique<TieringEngine>(*reads_, *sequencer_);
+    engine_ = std::make_unique<TieringEngine>(*reads_, *sequencer_, *io_pool_);
+    dispatch_ = std::make_unique<abyss::testing::SyncDispatcher>(*engine_);
   }
 
   void CloseAll() {
+    io_pool_.reset();
+    dispatch_.reset();
     engine_.reset();
     reads_.reset();
     sequencer_.reset();
@@ -254,19 +261,20 @@ class SequencedEngineTest : public ::testing::Test {
   void TearDown() override { CloseAll(); }
 
   std::string Write(std::vector<std::string> args, Flags flags = Flags::kNone) {
-    auto reply = RunToCompletion(*sequencer_, core::RespCommand{.args = std::move(args)}, flags);
+    auto reply = abyss::testing::RunToCompletion(*sequencer_,
+                                                 core::RespCommand{.args = std::move(args)}, flags);
     if (!reply.has_value()) return "error: " + reply.error().message();
     return Describe(*reply);
   }
   std::string Read(std::vector<std::string> args) {
     const std::string name = args.front();
-    auto reply = engine_->DispatchRead(name, core::RespCommand{.args = std::move(args)});
+    auto reply = dispatch_->DispatchRead(name, core::RespCommand{.args = std::move(args)});
     if (!reply.has_value()) return "error: " + reply.error().message();
     return Describe(*reply);
   }
   std::string Exists(std::string key) {
-    auto reply = engine_->DispatchFanOut(core::MultiKeyKind::kExists,
-                                         core::RespCommand{.args = {"EXISTS", std::move(key)}});
+    auto reply = dispatch_->DispatchFanOut(core::MultiKeyKind::kExists,
+                                           core::RespCommand{.args = {"EXISTS", std::move(key)}});
     if (!reply.has_value()) return "error: " + reply.error().message();
     return Describe(*reply);
   }
@@ -312,8 +320,8 @@ class SequencedEngineTest : public ::testing::Test {
   }
 
   std::vector<std::string> Members(std::string key) {
-    auto reply =
-        engine_->DispatchRead("SMEMBERS", core::RespCommand{.args = {"SMEMBERS", std::move(key)}});
+    auto reply = dispatch_->DispatchRead("SMEMBERS",
+                                         core::RespCommand{.args = {"SMEMBERS", std::move(key)}});
     EXPECT_TRUE(reply.has_value() && reply->IsArray());
     std::vector<std::string> members;
     if (!reply.has_value() || !reply->IsArray()) return members;
@@ -358,8 +366,10 @@ class SequencedEngineTest : public ::testing::Test {
   std::unique_ptr<consumer::ColdConsumerPool> pool_;
   std::unique_ptr<Loader> loader_;
   std::unique_ptr<Sequencer> sequencer_;
+  std::unique_ptr<IoPool> io_pool_;
   std::unique_ptr<ReadPath> reads_;
   std::unique_ptr<TieringEngine> engine_;
+  std::unique_ptr<abyss::testing::SyncDispatcher> dispatch_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 

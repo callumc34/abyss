@@ -355,9 +355,8 @@ class CrashTest : public PropertyHarness {
     // ratio leaves room for what the stalled flushes hold back.
     options.hot_memory_bytes = 4096;
     options.backpressure_ratio = 4.0;
-    options.write_timeout = std::chrono::milliseconds(300);
+    options.command_timeout = std::chrono::milliseconds(300);
     options.offset_fsync_interval = std::chrono::milliseconds(10);
-    PatientColdReads(options);
     options.run = "power" + std::to_string(seed) + "-";
     std::cout << "[crash] power loss seed=" << seed << " shards=" << options.shards
               << " durability=" << core::DurabilityName(options.durability) << '\n'
@@ -518,8 +517,7 @@ class CrashTest : public PropertyHarness {
     options.shards = 2;
     options.durability = core::Durability::kPowerLoss;
     options.segment_size_bytes = size_t{16} << 10;
-    options.write_timeout = std::chrono::milliseconds(300);
-    PatientColdReads(options);
+    options.command_timeout = std::chrono::milliseconds(300);
     options.run = "edge-";
     OpenAt(options, 1'700'000'000'000);
     full_log_.assign(options.shards, {});
@@ -964,8 +962,7 @@ Options KillOptions(uint64_t seed, const std::filesystem::path& dir) {
   options.shards = 1 + static_cast<uint32_t>(rng.Below(4));
   options.durability = core::Durability::kProcessCrash;
   options.segment_size_bytes = size_t{16} << 10;
-  options.write_timeout = std::chrono::seconds(1);
-  PatientColdReads(options);
+  options.command_timeout = std::chrono::seconds(1);
   // Absolute: the stores live in the victim's directory.
   options.run = dir.string() + "/";
   return options;
@@ -1103,7 +1100,6 @@ TEST_F(CrashTest, ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame) {
   options.shards = kShards;
   options.durability = core::Durability::kPowerLoss;
   options.segment_size_bytes = size_t{64} << 10;
-  PatientColdReads(options);
   options.run = "batch-";
   const auto key = [this](uint32_t shard) { return KeyOn(shard, 0, "b"); };
   std::vector<Batch> batches = {

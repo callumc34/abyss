@@ -16,18 +16,25 @@
 #include <utility>
 #include <vector>
 
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/effect.h"
 #include "abyss/core/types.h"
-#include "abyss/engine/blocking_driver.h"
+#include "abyss/engine/io_pool.h"
+#include "abyss/engine/read_path.h"
+#include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/queue/wal_queue.h"
 #include "alloc_counter.h"
+#include "blocking_driver.h"
 #include "mock_cold_store.h"
 #include "sequencer_fixture.h"
+#include "sync_dispatch.h"
 #include "temp_dir.h"
 
 namespace abyss::engine {
 namespace {
+
+using ::abyss::testing::RunToCompletion;
 
 using abyss::testing::BigAllocs;
 using abyss::testing::BigFrees;
@@ -78,8 +85,14 @@ TEST_F(SequencerAllocTest, ARetryOverSeveralShardsReusesEachCopy) {
         return core::Error{core::ErrorCode::kResourceExhausted, "window full"};
       });
   // Effect order is b then a; log order is by shard.
-  const std::string a = KeyOn(0);
-  const std::string b = KeyOn(1);
+  const auto key_on = [](core::ShardId shard) {
+    for (int i = 0;; ++i) {
+      std::string key = "m" + std::to_string(i);
+      if (core::ComputeShard(key, kShards) == shard) return key;
+    }
+  };
+  const std::string a = key_on(0);
+  const std::string b = key_on(1);
   const std::string a_value(std::size_t{1} << 20, 'a');
   const std::string b_value(std::size_t{1} << 20, 'b');
   core::RespCommand cmd{.args = {"MSET", b, b_value, a, a_value}};
@@ -259,6 +272,125 @@ TEST_F(HoldAllocTest, ASmallSetOverAResidentKeyAllocatesNoMoreThanTheBlockingPat
   RecordProperty("allocs_per_write", static_cast<int>(most));
   std::cout << "allocations per write: " << fewest << ".." << most << '\n';
   EXPECT_LE(most, kAllocsPerWrite);
+}
+
+// The same write through Dispatch on a warm connection: its task and
+// slot are reused, so nothing is added to what the write path takes.
+TEST_F(HoldAllocTest, ASmallSetThroughDispatchAllocatesNoMoreThanTheBlockingPath) {
+  IoPool pool(IoPoolConfig{.threads = 2});
+  ReadPath reads(*hot_, *loader_, pool, ReadPathConfig{});
+  TieringEngine engine(reads, *sequencer_, pool);
+  ::abyss::testing::SyncConnection connection(engine);
+  const std::string key(32, 'k');
+  std::size_t blocking = 0;
+  std::size_t most = 0;
+  for (int i = 0; i < 64; ++i) {
+    std::string value(64, static_cast<char>('a' + (i % 26)));
+    core::RespCommand direct{.args = {"SET", key, value}};
+    core::Request request{.kind = core::Request::Kind::kWrite,
+                          .cmd = core::RespCommand{.args = {"SET", key, std::move(value)}}};
+    std::size_t before = ThreadAllocs();
+    ASSERT_TRUE(::abyss::testing::RunToCompletion(*sequencer_, std::move(direct),
+                                                  core::PredicateFlags::kNone)
+                    .has_value());
+    const std::size_t direct_used = ThreadAllocs() - before;
+    before = ThreadAllocs();
+    ASSERT_TRUE(connection.Run(std::move(request)).has_value());
+    const std::size_t used = ThreadAllocs() - before;
+    if (i < 8) continue;
+    blocking = std::max(blocking, direct_used);
+    most = std::max(most, used);
+  }
+  pool.Shutdown();
+  RecordProperty("allocs_per_dispatched_write", static_cast<int>(most));
+  std::cout << "allocations per write: dispatched " << most << ", blocking " << blocking << '\n';
+  EXPECT_LE(most, blocking);
+  EXPECT_LE(most, 23U) << "Phase 2's figure, which 3-2a held";
+}
+
+// SET, a GET miss, MSET and an HGETALL miss, again and again on one
+// connection: once warm, its one task and its slot allocate nothing.
+// A miss's cold read and its reply are built on the pool, so what this
+// thread allocates for one is only hot's own miss.
+TEST_F(HoldAllocTest, AlternatingCommandsOnOneConnectionAllocateNothingOnceWarm) {
+  IoPool pool(IoPoolConfig{.threads = 2});
+  ReadPath reads(*hot_, *loader_, pool, ReadPathConfig{.fill_doorkeeper = false});
+  TieringEngine engine(reads, *sequencer_, pool);
+  ::abyss::testing::SyncConnection connection(engine);
+  const std::string key(32, 'k');
+  const auto key_on = [](core::ShardId shard) {
+    for (int i = 0;; ++i) {
+      std::string key = "m" + std::to_string(i);
+      if (core::ComputeShard(key, kShards) == shard) return key;
+    }
+  };
+  const std::string a = key_on(0);
+  const std::string b = key_on(1);
+  // Hot's own cost of a miss, on this thread.
+  std::size_t before = ThreadAllocs();
+  (void)hot_->Read(core::ops::ReadOp{core::ops::StringGet{.key = "nowhere"}});
+  const std::size_t hot_miss = ThreadAllocs() - before;
+
+  std::size_t set_most = 0;
+  std::size_t mset_most = 0;
+  std::size_t get_most = 0;
+  std::size_t hgetall_most = 0;
+  std::size_t set_blocking = 0;
+  std::size_t mset_blocking = 0;
+  const core::Task* task = nullptr;
+  for (int cycle = 0; cycle < 24; ++cycle) {
+    const std::string n = std::to_string(cycle);
+    core::Request set{.kind = core::Request::Kind::kWrite,
+                      .cmd = core::RespCommand{.args = {"SET", key, std::string(64, 'v')}}};
+    core::Request get{.kind = core::Request::Kind::kRead,
+                      .name = "GET",
+                      .cmd = core::RespCommand{.args = {"GET", "g" + n}}};
+    core::Request mset{.kind = core::Request::Kind::kFanOut,
+                       .multi_key = core::MultiKeyKind::kMset,
+                       .cmd = core::RespCommand{.args = {"MSET", a, "1", b, "2"}}};
+    core::Request hgetall{.kind = core::Request::Kind::kRead,
+                          .name = "HGETALL",
+                          .cmd = core::RespCommand{.args = {"HGETALL", "h" + n}}};
+    core::RespCommand set_direct{.args = {"SET", key, std::string(64, 'v')}};
+    core::RespCommand mset_direct{.args = {"MSET", a, "1", b, "2"}};
+    const auto measure = [&connection](core::Request request) {
+      const std::size_t start = ThreadAllocs();
+      auto reply = connection.Run(std::move(request));
+      EXPECT_TRUE(reply.has_value() && !reply->IsError());
+      return ThreadAllocs() - start;
+    };
+    const std::size_t set_used = measure(std::move(set));
+    const std::size_t get_used = measure(std::move(get));
+    const std::size_t mset_used = measure(std::move(mset));
+    const std::size_t hgetall_used = measure(std::move(hgetall));
+    before = ThreadAllocs();
+    ASSERT_TRUE(::abyss::testing::RunToCompletion(*sequencer_, std::move(set_direct),
+                                                  core::PredicateFlags::kNone)
+                    .has_value());
+    const std::size_t set_direct_used = ThreadAllocs() - before;
+    before = ThreadAllocs();
+    ASSERT_TRUE(::abyss::testing::RunToCompletion(*sequencer_, std::move(mset_direct),
+                                                  core::PredicateFlags::kNone)
+                    .has_value());
+    const std::size_t mset_direct_used = ThreadAllocs() - before;
+    if (cycle == 0) task = connection.task();
+    EXPECT_EQ(connection.task(), task) << "the task was replaced";
+    if (cycle < 4) continue;
+    set_most = std::max(set_most, set_used);
+    get_most = std::max(get_most, get_used);
+    mset_most = std::max(mset_most, mset_used);
+    hgetall_most = std::max(hgetall_most, hgetall_used);
+    set_blocking = std::max(set_blocking, set_direct_used);
+    mset_blocking = std::max(mset_blocking, mset_direct_used);
+  }
+  pool.Shutdown();
+  std::cout << "allocations: SET " << set_most << " (blocking " << set_blocking << "), GET miss "
+            << get_most << ", MSET " << mset_most << " (blocking " << mset_blocking
+            << "), HGETALL miss " << hgetall_most << ", hot's miss " << hot_miss << '\n';
+  EXPECT_LE(set_most, set_blocking);
+  EXPECT_LE(mset_most, mset_blocking);
+  EXPECT_LE(get_most, hot_miss) << "the dispatch of a miss allocated";
+  EXPECT_LE(hgetall_most, hot_miss) << "the dispatch of a miss allocated";
 }
 
 TEST(FillAllocTest, WhatAFillEvictsIsFreedAfterTheHold) {

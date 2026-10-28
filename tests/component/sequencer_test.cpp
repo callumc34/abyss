@@ -100,7 +100,7 @@ TEST_F(SequencedEngineTest, FlushDbRacingWritersHidesEveryEarlierKey) {
     });
   }
   std::this_thread::sleep_for(5ms);
-  auto flushed = engine_->DispatchFlush(core::FlushTarget::kThisDb);
+  auto flushed = dispatch_->DispatchFlush();
   stop = true;
   for (auto& writer : writers) writer.join();
   ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
@@ -118,7 +118,7 @@ TEST_F(SequencedEngineTest, FlushDbOverTwoLogsCompletes) {
   for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
     ASSERT_EQ(Write({"SET", KeyOn(shard), "v"}), "OK");
   }
-  auto flushed = engine_->DispatchFlush(core::FlushTarget::kThisDb);
+  auto flushed = dispatch_->DispatchFlush();
   ASSERT_TRUE(flushed.has_value()) << flushed.error().message();
   EXPECT_EQ(queue::ReservationsHeld(), 0U);
   for (core::ShardId shard = 0; shard < options_.shards; ++shard) {

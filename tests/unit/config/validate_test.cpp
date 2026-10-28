@@ -2,6 +2,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -388,6 +389,48 @@ TEST(ConfigValidate, RemovedEngineKeysNameTheirReason) {
         << cfg.error().message();
     EXPECT_NE(cfg.error().message().find(reason), std::string::npos) << cfg.error().message();
   }
+}
+
+TEST(ConfigValidate, CommandTimeoutLoadsAndValidates) {
+  auto defaults = Config::ParseFromYaml("engine: {}\n");
+  ASSERT_TRUE(defaults.has_value()) << defaults.error().message();
+  EXPECT_EQ(defaults->engine.command_timeout, std::chrono::milliseconds{5000});
+  EXPECT_EQ(defaults->engine.cold_io_threads, 0U);
+
+  auto set = Config::ParseFromYaml("engine:\n  command_timeout_ms: 750\n");
+  ASSERT_TRUE(set.has_value()) << set.error().message();
+  EXPECT_EQ(set->engine.command_timeout, std::chrono::milliseconds{750});
+
+  auto zero = Config::ParseFromYaml("engine:\n  command_timeout_ms: 0\n");
+  ASSERT_FALSE(zero.has_value());
+  EXPECT_NE(zero.error().message().find("engine.command_timeout_ms"), std::string::npos)
+      << zero.error().message();
+}
+
+TEST(ConfigValidate, TheOldWriteTimeoutKeyNamesItsReplacement) {
+  auto cfg = Config::ParseFromYaml("engine:\n  write_timeout_ms: 5000\n");
+  ASSERT_FALSE(cfg.has_value());
+  EXPECT_NE(cfg.error().message().find("engine.write_timeout_ms"), std::string::npos)
+      << cfg.error().message();
+  EXPECT_NE(cfg.error().message().find("engine.command_timeout_ms"), std::string::npos)
+      << cfg.error().message();
+}
+
+TEST(ConfigValidate, ColdIoThreadsAreAutoOrTwoToSixtyFour) {
+  for (const uint32_t ok : {0U, 2U, 3U, 64U}) {
+    auto cfg = Config::ParseFromYaml("engine:\n  cold_io_threads: " + std::to_string(ok) + "\n");
+    ASSERT_TRUE(cfg.has_value()) << ok << ": " << cfg.error().message();
+    EXPECT_EQ(cfg->engine.cold_io_threads, ok);
+  }
+  auto one = Config::ParseFromYaml("engine:\n  cold_io_threads: 1\n");
+  ASSERT_FALSE(one.has_value());
+  EXPECT_NE(one.error().message().find("engine.cold_io_threads"), std::string::npos)
+      << one.error().message();
+  EXPECT_NE(one.error().message().find("pread"), std::string::npos) << one.error().message();
+  auto many = Config::ParseFromYaml("engine:\n  cold_io_threads: 65\n");
+  ASSERT_FALSE(many.has_value());
+  EXPECT_NE(many.error().message().find("engine.cold_io_threads"), std::string::npos)
+      << many.error().message();
 }
 
 TEST(ConfigValidate, RejectsEmptyDataPath) {

@@ -15,6 +15,7 @@ add_executable(abyss_component_tests
   read_path_test.cpp
   sequencer_test.cpp
   sequencer_wait_test.cpp
+  dispatch_test.cpp
 )
 
 target_link_libraries(abyss_component_tests PRIVATE

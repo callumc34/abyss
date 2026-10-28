@@ -17,6 +17,7 @@
 #include "abyss/core/result.h"
 #include "abyss/core/topology_manifest.h"
 #include "abyss/engine/bounded_thread_shard_scheduler.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/recovery_coordinator.h"
@@ -104,6 +105,9 @@ class Server {
   std::unique_ptr<engine::Sequencer> sequencer_;
   std::unique_ptr<engine::ReadPath> read_path_;
   std::unique_ptr<engine::TieringEngine> engine_;
+  // Its jobs read through the read path, the loader and hot: declared
+  // after them, so destroyed first.
+  std::unique_ptr<engine::IoPool> io_pool_;
   std::unique_ptr<engine::BoundedThreadShardScheduler> recovery_scheduler_;
   std::unique_ptr<engine::RecoveryCoordinator> recovery_coordinator_;
 

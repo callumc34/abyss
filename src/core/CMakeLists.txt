@@ -10,6 +10,7 @@ add_library(abyss_core
   atomic_file.cpp
   fatal.cpp
   durability.cpp
+  durable_wait.cpp
   queue.cpp
   seq_waiters.cpp
   wait_list.cpp

@@ -21,26 +21,65 @@ void PostResume(const core::Completion completion, core::Result<void> result) no
 }  // namespace
 
 PendingWrite::PendingWrite(core::RespCommand cmd, core::PredicateFlags flags,
-                           core::Completion completion, core::SteadyTime deadline)
-    : cmd_(std::move(cmd)),
-      flags_(flags),
-      flush_(false),
-      completion_(completion),
-      deadline_(deadline),
-      owner_(std::this_thread::get_id()),
-      load_wake_(completion) {}
+                           core::Completion completion, core::SteadyTime deadline) {
+  Reset(std::move(cmd), flags, completion, deadline);
+}
 
-PendingWrite::PendingWrite(FlushAll /*flush*/, core::Completion completion,
-                           core::SteadyTime deadline)
-    : flush_(true),
-      completion_(completion),
-      deadline_(deadline),
-      owner_(std::this_thread::get_id()),
-      load_wake_(completion) {}
+PendingWrite::PendingWrite(FlushAll flush, core::Completion completion, core::SteadyTime deadline) {
+  Reset(flush, completion, deadline);
+}
 
 PendingWrite::~PendingWrite() {
-  const bool cleaned = !waiting_ && owned_.empty() && !node_.has_value();
-  ABYSS_DCHECK(cleaned, "a write destroyed with a wait or a load not cleaned up");
+  ABYSS_DCHECK(Quiescent(), "a write destroyed with a wait or a load not cleaned up");
+}
+
+void PendingWrite::Reset(core::RespCommand cmd, core::PredicateFlags flags,
+                         core::Completion completion, core::SteadyTime deadline) {
+  Reset(FlushAll{}, completion, deadline);
+  cmd_ = std::move(cmd);
+  flags_ = flags;
+  flush_ = false;
+}
+
+void PendingWrite::Reset(FlushAll /*flush*/, core::Completion completion,
+                         core::SteadyTime deadline) {
+  ABYSS_DCHECK(Quiescent(), "a write reset with a wait or a load not cleaned up");
+  cmd_.args.clear();
+  flags_ = core::PredicateFlags::kNone;
+  flush_ = true;
+  completion_ = completion;
+  deadline_ = deadline;
+  owner_ = std::this_thread::get_id();
+  phase_ = Phase::kStart;
+  phase_times_ = {};
+  shards_.clear();
+  spare_.clear();
+  grows_ = false;
+  await_memory_ = false;
+  redecided_.reset();
+  waiting_ = false;
+  wait_reason_ = WaitReason::kLoads;
+  wait_shard_ = 0;
+  wake_.reset();
+  expired_ = false;
+  abandoned_ = false;
+  admit_next_ = 0;
+  refusal_.reset();
+  spare_next_ = 0;
+  spare_logs_.clear();
+  memory_next_ = 0;
+  memory_waited_ = false;
+  foreign_.clear();
+  foreign_next_ = 0;
+  full_load_ = false;
+  completions_.clear();
+  load_error_.reset();
+  load_wake_.completion = completion;
+  reply_ = {};
+  durable_kind_ = DurableKind::kWrite;
+  record_phases_ = false;
+  ranges_.clear();
+  fences_.clear();
 }
 
 void PendingWrite::Woken(core::Result<void> result) {
@@ -55,7 +94,7 @@ void PendingWrite::Wake(core::Result<void> result) noexcept {
 }
 
 void PendingWrite::LoadWake::Wake(core::Result<void> result) noexcept {
-  PostResume(completion_, std::move(result));
+  PostResume(completion, std::move(result));
 }
 
 ShardSeq PendingWrite::DurableAt(size_t i) const {

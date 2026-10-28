@@ -13,6 +13,7 @@
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
@@ -20,6 +21,7 @@
 #include "mock_cold_store.h"
 #include "mock_queue.h"
 #include "on_exit.h"
+#include "sync_dispatch.h"
 
 namespace abyss::engine {
 namespace {
@@ -69,11 +71,18 @@ class TieringEngineTest : public ::testing::Test {
   SingleBufferRouter router_{buffer_};
   Loader loader_{hot_, router_, cold_};
   Sequencer sequencer_{hot_, queue_, loader_, router_,
-                       SequencerConfig{.write_timeout = kWriteTimeout}};
-  ReadPath reads_{hot_, loader_, sequencer_, ReadPathConfig{.write_timeout = kWriteTimeout}};
+                       SequencerConfig{.command_timeout = kWriteTimeout}};
+  IoPool pool_{IoPoolConfig{.threads = 2}};
+  ReadPath reads_{hot_, loader_, pool_, ReadPathConfig{}};
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 
-  TieringEngine MakeEngine() { return {reads_, sequencer_}; }
+  // Before what its queued fills read through goes.
+  void TearDown() override { pool_.Shutdown(); }
+
+  TieringEngine MakeEngine() { return {reads_, sequencer_, pool_}; }
+  static abyss::testing::SyncDispatcher Sync(TieringEngine& engine) {
+    return abyss::testing::SyncDispatcher(engine);
+  }
 
   core::RespCommand MakeCmd(std::initializer_list<std::string> args) {
     return core::RespCommand{.args = std::vector<std::string>(args)};
@@ -81,7 +90,8 @@ class TieringEngineTest : public ::testing::Test {
 
   // Writes through the engine, so hot holds the key as decided.
   void Seed(TieringEngine& engine, std::initializer_list<std::string> args) {
-    auto written = engine.DispatchWrite(*args.begin(), MakeCmd(args), core::PredicateFlags::kNone);
+    auto written =
+        Sync(engine).DispatchWrite(*args.begin(), MakeCmd(args), core::PredicateFlags::kNone);
     ASSERT_TRUE(written.has_value()) << written.error().message();
     ASSERT_FALSE(written->IsError()) << written->AsString();
   }
@@ -93,8 +103,8 @@ class TieringEngineTest : public ::testing::Test {
 
 TEST_F(TieringEngineTest, WriteGoesThroughTheSequencer) {
   auto engine = MakeEngine();
-  auto result =
-      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
+  auto result = Sync(engine).DispatchWrite("SET", MakeCmd({"SET", "key", "value"}),
+                                           core::PredicateFlags::kNone);
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
 
@@ -102,7 +112,7 @@ TEST_F(TieringEngineTest, WriteGoesThroughTheSequencer) {
   ASSERT_EQ(published.size(), 1U);
   EXPECT_EQ(std::get<core::entry::Write>(published[0].payload).cmd.args,
             (std::vector<std::string>{"SET", "key", "value"}));
-  auto read = engine.DispatchRead("GET", MakeCmd({"GET", "key"}));
+  auto read = Sync(engine).DispatchRead("GET", MakeCmd({"GET", "key"}));
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->AsString(), "value");
 }
@@ -110,8 +120,8 @@ TEST_F(TieringEngineTest, WriteGoesThroughTheSequencer) {
 TEST_F(TieringEngineTest, WriteDecideErrorLogsNothing) {
   auto engine = MakeEngine();
   ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "key", "v"}));
-  auto result =
-      engine.DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}), core::PredicateFlags::kNone);
+  auto result = Sync(engine).DispatchWrite("SADD", MakeCmd({"SADD", "key", "m"}),
+                                           core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kWrongType);
   EXPECT_EQ(queue_.Published(ShardOf("key")).size(), 1U);
@@ -122,8 +132,8 @@ TEST_F(TieringEngineTest, WriteReserveFailureAppliesNothing) {
   queue_.SetReserveFault([](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
     return core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"};
   });
-  auto result =
-      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
+  auto result = Sync(engine).DispatchWrite("SET", MakeCmd({"SET", "key", "value"}),
+                                           core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
   EXPECT_TRUE(queue_.Published(ShardOf("key")).empty());
@@ -135,19 +145,19 @@ TEST_F(TieringEngineTest, WriteReserveFailureAppliesNothing) {
 TEST_F(TieringEngineTest, WriteDurableFailurePropagates) {
   auto engine = MakeEngine();
   queue_.FailDurable(core::Error{core::ErrorCode::kInternal, "fsync failed"});
-  auto result =
-      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
+  auto result = Sync(engine).DispatchWrite("SET", MakeCmd({"SET", "key", "value"}),
+                                           core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
 }
 
 TEST_F(TieringEngineTest, WriteDurableTimeoutRepliesWithTheTimeoutText) {
-  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.write_timeout = 50ms});
-  TieringEngine engine(reads_, fast);
+  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.command_timeout = 50ms});
+  TieringEngine engine(reads_, fast, pool_);
   queue_.HoldDurable();
   const testing::OnExit release([this] { queue_.ReleaseDurable(); });
-  auto result =
-      engine.DispatchWrite("SET", MakeCmd({"SET", "key", "value"}), core::PredicateFlags::kNone);
+  auto result = Sync(engine).DispatchWrite("SET", MakeCmd({"SET", "key", "value"}),
+                                           core::PredicateFlags::kNone);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
   EXPECT_TRUE(result.error().message().starts_with("write durable wait exceeded server timeout"))
@@ -175,7 +185,7 @@ TEST_F(TieringEngineTest, MgetAggregatesAcrossTiersInPositionalOrder) {
   EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"b"}, _, _)).Times(0);
 
   auto result =
-      engine.DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "a", "b", "c", "d"}));
+      Sync(engine).DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "a", "b", "c", "d"}));
   ASSERT_TRUE(result.has_value());
   ASSERT_TRUE(result->IsArray());
   const auto& arr = result->AsArray();
@@ -190,7 +200,7 @@ TEST_F(TieringEngineTest, MgetWrongTypeInHotCollapsesToNil) {
   auto engine = MakeEngine();
   ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SADD", "k", "m"}));
 
-  auto result = engine.DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "k"}));
+  auto result = Sync(engine).DispatchFanOut(core::MultiKeyKind::kMget, MakeCmd({"MGET", "k"}));
   ASSERT_TRUE(result.has_value());
   ASSERT_TRUE(result->IsArray());
   ASSERT_EQ(result->AsArray().size(), 1U);
@@ -209,7 +219,7 @@ TEST_F(TieringEngineTest, ExistsTombstoneInBufferOverridesColdResidual) {
   // tombstone decides.
   EXPECT_CALL(cold_, ProbeKey(_, _)).Times(0);
 
-  auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
+  auto result = Sync(engine).DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsInteger(), 0);
 }
@@ -218,7 +228,8 @@ TEST_F(TieringEngineTest, ExistsCountsDuplicatesRedisStyle) {
   auto engine = MakeEngine();
   ASSERT_NO_FATAL_FAILURE(Seed(engine, {"SET", "k", "v"}));
 
-  auto result = engine.DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k", "k"}));
+  auto result =
+      Sync(engine).DispatchFanOut(core::MultiKeyKind::kExists, MakeCmd({"EXISTS", "k", "k"}));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->AsInteger(), 2);
 }
@@ -232,8 +243,8 @@ TEST_F(TieringEngineTest, MsetReservesOneBatchAcrossItsShards) {
         return std::nullopt;
       });
 
-  auto result = engine.DispatchFanOut(core::MultiKeyKind::kMset,
-                                      MakeCmd({"MSET", "a", "1", "b", "2", "c", "3"}));
+  auto result = Sync(engine).DispatchFanOut(core::MultiKeyKind::kMset,
+                                            MakeCmd({"MSET", "a", "1", "b", "2", "c", "3"}));
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
   EXPECT_EQ(reserves, 1);
@@ -256,7 +267,8 @@ TEST_F(TieringEngineTest, DelCountsLiveKeysInOneDecision) {
       .WillOnce(Return(core::Result<std::optional<core::KeyMeta>>(std::nullopt)));
   EXPECT_CALL(cold_, LoadKey(_, _)).Times(0);
 
-  auto result = engine.DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c"}));
+  auto result =
+      Sync(engine).DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c"}));
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsInteger(), 2);
 }
@@ -271,7 +283,7 @@ TEST_F(TieringEngineTest, FlushAdmitsEveryShard) {
         return true;
       });
 
-  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  auto result = Sync(engine).DispatchFlush();
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->AsString(), "OK");
   ASSERT_EQ(checked.size(), kShardCount);
@@ -286,11 +298,11 @@ TEST_F(TieringEngineTest, FlushAdmitsEveryShard) {
 // A flush's admission waits end at its own deadline, and leave no
 // waiter behind.
 TEST_F(TieringEngineTest, FlushAdmissionTimesOutAtItsDeadline) {
-  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.write_timeout = 50ms});
-  TieringEngine engine(reads_, fast);
+  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.command_timeout = 50ms});
+  TieringEngine engine(reads_, fast, pool_);
   queue_.SetAdmissible(false);
   const auto start = core::SteadyClock::now();
-  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  auto result = Sync(engine).DispatchFlush();
   const auto waited = core::SteadyClock::now() - start;
   queue_.SetAdmissible(true);
   ASSERT_FALSE(result.has_value());
@@ -311,14 +323,14 @@ TEST_F(TieringEngineTest, FlushAdmissionFailureWipesNothing) {
   EXPECT_CALL(queue_, WhenReady(core::QueueWait::kAdmission, kShardCount - 1, _, true))
       .WillOnce(Return(std::optional<core::Result<void>>(core::Result<void>{
           std::unexpected(core::Error{core::ErrorCode::kResourceExhausted, "window full"})})));
-  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  auto result = Sync(engine).DispatchFlush();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kResourceExhausted);
   EXPECT_EQ(checked.size(), kShardCount);
   for (core::ShardId shard = 0; shard < kShardCount; ++shard) {
     EXPECT_EQ(queue_.Published(shard).size(), shard == ShardOf("k") ? 1U : 0U) << shard;
   }
-  EXPECT_EQ(engine.DispatchRead("GET", MakeCmd({"GET", "k"}))->AsString(), "v");
+  EXPECT_EQ(Sync(engine).DispatchRead("GET", MakeCmd({"GET", "k"}))->AsString(), "v");
 }
 
 TEST_F(TieringEngineTest, FlushReserveFailureWipesNothing) {
@@ -327,19 +339,19 @@ TEST_F(TieringEngineTest, FlushReserveFailureWipesNothing) {
   queue_.SetReserveFault([](std::span<const queue::ShardEntries>) -> std::optional<core::Error> {
     return core::Error{core::ErrorCode::kInternal, "pwrite: I/O error"};
   });
-  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  auto result = Sync(engine).DispatchFlush();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
   EXPECT_EQ(queue_.Published(ShardOf("k")).size(), 1U);
-  EXPECT_EQ(engine.DispatchRead("GET", MakeCmd({"GET", "k"}))->AsString(), "v");
+  EXPECT_EQ(Sync(engine).DispatchRead("GET", MakeCmd({"GET", "k"}))->AsString(), "v");
 }
 
 TEST_F(TieringEngineTest, FlushDurableTimeoutRepliesWithTheTimeoutText) {
-  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.write_timeout = 50ms});
-  TieringEngine engine(reads_, fast);
+  Sequencer fast(hot_, queue_, loader_, router_, SequencerConfig{.command_timeout = 50ms});
+  TieringEngine engine(reads_, fast, pool_);
   queue_.HoldDurable();
   const testing::OnExit release([this] { queue_.ReleaseDurable(); });
-  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  auto result = Sync(engine).DispatchFlush();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kTimeout);
   EXPECT_TRUE(result.error().message().starts_with("flush durable wait exceeded server timeout"))
@@ -349,7 +361,7 @@ TEST_F(TieringEngineTest, FlushDurableTimeoutRepliesWithTheTimeoutText) {
 TEST_F(TieringEngineTest, FlushDurableFailurePropagates) {
   auto engine = MakeEngine();
   queue_.FailDurable(core::Error{core::ErrorCode::kInternal, "fsync failed"});
-  auto result = engine.DispatchFlush(core::FlushTarget::kThisDb);
+  auto result = Sync(engine).DispatchFlush();
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
 }
@@ -363,8 +375,8 @@ TEST_F(TieringEngineTest, DelAdmitsEveryShard) {
     return true;
   });
   const std::vector<std::string> keys{"a", "b", "c", "d", "e"};
-  auto result =
-      engine.DispatchFanOut(core::MultiKeyKind::kDelete, MakeCmd({"DEL", "a", "b", "c", "d", "e"}));
+  auto result = Sync(engine).DispatchFanOut(core::MultiKeyKind::kDelete,
+                                            MakeCmd({"DEL", "a", "b", "c", "d", "e"}));
   ASSERT_TRUE(result.has_value()) << result.error().message();
   std::vector<core::ShardId> shards;
   shards.reserve(keys.size());
@@ -383,7 +395,7 @@ TEST_F(TieringEngineTest, MultiKeyReserveFailureAppliesNothing) {
   });
 
   auto result =
-      engine.DispatchFanOut(core::MultiKeyKind::kMset, MakeCmd({"MSET", "a", "1", "b", "2"}));
+      Sync(engine).DispatchFanOut(core::MultiKeyKind::kMset, MakeCmd({"MSET", "a", "1", "b", "2"}));
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kInternal);
   for (const char* key : {"a", "b"}) {

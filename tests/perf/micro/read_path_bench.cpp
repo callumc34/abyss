@@ -19,13 +19,12 @@
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
-#include "abyss/engine/sequencer.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
-#include "abyss/queue/wal_queue.h"
 
 // The read path's cache fill with and without the doorkeeper. Cold
 // holds ten times hot's budget; GETs follow Zipf 0.99, Zipf 1.2 or a
@@ -38,6 +37,8 @@ namespace {
 constexpr uint64_t kKeys = 200'000;
 constexpr uint32_t kShards = 4;
 constexpr uint64_t kWarmup = 200'000;
+// A cold point read's budget, as a command's would be.
+constexpr std::chrono::milliseconds kReadDeadline{200};
 
 class NoBuffers : public consumer::CompactionBufferRouter {
  public:
@@ -149,26 +150,20 @@ void BM_ReadMixFill(benchmark::State& state) {
   const bool doorkeeper = state.range(0) == 1;
   const double theta = static_cast<double>(state.range(1)) / 100.0;
   ColdData& data = ColdData::Get();
-  const auto wal = TempPath("abyss_read_path_bench_wal_");
-  auto queue = queue::WalQueue::Open({.wal_path = wal.string(),
-                                      .segment_size_bytes = size_t{16} << 20,
-                                      .max_value_size_bytes = size_t{1} << 20,
-                                      .shard_count = kShards,
-                                      .retention_consumers = {core::kColdConsumer}});
-  if (!queue.has_value()) std::abort();
   hot::ShardedHotStore hot{hot::ShardedHotStoreConfig{
       .max_memory_bytes = static_cast<size_t>(data.bytes / 10), .shard_count = kShards}};
   NoBuffers buffers;
   Loader loader(hot, buffers, *data.cold);
-  Sequencer sequencer(hot, **queue, loader, buffers, SequencerConfig{});
-  ReadPath reads(hot, loader, sequencer,
-                 ReadPathConfig{.cold_read_deadline = std::chrono::milliseconds{200},
-                                .fill_doorkeeper = doorkeeper});
+  IoPool pool(IoPoolConfig{.threads = 2});
+  ReadPath reads(hot, loader, pool, ReadPathConfig{.fill_doorkeeper = doorkeeper});
   Ranks ranks(theta, 42);
+  // The read path's own work: a miss answers here, not on the pool.
   const auto read = [&] {
     const auto& key = data.keys[ranks.Next()];
-    auto value = reads.Read(core::ops::ReadOp{core::ops::StringGet{.key = key}});
-    if (!value.has_value() || !value->IsBulkString()) std::abort();
+    const core::ops::ReadOp op{core::ops::StringGet{.key = key}};
+    std::optional<ReadAnswer> answer = reads.TryHot(op);
+    if (!answer.has_value()) answer = reads.Miss(op, core::SteadyClock::now() + kReadDeadline);
+    if (!answer->reply.has_value() || !answer->reply->IsBulkString()) std::abort();
   };
   for (uint64_t i = 0; i < kWarmup; ++i) read();
 
@@ -180,9 +175,7 @@ void BM_ReadMixFill(benchmark::State& state) {
   state.counters["hot_hit_ratio"] = hot_hits / std::max(hot_hits + cold_hits, 1.0);
   state.counters["evictions"] = static_cast<double>(hot.Stats()->eviction_count);
 
-  queue->reset();
-  std::error_code ec;
-  std::filesystem::remove_all(wal, ec);
+  pool.Shutdown();
 }
 BENCHMARK(BM_ReadMixFill)
     ->ArgNames({"doorkeeper", "theta_x100"})

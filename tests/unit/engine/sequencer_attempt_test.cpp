@@ -19,7 +19,6 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/types.h"
-#include "abyss/engine/blocking_driver.h"
 #include "abyss/engine/pending_write.h"
 #include "abyss/engine/sequencer.h"
 #include "abyss/metrics/names.h"
@@ -69,12 +68,20 @@ class SequencerAttemptTest : public testing::SequencerFixture {
                                           core::PredicateFlags::kNone, sink_.For(slot),
                                           core::SteadyClock::now() + timeout);
   }
-  Step Attempt(PendingWrite& write) { return sequencer_->Attempt(write); }
+  // An attempt; a linearised write hands its reply to durable_, and
+  // replies now if it is durable already.
+  Step Attempt(PendingWrite& write) {
+    Step step = sequencer_->Attempt(write);
+    if (step.kind != Step::Kind::kSequenced) return step;
+    auto now = sequencer_->Sequence(write, durable_, write.completion());
+    if (!now.has_value()) return step;
+    return Step{.kind = Step::Kind::kReplied, .reply = *std::move(now)};
+  }
   // The next attempt, once the `n`th post has come.
   Step Resume(PendingWrite& write, size_t n) {
     if (!sink_.WaitFor(n)) return Step{.kind = Step::Kind::kWait};
     write.Woken(sink_.Events().at(n - 1).result);
-    return sequencer_->Attempt(write);
+    return Attempt(write);
   }
   static std::string Replied(const Step& step) {
     if (step.kind != Step::Kind::kReplied) return "not replied";
@@ -104,8 +111,10 @@ class SequencerAttemptTest : public testing::SequencerFixture {
     return Describe(*read.result);
   }
 
-  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::RecordingSink sink_;
+  core::DurableWait durable_;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
 // --- Admission ---
@@ -151,7 +160,7 @@ TEST_F(SequencerAttemptTest, AnAdmissionWaitAfterARefusalReDecides) {
 }
 
 TEST_F(SequencerAttemptTest, AnAdmissionWaitTimesOutUnappliedWithTheWindowText) {
-  Build(Options{.write_timeout = 50ms});
+  Build(Options{.command_timeout = 50ms});
   queue_.SetAdmissible(false);
   auto result = Run({"SET", "k", "v"});
   ASSERT_FALSE(result.has_value());
@@ -209,7 +218,7 @@ TEST_F(SequencerAttemptTest, ASpareWaitRegistersResumesReDecidesAndCompletes) {
 }
 
 TEST_F(SequencerAttemptTest, ASpareWaitTimesOutUnappliedWithTheSpareText) {
-  Build(Options{.write_timeout = 50ms});
+  Build(Options{.command_timeout = 50ms});
   FailReserves(core::ErrorCode::kUnavailable, 1'000'000);
   queue_.SetSpareReady(false);
   auto result = Run({"SET", "k", "v"});
@@ -246,7 +255,7 @@ TEST_F(SequencerAttemptTest, AForeignLoadWaitResumesReDecidesAndCompletes) {
 }
 
 TEST_F(SequencerAttemptTest, AForeignLoadWaitTimesOutUnappliedAndLeavesTheirLoad) {
-  Build(Options{.write_timeout = 50ms});
+  Build(Options{.command_timeout = 50ms});
   const hot::LoadStart theirs = hot_->BeginLoad("k");
   ASSERT_TRUE(theirs.started());
   auto result = Run({"SADD", "k", "b"});
@@ -324,14 +333,16 @@ TEST_F(SequencerAttemptTest, AWakeRacingTheDeadlineLosesTheCancelAndIsNeverAppli
   std::thread notifier([this] { queue_.SetAdmissible(true); });
   ASSERT_TRUE(gated.entered.Wait());
   std::this_thread::sleep_until(write.deadline() + 5ms);
-  EXPECT_FALSE(sequencer_->Expire(write)) << "the notifier had it";
+  const auto reply = sequencer_->Abandon(write);
+  ASSERT_FALSE(reply.has_value());
+  EXPECT_EQ(reply.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_FALSE(write.Quiescent()) << "the notifier had it, so its wake is owed";
   gated.release.Open();
   notifier.join();
   write.Woken(gated.Result());
   const Step step = Attempt(write);
   ASSERT_EQ(step.kind, Step::Kind::kReplied);
-  ASSERT_FALSE(step.reply.has_value());
-  EXPECT_EQ(step.reply.error().code(), core::ErrorCode::kResourceExhausted);
+  EXPECT_TRUE(write.Quiescent());
   EXPECT_EQ(HotString("k"), std::nullopt);
   EXPECT_EQ(PublishedCount(), 0U);
   EXPECT_EQ(queue_.AdmissionWaiters(), 0U);
@@ -342,12 +353,11 @@ TEST_F(SequencerAttemptTest, AnExpiredWaitIsCancelledAndRepliesWithItsTimeout) {
   auto write = Write({"SET", "k", "v"}, 10ms);
   ASSERT_EQ(Attempt(*write).kind, Step::Kind::kWait);
   std::this_thread::sleep_until(write->deadline() + 1ms);
-  ASSERT_TRUE(sequencer_->Expire(*write));
+  const auto reply = sequencer_->Abandon(*write);
+  EXPECT_TRUE(write->Quiescent()) << "cancelled: nothing is owed";
   EXPECT_EQ(queue_.AdmissionWaiters(), 0U);
-  const Step step = Attempt(*write);
-  ASSERT_EQ(step.kind, Step::Kind::kReplied);
-  ASSERT_FALSE(step.reply.has_value());
-  EXPECT_EQ(step.reply.error().code(), core::ErrorCode::kResourceExhausted);
+  ASSERT_FALSE(reply.has_value());
+  EXPECT_EQ(reply.error().code(), core::ErrorCode::kResourceExhausted);
   queue_.SetAdmissible(true);
   EXPECT_TRUE(sink_.Events().empty()) << "a cancelled wait is never woken";
 }
@@ -357,7 +367,7 @@ TEST_F(SequencerAttemptTest, AnExpiredWaitIsCancelledAndRepliesWithItsTimeout) {
 // The durable wait is past the linearisation point: its deadline keeps
 // the write applied and says so.
 TEST_F(SequencerAttemptTest, ADeadlineInTheDurableWaitKeepsTheWriteApplied) {
-  Build(Options{.write_timeout = 50ms});
+  Build(Options{.command_timeout = 50ms});
   queue_.HoldDurable();
   auto result = Run({"SET", "k", "v"});
   queue_.ReleaseDurable();
@@ -370,7 +380,8 @@ TEST_F(SequencerAttemptTest, ADeadlineInTheDurableWaitKeepsTheWriteApplied) {
   EXPECT_EQ(Logged(ShardOf("k")), (std::vector<std::vector<std::string>>{{"SET", "k", "v"}}));
 }
 
-// A write over two shards replies once both streams are durable.
+// A write over two shards replies once both streams are durable: each
+// posts kDurable, and the reply goes at the last (N5).
 TEST_F(SequencerAttemptTest, ASequencedWriteRepliesOnceEveryStreamIsDurable) {
   const std::string a = KeyOn(0);
   const std::string b = KeyOn(1);
@@ -378,13 +389,22 @@ TEST_F(SequencerAttemptTest, ASequencedWriteRepliesOnceEveryStreamIsDurable) {
   auto write = Write({"MSET", a, "1", b, "2"});
   Step step = Attempt(*write);
   ASSERT_EQ(step.kind, Step::Kind::kSequenced);
+  EXPECT_TRUE(write->Quiescent()) << "the durable wait is the slot's, not the write's";
   EXPECT_EQ(HotString(a), "1") << "applied before it is durable";
   EXPECT_TRUE(sink_.Events().empty());
 
   queue_.ReleaseDurable();
-  step = Resume(*write, 1);
+  ASSERT_TRUE(sink_.WaitFor(2));
   EXPECT_EQ(sink_.Events().at(0).kind, core::CompletionKind::kDurable);
-  EXPECT_EQ(Replied(step), "OK");
+  EXPECT_EQ(sink_.Events().at(1).kind, core::CompletionKind::kDurable);
+  EXPECT_FALSE(durable_.Arrived(sink_.Events().at(0).result).has_value()) << "one stream left";
+  auto reply = durable_.Arrived(sink_.Events().at(1).result);
+  ASSERT_TRUE(reply.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
+  ASSERT_TRUE(reply->has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
+  EXPECT_EQ(Describe(**reply), "OK");
+  EXPECT_TRUE(durable_.Quiescent());
 }
 
 TEST_F(SequencerAttemptTest, TheFastPathRepliesInOneAttempt) {
@@ -430,7 +450,7 @@ class SequencerAttemptBackpressureTest : public SequencerAttemptTest {
   void SetUp() override {
     // 16 KiB a shard, over its limit past 20 KiB; nothing drains, so
     // no fill is evictable.
-    Build(Options{.max_memory_bytes = 64 << 10, .write_timeout = 300ms, .drain_gated = true});
+    Build(Options{.max_memory_bytes = 64 << 10, .command_timeout = 300ms, .drain_gated = true});
     for (int i = 0; i < 3; ++i) {
       ASSERT_EQ(Reply({"SET", KeyOn(0, i, "fill"), std::string(8 << 10, 'f')}), "OK");
     }

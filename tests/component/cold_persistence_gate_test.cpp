@@ -33,6 +33,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
@@ -48,6 +49,7 @@
 #include "latch.h"
 #include "on_exit.h"
 #include "queue_append.h"
+#include "sync_dispatch.h"
 #include "temp_dir.h"
 #include "wal_power_loss.h"
 
@@ -381,10 +383,12 @@ TEST_F(ColdPersistenceGateTest, BufferedKeyStaysReadableWhileItsBatchIsInFlight)
   });
   engine::Loader loader(hot, pool, cold);
   engine::Sequencer sequencer(hot, *queue_, loader, pool, engine::SequencerConfig{});
-  engine::ReadPath read_path(hot, loader, sequencer, engine::ReadPathConfig{});
-  engine::TieringEngine engine(read_path, sequencer);
+  engine::IoPool io(engine::IoPoolConfig{.threads = 2});
+  engine::ReadPath read_path(hot, loader, io, engine::ReadPathConfig{});
+  engine::TieringEngine engine(read_path, sequencer, io);
+  const abyss::testing::OnExit stop_io([&io] { io.Shutdown(); });
   const auto get = [&engine] {
-    auto read = engine.DispatchRead("GET", Cmd({"GET", "k"}));
+    auto read = abyss::testing::SyncDispatcher(engine).DispatchRead("GET", Cmd({"GET", "k"}));
     if (!read.has_value()) return std::string("<error>");
     return read->IsBulkString() ? read->AsString() : std::string("<nil>");
   };

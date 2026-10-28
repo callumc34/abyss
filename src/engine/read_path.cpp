@@ -45,9 +45,48 @@ core::RespValue BulkOrNull(const std::optional<core::MemberValue>& value) {
 
 }  // namespace
 
-ReadPath::ReadPath(hot::ShardedHotStore& hot, Loader& loader, Sequencer& sequencer,
-                   ReadPathConfig config)
-    : hot_(hot), loader_(loader), sequencer_(sequencer), config_(std::move(config)) {
+// A collection's fill after its point or count read, on the pool's
+// background queue. It holds no command and posts nothing. Install
+// takes the key's placeholder before it reads, so however late it
+// runs it cannot install what a write has since replaced.
+class ReadPath::FillJob final : public IoJob {
+ public:
+  FillJob(ReadPath& reads, std::string_view key, core::KeyType type, core::SteadyTime deadline)
+      : reads_(reads), key_(key), type_(type), deadline_(deadline) {}
+
+  // NOLINTNEXTLINE(bugprone-exception-escape): an OOM may terminate.
+  void Run() noexcept override { reads_.CountFill(reads_.loader_.Install(key_, type_, deadline_)); }
+  // NOLINTNEXTLINE(bugprone-exception-escape): its outcome is in range.
+  void Fail(core::Error error) noexcept override {
+    reads_.CountFill(error.code() == core::ErrorCode::kTimeout ? metrics::FillOutcome::kExpired
+                                                               : metrics::FillOutcome::kDropped);
+  }
+
+ private:
+  ReadPath& reads_;
+  std::string key_;
+  core::KeyType type_;
+  core::SteadyTime deadline_;
+};
+
+void FanOut::Reset(core::MultiKeyKind fan_kind, std::span<const std::string> fan_keys) {
+  kind = fan_kind;
+  keys = fan_keys;
+  next = 0;
+  values.clear();
+  count = 0;
+  fences.clear();
+  error.reset();
+}
+
+core::Result<core::RespValue> FanOut::Reply() {
+  if (error.has_value()) return std::unexpected(*error);
+  if (kind == core::MultiKeyKind::kExists) return core::RespValue::Integer(count);
+  return core::RespValue::Array(std::move(values));
+}
+
+ReadPath::ReadPath(hot::ShardedHotStore& hot, Loader& loader, IoPool& pool, ReadPathConfig config)
+    : hot_(hot), loader_(loader), pool_(pool), config_(std::move(config)) {
   if (config_.fill_doorkeeper) {
     doorkeeper_ = std::make_unique<Doorkeeper>(config_.doorkeeper_window);
   }
@@ -60,47 +99,72 @@ ReadPath::ReadPath(hot::ShardedHotStore& hot, Loader& loader, Sequencer& sequenc
   using metrics::FillOutcome;
   for (const FillOutcome outcome :
        {FillOutcome::kInstalled, FillOutcome::kDiscarded, FillOutcome::kSkippedBackpressure,
-        FillOutcome::kSkippedSize, FillOutcome::kSkippedEvictCap, FillOutcome::kFailed}) {
+        FillOutcome::kSkippedSize, FillOutcome::kSkippedEvictCap, FillOutcome::kFailed,
+        FillOutcome::kDropped, FillOutcome::kExpired}) {
     fills_.at(static_cast<size_t>(outcome)) = reg.Counter(metrics::names::kHotFillsTotal, outcome);
   }
 }
 
-core::Result<core::RespValue> ReadPath::Read(const ops::ReadOp& op) {
-  if (auto hot = FromHot(op); hot.has_value()) return *std::move(hot);
-  return Miss(op);
+std::optional<ReadAnswer> ReadPath::TryHot(const ops::ReadOp& op) { return FromHot(op); }
+
+metrics::IoKind ReadPath::KindOf(const ops::ReadOp& op) {
+  return LoadsWholeKey(op) ? metrics::IoKind::kScan : metrics::IoKind::kPoint;
 }
 
-core::Result<core::RespValue> ReadPath::Mget(std::span<const std::string> keys) {
-  std::vector<core::RespValue> out;
-  out.reserve(keys.size());
-  for (const auto& key : keys) {
-    auto result = Read(ops::ReadOp{ops::StringGet{.key = key}});
-    if (!result.has_value()) {
-      // Redis MGET answers nil for a key of another type.
-      if (result.error().code() != core::ErrorCode::kWrongType) {
-        return std::unexpected(result.error());
-      }
-      out.push_back(core::RespValue::Null());
-      continue;
+void ReadPath::FanOutHot(FanOut& fan) {
+  while (!fan.done()) {
+    const std::string& key = fan.keys[fan.next];
+    std::optional<ReadAnswer> hit;
+    if (fan.kind == core::MultiKeyKind::kExists) {
+      hit = TryHot(ops::ReadOp{ops::Exists{.keys = {key}}});
+    } else {
+      hit = TryHot(ops::ReadOp{ops::StringGet{.key = key}});
     }
-    out.push_back(std::move(*result));
+    if (!hit.has_value()) return;
+    Fold(fan, *std::move(hit));
   }
-  return core::RespValue::Array(std::move(out));
 }
 
-core::Result<core::RespValue> ReadPath::Exists(std::span<const std::string> keys) {
-  // EXISTS k k counts twice (Redis behaviour): no dedup.
-  int64_t count = 0;
-  for (const auto& key : keys) {
-    auto present = Read(ops::ReadOp{ops::Exists{.keys = {key}}});
-    if (!present.has_value()) return std::unexpected(present.error());
-    count += present->AsInteger();
+void ReadPath::FanOutMiss(FanOut& fan, core::SteadyTime deadline) {
+  bool more = !fan.done();
+  while (more) {
+    const std::string& key = fan.keys[fan.next];
+    ops::ReadOp op;
+    if (fan.kind == core::MultiKeyKind::kExists) {
+      op = ops::Exists{.keys = {key}};
+    } else {
+      op = ops::StringGet{.key = key};
+    }
+    std::optional<ReadAnswer> answer = TryHot(op);
+    if (!answer.has_value()) answer = Miss(op, deadline);
+    more = Fold(fan, *std::move(answer)) && !fan.done();
   }
-  return core::RespValue::Integer(count);
 }
 
-std::optional<core::Result<core::RespValue>> ReadPath::FromHot(
-    const ops::ReadOp& op, std::optional<Loader::Source> filled_from) {
+bool ReadPath::Fold(FanOut& fan, ReadAnswer answer) {
+  if (answer.fence.has_value()) fan.fences.push_back(*answer.fence);
+  ++fan.next;
+  if (!answer.reply.has_value()) {
+    // Redis MGET answers nil for a key of another type.
+    if (fan.kind == core::MultiKeyKind::kMget &&
+        answer.reply.error().code() == core::ErrorCode::kWrongType) {
+      fan.values.push_back(core::RespValue::Null());
+      return true;
+    }
+    fan.error = answer.reply.error();
+    return false;
+  }
+  if (fan.kind == core::MultiKeyKind::kExists) {
+    // EXISTS k k counts twice (Redis behaviour): no dedup.
+    fan.count += answer.reply->AsInteger();
+  } else {
+    fan.values.push_back(*std::move(answer.reply));
+  }
+  return true;
+}
+
+std::optional<ReadAnswer> ReadPath::FromHot(const ops::ReadOp& op,
+                                            std::optional<Loader::Source> filled_from) {
   auto read = hot_.Read(op);
   if (!read.result.has_value() && read.result.error().code() == core::ErrorCode::kNotFound) {
     return std::nullopt;
@@ -112,67 +176,65 @@ std::optional<core::Result<core::RespValue>> ReadPath::FromHot(
       hits_hot_.Increment();
     }
   }
-  if (read.fence.has_value()) {
-    const ShardSeq fence{.shard = hot_.ShardOf(ops::PrimaryKey(op)), .seq = *read.fence};
-    // Hot shows a write once it is applied, which precedes its publish.
-    if (auto fenced = sequencer_.Fence(std::span(&fence, 1), After(config_.write_timeout));
-        !fenced) {
-      return std::unexpected(fenced.error());
-    }
-  }
-  return std::move(read.result);
+  return ReadAnswer{.reply = std::move(read.result), .fence = FenceOf(op, read.fence)};
 }
 
-core::Result<core::RespValue> ReadPath::Miss(const ops::ReadOp& op) {
+// Hot shows a write once it is applied, which precedes its publish.
+std::optional<ShardSeq> ReadPath::FenceOf(const ops::ReadOp& op,
+                                          std::optional<core::SequenceId> seq) const {
+  if (!seq.has_value()) return std::nullopt;
+  return ShardSeq{.shard = hot_.ShardOf(ops::PrimaryKey(op)), .seq = *seq};
+}
+
+ReadAnswer ReadPath::Miss(const ops::ReadOp& op, core::SteadyTime deadline) {
   return std::visit(
-      [&](const auto& o) -> core::Result<core::RespValue> {
+      [&](const auto& o) -> ReadAnswer {
         using T = std::decay_t<decltype(o)>;
         using core::KeyType;
         if constexpr (std::is_same_v<T, ops::Exists> || std::is_same_v<T, ops::Ttl> ||
                       std::is_same_v<T, ops::Type>) {
           const auto key = ops::PrimaryKey(op);
           Loader::Source source = Loader::Source::kBuffer;
-          auto probed =
-              loader_.Probe(hot_.ShardOf(key), key, After(config_.cold_read_deadline), &source);
-          if (!probed.has_value()) return Failed(op, probed.error());
-          return Answer(op, *probed, source);
+          auto probed = loader_.Probe(hot_.ShardOf(key), key, deadline, &source);
+          if (!probed.has_value()) return {.reply = Failed(op, probed.error())};
+          return {.reply = Answer(op, *probed, source)};
         } else if constexpr (std::is_same_v<T, ops::StringGet>) {
-          return Fill(op, KeyType::kString, config_.cold_read_deadline);
+          return Fill(op, KeyType::kString, deadline);
         } else if constexpr (std::is_same_v<T, ops::SetIsMember>) {
-          return PointRead(op, KeyType::kSet);
+          return {.reply = PointRead(op, KeyType::kSet, deadline)};
         } else if constexpr (std::is_same_v<T, ops::ZsetScore>) {
-          return PointRead(op, KeyType::kZset);
+          return {.reply = PointRead(op, KeyType::kZset, deadline)};
         } else if constexpr (std::is_same_v<T, ops::HashGet> ||
                              std::is_same_v<T, ops::HashFieldExists> ||
                              std::is_same_v<T, ops::HashMultiGet>) {
-          return PointRead(op, KeyType::kHash);
+          return {.reply = PointRead(op, KeyType::kHash, deadline)};
         } else if constexpr (std::is_same_v<T, ops::SetCard>) {
-          return CountRead(op, KeyType::kSet);
+          return {.reply = CountRead(op, KeyType::kSet, deadline)};
         } else if constexpr (std::is_same_v<T, ops::ZsetCard>) {
-          return CountRead(op, KeyType::kZset);
+          return {.reply = CountRead(op, KeyType::kZset, deadline)};
         } else if constexpr (std::is_same_v<T, ops::HashLen>) {
-          return CountRead(op, KeyType::kHash);
+          return {.reply = CountRead(op, KeyType::kHash, deadline)};
         } else if constexpr (std::is_same_v<T, ops::SetMembers>) {
-          return Fill(op, KeyType::kSet, config_.cold_scan_deadline);
+          return Fill(op, KeyType::kSet, deadline);
         } else if constexpr (std::is_same_v<T, ops::ZsetRange>) {
-          return Fill(op, KeyType::kZset, config_.cold_scan_deadline);
+          return Fill(op, KeyType::kZset, deadline);
         } else {
-          return Fill(op, KeyType::kHash, config_.cold_scan_deadline);
+          return Fill(op, KeyType::kHash, deadline);
         }
       },
       op);
 }
 
-core::Result<core::RespValue> ReadPath::Fill(const ops::ReadOp& op, core::KeyType type,
-                                             std::chrono::milliseconds budget) {
+ReadAnswer ReadPath::Fill(const ops::ReadOp& op, core::KeyType type, core::SteadyTime deadline) {
   const auto key = ops::PrimaryKey(op);
   const auto shard = hot_.ShardOf(key);
-  const auto deadline = After(budget);
   if (Admit(key)) {
     auto filled = loader_.Install(key, type, deadline);
     CountFill(filled);
-    if (!filled.has_value()) return Failed(op, filled.error());
-    if (filled->result.has_value()) return Answer(op, *filled->result, filled->source);
+    if (!filled.has_value()) return {.reply = Failed(op, filled.error())};
+    if (filled->result.has_value()) {
+      return {.reply = Answer(op, *filled->result, filled->source)};
+    }
     if (filled->fill != Loader::Fill::kPending) {
       const bool loaded_here = filled->fill == Loader::Fill::kInstalled;
       if (auto hot = FromHot(op, loaded_here ? std::optional(filled->source) : std::nullopt);
@@ -185,50 +247,52 @@ core::Result<core::RespValue> ReadPath::Fill(const ops::ReadOp& op, core::KeyTyp
   }
   Loader::Source source = Loader::Source::kBuffer;
   auto loaded = loader_.LoadAs(shard, key, type, deadline, &source);
-  if (!loaded.has_value()) return Failed(op, loaded.error());
-  return Answer(op, **loaded, source);
+  if (!loaded.has_value()) return {.reply = Failed(op, loaded.error())};
+  return {.reply = Answer(op, **loaded, source)};
 }
 
-core::Result<core::RespValue> ReadPath::CountRead(const ops::ReadOp& op, core::KeyType type) {
+core::Result<core::RespValue> ReadPath::CountRead(const ops::ReadOp& op, core::KeyType type,
+                                                  core::SteadyTime deadline) {
   const auto key = ops::PrimaryKey(op);
-  auto count = loader_.Cardinality(hot_.ShardOf(key), key, type, After(config_.cold_read_deadline));
+  auto count = loader_.Cardinality(hot_.ShardOf(key), key, type, deadline);
   if (!count.has_value()) return std::unexpected(count.error());
   if (count->members == 0) {
     misses_.Increment();
   } else {
     CountHit(count->source);
   }
-  FillSmall(key, type, count->members);
+  FillSmall(key, type, count->members, deadline);
   return core::RespValue::Integer(static_cast<int64_t>(count->members));
 }
 
-void ReadPath::FillSmall(std::string_view key, core::KeyType type, uint64_t members) {
+void ReadPath::FillSmall(std::string_view key, core::KeyType type, uint64_t members,
+                         core::SteadyTime deadline) {
   if (members == 0 || members >= config_.fill_max_members || !Admit(key)) return;
-  // A failed fill costs only the next read's cold read.
-  CountFill(loader_.Install(key, type, After(config_.cold_scan_deadline)));
+  // A fill that never runs costs only the next read's cold read.
+  pool_.SubmitBackground(std::make_unique<FillJob>(*this, key, type, deadline), deadline);
 }
 
 void ReadPath::CountFill(const core::Result<Loader::Filled>& filled) {
   using metrics::FillOutcome;
   if (!filled.has_value()) {
-    fills_.at(static_cast<size_t>(FillOutcome::kFailed)).Increment();
+    CountFill(FillOutcome::kFailed);
     return;
   }
   switch (filled->fill) {
     case Loader::Fill::kInstalled:
-      fills_.at(static_cast<size_t>(FillOutcome::kInstalled)).Increment();
+      CountFill(FillOutcome::kInstalled);
       break;
     case Loader::Fill::kDiscarded:
-      fills_.at(static_cast<size_t>(FillOutcome::kDiscarded)).Increment();
+      CountFill(FillOutcome::kDiscarded);
       break;
     case Loader::Fill::kSkippedBackpressure:
-      fills_.at(static_cast<size_t>(FillOutcome::kSkippedBackpressure)).Increment();
+      CountFill(FillOutcome::kSkippedBackpressure);
       break;
     case Loader::Fill::kSkippedSize:
-      fills_.at(static_cast<size_t>(FillOutcome::kSkippedSize)).Increment();
+      CountFill(FillOutcome::kSkippedSize);
       break;
     case Loader::Fill::kSkippedEvictCap:
-      fills_.at(static_cast<size_t>(FillOutcome::kSkippedEvictCap)).Increment();
+      CountFill(FillOutcome::kSkippedEvictCap);
       break;
     case Loader::Fill::kResident:
     case Loader::Fill::kFlushed:
@@ -237,7 +301,12 @@ void ReadPath::CountFill(const core::Result<Loader::Filled>& filled) {
   }
 }
 
-core::Result<core::RespValue> ReadPath::PointRead(const ops::ReadOp& op, core::KeyType type) {
+void ReadPath::CountFill(metrics::FillOutcome outcome) {
+  fills_.at(static_cast<size_t>(outcome)).Increment();
+}
+
+core::Result<core::RespValue> ReadPath::PointRead(const ops::ReadOp& op, core::KeyType type,
+                                                  core::SteadyTime deadline) {
   const auto key = ops::PrimaryKey(op);
   const auto shard = hot_.ShardOf(key);
   std::vector<std::string_view> asks;
@@ -254,14 +323,14 @@ core::Result<core::RespValue> ReadPath::PointRead(const ops::ReadOp& op, core::K
         }
       },
       op);
-  auto read = loader_.ReadMembers(shard, key, type, asks, After(config_.cold_read_deadline));
+  auto read = loader_.ReadMembers(shard, key, type, asks, deadline);
   if (!read.has_value()) return std::unexpected(read.error());
   if (read->cardinality == 0) {
     misses_.Increment();
   } else {
     CountHit(read->source);
   }
-  FillSmall(key, type, read->cardinality);
+  FillSmall(key, type, read->cardinality, deadline);
 
   const auto& values = read->values;
   if (std::holds_alternative<ops::HashMultiGet>(op)) {
@@ -322,10 +391,6 @@ void ReadPath::CountHit(Loader::Source source) {
 
 bool ReadPath::Admit(std::string_view key) {
   return doorkeeper_ == nullptr || doorkeeper_->Admit(key);
-}
-
-core::SteadyTime ReadPath::After(std::chrono::milliseconds budget) const {
-  return core::SteadyClock::now() + budget;
 }
 
 }  // namespace abyss::engine

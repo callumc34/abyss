@@ -135,9 +135,12 @@ struct NetConfig {
 };
 
 struct EngineConfig {
-  // A write's whole budget: admission, loads, backpressure and its
-  // durable wait. Also bounds a read's wait for what it saw.
-  std::chrono::milliseconds write_timeout{5000};
+  // A command's whole budget. A write's admission, loads, backpressure
+  // and durable wait; a read's cold read and its wait for what it saw.
+  std::chrono::milliseconds command_timeout{5000};
+  // Threads for cold reads, which block in pread. 0 = auto:
+  // min(4, max(2, hardware_concurrency)).
+  uint32_t cold_io_threads = 0;
 };
 
 struct MetricsConfig {

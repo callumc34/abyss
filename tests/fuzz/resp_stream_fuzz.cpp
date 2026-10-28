@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -27,22 +28,12 @@ namespace {
 
 class NoopDispatcher : public abyss::core::CommandDispatcher {
  public:
-  abyss::core::Result<abyss::core::RespValue> DispatchRead(
-      std::string_view /*name*/, const abyss::core::RespCommand& /*cmd*/) override {
-    return abyss::core::RespValue::BulkString("v");
-  }
-  abyss::core::Result<abyss::core::RespValue> DispatchWrite(
-      std::string_view /*name*/, abyss::core::RespCommand /*cmd*/,
-      abyss::core::PredicateFlags /*flags*/) override {
-    return abyss::core::RespValue::SimpleString("OK");
-  }
-  abyss::core::Result<abyss::core::RespValue> DispatchFanOut(
-      abyss::core::MultiKeyKind /*kind*/, abyss::core::RespCommand /*cmd*/) override {
-    return abyss::core::RespValue::SimpleString("OK");
-  }
-  abyss::core::Result<abyss::core::RespValue> DispatchFlush(
-      abyss::core::FlushTarget /*target*/) override {
-    return abyss::core::RespValue::SimpleString("OK");
+  abyss::core::Outcome Dispatch(abyss::core::Request request, abyss::core::Slot& /*slot*/,
+                                std::unique_ptr<abyss::core::Task>& /*task*/) override {
+    if (request.kind == abyss::core::Request::Kind::kRead) {
+      return {.reply = abyss::core::RespValue::BulkString("v")};
+    }
+    return {.reply = abyss::core::RespValue::SimpleString("OK")};
   }
 };
 

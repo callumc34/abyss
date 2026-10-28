@@ -19,7 +19,7 @@ TEST(ParseReadOpTest, ParsesGet) {
 }
 
 // MGET / EXISTS are decomposed in the engine before parse; ParseReadOp doesn't
-// know about them. See TieringEngine::DispatchFanOut.
+// know about them. See TieringEngine::Dispatch.
 TEST(ParseReadOpTest, MgetNotRegistered) {
   RespCommand cmd{{"MGET", "k1"}};
   EXPECT_FALSE(ParseReadOp("MGET", cmd).has_value());

@@ -1,12 +1,13 @@
 add_library(abyss_engine
   decide.cpp
   doorkeeper.cpp
+  io_pool.cpp
   hot_replayer.cpp
   loader.cpp
   pending_write.cpp
   read_path.cpp
   sequencer.cpp
-  blocking_driver.cpp
+  command_task.cpp
   tiering_engine.cpp
   recovery_coordinator.cpp
   bounded_thread_shard_scheduler.cpp

@@ -6,10 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <span>
 #include <vector>
 
 #include "abyss/consumer/compaction_buffer_router.h"
+#include "abyss/core/completion.h"
+#include "abyss/core/durable_wait.h"
 #include "abyss/core/predicate.h"
 #include "abyss/core/queue.h"
 #include "abyss/core/resp_types.h"
@@ -25,8 +26,9 @@
 namespace abyss::engine {
 
 struct SequencerConfig {
-  // One write's whole budget, every wait in it included.
-  std::chrono::milliseconds write_timeout{5000};
+  // A command's whole budget, every wait in it included: reads take
+  // it as well as writes.
+  std::chrono::milliseconds command_timeout{5000};
   core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
@@ -47,28 +49,36 @@ struct SequencerStats {
 // that must wait registers itself first, then re-checks; it returns
 // only once registered, and its wake runs the next attempt. A write
 // whose deadline passes before it is linearised is never applied.
-class Sequencer {
+class Sequencer final : private core::DurableWait::Timer {
  public:
   Sequencer(hot::ShardedHotStore& hot, core::Queue& queue, Loader& loader,
             consumer::CompactionBufferRouter& buffers, SequencerConfig config);
 
   // The write, single-key or multi-key (its keys' shards must share a
   // log), or FLUSHDB (a Flush per shard, every shard wiped under its
-  // lock), until it replies or must wait.
+  // lock), until it replies, is linearised, or must wait.
   Step Attempt(PendingWrite& write);
   // A write's own loads, the wait kLoads names; on any thread.
   void Load(PendingWrite& write);
-  // At its deadline, for a write still waiting: true if its wait was
-  // cancelled, and the next Attempt replies with the timeout. False:
-  // its wake is on the way, and the Attempt that follows replies.
-  bool Expire(PendingWrite& write);
-  // Waits until each shard's seq is durable at the ack class: a reply
-  // that observed it may otherwise show a write not yet published. A 0,
-  // loaded state's, is below every durable end, so returns at once.
-  core::Result<void> Fence(std::span<const ShardSeq> fences, core::SteadyTime deadline);
+  // Instead of Load, for loads that will not run (`error`): ends each
+  // one's placeholder, so writers and readers of its key go on. Any
+  // error but the deadline's is the write's reply.
+  void Unload(PendingWrite& write, const core::Error& error);
+  // For a write that returned kSequenced: hands its reply and the seqs
+  // it shows to `wait`, whose posts go to `completion`. The reply now,
+  // if all of them are durable already.
+  std::optional<core::Result<core::RespValue>> Sequence(PendingWrite& write,
+                                                        core::DurableWait& wait,
+                                                        core::Completion completion);
+  // At its deadline, for a write that returned kWait: its timeout
+  // reply, and it is never applied. Its wait is cancelled if it can be;
+  // otherwise its wake or its loads are on their way, and the Attempt
+  // they run only cleans up (FinishWait's hand-off, N2's installs).
+  core::Result<core::RespValue> Abandon(PendingWrite& write);
 
   SequencerStats Snapshot() const;
   const SequencerConfig& config() const { return config_; }
+  core::Queue& queue() const { return queue_; }
 
  private:
   class Hold;
@@ -85,22 +95,25 @@ class Sequencer {
   // waits for its cold drain until it is not; OOM at the deadline.
   std::optional<Step> AwaitMemory(PendingWrite& write);
   std::optional<Step> AwaitForeignLoads(PendingWrite& write);
-  // Each of the write's durable seqs at the ack class: its ranges' last,
-  // or its fences.
-  Step AwaitDurable(PendingWrite& write);
+  static Step Linearised(PendingWrite& write);
   // Registered, to wait for `reason`.
   static Step Waiting(PendingWrite& write, WaitReason reason, core::ShardId shard = 0);
   Step Done(PendingWrite& write, core::Result<core::RespValue> reply);
   // A write past its deadline, not yet linearised: ends its wait and
-  // its loads, and replies with the wait's timeout.
-  Step Abandon(PendingWrite& write);
+  // its loads, and replies with the wait's timeout, unless Abandon
+  // already has.
+  Step Expired(PendingWrite& write);
+  // Ends the wait `wake` answered, if any, and the loads.
+  void EndWait(PendingWrite& write, const std::optional<core::Result<void>>& wake);
+  // The wait's timeout reply, counted as its rejection.
+  core::Result<core::RespValue> TimeoutOf(PendingWrite& write,
+                                          const std::optional<core::Result<void>>& wake);
   void AbortLoads(PendingWrite& write);
   void InstallLoads(PendingWrite& write);
   static void ClearLoads(PendingWrite& write);
-  Step DurableTimedOut(PendingWrite& write);
-  Step DurableFailed(PendingWrite& write, const core::Error& error);
   void Redecided(metrics::RedecideReason reason);
   void Again(PendingWrite& write, metrics::RedecideReason reason);
+  void Waited(std::chrono::steady_clock::duration waited) noexcept override;
 
   hot::ShardedHotStore& hot_;
   core::Queue& queue_;

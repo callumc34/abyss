@@ -1,13 +1,19 @@
 #include "abyss/resp/request_pipeline.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "abyss/core/ascii.h"
+#include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/thread_annotations.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
 #include "abyss/resp/admin_handlers.h"
@@ -40,9 +46,52 @@ ErrorPrefix MapErrorCode(core::ErrorCode code) {
 
 }  // namespace
 
+// The engine's events for this pipeline, in order. Warm, a post
+// allocates nothing; the loop lets it go only once nothing of its
+// command is outstanding, so no poster is still inside it.
+class RequestPipeline::Inbox final : public core::CompletionSink {
+ public:
+  // NOLINTNEXTLINE(bugprone-exception-escape): an OOM may terminate.
+  void Post(std::span<const core::CompletionEvent> events) noexcept override {
+    const std::scoped_lock lock(mu_);
+    events_.insert(events_.end(), events.begin(), events.end());
+    cv_.notify_one();
+  }
+
+  // The next event; nullopt once `deadline` passes with none.
+  std::optional<core::CompletionEvent> Take(std::optional<core::SteadyTime> deadline) {
+    std::unique_lock lock(mu_);
+    const auto ready = [this] ABYSS_REQUIRES(mu_) { return next_ < events_.size(); };
+    if (!deadline.has_value()) {
+      cv_.wait(lock, ready);
+    } else if (!cv_.wait_until(lock, *deadline, ready)) {
+      return std::nullopt;
+    }
+    core::CompletionEvent event = std::move(events_[next_++]);
+    if (next_ == events_.size()) {
+      events_.clear();
+      next_ = 0;
+    }
+    return event;
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::vector<core::CompletionEvent> events_ ABYSS_GUARDED_BY(mu_);
+  size_t next_ ABYSS_GUARDED_BY(mu_) = 0;
+};
+
 RequestPipeline::RequestPipeline(const CommandRegistry& registry, ConnectionState state,
                                  Dependencies deps)
-    : registry_(registry), deps_(deps), state_(std::move(state)) {}
+    : registry_(registry),
+      deps_(deps),
+      state_(std::move(state)),
+      inbox_(std::make_unique<Inbox>()) {}
+
+RequestPipeline::~RequestPipeline() {
+  ABYSS_DCHECK(Quiescent(), "a pipeline closed with a command outstanding");
+}
 
 RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t> input,
                                                         std::vector<uint8_t>& output) {
@@ -67,7 +116,7 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
       close_reason_ = ProcessCloseReason::kProtocolError;
       break;
     }
-    auto response = Dispatch(parsed->command);
+    auto response = Dispatch(std::move(parsed->command));
     auto bytes = Serializer::Serialize(response);
     output.insert(output.end(), bytes.begin(), bytes.end());
     consumed += parsed->bytes_consumed;
@@ -79,9 +128,9 @@ RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t>
   return {.bytes_consumed = consumed, .close_reason = close_reason_};
 }
 
-RespValue RequestPipeline::Dispatch(const RespCommand& cmd) {
+RespValue RequestPipeline::Dispatch(RespCommand cmd) {
   const auto start = std::chrono::steady_clock::now();
-  auto outcome = DispatchImpl(cmd);
+  auto outcome = DispatchImpl(std::move(cmd));
 
   if (deps_.metrics != nullptr) {
     const auto elapsed = std::chrono::steady_clock::now() - start;
@@ -92,7 +141,7 @@ RespValue RequestPipeline::Dispatch(const RespCommand& cmd) {
   return std::move(outcome.response);
 }
 
-RequestPipeline::DispatchOutcome RequestPipeline::DispatchImpl(const RespCommand& cmd) {
+RequestPipeline::DispatchOutcome RequestPipeline::DispatchImpl(RespCommand cmd) {
   const auto resolution = registry_.Resolve(cmd);
 
   switch (resolution.status) {
@@ -121,32 +170,38 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchImpl(const RespCommand
     return {MakeLoading(), RequestStatus::kLoading, resolved.parent->name};
   }
 
-  return DispatchResolved(resolved, cmd);
+  return DispatchResolved(resolved, std::move(cmd));
 }
 
 RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const ResolvedCommand& resolved,
-                                                                   const RespCommand& cmd) {
+                                                                   RespCommand cmd) {
   const auto& parent = *resolved.parent;
   auto finish = [&parent](RespValue response) -> DispatchOutcome {
     const auto status = response.IsError() ? RequestStatus::kError : RequestStatus::kOk;
     return {std::move(response), status, parent.name};
   };
+  auto engine = [this, &parent, &finish](core::Request request, std::string_view what) {
+    auto result = RunToReply(std::move(request));
+    if (!result.has_value()) {
+      ABYSS_LOG_WARN(what, {"client_id", state_.client_id}, {"cmd", std::string_view{parent.name}},
+                     {"err", std::string_view{result.error().message()}});
+      return finish(
+          RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
+    }
+    return finish(*std::move(result));
+  };
 
-  // Fan-out commands route through DispatchFanOut instead of read/write. The
+  // Fan-out commands route as their own kind instead of read/write. The
   // kind is only set on parent specs, never on subcommands.
   if (resolved.subcommand == nullptr && parent.multi_key_kind != core::MultiKeyKind::kNone) {
     if (deps_.dispatcher == nullptr) {
       return finish(InternalServerError("dispatcher missing for fan-out", parent.name));
     }
-    auto result = deps_.dispatcher->DispatchFanOut(parent.multi_key_kind, RespCommand(cmd));
-    if (!result.has_value()) {
-      ABYSS_LOG_WARN("engine fan-out error", {"client_id", state_.client_id},
-                     {"cmd", std::string_view{parent.name}},
-                     {"err", std::string_view{result.error().message()}});
-      return finish(
-          RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
-    }
-    return finish(std::move(*result));
+    return engine(core::Request{.kind = core::Request::Kind::kFanOut,
+                                .name = parent.name,
+                                .multi_key = parent.multi_key_kind,
+                                .cmd = std::move(cmd)},
+                  "engine fan-out error");
   }
 
   switch (resolved.DispatchClass()) {
@@ -157,17 +212,10 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
       if (deps_.dispatcher == nullptr) {
         return finish(InternalServerError("dispatcher missing for tiered read", parent.name));
       }
-      {
-        auto result = deps_.dispatcher->DispatchRead(parent.name, cmd);
-        if (!result.has_value()) {
-          ABYSS_LOG_WARN("engine read error", {"client_id", state_.client_id},
-                         {"cmd", std::string_view{parent.name}},
-                         {"err", std::string_view{result.error().message()}});
-          return finish(
-              RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
-        }
-        return finish(std::move(*result));
-      }
+      return engine(
+          core::Request{
+              .kind = core::Request::Kind::kRead, .name = parent.name, .cmd = std::move(cmd)},
+          "engine read error");
 
     case Dispatch::kWritePath: {
       if (deps_.dispatcher == nullptr) {
@@ -198,15 +246,11 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
 
       // The client's spelling: the engine logs the canonical effect it
       // decides, its TTLs made absolute at the instant it decides at.
-      auto result = deps_.dispatcher->DispatchWrite(parent.name, RespCommand(cmd), flags);
-      if (!result.has_value()) {
-        ABYSS_LOG_WARN("engine write error", {"client_id", state_.client_id},
-                       {"cmd", std::string_view{parent.name}},
-                       {"err", std::string_view{result.error().message()}});
-        return finish(
-            RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
-      }
-      return finish(std::move(*result));
+      return engine(core::Request{.kind = core::Request::Kind::kWrite,
+                                  .name = parent.name,
+                                  .flags = flags,
+                                  .cmd = std::move(cmd)},
+                    "engine write error");
     }
 
     case Dispatch::kAdmin:
@@ -244,20 +288,62 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
           return finish(RespValue::Error(ErrorPrefix::kErr, "syntax error"));
         }
       }
-      const auto target =
-          (parent.name == "FLUSHALL") ? core::FlushTarget::kAllDbs : core::FlushTarget::kThisDb;
-      auto result = deps_.dispatcher->DispatchFlush(target);
-      if (!result.has_value()) {
-        ABYSS_LOG_WARN("flush dispatch error", {"client_id", state_.client_id},
-                       {"cmd", std::string_view{parent.name}},
-                       {"err", std::string_view{result.error().message()}});
-        return finish(
-            RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
-      }
-      return finish(std::move(*result));
+      // One database: FLUSHALL and FLUSHDB both wipe it.
+      return engine(core::Request{.kind = core::Request::Kind::kFlush, .name = parent.name},
+                    "flush dispatch error");
     }
   }
   return finish(InternalServerError("unhandled dispatch class", parent.name));
+}
+
+core::Result<RespValue> RequestPipeline::RunToReply(core::Request request) {
+  slot_.completion = core::Completion{
+      .sink = inbox_.get(), .client_id = state_.client_id, .slot_seq = ++slot_seq_};
+  core::Outcome outcome = deps_.dispatcher->Dispatch(std::move(request), slot_, task_);
+  std::optional<core::Result<RespValue>> reply;
+  bool pending = false;
+  switch (outcome.kind) {
+    case core::Outcome::Kind::kReplied:
+      reply = std::move(outcome.reply);
+      break;
+    case core::Outcome::Kind::kSequenced:
+      break;
+    case core::Outcome::Kind::kPending:
+      pending = true;
+      break;
+  }
+  // Once replied it waits only for what is already on its way, which
+  // the deadline just passed bounds: a wake a Cancel lost, or a job.
+  while (!reply.has_value() || !Quiescent()) {
+    std::optional<core::CompletionEvent> event =
+        inbox_->Take(reply.has_value() ? std::nullopt : std::optional(slot_.deadline));
+    if (!event.has_value()) {
+      ABYSS_DCHECK(pending || slot_.durable.waiting(), "a deadline for a command not waiting");
+      reply = pending ? task_->Abandon(slot_) : slot_.durable.Expire();
+      continue;
+    }
+    // Another command's event never runs this one's task.
+    if (event->client_id != slot_.completion.client_id ||
+        event->slot_seq != slot_.completion.slot_seq) {
+      continue;
+    }
+    if (event->kind == core::CompletionKind::kDurable) {
+      auto released = slot_.durable.Arrived(std::move(event->result));
+      if (released.has_value() && !reply.has_value()) reply = *std::move(released);
+      continue;
+    }
+    if (event->kind != core::CompletionKind::kResume) continue;
+    ABYSS_DCHECK(task_ != nullptr, "a kResume for a command with no task");
+    core::Outcome next = task_->Run(slot_, std::move(event->result));
+    if (reply.has_value()) continue;
+    pending = next.kind == core::Outcome::Kind::kPending;
+    if (next.kind == core::Outcome::Kind::kReplied) reply = std::move(next.reply);
+  }
+  return *std::move(reply);
+}
+
+bool RequestPipeline::Quiescent() const {
+  return (task_ == nullptr || task_->Quiescent()) && slot_.durable.Quiescent();
 }
 
 RequestPipeline::DispatchOutcome RequestPipeline::HandleAdminStateless(

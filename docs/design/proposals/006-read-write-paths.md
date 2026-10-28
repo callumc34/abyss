@@ -51,9 +51,9 @@ A decision with no effect (`SET NX` on a present key, for example) logs nothing 
 
 **Multi-key writes.** `MSET`, multi-key `DEL` and `UNLINK`, `MSETNX`, `RENAMENX` and `COPY` are one decision and one reservation across their shards, so they are atomic to readers and across a crash. Their keys must share a WAL log. With `queue.log_count` above 1, a write whose keys span logs is rejected with `-CROSSSLOT` before anything is decided (#169).
 
-**Failures before apply reject the write cleanly.** Every wait is bounded by `engine.write_timeout_ms` (default 5 s), which covers admission, loads, backpressure and the durable wait. A write that cannot be admitted, find a spare segment, load its keys or get past memory backpressure in that time is rejected, and nothing was logged or applied. Memory backpressure replies `-OOM command not allowed when hot memory is over its limit and cold is behind`. Each re-decision is counted in `abyss_sequencer_redecides_total` by reason.
+**Failures before apply reject the write cleanly.** Every wait is bounded by `engine.command_timeout_ms` (default 5 s), which covers admission, loads, backpressure and the durable wait. A write that cannot be admitted, find a spare segment, load its keys or get past memory backpressure in that time is rejected, and nothing was logged or applied. Memory backpressure replies `-OOM command not allowed when hot memory is over its limit and cold is behind`. Each re-decision is counted in `abyss_sequencer_redecides_total` by reason.
 
-**After apply, a write cannot be undone.** A write whose durable wait passes `engine.write_timeout_ms` replies with an error saying it is applied and may yet become durable. A failed flush or publish terminates the process ([ADP-015](015-write-path-and-durability.md) §Fail-stop after apply).
+**After apply, a write cannot be undone.** A write whose durable wait passes `engine.command_timeout_ms` replies with an error saying it is applied and may yet become durable. A failed flush or publish terminates the process ([ADP-015](015-write-path-and-durability.md) §Fail-stop after apply).
 
 The queue is the sole write path. There is no dual write, and nothing but the sequencer, and recovery's replay of the log, applies hot. The consumer RPC promise registry through which a hot consumer and the resolver used to fulfil writes is removed: the sequencer has the reply when it unlocks, and waits only on the queue's durable future.
 
@@ -131,7 +131,7 @@ Client ──▶ RESP Frontend ──▶ Sequencer
 
 - **Hot** wipes each shard under its lock: entries, stubs and load placeholders. The shard's flush floor is set to the Flush's seq, so until cold's drained seq passes it, a hot miss on that shard is absent with no cold read ([ADP-002](002-hot-store.md) §Residency). Readers see the whole wipe or none of it.
 - **Cold** reads its shard's Flush like any entry, drops its compaction buffer (pre-Flush writes never reach cold), and wipes **its own shard's slice** of the cold store, once the Flush is power-durable ([ADP-004](004-cold-consumer.md)).
-- FLUSHDB never waits for memory backpressure. If it cannot be admitted or find a spare segment within `engine.write_timeout_ms`, it is rejected and wipes nothing.
+- FLUSHDB never waits for memory backpressure. If it cannot be admitted or find a spare segment within `engine.command_timeout_ms`, it is rejected and wipes nothing.
 
 The client sees `+OK` once every shard's Flush frame has reached the acknowledgement class. Nothing waits for a consumer: the flush floor answers reads until cold's wipe lands. A durable wait that times out replies with an error; the Flushes are applied to hot and logged, and a retry is idempotent at the wipe level.
 

@@ -207,16 +207,19 @@ bool Server::Initialize() {
   sequencer_ =
       std::make_unique<engine::Sequencer>(*hot_store_, *queue_, *loader_, *cold_pool_,
                                           engine::SequencerConfig{
-                                              .write_timeout = config_.engine.write_timeout,
+                                              .command_timeout = config_.engine.command_timeout,
                                           });
+  io_pool_ = std::make_unique<engine::IoPool>(engine::IoPoolConfig{
+      .threads = engine::ColdIoThreads(config_.engine.cold_io_threads,
+                                       std::thread::hardware_concurrency()),
+  });
   read_path_ =
-      std::make_unique<engine::ReadPath>(*hot_store_, *loader_, *sequencer_,
+      std::make_unique<engine::ReadPath>(*hot_store_, *loader_, *io_pool_,
                                          engine::ReadPathConfig{
-                                             .write_timeout = config_.engine.write_timeout,
                                              .fill_doorkeeper = config_.hot.fill_doorkeeper,
                                              .fill_max_members = config_.hot.fill_max_members,
                                          });
-  engine_ = std::make_unique<engine::TieringEngine>(*read_path_, *sequencer_);
+  engine_ = std::make_unique<engine::TieringEngine>(*read_path_, *sequencer_, *io_pool_);
 
   hot_eviction_worker_ = std::make_unique<hot::EvictionWorker>(
       *hot_store_, hot::EvictionWorker::Config{.tick = config_.hot.eviction_tick});
@@ -542,6 +545,9 @@ void Server::Shutdown() {
   if (tcp_server_) {
     tcp_server_->Stop();
   }
+  // No command is left to post to: queued fills fail unrun, and running
+  // jobs finish before what they read from stops.
+  if (io_pool_) io_pool_->Shutdown();
 
   // Stop the eviction worker before the cold pool: its tombstone-GC tick reads
   // the cold consumers' drained seq, so it must not run once the pool stops.

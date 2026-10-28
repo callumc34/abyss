@@ -9,27 +9,25 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "abyss/core/cold_store.h"
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/engine/decide.h"
 #include "abyss/engine/doorkeeper.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
-#include "abyss/engine/sequencer.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
 
 namespace abyss::engine {
 
 struct ReadPathConfig {
-  // Bounds the wait for the writes a hot answer saw to become durable.
-  std::chrono::milliseconds write_timeout{5000};
-  // ADP-003's cold point-read SLA: a miss's point reads and probes.
-  std::chrono::milliseconds cold_read_deadline{5};
-  // A miss that loads a whole key: a cardinality or a scan.
-  std::chrono::milliseconds cold_scan_deadline{50};
   // Fill hot only on a key's second miss within the doorkeeper's
   // window; off, every miss fills.
   bool fill_doorkeeper = true;
@@ -40,19 +38,48 @@ struct ReadPathConfig {
   core::WallClockFn wall_clock = core::DefaultWallClock;
 };
 
-// Every read. A hot hit answers once what it saw is durable (the
-// fence). A miss needs no wait: residency puts a non-resident key's
-// whole state in buffer plus cold. The flush floor is checked first,
-// under hot's lock, and makes a miss absent.
+// A read's reply, and what it showed that may not yet be durable at
+// the ack class: the reply waits for that seq (the fence).
+struct ReadAnswer {
+  core::Result<core::RespValue> reply;
+  std::optional<ShardSeq> fence;
+};
+
+// MGET or EXISTS over its keys, per key and in order, and not atomic
+// (#170). Hot answers on the caller's thread until a miss; the rest,
+// that key on, is one job on the I/O pool.
+struct FanOut {
+  core::MultiKeyKind kind = core::MultiKeyKind::kMget;
+  std::span<const std::string> keys;
+  // The next key to read.
+  size_t next = 0;
+  std::vector<core::RespValue> values;
+  int64_t count = 0;
+  std::vector<ShardSeq> fences;
+  std::optional<core::Error> error;
+
+  void Reset(core::MultiKeyKind fan_kind, std::span<const std::string> fan_keys);
+  bool done() const { return error.has_value() || next == keys.size(); }
+  core::Result<core::RespValue> Reply();
+};
+
+// Every read, split where it would block. Hot answers on the caller's
+// thread (TryHot), and a hit waits only for its fence, which the
+// caller registers. A miss is answered on the I/O pool (Miss) and
+// needs no wait: residency puts a non-resident key's whole state in
+// buffer plus cold. The flush floor is checked first, under hot's
+// lock, and makes a miss absent.
 //
 // Cache fill on a miss, under the doorkeeper and never past hot's
 // backpressure limit:
-// - GET loads the string (one point read) and fills;
+// - GET loads the string (one point read) and fills: the fill is the
+//   answer;
 // - SISMEMBER, ZSCORE, HGET, HEXISTS and HMGET read their members
-//   only, and fill a collection under fill_max_members;
+//   only, and fill a collection under fill_max_members afterwards, on
+//   the pool's background queue;
 // - SCARD, ZCARD and HLEN count from cold's meta and the delta, and
 //   fill likewise;
-// - the scans load the key, filling hot;
+// - the scans load the key, filling hot: the fill is the answer;
 // - EXISTS, TYPE, TTL and PTTL answer from a stub or a cold probe,
 //   and fill nothing.
 // Hot refuses a fill over fill_max_fraction of a shard's budget. Loads
@@ -60,38 +87,53 @@ struct ReadPathConfig {
 // A key of another type answers WRONGTYPE without reading members.
 class ReadPath {
  public:
-  ReadPath(hot::ShardedHotStore& hot, Loader& loader, Sequencer& sequencer, ReadPathConfig config);
+  ReadPath(hot::ShardedHotStore& hot, Loader& loader, IoPool& pool, ReadPathConfig config);
 
-  core::Result<core::RespValue> Read(const core::ops::ReadOp& op);
-  // Per key and not atomic (#170), each through Read.
-  core::Result<core::RespValue> Mget(std::span<const std::string> keys);
-  core::Result<core::RespValue> Exists(std::span<const std::string> keys);
+  // Hot's answer, on the caller's thread; nullopt on a miss.
+  std::optional<ReadAnswer> TryHot(const core::ops::ReadOp& op);
+  // A miss's answer from buffer and cold, on the pool, by `deadline`,
+  // the command's. A background fill inherits it.
+  ReadAnswer Miss(const core::ops::ReadOp& op, core::SteadyTime deadline);
+  // Hot's answers from `fan.next` on, stopping at the first miss.
+  void FanOutHot(FanOut& fan);
+  // Every key left, on the pool: hot, then buffer and cold on a miss.
+  void FanOutMiss(FanOut& fan, core::SteadyTime deadline);
+  // A miss that will not be read: its error, counted as a read's.
+  core::Result<core::RespValue> Failed(const core::ops::ReadOp& op, const core::Error& error);
+  // Its miss's kind on the pool: a scan loads the whole key.
+  static metrics::IoKind KindOf(const core::ops::ReadOp& op);
 
  private:
-  // Hot's answer, fenced; nullopt on a miss. After a fill, `filled_from`
-  // is where the fill read it, and is counted instead of a hot hit.
-  std::optional<core::Result<core::RespValue>> FromHot(
-      const core::ops::ReadOp& op, std::optional<Loader::Source> filled_from = std::nullopt);
-  core::Result<core::RespValue> Miss(const core::ops::ReadOp& op);
+  class FillJob;
+
+  // Hot's answer; nullopt on a miss. After a fill, `filled_from` is
+  // where the fill read it, and is counted instead of a hot hit.
+  std::optional<ReadAnswer> FromHot(const core::ops::ReadOp& op,
+                                    std::optional<Loader::Source> filled_from = std::nullopt);
   // Loads `key` as `type`, filling hot when admitted.
-  core::Result<core::RespValue> Fill(const core::ops::ReadOp& op, core::KeyType type,
-                                     std::chrono::milliseconds budget);
-  core::Result<core::RespValue> PointRead(const core::ops::ReadOp& op, core::KeyType type);
+  ReadAnswer Fill(const core::ops::ReadOp& op, core::KeyType type, core::SteadyTime deadline);
+  core::Result<core::RespValue> PointRead(const core::ops::ReadOp& op, core::KeyType type,
+                                          core::SteadyTime deadline);
   // SCARD, ZCARD or HLEN: exact, reading no member but the delta's.
-  core::Result<core::RespValue> CountRead(const core::ops::ReadOp& op, core::KeyType type);
-  // Fills a collection under fill_max_members, when admitted.
-  void FillSmall(std::string_view key, core::KeyType type, uint64_t members);
+  core::Result<core::RespValue> CountRead(const core::ops::ReadOp& op, core::KeyType type,
+                                          core::SteadyTime deadline);
+  // Queues a collection's fill under fill_max_members, when admitted.
+  void FillSmall(std::string_view key, core::KeyType type, uint64_t members,
+                 core::SteadyTime deadline);
+  // One fan-out key's answer, folded in; false once it is an error.
+  bool Fold(FanOut& fan, ReadAnswer answer);
   core::Result<core::RespValue> Answer(const core::ops::ReadOp& op, const hot::LoadResult& loaded,
                                        Loader::Source source);
-  core::Result<core::RespValue> Failed(const core::ops::ReadOp& op, const core::Error& error);
   void CountHit(Loader::Source source);
   void CountFill(const core::Result<Loader::Filled>& filled);
+  void CountFill(metrics::FillOutcome outcome);
   bool Admit(std::string_view key);
-  core::SteadyTime After(std::chrono::milliseconds budget) const;
+  std::optional<ShardSeq> FenceOf(const core::ops::ReadOp& op,
+                                  std::optional<core::SequenceId> seq) const;
 
   hot::ShardedHotStore& hot_;
   Loader& loader_;
-  Sequencer& sequencer_;
+  IoPool& pool_;
   ReadPathConfig config_;
   std::unique_ptr<Doorkeeper> doorkeeper_;
 
@@ -101,7 +143,7 @@ class ReadPath {
   metrics::CounterHandle misses_;
   metrics::CounterHandle cold_scan_deadline_exceeded_;
   // By metrics::FillOutcome.
-  std::array<metrics::CounterHandle, 6> fills_;
+  std::array<metrics::CounterHandle, 8> fills_;
 };
 
 }  // namespace abyss::engine

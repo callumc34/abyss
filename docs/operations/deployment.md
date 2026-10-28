@@ -168,7 +168,8 @@ cold_consumer:
   drain_grace_seconds: 15               # per-shard graceful drain budget on SIGTERM
 
 engine:
-  write_timeout_ms: 5000              # a write's whole budget, durable wait included
+  command_timeout_ms: 5000            # a command's whole budget: a write's waits, a read's cold read
+  cold_io_threads: 0                  # cold read threads; 0 = min(4, max(2, CPUs)), else 2..64
 
 recovery:
   replay_parallelism: 4               # workers the one recovery scan replays shards on

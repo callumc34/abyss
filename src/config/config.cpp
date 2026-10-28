@@ -138,7 +138,10 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kRemovedS
 
 core::Result<void> ParseEngine(const YamlCursor& cur, EngineConfig& out) {
   return SectionDecoder(cur)
-      .Optional("write_timeout_ms", out.write_timeout)
+      .Optional("command_timeout_ms", out.command_timeout)
+      .Optional("cold_io_threads", out.cold_io_threads)
+      .Removed("write_timeout_ms",
+               "renamed to engine.command_timeout_ms, which bounds reads as well as writes")
       .Removed("min_rpc_wait_fraction",
                "removed; a write replies once durable, with no consumer apply to wait for")
       .Removed("buffer_consistency_wait_timeout_ms",

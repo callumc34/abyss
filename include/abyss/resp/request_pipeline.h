@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -38,13 +39,14 @@ struct PipelineDependencies {
 };
 
 // One pipeline per connection; not thread-safe. Injected providers must be.
+// It runs one command at a time to its reply, on the calling thread.
 class RequestPipeline {
  public:
   using Dependencies = PipelineDependencies;
 
   RequestPipeline(const CommandRegistry& registry, ConnectionState state,
                   PipelineDependencies deps = {});
-  ~RequestPipeline() = default;
+  ~RequestPipeline();
 
   RequestPipeline(const RequestPipeline&) = delete;
   RequestPipeline& operator=(const RequestPipeline&) = delete;
@@ -61,7 +63,7 @@ class RequestPipeline {
 
   ProcessResult Process(std::span<const uint8_t> input, std::vector<uint8_t>& output);
 
-  core::RespValue Dispatch(const core::RespCommand& cmd);
+  core::RespValue Dispatch(core::RespCommand cmd);
 
   const ConnectionState& state() const { return state_; }
 
@@ -72,8 +74,16 @@ class RequestPipeline {
     std::string_view cmd_name;
   };
 
-  DispatchOutcome DispatchImpl(const core::RespCommand& cmd);
-  DispatchOutcome DispatchResolved(const ResolvedCommand& resolved, const core::RespCommand& cmd);
+  // The engine's events for this pipeline's command in flight.
+  class Inbox;
+
+  DispatchOutcome DispatchImpl(core::RespCommand cmd);
+  DispatchOutcome DispatchResolved(const ResolvedCommand& resolved, core::RespCommand cmd);
+  // The engine's reply to `request`: the dispatcher's outcome, then its
+  // events on this thread until it replies or its deadline passes, and
+  // on until nothing of it is outstanding.
+  core::Result<core::RespValue> RunToReply(core::Request request);
+  bool Quiescent() const;
   DispatchOutcome HandleAdminStateless(const ResolvedCommand& resolved,
                                        const core::RespCommand& cmd);
 
@@ -99,6 +109,12 @@ class RequestPipeline {
   ConnectionState state_;
   // Set by QUIT (via Dispatch) and surfaced through ProcessResult.
   ProcessCloseReason close_reason_ = ProcessCloseReason::kNone;
+
+  // Declared in the order they must outlive one another.
+  std::unique_ptr<Inbox> inbox_;
+  core::Slot slot_;
+  std::unique_ptr<core::Task> task_;
+  uint64_t slot_seq_ = 0;
 };
 
 }  // namespace abyss::resp

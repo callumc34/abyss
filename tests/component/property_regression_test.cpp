@@ -115,7 +115,7 @@ TEST_F(PropertyRegressionTest, MemoryPressureEvictsParkedKeysColdHasDrained) {
   Options options;
   options.shards = 1;
   options.hot_memory_bytes = 4096;
-  options.write_timeout = std::chrono::milliseconds(300);
+  options.command_timeout = std::chrono::milliseconds(300);
   OpenWithClock(options);
   const std::string big(2000, 'x');
   ASSERT_EQ(Write({"SET", "k1", big}), "OK");
@@ -143,7 +143,7 @@ TEST_F(PropertyRegressionTest, MemoryPressureFreesNegativesAndDrainedTombstones)
   // never shrink and differ by standard library.
   options.hot_memory_bytes = 4096 + testing::EmptyStoreBytes(256);
   options.fill_doorkeeper = false;
-  options.write_timeout = std::chrono::milliseconds(300);
+  options.command_timeout = std::chrono::milliseconds(300);
   OpenWithClock(options);
   for (int i = 0; i < 80; ++i) ASSERT_EQ(Read({"GET", "absent" + std::to_string(i)}), "nil");
   for (int i = 0; i < 20; ++i) ASSERT_EQ(Write({"SET", "d" + std::to_string(i), "v"}), "OK");
@@ -164,7 +164,7 @@ TEST_F(PropertyRegressionTest, AWriteNeedingAnEntryOverItsShardsLimitIsNotRefuse
   options.hot_memory_bytes = 8192;
   // An evicted key leaves no stub, so a TTL read loads the value.
   options.stub_memory_fraction = 0;
-  options.write_timeout = std::chrono::milliseconds(300);
+  options.command_timeout = std::chrono::milliseconds(300);
   OpenWithClock(options);
   const std::string big(6000, 'x');
   const std::string kept = KeyOn(1, 0, "k");

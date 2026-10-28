@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -50,29 +53,31 @@ class StubDispatcher : public core::CommandDispatcher {
  public:
   int flush_calls = 0;
   int write_calls = 0;
-  core::FlushTarget last_target = core::FlushTarget::kThisDb;
+  std::string last_flush;
   core::RespCommand last_write;
   core::PredicateFlags last_flags = core::PredicateFlags::kNone;
 
-  core::Result<core::RespValue> DispatchRead(std::string_view /*name*/,
-                                             const core::RespCommand& /*cmd*/) override {
-    return core::RespValue::Null();
-  }
-  core::Result<core::RespValue> DispatchWrite(std::string_view /*name*/, core::RespCommand cmd,
-                                              core::PredicateFlags flags) override {
-    ++write_calls;
-    last_write = std::move(cmd);
-    last_flags = flags;
-    return core::RespValue::SimpleString("OK");
-  }
-  core::Result<core::RespValue> DispatchFanOut(core::MultiKeyKind /*kind*/,
-                                               core::RespCommand /*cmd*/) override {
-    return core::RespValue::SimpleString("OK");
-  }
-  core::Result<core::RespValue> DispatchFlush(core::FlushTarget target) override {
-    ++flush_calls;
-    last_target = target;
-    return core::RespValue::SimpleString("OK");
+  int dispatches = 0;
+
+  core::Outcome Dispatch(core::Request request, core::Slot& /*slot*/,
+                         std::unique_ptr<core::Task>& /*task*/) override {
+    ++dispatches;
+    switch (request.kind) {
+      case core::Request::Kind::kRead:
+        return {.reply = core::RespValue::Null()};
+      case core::Request::Kind::kWrite:
+        ++write_calls;
+        last_write = std::move(request.cmd);
+        last_flags = request.flags;
+        return {.reply = core::RespValue::SimpleString("OK")};
+      case core::Request::Kind::kFanOut:
+        return {.reply = core::RespValue::SimpleString("OK")};
+      case core::Request::Kind::kFlush:
+        ++flush_calls;
+        last_flush = std::string(request.name);
+        return {.reply = core::RespValue::SimpleString("OK")};
+    }
+    return {.reply = core::RespValue::Null()};
   }
 };
 
@@ -170,6 +175,80 @@ TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
   EXPECT_NE(response.AsString().find("unknown command 'LPUSH'"), std::string::npos);
 }
 
+// Its first command replies at once; its second pends, and before that
+// command's own kResume it posts one naming the first command's slot.
+class StaleEventDispatcher : public core::CommandDispatcher {
+ public:
+  class Task final : public core::Task {
+   public:
+    core::Outcome Run(core::Slot& /*slot*/, core::Result<void> wake) override {
+      ++runs;
+      if (!wake.has_value()) return {.reply = core::RespValue::BulkString("stale")};
+      return {.reply = core::RespValue::BulkString("resumed")};
+    }
+    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/) override {
+      return std::unexpected(core::Error{core::ErrorCode::kTimeout, "abandoned"});
+    }
+    bool Quiescent() const override { return true; }
+
+    // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+    int runs = 0;
+  };
+
+  core::Outcome Dispatch(core::Request /*request*/, core::Slot& slot,
+                         std::unique_ptr<core::Task>& task) override {
+    slot.deadline = core::SteadyClock::now() + std::chrono::seconds{10};
+    if (++calls == 1) {
+      first = slot.completion;
+      return {.reply = core::RespValue::BulkString("first")};
+    }
+    if (task == nullptr) task = std::make_unique<Task>();
+    const std::array<core::CompletionEvent, 2> events{{
+        {.client_id = first.client_id,
+         .slot_seq = first.slot_seq,
+         .kind = core::CompletionKind::kResume,
+         .result = std::unexpected(core::Error{core::ErrorCode::kInternal, "stale"})},
+        {.client_id = slot.completion.client_id,
+         .slot_seq = slot.completion.slot_seq,
+         .kind = core::CompletionKind::kResume,
+         .result = {}},
+    }};
+    slot.completion.sink->Post(events);
+    return {.kind = core::Outcome::Kind::kPending};
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  int calls = 0;
+  core::Completion first;
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+};
+
+// Events route by client and slot seq: one naming an earlier command's
+// slot never runs the current command's task.
+TEST(RequestPipelineTest, AStaleEventForAReusedSlotIsDropped) {
+  StaleEventDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 7, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$1\r\na\r\n"), output);
+  EXPECT_EQ(ToStr(output), "$5\r\nfirst\r\n");
+  output.clear();
+  pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$1\r\nb\r\n"), output);
+  EXPECT_EQ(ToStr(output), "$7\r\nresumed\r\n");
+  EXPECT_EQ(dispatcher.first.client_id, 7U);
+}
+
+TEST(RequestPipelineTest, StatelessAndAdminCommandsNeverDispatch) {
+  StubDispatcher dispatcher;
+  FakeStats stats(StandardStats());
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher, .stats = &stats});
+  std::vector<uint8_t> output;
+  pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n*1\r\n$6\r\nDBSIZE\r\n"), output);
+  EXPECT_EQ(ToStr(output), "+PONG\r\n:10\r\n");
+  EXPECT_EQ(dispatcher.dispatches, 0);
+}
+
 TEST(RequestPipelineTest, FlushdbRoutesThroughDispatcher) {
   StubDispatcher dispatcher;
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
@@ -178,7 +257,7 @@ TEST(RequestPipelineTest, FlushdbRoutesThroughDispatcher) {
   pipeline.Process(Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
   EXPECT_EQ(dispatcher.flush_calls, 1);
-  EXPECT_EQ(dispatcher.last_target, core::FlushTarget::kThisDb);
+  EXPECT_EQ(dispatcher.last_flush, "FLUSHDB");
 }
 
 TEST(RequestPipelineTest, FlushallRoutesThroughDispatcher) {
@@ -189,7 +268,7 @@ TEST(RequestPipelineTest, FlushallRoutesThroughDispatcher) {
   pipeline.Process(Bytes("*1\r\n$8\r\nFLUSHALL\r\n"), output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
   EXPECT_EQ(dispatcher.flush_calls, 1);
-  EXPECT_EQ(dispatcher.last_target, core::FlushTarget::kAllDbs);
+  EXPECT_EQ(dispatcher.last_flush, "FLUSHALL");
 }
 
 TEST(RequestPipelineTest, FlushdbAsyncAndSyncModifiersAccepted) {

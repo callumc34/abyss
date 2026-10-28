@@ -22,6 +22,8 @@ enum class LabelKey : uint8_t {
   kOutcome,
   kPass,
   kPhase,
+  kQueue,
+  kKind,
 };
 
 constexpr std::string_view ToStringView(LabelKey k) noexcept {
@@ -48,6 +50,10 @@ constexpr std::string_view ToStringView(LabelKey k) noexcept {
       return "pass";
     case LabelKey::kPhase:
       return "phase";
+    case LabelKey::kQueue:
+      return "queue";
+    case LabelKey::kKind:
+      return "kind";
   }
   return {};
 }
@@ -214,6 +220,10 @@ enum class FillOutcome : uint8_t {
   kSkippedSize,
   kSkippedEvictCap,
   kFailed,
+  // The background queue was full, or the pool shut down.
+  kDropped,
+  // Dequeued past the deadline of the command that admitted it.
+  kExpired,
 };
 
 constexpr std::string_view ToStringView(FillOutcome o) noexcept {
@@ -230,6 +240,10 @@ constexpr std::string_view ToStringView(FillOutcome o) noexcept {
       return "skipped_evict_cap";
     case FillOutcome::kFailed:
       return "failed";
+    case FillOutcome::kDropped:
+      return "dropped";
+    case FillOutcome::kExpired:
+      return "expired";
   }
   return {};
 }
@@ -249,6 +263,38 @@ constexpr std::string_view ToStringView(MaintenancePass p) noexcept {
       return "deadline";
     case MaintenancePass::kMemory:
       return "memory";
+  }
+  return {};
+}
+
+// The cold I/O pool's queues.
+enum class IoQueue : uint8_t { kForeground, kBackground };
+
+constexpr std::string_view ToStringView(IoQueue q) noexcept {
+  switch (q) {
+    case IoQueue::kForeground:
+      return "foreground";
+    case IoQueue::kBackground:
+      return "background";
+  }
+  return {};
+}
+
+// What a cold I/O job reads: a point read or probe, a whole key for a
+// read, a write's own loads, or a cache fill.
+enum class IoKind : uint8_t { kPoint, kScan, kLoad, kFill };
+inline constexpr size_t kIoKindCount = 4;
+
+constexpr std::string_view ToStringView(IoKind k) noexcept {
+  switch (k) {
+    case IoKind::kPoint:
+      return "point";
+    case IoKind::kScan:
+      return "scan";
+    case IoKind::kLoad:
+      return "load";
+    case IoKind::kFill:
+      return "fill";
   }
   return {};
 }
@@ -368,6 +414,14 @@ template <>
 struct LabelKeyOf<TtlSubject> {
   static constexpr LabelKey value = LabelKey::kSubject;
 };
+template <>
+struct LabelKeyOf<IoQueue> {
+  static constexpr LabelKey value = LabelKey::kQueue;
+};
+template <>
+struct LabelKeyOf<IoKind> {
+  static constexpr LabelKey value = LabelKey::kKind;
+};
 
 // Produces the string value written into a Prometheus series for a typed
 // label value. Registration-time only; never called on the hot path.
@@ -386,6 +440,8 @@ inline std::string ToLabelString(ShardLabel s) { return std::to_string(s.id); }
 inline std::string ToLabelString(RequestStatus s) { return std::string(ToStringView(s)); }
 inline std::string ToLabelString(ProtoLabel p) { return std::to_string(p.version); }
 inline std::string ToLabelString(TtlSubject s) { return std::string(ToStringView(s)); }
+inline std::string ToLabelString(IoQueue q) { return std::string(ToStringView(q)); }
+inline std::string ToLabelString(IoKind k) { return std::string(ToStringView(k)); }
 
 template <class... Ts>
 struct CounterDesc {
@@ -598,6 +654,23 @@ inline constexpr GaugeDesc<> kHotStubEntries{
 inline constexpr CounterDesc<FillOutcome> kHotFillsTotal{
     .name = "abyss_hot_fills_total",
     .help = "Cache fills on read misses, by what became of each.",
+};
+
+inline constexpr GaugeDesc<IoQueue> kEngineIoQueueDepth{
+    .name = "abyss_engine_io_queue_depth",
+    .help = "Cold I/O jobs queued for the pool, by queue.",
+};
+
+inline constexpr HistogramDesc<> kEngineIoWaitSeconds{
+    .name = "abyss_engine_io_wait_seconds",
+    .help = "Time a cold I/O job spent queued, from enqueue to its start or expiry.",
+    .buckets = buckets::kLatencySeconds,
+};
+
+inline constexpr HistogramDesc<IoKind> kEngineIoRunSeconds{
+    .name = "abyss_engine_io_run_seconds",
+    .help = "Time a cold I/O job ran on the pool, by kind.",
+    .buckets = buckets::kLatencySeconds,
 };
 
 inline constexpr GaugeDesc<> kHotNegativeEntries{
@@ -838,15 +911,11 @@ inline constexpr CounterDesc<> kHotLoadDiscardsTotal{
     .help = "Key loads discarded because a write or flush superseded them.",
 };
 
-// A cold collection scan (SMEMBERS/ZRANGE/HGETALL/HKEYS/HVALS) exceeded the
-// configured cold_scan_deadline and was failed closed with a deadline error
-// rather than returning a silently truncated result. A rising rate means a
-// legitimately large collection is being capped — operators tune
-// cold_scan_deadline. See docs/operations/failure-modes.md (decision 4 /
-// invariant 5).
+// A whole-key read from cold failed closed at the command deadline
+// rather than return a truncated answer.
 inline constexpr CounterDesc<> kColdScanDeadlineExceededTotal{
     .name = "abyss_cold_scan_deadline_exceeded_total",
-    .help = "Cold collection scans aborted because they exceeded the cold-scan deadline.",
+    .help = "Cold collection scans aborted because they exceeded the command deadline.",
 };
 
 inline constexpr GaugeDesc<> kNetConnectionsActive{

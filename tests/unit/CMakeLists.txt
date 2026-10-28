@@ -256,6 +256,9 @@ add_executable(abyss_engine_tests
   engine/loader_test.cpp
   engine/sequencer_attempt_test.cpp
   engine/sequencer_test.cpp
+  engine/io_pool_test.cpp
+  engine/dispatch_test.cpp
+  engine/durable_wait_test.cpp
 )
 
 target_link_libraries(abyss_engine_tests PRIVATE

@@ -16,6 +16,7 @@
 
 #include "abyss/core/completion.h"
 #include "abyss/core/durability.h"
+#include "abyss/core/durable_wait.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/pending_write.h"
 #include "abyss/metrics/names.h"
@@ -43,6 +44,19 @@ class SequencerWaitTest : public SequencedEngineTest {
     if (!step.reply.has_value()) return "error: " + step.reply.error().message();
     return Describe(*step.reply);
   }
+  // Slot `slot`'s durable wait, as a connection's slot holds it.
+  core::DurableWait& Durable(uint64_t slot) {
+    while (durable_.size() <= slot) durable_.push_back(std::make_unique<core::DurableWait>());
+    return *durable_[slot];
+  }
+  // An attempt's step, a linearised write's durable wait handed to its
+  // slot: replied if durable already.
+  Step Settle(PendingWrite& write, uint64_t slot, Step step) {
+    if (step.kind != Step::Kind::kSequenced) return step;
+    auto now = sequencer_->Sequence(write, Durable(slot), write.completion());
+    if (!now.has_value()) return step;
+    return Step{.kind = Step::Kind::kReplied, .reply = *std::move(now)};
+  }
   // Attempts each write's next step as its posts come, until every one
   // has replied; their replies by slot.
   std::vector<std::string> Pump(std::vector<std::unique_ptr<PendingWrite>>& writes,
@@ -59,9 +73,18 @@ class SequencerWaitTest : public SequencedEngineTest {
     while (open > 0) {
       if (!sink_.WaitFor(seen_ + 1)) break;
       const core::CompletionEvent event = sink_.Events().at(seen_++);
+      if (event.kind == core::CompletionKind::kDurable) {
+        auto reply = Durable(event.slot_seq).Arrived(event.result);
+        if (reply.has_value()) {
+          replies.at(event.slot_seq) =
+              Replied(Step{.kind = Step::Kind::kReplied, .reply = *std::move(reply)});
+          --open;
+        }
+        continue;
+      }
       PendingWrite& write = *writes.at(event.slot_seq);
       write.Woken(event.result);
-      const Step step = sequencer_->Attempt(write);
+      const Step step = Settle(write, event.slot_seq, sequencer_->Attempt(write));
       if (step.kind == Step::Kind::kReplied) {
         replies.at(event.slot_seq) = Replied(step);
         --open;
@@ -69,14 +92,17 @@ class SequencerWaitTest : public SequencedEngineTest {
     }
     return replies;
   }
-  // Ends a wait at its deadline: expired, or its wake taken.
+  // Abandons a wait at its deadline. A wake its notifier had already
+  // taken still comes, and only cleans up.
   Step Expired(PendingWrite& write) {
     std::this_thread::sleep_until(write.deadline() + 5ms);
-    if (!sequencer_->Expire(write)) {
-      if (!sink_.WaitFor(seen_ + 1)) return Step{.kind = Step::Kind::kWait};
+    core::Result<core::RespValue> reply = sequencer_->Abandon(write);
+    if (!write.Quiescent() && sink_.WaitFor(seen_ + 1)) {
       write.Woken(sink_.Events().at(seen_++).result);
+      (void)sequencer_->Attempt(write);
     }
-    return sequencer_->Attempt(write);
+    EXPECT_TRUE(write.Quiescent());
+    return Step{.kind = Step::Kind::kReplied, .reply = std::move(reply)};
   }
   uint64_t Redecides(metrics::RedecideReason reason) const {
     return sequencer_->Snapshot().redecides.at(static_cast<size_t>(reason));
@@ -85,6 +111,7 @@ class SequencerWaitTest : public SequencedEngineTest {
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::RecordingSink sink_;
   size_t seen_ = 0;
+  std::vector<std::unique_ptr<core::DurableWait>> durable_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
@@ -100,8 +127,7 @@ std::pair<int, std::unique_ptr<PendingWrite>> FillWindow(
       EXPECT_EQ(step.reason, WaitReason::kAdmission);
       return {i, std::move(write)};
     }
-    EXPECT_EQ(step.kind, Step::Kind::kReplied);
-    EXPECT_TRUE(step.reply.has_value());
+    EXPECT_EQ(step.kind, Step::Kind::kSequenced);
   }
   ADD_FAILURE() << "the window never filled";
   return {0, nullptr};
@@ -161,8 +187,7 @@ std::pair<int, std::unique_ptr<PendingWrite>> UseUpSpares(
       EXPECT_EQ(step.reason, WaitReason::kSpare);
       return {i, std::move(write)};
     }
-    EXPECT_EQ(step.kind, Step::Kind::kReplied);
-    EXPECT_TRUE(step.reply.has_value());
+    EXPECT_EQ(step.kind, Step::Kind::kSequenced);
   }
   ADD_FAILURE() << "the spares never ran out";
   return {0, nullptr};
@@ -219,7 +244,8 @@ class SequencerBackpressureWaitTest : public SequencerWaitTest {
   int FillUntilAWait(std::chrono::milliseconds timeout) {
     for (int i = 0; i < 64; ++i) {
       writes_.push_back(Pending({"SET", KeyOn(0, i), value_}, timeout, writes_.size()));
-      steps_.push_back(sequencer_->Attempt(*writes_.back()));
+      steps_.push_back(
+          Settle(*writes_.back(), writes_.size() - 1, sequencer_->Attempt(*writes_.back())));
       if (steps_.back().kind == Step::Kind::kWait) {
         EXPECT_EQ(steps_.back().reason, WaitReason::kBackpressure);
         return i;

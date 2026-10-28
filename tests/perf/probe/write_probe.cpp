@@ -32,6 +32,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/shard_router.h"
+#include "abyss/engine/io_pool.h"
 #include "abyss/engine/loader.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
@@ -45,6 +46,7 @@
 #include "common.h"
 #include "histogram.h"
 #include "metrics_scraper.h"
+#include "sync_dispatch.h"
 #include "temp_dir.h"
 #include "workload.h"
 #include "workload_shape.h"
@@ -216,6 +218,7 @@ struct WritePath {
   std::unique_ptr<abyss::consumer::ColdConsumerPool> cold_pool;
   std::unique_ptr<abyss::engine::Loader> loader;
   std::unique_ptr<abyss::engine::Sequencer> sequencer;
+  std::unique_ptr<abyss::engine::IoPool> io_pool;
   std::unique_ptr<abyss::engine::ReadPath> reads;
   std::unique_ptr<abyss::engine::TieringEngine> engine;
   std::unique_ptr<abyss::hot::EvictionWorker> hot_eviction_worker;
@@ -312,16 +315,20 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
   wp->sequencer = std::make_unique<abyss::engine::Sequencer>(
       *wp->hot_store, *wp->queue, *wp->loader, *wp->cold_pool,
       abyss::engine::SequencerConfig{
-          .write_timeout = config.engine.write_timeout,
+          .command_timeout = config.engine.command_timeout,
       });
+  wp->io_pool = std::make_unique<abyss::engine::IoPool>(abyss::engine::IoPoolConfig{
+      .threads = abyss::engine::ColdIoThreads(config.engine.cold_io_threads,
+                                              std::thread::hardware_concurrency()),
+  });
   wp->reads =
-      std::make_unique<abyss::engine::ReadPath>(*wp->hot_store, *wp->loader, *wp->sequencer,
+      std::make_unique<abyss::engine::ReadPath>(*wp->hot_store, *wp->loader, *wp->io_pool,
                                                 abyss::engine::ReadPathConfig{
-                                                    .write_timeout = config.engine.write_timeout,
                                                     .fill_doorkeeper = config.hot.fill_doorkeeper,
                                                     .fill_max_members = config.hot.fill_max_members,
                                                 });
-  wp->engine = std::make_unique<abyss::engine::TieringEngine>(*wp->reads, *wp->sequencer);
+  wp->engine =
+      std::make_unique<abyss::engine::TieringEngine>(*wp->reads, *wp->sequencer, *wp->io_pool);
 
   wp->hot_eviction_worker = std::make_unique<abyss::hot::EvictionWorker>(
       *wp->hot_store, abyss::hot::EvictionWorker::Config{.tick = config.hot.eviction_tick});
@@ -340,6 +347,7 @@ void StartWritePath(WritePath& wp) {
 
 // Server::Shutdown's order.
 void StopWritePath(WritePath& wp, std::chrono::seconds drain_grace) {
+  wp.io_pool->Shutdown();
   wp.hot_eviction_worker->Stop();
   wp.cold_pool->Stop(std::chrono::duration_cast<std::chrono::milliseconds>(drain_grace));
   if (auto rc = wp.cold_store->Stop(); !rc.has_value()) {
@@ -347,15 +355,18 @@ void StopWritePath(WritePath& wp, std::chrono::seconds drain_grace) {
   }
 }
 
-bool Write(WritePath& wp, abyss::core::RespCommand cmd) {
+// A worker's commands, as one connection's, each run to its reply.
+using Connection = abyss::testing::SyncConnection;
+
+bool Write(Connection& connection, abyss::core::RespCommand cmd) {
   if (!Validate(cmd).has_value()) return false;
-  const std::string name = cmd.args.front();
-  auto reply = wp.engine->DispatchWrite(name, std::move(cmd), abyss::core::PredicateFlags::kNone);
+  auto reply = connection.Write(std::move(cmd));
   return reply.has_value() && !reply->IsError();
 }
 
-bool Read(WritePath& wp, const abyss::core::RespCommand& cmd) {
-  auto reply = wp.engine->DispatchRead(cmd.args.front(), cmd);
+bool Read(Connection& connection, abyss::core::RespCommand cmd) {
+  const std::string name = cmd.args.front();
+  auto reply = connection.Read(name, std::move(cmd));
   return reply.has_value() && !reply->IsError();
 }
 
@@ -367,10 +378,11 @@ Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
                      const abyss::perf::probe::WorkloadShape& shape, bool trace,
                      const std::string& value, uint64_t seed) {
   const uint32_t shards = wp.hot_store->shard_count();
+  Connection connection(*wp.engine);
   std::mt19937_64 rng{seed};
   for (uint64_t i = 0; trace && i < entries; ++i) {
     for (auto& cmd : shape.Create(i % key_count, rng)) {
-      if (!Write(wp, std::move(cmd))) {
+      if (!Write(connection, std::move(cmd))) {
         return std::unexpected(Error(ErrorCode::kInternal, "a prefill write failed"));
       }
     }
@@ -380,7 +392,7 @@ Result<void> Prefill(WritePath& wp, uint64_t entries, uint64_t key_count,
   const auto write = [&](uint32_t shard) -> Result<void> {
     auto& mset = pending[shard];
     if (mset.args.empty()) return {};
-    auto reply = wp.engine->DispatchFanOut(abyss::core::MultiKeyKind::kMset, std::move(mset));
+    auto reply = connection.FanOut(abyss::core::MultiKeyKind::kMset, std::move(mset));
     mset = {};
     if (!reply.has_value()) return std::unexpected(reply.error());
     if (reply->IsError()) {
@@ -431,10 +443,11 @@ struct TtlShare {
 TtlShare SampleTtls(WritePath& wp, const abyss::perf::probe::WorkloadShape& shape,
                     uint64_t key_count) {
   TtlShare share;
+  Connection connection(*wp.engine);
   const uint64_t n = std::min(key_count, kTtlSamples);
   for (uint64_t i = 0; i < n; ++i) {
-    const abyss::core::RespCommand cmd{.args = {"PTTL", shape.Key(i * key_count / n)}};
-    const auto reply = wp.engine->DispatchRead("PTTL", cmd);
+    const auto reply = connection.Read(
+        "PTTL", abyss::core::RespCommand{.args = {"PTTL", shape.Key(i * key_count / n)}});
     if (!reply.has_value() || !reply->IsInteger()) continue;
     if (reply->AsInteger() >= 0) {
       ++share.with_ttl;
@@ -477,11 +490,11 @@ struct FaultTally {
   }
 };
 
-bool CountedWrite(WritePath& wp, abyss::core::RespCommand cmd, FaultTally& tally) {
+bool CountedWrite(Connection& connection, abyss::core::RespCommand cmd, FaultTally& tally) {
   rusage before{};
   getrusage(kFaultScope, &before);
   const auto start = Clock::now();
-  const bool ok = Write(wp, std::move(cmd));
+  const bool ok = Write(connection, std::move(cmd));
   const auto elapsed = Clock::now() - start;
   rusage after{};
   getrusage(kFaultScope, &after);
@@ -514,7 +527,7 @@ struct FlushGate {
 };
 
 // The server's io_threads default; workers emulate its reactors, each
-// blocking in DispatchWrite.
+// running each write to its reply.
 int ReactorCount() {
   const auto hw = std::thread::hardware_concurrency();
   return static_cast<int>(std::clamp<uint32_t>(hw == 0 ? 1U : hw, 1U, 16U));
@@ -698,14 +711,21 @@ int main(int argc, char** argv) {
   }
   const TtlShare ttl_after_prefill = trace ? SampleTtls(wp, shape, args.key_count) : TtlShare{};
   std::vector<FaultTally> faults(static_cast<size_t>(args.workers));
+  std::vector<std::unique_ptr<Connection>> connections;
+  connections.reserve(static_cast<size_t>(args.workers));
+  for (int w = 0; w < args.workers; ++w) {
+    connections.push_back(std::make_unique<Connection>(*wp.engine));
+  }
   std::atomic<bool> measuring{false};
   abyss::perf::OpFn op_fn = [&](int worker_id, std::string_view op_name, uint64_t key_index) {
     auto& rng = rngs[static_cast<size_t>(worker_id)];
-    if (op_name == kOpRead) return Read(wp, shape.Read(key_index, rng));
+    Connection& connection = *connections[static_cast<size_t>(worker_id)];
+    if (op_name == kOpRead) return Read(connection, shape.Read(key_index, rng));
     if (count_faults && measuring.load(std::memory_order_relaxed)) {
-      return CountedWrite(wp, shape.Write(key_index, rng), faults[static_cast<size_t>(worker_id)]);
+      return CountedWrite(connection, shape.Write(key_index, rng),
+                          faults[static_cast<size_t>(worker_id)]);
     }
-    return Write(wp, shape.Write(key_index, rng));
+    return Write(connection, shape.Write(key_index, rng));
   };
 
   const auto gate = std::make_shared<FlushGate>();

@@ -22,13 +22,15 @@
 #include "abyss/core/queue.h"
 #include "abyss/core/string_hash.h"
 #include "abyss/core/types.h"
-#include "abyss/engine/blocking_driver.h"
 #include "abyss/metrics/names.h"
+#include "blocking_driver.h"
 #include "latch.h"
 #include "sequencer_fixture.h"
 
 namespace abyss::engine {
 namespace {
+
+using ::abyss::testing::RunFlushToCompletion;
 
 using metrics::RedecideReason;
 using ::testing::_;
@@ -187,7 +189,7 @@ TEST_F(SequencerTest, ASpareWaitThatFailsBeforeTheDeadlineIsShutdown) {
 }
 
 TEST_F(SequencerTest, ReDecidesUntilTheDeadlineAndNoLonger) {
-  Build(Options{.write_timeout = 60ms});
+  Build(Options{.command_timeout = 60ms});
   FailReserves(core::ErrorCode::kResourceExhausted, 1'000'000);
   const auto start = std::chrono::steady_clock::now();
   auto result = Run({"SET", "k", "v"});
@@ -320,7 +322,7 @@ TEST_F(SequencerTest, ANoEffectDecisionFencesOnWhatItRead) {
 }
 
 TEST_F(SequencerTest, AFenceTimeoutRepliesWithTheTimeoutText) {
-  Build(Options{.write_timeout = 50ms});
+  Build(Options{.command_timeout = 50ms});
   EXPECT_EQ(Reply({"SET", "k", "v"}), "OK");
   EXPECT_CALL(queue_, WhenDurable(_, _, _))
       .WillOnce([this](core::ShardId shard, core::Durability, core::SeqWaiterNode& node) {
@@ -381,7 +383,7 @@ class SequencerBackpressureTest : public SequencerTest {
   void SetUp() override {
     // 16 KiB a shard, over its limit past 20 KiB; nothing drains, so
     // no fill is evictable.
-    Build(Options{.max_memory_bytes = 64 << 10, .write_timeout = 300ms, .drain_gated = true});
+    Build(Options{.max_memory_bytes = 64 << 10, .command_timeout = 300ms, .drain_gated = true});
     for (int i = 0; i < 3; ++i) {
       ASSERT_EQ(Reply({"SET", KeyOn(0, i, "fill"), std::string(8 << 10, 'f')}), "OK");
     }

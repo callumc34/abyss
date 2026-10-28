@@ -474,6 +474,8 @@ class DifferentialTest : public PropertyHarness {
       (void)LoggedNothing(args, keys, got);
       return;
     }
+    // A read that ran out of the command deadline on cold had no effect.
+    if (!write && reply.IsError() && LoadTimedOut(ErrorMessage(reply))) return;
     for (const auto& key : keys) {
       if (stubbed_.contains(key) && !loaded_.contains(key) && ExistenceOnly(args)) {
         ++counts_.at(kStubAnswersExistence);
@@ -698,8 +700,8 @@ class DifferentialTest : public PropertyHarness {
                                            "n" + std::to_string(++counter_)};
         Absorb(ShardOf(key));
         // The engine directly: the pipeline is mid-dispatch.
-        auto result = engine_->DispatchWrite("SET", core::RespCommand{.args = nested},
-                                             core::PredicateFlags::kNone);
+        auto result = dispatch_->DispatchWrite("SET", core::RespCommand{.args = nested},
+                                               core::PredicateFlags::kNone);
         const core::RespValue reply =
             result.has_value()
                 ? *std::move(result)

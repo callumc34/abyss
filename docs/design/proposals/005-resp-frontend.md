@@ -410,7 +410,7 @@ The reply is the one the sequencer decided: `+OK`, nil, the prior value for `SET
 
 The queue is the sole write path — there is no dual write. Hot is applied in the same critical section that sequences the write, so there is no consumer to wait for.
 
-**Timeout:** `engine.write_timeout_ms`, default 5s, bounds a write's admission, loads, memory backpressure and durable wait. A write that runs out of time before its reservation is rejected having applied nothing. One that runs out on its durable wait returns a Redis error, but it is already in the queue and applied to hot, and becomes durable when the flush catches up.
+**Timeout:** `engine.command_timeout_ms`, default 5s, bounds a write's admission, loads, memory backpressure and durable wait. A write that runs out of time before its reservation is rejected having applied nothing. One that runs out on its durable wait returns a Redis error, but it is already in the queue and applied to hot, and becomes durable when the flush catches up.
 
 See [ADP-006](006-read-write-paths.md) for read and write path details, and [ADP-015](015-write-path-and-durability.md) for the sequencer and decide-then-log.
 
@@ -449,7 +449,7 @@ net:
   io_threads: 0            # 0 = min(hardware_concurrency, 16)
 
 engine:
-  write_timeout_ms: 5000   # a write's whole budget, durable wait included
+  command_timeout_ms: 5000   # a command's whole budget, durable wait included
 ```
 
 ## Invariants

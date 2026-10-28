@@ -157,7 +157,7 @@ The sequencer applies the entry's effect to hot before the entry is published, a
 
 **Bounded window.**
 - Acknowledged-but-not-power-durable data is bounded by `queue.durability_window_bytes` (volume-wide unflushed bytes) and `queue.durability_window_ms` (the age of a log's oldest unflushed entry).
-- Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.write_timeout_ms`, it is rejected with an error saying the device is not keeping up.
+- Admission is checked before the append lock is taken. An append over either bound waits for a flush. If it is still over after `engine.command_timeout_ms`, it is rejected with an error saying the device is not keeping up.
 - An empty window always admits, so a single value larger than the window cannot deadlock.
 - Both bounds are soft. Concurrent appends can each pass the check before the others' bytes count, so unflushed bytes can overshoot by up to one reservation per concurrent appender, and a slow flush lets admitted data age past `durability_window_ms`.
 - `abyss_wal_unflushed_bytes`, `abyss_wal_durability_lag_seconds` and the backpressure counters report it.

@@ -113,11 +113,14 @@ inline bool SpareTimedOut(std::string_view message) {
   return message == "write timed out waiting for a spare WAL segment";
 }
 
-// A cold load that ran out of its deadline: the cold store's check, the
-// RocksDB read's own, or a wait on another's load of the key.
+// A cold load that ran out of the command's deadline: the cold store's
+// check, the RocksDB read's own, a wait on another's load of the key,
+// the I/O queue, or a read abandoned at its deadline.
 inline bool LoadTimedOut(std::string_view message) {
   if (message == "cold load deadline passed" ||
-      message == "timed out awaiting another load of the key") {
+      message == "timed out awaiting another load of the key" ||
+      message == "command deadline passed while queued for cold I/O" ||
+      message == "read timed out loading its key" || message == "read timed out loading its keys") {
     return true;
   }
   return std::ranges::any_of(
@@ -128,10 +131,9 @@ inline bool LoadTimedOut(std::string_view message) {
       });
 }
 
-// `write`: the command is a write, whose loads run on its deadline
-// before anything is reserved; a read's run on cold's own, which a
-// healthy store meets.
-inline ReplyKind Classify(const core::RespValue& reply, bool write) {
+// A load's timeout comes before a write reserves anything, and a read
+// has no effect: either way the command did nothing.
+inline ReplyKind Classify(const core::RespValue& reply, bool /*write*/) {
   if (!reply.IsError()) return ReplyKind::kDefinite;
   const std::string_view text = reply.AsString();
   const std::string_view message = ErrorMessage(reply);
@@ -160,15 +162,8 @@ inline ReplyKind Classify(const core::RespValue& reply, bool write) {
       message.starts_with("WAL durability window full: the device is not keeping up")) {
     return ReplyKind::kNoOp;
   }
-  if (write && LoadTimedOut(message)) return ReplyKind::kNoOp;
+  if (LoadTimedOut(message)) return ReplyKind::kNoOp;
   return ReplyKind::kUnexpected;
-}
-
-// A healthy cold store answers well inside these, so a cold read that
-// runs out of one is a failure, not a flake.
-inline void PatientColdReads(Options& options) {
-  options.cold_read_deadline = std::chrono::seconds(5);
-  options.cold_scan_deadline = std::chrono::seconds(5);
 }
 
 // The configuration a seed fixes, swarm style.
@@ -196,7 +191,6 @@ inline Swarm SwarmFor(uint64_t seed) {
   o.fill_max_members = kFillMembers.at(rng.Below(kFillMembers.size()));
   constexpr std::array<double, 3> kRatio = {1.1, 1.25, 2.0};
   o.backpressure_ratio = kRatio.at(rng.Below(kRatio.size()));
-  PatientColdReads(o);
   o.run = "seed" + std::to_string(seed) + "-";
   // Persisted offsets let retention reclaim segments, so a restart
   // replays a log whose head is gone.
@@ -204,7 +198,7 @@ inline Swarm SwarmFor(uint64_t seed) {
   const bool relieve = !rng.Chance(0.25);
   if (!relieve) {
     // Small shards, so writes outrun cold and meet -OOM.
-    o.write_timeout = std::chrono::milliseconds(80);
+    o.command_timeout = std::chrono::milliseconds(80);
     o.hot_memory_bytes = size_t{16} << 10;
     o.shards = std::max<uint32_t>(o.shards, 4);
     o.log_count = 1;
