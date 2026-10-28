@@ -142,7 +142,6 @@ class WalQueue : public core::Queue, public SegmentRegistry {
 
   // A log-structured scan: one header-only walker per log feeds
   // shard-affine decode workers. Retention is held off meanwhile.
-  core::RetentionPin PinRetention() override;
   core::Result<void> Scan(std::span<const core::SequenceId> from,
                           std::span<const core::SequenceId> end, uint32_t parallelism,
                           const ScanSink& sink, const std::atomic<bool>& cancel) override;
@@ -197,7 +196,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void SetBatchCommitHookForTesting(const std::function<void(std::size_t committed)>& hook);
   // While paused, `log` prepares no spare segments.
   void PauseSegmentPreparerForTesting(uint32_t log, bool paused);
-  // The destructor's first step: every stream refuses from here on.
+  // As the destructor does: every stream refuses from here on.
   void StopStreamsForTesting();
   // The next removal of a reclaimed segment's file in `log` fails.
   void InjectSegmentRemoveErrorForTesting(uint32_t log, core::Error error);
