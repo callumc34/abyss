@@ -128,7 +128,7 @@ TEST_F(DurabilityWindowTest, ALogHeldByItsAgeStrandsNoOtherLogsWaiter) {
   window_->Release(1);
   ASSERT_EQ(other.wait_for(4s), std::future_status::ready) << "log 1's waiter was stranded";
   EXPECT_TRUE(other.get().has_value());
-  EXPECT_EQ(window_->admission(0).size(), kHeld);
+  EXPECT_TRUE(Waiting(0, kHeld)) << "a held waiter left the list";
 
   window_->Shutdown();
   for (auto& admit : held) {
