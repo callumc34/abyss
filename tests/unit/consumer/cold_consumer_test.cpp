@@ -345,6 +345,42 @@ TEST_F(ColdConsumerTest, IdleBackoffIsInterruptedByAWaiterOnADrain) {
   EXPECT_TRUE(drained) << "the wait expired while the consumer slept out its idle backoff";
 }
 
+// A test's wait for a far drained seq sits on the drained seq's own
+// waiters, so the backpressure waiter linked after it is the one a
+// drain that frees room wakes.
+TEST_F(ColdConsumerTest, AFarDrainWaitHoldsUpNoBackpressureWaiter) {
+  struct CountingWaiter final : core::Waiter {
+    void Wake(core::Result<void> /*result*/) noexcept override { wakes.fetch_add(1); }
+    std::atomic<int> wakes{0};
+  };
+  auto c = MakeConsumer();
+  std::atomic<core::SequenceId> next{1};
+  EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
+      .WillRepeatedly(
+          [&next](core::ShardId, core::SequenceId, size_t, core::Duration, core::Durability) {
+            std::vector<core::QueueEntry> out;
+            const core::SequenceId seq = next.fetch_add(1);
+            if (seq <= 2) out.push_back(MakeWriteEntry(seq, {"SET", "k", "v"}));
+            return out;
+          });
+
+  auto far = std::async(std::launch::async, [&c] { return testing::WaitDrained(*c, 100, 300ms); });
+  const auto waiting = [&c] { return c->DrainedWaitersForTesting() + c->RoomWaitersForTesting(); };
+  const auto until = std::chrono::steady_clock::now() + 5s;
+  while (waiting() == 0 && std::chrono::steady_clock::now() < until) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(waiting(), 1U);
+
+  CountingWaiter room;
+  ASSERT_FALSE(c->WhenDrainedPast(c->LatestDrainedSeq(), room).has_value());
+  c->Drain();
+  EXPECT_EQ(room.wakes.load(), 1) << "the far wait took the drain's wake";
+  c->FinishDrainWait(room);
+  EXPECT_TRUE(testing::TimedOut(far.get()));
+  EXPECT_EQ(waiting(), 0U);
+}
+
 // --- XERR-6: a missing parser is a capability gap, not poison -----------------
 
 TEST_F(ColdConsumerTest, WriteWithNoParserIsSkippedNotPoisoned) {

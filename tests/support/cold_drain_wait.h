@@ -1,36 +1,35 @@
 #pragma once
 
+#include <string>
+
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/core/result.h"
+#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
-#include "abyss/core/wait_list.h"
 #include "blocking_wait.h"
 
 namespace abyss::testing {
 
-// ok once `consumer` has drained through `through`, by its
-// WhenDrainedPast; kTimeout with no waiter left linked; kUnavailable
-// once it stopped.
+// ok once `consumer` has drained through `through`; kTimeout with no
+// node left registered; kUnavailable once it stopped. A seq wait on
+// the drained seq's own waiters, never on backpressure's room list,
+// whose one-at-a-time wakes a far target here would hold up.
 inline core::Result<void> WaitDrained(consumer::ColdConsumer& consumer, core::SequenceId through,
                                       core::Duration timeout) {
   if (through < core::kFirstSeq) return {};
-  return AwaitWaiter(
-      [&](core::Waiter& waiter, bool) { return consumer.WhenDrainedPast(through - 1, waiter); },
-      [&](core::Waiter& waiter) { return consumer.CancelDrainWait(waiter); },
-      [&](core::Waiter& waiter) { consumer.FinishDrainWait(waiter); },
-      core::SteadyClock::now() + timeout);
+  return AwaitNode(
+      through - 1, timeout, [&](core::SeqWaiterNode& node) { return consumer.WhenDrained(node); },
+      [&](core::SeqWaiterNode& node) { return consumer.CancelDrained(node); });
 }
 
-// As above, through the pool's routing to `shard`'s consumer.
 inline core::Result<void> WaitDrained(consumer::ColdConsumerPool& pool, core::ShardId shard,
                                       core::SequenceId through, core::Duration timeout) {
-  if (through < core::kFirstSeq) return {};
-  return AwaitWaiter(
-      [&](core::Waiter& waiter, bool) { return pool.WhenDrainedPast(shard, through - 1, waiter); },
-      [&](core::Waiter& waiter) { return pool.CancelDrainWait(shard, waiter); },
-      [&](core::Waiter& waiter) { pool.FinishDrainWait(shard, waiter); },
-      core::SteadyClock::now() + timeout);
+  if (shard >= pool.ShardCount()) {
+    return std::unexpected(core::Error{core::ErrorCode::kInvalidArgument,
+                                       "cold shard " + std::to_string(shard) + " out of range"});
+  }
+  return WaitDrained(pool.ConsumerFor(shard), through, timeout);
 }
 
 }  // namespace abyss::testing
