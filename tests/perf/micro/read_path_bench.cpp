@@ -157,13 +157,19 @@ void BM_ReadMixFill(benchmark::State& state) {
   IoPool pool(IoPoolConfig{.threads = 2});
   ReadPath reads(hot, loader, pool, ReadPathConfig{.fill_doorkeeper = doorkeeper});
   Ranks ranks(theta, 42);
+  Loader::FlightJoin join;
   // The read path's own work: a miss answers here, not on the pool.
   const auto read = [&] {
     const auto& key = data.keys[ranks.Next()];
     const core::ops::ReadOp op{core::ops::StringGet{.key = key}};
     std::optional<ReadAnswer> answer = reads.TryHot(op);
-    if (!answer.has_value()) answer = reads.Miss(op, core::SteadyClock::now() + kReadDeadline);
-    if (!answer->reply.has_value() || !answer->reply->IsBulkString()) std::abort();
+    // One reader: no load is ever in flight to join.
+    if (!answer.has_value()) {
+      answer = reads.Miss(op, core::SteadyClock::now() + kReadDeadline, join, core::Completion{});
+    }
+    if (!answer.has_value() || !answer->reply.has_value() || !answer->reply->IsBulkString()) {
+      std::abort();
+    }
   };
   for (uint64_t i = 0; i < kWarmup; ++i) read();
 

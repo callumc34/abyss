@@ -73,7 +73,8 @@ class Sequencer final : private core::DurableWait::Timer {
   // At its deadline, for a write that returned kWait: its timeout
   // reply, and it is never applied. Its wait is cancelled if it can be;
   // otherwise its wake or its loads are on their way, and the Attempt
-  // they run only cleans up (FinishWait's hand-off, N2's installs).
+  // they run only cleans up: FinishWait's hand-off, and installs of the
+  // loads it took whose tokens still allow them.
   core::Result<core::RespValue> Abandon(PendingWrite& write);
 
   SequencerStats Snapshot() const;

@@ -238,6 +238,57 @@ TEST(RequestPipelineTest, AStaleEventForAReusedSlotIsDropped) {
   EXPECT_EQ(dispatcher.first.client_id, 7U);
 }
 
+// Its task stays busy once asked to, as a task whose post is lost
+// would: a pipeline closed then is caught.
+class BusyTaskDispatcher : public core::CommandDispatcher {
+ public:
+  class Task final : public core::Task {
+   public:
+    core::Outcome Run(core::Slot& /*slot*/, core::Result<void> /*wake*/) override {
+      return {.reply = core::RespValue::Null()};
+    }
+    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/) override {
+      return std::unexpected(core::Error{core::ErrorCode::kTimeout, "abandoned"});
+    }
+    bool Quiescent() const override { return !busy; }
+
+    // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+    bool busy = false;
+  };
+
+  core::Outcome Dispatch(core::Request /*request*/, core::Slot& slot,
+                         std::unique_ptr<core::Task>& task) override {
+    slot.deadline = core::SteadyClock::now() + std::chrono::seconds{10};
+    if (task == nullptr) {
+      auto made = std::make_unique<Task>();
+      last = made.get();
+      task = std::move(made);
+    }
+    return {.reply = core::RespValue::SimpleString("OK")};
+  }
+
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  Task* last = nullptr;
+};
+
+#ifndef NDEBUG
+TEST(RequestPipelineTest, ClosingWithACommandOutstandingIsFatal) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        BusyTaskDispatcher dispatcher;
+        auto pipeline =
+            std::make_unique<RequestPipeline>(GlobalRegistry(), ConnectionState{.client_id = 1},
+                                              PipelineDependencies{.dispatcher = &dispatcher});
+        std::vector<uint8_t> output;
+        pipeline->Process(Bytes("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"), output);
+        dispatcher.last->busy = true;
+        pipeline.reset();
+      },
+      "a pipeline closed with a command outstanding");
+}
+#endif
+
 TEST(RequestPipelineTest, StatelessAndAdminCommandsNeverDispatch) {
   StubDispatcher dispatcher;
   FakeStats stats(StandardStats());

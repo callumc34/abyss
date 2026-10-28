@@ -193,5 +193,20 @@ TEST_F(DurableWaitTest, ItsNodesGrowOnceAndAreReused) {
   }
 }
 
+#ifndef NDEBUG
+// A wait with a node still linked must not be freed: its notifier
+// would post through freed memory.
+TEST_F(DurableWaitTest, FreedWithANodeLinkedIsFatal) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        DurableWait linked;
+        linked.Begin(queue_, DurableWait::Kind::kWrite, To(inbox_), 1, RespValue::Integer(0));
+        linked.Add(0, 3);
+      },
+      "a durable wait freed with a node linked or a post on its way");
+}
+#endif
+
 }  // namespace
 }  // namespace abyss::core

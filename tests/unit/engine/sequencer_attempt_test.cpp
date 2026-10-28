@@ -381,7 +381,7 @@ TEST_F(SequencerAttemptTest, ADeadlineInTheDurableWaitKeepsTheWriteApplied) {
 }
 
 // A write over two shards replies once both streams are durable: each
-// posts kDurable, and the reply goes at the last (N5).
+// posts kDurable, and the reply goes with the last.
 TEST_F(SequencerAttemptTest, ASequencedWriteRepliesOnceEveryStreamIsDurable) {
   const std::string a = KeyOn(0);
   const std::string b = KeyOn(1);

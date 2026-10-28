@@ -274,6 +274,17 @@ TEST_F(HoldAllocTest, ASmallSetOverAResidentKeyAllocatesNoMoreThanTheBlockingPat
   EXPECT_LE(most, kAllocsPerWrite);
 }
 
+// A slot is made per command by the blocking driver: empty, its
+// durable wait allocates nothing, on any standard library.
+TEST(DurableWaitAllocTest, AnEmptySlotAllocatesNothing) {
+  const std::size_t before = ThreadAllocs();
+  {
+    const core::Slot slot;
+    const core::DurableWait wait;
+  }
+  EXPECT_EQ(ThreadAllocs() - before, 0U);
+}
+
 // The same write through Dispatch on a warm connection: its task and
 // slot are reused, so nothing is added to what the write path takes.
 TEST_F(HoldAllocTest, ASmallSetThroughDispatchAllocatesNoMoreThanTheBlockingPath) {
@@ -305,7 +316,7 @@ TEST_F(HoldAllocTest, ASmallSetThroughDispatchAllocatesNoMoreThanTheBlockingPath
   RecordProperty("allocs_per_dispatched_write", static_cast<int>(most));
   std::cout << "allocations per write: dispatched " << most << ", blocking " << blocking << '\n';
   EXPECT_LE(most, blocking);
-  EXPECT_LE(most, 23U) << "Phase 2's figure, which 3-2a held";
+  EXPECT_LE(most, 23U) << "the blocking write path's figure";
 }
 
 // SET, a GET miss, MSET and an HGETALL miss, again and again on one

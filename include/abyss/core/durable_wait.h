@@ -3,8 +3,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <memory>
 #include <optional>
+#include <vector>
 
 #include "abyss/core/completion.h"
 #include "abyss/core/durability.h"
@@ -20,7 +21,7 @@ class Queue;
 // A sequenced command's reply, held until what it shows is durable at
 // the ack class: one seq per stream it touched. Each stream's node
 // posts kDurable to the slot, and the reply goes once the last has
-// arrived (N5). Owned by the slot and reused, so once its node storage
+// arrived. Owned by the slot and reused, so once its node storage
 // has grown to a command's streams it never allocates again.
 class DurableWait {
  public:
@@ -72,14 +73,15 @@ class DurableWait {
   // No node linked and no post on its way: safe to Begin or free.
   bool Quiescent() const { return outstanding_ == 0; }
   size_t CapacityForTesting() const { return 1 + more_.size(); }
+  size_t StreamsForTesting() const { return added_; }
 
  private:
   struct Stream {
     ShardId shard = 0;
     std::optional<SeqWaiterNode> node;
   };
-  Stream& At(size_t i) { return i == 0 ? first_ : more_[i - 1]; }
-  const Stream& At(size_t i) const { return i == 0 ? first_ : more_[i - 1]; }
+  Stream& At(size_t i) { return i == 0 ? first_ : *more_[i - 1]; }
+  const Stream& At(size_t i) const { return i == 0 ? first_ : *more_[i - 1]; }
   // Unlinks what it can; what it cannot is on its way.
   void CancelRest();
   Result<RespValue> Release();
@@ -97,10 +99,11 @@ class DurableWait {
   size_t added_ = 0;
   // Registered, and not yet arrived or cancelled.
   size_t outstanding_ = 0;
-  // A single stream's node is held in place. More grow in place and
-  // are kept: a deque never moves what it holds.
+  // A single stream's node is held in place. More are grown once, each
+  // on its own, so none moves, and kept. Empty, nothing is allocated
+  // on any standard library (libstdc++'s deque allocates when empty).
   Stream first_;
-  std::deque<Stream> more_;
+  std::vector<std::unique_ptr<Stream>> more_;
 };
 
 }  // namespace abyss::core

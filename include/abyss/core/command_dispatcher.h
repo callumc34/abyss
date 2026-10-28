@@ -63,7 +63,7 @@ struct Slot {
 // or a read miss on the I/O pool. The caller owns one and reuses it for
 // each command it dispatches, one at a time. Run, Abandon and the
 // deadline all happen on the caller's thread, which alone decides what
-// becomes of the command (N4).
+// becomes of the command.
 class Task {
  public:
   Task() = default;

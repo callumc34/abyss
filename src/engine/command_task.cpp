@@ -18,7 +18,10 @@ core::Error ReadTimedOut() {
 
 core::Outcome Fenced(core::Queue& queue, core::Slot& slot, core::Result<core::RespValue> reply,
                      std::span<const ShardSeq> fences) {
-  if (fences.empty()) return {.reply = std::move(reply)};
+  // An error that shows no state, a timeout or a stopped pool, waits
+  // for nothing; WRONGTYPE shows a key's type, so it does.
+  const bool shows_state = reply.has_value() || reply.error().code() == core::ErrorCode::kWrongType;
+  if (fences.empty() || !shows_state) return {.reply = std::move(reply)};
   core::DurableWait& wait = slot.durable;
   wait.Begin(queue, core::DurableWait::Kind::kFence, slot.completion, fences.size(),
              std::move(reply));
@@ -78,6 +81,9 @@ core::Outcome CommandTask::Run(core::Slot& slot, core::Result<void> wake) {
   ABYSS_DCHECK(its_slot, "a task resumed for another command's slot");
   ABYSS_DCHECK(mode_ != Mode::kIdle, "an idle task resumed");
   const bool from_job = std::exchange(job_, false);
+  // A read's post that is not its job's is the landing it armed for.
+  const bool landing = mode_ != Mode::kWrite && !from_job;
+  if (landing) armed_ = false;
   // Abandoned, it only cleans up: it is never applied.
   if (abandoned_) {
     Settle(std::move(wake), from_job);
@@ -87,6 +93,11 @@ core::Outcome CommandTask::Run(core::Slot& slot, core::Result<void> wake) {
     if (!from_job) write_.Woken(std::move(wake));
     return Drive(slot);
   }
+  if (from_job && std::exchange(joining_, false)) {
+    if (Waiting()) return {.kind = core::Outcome::Kind::kPending};
+    return Joined(slot);
+  }
+  if (landing) return Joined(slot);
   return Answered(slot);
 }
 
@@ -102,16 +113,23 @@ core::Result<core::RespValue> CommandTask::Abandon(core::Slot& /*slot*/) {
     job_ = false;
     io_.Unrun(ReadTimedOut());
   }
+  // Armed on another's load: left, unless it has begun to land.
+  if (armed_ && reads_.CancelJoin(flight_)) {
+    armed_ = false;
+    flight_.Reset();
+  }
   core::Result<core::RespValue> reply;
   if (mode_ == Mode::kWrite) {
     reply = sequencer_.Abandon(write_);
     // Its loads ended unrun: the attempt that ends its wait runs now.
     if (cancelled) (void)sequencer_.Attempt(write_);
+  } else if (mode_ == Mode::kMiss && op_.has_value()) {
+    reply = reads_.Failed(*op_, ReadTimedOut());
+    reads_.Replied(ReadPath::KindOf(*op_), reply);
   } else {
-    reply = mode_ == Mode::kMiss && op_.has_value()
-                ? reads_.Failed(*op_, ReadTimedOut())
-                : std::unexpected(
-                      core::Error{core::ErrorCode::kTimeout, "read timed out loading its keys"});
+    reply =
+        std::unexpected(core::Error{core::ErrorCode::kTimeout, "read timed out loading its keys"});
+    reads_.Replied(metrics::IoKind::kPoint, reply);
   }
   const bool owes = cancelled && !Quiescent();
   ABYSS_DCHECK(!owes, "a task owes a post after its job was cancelled");
@@ -164,10 +182,12 @@ core::Outcome CommandTask::Answered(core::Slot& slot) {
   const Mode mode = std::exchange(mode_, Mode::kIdle);
   if (mode == Mode::kFanOut) {
     core::Result<core::RespValue> reply = fan_.Reply();
+    reads_.Replied(metrics::IoKind::kPoint, reply);
     return Fenced(sequencer_.queue(), slot, std::move(reply), fan_.fences);
   }
-  op_.reset();
   ReadAnswer answer = std::exchange(answer_, {});
+  if (op_.has_value()) reads_.Replied(ReadPath::KindOf(*op_), answer.reply);
+  op_.reset();
   const std::span<const ShardSeq> fences = answer.fence.has_value()
                                                ? std::span<const ShardSeq>(&*answer.fence, 1)
                                                : std::span<const ShardSeq>();
@@ -177,13 +197,39 @@ core::Outcome CommandTask::Answered(core::Slot& slot) {
 void CommandTask::Settle(core::Result<void> wake, bool from_job) {
   if (mode_ == Mode::kWrite) {
     if (!from_job) write_.Woken(std::move(wake));
-    // Its wait ends: a hand-off for an ok wake, N2's installs.
+    // Its wait ends: a hand-off for an ok wake; loads its token still
+    // allows install.
     (void)sequencer_.Attempt(write_);
+  } else if (from_job && std::exchange(joining_, false)) {
+    // Its job joined another's load: left, or waited for if it has
+    // begun to land.
+    if (!reads_.CancelJoin(flight_) && Waiting()) return;
+    flight_.Reset();
+  } else if (!from_job) {
+    flight_.Reset();
   }
   answer_ = {};
   op_.reset();
   abandoned_ = false;
   mode_ = Mode::kIdle;
+}
+
+bool CommandTask::Waiting() {
+  armed_ = flight_.Arm();
+  return armed_;
+}
+
+core::Outcome CommandTask::Joined(core::Slot& slot) {
+  if (mode_ == Mode::kMiss) {
+    if (op_.has_value()) answer_ = ReadAnswer{.reply = reads_.Landed(*op_, flight_)};
+    flight_.Reset();
+    return Answered(slot);
+  }
+  reads_.FanOutLanded(fan_, flight_);
+  flight_.Reset();
+  if (fan_.done()) return Answered(slot);
+  // The keys left, on the pool.
+  return Submit(metrics::IoKind::kPoint);
 }
 
 void CommandTask::Post() const noexcept {
@@ -204,10 +250,19 @@ void CommandTask::Job::Run() noexcept {
       task.sequencer_.Load(task.write_);
       break;
     case Mode::kMiss:
-      if (task.op_.has_value()) task.answer_ = task.reads_.Miss(*task.op_, task.deadline_);
+      if (task.op_.has_value()) {
+        auto answer = task.reads_.Miss(*task.op_, task.deadline_, task.flight_, task.completion_);
+        if (answer.has_value()) {
+          task.answer_ = *std::move(answer);
+        } else {
+          task.joining_ = true;
+        }
+      }
       break;
     case Mode::kFanOut:
-      task.reads_.FanOutMiss(task.fan_, task.deadline_);
+      if (!task.reads_.FanOutMiss(task.fan_, task.deadline_, task.flight_, task.completion_)) {
+        task.joining_ = true;
+      }
       break;
     case Mode::kIdle:
       break;

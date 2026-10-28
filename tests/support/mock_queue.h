@@ -122,6 +122,12 @@ class MockQueue : public core::Queue {
     fake_->admissible.store(admissible, std::memory_order_seq_cst);
     if (admissible) fake_->admission.NotifyOne();
   }
+  // One spare made ready, for the front waiter, as a preparer finishing
+  // one segment.
+  void ReadySpareOne() {
+    fake_->spare_ready.store(true, std::memory_order_seq_cst);
+    fake_->spares.NotifyOne();
+  }
   void SetSpareReady(bool ready) {
     fake_->spare_ready.store(ready, std::memory_order_seq_cst);
     if (ready) fake_->spares.Notify();

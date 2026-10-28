@@ -911,11 +911,11 @@ inline constexpr CounterDesc<> kHotLoadDiscardsTotal{
     .help = "Key loads discarded because a write or flush superseded them.",
 };
 
-// A whole-key read from cold failed closed at the command deadline
-// rather than return a truncated answer.
-inline constexpr CounterDesc<> kColdScanDeadlineExceededTotal{
-    .name = "abyss_cold_scan_deadline_exceeded_total",
-    .help = "Cold collection scans aborted because they exceeded the command deadline.",
+// A read that failed closed at the command deadline while it read cold,
+// never a truncated answer; by whether it loaded a whole key.
+inline constexpr CounterDesc<IoKind> kColdReadDeadlineExceededTotal{
+    .name = "abyss_cold_read_deadline_exceeded_total",
+    .help = "Reads that failed at the command deadline reading cold, by point or scan.",
 };
 
 inline constexpr GaugeDesc<> kNetConnectionsActive{

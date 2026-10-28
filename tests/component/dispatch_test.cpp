@@ -79,6 +79,7 @@ class ColdGate {
     {
       const std::scoped_lock lock(mu_);
       if (key != key_) return;
+      ++calls_;
       thread_ = std::this_thread::get_id();
       if (pass_ > 0) {
         --pass_;
@@ -92,6 +93,10 @@ class ColdGate {
     const std::scoped_lock lock(mu_);
     return thread_;
   }
+  int Calls() {
+    const std::scoped_lock lock(mu_);
+    return calls_;
+  }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   abyss::testing::Latch entered;
@@ -102,6 +107,7 @@ class ColdGate {
   std::mutex mu_;
   std::string key_;
   int pass_ = 0;
+  int calls_ = 0;
   std::thread::id thread_;
 };
 
@@ -168,6 +174,21 @@ class DispatchTest : public SequencedEngineTest {
       if (next.kind == Kind::kReplied) reply = std::move(next.reply);
     }
     return *std::move(reply);
+  }
+  // Every post still to come for `conn`'s command, taken as its loop
+  // would, with the pool run dry between them.
+  void Drain(Conn& conn) {
+    for (;;) {
+      io_pool_->WaitIdleForTesting();
+      std::optional<core::CompletionEvent> event = conn.inbox.Take(core::SteadyClock::now() + 50ms);
+      if (!event.has_value()) return;
+      if (event->slot_seq != conn.seq) continue;
+      if (event->kind == core::CompletionKind::kDurable) {
+        (void)conn.slot.durable.Arrived(std::move(event->result));
+      } else {
+        (void)conn.task->Run(conn.slot, std::move(event->result));
+      }
+    }
   }
   std::string Run(Conn& conn, core::Request request) {
     return Text(Finish(conn, Dispatch(conn, std::move(request))));
@@ -273,6 +294,7 @@ TEST_F(DispatchTest, AHitNeverTouchesThePool) {
   Conn writer(1);
   ASSERT_EQ(Run(writer, WriteReq({"SET", "k", "v"})), "OK");
   ASSERT_EQ(Run(writer, WriteReq({"SET", "j", "w"})), "OK");
+  io_pool_->WaitIdleForTesting();
   const uint64_t jobs = PoolJobs();
   Conn reader(2);
   core::Outcome hit = Dispatch(reader, Get("k"));
@@ -367,7 +389,7 @@ TEST_F(DispatchTest, ADroppedFillChangesNoAnswer) {
 
 // At the deadline the write is abandoned with its load running: it
 // replies at once, and is never applied. The load lands later and
-// installs (N2), ending the placeholder a keyed waiter is linked on.
+// installs, as its token still allows, ending the placeholder a keyed waiter is linked on.
 TEST_F(DispatchTest, ADeadlineWhileALoadRunsInstallsItAndFreesTheKey) {
   Open();
   Cold({"SADD", "s", "a"});
@@ -542,6 +564,240 @@ TEST_F(DispatchTest, AbandonTakesBackAQueuedLoadJobAndFreesItsKey) {
   EXPECT_EQ(cold_calls_q_.load() - cold_before, kWrites) << "only the waiters read cold";
 }
 
+// --- Joins of a load in flight ---
+
+// A miss that finds another's load of its key in flight joins it and
+// ends: the pool thread is free at once. With two threads, one held
+// by the load of K and eight misses of K joined to it, a miss of J is
+// answered while K's read is still held; then each joiner takes the
+// one read of K.
+TEST_F(DispatchTest, AJoinOfALoadInFlightNeverHoldsAPoolThread) {
+  constexpr int kJoiners = 8;
+  Open(Options{.cold_io_threads = 2});
+  Cold({"SET", "fk", "v"});
+  Cold({"SET", "fj", "w"});
+  gate_->Hold("fk");
+  Conn leader(1);
+  core::Outcome led = Dispatch(leader, Get("fk"));
+  ASSERT_EQ(led.kind, Kind::kPending);
+  ASSERT_TRUE(gate_->entered.Wait());
+  std::vector<std::unique_ptr<Conn>> joiners;
+  std::vector<core::Outcome> joined;
+  for (int i = 0; i < kJoiners; ++i) {
+    joiners.push_back(std::make_unique<Conn>(10 + i));
+    joined.push_back(Dispatch(*joiners.back(), Get("fk")));
+    ASSERT_EQ(joined.back().kind, Kind::kPending);
+  }
+  const core::ShardId shard = ShardOf("fk");
+  for (int i = 0; i < 2000 && loader_->JoinersForTesting(shard) < kJoiners; ++i) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(loader_->JoinersForTesting(shard), static_cast<size_t>(kJoiners));
+
+  Conn other(2);
+  const auto start = core::SteadyClock::now();
+  EXPECT_EQ(Run(other, Get("fj")), "w");
+  EXPECT_LT(core::SteadyClock::now() - start, 1s) << "a joiner held the other pool thread";
+  EXPECT_EQ(gate_->Calls(), 1) << "K's read was not still held";
+
+  gate_->release.Open();
+  EXPECT_EQ(Text(Finish(leader, std::move(led))), "v");
+  for (int i = 0; i < kJoiners; ++i) {
+    const auto index = static_cast<size_t>(i);
+    EXPECT_EQ(Text(Finish(*joiners[index], std::move(joined[index]))), "v") << i;
+  }
+  EXPECT_EQ(gate_->Calls(), 1) << "a joiner read K again";
+  EXPECT_EQ(loader_->JoinersForTesting(shard), 0U);
+  EXPECT_EQ(loader_->FlightsForTesting(shard), 0U);
+}
+
+// The deadline comes for a joiner armed on a load as the load lands:
+// whichever wins, no joiner is left linked and the task is quiescent.
+TEST_F(DispatchTest, AnAbandonRacingTheLandingLeavesNoJoiner) {
+  Open();
+  std::mt19937 rng(11);  // NOLINT(bugprone-random-generator-seed)
+  for (int round = 0; round < 20; ++round) {
+    const std::string key = "fr" + std::to_string(round);
+    Cold({"SET", key, "v"});
+    gate_ = std::make_unique<ColdGate>();
+    gate_->Hold(key);
+    Conn leader(100 + round);
+    core::Outcome led = Dispatch(leader, Get(key));
+    ASSERT_EQ(led.kind, Kind::kPending);
+    ASSERT_TRUE(gate_->entered.Wait());
+    Conn joiner(200 + round);
+    ASSERT_EQ(Dispatch(joiner, Get(key)).kind, Kind::kPending);
+    // Its job's post: the join is made, and the task arms it.
+    std::optional<core::CompletionEvent> ended = joiner.inbox.Take(core::SteadyClock::now() + 5s);
+    ASSERT_TRUE(ended.has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
+    ASSERT_EQ(joiner.task->Run(joiner.slot, std::move(ended->result)).kind, Kind::kPending);
+    ASSERT_FALSE(joiner.Quiescent()) << "armed on the load";
+
+    const auto delay = std::chrono::microseconds(std::uniform_int_distribution<int>(0, 300)(rng));
+    std::thread releaser([this, delay] {
+      std::this_thread::sleep_for(delay);
+      gate_->release.Open();
+    });
+    std::this_thread::sleep_for(150us);
+    EXPECT_FALSE(joiner.task->Abandon(joiner.slot).has_value());
+    releaser.join();
+    EXPECT_EQ(Text(Finish(leader, std::move(led))), "v");
+    Drain(joiner);
+    EXPECT_TRUE(joiner.Quiescent()) << "round " << round;
+    EXPECT_EQ(loader_->JoinersForTesting(ShardOf(key)), 0U) << "round " << round;
+  }
+}
+
+// --- Fan-out ---
+
+TEST_F(DispatchTest, AFanOutWithSeveralMissesIsOnePoolJob) {
+  Open();
+  Cold({"MSET", "ma", "1", "mb", "2", "mc", "3"});
+  Conn conn(1);
+  io_pool_->WaitIdleForTesting();
+  uint64_t jobs = PoolJobs();
+  EXPECT_EQ(Run(conn, Req(core::Request::Kind::kFanOut, "MGET", {"MGET", "ma", "mb", "mc"},
+                          core::MultiKeyKind::kMget)),
+            "[1,2,3]");
+  io_pool_->WaitIdleForTesting();
+  EXPECT_EQ(PoolJobs() - jobs, 1U);
+  // The doorkeeper filled none of them on a first miss: EXISTS misses
+  // all three again, in one job too.
+  jobs = PoolJobs();
+  EXPECT_EQ(Run(conn, Req(core::Request::Kind::kFanOut, "EXISTS", {"EXISTS", "ma", "nowhere", "mc"},
+                          core::MultiKeyKind::kExists)),
+            ":2");
+  io_pool_->WaitIdleForTesting();
+  EXPECT_EQ(PoolJobs() - jobs, 1U);
+}
+
+// Durability is monotonic per shard, so the fences a fan-out gathers
+// fold to one per shard however many keys it read.
+TEST_F(DispatchTest, AFanOutsFencesFoldToOnePerShard) {
+  Open(Options{.durability = core::Durability::kPowerLoss});
+  const FlushStall stall;
+  queue_->SetFlushHookForTesting(stall.Hook());
+  const std::string a = KeyOn(0, 0);
+  const std::string b = KeyOn(0, 1);
+  const std::string c = KeyOn(1, 0);
+  Conn writer(1);
+  for (const std::string& key : {a, b, c}) {
+    ASSERT_EQ(Dispatch(writer, WriteReq({"SET", key, "v"})).kind, Kind::kSequenced);
+    EXPECT_FALSE(writer.slot.durable.Expire().has_value()) << "it became durable while stalled";
+    Drain(writer);
+  }
+  Conn reader(2);
+  core::Outcome read = Dispatch(reader, Req(core::Request::Kind::kFanOut, "MGET",
+                                            {"MGET", a, b, c, a}, core::MultiKeyKind::kMget));
+  ASSERT_EQ(read.kind, Kind::kSequenced);
+  EXPECT_EQ(reader.slot.durable.StreamsForTesting(), 2U) << "one fence per shard";
+  stall.Release();
+  EXPECT_EQ(Durable(reader), "[v,v,v,v]");
+}
+
+// A fan-out that fails without reading its keys shows no state, so it
+// does not wait on the fences it gathered: its error replies at once.
+TEST_F(DispatchTest, AFanOutsErrorSkipsItsFences) {
+  Open(Options{.durability = core::Durability::kPowerLoss, .command_timeout = 300ms});
+  ASSERT_NO_FATAL_FAILURE(Cold({"SET", "fc", "1"}));
+  const FlushStall stall;
+  queue_->SetFlushHookForTesting(stall.Hook());
+  Conn writer(1);
+  ASSERT_EQ(Dispatch(writer, WriteReq({"SET", "fa", "v"})).kind, Kind::kSequenced);
+  Blocker first;
+  Blocker second;
+  io_pool_->Submit(first, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  io_pool_->Submit(second, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  ASSERT_TRUE(first.started.Wait());
+  ASSERT_TRUE(second.started.Wait());
+  Conn reader(2);
+  core::Outcome read = Dispatch(reader, Req(core::Request::Kind::kFanOut, "MGET",
+                                            {"MGET", "fa", "fc"}, core::MultiKeyKind::kMget));
+  ASSERT_EQ(read.kind, Kind::kPending) << "fa's hit, then fc's miss queued";
+  std::this_thread::sleep_until(reader.slot.deadline + 20ms);
+  first.release.Open();
+  std::optional<core::CompletionEvent> event = reader.inbox.Take(core::SteadyClock::now() + 5s);
+  ASSERT_TRUE(event.has_value());
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
+  core::Outcome replied = reader.task->Run(reader.slot, std::move(event->result));
+  ASSERT_EQ(replied.kind, Kind::kReplied) << "it waited on fa's fence";
+  EXPECT_EQ(Text(replied.reply), "error: command deadline passed while queued for cold I/O");
+  EXPECT_FALSE(reader.slot.durable.waiting());
+  second.release.Open();
+  ASSERT_TRUE(second.done.Wait());
+  EXPECT_FALSE(writer.slot.durable.Expire().has_value()) << "it became durable while stalled";
+  stall.Release();
+  Drain(writer);
+}
+
+// A fill queued behind foreground work past the deadline of the read
+// that admitted it never runs, and counts as expired.
+TEST_F(DispatchTest, AFillPastItsDeadlineInTheQueueExpires) {
+  Open(Options{.fill_doorkeeper = false, .command_timeout = 300ms, .cold_io_threads = 2});
+  Cold({"HSET", "eh", "f", "1"});
+  const auto expired = [] {
+    return metrics::testing::GetCounterValue(metrics::names::kHotFillsTotal,
+                                             metrics::FillOutcome::kExpired)
+        .value_or(0);
+  };
+  const double before = expired();
+  Blocker held;
+  io_pool_->Submit(held, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  ASSERT_TRUE(held.started.Wait());
+  Conn conn(1);
+  core::Outcome miss = Dispatch(conn, Req(core::Request::Kind::kRead, "HGET", {"HGET", "eh", "f"}));
+  ASSERT_EQ(miss.kind, Kind::kPending);
+  // Behind the miss on the one free thread, ahead of its fill.
+  Blocker after;
+  io_pool_->Submit(after, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  EXPECT_EQ(Text(Finish(conn, std::move(miss))), "1");
+  ASSERT_TRUE(after.started.Wait());
+  std::this_thread::sleep_until(conn.slot.deadline + 20ms);
+  held.release.Open();
+  after.release.Open();
+  io_pool_->WaitIdleForTesting();
+  EXPECT_EQ(expired(), before + 1);
+  EXPECT_FALSE(hot_->Read(core::ops::ReadOp{core::ops::HashLen{.key = "eh"}}).result.has_value());
+}
+
+// --- Shutdown ---
+
+// The pool stops with a write's load job still queued: the job fails
+// unrun, still ending its placeholder, so the write waiting on that
+// key goes on, and either replies or meets the stopped pool itself.
+TEST_F(DispatchTest, ShutdownFreesTheKeysOfQueuedLoadJobs) {
+  Open();
+  Cold({"SADD", "ss", "a"});
+  Blocker first;
+  Blocker second;
+  io_pool_->Submit(first, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  io_pool_->Submit(second, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  ASSERT_TRUE(first.started.Wait());
+  ASSERT_TRUE(second.started.Wait());
+  Conn owner(1);
+  core::Outcome loading = Dispatch(owner, WriteReq({"SADD", "ss", "b"}));
+  ASSERT_EQ(loading.kind, Kind::kPending);
+  Conn waiter(2);
+  core::Outcome waiting = Dispatch(waiter, WriteReq({"SADD", "ss", "c"}));
+  ASSERT_EQ(waiting.kind, Kind::kPending);
+  ASSERT_EQ(hot_->LoadWaitersForTesting("ss"), 1U);
+
+  std::thread stopper([this] { io_pool_->Shutdown(); });
+  for (int i = 0; i < 2000 && hot_->LoadWaitersForTesting("ss") > 0; ++i) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_EQ(hot_->LoadWaitersForTesting("ss"), 0U) << "the failed job held its key";
+  first.release.Open();
+  second.release.Open();
+  stopper.join();
+  EXPECT_EQ(Text(Finish(owner, std::move(loading))), "error: cold I/O pool shut down");
+  const std::string waited = Text(Finish(waiter, std::move(waiting)));
+  EXPECT_TRUE(waited == ":1" || waited == "error: cold I/O pool shut down") << waited;
+  EXPECT_FALSE(Member("ss", "b"));
+  EXPECT_FALSE(hot_->LoadPending("ss"));
+}
+
 // --- The task and its slots ---
 
 // The connection's one task moves on to the next command while the
@@ -611,9 +867,11 @@ TEST_F(DispatchTest, AResumedTaskChecksForAbandonmentFirst) {
   ASSERT_TRUE(event->result.has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
   (void)conn.task->Run(conn.slot, std::move(event->result));
+  // Whatever it went on to do, let it finish.
+  Drain(conn);
+  EXPECT_FALSE(Member("s", "b")) << "the abandoned write was applied";
+  EXPECT_EQ(Logged(ShardOf("s")).size(), 1U) << "the abandoned write was logged";
   EXPECT_TRUE(conn.Quiescent());
-  EXPECT_FALSE(Member("s", "b"));
-  EXPECT_EQ(Logged(ShardOf("s")).size(), 1U);
   EXPECT_EQ(Run(conn, WriteReq({"SADD", "s", "c"})), ":1")
       << "the task goes on to the next command";
 }

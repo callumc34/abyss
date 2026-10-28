@@ -1,5 +1,7 @@
 #include "abyss/core/durable_wait.h"
 
+#include <algorithm>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -33,7 +35,11 @@ void DurableWait::Begin(Queue& queue, Kind kind, Completion completion, size_t s
   ABYSS_DCHECK(idle, "a durable wait begun while another is open");
   // The last wait's nodes are all unlinked by now.
   for (size_t i = 0; i < added_; ++i) At(i).node.reset();
-  while (1 + more_.size() < streams) more_.emplace_back();
+  // Nodes for a FLUSHDB over many shards are not all kept after it.
+  constexpr size_t kKeptStreams = 64;
+  const size_t keep = std::max(streams, kKeptStreams) - 1;
+  if (more_.size() > keep) more_.resize(keep);
+  while (1 + more_.size() < streams) more_.push_back(std::make_unique<Stream>());
   queue_ = &queue;
   ack_ = queue.AckDurability();
   kind_ = kind;

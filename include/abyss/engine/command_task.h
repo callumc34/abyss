@@ -16,6 +16,7 @@
 #include "abyss/core/types.h"
 #include "abyss/engine/decide.h"
 #include "abyss/engine/io_pool.h"
+#include "abyss/engine/loader.h"
 #include "abyss/engine/pending_write.h"
 #include "abyss/engine/read_path.h"
 #include "abyss/engine/sequencer.h"
@@ -33,8 +34,9 @@ core::Outcome Fenced(core::Queue& queue, core::Slot& slot, core::Result<core::Re
 // allocates a task or a job once the first has.
 //
 // Quiescent once nothing outside refers to it: its write is linked on
-// no wait list, owes no wake and holds no load placeholder, and no job
-// of it is queued or running (job_ until the job's post is Run).
+// no wait list, owes no wake and holds no load placeholder, no job of
+// it is queued or running (job_ until the job's post is Run), and no
+// load in flight will land in its flight join (armed_).
 class CommandTask final : public core::Task {
  public:
   CommandTask(Sequencer& sequencer, ReadPath& reads, IoPool& pool);
@@ -53,7 +55,7 @@ class CommandTask final : public core::Task {
 
   core::Outcome Run(core::Slot& slot, core::Result<void> wake) override;
   core::Result<core::RespValue> Abandon(core::Slot& slot) override;
-  bool Quiescent() const override { return !job_ && write_.Quiescent(); }
+  bool Quiescent() const override { return !job_ && !armed_ && write_.Quiescent(); }
 
  private:
   enum class Mode : uint8_t { kIdle, kWrite, kMiss, kFanOut };
@@ -79,8 +81,15 @@ class CommandTask final : public core::Task {
   core::Outcome Drive(core::Slot& slot);
   core::Outcome Submit(metrics::IoKind kind);
   core::Outcome Answered(core::Slot& slot);
-  // An abandoned command's late post: it cleans up and goes idle.
+  // An abandoned command's late post: it cleans up and goes idle,
+  // unless a load it joined is still to land.
   void Settle(core::Result<void> wake, bool from_job);
+  // After a job that joined a load in flight: true while it waits for
+  // the landing, which posts; false once landed.
+  bool Waiting();
+  // The joined load's landing, taken: the miss's answer, or the
+  // fan-out's next step.
+  core::Outcome Joined(core::Slot& slot);
   void Post() const noexcept;
 
   Sequencer& sequencer_;
@@ -96,8 +105,14 @@ class CommandTask final : public core::Task {
   std::optional<core::ops::ReadOp> op_;
   ReadAnswer answer_;
   engine::FanOut fan_;
+  // A read's join of another's load in flight; joining_ is set by the
+  // job that joined it, before its post.
+  Loader::FlightJoin flight_;
+  bool joining_ = false;
   // A job is queued or running, or its post is on the way.
   bool job_ = false;
+  // Armed on a load in flight, whose landing posts.
+  bool armed_ = false;
   // Past its deadline: replied, and only its late post is to come.
   bool abandoned_ = false;
   Job io_{*this};

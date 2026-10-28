@@ -131,6 +131,7 @@ constexpr auto kConditional = std::to_array<std::string_view>({
     "abyss_queue_read_out_of_range_total",
     "abyss_wal_segment_prepare_failures_total",
     "abyss_cold_drain_truncated_total",
+    "abyss_cold_read_deadline_exceeded_total",
     "abyss_cold_apply_type_conflicts_total",
     "abyss_cold_ttl_conflicts_total",
     // Keys expired in cold by its log clock; a log with a reclaimed tail.

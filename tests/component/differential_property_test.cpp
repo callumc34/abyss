@@ -169,6 +169,14 @@ class DifferentialTest : public PropertyHarness {
         Command(Generate());
       }
     }
+    // A read has nothing to wait for but cold: a healthy store serves
+    // nearly all of them within the command deadline. Judged over the
+    // seeds so far, once they hold enough reads to judge by.
+    std::cout << "[differential] seed=" << seed << " " << reads_timed_out_ << " of " << reads_
+              << " reads so far timed out\n";
+    if (!failed_ && reads_ >= kReadsToJudge && reads_timed_out_ * 100 > reads_) {
+      Fail(std::to_string(reads_timed_out_) + " of " + std::to_string(reads_) + " reads timed out");
+    }
     if (!failed_) Finish();
     hooked_.SetHook(nullptr);
     CloseAll();
@@ -474,8 +482,12 @@ class DifferentialTest : public PropertyHarness {
       (void)LoggedNothing(args, keys, got);
       return;
     }
+    if (!write) ++reads_;
     // A read that ran out of the command deadline on cold had no effect.
-    if (!write && reply.IsError() && LoadTimedOut(ErrorMessage(reply))) return;
+    if (!write && reply.IsError() && LoadTimedOut(ErrorMessage(reply))) {
+      ++reads_timed_out_;
+      return;
+    }
     for (const auto& key : keys) {
       if (stubbed_.contains(key) && !loaded_.contains(key) && ExistenceOnly(args)) {
         ++counts_.at(kStubAnswersExistence);
@@ -1061,6 +1073,10 @@ class DifferentialTest : public PropertyHarness {
   uint64_t counter_ = 0;
   bool failed_ = false;
   Counts counts_{};
+  // Reads, and those that timed out, over every seed this test ran.
+  static constexpr uint64_t kReadsToJudge = 100;
+  uint64_t reads_ = 0;
+  uint64_t reads_timed_out_ = 0;
   std::deque<std::string> history_;
   std::deque<std::map<core::ShardId, std::pair<core::SequenceId, core::SequenceId>>> batches_;
   const std::vector<std::string>* outer_ = nullptr;

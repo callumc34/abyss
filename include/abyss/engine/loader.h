@@ -18,6 +18,7 @@
 #include "abyss/consumer/compacted_state.h"
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/cold_store.h"
+#include "abyss/core/completion.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/decide.h"
@@ -56,6 +57,82 @@ class Loader {
   // result or error; once it completes, the next call loads afresh.
   core::Result<Shared> LoadAs(core::ShardId shard, std::string_view key, core::KeyType type,
                               core::SteadyTime deadline, Source* source = nullptr) const;
+
+ private:
+  struct Flight {
+    core::Result<Shared> result;
+    Source source = Source::kBuffer;
+  };
+  // A call linked on another's load in flight. The leader unlinks
+  // every one under the flights' lock, then lands it outside.
+  class JoinLink {
+   public:
+    virtual ~JoinLink() = default;
+    JoinLink(const JoinLink&) = delete;
+    JoinLink& operator=(const JoinLink&) = delete;
+    JoinLink(JoinLink&&) = delete;
+    JoinLink& operator=(JoinLink&&) = delete;
+    // Once, outside the flights' lock; touches nothing of *this after.
+    virtual void Land(const Flight& flight) noexcept = 0;
+
+    // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+    // Under the flights' lock.
+    JoinLink* prev = nullptr;
+    JoinLink* next = nullptr;
+    bool linked = false;
+    // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+
+   protected:
+    JoinLink() = default;
+  };
+  using FlightId = std::tuple<std::string, core::KeyType, core::SequenceId>;
+
+ public:
+  // A call's join of another's load of its key, which never waits: the
+  // leader lands its result here, so no second cold read is made. Owned
+  // by its caller, reused one join at a time. Once the joining call has
+  // ended, its owner arms it: if the result has landed it takes it now,
+  // otherwise the landing posts kResume to the join's completion.
+  class FlightJoin final : private JoinLink {
+   public:
+    FlightJoin() = default;
+    ~FlightJoin() override;
+    FlightJoin(const FlightJoin&) = delete;
+    FlightJoin& operator=(const FlightJoin&) = delete;
+    FlightJoin(FlightJoin&&) = delete;
+    FlightJoin& operator=(FlightJoin&&) = delete;
+
+    // On the owner's thread, once the joining call has returned. True:
+    // armed, and the landing posts. False: landed already, no post.
+    bool Arm() noexcept;
+    // Its landed result, once Arm returned false or the post came.
+    const core::Result<Shared>& result() const { return flight_.result; }
+    Source source() const { return flight_.source; }
+    // For the next join, once landed and taken, or cancelled.
+    void Reset() noexcept;
+
+   private:
+    friend class Loader;
+    enum class State : uint8_t { kIdle, kJoined, kArmed, kLanded };
+
+    void Land(const Flight& flight) noexcept override;
+
+    core::Completion completion_;
+    core::ShardId shard_ = 0;
+    FlightId id_;
+    Flight flight_;
+    std::atomic<State> state_{State::kIdle};
+  };
+
+  // LoadAs that never waits for another's load: the result, or nullopt
+  // when `join` joined a load of the key already in flight.
+  std::optional<core::Result<Shared>> LoadAsOrJoin(core::ShardId shard, std::string_view key,
+                                                   core::KeyType type, core::SteadyTime deadline,
+                                                   Source* source, FlightJoin& join,
+                                                   core::Completion completion) const;
+  // For a join LoadAsOrJoin made. True: unlinked, and nothing lands.
+  // False: the leader took it, and its landing comes.
+  bool CancelJoin(FlightJoin& join) const noexcept;
   // The key's type and TTL, reading no members: LoadedAbsent or
   // LoadedExists, or in full when removals may have emptied it.
   core::Result<hot::LoadResult> Probe(core::ShardId shard, std::string_view key,
@@ -89,8 +166,8 @@ class Loader {
     Source source = Source::kBuffer;
   };
   // The read path's cache fill: begin, load as `type` and fill, each in
-  // its own hold. A read's load already in flight is joined, not
-  // repeated; another's placeholder is never awaited.
+  // its own hold. It never waits: another's placeholder, or another's
+  // load of the key in flight, makes it kPending.
   core::Result<Filled> Install(std::string_view key, core::KeyType type, core::SteadyTime deadline);
 
   struct Members {
@@ -157,23 +234,23 @@ class Loader {
                                                         core::KeyType type, std::string_view member,
                                                         core::SteadyTime deadline) const;
 
-  // LoadAs, as the leader of a load in flight or a waiter on one. A
-  // leader passing `owned` gets its result there, and lends waiters a
-  // copy only when there are some.
-  core::Result<Shared> Fly(core::ShardId shard, std::string_view key, core::KeyType type,
-                           core::SteadyTime deadline, Source* source,
-                           std::optional<hot::LoadResult>* owned) const;
+  // What a call that finds another's load in flight does: wait for it,
+  // join it without waiting (`async`), or leave it.
+  enum class JoinMode : uint8_t { kWait, kAsync, kNever };
+  // LoadAs, as the leader of a load in flight or a joiner of one. A
+  // leader passing `owned` gets its result there, and lends joiners a
+  // copy only when there are some. nullopt: not loaded here, another's
+  // load being in flight (kAsync, kNever).
+  std::optional<core::Result<Shared>> Fly(core::ShardId shard, std::string_view key,
+                                          core::KeyType type, core::SteadyTime deadline,
+                                          Source* source, std::optional<hot::LoadResult>* owned,
+                                          JoinMode mode, FlightJoin* async = nullptr) const;
 
-  struct Flight {
-    core::Result<Shared> result;
-    Source source = Source::kBuffer;
-  };
-  // A call joined to another's load, linked on it while it flies.
+  // A call waiting on another's load, on its stack.
   class Joiner;
   struct Pending {
-    Joiner* joiners = nullptr;
+    JoinLink* joiners = nullptr;
   };
-  using FlightId = std::tuple<std::string, core::KeyType, core::SequenceId>;
   // Loads in flight, per shard: LoadAs's and Install's.
   struct Flights {
     mutable std::mutex mu;
@@ -181,7 +258,7 @@ class Loader {
     std::map<FlightId, Pending> loading;
   };
   // False if the leader already took `joiner`, whose landing comes.
-  static bool Unjoin(Flights& flights, const FlightId& id, Joiner& joiner);
+  static bool Unjoin(Flights& flights, const FlightId& id, JoinLink& joiner);
 
   hot::ShardedHotStore& hot_;
   const consumer::CompactionBufferRouter& buffers_;

@@ -182,6 +182,9 @@ class CrashTest : public PropertyHarness {
     uint64_t checked_calls = 0;
     // Replies refused or timed out, which no state explains.
     uint64_t refused = 0;
+    // Reads, and those that timed out reading cold.
+    uint64_t reads = 0;
+    uint64_t reads_timed_out = 0;
     bool ok = true;
   };
 
@@ -724,6 +727,10 @@ class CrashTest : public PropertyHarness {
         return run;
       }
       if (call.reply == kTimedOut || call.reply == kNoEffect) ++run.refused;
+      if (!Writes(call.op)) {
+        ++run.reads;
+        if (call.reply == kNoEffect) ++run.reads_timed_out;
+      }
       if (!acks_survive) continue;
       ++run.checked_calls;
       if (IdentifiesItsEffect(call)) {
@@ -815,7 +822,7 @@ class CrashTest : public PropertyHarness {
       const std::string got = RedisModel::Render(Run(set));
       // The crash workload's short deadline can lapse on a slow fsync;
       // that reply still means the write is applied.
-      if (got != "+OK" && got.find("the write is applied") == std::string::npos) {
+      if (got != "+OK" && !got.contains("the write is applied")) {
         fail("a write after recovery: " + got);
         return run;
       }
@@ -836,6 +843,8 @@ class CrashTest : public PropertyHarness {
     total.cold_absorbed += run.cold_absorbed;
     total.checked_calls += run.checked_calls;
     total.refused += run.refused;
+    total.reads += run.reads;
+    total.reads_timed_out += run.reads_timed_out;
   }
 
   // A server that refused or timed out most calls would pass every
@@ -844,6 +853,10 @@ class CrashTest : public PropertyHarness {
     EXPECT_GE(total.acknowledged * 20, total.checked_calls) << "too few writes acknowledged";
     EXPECT_GE(total.checked_replies * 20, total.checked_calls) << "too few replies checked";
     EXPECT_LE(total.refused * 10, total.calls) << "too many calls refused or timed out";
+    // A read has nothing to wait for but cold: a healthy store serves
+    // nearly all of them within the command deadline.
+    EXPECT_LE(total.reads_timed_out * 100, total.reads)
+        << total.reads_timed_out << " of " << total.reads << " reads timed out";
   }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
@@ -887,7 +900,8 @@ TEST_F(CrashTest, PowerLossRecoversAPrefixThatExplainsEveryReply) {
     if (!run.ok) break;
   }
   std::cout << "[crash] power loss: " << seeds.size() << " crashes, " << total.calls << " calls ("
-            << total.refused << " refused or timed out), " << total.acknowledged
+            << total.refused << " refused or timed out, " << total.reads_timed_out << " of "
+            << total.reads << " reads timed out), " << total.acknowledged
             << " acknowledged writes kept, " << total.checked_replies << " replies explained, "
             << total.lost_frames << " unacknowledged frames lost, " << total.cold_absorbed
             << " frames cold took, " << total.recycled << " lost pages of recycled segments, "
@@ -1075,7 +1089,8 @@ TEST_F(CrashTest, KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply) {
     if (!run.ok) break;
   }
   std::cout << "[crash] kill -9: " << seeds.size() << " kills, " << total.calls << " calls ("
-            << total.refused << " refused or timed out), " << total.acknowledged
+            << total.refused << " refused or timed out, " << total.reads_timed_out << " of "
+            << total.reads << " reads timed out), " << total.acknowledged
             << " acknowledged writes recovered, " << total.checked_replies << " replies explained"
             << '\n'
             << std::flush;

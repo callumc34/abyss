@@ -13,6 +13,7 @@
 
 #include "abyss/core/cold_store.h"
 #include "abyss/core/command_dispatcher.h"
+#include "abyss/core/completion.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
@@ -49,6 +50,9 @@ struct ReadAnswer {
 // (#170). Hot answers on the caller's thread until a miss; the rest,
 // that key on, is one job on the I/O pool.
 struct FanOut {
+  // Storage kept from one command to the next, at most.
+  static constexpr size_t kKeptElements = 1024;
+
   core::MultiKeyKind kind = core::MultiKeyKind::kMget;
   std::span<const std::string> keys;
   // The next key to read.
@@ -83,7 +87,9 @@ struct FanOut {
 // - EXISTS, TYPE, TTL and PTTL answer from a stub or a cold probe,
 //   and fill nothing.
 // Hot refuses a fill over fill_max_fraction of a shard's budget. Loads
-// that are not filled are shared by concurrent misses (Loader::LoadAs).
+// that are not filled are shared by concurrent misses: a miss that
+// finds one in flight joins it and ends, and its caller takes the
+// leader's result once it lands (Landed). No pool thread waits on one.
 // A key of another type answers WRONGTYPE without reading members.
 class ReadPath {
  public:
@@ -92,14 +98,27 @@ class ReadPath {
   // Hot's answer, on the caller's thread; nullopt on a miss.
   std::optional<ReadAnswer> TryHot(const core::ops::ReadOp& op);
   // A miss's answer from buffer and cold, on the pool, by `deadline`,
-  // the command's. A background fill inherits it.
-  ReadAnswer Miss(const core::ops::ReadOp& op, core::SteadyTime deadline);
+  // the command's. A background fill inherits it. nullopt: it joined
+  // another's load of the key, whose landing goes to `completion`.
+  std::optional<ReadAnswer> Miss(const core::ops::ReadOp& op, core::SteadyTime deadline,
+                                 Loader::FlightJoin& join, core::Completion completion);
+  // A joined miss's answer, once its load has landed in `join`.
+  core::Result<core::RespValue> Landed(const core::ops::ReadOp& op, const Loader::FlightJoin& join);
   // Hot's answers from `fan.next` on, stopping at the first miss.
   void FanOutHot(FanOut& fan);
   // Every key left, on the pool: hot, then buffer and cold on a miss.
-  void FanOutMiss(FanOut& fan, core::SteadyTime deadline);
-  // A miss that will not be read: its error, counted as a read's.
+  // False when the key at `fan.next` joined a load in flight.
+  bool FanOutMiss(FanOut& fan, core::SteadyTime deadline, Loader::FlightJoin& join,
+                  core::Completion completion);
+  // The joined key's answer, folded in.
+  void FanOutLanded(FanOut& fan, const Loader::FlightJoin& join);
+  // Loader::CancelJoin, for a join a miss made.
+  bool CancelJoin(Loader::FlightJoin& join) { return loader_.CancelJoin(join); }
+  // A miss's error as the read's reply.
   core::Result<core::RespValue> Failed(const core::ops::ReadOp& op, const core::Error& error);
+  // On the caller's thread, once per command it replies: counts a
+  // timeout of a read that went to cold, a point read's or a scan's.
+  void Replied(metrics::IoKind kind, const core::Result<core::RespValue>& reply);
   // Its miss's kind on the pool: a scan loads the whole key.
   static metrics::IoKind KindOf(const core::ops::ReadOp& op);
 
@@ -111,7 +130,11 @@ class ReadPath {
   std::optional<ReadAnswer> FromHot(const core::ops::ReadOp& op,
                                     std::optional<Loader::Source> filled_from = std::nullopt);
   // Loads `key` as `type`, filling hot when admitted.
-  ReadAnswer Fill(const core::ops::ReadOp& op, core::KeyType type, core::SteadyTime deadline);
+  std::optional<ReadAnswer> Fill(const core::ops::ReadOp& op, core::KeyType type,
+                                 core::SteadyTime deadline, Loader::FlightJoin& join,
+                                 core::Completion completion);
+  // A fan-out's read of its key at `fan.next`.
+  static core::ops::ReadOp KeyOp(const FanOut& fan);
   core::Result<core::RespValue> PointRead(const core::ops::ReadOp& op, core::KeyType type,
                                           core::SteadyTime deadline);
   // SCARD, ZCARD or HLEN: exact, reading no member but the delta's.
@@ -141,6 +164,7 @@ class ReadPath {
   metrics::CounterHandle hits_buffer_;
   metrics::CounterHandle hits_cold_;
   metrics::CounterHandle misses_;
+  metrics::CounterHandle cold_point_deadline_exceeded_;
   metrics::CounterHandle cold_scan_deadline_exceeded_;
   // By metrics::FillOutcome.
   std::array<metrics::CounterHandle, 8> fills_;

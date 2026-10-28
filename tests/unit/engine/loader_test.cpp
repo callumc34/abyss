@@ -23,6 +23,7 @@
 #include "abyss/consumer/compaction_buffer.h"
 #include "abyss/consumer/compaction_buffer_router.h"
 #include "abyss/core/cold_store.h"
+#include "abyss/core/completion.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
 #include "abyss/core/predicate.h"
@@ -33,6 +34,7 @@
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
 #include "decide_fixture.h"
+#include "event_inbox.h"
 #include "latch.h"
 #include "mock_cold_store.h"
 #include "on_exit.h"
@@ -628,6 +630,83 @@ TEST_F(LoaderTest, AJoinerTakenAsItTimesOutTakesTheLanding) {
   EXPECT_NE(std::get_if<hot::LoadedFull>(joined.value().get()), nullptr);
   EXPECT_EQ(loader_.JoinsForTesting(), 1U);
   EXPECT_TRUE(leader.get().has_value());
+}
+
+// A join that never waits: armed before the landing, the landing posts
+// once; landed first, Arm takes it with no post; cancelled first,
+// nothing lands. Each takes the leader's one read.
+TEST_F(LoaderTest, AnAsyncJoinTakesTheLeadersReadWithoutWaiting) {
+  std::atomic<int> loads{0};
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillRepeatedly([&](auto, auto, auto) {
+        ++loads;
+        entered.Open();
+        release.Wait();
+        return LoadAsResult{core::LoadedAs{
+            core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
+      });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  abyss::testing::EventInbox inbox;
+  const core::Completion completion{.sink = &inbox, .client_id = 1, .slot_seq = 1};
+  Loader::FlightJoin armed;
+  Loader::FlightJoin landed;
+  Loader::FlightJoin cancelled;
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  for (Loader::FlightJoin* join : {&armed, &landed, &cancelled}) {
+    EXPECT_FALSE(loader_.LoadAsOrJoin(0, "k", KeyType::kSet, Deadline(), nullptr, *join, completion)
+                     .has_value())
+        << "it waited, or loaded again";
+  }
+  EXPECT_EQ(loader_.JoinersForTesting(0), 3U);
+  EXPECT_TRUE(armed.Arm());
+  EXPECT_TRUE(loader_.CancelJoin(cancelled));
+  cancelled.Reset();
+  EXPECT_EQ(loader_.JoinersForTesting(0), 2U);
+
+  release.Open();
+  ASSERT_TRUE(leader.get().has_value());
+  std::optional<core::CompletionEvent> post = inbox.Take(core::SteadyClock::now() + 5s);
+  ASSERT_TRUE(post.has_value()) << "the armed join was not posted";
+  EXPECT_FALSE(landed.Arm()) << "it landed before it was armed";
+  for (Loader::FlightJoin* join : {&armed, &landed}) {
+    ASSERT_TRUE(join->result().has_value());
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
+    EXPECT_NE(std::get_if<hot::LoadedFull>(join->result().value().get()), nullptr);
+    join->Reset();
+  }
+  EXPECT_FALSE(inbox.Take(core::SteadyClock::now() + 50ms).has_value()) << "posted twice";
+  EXPECT_EQ(loads.load(), 1);
+  EXPECT_EQ(loader_.JoinersForTesting(0), 0U);
+  EXPECT_EQ(loader_.FlightsForTesting(0), 0U);
+}
+
+// The read path's fill never joins another's load: it leaves the key
+// to that load, and the caller reads through it.
+TEST_F(LoaderTest, AnInstallFindingAReadsLoadInFlightLeavesIt) {
+  abyss::testing::Latch entered;
+  abyss::testing::Latch release;
+  EXPECT_CALL(cold_, LoadKeyAs(std::string_view{"k"}, KeyType::kSet, _))
+      .WillOnce([&](auto, auto, auto) {
+        entered.Open();
+        release.Wait();
+        return LoadAsResult{core::LoadedAs{
+            core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
+      });
+  const abyss::testing::OnExit unblock([&] { release.Open(); });
+  auto leader = std::async(std::launch::async,
+                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  ASSERT_TRUE(entered.Wait());
+  auto filled = loader_.Install("k", KeyType::kSet, Deadline());
+  ASSERT_TRUE(filled.has_value()) << filled.error().message();
+  EXPECT_EQ(filled->fill, Loader::Fill::kPending);
+  EXPECT_FALSE(hot_.LoadPending("k")) << "its placeholder was left behind";
+  EXPECT_EQ(loader_.JoinsForTesting(), 0U);
+  release.Open();
+  ASSERT_TRUE(leader.get().has_value());
 }
 
 }  // namespace

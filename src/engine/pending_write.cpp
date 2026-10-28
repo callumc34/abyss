@@ -1,13 +1,25 @@
 #include "abyss/engine/pending_write.h"
 
+#include <cstddef>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "abyss/core/fatal.h"
 
 namespace abyss::engine {
 
 namespace {
+
+// Storage a write keeps for the next, at most: a huge command's is
+// let go rather than held by its connection.
+constexpr size_t kKeptElements = 1024;
+
+template <typename T>
+void Empty(std::vector<T>& v) {
+  v.clear();
+  if (v.capacity() > kKeptElements) v.shrink_to_fit();
+}
 
 // Touches nothing but the copy it was given.
 void PostResume(const core::Completion completion, core::Result<void> result) noexcept {
@@ -52,8 +64,8 @@ void PendingWrite::Reset(FlushAll /*flush*/, core::Completion completion,
   owner_ = std::this_thread::get_id();
   phase_ = Phase::kStart;
   phase_times_ = {};
-  shards_.clear();
-  spare_.clear();
+  Empty(shards_);
+  Empty(spare_);
   grows_ = false;
   await_memory_ = false;
   redecided_.reset();
@@ -72,7 +84,8 @@ void PendingWrite::Reset(FlushAll /*flush*/, core::Completion completion,
   foreign_.clear();
   foreign_next_ = 0;
   full_load_ = false;
-  completions_.clear();
+  Empty(completions_);
+  Empty(owned_);
   load_error_.reset();
   load_wake_.completion = completion;
   reply_ = {};
