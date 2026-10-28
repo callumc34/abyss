@@ -968,6 +968,16 @@ inline constexpr CounterDesc<> kNetBackpressureExitedTotal{
     .help = "Times a connection exited the back-pressure paused state.",
 };
 
+inline constexpr CounterDesc<> kNetLateCompletionsTotal{
+    .name = "abyss_net_late_completions_total",
+    .help = "Engine events that named no live or orphaned command, dropped.",
+};
+
+inline constexpr GaugeDesc<> kNetOrphans{
+    .name = "abyss_net_orphans",
+    .help = "Abandoned tasks and closed connections' pipelines still owed an engine event.",
+};
+
 // --- Cold TTL active expiry ------------------------------------------------
 
 inline constexpr CounterDesc<TtlSubject> kColdTtlSamplesTotal{

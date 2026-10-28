@@ -68,8 +68,13 @@ class DurableWait {
   // At the deadline, while waiting: the timeout reply. The write stays
   // applied. A post a notifier already took still arrives.
   Result<RespValue> Expire();
+  // While waiting, for a caller that has gone: no reply. A post a
+  // notifier already took still arrives.
+  void Abandon();
 
   bool waiting() const { return waiting_; }
+  // The reply it holds while waiting.
+  const Result<RespValue>& held() const { return reply_; }
   // No node linked and no post on its way: safe to Begin or free.
   bool Quiescent() const { return outstanding_ == 0; }
   size_t CapacityForTesting() const { return 1 + more_.size(); }

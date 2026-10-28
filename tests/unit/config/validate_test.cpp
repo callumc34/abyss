@@ -603,6 +603,45 @@ TEST(ConfigValidate, RejectsZeroReaperTick) {
   EXPECT_NE(cfg.error().message().find("net.reaper_tick_ms"), std::string::npos);
 }
 
+TEST(ConfigValidate, MaxInflightCommandsLoadsAndIsAtLeastOne) {
+  auto defaults = Config::ParseFromYaml("net: {}\n");
+  ASSERT_TRUE(defaults.has_value()) << defaults.error().message();
+  EXPECT_EQ(defaults->net.max_inflight_commands, 1024U);
+
+  auto one = Config::ParseFromYaml("net:\n  max_inflight_commands: 1\n");
+  ASSERT_TRUE(one.has_value()) << one.error().message();
+  EXPECT_EQ(one->net.max_inflight_commands, 1U);
+
+  auto zero = Config::ParseFromYaml("net:\n  max_inflight_commands: 0\n");
+  ASSERT_FALSE(zero.has_value());
+  EXPECT_NE(zero.error().message().find("net.max_inflight_commands"), std::string::npos)
+      << zero.error().message();
+}
+
+// It bounds a stop that includes the cold drain and a cold read
+// running to its command deadline.
+TEST(ConfigValidate, ShutdownTimeoutOutlastsTheDrainAndACommand) {
+  auto defaults = Config::ParseFromYaml("net: {}\n");
+  ASSERT_TRUE(defaults.has_value()) << defaults.error().message();
+  EXPECT_EQ(defaults->net.shutdown_timeout, std::chrono::seconds{60});
+
+  auto set = Config::ParseFromYaml("net:\n  shutdown_timeout_seconds: 21\n");
+  ASSERT_TRUE(set.has_value()) << set.error().message();
+  EXPECT_EQ(set->net.shutdown_timeout, std::chrono::seconds{21});
+
+  auto short_of = Config::ParseFromYaml(
+      "net:\n  shutdown_timeout_seconds: 20\n"
+      "cold_consumer:\n  drain_grace_seconds: 15\n"
+      "engine:\n  command_timeout_ms: 5000\n");
+  ASSERT_FALSE(short_of.has_value());
+  for (const std::string_view key :
+       {"net.shutdown_timeout_seconds", "cold_consumer.drain_grace_seconds",
+        "engine.command_timeout_ms"}) {
+    EXPECT_NE(short_of.error().message().find(key), std::string::npos)
+        << short_of.error().message();
+  }
+}
+
 TEST(ConfigValidate, AcceptsZeroIoThreadsAsAuto) {
   auto cfg = Config::ParseFromYaml("net:\n  io_threads: 0\n");
   ASSERT_TRUE(cfg.has_value()) << cfg.error().message();

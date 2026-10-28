@@ -131,7 +131,14 @@ struct NetConfig {
   size_t write_resume_bytes = 1048576;
   size_t write_hard_limit_bytes = 16777216;
   std::chrono::seconds shutdown_grace{30};
+  // Bounds the rest of a stop once connections are closed: the engine's
+  // stop, cold drain included, and the reactors'. Past it the process
+  // exits nonzero.
+  std::chrono::seconds shutdown_timeout{60};
   std::chrono::milliseconds reaper_tick{1000};
+  // Commands a connection has dispatched and not yet written; reading
+  // pauses at the cap.
+  uint32_t max_inflight_commands = 1024;
 };
 
 struct EngineConfig {

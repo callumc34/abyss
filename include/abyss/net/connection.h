@@ -26,6 +26,8 @@ struct NetMetrics {
   metrics::GaugeHandle backpressure_active;
   metrics::CounterHandle backpressure_entered;
   metrics::CounterHandle backpressure_exited;
+  metrics::CounterHandle late_completions;
+  metrics::GaugeHandle orphans;
 
   metrics::CounterHandle Closed(metrics::CloseReason r) const noexcept;
   metrics::CounterHandle Rejected(metrics::RejectReason r) const noexcept;
@@ -43,10 +45,14 @@ struct NetMetrics {
 
 struct ConnectionConfig {
   size_t max_read_buffer_bytes = 67108864;
+  // Reading pauses, and dispatch stops, while the unwritten bytes and
+  // the replies still held for them reach this.
   size_t write_backpressure_bytes = 4194304;
   size_t write_resume_bytes = 1048576;
   size_t write_hard_limit_bytes = 16777216;
   std::chrono::seconds idle_timeout{300};
+  // Commands dispatched and not yet written; reading pauses at the cap.
+  size_t max_inflight_commands = 1024;
 };
 
 // All non-const methods run on the owning reactor thread.
@@ -55,7 +61,7 @@ class Connection {
   Connection(Fd fd, uint32_t remote_ipv4, uint16_t remote_port, uint64_t client_id, Poller& poller,
              const resp::CommandRegistry& registry, resp::PipelineDependencies deps,
              ConnectionConfig config, NetMetrics& net_metrics,
-             core::SteadyClockFn clock = core::DefaultSteadyClock);
+             core::SteadyClockFn clock = core::DefaultSteadyClock, resp::PipelineHost host = {});
   ~Connection();
 
   Connection(const Connection&) = delete;
@@ -72,6 +78,7 @@ class Connection {
   std::optional<metrics::CloseReason> CloseReasonValue() const noexcept;
 
   core::SteadyTime LastActivity() const noexcept { return last_activity_; }
+  // Quiet past the idle timeout with nothing in flight.
   bool IsIdle(core::SteadyTime now) const noexcept;
 
   bool ReadingPaused() const noexcept { return reading_paused_; }
@@ -80,28 +87,45 @@ class Connection {
   // published by the server-scoped snapshotter.
   size_t ReadBufferHighWater() const noexcept { return read_buf_high_water_; }
   bool HasPendingWrites() const noexcept { return WriteBufferBytes() > 0; }
+  // Commands in flight, or replies not yet written.
+  bool Busy() const noexcept;
 
   core::Result<void> Arm();
 
   void OnReadable();
   void OnWritable();
+  // After engine events for its pipeline: writes what is ready, and
+  // dispatches what they let through.
+  void Pump();
+  // Its pipeline's deadline: what is past it ends. A pending command's
+  // task still busy is handed back, for the reactor's orphans.
+  std::unique_ptr<resp::OrphanTask> OnTimer(core::SteadyTime now);
+  // The server is stopping: nothing more is read or dispatched.
+  void StopDispatch();
+
+  // Null once released.
+  resp::RequestPipeline* Pipeline() noexcept { return pipeline_.get(); }
+  // Once closed, for the reactor's orphans.
+  std::unique_ptr<resp::RequestPipeline> ReleasePipeline();
 
   // Idempotent; first reason wins.
   void Close(metrics::CloseReason reason);
 
  private:
+  // Parses and dispatches what is buffered.
+  resp::RequestPipeline::FeedResult Feed();
+  // Reads until the socket would block or the buffer is at its cap:
+  // true at the cap.
+  bool ReadSocket();
+  bool ReadAllowed() const noexcept;
   void TryDrainWrite();
-  void MaybePauseReading();
-  void MaybeResumeReading();
+  void UpdateBackpressure();
   bool EnforceWriteHardLimit();
-  // Returns bytes consumed by the pipeline this pass; maps the pipeline's
-  // close signal onto pending_close_.
-  size_t DispatchPipelineOutput();
   void RecordReadBufferHighWater();
   void TouchActivity();
 
-  // Lazy poller interest: kReadable iff not paused; kWritable iff write
-  // buffer has pending bytes. Avoids spurious POLLOUT storms on level-
+  // Lazy poller interest: kReadable iff reading is allowed; kWritable iff
+  // write buffer has pending bytes. Avoids spurious POLLOUT storms on level-
   // triggered backends (WSAPoll) for idle connections.
   EventKind DesiredInterest() const noexcept;
   bool SyncPollerInterest();
@@ -126,14 +150,20 @@ class Connection {
 
   core::SteadyTime last_activity_;
   bool reading_paused_ = false;
+  // The last Feed stopped with input it may not dispatch yet.
+  bool feed_blocked_ = false;
+  bool dispatch_stopped_ = false;
+  // The socket read to would-block since its last readable event.
+  bool socket_drained_ = false;
+  bool read_allowed_ = true;
   // Single source of truth for "this connection currently contributes to
   // backpressure_active". Set only after a pause transition is committed to the
   // poller, so a failed Modify can neither leak an increment nor produce a
   // decrement that was never matched.
   bool backpressure_counted_ = false;
-  // A close the pipeline/transport requested; fires deterministically once the
-  // pending write buffer drains. Replaces the old close_after_drain_ bool so
-  // the close reason is carried, not just the fact of a close.
+  // A close the pipeline/transport requested; fires deterministically once
+  // every command before it has replied and the write buffer drains. The
+  // close reason is carried, not just the fact of a close.
   std::optional<metrics::CloseReason> pending_close_;
   bool closed_ = false;
   std::optional<metrics::CloseReason> close_reason_;

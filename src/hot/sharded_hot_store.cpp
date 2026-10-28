@@ -131,10 +131,13 @@ ShardedHotStore::ShardedHotStore(ShardedHotStoreConfig config) : config_(std::mo
                  {"max_memory_bytes", static_cast<uint64_t>(config_.max_memory_bytes)});
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): as FailLoadWaits.
+ShardedHotStore::~ShardedHotStore() { FailLoadWaits(); }
+
 // Only a lock or the error's allocation can throw here, and either at
 // teardown may terminate.
 // NOLINTNEXTLINE(bugprone-exception-escape)
-ShardedHotStore::~ShardedHotStore() {
+void ShardedHotStore::FailLoadWaits() {
   const core::Result<void> gone =
       std::unexpected(core::Error{core::ErrorCode::kUnavailable, "hot store shutting down"});
   for (auto& shard : shards_) {

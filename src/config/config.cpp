@@ -162,7 +162,9 @@ core::Result<void> ParseNet(const YamlCursor& cur, NetConfig& out) {
       .Optional("write_resume_bytes", out.write_resume_bytes)
       .Optional("write_hard_limit_bytes", out.write_hard_limit_bytes)
       .Optional("shutdown_grace_seconds", out.shutdown_grace)
+      .Optional("shutdown_timeout_seconds", out.shutdown_timeout)
       .Optional("reaper_tick_ms", out.reaper_tick)
+      .Optional("max_inflight_commands", out.max_inflight_commands)
       .Finish();
 }
 

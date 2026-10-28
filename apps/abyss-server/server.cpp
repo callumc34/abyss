@@ -275,8 +275,10 @@ bool Server::Initialize() {
               .write_resume_bytes = config_.net.write_resume_bytes,
               .write_hard_limit_bytes = config_.net.write_hard_limit_bytes,
               .idle_timeout = config_.net.idle_timeout,
+              .max_inflight_commands = config_.net.max_inflight_commands,
           },
       .shutdown_grace = config_.net.shutdown_grace,
+      .shutdown_timeout = config_.net.shutdown_timeout,
       .reaper_tick = config_.net.reaper_tick,
   };
   tcp_server_ = std::make_unique<net::TcpServer>(tcp_config, resp::GlobalRegistry(), pipeline_deps);
@@ -518,6 +520,41 @@ void Server::NotifyReady() {
   ready_fd_ = -1;
 }
 
+// Every owner fails its waiters, and every thread that can post an
+// engine event is joined; the objects stay.
+void Server::StopEngine() {
+  // Queued cold reads fail unrun, and running ones finish before what
+  // they read from stops.
+  if (io_pool_) io_pool_->Shutdown();
+
+  // Stop the eviction worker before the cold pool: its tombstone-GC tick reads
+  // the cold consumers' drained seq, so it must not run once the pool stops.
+  if (hot_eviction_worker_) hot_eviction_worker_->Stop();
+  // Graceful cold drain (G6): flush the in-memory compaction buffer to durable
+  // cold and advance the cold commit BEFORE the hard stop, bounded by the
+  // shutdown grace budget. A rolling restart no longer discards the buffer and
+  // forces a full cold replay. The drain Checkpoints (durable) before
+  // committing, so the commit is never past durable; on deadline expiry the
+  // remaining slice replays from the WAL (correctness preserved). Cold store
+  // is stopped AFTER the pool so the drain's ApplyBatch sees a live store.
+  if (cold_pool_) {
+    cold_pool_->Stop(
+        std::chrono::duration_cast<std::chrono::milliseconds>(config_.cold_consumer.drain_grace));
+  }
+  if (queue_) {
+    // Every committing consumer has stopped, so this persist captures their
+    // final offsets; a restart then replays only what was never committed.
+    if (auto r = queue_->FlushOffsets(); !r.has_value()) {
+      ABYSS_LOG_WARN("final offset persist failed; restart replays from the last checkpoint",
+                     {"err", std::string_view{r.error().message()}});
+    }
+    // The final flush, then the committers and preparers stop and every
+    // waiter on the log fails.
+    queue_->Shutdown();
+  }
+  if (hot_store_) hot_store_->FailLoadWaits();
+}
+
 void Server::Shutdown() {
   // Single-shot guard: only the first caller past kDraining runs teardown.
   // CAS from any pre-draining state to kDraining; a concurrent/repeat call
@@ -542,34 +579,17 @@ void Server::Shutdown() {
   if (admin_http_) admin_http_->Stop();
   if (metrics_http_) metrics_http_->Stop();
 
+  // Connections stop accepting, dispatching and then open; the engine
+  // stops while the reactors go on taking its events, so what a closed
+  // connection was still owed is cleaned up on its reactor; then the
+  // reactors stop. The engine's objects outlive them all.
   if (tcp_server_) {
-    tcp_server_->Stop();
-  }
-  // No command is left to post to: queued fills fail unrun, and running
-  // jobs finish before what they read from stops.
-  if (io_pool_) io_pool_->Shutdown();
-
-  // Stop the eviction worker before the cold pool: its tombstone-GC tick reads
-  // the cold consumers' drained seq, so it must not run once the pool stops.
-  if (hot_eviction_worker_) hot_eviction_worker_->Stop();
-  // Graceful cold drain (G6): flush the in-memory compaction buffer to durable
-  // cold and advance the cold commit BEFORE the hard stop, bounded by the
-  // shutdown grace budget. A rolling restart no longer discards the buffer and
-  // forces a full cold replay. The drain Checkpoints (durable) before
-  // committing, so the commit is never past durable; on deadline expiry the
-  // remaining slice replays from the WAL (correctness preserved). Cold store
-  // is stopped AFTER the pool so the drain's ApplyBatch sees a live store.
-  if (cold_pool_) {
-    cold_pool_->Stop(
-        std::chrono::duration_cast<std::chrono::milliseconds>(config_.cold_consumer.drain_grace));
-  }
-  // Every committing consumer has stopped, so this persist captures their
-  // final offsets; a restart then replays only what was never committed.
-  if (queue_) {
-    if (auto r = queue_->FlushOffsets(); !r.has_value()) {
-      ABYSS_LOG_WARN("final offset persist failed; restart replays from the last checkpoint",
-                     {"err", std::string_view{r.error().message()}});
-    }
+    tcp_server_->Shutdown(net::EngineStop{
+        .stop = [this] { StopEngine(); },
+        .running_jobs = [this] { return io_pool_ != nullptr ? io_pool_->RunningJobs() : 0; },
+    });
+  } else {
+    StopEngine();
   }
   if (cold_store_) {
     if (auto r = cold_store_->Stop(); !r.has_value()) {

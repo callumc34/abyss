@@ -170,6 +170,11 @@ void IoPool::Shutdown() {
   }
 }
 
+size_t IoPool::RunningJobs() const {
+  const std::scoped_lock lock(mu_);
+  return running_;
+}
+
 size_t IoPool::QueuedForTesting(metrics::IoQueue queue) const {
   const std::scoped_lock lock(mu_);
   if (queue == metrics::IoQueue::kBackground) return background_.size;

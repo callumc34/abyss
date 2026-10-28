@@ -399,6 +399,25 @@ core::Result<void> ValidateNet(const NetConfig& n) {
   if (n.reaper_tick.count() <= 0) {
     return std::unexpected(InvalidArg("net.reaper_tick_ms", "must be > 0 milliseconds"));
   }
+  if (n.max_inflight_commands < 1) {
+    return std::unexpected(InvalidArg("net.max_inflight_commands", "must be >= 1"));
+  }
+  return {};
+}
+
+// The stop's timeout covers the cold drain and a cold read still
+// running to its command deadline; shorter, a clean stop would exit
+// as stuck.
+core::Result<void> ValidateShutdownTimeout(const Config& c) {
+  const auto needed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(c.cold_consumer.drain_grace) +
+      c.engine.command_timeout;
+  if (c.net.shutdown_timeout <= needed) {
+    return std::unexpected(
+        InvalidArg("net.shutdown_timeout_seconds",
+                   "must be > cold_consumer.drain_grace_seconds + engine.command_timeout_ms (" +
+                       std::to_string(needed.count()) + " ms)"));
+  }
   return {};
 }
 
@@ -518,6 +537,7 @@ core::Result<void> Validate(const Config& config) {
   if (auto r = ValidatePortCollisions(config); !r) return r;
   if (auto r = ValidateRetentionVsEviction(config); !r) return r;
   if (auto r = ValidateLogCountVsShards(config); !r) return r;
+  if (auto r = ValidateShutdownTimeout(config); !r) return r;
   return {};
 }
 

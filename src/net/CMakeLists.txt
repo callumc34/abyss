@@ -1,6 +1,7 @@
 set(ABYSS_NET_SOURCES
   socket_ops.cpp
   connection.cpp
+  inbox.cpp
   reactor.cpp
   tcp_server.cpp
 )
