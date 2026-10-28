@@ -171,6 +171,10 @@ WalQueue::WalQueue(WalConfig config)
 // Only allocation can throw here, and an OOM at teardown may terminate.
 // NOLINTNEXTLINE(bugprone-exception-escape)
 WalQueue::~WalQueue() {
+  {
+    const std::scoped_lock lock(reaper_mu_);
+    ABYSS_DCHECK(pins_ == 0, "a retention pin outlived its queue");
+  }
   StopPersister();
   bool persist = false;
   {
