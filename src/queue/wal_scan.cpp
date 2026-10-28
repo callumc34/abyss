@@ -137,25 +137,7 @@ core::Result<void> WalQueue::Scan(std::span<const core::SequenceId> from,
         Invalid("scan bounds must cover all " + std::to_string(shards) + " shards"));
   }
   // Pinned for the scan, so no position it holds is reclaimed.
-  class Pin {
-   public:
-    explicit Pin(WalQueue& queue) : queue_(queue) {
-      const std::scoped_lock lock(queue_.reaper_mu_);
-      ++queue_.scans_;
-    }
-    ~Pin() {
-      const std::scoped_lock lock(queue_.reaper_mu_);
-      --queue_.scans_;
-    }
-    Pin(const Pin&) = delete;
-    Pin& operator=(const Pin&) = delete;
-    Pin(Pin&&) = delete;
-    Pin& operator=(Pin&&) = delete;
-
-   private:
-    WalQueue& queue_;
-  };
-  const Pin pin(*this);
+  const core::RetentionPin pin = PinRetention();
 
   const core::Durability visible = AckDurability();
   for (core::ShardId shard = 0; shard < shards; ++shard) {

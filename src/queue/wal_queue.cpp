@@ -490,9 +490,21 @@ core::Duration WalQueue::DurabilityLag() const {
   return std::chrono::duration_cast<core::Duration>(lag);
 }
 
+// Taken under reaper_mu_, so a sweep under way ends first.
+core::RetentionPin WalQueue::PinRetention() {
+  {
+    const std::scoped_lock lock(reaper_mu_);
+    ++pins_;
+  }
+  return core::RetentionPin([this] {
+    const std::scoped_lock lock(reaper_mu_);
+    --pins_;
+  });
+}
+
 void WalQueue::RunReaper() {
   const std::scoped_lock lock(reaper_mu_);
-  if (!reaper_ || scans_ > 0) return;
+  if (!reaper_ || pins_ > 0) return;
   auto result = reaper_->RunOnce();
   if (!result.has_value()) {
     reaper_failures_.fetch_add(1, std::memory_order_relaxed);

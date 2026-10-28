@@ -6,6 +6,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "abyss/core/durability.h"
@@ -30,6 +31,26 @@ struct QueueStats {
   SequenceId head_seq = 0;
   // Lowest first retained seq across shards.
   SequenceId first_seq = 0;
+};
+
+// While held, the queue reclaims nothing: a seq FirstSeq reports under
+// it stays readable until it is released, before the queue goes.
+class RetentionPin {
+ public:
+  RetentionPin() = default;
+  explicit RetentionPin(std::function<void()> release) : release_(std::move(release)) {}
+  RetentionPin(RetentionPin&& other) noexcept : release_(std::exchange(other.release_, {})) {}
+  RetentionPin& operator=(RetentionPin&&) = delete;
+  RetentionPin(const RetentionPin&) = delete;
+  RetentionPin& operator=(const RetentionPin&) = delete;
+  // A release only takes a lock, which failing may terminate.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
+  ~RetentionPin() {
+    if (release_) release_();
+  }
+
+ private:
+  std::function<void()> release_;
 };
 
 // Two-phase append (BeginAppend → Publish) is the race-free path for callers
@@ -125,6 +146,9 @@ class Queue {
 
   // Lowest seq still readable on `shard`.
   virtual Result<SequenceId> FirstSeq(ShardId shard) = 0;
+  // For a caller that reads FirstSeq and then reads from it. A queue
+  // that never reclaims returns an empty pin; a wrapper forwards it.
+  virtual RetentionPin PinRetention() = 0;
   // Min persisted committed offset across retention consumers (the retention
   // floor); FirstSeq when any retention consumer has none persisted.
   virtual Result<SequenceId> OldestRetained(ShardId shard) = 0;
