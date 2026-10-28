@@ -269,7 +269,8 @@ bool Sequencer::Expire(PendingWrite& write) {
 // Deadlock-free: hot shard locks are taken ascending, then each
 // stream's append_mu_ inside Reserve, and nothing waits under a hot
 // lock: admission, spare segments, loads, cold drain and durability
-// are all waited for with every lock released.
+// are all waited for with every lock released. A write takes every
+// placeholder it owns in one hold, so its foreign waits form no cycle.
 Step Sequencer::WriteAttempt(PendingWrite& write) {
   using Phase = PendingWrite::Phase;
   Phases phases(*this, write.phase_times_);
@@ -911,6 +912,7 @@ Step Sequencer::Abandon(PendingWrite& write) {
       return Done(write, std::unexpected(queue_.AdmissionTimedOut(shard)));
     case WaitReason::kSpare:
       if (woken) queue_.FinishWait(core::QueueWait::kSpare, shard, write);
+      if (failed) return Done(write, std::unexpected(wake->error()));
       return Done(write, std::unexpected(SpareTimedOut(write.flush_)));
     case WaitReason::kBackpressure:
       if (woken) buffers_.FinishDrainWait(shard, write);

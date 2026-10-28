@@ -233,8 +233,13 @@ TEST_F(HoldAllocTest, ASmallSetOverAResidentKeyAllocatesLittleUnderItsHold) {
 }
 
 // The whole of a resident SET's write under process_crash, the fast
-// path: nothing past what the blocking write path took, 23 with
-// libc++ (its shards, entries and reservation among them).
+// path: nothing past what the blocking write path took (its shards,
+// entries and reservation among them), per standard library.
+#ifdef _MSC_VER
+constexpr std::size_t kAllocsPerWrite = 25;
+#else
+constexpr std::size_t kAllocsPerWrite = 23;
+#endif
 TEST_F(HoldAllocTest, ASmallSetOverAResidentKeyAllocatesNoMoreThanTheBlockingPath) {
   const std::string key(32, 'k');
   std::size_t fewest = SIZE_MAX;
@@ -253,7 +258,7 @@ TEST_F(HoldAllocTest, ASmallSetOverAResidentKeyAllocatesNoMoreThanTheBlockingPat
   }
   RecordProperty("allocs_per_write", static_cast<int>(most));
   std::cout << "allocations per write: " << fewest << ".." << most << '\n';
-  EXPECT_LE(most, 23U);
+  EXPECT_LE(most, kAllocsPerWrite);
 }
 
 TEST(FillAllocTest, WhatAFillEvictsIsFreedAfterTheHold) {

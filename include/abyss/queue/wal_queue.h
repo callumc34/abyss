@@ -197,6 +197,8 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   void SetBatchCommitHookForTesting(const std::function<void(std::size_t committed)>& hook);
   // While paused, `log` prepares no spare segments.
   void PauseSegmentPreparerForTesting(uint32_t log, bool paused);
+  // The destructor's first step: every stream refuses from here on.
+  void StopStreamsForTesting();
   // The next removal of a reclaimed segment's file in `log` fails.
   void InjectSegmentRemoveErrorForTesting(uint32_t log, core::Error error);
   // For tests that look at how a shard's reads locate frames.

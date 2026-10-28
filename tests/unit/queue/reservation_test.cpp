@@ -28,6 +28,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
+#include "abyss/core/wait_list.h"
 #include "abyss/metrics/testing.h"
 #include "abyss/queue/frame.h"
 #include "abyss/queue/wal_queue.h"
@@ -338,6 +339,72 @@ TEST_F(ReservationTest, AWindowRefusalConsumesNothing) {
   const auto read = ReadAll(0);
   ASSERT_EQ(read.size(), 3U);
   EXPECT_EQ(ValueBytes(read[2]), kLarge);
+}
+
+// Counts its wakes, from the preparer's thread.
+struct CountingWaiter final : core::Waiter {
+  void Wake(core::Result<void> result) noexcept override {
+    ok.store(result.has_value());
+    wakes.fetch_add(1);
+  }
+  std::atomic<int> wakes{0};
+  std::atomic<bool> ok{false};
+};
+
+// A woken spare waiter that meets a stopping stream ends its wait and
+// hands the wake on, so a waiter linked behind it is woken too.
+TEST_F(ReservationTest, AWokenSpareWaiterThatMeetsAStopHandsItsWakeOn) {
+  auto config = Config(1);
+  config.segment_size_bytes = kHeaderBlock + (std::size_t{64} << 10);
+  OpenWith(config);
+  queue_->PauseSegmentPreparerForTesting(0, true);
+  const abyss::testing::OnExit resume([this] { queue_->PauseSegmentPreparerForTesting(0, false); });
+  std::vector<core::QueueEntry> large{Write("large", kLarge)};
+  const std::array parts{ShardEntries{.shard = 0, .entries = large}};
+  const auto exhaust = [&] {
+    for (int i = 0; i < 100; ++i) {
+      large[0] = Write("large", kLarge);
+      auto reserved = queue_->Reserve(parts);
+      if (!reserved.has_value()) return true;
+      queue_->Complete(std::move(*reserved));
+    }
+    return false;
+  };
+  const auto await_wake = [](const CountingWaiter& waiter) {
+    const auto until = std::chrono::steady_clock::now() + 10s;
+    while (waiter.wakes.load() == 0 && std::chrono::steady_clock::now() < until) {
+      std::this_thread::sleep_for(1ms);
+    }
+    return waiter.wakes.load() == 1;
+  };
+
+  ASSERT_TRUE(exhaust()) << "the spares never ran out";
+  CountingWaiter woken;
+  ASSERT_FALSE(queue_->WhenReady(core::QueueWait::kSpare, 0, woken, true).has_value());
+  queue_->PauseSegmentPreparerForTesting(0, false);
+  ASSERT_TRUE(await_wake(woken));
+  ASSERT_TRUE(woken.ok.load());
+
+  // A spare prepared in flight as the preparer pauses may let `next`
+  // pass at once; exhaust again until it waits.
+  queue_->PauseSegmentPreparerForTesting(0, true);
+  CountingWaiter next;
+  bool linked = false;
+  for (int attempt = 0; attempt < 50 && !linked; ++attempt) {
+    ASSERT_TRUE(exhaust()) << "the spares never ran out";
+    linked = !queue_->WhenReady(core::QueueWait::kSpare, 0, next, true).has_value();
+  }
+  ASSERT_TRUE(linked);
+
+  queue_->StopStreamsForTesting();
+  const auto unavailable = [](const std::optional<core::Result<void>>& outcome) {
+    return outcome.has_value() && !outcome->has_value() &&
+           outcome->error().code() == core::ErrorCode::kUnavailable;
+  };
+  EXPECT_TRUE(unavailable(queue_->WhenReady(core::QueueWait::kSpare, 0, woken, false)));
+  ASSERT_EQ(next.wakes.load(), 1) << "the wake died with a stopped waiter";
+  EXPECT_TRUE(next.ok.load());
+  EXPECT_TRUE(unavailable(queue_->WhenReady(core::QueueWait::kSpare, 0, next, false)));
 }
 
 TEST_F(ReservationTest, NoSpareRefusesWithoutConsumingASeq) {

@@ -466,6 +466,10 @@ void WalQueue::SetBatchCommitHookForTesting(
   for (auto& stream : streams_) stream->SetBatchCommitHookForTesting(hook);
 }
 
+void WalQueue::StopStreamsForTesting() {
+  for (auto& stream : streams_) stream->Shutdown();
+}
+
 void WalQueue::PauseSegmentPreparerForTesting(uint32_t log, bool paused) {
   Log& target = *logs_.at(log)->log;
   if (paused) {
@@ -611,8 +615,9 @@ std::optional<core::Result<void>> WalQueue::WhenReady(core::QueueWait wait, core
   const uint32_t log = shard % config_.log_count;
   if (wait == core::QueueWait::kAdmission) return window_.WhenAdmissible(log, waiter, first);
   // A stopping queue refuses Reserve, so a ready spare must not invite
-  // another attempt.
+  // another attempt. A woken waiter ends its wait, passing the wake on.
   if (streams_[shard]->stopping()) {
+    if (!first) logs_[log]->log->FinishSpare(waiter);
     return core::Result<void>{
         std::unexpected(core::Error{core::ErrorCode::kUnavailable, "WAL queue is shutting down"})};
   }
