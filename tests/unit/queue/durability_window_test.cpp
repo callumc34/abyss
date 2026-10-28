@@ -125,10 +125,13 @@ TEST_F(DurabilityWindowTest, ALogHeldByItsAgeStrandsNoOtherLogsWaiter) {
   auto other = AdmitAsync(20s, 1);
   EXPECT_TRUE(Waiting(1, 1)) << "log 1's waiter is not on a list of its own";
 
+  const uint64_t pops = window_->admission(0).StatsForTesting().locked_pops;
   window_->Release(1);
   ASSERT_EQ(other.wait_for(4s), std::future_status::ready) << "log 1's waiter was stranded";
   EXPECT_TRUE(other.get().has_value());
-  EXPECT_TRUE(Waiting(0, kHeld)) << "a held waiter left the list";
+  EXPECT_EQ(window_->admission(0).StatsForTesting().locked_pops, pops)
+      << "a release woke a log its age still holds";
+  EXPECT_EQ(window_->admission(0).size(), kHeld);
 
   window_->Shutdown();
   for (auto& admit : held) {
@@ -137,6 +140,27 @@ TEST_F(DurabilityWindowTest, ALogHeldByItsAgeStrandsNoOtherLogsWaiter) {
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
   }
+}
+
+// The flush that clears a log's age wakes it, and each waiter admitted
+// hands on to the next: every one passes with no further release.
+TEST_F(DurabilityWindowTest, AFlushThatClearsTheAgeAdmitsEveryHeldWaiter) {
+  constexpr std::size_t kHeld = (2 * core::WaitList::kWakeBatch) + 2;
+  window_->Add(1);
+  SetAge(age(), Clock::now() - (2 * kMaxAge));
+  std::vector<std::future<core::Result<void>>> held;
+  held.reserve(kHeld);
+  for (std::size_t i = 0; i < kHeld; ++i) held.push_back(AdmitAsync(20s, 0));
+  ASSERT_TRUE(Waiting(0, kHeld));
+
+  window_->Add(1);
+  SetAge(age(), Clock::now());
+  window_->Release(1);
+  for (auto& admit : held) {
+    ASSERT_EQ(admit.wait_for(10s), std::future_status::ready) << "a held waiter was stranded";
+    EXPECT_TRUE(admit.get().has_value());
+  }
+  EXPECT_EQ(window_->admission(0).size(), 0U);
 }
 
 TEST_F(DurabilityWindowTest, RejectsAtTheDeadline) {
