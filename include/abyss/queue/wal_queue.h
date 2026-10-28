@@ -118,6 +118,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   core::Result<bool> AwaitDurable(core::ShardId shard, core::SequenceId seq,
                                   core::Durability durability, core::Duration timeout) override;
   core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override;
+  core::RetentionPin PinRetention() override;
   core::Result<core::SequenceId> OldestRetained(core::ShardId shard) override;
   core::Result<core::SequenceId> TailSeq(core::ShardId shard) override;
   core::Result<core::QueueStats> Stats() override;
@@ -242,11 +243,11 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   bool persister_stop_ ABYSS_GUARDED_BY(persister_mu_) = false;
   std::thread persister_;
 
-  // Sweeps run from the persister, one at a time, and never during a
-  // Scan.
+  // Sweeps run from the persister, one at a time, and never while
+  // retention is pinned, as a Scan pins it.
   std::mutex reaper_mu_;
   std::unique_ptr<SegmentReaper> reaper_ ABYSS_GUARDED_BY(reaper_mu_);
-  uint32_t scans_ ABYSS_GUARDED_BY(reaper_mu_) = 0;
+  uint32_t pins_ ABYSS_GUARDED_BY(reaper_mu_) = 0;
 };
 
 }  // namespace abyss::queue

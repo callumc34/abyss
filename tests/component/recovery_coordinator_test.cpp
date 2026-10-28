@@ -27,6 +27,7 @@
 #include "abyss/core/durability.h"
 #include "abyss/core/eviction_policy.h"
 #include "abyss/core/ops.h"
+#include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
@@ -37,6 +38,7 @@
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
 #include "abyss/queue/wal_queue.h"
+#include "forwarding_queue.h"
 #include "temp_dir.h"
 
 namespace abyss::engine {
@@ -79,6 +81,7 @@ class MemoryColdStore : public core::ColdStore {
         for (const auto key : del->keys) state_.erase(std::string(key));
         continue;
       }
+      ++applied_;
       Value value;
       for (const auto& arg : core::ops::CanonicalCommand(op).args) value.op += arg + " ";
       if (const auto* set = std::get_if<core::ops::StringSet>(&op)) value.text = set->value;
@@ -137,10 +140,16 @@ class MemoryColdStore : public core::ColdStore {
     return state_;
   }
   void FailWipes() { fail_wipes_.store(true); }
+  // Ops applied, a replayed one each time.
+  uint64_t Applied() const {
+    const std::scoped_lock lock(mu_);
+    return applied_;
+  }
 
  private:
   mutable std::mutex mu_;
   std::map<std::string, Value> state_;
+  uint64_t applied_ = 0;
   std::atomic<bool> fail_wipes_{false};
 };
 
@@ -176,10 +185,12 @@ struct Node {
   }
 
   // Runs the coordinator, cancelling it if it outlives `bound`, so a
-  // hang fails the test instead of stalling the suite.
-  core::Result<void> Recover(uint32_t parallelism, std::chrono::seconds bound = 30s) const {
+  // hang fails the test instead of stalling the suite. It reads the log
+  // through `via` when given.
+  core::Result<void> Recover(uint32_t parallelism, std::chrono::seconds bound = 30s,
+                             core::Queue* via = nullptr) const {
     BoundedThreadShardScheduler scheduler(16);
-    RecoveryCoordinator coordinator(*queue, *cold_pool, *hot, scheduler,
+    RecoveryCoordinator coordinator(via != nullptr ? *via : *queue, *cold_pool, *hot, scheduler,
                                     RecoveryConfig{.replay_parallelism = parallelism});
     std::atomic<bool> cancel{false};
     auto run = std::async(std::launch::async, [&] { return coordinator.Run(cancel); });
@@ -334,6 +345,85 @@ TEST_F(RecoveryCoordinatorScanTest, OneScanRebuildsHotAndColdToTheLog) {
     }
   }
   EXPECT_GT(in_hot, model.size() / 2);
+}
+
+// Sweeps once, as recovery reads its first FirstSeq: where a sweep
+// that lands before the scan pins retention would.
+class SweepOnFirstSeq : public testing::ForwardingQueue {
+ public:
+  explicit SweepOnFirstSeq(queue::WalQueue& wal) : ForwardingQueue(wal), wal_(wal) {}
+
+  core::Result<core::SequenceId> FirstSeq(core::ShardId shard) override {
+    auto first = inner().FirstSeq(shard);
+    if (!swept_.exchange(true)) {
+      EXPECT_TRUE(wal_.FlushOffsets().has_value());
+    }
+    return first;
+  }
+
+ private:
+  queue::WalQueue& wal_;
+  std::atomic<bool> swept_{false};
+};
+
+// The first segment is sealed and wholly below cold's persisted commit,
+// but unswept at the restart. A sweep as recovery reads FirstSeq would
+// reclaim what hot is to replay; recovery has pinned retention, so it
+// reclaims nothing, and each entry is replayed once, none skipped.
+TEST_F(RecoveryCoordinatorScanTest, ASweepAsRecoveryReadsFirstSeqTakesNothingItReplays) {
+  constexpr uint32_t kShards = 2;
+  const auto wal = dir_.Sub("wal");
+  std::vector<std::string> keys;
+  std::vector<core::SequenceId> committed(kShards);
+  uint64_t after_commit = 0;
+  {
+    auto opened = queue::WalQueue::Open(WalConfigFor(wal, kShards));
+    ASSERT_TRUE(opened.has_value()) << opened.error().message();
+    auto& queue = **opened;
+    const auto write = [&] {
+      const auto shard = static_cast<core::ShardId>(keys.size() % kShards);
+      keys.push_back(Key(shard, "k" + std::to_string(keys.size()), kShards));
+      Append(queue, shard, WriteEntry(keys.back(), "v" + std::to_string(keys.size())));
+    };
+    while (queue.ListSealedSegments().empty()) {
+      ASSERT_LT(keys.size(), 100'000U);
+      write();
+    }
+    for (core::ShardId s = 0; s < kShards; ++s) {
+      committed[s] = queue.TailSeq(s).value();
+      ASSERT_TRUE(queue.AwaitDurable(s, committed[s], core::Durability::kPowerLoss, 10s).value());
+      ASSERT_TRUE(queue.CommitOffset(core::kColdConsumer, s, committed[s]).has_value());
+    }
+    {
+      // Both checkpoint slots hold the commits; pinned, nothing is swept.
+      const core::RetentionPin pin = queue.PinRetention();
+      ASSERT_TRUE(queue.FlushOffsets().has_value());
+      ASSERT_TRUE(queue.FlushOffsets().has_value());
+    }
+    for (int i = 0; i < 100; ++i) write();
+    after_commit = 100;
+  }
+
+  Node node(wal, kShards);
+  ASSERT_TRUE(node.queue != nullptr);
+  for (core::ShardId s = 0; s < kShards; ++s) {
+    ASSERT_EQ(node.queue->FirstSeq(s).value(), core::kFirstSeq) << "shard " << s;
+  }
+  SweepOnFirstSeq sweeping(*node.queue);
+  auto recovered = node.Recover(2, 30s, &sweeping);
+  ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+
+  // Hot rebuilt every entry from the first seq, cold every one past its
+  // commit, each once.
+  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kRecoveryHotEntriesReplayed),
+            static_cast<double>(keys.size()));
+  EXPECT_EQ(node.cold.Applied(), after_commit);
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    EXPECT_EQ(node.HotGet(keys[i]), "v" + std::to_string(i + 1)) << keys[i];
+  }
+  // The sweep had something to take: unpinned, it reclaims it now.
+  ASSERT_TRUE(node.queue->FlushOffsets().has_value());
+  EXPECT_GT(node.queue->FirstSeq(0).value(), core::kFirstSeq);
 }
 
 // A wipe that never succeeds fails recovery once drain_grace is spent.

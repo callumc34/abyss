@@ -68,6 +68,8 @@ class MockQueue : public core::Queue {
                core::Duration timeout),
               (override));
   MOCK_METHOD(core::Result<core::SequenceId>, FirstSeq, (core::ShardId shard), (override));
+  // The fake never reclaims.
+  core::RetentionPin PinRetention() override { return {}; }
   MOCK_METHOD(core::Result<core::SequenceId>, OldestRetained, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::SequenceId>, TailSeq, (core::ShardId shard), (override));
   MOCK_METHOD(core::Result<core::QueueStats>, Stats, (), (override));
