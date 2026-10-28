@@ -4,6 +4,7 @@ add_library(abyss_resp
   command_registry.cpp
   predicate_extractor.cpp
   request_pipeline.cpp
+  orphans.cpp
   metrics.cpp
   node_identity.cpp
   info.cpp

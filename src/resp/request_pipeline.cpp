@@ -1,9 +1,8 @@
 #include "abyss/resp/request_pipeline.h"
 
+#include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -13,7 +12,6 @@
 #include "abyss/core/ascii.h"
 #include "abyss/core/fatal.h"
 #include "abyss/core/ops.h"
-#include "abyss/core/thread_annotations.h"
 #include "abyss/log/log.h"
 #include "abyss/metrics/names.h"
 #include "abyss/resp/admin_handlers.h"
@@ -33,6 +31,11 @@ using core::RespCommand;
 using core::RespValue;
 using metrics::RequestStatus;
 
+// A ring grows towards the cap only as a deep pipeline needs it, and
+// gives back what is past kKeptSlots once it empties.
+constexpr size_t kFirstSlots = 4;
+constexpr size_t kKeptSlots = 16;
+
 ErrorPrefix MapErrorCode(core::ErrorCode code) {
   switch (code) {
     case core::ErrorCode::kWrongType:
@@ -46,149 +49,272 @@ ErrorPrefix MapErrorCode(core::ErrorCode code) {
 
 }  // namespace
 
-// The engine's events for this pipeline, in order. Warm, a post
-// allocates nothing; the loop lets it go only once nothing of its
-// command is outstanding, so no poster is still inside it.
-class RequestPipeline::Inbox final : public core::CompletionSink {
- public:
-  // NOLINTNEXTLINE(bugprone-exception-escape): an OOM may terminate.
-  void Post(std::span<const core::CompletionEvent> events) noexcept override {
-    const std::scoped_lock lock(mu_);
-    events_.insert(events_.end(), events.begin(), events.end());
-    cv_.notify_one();
-  }
+struct RequestPipeline::Entry {
+  enum class State : uint8_t { kFree, kPending, kSequenced, kReplied, kDrained };
 
-  // The next event; nullopt once `deadline` passes with none.
-  std::optional<core::CompletionEvent> Take(std::optional<core::SteadyTime> deadline) {
-    std::unique_lock lock(mu_);
-    const auto ready = [this] ABYSS_REQUIRES(mu_) { return next_ < events_.size(); };
-    if (!deadline.has_value()) {
-      cv_.wait(lock, ready);
-    } else if (!cv_.wait_until(lock, *deadline, ready)) {
-      return std::nullopt;
-    }
-    core::CompletionEvent event = std::move(events_[next_++]);
-    if (next_ == events_.size()) {
-      events_.clear();
-      next_ = 0;
-    }
-    return event;
-  }
-
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::vector<core::CompletionEvent> events_ ABYSS_GUARDED_BY(mu_);
-  size_t next_ ABYSS_GUARDED_BY(mu_) = 0;
+  State state = State::kFree;
+  uint64_t seq = 0;
+  core::Slot slot;
+  RespValue reply;
+  // The encoded size of its reply, or of the one its durable wait holds.
+  size_t reply_bytes = 0;
+  // For its metrics, and an engine error's log line.
+  std::string_view name;
+  std::string_view what;
+  std::chrono::steady_clock::time_point started;
 };
 
 RequestPipeline::RequestPipeline(const CommandRegistry& registry, ConnectionState state,
-                                 Dependencies deps)
+                                 Dependencies deps, PipelineHost host, PipelineLimits limits)
     : registry_(registry),
       deps_(deps),
+      host_(host),
+      limits_(limits),
       state_(std::move(state)),
-      inbox_(std::make_unique<Inbox>()) {}
+      timer_(state_.client_id) {}
+
+size_t RequestPipeline::EntryBytesForTesting() {
+  return sizeof(Entry) + sizeof(std::unique_ptr<Entry>);
+}
 
 RequestPipeline::~RequestPipeline() {
   ABYSS_DCHECK(Quiescent(), "a pipeline closed with a command outstanding");
 }
 
-RequestPipeline::ProcessResult RequestPipeline::Process(std::span<const uint8_t> input,
-                                                        std::vector<uint8_t>& output) {
-  size_t consumed = 0;
-  while (consumed < input.size()) {
-    auto remaining = input.subspan(consumed);
-    auto parsed = Parser::ParseCommand(remaining);
+RequestPipeline::FeedResult RequestPipeline::Feed(std::span<const uint8_t> input,
+                                                  size_t unwritten) {
+  FeedResult result;
+  while (result.consumed < input.size()) {
+    if (!CanDispatch(unwritten)) {
+      result.blocked = true;
+      break;
+    }
+    auto parsed = Parser::ParseCommand(input.subspan(result.consumed));
     if (!parsed.has_value()) {
-      if (parsed.error().code() == core::ErrorCode::kIncomplete) {
-        break;
-      }
+      if (parsed.error().code() == core::ErrorCode::kIncomplete) break;
       ABYSS_LOG_DEBUG("parse error", {"client_id", state_.client_id},
                       {"err", std::string_view{parsed.error().message()}});
       if (deps_.metrics != nullptr) deps_.metrics->RecordParseError();
-      auto response = RespValue::Error(ErrorPrefix::kErr,
-                                       std::string("Protocol error: ") + parsed.error().message());
-      auto bytes = Serializer::Serialize(response);
-      output.insert(output.end(), bytes.begin(), bytes.end());
-      // Unframable input: emit the error, consume the lot, and fail-closed so
-      // the connection is torn down once the reply drains.
-      consumed = input.size();
-      close_reason_ = ProcessCloseReason::kProtocolError;
+      // Unframable input: its error goes out in order, the rest is
+      // dropped, and the connection closes once the replies drain.
+      Store(Acquire(), RespValue::Error(ErrorPrefix::kErr, std::string("Protocol error: ") +
+                                                               parsed.error().message()));
+      result.consumed = input.size();
+      close_request_ = CloseRequest::kProtocolError;
       break;
     }
-    auto response = Dispatch(std::move(parsed->command));
-    auto bytes = Serializer::Serialize(response);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-    consumed += parsed->bytes_consumed;
+    result.consumed += parsed->bytes_consumed;
+    DispatchCommand(std::move(parsed->command));
+    if (close_request_ != CloseRequest::kNone) break;
+  }
+  SyncTimer();
+  return result;
+}
 
-    if (close_reason_ != ProcessCloseReason::kNone) {
+void RequestPipeline::Drain(std::vector<uint8_t>& output) {
+  while (drain_ < tail_) {
+    Entry& entry = At(drain_);
+    if (entry.state != Entry::State::kReplied) break;
+    Serializer::Append(entry.reply, output);
+    Release(entry);
+    ++drain_;
+  }
+  Reclaim();
+}
+
+bool RequestPipeline::OnEvent(const core::CompletionEvent& event) {
+  if (event.slot_seq <= head_ || event.slot_seq > tail_) return false;
+  Entry& entry = At(event.slot_seq - 1);
+  switch (event.kind) {
+    case core::CompletionKind::kResume: {
+      if (task_ == nullptr || task_seq_ != event.slot_seq) return false;
+      core::Outcome outcome = task_->Run(entry.slot, event.result);
+      if (entry.state == Entry::State::kPending) {
+        Settle(entry, std::move(outcome));
+      } else if (!TaskBusy()) {
+        // Its command already ended, at its deadline or with its
+        // connection: this was cleanup.
+        task_seq_ = 0;
+      }
       break;
     }
+    case core::CompletionKind::kDurable: {
+      if (entry.slot.durable.Quiescent()) return false;
+      auto released = entry.slot.durable.Arrived(event.result);
+      if (released.has_value() && entry.state == Entry::State::kSequenced) {
+        Reply(entry, *std::move(released));
+      }
+      break;
+    }
+    case core::CompletionKind::kSequenced:
+    case core::CompletionKind::kReplied:
+      return false;
   }
-  return {.bytes_consumed = consumed, .close_reason = close_reason_};
+  Reclaim();
+  SyncTimer();
+  return true;
 }
 
-RespValue RequestPipeline::Dispatch(RespCommand cmd) {
-  const auto start = std::chrono::steady_clock::now();
-  auto outcome = DispatchImpl(std::move(cmd));
-
-  if (deps_.metrics != nullptr) {
-    const auto elapsed = std::chrono::steady_clock::now() - start;
-    const double seconds = std::chrono::duration<double>(elapsed).count();
-    deps_.metrics->RecordDuration(outcome.cmd_name, seconds);
-    deps_.metrics->RecordRequest(outcome.cmd_name, outcome.status);
+std::unique_ptr<OrphanTask> RequestPipeline::Expire(core::SteadyTime now) {
+  std::unique_ptr<OrphanTask> orphan;
+  for (uint64_t pos = drain_; pos < tail_; ++pos) {
+    Entry& entry = At(pos);
+    if (entry.state != Entry::State::kPending && entry.state != Entry::State::kSequenced) continue;
+    // Every command gets the same timeout, so later ones are later.
+    if (entry.slot.deadline > now) break;
+    if (entry.state == Entry::State::kSequenced) {
+      // The write stays applied.
+      Reply(entry, entry.slot.durable.Expire());
+      continue;
+    }
+    // Never applied from here: what is still out of it lands as cleanup.
+    core::Result<RespValue> reply = task_->Abandon(entry.slot);
+    if (!TaskBusy()) {
+      task_seq_ = 0;
+    } else if (!closed_) {
+      orphan = std::make_unique<OrphanTask>();
+      orphan->slot.completion = entry.slot.completion;
+      orphan->slot.deadline = entry.slot.deadline;
+      orphan->task = std::move(task_);
+      task_seq_ = 0;
+    }
+    Reply(entry, std::move(reply));
   }
-  return std::move(outcome.response);
+  Reclaim();
+  SyncTimer();
+  return orphan;
 }
 
-RequestPipeline::DispatchOutcome RequestPipeline::DispatchImpl(RespCommand cmd) {
+std::optional<core::SteadyTime> RequestPipeline::NextDeadline() const {
+  for (uint64_t pos = drain_; pos < tail_; ++pos) {
+    const Entry& entry = At(pos);
+    if (entry.state == Entry::State::kPending || entry.state == Entry::State::kSequenced) {
+      return entry.slot.deadline;
+    }
+  }
+  return std::nullopt;
+}
+
+void RequestPipeline::StopDispatch() { stopped_ = true; }
+
+void RequestPipeline::Close() {
+  if (closed_) return;
+  closed_ = true;
+  for (uint64_t pos = drain_; pos < tail_; ++pos) {
+    Entry& entry = At(pos);
+    // It runs on to its outcome or its deadline, which nothing hears.
+    if (entry.state == Entry::State::kPending) continue;
+    if (entry.state == Entry::State::kSequenced) entry.slot.durable.Abandon();
+    Release(entry);
+  }
+  while (drain_ < tail_ && At(drain_).state == Entry::State::kDrained) ++drain_;
+  Reclaim();
+  SyncTimer();
+}
+
+bool RequestPipeline::Quiescent() const {
+  if (TaskBusy()) return false;
+  for (uint64_t pos = head_; pos < tail_; ++pos) {
+    if (!At(pos).slot.durable.Quiescent()) return false;
+  }
+  return true;
+}
+
+bool RequestPipeline::CanDispatch(size_t unwritten) const {
+  return !closed_ && !stopped_ && close_request_ == CloseRequest::kNone && task_seq_ == 0 &&
+         Slots() < limits_.max_inflight && unwritten + reply_bytes_ < limits_.reply_bytes;
+}
+
+RequestPipeline::Entry& RequestPipeline::Acquire() {
+  if (Slots() == ring_.size()) Grow();
+  Entry& entry = At(tail_);
+  const bool free = entry.state == Entry::State::kFree && entry.slot.durable.Quiescent();
+  ABYSS_DCHECK(free, "a slot reused while owed a post");
+  entry.seq = ++tail_;
+  entry.started = std::chrono::steady_clock::now();
+  return entry;
+}
+
+void RequestPipeline::Grow() {
+  const size_t size = ring_.size();
+  const size_t grown = std::min(std::max(size * 2, kFirstSlots), limits_.max_inflight);
+  ABYSS_DCHECK(grown > size, "a ring grown past its cap");
+  // Entries keep their addresses: a slot's nodes are linked by them.
+  std::vector<std::unique_ptr<Entry>> ring(grown);
+  for (uint64_t pos = head_; pos < tail_; ++pos) ring[pos % grown] = std::move(ring_[pos % size]);
+  for (auto& entry : ring) {
+    if (entry == nullptr) entry = std::make_unique<Entry>();
+  }
+  ring_ = std::move(ring);
+}
+
+void RequestPipeline::Reclaim() {
+  while (head_ < drain_) {
+    Entry& entry = At(head_);
+    // A slot is reused only once nothing will post to it, and a busy
+    // task's slot is the one it runs on.
+    if (!entry.slot.durable.Quiescent() || entry.seq == task_seq_) break;
+    entry.state = Entry::State::kFree;
+    ++head_;
+  }
+  if (head_ == tail_ && ring_.size() > kKeptSlots) ring_.resize(kKeptSlots);
+}
+
+void RequestPipeline::SyncTimer() {
+  if (host_.timers == nullptr) return;
+  if (auto deadline = NextDeadline()) {
+    host_.timers->Schedule(timer_, *deadline);
+  } else {
+    host_.timers->Cancel(timer_);
+  }
+}
+
+void RequestPipeline::DispatchCommand(RespCommand cmd) {
+  Entry& entry = Acquire();
   const auto resolution = registry_.Resolve(cmd);
-
+  std::optional<Immediate> now;
   switch (resolution.status) {
     case CommandRegistry::ResolveStatus::kUnknownCommand: {
       const std::string_view name = cmd.ArgCount() > 0 ? std::string_view(cmd.Name()) : "";
       const std::string_view first_arg = cmd.ArgCount() > 1 ? std::string_view(cmd.args[1]) : "";
-      return {MakeUnknownCommand(name, first_arg), RequestStatus::kUnknown, kUnknownCmdLabel};
+      now =
+          Immediate{MakeUnknownCommand(name, first_arg), RequestStatus::kUnknown, kUnknownCmdLabel};
+      break;
     }
-
     case CommandRegistry::ResolveStatus::kArityMismatch:
-      return {MakeArityError(resolution.resolved), RequestStatus::kArity,
-              resolution.resolved.parent->name};
-
+      now = Immediate{MakeArityError(resolution.resolved), RequestStatus::kArity,
+                      resolution.resolved.parent->name};
+      break;
     case CommandRegistry::ResolveStatus::kUnknownSubcommand: {
       const std::string_view raw = cmd.ArgCount() > 1 ? std::string_view(cmd.args[1]) : "";
-      return {MakeUnknownSubcommand(*resolution.resolved.parent, raw), RequestStatus::kError,
-              resolution.resolved.parent->name};
-    }
-
-    case CommandRegistry::ResolveStatus::kOk:
+      now = Immediate{MakeUnknownSubcommand(*resolution.resolved.parent, raw),
+                      RequestStatus::kError, resolution.resolved.parent->name};
       break;
+    }
+    case CommandRegistry::ResolveStatus::kOk: {
+      const auto& resolved = resolution.resolved;
+      if (deps_.loading != nullptr && deps_.loading->IsLoading() && !resolved.LoadingSafe()) {
+        now = Immediate{MakeLoading(), RequestStatus::kLoading, resolved.parent->name};
+      } else {
+        now = DispatchResolved(entry, resolved, std::move(cmd));
+      }
+      break;
+    }
   }
-
-  const auto& resolved = resolution.resolved;
-  if (deps_.loading != nullptr && deps_.loading->IsLoading() && !resolved.LoadingSafe()) {
-    return {MakeLoading(), RequestStatus::kLoading, resolved.parent->name};
-  }
-
-  return DispatchResolved(resolved, std::move(cmd));
+  if (now.has_value()) Finish(entry, std::move(now->response), now->status, now->cmd_name);
 }
 
-RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const ResolvedCommand& resolved,
-                                                                   RespCommand cmd) {
+std::optional<RequestPipeline::Immediate> RequestPipeline::DispatchResolved(
+    Entry& entry, const ResolvedCommand& resolved, RespCommand cmd) {
   const auto& parent = *resolved.parent;
-  auto finish = [&parent](RespValue response) -> DispatchOutcome {
+  auto finish = [&parent](RespValue response) -> Immediate {
     const auto status = response.IsError() ? RequestStatus::kError : RequestStatus::kOk;
     return {std::move(response), status, parent.name};
   };
-  auto engine = [this, &parent, &finish](core::Request request, std::string_view what) {
-    auto result = RunToReply(std::move(request));
-    if (!result.has_value()) {
-      ABYSS_LOG_WARN(what, {"client_id", state_.client_id}, {"cmd", std::string_view{parent.name}},
-                     {"err", std::string_view{result.error().message()}});
-      return finish(
-          RespValue::Error(MapErrorCode(result.error().code()), result.error().message()));
-    }
-    return finish(*std::move(result));
+  auto engine = [this, &entry](core::Request request,
+                               std::string_view what) -> std::optional<Immediate> {
+    Submit(entry, std::move(request), what);
+    return std::nullopt;
   };
 
   // Fan-out commands route as their own kind instead of read/write. The
@@ -296,66 +422,102 @@ RequestPipeline::DispatchOutcome RequestPipeline::DispatchResolved(const Resolve
   return finish(InternalServerError("unhandled dispatch class", parent.name));
 }
 
-core::Result<RespValue> RequestPipeline::RunToReply(core::Request request) {
-  slot_.completion = core::Completion{
-      .sink = inbox_.get(), .client_id = state_.client_id, .slot_seq = ++slot_seq_};
-  core::Outcome outcome = deps_.dispatcher->Dispatch(std::move(request), slot_, task_);
-  std::optional<core::Result<RespValue>> reply;
-  bool pending = false;
+void RequestPipeline::Submit(Entry& entry, core::Request request, std::string_view what) {
+  entry.name = request.name;
+  entry.what = what;
+  entry.slot.completion =
+      core::Completion{.sink = host_.sink, .client_id = state_.client_id, .slot_seq = entry.seq};
+  core::Outcome outcome = deps_.dispatcher->Dispatch(std::move(request), entry.slot, task_);
+  Settle(entry, std::move(outcome));
+}
+
+void RequestPipeline::Settle(Entry& entry, core::Outcome outcome) {
   switch (outcome.kind) {
     case core::Outcome::Kind::kReplied:
-      reply = std::move(outcome.reply);
+      Reply(entry, std::move(outcome.reply));
       break;
     case core::Outcome::Kind::kSequenced:
+      if (closed_) {
+        // Applied; nothing waits to hear when it is durable.
+        entry.slot.durable.Abandon();
+        Drop(entry);
+        break;
+      }
+      entry.state = Entry::State::kSequenced;
+      {
+        const auto& held = entry.slot.durable.held();
+        entry.reply_bytes = held.has_value() ? Serializer::Size(*held) : 0;
+      }
+      reply_bytes_ += entry.reply_bytes;
       break;
     case core::Outcome::Kind::kPending:
-      pending = true;
+      entry.state = Entry::State::kPending;
       break;
   }
-  // Once replied it waits only for what is already on its way, which
-  // the deadline just passed bounds: a wake a Cancel lost, or a job.
-  while (!reply.has_value() || !Quiescent()) {
-    std::optional<core::CompletionEvent> event =
-        inbox_->Take(reply.has_value() ? std::nullopt : std::optional(slot_.deadline));
-    if (!event.has_value()) {
-      ABYSS_DCHECK(pending || slot_.durable.waiting(), "a deadline for a command not waiting");
-      reply = pending ? task_->Abandon(slot_) : slot_.durable.Expire();
-      continue;
-    }
-    // Another command's event never runs this one's task.
-    if (event->client_id != slot_.completion.client_id ||
-        event->slot_seq != slot_.completion.slot_seq) {
-      continue;
-    }
-    if (event->kind == core::CompletionKind::kDurable) {
-      auto released = slot_.durable.Arrived(std::move(event->result));
-      if (released.has_value() && !reply.has_value()) reply = *std::move(released);
-      continue;
-    }
-    if (event->kind != core::CompletionKind::kResume) continue;
-    ABYSS_DCHECK(task_ != nullptr, "a kResume for a command with no task");
-    core::Outcome next = task_->Run(slot_, std::move(event->result));
-    if (reply.has_value()) continue;
-    pending = next.kind == core::Outcome::Kind::kPending;
-    if (next.kind == core::Outcome::Kind::kReplied) reply = std::move(next.reply);
+  if (entry.state == Entry::State::kPending || TaskBusy()) {
+    task_seq_ = entry.seq;
+  } else if (task_seq_ == entry.seq) {
+    task_seq_ = 0;
   }
-  return *std::move(reply);
 }
 
-bool RequestPipeline::Quiescent() const {
-  return (task_ == nullptr || task_->Quiescent()) && slot_.durable.Quiescent();
+void RequestPipeline::Reply(Entry& entry, core::Result<RespValue> result) {
+  if (closed_) {
+    Drop(entry);
+    return;
+  }
+  if (!result.has_value()) {
+    ABYSS_LOG_WARN(entry.what, {"client_id", state_.client_id}, {"cmd", entry.name},
+                   {"err", std::string_view{result.error().message()}});
+    Finish(entry, RespValue::Error(MapErrorCode(result.error().code()), result.error().message()),
+           RequestStatus::kError, entry.name);
+    return;
+  }
+  RespValue response = *std::move(result);
+  const auto status = response.IsError() ? RequestStatus::kError : RequestStatus::kOk;
+  Finish(entry, std::move(response), status, entry.name);
 }
 
-RequestPipeline::DispatchOutcome RequestPipeline::HandleAdminStateless(
-    const ResolvedCommand& resolved, const RespCommand& cmd) {
+void RequestPipeline::Finish(Entry& entry, RespValue response, RequestStatus status,
+                             std::string_view cmd_name) {
+  if (deps_.metrics != nullptr) {
+    const auto elapsed = std::chrono::steady_clock::now() - entry.started;
+    deps_.metrics->RecordDuration(cmd_name, std::chrono::duration<double>(elapsed).count());
+    deps_.metrics->RecordRequest(cmd_name, status);
+  }
+  Store(entry, std::move(response));
+}
+
+void RequestPipeline::Store(Entry& entry, RespValue response) {
+  reply_bytes_ -= entry.reply_bytes;
+  entry.reply = std::move(response);
+  entry.reply_bytes = Serializer::Size(entry.reply);
+  reply_bytes_ += entry.reply_bytes;
+  entry.state = Entry::State::kReplied;
+}
+
+void RequestPipeline::Release(Entry& entry) {
+  reply_bytes_ -= entry.reply_bytes;
+  entry.reply_bytes = 0;
+  entry.reply = RespValue{};
+  entry.state = Entry::State::kDrained;
+}
+
+void RequestPipeline::Drop(Entry& entry) {
+  Release(entry);
+  while (drain_ < tail_ && At(drain_).state == Entry::State::kDrained) ++drain_;
+}
+
+RequestPipeline::Immediate RequestPipeline::HandleAdminStateless(const ResolvedCommand& resolved,
+                                                                 const RespCommand& cmd) {
   const auto& parent = *resolved.parent;
   const std::string_view sub_name =
       resolved.subcommand != nullptr ? resolved.subcommand->name : std::string_view{};
 
-  auto finish = [&parent](RespValue response, RequestStatus status) -> DispatchOutcome {
+  auto finish = [&parent](RespValue response, RequestStatus status) -> Immediate {
     return {std::move(response), status, parent.name};
   };
-  auto ok_or_err = [&finish](RespValue response) -> DispatchOutcome {
+  auto ok_or_err = [&finish](RespValue response) -> Immediate {
     const auto status = response.IsError() ? RequestStatus::kError : RequestStatus::kOk;
     return finish(std::move(response), status);
   };
@@ -416,13 +578,13 @@ RespValue RequestPipeline::HandleEcho(const RespCommand& cmd) {
 }
 
 RespValue RequestPipeline::HandleQuit() {
-  close_reason_ = ProcessCloseReason::kClientQuit;
+  close_request_ = CloseRequest::kClientQuit;
   return RespValue::SimpleString("OK");
 }
 
-RequestPipeline::DispatchOutcome RequestPipeline::HandleHello(const CommandSpec& spec,
-                                                              const RespCommand& cmd) {
-  auto record_response = [&spec](RespValue response) -> DispatchOutcome {
+RequestPipeline::Immediate RequestPipeline::HandleHello(const CommandSpec& spec,
+                                                        const RespCommand& cmd) {
+  auto record_response = [&spec](RespValue response) -> Immediate {
     if (response.IsError()) {
       const auto status = response.ErrorPrefixOf() == ErrorPrefix::kNoProto
                               ? RequestStatus::kNoProto

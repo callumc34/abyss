@@ -16,10 +16,18 @@ add_executable(abyss_component_tests
   sequencer_test.cpp
   sequencer_wait_test.cpp
   dispatch_test.cpp
+  front_end_test.cpp
+  net/sync_redis_client.cpp
+)
+
+target_include_directories(abyss_component_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/net
 )
 
 target_link_libraries(abyss_component_tests PRIVATE
   abyss::engine
+  abyss::net
+  abyss::resp
   abyss::consumer
   abyss::hot
   abyss::cold

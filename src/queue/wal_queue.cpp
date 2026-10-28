@@ -175,6 +175,13 @@ WalQueue::~WalQueue() {
     const std::scoped_lock lock(reaper_mu_);
     ABYSS_DCHECK(pins_ == 0, "a retention pin outlived its queue");
   }
+  Shutdown();
+}
+
+// Only allocation can throw here, and an OOM at teardown may terminate.
+// NOLINTNEXTLINE(bugprone-exception-escape)
+void WalQueue::Shutdown() {
+  if (std::exchange(shut_down_, true)) return;
   StopPersister();
   bool persist = false;
   {

@@ -94,6 +94,8 @@ class IoPool {
   void Shutdown();
 
   uint32_t threads() const { return config_.threads; }
+  // Jobs a thread has taken and not finished.
+  size_t RunningJobs() const;
   size_t QueuedForTesting(metrics::IoQueue queue) const;
   // Until no job is queued or running.
   void WaitIdleForTesting();

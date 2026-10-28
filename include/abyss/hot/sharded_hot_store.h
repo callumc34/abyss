@@ -105,6 +105,10 @@ class ShardedHotStore : public core::HotStore {
  public:
   explicit ShardedHotStore(ShardedHotStoreConfig config);
   ~ShardedHotStore() override;
+
+  // As its teardown does, with the store left in place: every wait on
+  // a load in flight, and every later one, gets kUnavailable.
+  void FailLoadWaits();
   ShardedHotStore(const ShardedHotStore&) = delete;
   ShardedHotStore& operator=(const ShardedHotStore&) = delete;
   ShardedHotStore(ShardedHotStore&&) = delete;

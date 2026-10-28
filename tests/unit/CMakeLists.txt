@@ -16,6 +16,7 @@ add_executable(abyss_core_tests
   core/durability_test.cpp
   core/seq_waiters_test.cpp
   core/wait_list_test.cpp
+  core/timer_wheel_test.cpp
 )
 
 target_link_libraries(abyss_core_tests PRIVATE
@@ -72,10 +73,12 @@ add_executable(abyss_resp_tests
   resp/node_identity_test.cpp
   resp/cluster_test.cpp
   resp/predicate_extractor_test.cpp
+  resp/async_pipeline_test.cpp
 )
 
 target_link_libraries(abyss_resp_tests PRIVATE
   abyss::resp
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )
@@ -211,6 +214,8 @@ add_executable(abyss_net_tests
   net/connection_lazy_arm_test.cpp
   net/connection_oversize_test.cpp
   net/reactor_lifecycle_test.cpp
+  net/inbox_test.cpp
+  net/connection_async_test.cpp
 )
 
 target_include_directories(abyss_net_tests PRIVATE
@@ -220,6 +225,7 @@ target_include_directories(abyss_net_tests PRIVATE
 
 target_link_libraries(abyss_net_tests PRIVATE
   abyss::net
+  abyss::queue
   abyss::test_support
   GTest::gtest_main
 )

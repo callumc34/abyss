@@ -49,6 +49,7 @@
 #include "abyss/core/ascii.h"
 #include "linearizability.h"
 #include "property_harness.h"
+#include "sync_pipeline.h"
 
 namespace abyss::engine {
 namespace {
@@ -243,8 +244,9 @@ class LinearizabilityTest : public PropertyHarness {
         clients.emplace_back([&, t] {
           start.arrive_and_wait();
           Rng mine((seed * 1000) + (static_cast<uint64_t>(burst) * 100) + static_cast<uint64_t>(t));
-          resp::RequestPipeline pipeline(resp::GlobalRegistry(), resp::ConnectionState{},
-                                         resp::PipelineDependencies{.dispatcher = engine_.get()});
+          abyss::testing::SyncPipeline pipeline(
+              resp::GlobalRegistry(), resp::ConnectionState{},
+              resp::PipelineDependencies{.dispatcher = engine_.get()});
           std::vector<Record> local;
           for (int i = 0; i < per_burst; ++i) {
             Record record{.client = t, .args = Generate(mine, t), .at_ms = now_ms_};

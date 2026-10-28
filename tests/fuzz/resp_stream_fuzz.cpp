@@ -2,7 +2,7 @@
 //
 // resp_parser_fuzz hands the parser one complete buffer, so it never reaches the
 // kIncomplete/resume transitions the real server lives in. Here the input is cut
-// into content-derived chunks and pushed through the same accumulate/Process/
+// into content-derived chunks and pushed through the same accumulate/Feed/Drain/
 // compact loop Connection runs, so a frame that straddles a chunk boundary is
 // parsed exactly the way a frame straddling a socket read is.
 //
@@ -69,12 +69,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                     input.begin() + static_cast<ptrdiff_t>(offset + chunk));
     offset += chunk;
 
-    const auto result = pipeline.Process(read_buf, write_buf);
-    read_buf.erase(read_buf.begin(),
-                   read_buf.begin() + static_cast<ptrdiff_t>(result.bytes_consumed));
+    const auto fed = pipeline.Feed(read_buf, 0);
+    read_buf.erase(read_buf.begin(), read_buf.begin() + static_cast<ptrdiff_t>(fed.consumed));
+    pipeline.Drain(write_buf);
     write_buf.clear();
 
-    if (result.close_reason != abyss::resp::RequestPipeline::ProcessCloseReason::kNone) break;
+    if (pipeline.close_request() != abyss::resp::RequestPipeline::CloseRequest::kNone) break;
     if (read_buf.size() >= kMaxReadBufferBytes) break;
   }
 

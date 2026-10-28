@@ -79,6 +79,7 @@ class Server {
 
  private:
   void NotifyReady();
+  void StopEngine();
   // Stores the new state and reflects it on the lifecycle-state gauge. The
   // single place the state changes, so the metric never drifts from the atomic.
   void Transition(LifecycleState next);

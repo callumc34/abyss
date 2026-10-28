@@ -110,6 +110,13 @@ Result<RespValue> DurableWait::Expire() {
       Error{ErrorCode::kTimeout, std::string(flush ? kFlushDurableTimeout : kWriteDurableTimeout)});
 }
 
+void DurableWait::Abandon() {
+  ABYSS_DCHECK(waiting_, "a durable wait abandoned while not waiting");
+  waiting_ = false;
+  reply_ = {};
+  CancelRest();
+}
+
 void DurableWait::CancelRest() {
   for (size_t i = 0; i < added_; ++i) {
     Stream& stream = At(i);

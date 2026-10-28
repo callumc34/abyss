@@ -32,6 +32,7 @@
 #include "hooked_cold_store.h"
 #include "redis_model.h"
 #include "sequenced_engine_fixture.h"
+#include "sync_pipeline.h"
 
 namespace abyss::engine {
 
@@ -266,7 +267,7 @@ class PropertyHarness : public SequencedEngineTest {
     return restarted;
   }
   void Wire() {
-    pipeline_ = std::make_unique<resp::RequestPipeline>(
+    pipeline_ = std::make_unique<abyss::testing::SyncPipeline>(
         resp::GlobalRegistry(), resp::ConnectionState{},
         resp::PipelineDependencies{.dispatcher = engine_.get()});
   }
@@ -481,7 +482,7 @@ class PropertyHarness : public SequencedEngineTest {
     });
   }};
   abyss::testing::HookedColdStore hooked_{[this]() -> core::ColdStore& { return *cold_; }};
-  std::unique_ptr<resp::RequestPipeline> pipeline_;
+  std::unique_ptr<abyss::testing::SyncPipeline> pipeline_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 

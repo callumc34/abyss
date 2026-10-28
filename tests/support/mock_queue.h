@@ -213,6 +213,12 @@ class MockQueue : public core::Queue {
     const std::scoped_lock lock(fake_->mu);
     fake_->durable_error = std::move(error);
   }
+  // Makes everything parked on `shard` durable, posting to its waiters.
+  void ReleaseParked(core::ShardId shard) {
+    FakeShard& state = Shard(shard);
+    state.end.store(kAllDurable, std::memory_order_seq_cst);
+    state.waiters.Advance(kAllDurable);
+  }
   // Fails every node waiting on `shard`, as its stream stopping would.
   void FailParked(core::ShardId shard, const core::Error& error) {
     Shard(shard).waiters.FailAll(error);

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <utility>
 
+#include "abyss/core/fatal.h"
 #include "abyss/log/log.h"
 #include "abyss/platform/net.h"
 
@@ -56,6 +57,8 @@ NetMetrics NetMetrics::Register() {
       .backpressure_active = reg.Gauge(metrics::names::kNetBackpressureActive),
       .backpressure_entered = reg.Counter(metrics::names::kNetBackpressureEnteredTotal),
       .backpressure_exited = reg.Counter(metrics::names::kNetBackpressureExitedTotal),
+      .late_completions = reg.Counter(metrics::names::kNetLateCompletionsTotal),
+      .orphans = reg.Gauge(metrics::names::kNetOrphans),
       .connections_closed_client =
           reg.Counter(metrics::names::kNetConnectionsClosedTotal, metrics::CloseReason::kClient),
       .connections_closed_idle =
@@ -76,7 +79,7 @@ NetMetrics NetMetrics::Register() {
 Connection::Connection(Fd fd, uint32_t remote_ipv4, uint16_t remote_port, uint64_t client_id,
                        Poller& poller, const resp::CommandRegistry& registry,
                        resp::PipelineDependencies deps, ConnectionConfig config,
-                       NetMetrics& net_metrics, core::SteadyClockFn clock)
+                       NetMetrics& net_metrics, core::SteadyClockFn clock, resp::PipelineHost host)
     : fd_(std::move(fd)),
       remote_ipv4_(remote_ipv4),
       remote_port_(remote_port),
@@ -86,7 +89,10 @@ Connection::Connection(Fd fd, uint32_t remote_ipv4, uint16_t remote_port, uint64
       metrics_(net_metrics),
       clock_(std::move(clock)),
       pipeline_(std::make_unique<resp::RequestPipeline>(
-          registry, resp::ConnectionState{.client_id = client_id, .protocol_version = 2}, deps)),
+          registry, resp::ConnectionState{.client_id = client_id, .protocol_version = 2}, deps,
+          host,
+          resp::PipelineLimits{.max_inflight = config.max_inflight_commands,
+                               .reply_bytes = config.write_backpressure_bytes})),
       last_activity_(clock_()) {
   metrics_.connections_active.Increment();
   metrics_.connections_accepted.Increment();
@@ -101,7 +107,14 @@ std::optional<metrics::CloseReason> Connection::CloseReasonValue() const noexcep
 }
 
 bool Connection::IsIdle(core::SteadyTime now) const noexcept {
+  // A command waiting on the engine is not idleness.
+  if (pipeline_ != nullptr && pipeline_->InFlight() > 0) return false;
   return (now - last_activity_) > config_.idle_timeout;
+}
+
+bool Connection::Busy() const noexcept {
+  if (closed_) return false;
+  return HasPendingWrites() || (pipeline_ != nullptr && pipeline_->InFlight() > 0);
 }
 
 core::Result<void> Connection::Arm() {
@@ -109,9 +122,13 @@ core::Result<void> Connection::Arm() {
   return poller_.Add(fd_.Get(), armed_interest_, this);
 }
 
+bool Connection::ReadAllowed() const noexcept {
+  return !reading_paused_ && !feed_blocked_ && !dispatch_stopped_ && !pending_close_.has_value();
+}
+
 EventKind Connection::DesiredInterest() const noexcept {
   EventKind k = EventKind::kNone;
-  if (!reading_paused_) k |= EventKind::kReadable;
+  if (ReadAllowed()) k |= EventKind::kReadable;
   if (HasPendingWrites()) k |= EventKind::kWritable;
   return k;
 }
@@ -152,59 +169,60 @@ void Connection::Close(metrics::CloseReason reason) {
     pnet::ShutdownBoth(fd_.Get());
   }
   fd_.Reset();
+  // Never waits for the engine: what it still owes posts lands as cleanup.
+  if (pipeline_ != nullptr) pipeline_->Close();
 
   ABYSS_LOG_DEBUG("client closed", {"client_id", client_id_},
                   {"reason", metrics::ToStringView(reason)},
                   {"bytes_pending", static_cast<uint64_t>(WriteBufferBytes())});
+  // Undispatched input and unwritten replies go with the socket.
+  std::vector<uint8_t>().swap(read_buf_);
+  std::vector<uint8_t>().swap(write_buf_);
+  write_pos_ = 0;
+}
+
+std::unique_ptr<resp::RequestPipeline> Connection::ReleasePipeline() {
+  ABYSS_DCHECK(closed_, "a pipeline released from an open connection");
+  return std::move(pipeline_);
 }
 
 void Connection::OnReadable() {
   if (closed_) return;
+  socket_drained_ = false;
+  Pump();
+}
 
-  // Edge-triggered drain: each pass reads the socket until EAGAIN or the read
-  // buffer cap, then feeds the pipeline. If we stopped at the cap (not EAGAIN)
-  // we must make progress in THIS call — an ET backend will not redeliver the
-  // readable edge for bytes still queued in the kernel. If the pipeline freed
-  // buffer space we loop and read more; if it consumed nothing while the buffer
-  // is at the cap the command is unconsumably large and we close deterministically.
-  bool stopped_at_cap = false;
-  do {
-    stopped_at_cap = false;
-    while (true) {
-      const size_t old_size = read_buf_.size();
-      if (old_size >= config_.max_read_buffer_bytes) {
-        stopped_at_cap = true;
-        break;
-      }
-      const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
-      read_buf_.resize(old_size + want);
+void Connection::OnWritable() {
+  if (closed_) return;
+  Pump();
+}
 
-      const auto n = pnet::Recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
-      if (n > 0) {
-        read_buf_.resize(old_size + static_cast<size_t>(n));
-        metrics_.bytes_in.Increment(static_cast<double>(n));
-        TouchActivity();
-        RecordReadBufferHighWater();
-        continue;
-      }
-      read_buf_.resize(old_size);
-      if (n == 0) {
-        Close(metrics::CloseReason::kClient);
-        return;
-      }
-      const int err = pnet::LastError();
-      if (pnet::IsInterrupted(err)) continue;
-      if (pnet::IsWouldBlock(err)) break;
-      ABYSS_LOG_DEBUG("recv error", {"client_id", client_id_},
-                      {"err", std::string_view{pnet::ErrorString(err)}});
-      Close(metrics::CloseReason::kClient);
-      return;
-    }
+std::unique_ptr<resp::OrphanTask> Connection::OnTimer(core::SteadyTime now) {
+  if (pipeline_ == nullptr) return nullptr;
+  auto orphan = pipeline_->Expire(now);
+  Pump();
+  return orphan;
+}
 
-    const size_t consumed = DispatchPipelineOutput();
+void Connection::StopDispatch() {
+  if (closed_) return;
+  dispatch_stopped_ = true;
+  pipeline_->StopDispatch();
+  SyncPollerInterest();
+}
+
+// Each pass dispatches what is buffered, writes what is ready, then
+// reads more if it may. Edge-triggered backends redeliver nothing for
+// bytes already in the kernel, so whenever reading is allowed again the
+// socket is read without waiting for an event; and what is buffered is
+// dispatched before reading is re-armed.
+void Connection::Pump() {
+  bool read_to_cap = false;
+  for (;;) {
     if (closed_) return;
-
-    if (stopped_at_cap && consumed == 0) {
+    const auto fed = Feed();
+    if (closed_) return;
+    if (read_to_cap && fed.consumed == 0 && !fed.blocked && !pending_close_.has_value()) {
       // A single command fills the entire read buffer yet cannot be framed:
       // it can never be consumed, so close now rather than wait for an edge
       // that will never arrive.
@@ -213,57 +231,76 @@ void Connection::OnReadable() {
       Close(metrics::CloseReason::kOversize);
       return;
     }
-    // If we stopped at the cap but DID consume bytes, loop: the freed space lets
-    // us drain more of the socket within this call (ET-safe forward progress).
-    // Stop draining once a close is pending — the queued reply must flush first.
-  } while (stopped_at_cap && !pending_close_.has_value());
-
-  TryDrainWrite();
-  if (closed_) return;
-
-  if (EnforceWriteHardLimit()) return;
-  MaybePauseReading();
-  if (closed_) return;
-
-  if (pending_close_.has_value() && !HasPendingWrites()) {
+    pipeline_->Drain(write_buf_);
+    TryDrainWrite();
+    if (closed_) return;
+    if (EnforceWriteHardLimit()) return;
+    UpdateBackpressure();
+    if (closed_) return;
+    const bool allowed = ReadAllowed();
+    // Blocked or paused, it read nothing for a while: try the socket.
+    if (allowed && !read_allowed_) socket_drained_ = false;
+    read_allowed_ = allowed;
+    if (!allowed || socket_drained_) break;
+    read_to_cap = ReadSocket();
+  }
+  if (pending_close_.has_value() && pipeline_->InFlight() == 0 && !HasPendingWrites()) {
     Close(*pending_close_);
     return;
   }
-
   SyncPollerInterest();
 }
 
-void Connection::OnWritable() {
-  if (closed_) return;
-
-  TryDrainWrite();
-  if (closed_) return;
-
-  MaybeResumeReading();
-  if (closed_) return;
-
-  if (pending_close_.has_value() && !HasPendingWrites()) {
-    Close(*pending_close_);
-    return;
+resp::RequestPipeline::FeedResult Connection::Feed() {
+  if (read_buf_.empty()) {
+    feed_blocked_ = false;
+    return {};
   }
-
-  SyncPollerInterest();
-}
-
-size_t Connection::DispatchPipelineOutput() {
-  if (read_buf_.empty()) return 0;
-  const auto result = pipeline_->Process(read_buf_, write_buf_);
-  if (result.bytes_consumed > 0) {
-    read_buf_.erase(read_buf_.begin(),
-                    read_buf_.begin() + static_cast<ptrdiff_t>(result.bytes_consumed));
+  const auto fed = pipeline_->Feed(read_buf_, WriteBufferBytes());
+  if (fed.consumed > 0) {
+    read_buf_.erase(read_buf_.begin(), read_buf_.begin() + static_cast<ptrdiff_t>(fed.consumed));
   }
+  feed_blocked_ = fed.blocked;
   // Both QUIT and an unframable protocol error close the client connection
-  // after the queued reply (the -ERR or +OK) drains.
-  if (result.close_reason != resp::RequestPipeline::ProcessCloseReason::kNone &&
+  // once every reply before it, and its own, is written.
+  if (pipeline_->close_request() != resp::RequestPipeline::CloseRequest::kNone &&
       !pending_close_.has_value()) {
     pending_close_ = metrics::CloseReason::kClient;
   }
-  return result.bytes_consumed;
+  return fed;
+}
+
+bool Connection::ReadSocket() {
+  while (true) {
+    const size_t old_size = read_buf_.size();
+    if (old_size >= config_.max_read_buffer_bytes) return true;
+    const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
+    read_buf_.resize(old_size + want);
+
+    const auto n = pnet::Recv(fd_.Get(), read_buf_.data() + old_size, want, 0);
+    if (n > 0) {
+      read_buf_.resize(old_size + static_cast<size_t>(n));
+      metrics_.bytes_in.Increment(static_cast<double>(n));
+      TouchActivity();
+      RecordReadBufferHighWater();
+      continue;
+    }
+    read_buf_.resize(old_size);
+    if (n == 0) {
+      Close(metrics::CloseReason::kClient);
+      return false;
+    }
+    const int err = pnet::LastError();
+    if (pnet::IsInterrupted(err)) continue;
+    if (pnet::IsWouldBlock(err)) {
+      socket_drained_ = true;
+      return false;
+    }
+    ABYSS_LOG_DEBUG("recv error", {"client_id", client_id_},
+                    {"err", std::string_view{pnet::ErrorString(err)}});
+    Close(metrics::CloseReason::kClient);
+    return false;
+  }
 }
 
 void Connection::TryDrainWrite() {
@@ -312,27 +349,31 @@ bool Connection::EnforceWriteHardLimit() {
   return false;
 }
 
-void Connection::MaybePauseReading() {
-  if (reading_paused_) return;
-  if (WriteBufferBytes() < config_.write_backpressure_bytes) return;
-
-  // reading_paused_ must flip first because SyncPollerInterest derives the
-  // interest mask from it; the gauge moves only once the transition is
-  // committed. A failed Modify closes with backpressure_counted_ still false,
-  // so Close() cannot decrement an increment that never happened.
-  reading_paused_ = true;
-  if (!SyncPollerInterest()) return;
-  backpressure_counted_ = true;
-  metrics_.backpressure_active.Increment();
-  metrics_.backpressure_entered.Increment();
-  ABYSS_LOG_DEBUG("backpressure paused", {"client_id", client_id_},
-                  {"write_bytes", static_cast<uint64_t>(WriteBufferBytes())});
-}
-
-void Connection::MaybeResumeReading() {
-  if (!reading_paused_) return;
-  if (WriteBufferBytes() >= config_.write_resume_bytes) return;
-
+// Pauses at the slot cap or the reply-byte threshold, counting replies
+// held for commands not yet written; resumes below write_resume_bytes
+// with fewer than half the cap in use.
+void Connection::UpdateBackpressure() {
+  const size_t held = WriteBufferBytes() + pipeline_->ReplyBytes();
+  const size_t slots = pipeline_->Slots();
+  if (!reading_paused_) {
+    if (held < config_.write_backpressure_bytes && slots < config_.max_inflight_commands) return;
+    // reading_paused_ must flip first because SyncPollerInterest derives the
+    // interest mask from it; the gauge moves only once the transition is
+    // committed. A failed Modify closes with backpressure_counted_ still false,
+    // so Close() cannot decrement an increment that never happened.
+    reading_paused_ = true;
+    if (!SyncPollerInterest()) return;
+    backpressure_counted_ = true;
+    metrics_.backpressure_active.Increment();
+    metrics_.backpressure_entered.Increment();
+    ABYSS_LOG_DEBUG("backpressure paused", {"client_id", client_id_},
+                    {"write_bytes", static_cast<uint64_t>(held)},
+                    {"slots", static_cast<uint64_t>(slots)});
+    return;
+  }
+  if (held >= config_.write_resume_bytes || slots >= (config_.max_inflight_commands + 1) / 2) {
+    return;
+  }
   reading_paused_ = false;
   // A failed Modify here leaves backpressure_counted_ set, so the Close() it
   // triggers drops the gauge exactly once instead of leaking the increment.
@@ -341,7 +382,7 @@ void Connection::MaybeResumeReading() {
   metrics_.backpressure_active.Decrement();
   metrics_.backpressure_exited.Increment();
   ABYSS_LOG_DEBUG("backpressure resumed", {"client_id", client_id_},
-                  {"write_bytes", static_cast<uint64_t>(WriteBufferBytes())});
+                  {"write_bytes", static_cast<uint64_t>(held)});
 }
 
 // Deliberately does not touch the process-wide gauge: every connection Setting

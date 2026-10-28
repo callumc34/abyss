@@ -74,6 +74,12 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   static core::Result<std::unique_ptr<WalQueue>> Open(WalConfig config);
   ~WalQueue() override;
 
+  // What the destructor does, with the queue left in place for what
+  // still refers to it: offsets persist, admission and appends refuse,
+  // a final flush covers every filled frame, the committers and
+  // preparers stop, and every waiter fails. Idempotent.
+  void Shutdown();
+
   WalQueue(const WalQueue&) = delete;
   WalQueue& operator=(const WalQueue&) = delete;
   WalQueue(WalQueue&&) = delete;
@@ -216,6 +222,7 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   std::vector<std::unique_ptr<LogUnit>> logs_;
   std::vector<std::unique_ptr<ShardStream>> streams_;
   std::atomic<bool> skip_final_flush_{false};
+  bool shut_down_ = false;
   metrics::CounterHandle scan_bytes_;
   std::unique_ptr<OffsetCheckpoint> checkpoint_;
 

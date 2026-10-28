@@ -54,6 +54,7 @@
 #include "abyss/platform/mapped_file.h"
 #include "crash_harness.h"
 #include "property_harness.h"
+#include "sync_pipeline.h"
 #include "wal_power_loss.h"
 
 namespace abyss::engine {
@@ -389,8 +390,9 @@ class CrashTest : public PropertyHarness {
     for (int c = 0; c < kClients; ++c) {
       clients.emplace_back([&, c] {
         Rng mine((seed * 100) + static_cast<uint64_t>(c));
-        resp::RequestPipeline pipeline(resp::GlobalRegistry(), resp::ConnectionState{},
-                                       resp::PipelineDependencies{.dispatcher = engine_.get()});
+        abyss::testing::SyncPipeline pipeline(
+            resp::GlobalRegistry(), resp::ConnectionState{},
+            resp::PipelineDependencies{.dispatcher = engine_.get()});
         start.arrive_and_wait();
         std::vector<Call> local;
         while (!crashed.load()) {
@@ -534,8 +536,9 @@ class CrashTest : public PropertyHarness {
     Gate(true);
     std::atomic<uint64_t> clock{1};
     std::thread writer([this, &key] {
-      resp::RequestPipeline pipeline(resp::GlobalRegistry(), resp::ConnectionState{},
-                                     resp::PipelineDependencies{.dispatcher = engine_.get()});
+      abyss::testing::SyncPipeline pipeline(
+          resp::GlobalRegistry(), resp::ConnectionState{},
+          resp::PipelineDependencies{.dispatcher = engine_.get()});
       (void)pipeline.Dispatch(core::RespCommand{.args = {"SET", key, "v1"}});
     });
     // Applied and published, never flushed.
@@ -550,8 +553,9 @@ class CrashTest : public PropertyHarness {
     std::vector<std::thread> readers;
     for (const Op op : {Op::kSAdd, Op::kGet, Op::kType, Op::kSetNx}) {
       readers.emplace_back([&, op] {
-        resp::RequestPipeline pipeline(resp::GlobalRegistry(), resp::ConnectionState{},
-                                       resp::PipelineDependencies{.dispatcher = engine_.get()});
+        abyss::testing::SyncPipeline pipeline(
+            resp::GlobalRegistry(), resp::ConnectionState{},
+            resp::PipelineDependencies{.dispatcher = engine_.get()});
         Call call{.client = static_cast<int>(op), .op = op, .key = 0, .id = 1000};
         call.call = clock.fetch_add(1);
         call.reply = Text(pipeline.Dispatch(core::RespCommand{.args = ArgsOf(call)}), Writes(op));
@@ -1001,8 +1005,9 @@ TEST_F(CrashTest, KillNineVictim) {
   for (int c = 0; c < kKillClients; ++c) {
     clients.emplace_back([&, c] {
       Rng mine((seed * 100) + static_cast<uint64_t>(c));
-      resp::RequestPipeline pipeline(resp::GlobalRegistry(), resp::ConnectionState{},
-                                     resp::PipelineDependencies{.dispatcher = engine_.get()});
+      abyss::testing::SyncPipeline pipeline(
+          resp::GlobalRegistry(), resp::ConnectionState{},
+          resp::PipelineDependencies{.dispatcher = engine_.get()});
       for (size_t i = 0; i < kSlotsPerClient; ++i) {
         Call call{.client = c, .key = static_cast<int>(mine.Below(kCrashKeys))};
         call.op = PickOp(mine.Below(100));

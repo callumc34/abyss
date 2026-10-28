@@ -2,7 +2,6 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -17,6 +16,7 @@
 #include "abyss/resp/loading_state.h"
 #include "abyss/resp/node_identity.h"
 #include "abyss/resp/parser.h"
+#include "abyss/resp/serializer.h"
 #include "abyss/resp/server_stats.h"
 
 namespace abyss::resp {
@@ -98,6 +98,25 @@ core::RespValue ParseResponse(const std::vector<uint8_t>& bytes) {
   return r->value;
 }
 
+struct Processed {
+  size_t bytes_consumed = 0;
+  RequestPipeline::CloseRequest close_reason = RequestPipeline::CloseRequest::kNone;
+};
+
+// Feeds `input` and writes what is ready, as a connection's pass does.
+Processed Process(RequestPipeline& pipeline, std::span<const uint8_t> input,
+                  std::vector<uint8_t>& output) {
+  const auto fed = pipeline.Feed(input, 0);
+  pipeline.Drain(output);
+  return {.bytes_consumed = fed.consumed, .close_reason = pipeline.close_request()};
+}
+
+core::RespValue Dispatch(RequestPipeline& pipeline, const core::RespCommand& cmd) {
+  std::vector<uint8_t> output;
+  Process(pipeline, Serializer::SerializeCommand(cmd), output);
+  return ParseResponse(output);
+}
+
 ServerStats StandardStats() {
   return ServerStats{
       .hot_key_count = 3,
@@ -118,16 +137,16 @@ ServerStats StandardStats() {
 TEST(RequestPipelineTest, RespPing) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  auto result = pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n"), output);
+  auto result = Process(pipeline, Bytes("*1\r\n$4\r\nPING\r\n"), output);
   EXPECT_GT(result.bytes_consumed, 0U);
-  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kNone);
+  EXPECT_EQ(result.close_reason, RequestPipeline::CloseRequest::kNone);
   EXPECT_EQ(ToStr(output), "+PONG\r\n");
 }
 
 TEST(RequestPipelineTest, PingWithMessageReturnsBulk) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"), output);
   EXPECT_EQ(ToStr(output), "$5\r\nhello\r\n");
 }
 
@@ -136,7 +155,7 @@ TEST(RequestPipelineTest, PingWithMessageReturnsBulk) {
 TEST(RequestPipelineTest, PingExtraArgsIsArityError) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.AsString(), "ERR wrong number of arguments for 'ping' command");
@@ -145,7 +164,7 @@ TEST(RequestPipelineTest, PingExtraArgsIsArityError) {
 TEST(RequestPipelineTest, InlinePing) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  auto result = pipeline.Process(Bytes("PING\r\n"), output);
+  auto result = Process(pipeline, Bytes("PING\r\n"), output);
   EXPECT_EQ(result.bytes_consumed, 6U);
   EXPECT_EQ(ToStr(output), "+PONG\r\n");
 }
@@ -153,22 +172,22 @@ TEST(RequestPipelineTest, InlinePing) {
 TEST(RequestPipelineTest, Echo) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$4\r\nECHO\r\n$3\r\nfoo\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$4\r\nECHO\r\n$3\r\nfoo\r\n"), output);
   EXPECT_EQ(ToStr(output), "$3\r\nfoo\r\n");
 }
 
 TEST(RequestPipelineTest, QuitSetsCloseRequested) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  auto result = pipeline.Process(Bytes("*1\r\n$4\r\nQUIT\r\n"), output);
-  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kClientQuit);
+  auto result = Process(pipeline, Bytes("*1\r\n$4\r\nQUIT\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::CloseRequest::kClientQuit);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
 }
 
 TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$5\r\nLPUSH\r\n$3\r\nkey\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$5\r\nLPUSH\r\n$3\r\nkey\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
@@ -177,67 +196,6 @@ TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
 
 // Its first command replies at once; its second pends, and before that
 // command's own kResume it posts one naming the first command's slot.
-class StaleEventDispatcher : public core::CommandDispatcher {
- public:
-  class Task final : public core::Task {
-   public:
-    core::Outcome Run(core::Slot& /*slot*/, core::Result<void> wake) override {
-      ++runs;
-      if (!wake.has_value()) return {.reply = core::RespValue::BulkString("stale")};
-      return {.reply = core::RespValue::BulkString("resumed")};
-    }
-    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/) override {
-      return std::unexpected(core::Error{core::ErrorCode::kTimeout, "abandoned"});
-    }
-    bool Quiescent() const override { return true; }
-
-    // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
-    int runs = 0;
-  };
-
-  core::Outcome Dispatch(core::Request /*request*/, core::Slot& slot,
-                         std::unique_ptr<core::Task>& task) override {
-    slot.deadline = core::SteadyClock::now() + std::chrono::seconds{10};
-    if (++calls == 1) {
-      first = slot.completion;
-      return {.reply = core::RespValue::BulkString("first")};
-    }
-    if (task == nullptr) task = std::make_unique<Task>();
-    const std::array<core::CompletionEvent, 2> events{{
-        {.client_id = first.client_id,
-         .slot_seq = first.slot_seq,
-         .kind = core::CompletionKind::kResume,
-         .result = std::unexpected(core::Error{core::ErrorCode::kInternal, "stale"})},
-        {.client_id = slot.completion.client_id,
-         .slot_seq = slot.completion.slot_seq,
-         .kind = core::CompletionKind::kResume,
-         .result = {}},
-    }};
-    slot.completion.sink->Post(events);
-    return {.kind = core::Outcome::Kind::kPending};
-  }
-
-  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
-  int calls = 0;
-  core::Completion first;
-  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
-};
-
-// Events route by client and slot seq: one naming an earlier command's
-// slot never runs the current command's task.
-TEST(RequestPipelineTest, AStaleEventForAReusedSlotIsDropped) {
-  StaleEventDispatcher dispatcher;
-  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 7, .client_name = {}},
-                           {.dispatcher = &dispatcher});
-  std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$1\r\na\r\n"), output);
-  EXPECT_EQ(ToStr(output), "$5\r\nfirst\r\n");
-  output.clear();
-  pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$1\r\nb\r\n"), output);
-  EXPECT_EQ(ToStr(output), "$7\r\nresumed\r\n");
-  EXPECT_EQ(dispatcher.first.client_id, 7U);
-}
-
 // Its task stays busy once asked to, as a task whose post is lost
 // would: a pipeline closed then is caught.
 class BusyTaskDispatcher : public core::CommandDispatcher {
@@ -281,7 +239,7 @@ TEST(RequestPipelineTest, ClosingWithACommandOutstandingIsFatal) {
             std::make_unique<RequestPipeline>(GlobalRegistry(), ConnectionState{.client_id = 1},
                                               PipelineDependencies{.dispatcher = &dispatcher});
         std::vector<uint8_t> output;
-        pipeline->Process(Bytes("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"), output);
+        Process(*pipeline, Bytes("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"), output);
         dispatcher.last->busy = true;
         pipeline.reset();
       },
@@ -295,7 +253,7 @@ TEST(RequestPipelineTest, StatelessAndAdminCommandsNeverDispatch) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher, .stats = &stats});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n*1\r\n$6\r\nDBSIZE\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$4\r\nPING\r\n*1\r\n$6\r\nDBSIZE\r\n"), output);
   EXPECT_EQ(ToStr(output), "+PONG\r\n:10\r\n");
   EXPECT_EQ(dispatcher.dispatches, 0);
 }
@@ -305,7 +263,7 @@ TEST(RequestPipelineTest, FlushdbRoutesThroughDispatcher) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
   EXPECT_EQ(dispatcher.flush_calls, 1);
   EXPECT_EQ(dispatcher.last_flush, "FLUSHDB");
@@ -316,7 +274,7 @@ TEST(RequestPipelineTest, FlushallRoutesThroughDispatcher) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$8\r\nFLUSHALL\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$8\r\nFLUSHALL\r\n"), output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
   EXPECT_EQ(dispatcher.flush_calls, 1);
   EXPECT_EQ(dispatcher.last_flush, "FLUSHALL");
@@ -327,11 +285,11 @@ TEST(RequestPipelineTest, FlushdbAsyncAndSyncModifiersAccepted) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output_async;
-  pipeline.Process(Bytes("*2\r\n$7\r\nFLUSHDB\r\n$5\r\nASYNC\r\n"), output_async);
+  Process(pipeline, Bytes("*2\r\n$7\r\nFLUSHDB\r\n$5\r\nASYNC\r\n"), output_async);
   EXPECT_EQ(ToStr(output_async), "+OK\r\n");
 
   std::vector<uint8_t> output_sync;
-  pipeline.Process(Bytes("*2\r\n$7\r\nFLUSHDB\r\n$4\r\nSYNC\r\n"), output_sync);
+  Process(pipeline, Bytes("*2\r\n$7\r\nFLUSHDB\r\n$4\r\nSYNC\r\n"), output_sync);
   EXPECT_EQ(ToStr(output_sync), "+OK\r\n");
 
   EXPECT_EQ(dispatcher.flush_calls, 2);
@@ -342,7 +300,7 @@ TEST(RequestPipelineTest, FlushdbRejectsUnknownModifier) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nFLUSHDB\r\n$3\r\nFOO\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nFLUSHDB\r\n$3\r\nFOO\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
@@ -356,7 +314,7 @@ TEST(RequestPipelineTest, SetWithUnknownOptionIsRejectedBeforeDispatch) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$5\r\nBOGUS\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$5\r\nBOGUS\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
@@ -371,8 +329,8 @@ TEST(RequestPipelineTest, SetNxWithUnknownOptionIsRejectedBeforeDispatch) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n$5\r\nBOGUS\r\n"),
-                   output);
+  Process(pipeline, Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n$5\r\nBOGUS\r\n"),
+          output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("syntax error"), std::string::npos);
@@ -387,7 +345,7 @@ TEST(RequestPipelineTest, SetNxDispatchesWithItsPredicateUncanonicalised) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n"), output);
   EXPECT_EQ(dispatcher.write_calls, 1);
   EXPECT_EQ(dispatcher.last_write.args, (std::vector<std::string>{"SET", "k", "v", "NX"}));
   EXPECT_EQ(dispatcher.last_flags, core::PredicateFlags::kNx);
@@ -401,7 +359,7 @@ TEST(RequestPipelineTest, UnconditionalWriteReachesTheEngineAsSent) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$5\r\nSETEX\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\nv\r\n"), output);
   ASSERT_EQ(dispatcher.write_calls, 1);
   EXPECT_EQ(dispatcher.last_write.args, (std::vector<std::string>{"SETEX", "k", "60", "v"}));
   EXPECT_EQ(dispatcher.last_flags, core::PredicateFlags::kNone);
@@ -412,8 +370,8 @@ TEST(RequestPipelineTest, SetWithTtlOptionStillDispatches) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n"),
-                   output);
+  Process(pipeline, Bytes("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n"),
+          output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
   EXPECT_EQ(dispatcher.write_calls, 1);
 }
@@ -421,7 +379,7 @@ TEST(RequestPipelineTest, SetWithTtlOptionStillDispatches) {
 TEST(RequestPipelineTest, FlushdbWithoutDispatcherReturnsInternalError) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$7\r\nFLUSHDB\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
@@ -431,7 +389,7 @@ TEST(RequestPipelineTest, FlushdbWithoutDispatcherReturnsInternalError) {
 TEST(RequestPipelineTest, ArityMismatchReturnsErr) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$3\r\nGET\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$3\r\nGET\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("wrong number of arguments"), std::string::npos);
@@ -441,7 +399,7 @@ TEST(RequestPipelineTest, ArityMismatchReturnsErr) {
 TEST(RequestPipelineTest, SubcommandArityMismatchUsesPipeForm) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("'client|setname'"), std::string::npos);
@@ -450,7 +408,7 @@ TEST(RequestPipelineTest, SubcommandArityMismatchUsesPipeForm) {
 TEST(RequestPipelineTest, Hello2ReturnsHandshakeMap) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 42, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   const auto& elements = response.AsArray();
@@ -466,14 +424,14 @@ TEST(RequestPipelineTest, Hello2ReturnsHandshakeMap) {
 TEST(RequestPipelineTest, Hello2UpdatesProtocolVersionInState) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
   EXPECT_EQ(pipeline.state().protocol_version, 2);
 }
 
 TEST(RequestPipelineTest, Hello3RejectedWithNoProtoPrefix) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kNoProto);
@@ -482,7 +440,7 @@ TEST(RequestPipelineTest, Hello3RejectedWithNoProtoPrefix) {
 TEST(RequestPipelineTest, HelloUnsupportedNonNumericRejected) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$3\r\nfoo\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$5\r\nHELLO\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kNoProto);
@@ -491,15 +449,17 @@ TEST(RequestPipelineTest, HelloUnsupportedNonNumericRejected) {
 TEST(RequestPipelineTest, HelloSetnameUpdatesConnectionState) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$7\r\nSETNAME\r\n$3\r\nbob\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$7\r\nSETNAME\r\n$3\r\nbob\r\n"),
+          output);
   EXPECT_EQ(pipeline.state().client_name, "bob");
 }
 
 TEST(RequestPipelineTest, HelloAuthArgumentsAccepted) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(
-      Bytes("*5\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$4\r\npass\r\n"), output);
+  Process(pipeline,
+          Bytes("*5\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$4\r\npass\r\n"),
+          output);
   auto response = ParseResponse(output);
   EXPECT_TRUE(response.IsArray());
 }
@@ -507,7 +467,7 @@ TEST(RequestPipelineTest, HelloAuthArgumentsAccepted) {
 TEST(RequestPipelineTest, HelloAuthMissingPasswordReturnsErr) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$5\r\nHELLO\r\n$1\r\n2\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("HELLO AUTH"), std::string::npos);
@@ -516,7 +476,7 @@ TEST(RequestPipelineTest, HelloAuthMissingPasswordReturnsErr) {
 TEST(RequestPipelineTest, ClientId) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 99, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), 99);
@@ -525,14 +485,14 @@ TEST(RequestPipelineTest, ClientId) {
 TEST(RequestPipelineTest, ClientNoEvictAck) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-EVICT\r\n$2\r\nON\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-EVICT\r\n$2\r\nON\r\n"), output);
   EXPECT_EQ(ToStr(output), "+OK\r\n");
 }
 
 TEST(RequestPipelineTest, ClientUnknownSubcommandIsRejectedByRegistry) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$5\r\nMAGIC\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$6\r\nCLIENT\r\n$5\r\nMAGIC\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("Unknown CLIENT subcommand"), std::string::npos);
@@ -541,12 +501,12 @@ TEST(RequestPipelineTest, ClientUnknownSubcommandIsRejectedByRegistry) {
 TEST(RequestPipelineTest, ClientSetnameThenGetname) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> out1;
-  pipeline.Process(Bytes("*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$5\r\nalice\r\n"), out1);
+  Process(pipeline, Bytes("*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$5\r\nalice\r\n"), out1);
   EXPECT_EQ(ToStr(out1), "+OK\r\n");
   EXPECT_EQ(pipeline.state().client_name, "alice");
 
   std::vector<uint8_t> out2;
-  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$7\r\nGETNAME\r\n"), out2);
+  Process(pipeline, Bytes("*2\r\n$6\r\nCLIENT\r\n$7\r\nGETNAME\r\n"), out2);
   auto response = ParseResponse(out2);
   ASSERT_TRUE(response.IsBulkString());
   EXPECT_EQ(response.AsString(), "alice");
@@ -555,7 +515,7 @@ TEST(RequestPipelineTest, ClientSetnameThenGetname) {
 TEST(RequestPipelineTest, CommandCountMatchesRegistrySize) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), static_cast<int64_t>(GlobalRegistry().Size()));
@@ -564,7 +524,7 @@ TEST(RequestPipelineTest, CommandCountMatchesRegistrySize) {
 TEST(RequestPipelineTest, CommandListReturnsEveryRegistryEntry) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$7\r\nCOMMAND\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$7\r\nCOMMAND\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   EXPECT_EQ(response.AsArray().size(), GlobalRegistry().Size());
@@ -573,7 +533,7 @@ TEST(RequestPipelineTest, CommandListReturnsEveryRegistryEntry) {
 TEST(RequestPipelineTest, CommandInfoReportsGetSpec) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$3\r\nGET\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$3\r\nGET\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   ASSERT_EQ(response.AsArray().size(), 1U);
@@ -591,14 +551,14 @@ TEST(RequestPipelineTest, CommandInfoReportsGetSpec) {
 TEST(RequestPipelineTest, CommandInfoUnknownIsNullArray) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$7\r\nBOGUSCC\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nINFO\r\n$7\r\nBOGUSCC\r\n"), output);
   EXPECT_EQ(ToStr(output), "*1\r\n*-1\r\n");
 }
 
 TEST(RequestPipelineTest, CommandDocsReturnsSummary) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$4\r\nPING\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$4\r\nPING\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   ASSERT_EQ(response.AsArray().size(), 2U);
@@ -609,7 +569,7 @@ TEST(RequestPipelineTest, CommandDocsReturnsSummary) {
 TEST(RequestPipelineTest, CommandDocsSkipsUnknownNames) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$7\r\nBOGUSCC\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n$7\r\nBOGUSCC\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   EXPECT_TRUE(response.AsArray().empty());
@@ -618,7 +578,7 @@ TEST(RequestPipelineTest, CommandDocsSkipsUnknownNames) {
 TEST(RequestPipelineTest, Time) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$4\r\nTIME\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$4\r\nTIME\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   ASSERT_EQ(response.AsArray().size(), 2U);
@@ -628,7 +588,7 @@ TEST(RequestPipelineTest, Time) {
 TEST(RequestPipelineTest, TieredReadWithoutDispatcherReturnsInternalError) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kErr);
@@ -642,7 +602,7 @@ TEST(RequestPipelineTest, ConditionalWriteWithoutDispatcherReturnsInternalServer
   // server error rather than leaking dependency identity to the client.
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$5\r\nSETNX\r\n$1\r\nk\r\n$1\r\nv\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$5\r\nSETNX\r\n$1\r\nk\r\n$1\r\nv\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
@@ -651,7 +611,7 @@ TEST(RequestPipelineTest, ConditionalWriteWithoutDispatcherReturnsInternalServer
 TEST(RequestPipelineTest, ObjectIdletimeIsRejectedAsUnsupported) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$6\r\nOBJECT\r\n$8\r\nIDLETIME\r\n$1\r\nk\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$6\r\nOBJECT\r\n$8\r\nIDLETIME\r\n$1\r\nk\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("not supported in this build"), std::string::npos);
@@ -662,7 +622,7 @@ TEST(RequestPipelineTest, ObjectIdletimeIsRejectedAsUnsupported) {
 TEST(RequestPipelineTest, ObjectEncodingDispatchesAsTieredRead) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nk\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nk\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   // No dispatcher injected → internal server error path, not the abyss#97 path.
@@ -672,7 +632,7 @@ TEST(RequestPipelineTest, ObjectEncodingDispatchesAsTieredRead) {
 TEST(RequestPipelineTest, DbsizeWithoutStatsReturnsInternalError) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$6\r\nDBSIZE\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$6\r\nDBSIZE\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("internal server error"), std::string::npos);
@@ -684,7 +644,7 @@ TEST(RequestPipelineTest, LoadingGateBlocksDataPlaneCommands) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kLoading);
@@ -696,7 +656,7 @@ TEST(RequestPipelineTest, LoadingGateAllowsPing) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$4\r\nPING\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$4\r\nPING\r\n"), output);
   EXPECT_EQ(ToStr(output), "+PONG\r\n");
 }
 
@@ -706,7 +666,7 @@ TEST(RequestPipelineTest, LoadingGateAllowsHello) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$5\r\nHELLO\r\n$1\r\n2\r\n"), output);
   auto response = ParseResponse(output);
   EXPECT_TRUE(response.IsArray());
 }
@@ -717,7 +677,7 @@ TEST(RequestPipelineTest, LoadingGateAllowsCommandCount) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n"), output);
   auto response = ParseResponse(output);
   EXPECT_TRUE(response.IsInteger());
 }
@@ -728,7 +688,7 @@ TEST(RequestPipelineTest, LoadingGateRejectsClientCommands) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kLoading);
@@ -742,7 +702,7 @@ TEST(RequestPipelineTest, LoadingGateRejectsClusterKeyslot) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading, .stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_EQ(response.ErrorPrefixOf(), core::ErrorPrefix::kLoading);
@@ -756,7 +716,7 @@ TEST(RequestPipelineTest, LoadingGateAllowsClusterSlots) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading, .stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
 }
@@ -769,7 +729,7 @@ TEST(RequestPipelineTest, LoadingGateAllowsClusterMyId) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.loading = &loading, .stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n"), output);
   auto response = ParseResponse(output);
   EXPECT_TRUE(response.IsBulkString());
 }
@@ -779,7 +739,7 @@ TEST(RequestPipelineTest, InfoReturnsStatsSections) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$4\r\nINFO\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$4\r\nINFO\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
   const auto& body = response.AsString();
@@ -796,7 +756,7 @@ TEST(RequestPipelineTest, InfoFiltersBySectionName) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$4\r\nINFO\r\n$7\r\nclients\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$4\r\nINFO\r\n$7\r\nclients\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
   const auto& body = response.AsString();
@@ -810,7 +770,7 @@ TEST(RequestPipelineTest, InfoUnknownSectionReturnsEmptyBulk) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$4\r\nINFO\r\n$7\r\nnosuch_\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$4\r\nINFO\r\n$7\r\nnosuch_\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
   EXPECT_TRUE(response.AsString().empty());
@@ -821,7 +781,7 @@ TEST(RequestPipelineTest, DbsizeSumsHotAndCold) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*1\r\n$6\r\nDBSIZE\r\n"), output);
+  Process(pipeline, Bytes("*1\r\n$6\r\nDBSIZE\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), 10);
@@ -835,7 +795,7 @@ TEST(RequestPipelineTest, ClusterSlotsUsesAdvertiseAddressWhenSet) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   const auto& node = response.AsArray()[0].AsArray()[2];
@@ -848,7 +808,7 @@ TEST(RequestPipelineTest, ClusterSlotsFallsBackToBindAddress) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   const auto& node = response.AsArray()[0].AsArray()[2];
@@ -861,7 +821,7 @@ TEST(RequestPipelineTest, ClusterKeyslotMatchesCore) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), 12182);
@@ -873,7 +833,7 @@ TEST(RequestPipelineTest, ClusterMyIdReturnsIdentity) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
   EXPECT_EQ(response.AsString(), "22222222-2222-4222-8222-222222222222");
@@ -887,7 +847,7 @@ TEST(RequestPipelineTest, ClusterNodesUsesBusPortAndAdvertiseAddress) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
   const auto& body = response.AsString();
@@ -903,7 +863,7 @@ TEST(RequestPipelineTest, ClusterInfoReportsOk) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsBulkString());
   EXPECT_NE(response.AsString().find("cluster_state:ok"), std::string::npos);
@@ -916,7 +876,7 @@ TEST(RequestPipelineTest, ClusterCountKeysInSlotIsNotKeyspaceTotal) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$1\r\n0\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$1\r\n0\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
   // Per-slot count for a valid slot must NOT be the whole-keyspace total (10).
@@ -930,8 +890,8 @@ TEST(RequestPipelineTest, ClusterCountKeysOutOfRangeReturnsZero) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$5\r\n99999\r\n"),
-                   output);
+  Process(pipeline, Bytes("*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$5\r\n99999\r\n"),
+          output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsInteger());
   EXPECT_EQ(response.AsInteger(), 0);
@@ -943,7 +903,7 @@ TEST(RequestPipelineTest, ClusterUnknownSubcommandErrors) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.stats = &stats, .identity = &identity});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*2\r\n$7\r\nCLUSTER\r\n$6\r\nFORGET\r\n"), output);
+  Process(pipeline, Bytes("*2\r\n$7\r\nCLUSTER\r\n$6\r\nFORGET\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("Unknown CLUSTER subcommand"), std::string::npos);
@@ -954,7 +914,7 @@ TEST(RequestPipelineTest, ConfigGetExactMatch) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.config = &config});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   ASSERT_EQ(response.AsArray().size(), 2U);
@@ -967,7 +927,7 @@ TEST(RequestPipelineTest, ConfigGetGlobMatchesMultiple) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.config = &config});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nmax*\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nmax*\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   EXPECT_EQ(response.AsArray().size(), 4U);
@@ -978,7 +938,7 @@ TEST(RequestPipelineTest, ConfigGetEmptyResultIsEmptyArray) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.config = &config});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$5\r\nbogus\r\n"), output);
+  Process(pipeline, Bytes("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$5\r\nbogus\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsArray());
   EXPECT_TRUE(response.AsArray().empty());
@@ -989,7 +949,7 @@ TEST(RequestPipelineTest, ConfigSetIsRejectedAsUnknownSubcommand) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.config = &config});
   std::vector<uint8_t> output;
-  pipeline.Process(Bytes("*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$4\r\nfoo1\r\n$1\r\n1\r\n"), output);
+  Process(pipeline, Bytes("*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$4\r\nfoo1\r\n$1\r\n1\r\n"), output);
   auto response = ParseResponse(output);
   ASSERT_TRUE(response.IsError());
   EXPECT_NE(response.AsString().find("Unknown CONFIG subcommand"), std::string::npos);
@@ -998,7 +958,7 @@ TEST(RequestPipelineTest, ConfigSetIsRejectedAsUnknownSubcommand) {
 TEST(RequestPipelineTest, PartialFrameLeftForCaller) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  auto result = pipeline.Process(Bytes("*2\r\n$4\r\nPING\r\n$3\r\nhe"), output);
+  auto result = Process(pipeline, Bytes("*2\r\n$4\r\nPING\r\n$3\r\nhe"), output);
   EXPECT_EQ(result.bytes_consumed, 0U);
   EXPECT_TRUE(output.empty());
 }
@@ -1008,8 +968,8 @@ TEST(RequestPipelineTest, ProtocolErrorSetsCloseReason) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   // A negative multibulk count with trailing junk is a fully-delimited bad frame.
-  auto result = pipeline.Process(Bytes("*-5\r\nGARBAGE\r\n"), output);
-  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  auto result = Process(pipeline, Bytes("*-5\r\nGARBAGE\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::CloseRequest::kProtocolError);
   EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
 }
 
@@ -1020,9 +980,9 @@ TEST(RequestPipelineTest, UnterminatedQuoteProducesErrorAndConsumesAll) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
   const std::string input = "SET key \"oops\r\n";
-  auto result = pipeline.Process(Bytes(input), output);
+  auto result = Process(pipeline, Bytes(input), output);
   EXPECT_EQ(result.bytes_consumed, input.size());
-  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  EXPECT_EQ(result.close_reason, RequestPipeline::CloseRequest::kProtocolError);
   EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
   EXPECT_NE(ToStr(output).find("unbalanced quotes"), std::string::npos);
 }
@@ -1032,8 +992,8 @@ TEST(RequestPipelineTest, UnterminatedQuoteProducesErrorAndConsumesAll) {
 TEST(RequestPipelineTest, HugeArrayCountIsProtocolErrorNotCrash) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   std::vector<uint8_t> output;
-  auto result = pipeline.Process(Bytes("*2000000000\r\n"), output);
-  EXPECT_EQ(result.close_reason, RequestPipeline::ProcessCloseReason::kProtocolError);
+  auto result = Process(pipeline, Bytes("*2000000000\r\n"), output);
+  EXPECT_EQ(result.close_reason, RequestPipeline::CloseRequest::kProtocolError);
   EXPECT_NE(ToStr(output).find("-ERR Protocol error"), std::string::npos);
 }
 
@@ -1043,18 +1003,18 @@ TEST(RequestPipelineTest, PipelinedFramesAreAllProcessed) {
   std::string input;
   input.append("*1\r\n$4\r\nPING\r\n");
   input.append("*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n");
-  auto result = pipeline.Process(Bytes(input), output);
+  auto result = Process(pipeline, Bytes(input), output);
   EXPECT_EQ(result.bytes_consumed, input.size());
   EXPECT_EQ(ToStr(output), "+PONG\r\n$3\r\nhey\r\n");
 }
 
 TEST(RequestPipelineTest, Reset) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
-  pipeline.Dispatch(core::RespCommand{{"CLIENT", "SETNAME", "foo"}});
+  Dispatch(pipeline, core::RespCommand{{"CLIENT", "SETNAME", "foo"}});
   EXPECT_EQ(pipeline.state().client_name, "foo");
 
   std::vector<uint8_t> out;
-  pipeline.Process(Bytes("*1\r\n$5\r\nRESET\r\n"), out);
+  Process(pipeline, Bytes("*1\r\n$5\r\nRESET\r\n"), out);
   EXPECT_EQ(ToStr(out), "+RESET\r\n");
   EXPECT_TRUE(pipeline.state().client_name.empty());
   EXPECT_EQ(pipeline.state().protocol_version, 2);
