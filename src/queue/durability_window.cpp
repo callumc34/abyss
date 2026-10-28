@@ -58,9 +58,13 @@ DurabilityWindow::DurabilityWindow(uint64_t max_bytes, Clock::duration max_age,
       logs_(log_count) {}
 
 bool DurabilityWindow::Admissible(std::size_t log) const noexcept {
+  return Admissible(log, Clock::now());
+}
+
+bool DurabilityWindow::Admissible(std::size_t log, Clock::time_point now) const noexcept {
   const uint64_t bytes = unflushed_bytes_.load(std::memory_order_seq_cst);
   if (bytes == 0) return true;
-  return bytes < max_bytes_ && age(log).Age(Clock::now()) < max_age_;
+  return bytes < max_bytes_ && age(log).Age(now) < max_age_;
 }
 
 core::Result<void> DurabilityWindow::Admit(std::size_t log, Clock::time_point deadline) {
@@ -94,10 +98,15 @@ void DurabilityWindow::Add(uint64_t bytes) noexcept {
 }
 
 // The flusher moved the age, then the bytes, seq_cst, before Notify
-// loads the waiter count.
+// loads the waiter count. A log turns admissible only here, after one
+// of those, and Add, Start and time only close it, so a log that fails
+// now has no waiter this Release could admit.
 void DurabilityWindow::Release(uint64_t bytes) noexcept {
   unflushed_bytes_.fetch_sub(bytes, std::memory_order_seq_cst);
-  for (Log& each : logs_) each.admission.Notify();
+  const auto now = Clock::now();
+  for (std::size_t log = 0; log < logs_.size(); ++log) {
+    if (Admissible(log, now)) logs_[log].admission.Notify();
+  }
 }
 
 void DurabilityWindow::Shutdown() {

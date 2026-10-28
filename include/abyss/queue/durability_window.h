@@ -67,7 +67,7 @@ class DurabilityWindow {
   // Entry frame bytes: after Reserve, before Commit.
   void Add(uint64_t bytes) noexcept;
   // After a flush, once the log's age is updated. The bytes are every
-  // log's, so it wakes every log's waiters, the flushed log's included.
+  // log's, so it wakes each log whose waiters would now pass.
   void Release(uint64_t bytes) noexcept;
   // Fails every admission wait, now and later, with kUnavailable.
   void Shutdown();
@@ -80,6 +80,8 @@ class DurabilityWindow {
   void SetAdmitHookForTesting(std::function<void()> hook) { admit_hook_ = std::move(hook); }
 
  private:
+  bool Admissible(std::size_t log, Clock::time_point now) const noexcept;
+
   const uint64_t max_bytes_;
   const Clock::duration max_age_;
   std::atomic<uint64_t> unflushed_bytes_{0};
