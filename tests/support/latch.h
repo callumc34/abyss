@@ -12,11 +12,11 @@ namespace abyss::testing {
 // goes on, so no thread stays parked behind a failed assertion.
 class Latch {
  public:
+  // Notifies under mu_: a waiter that sees it open may destroy the
+  // latch as soon as it relocks.
   void Open() {
-    {
-      const std::scoped_lock lock(mu_);
-      open_ = true;
-    }
+    const std::scoped_lock lock(mu_);
+    open_ = true;
     cv_.notify_all();
   }
   bool Wait(std::chrono::milliseconds timeout = std::chrono::seconds{10}) {

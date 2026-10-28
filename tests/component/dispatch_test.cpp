@@ -65,6 +65,9 @@ core::Request WriteReq(std::vector<std::string> args) {
 core::Request Get(std::string key) {
   return Req(core::Request::Kind::kRead, "GET", {"GET", std::move(key)});
 }
+core::Request HGet(std::string key, std::string field) {
+  return Req(core::Request::Kind::kRead, "HGET", {"HGET", std::move(key), std::move(field)});
+}
 
 // Blocks every cold call for `key` the hook sees until released, and
 // records the thread it ran on.
@@ -138,9 +141,11 @@ class DispatchTest : public SequencedEngineTest {
       if (key.starts_with("q")) cold_calls_q_.fetch_add(1);
       gate_->Hook(key);
     });
+    hooked_.SetAfterHook([this](std::string_view key) { after_gate_->Hook(key); });
   }
   void TearDown() override {
     gate_->release.Open();
+    after_gate_->release.Open();
     SequencedEngineTest::TearDown();
   }
 
@@ -214,6 +219,25 @@ class DispatchTest : public SequencedEngineTest {
   uint64_t PoolJobs() {
     return metrics::testing::GetHistogramCount(metrics::names::kEngineIoWaitSeconds).value_or(0);
   }
+  static double Fills(metrics::FillOutcome outcome) {
+    return metrics::testing::GetCounterValue(metrics::names::kHotFillsTotal, outcome).value_or(0);
+  }
+  static double AllFills() {
+    double all = 0;
+    for (uint8_t i = 0; i <= static_cast<uint8_t>(metrics::FillOutcome::kExpired); ++i) {
+      all += Fills(static_cast<metrics::FillOutcome>(i));
+    }
+    return all;
+  }
+  // How many cold reads an HGET miss makes before its fill reads the
+  // hash once, measured on a hash of its own.
+  int AnswerReads(Conn& conn) {
+    Cold({"HSET", "qa", "f", "1", "g", "2"});
+    const int before = cold_calls_q_.load();
+    EXPECT_EQ(Run(conn, HGet("qa", "f")), "1");
+    io_pool_->WaitIdleForTesting();
+    return cold_calls_q_.load() - before - 1;
+  }
   // A sequenced reply's events, with the stall released.
   std::string Durable(Conn& conn) {
     return Text(Finish(conn, core::Outcome{.kind = Kind::kSequenced}));
@@ -225,6 +249,8 @@ class DispatchTest : public SequencedEngineTest {
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   std::unique_ptr<ColdGate> gate_ = std::make_unique<ColdGate>();
+  // As gate_, once the cold call has read.
+  std::unique_ptr<ColdGate> after_gate_ = std::make_unique<ColdGate>();
   // Cold reads of keys starting "q".
   std::atomic<int> cold_calls_q_{0};
   abyss::testing::HookedColdStore hooked_{[this]() -> core::ColdStore& { return *cold_; }};
@@ -342,20 +368,14 @@ TEST_F(DispatchTest, AFenceRegisteredThroughWhenDurableGatesTheReply) {
 
 TEST_F(DispatchTest, AFillRunsAfterTheReply) {
   Open(Options{.fill_doorkeeper = false});
-  Cold({"HSET", "qa", "f", "1", "g", "2"});
-  Cold({"HSET", "qb", "f", "1", "g", "2"});
-  // How many cold reads an HGET miss and then its fill make: the fill
-  // reads the hash once.
   Conn conn(1);
-  int before = cold_calls_q_.load();
-  EXPECT_EQ(Run(conn, Req(core::Request::Kind::kRead, "HGET", {"HGET", "qa", "f"})), "1");
-  io_pool_->WaitIdleForTesting();
-  const int answer_reads = cold_calls_q_.load() - before - 1;
+  const int answer_reads = AnswerReads(conn);
   ASSERT_GE(answer_reads, 1);
+  Cold({"HSET", "qb", "f", "1", "g", "2"});
 
   // Hold the fill: the reply comes with it held.
   gate_->Hold("qb", answer_reads);
-  EXPECT_EQ(Run(conn, Req(core::Request::Kind::kRead, "HGET", {"HGET", "qb", "f"})), "1");
+  EXPECT_EQ(Run(conn, HGet("qb", "f")), "1");
   ASSERT_TRUE(gate_->entered.Wait()) << "no fill ran";
   auto read = hot_->Read(core::ops::ReadOp{core::ops::HashLen{.key = "qb"}});
   EXPECT_FALSE(read.result.has_value()) << "filled before the reply";
@@ -383,6 +403,98 @@ TEST_F(DispatchTest, ADroppedFillChangesNoAnswer) {
                 .value_or(0),
             dropped + 4);
   EXPECT_FALSE(hot_->Read(core::ops::ReadOp{core::ops::HashLen{.key = "h"}}).result.has_value());
+}
+
+// --- A fill overlapping the next command on its key ---
+
+// The fill holds the key's placeholder from before its read, so a write
+// that reads the key waits on it, then goes on over what it installed.
+// XX makes the SET read the key.
+TEST_F(DispatchTest, AWriteWaitsOnAFillHoldingItsKey) {
+  Open(Options{.fill_doorkeeper = false});
+  Conn reader(1);
+  const int answer_reads = AnswerReads(reader);
+  Cold({"HSET", "qk", "f", "1", "g", "2"});
+  after_gate_->Hold("qk", answer_reads);
+  EXPECT_EQ(Run(reader, HGet("qk", "f")), "1");
+  ASSERT_TRUE(after_gate_->entered.Wait()) << "no fill ran";
+  const size_t logged = Logged(ShardOf("qk")).size();
+
+  Conn writer(2);
+  core::Request set_xx = WriteReq({"SET", "qk", "v2", "XX"});
+  set_xx.flags = core::PredicateFlags::kXx;
+  core::Outcome set = Dispatch(writer, std::move(set_xx));
+  ASSERT_EQ(set.kind, Kind::kPending) << "the write went on under the fill";
+  EXPECT_EQ(hot_->LoadWaitersForTesting("qk"), 1U);
+  EXPECT_EQ(Logged(ShardOf("qk")).size(), logged);
+  after_gate_->release.Open();
+  EXPECT_EQ(Text(Finish(writer, std::move(set))), "OK");
+  io_pool_->WaitIdleForTesting();
+  EXPECT_EQ(Run(reader, Get("qk")), "v2");
+  EXPECT_EQ(Text(hot_->Read(core::ops::ReadOp{core::ops::StringGet{.key = "qk"}}).result), "v2");
+}
+
+// A blind write waits on no load: it ends the fill's placeholder, so
+// the fill installs nothing, though the write has since left hot and
+// what the fill read is all that would answer for the key there.
+TEST_F(DispatchTest, AFillOvertakenByABlindWriteInstallsNothing) {
+  Open(Options{.fill_doorkeeper = false});
+  Conn reader(1);
+  const int answer_reads = AnswerReads(reader);
+  Cold({"HSET", "qk", "f", "1", "g", "2"});
+  after_gate_->Hold("qk", answer_reads);
+  EXPECT_EQ(Run(reader, HGet("qk", "f")), "1");
+  ASSERT_TRUE(after_gate_->entered.Wait()) << "no fill ran";
+  const double discarded = Fills(metrics::FillOutcome::kDiscarded);
+
+  Conn writer(2);
+  EXPECT_EQ(Run(writer, WriteReq({"SET", "qk", "v2"})), "OK");
+  DrainToCold(ShardOf("qk"));
+  EvictDrained();
+  ASSERT_FALSE(Resident("qk"));
+  after_gate_->release.Open();
+  io_pool_->WaitIdleForTesting();
+  EXPECT_FALSE(Resident("qk")) << "the fill installed the state the write replaced";
+  EXPECT_EQ(Fills(metrics::FillOutcome::kDiscarded), discarded + 1);
+  EXPECT_EQ(Run(reader, Get("qk")), "v2");
+}
+
+// The write lands before the fill is dequeued: the fill finds the key
+// resident and skips it, reading nothing and counting no outcome.
+TEST_F(DispatchTest, AFillAfterTheWriteFindsItsKeyResident) {
+  Open(Options{.fill_doorkeeper = false});
+  Cold({"HSET", "qk", "f", "1", "g", "2"});
+  gate_->Hold("qk");
+  Conn reader(1);
+  core::Outcome miss = Dispatch(reader, HGet("qk", "f"));
+  ASSERT_EQ(miss.kind, Kind::kPending);
+  ASSERT_TRUE(gate_->entered.Wait());
+  // Both threads busy once the miss's job ends, so the fill it queues
+  // waits behind them.
+  Blocker first;
+  Blocker second;
+  io_pool_->Submit(first, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  ASSERT_TRUE(first.started.Wait());
+  io_pool_->Submit(second, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  gate_->release.Open();
+  EXPECT_EQ(Text(Finish(reader, std::move(miss))), "1");
+  ASSERT_TRUE(second.started.Wait());
+  const uint64_t jobs = PoolJobs();
+  const int cold_reads = cold_calls_q_.load();
+  const double fills = AllFills();
+
+  Conn writer(2);
+  EXPECT_EQ(Run(writer, WriteReq({"SET", "qk", "v2"})), "OK");
+  first.release.Open();
+  second.release.Open();
+  ASSERT_TRUE(first.done.Wait());
+  ASSERT_TRUE(second.done.Wait());
+  io_pool_->WaitIdleForTesting();
+  EXPECT_EQ(PoolJobs(), jobs + 1) << "no fill ran";
+  EXPECT_EQ(cold_calls_q_.load(), cold_reads) << "the fill read cold";
+  EXPECT_EQ(AllFills(), fills);
+  EXPECT_EQ(Run(writer, Get("qk")), "v2");
+  EXPECT_TRUE(Resident("qk"));
 }
 
 // --- A write's loads on the pool ---

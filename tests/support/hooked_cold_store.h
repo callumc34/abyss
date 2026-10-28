@@ -11,9 +11,10 @@
 
 namespace abyss::testing {
 
-// Forwards to a cold store, running a hook before each load: a test
-// interleaves evictions, flushes or writes with a load in flight.
-// SetHook only while no load runs: the hook is not synchronised.
+// Forwards to a cold store, running a hook before each load, and one
+// after it has read: a test interleaves evictions, flushes or writes
+// with a load in flight. Set them only while no load runs: the hooks
+// are not synchronised.
 class HookedColdStore : public core::ColdStore {
  public:
   using Hook = std::function<void(std::string_view key)>;
@@ -23,6 +24,7 @@ class HookedColdStore : public core::ColdStore {
   explicit HookedColdStore(std::function<core::ColdStore&()> cold) : cold_(std::move(cold)) {}
 
   void SetHook(Hook hook) { hook_ = std::move(hook); }
+  void SetAfterHook(Hook hook) { after_ = std::move(hook); }
 
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
@@ -39,32 +41,40 @@ class HookedColdStore : public core::ColdStore {
 
   core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
                                                           core::SteadyTime deadline) override {
-    Before(key);
-    return cold_().LoadKey(key, deadline);
+    Call(hook_, key);
+    auto loaded = cold_().LoadKey(key, deadline);
+    Call(after_, key);
+    return loaded;
   }
   core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
                                                         core::SteadyTime deadline) override {
-    Before(key);
-    return cold_().LoadKeyAs(key, type, deadline);
+    Call(hook_, key);
+    auto loaded = cold_().LoadKeyAs(key, type, deadline);
+    Call(after_, key);
+    return loaded;
   }
   core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
                                                       core::SteadyTime deadline) override {
-    Before(key);
-    return cold_().ProbeKey(key, deadline);
+    Call(hook_, key);
+    auto loaded = cold_().ProbeKey(key, deadline);
+    Call(after_, key);
+    return loaded;
   }
   core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
       std::string_view key, core::KeyType type, std::span<const std::string_view> members,
       core::SteadyTime deadline) override {
-    Before(key);
-    return cold_().LoadMembers(key, type, members, deadline);
+    Call(hook_, key);
+    auto loaded = cold_().LoadMembers(key, type, members, deadline);
+    Call(after_, key);
+    return loaded;
   }
 
  private:
   // Not re-entered on a thread: what a hook does loads nothing
   // through it.
-  void Before(std::string_view key) {
+  static void Call(const Hook& hook, std::string_view key) {
     thread_local bool in_hook = false;
-    if (!hook_ || in_hook) return;
+    if (!hook || in_hook) return;
     struct Guard {
       bool& flag;
       explicit Guard(bool& f) : flag(f) { flag = true; }
@@ -74,11 +84,12 @@ class HookedColdStore : public core::ColdStore {
       Guard& operator=(Guard&&) = delete;
       ~Guard() { flag = false; }
     } guard(in_hook);
-    hook_(key);
+    hook(key);
   }
 
   std::function<core::ColdStore&()> cold_;
   Hook hook_;
+  Hook after_;
 };
 
 }  // namespace abyss::testing

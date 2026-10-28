@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -116,6 +117,18 @@ bool ExistenceOnly(const std::vector<std::string>& args) {
   return conditional;
 }
 
+// Writes its keys without reading them, so it waits on no load of one.
+bool Blind(const std::vector<std::string>& args) {
+  const std::string name = core::AsciiUpper(args[0]);
+  if (name == "MSET" || name == "SETEX" || name == "PSETEX") return true;
+  if (name != "SET") return false;
+  for (size_t i = 3; i < args.size(); ++i) {
+    const std::string opt = core::AsciiUpper(args[i]);
+    if (opt == "GET" || opt == "NX" || opt == "XX" || opt == "KEEPTTL") return false;
+  }
+  return true;
+}
+
 class DifferentialTest : public PropertyHarness {
  protected:
   // One seed's stream; false once it has failed.
@@ -144,7 +157,7 @@ class DifferentialTest : public PropertyHarness {
     // A day behind real time, so the fake clock never overtakes the
     // retention reaper's real one.
     OpenAt(swarm.options, start - (start % 1000) - 86'400'000);
-    hooked_.SetHook([this](std::string_view key) { OnLoad(key); });
+    HookLoads(true);
 
     for (int step = 0; step < ops && !failed_; ++step) {
       step_ = step;
@@ -178,7 +191,7 @@ class DifferentialTest : public PropertyHarness {
       Fail(std::to_string(reads_timed_out_) + " of " + std::to_string(reads_) + " reads timed out");
     }
     if (!failed_) Finish();
-    hooked_.SetHook(nullptr);
+    HookLoads(false);
     CloseAll();
     for (size_t i = 0; i < counts.size(); ++i) counts.at(i) += counts_.at(i);
     return !failed_;
@@ -442,16 +455,26 @@ class DifferentialTest : public PropertyHarness {
       }
     }
     NoteBefore(name, args, keys, write);
-    nested_.clear();
-    loaded_.clear();
-    outer_ = &args;
     const std::vector<core::SequenceId> ends_before = Ends();
-    // What the command's own decision follows: a nested write moves it.
-    ends_before_outer_ = ends_before;
     const uint64_t discards_before = hot_->Stats()->load_discards;
     Journal('C', args);
+    {
+      // The hook's window: a fill an earlier read queued may load in
+      // it, and one this command queues may load after it closes.
+      const std::scoped_lock lock(hook_mu_);
+      nested_.clear();
+      loaded_.clear();
+      outer_ = &args;
+      outer_keys_ = &keys;
+      // What the command's own decision follows: a nested write moves it.
+      ends_before_outer_ = ends_before;
+    }
     const core::RespValue reply = Run(args);
-    outer_ = nullptr;
+    {
+      const std::scoped_lock lock(hook_mu_);
+      outer_ = nullptr;
+      outer_keys_ = nullptr;
+    }
     const std::string got = RedisModel::Canonical(name, reply);
     Remember(args, got);
     Journal('R', {got});
@@ -501,12 +524,17 @@ class DifferentialTest : public PropertyHarness {
       for (const auto& nested : nested_) (void)model_.Execute(nested, now);
       want = RedisModel::Canonical(name, model_.Execute(args, now));
     } else {
-      // A read raced by a write linearises before it or after it.
-      RedisModel before = model_;
-      const std::string early = RedisModel::Canonical(name, before.Execute(args, now));
-      for (const auto& nested : nested_) (void)model_.Execute(nested, now);
+      // A read raced by writes linearises before, between or after them.
+      bool between = false;
+      for (const auto& nested : nested_) {
+        if (!between) {
+          RedisModel at = model_;
+          between = got == RedisModel::Canonical(name, at.Execute(args, now));
+        }
+        (void)model_.Execute(nested, now);
+      }
       want = RedisModel::Canonical(name, model_.Execute(args, now));
-      if (got == early) want = early;
+      if (between) want = got;
     }
     if (got != want) {
       Fail("reply to " + Join(args) + ": got " + got + ", model " + want);
@@ -682,9 +710,12 @@ class DifferentialTest : public PropertyHarness {
 
   // ---- loads raced
 
+  // Only between a command's start and reply, on a load of one of its
+  // keys: its own load, or a fill of the key queued by an earlier read.
   void OnLoad(std::string_view key) {
+    const std::scoped_lock lock(hook_mu_);
+    if (outer_ == nullptr || std::ranges::find(*outer_keys_, key) == outer_keys_->end()) return;
     loaded_.insert(std::string(key));
-    if (outer_ == nullptr) return;
     switch (hook_rng_.Below(12)) {
       case 0:
       case 1: {
@@ -705,9 +736,11 @@ class DifferentialTest : public PropertyHarness {
       }
       case 3:
       case 4: {
-        // Only a blind write: anything else waits on this load.
+        // Only a blind write: anything else waits on this load. None
+        // in a blind write's window: it waits on no load, so the two
+        // would land in either order.
         const std::string outer = core::AsciiUpper(outer_->at(0));
-        if (outer == "MGET" || outer == "EXISTS") break;
+        if (outer == "MGET" || outer == "EXISTS" || Blind(*outer_)) break;
         std::vector<std::string> nested = {"SET", std::string(key),
                                            "n" + std::to_string(++counter_)};
         Absorb(ShardOf(key));
@@ -731,6 +764,16 @@ class DifferentialTest : public PropertyHarness {
       }
       default:
         break;
+    }
+  }
+
+  // The hook is unsynchronised: set it with no load running.
+  void HookLoads(bool on) {
+    if (io_pool_ != nullptr) io_pool_->WaitIdleForTesting();
+    if (on) {
+      hooked_.SetHook([this](std::string_view key) { OnLoad(key); });
+    } else {
+      hooked_.SetHook(nullptr);
     }
   }
 
@@ -835,9 +878,9 @@ class DifferentialTest : public PropertyHarness {
   // only what cold has not taken.
   void Reopen(bool settle_first) {
     if (settle_first) Settle();
-    hooked_.SetHook(nullptr);
+    HookLoads(false);
     auto restarted = RestartAt();
-    hooked_.SetHook([this](std::string_view key) { OnLoad(key); });
+    HookLoads(true);
     if (!restarted.has_value()) {
       Fail("restart: " + restarted.error().message());
       return;
@@ -943,7 +986,7 @@ class DifferentialTest : public PropertyHarness {
   }
 
   void Finish() {
-    hooked_.SetHook(nullptr);
+    HookLoads(false);
     CheckAll("at the end, hot then buffer plus cold");
     if (failed_) return;
     std::set<std::string> keys;
@@ -1079,7 +1122,11 @@ class DifferentialTest : public PropertyHarness {
   uint64_t reads_timed_out_ = 0;
   std::deque<std::string> history_;
   std::deque<std::map<core::ShardId, std::pair<core::SequenceId, core::SequenceId>>> batches_;
+  // The load hook's state, which it holds hook_mu_ over: a command sets
+  // outer_ to open its window, and reads the rest once it is closed.
+  std::mutex hook_mu_;
   const std::vector<std::string>* outer_ = nullptr;
+  const std::vector<std::string>* outer_keys_ = nullptr;
   std::vector<std::vector<std::string>> nested_;
   bool nested_on_loaded_ = false;
   std::set<std::string> loaded_;
