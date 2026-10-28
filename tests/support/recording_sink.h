@@ -19,11 +19,11 @@ namespace abyss::testing {
 class RecordingSink final : public core::CompletionSink {
  public:
   // NOLINTNEXTLINE(bugprone-exception-escape): a test double.
+  // Notifies under mu_: a waiter that sees the events may destroy the
+  // sink as soon as it relocks.
   void Post(std::span<const core::CompletionEvent> events) noexcept override {
-    {
-      const std::scoped_lock lock(mu_);
-      events_.insert(events_.end(), events.begin(), events.end());
-    }
+    const std::scoped_lock lock(mu_);
+    events_.insert(events_.end(), events.begin(), events.end());
     cv_.notify_all();
   }
 

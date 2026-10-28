@@ -26,7 +26,9 @@ struct CompletionEvent {
 
 // A reactor's inbox, or a test's. Post is thread-safe and short: a
 // guarded append and a wake. It never calls into a waiter list.
-// A sink outlives every Completion that names it.
+// A sink outlives every Completion that names it. Its owner may
+// destroy it once it has seen a post, so Post touches nothing of the
+// sink after the post is visible.
 class CompletionSink {
  public:
   CompletionSink() = default;

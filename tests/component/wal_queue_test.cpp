@@ -1044,12 +1044,11 @@ class EndCheckingSink final : public core::CompletionSink {
   // NOLINTNEXTLINE(bugprone-exception-escape): a test double.
   void Post(std::span<const core::CompletionEvent> events) noexcept override {
     const core::SequenceId end = queue_.DurableEnd(0, core::Durability::kPowerLoss).value_or(0);
-    {
-      const std::scoped_lock lock(mu_);
-      for (const core::CompletionEvent& event : events) {
-        if (!event.result.has_value() || end <= event.slot_seq) ++early_;
-        ++posts_;
-      }
+    // Under mu_: the test destroys the sink once it sees the posts.
+    const std::scoped_lock lock(mu_);
+    for (const core::CompletionEvent& event : events) {
+      if (!event.result.has_value() || end <= event.slot_seq) ++early_;
+      ++posts_;
     }
     cv_.notify_all();
   }
