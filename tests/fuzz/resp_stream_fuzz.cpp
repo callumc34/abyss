@@ -56,9 +56,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   const std::span<const uint8_t> input(data, size);
 
   NoopDispatcher dispatcher;
-  abyss::resp::RequestPipeline pipeline(
-      abyss::resp::GlobalRegistry(), abyss::resp::ConnectionState{.client_id = 1},
-      abyss::resp::PipelineDependencies{.dispatcher = &dispatcher});
+  abyss::resp::ConnectionState state;
+  state.client_id = 1;
+  abyss::resp::PipelineDependencies deps;
+  deps.dispatcher = &dispatcher;
+  abyss::resp::RequestPipeline pipeline(abyss::resp::GlobalRegistry(), state, deps);
 
   std::vector<uint8_t> read_buf;
   std::vector<uint8_t> write_buf;

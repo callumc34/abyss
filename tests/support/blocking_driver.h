@@ -55,7 +55,7 @@ inline core::Result<core::RespValue> DriveWrite(engine::Sequencer& sequencer,
     if (!event.has_value()) {
       core::Result<core::RespValue> reply = sequencer.Abandon(write);
       if (!write.Quiescent()) {
-        write.Woken(inbox.Take(std::nullopt)->result);
+        write.Woken(inbox.Take(std::nullopt).value().result);
         (void)sequencer.Attempt(write);
       }
       return reply;
