@@ -91,13 +91,22 @@ if(ABYSS_WITH_ROCKSDB)
     abyss_set_test_timeout(property_short "${CMAKE_CURRENT_SOURCE_DIR}" 30
       CrashTest.KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply)
   endif()
-  # No CI history yet: 3x their local time is under 10 s, so the floor
-  # is twice the sanitizers' 30 s stall limit, for the watchdog to fire
-  # first.
+  # Every front-end test beats a watchdog. The slowest degraded CI run
+  # is AMissThenASetOnOneConnectionReadsTheOldValue's 16.4 s, on Windows
+  # in a runner-wide I/O stall; twice that is under the floor of twice
+  # the sanitizers' 30 s stall limit, for the watchdog to fire first.
   set(_abyss_front_end_long
     FrontEndTest.APipelineOfPowerLossSetsSharesFlushes
+    FrontEndTest.AMissThenASetOnOneConnectionReadsTheOldValue
+    FrontEndTest.ASetThenAGetUnderPowerLossReplyInOrderOnceDurable
+    FrontEndTest.LateLoadsReachTheirOwnOrphansAndInstall
     FrontEndTest.OrphansAreBoundedByThePoolsThreads
+    FrontEndTest.ASyncPipelinesPendingDeadlineReplies
+    FrontEndTest.AHeldColdReadDoesNotDelayAHotReadOnTheSameReactor
+    FrontEndTest.AClosedConnectionsPipelineTakesAPostAlreadyTaken
     FrontEndTest.TheEnginesStopFailsAWaitAClosedConnectionLeft
+    FrontEndTest.TheServersStopGivesUpPendingWritesSoNoneIsLogged
+    FrontEndTest.TheReactorsOutlastANotifierHeldThroughTheEnginesStop
     ServerShutdownTest.AStopWithWorkOfEveryKindInFlightEndsClean)
   if(NOT WIN32)
     list(APPEND _abyss_front_end_long

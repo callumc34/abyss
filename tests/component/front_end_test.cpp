@@ -129,6 +129,7 @@ class HeldPost {
 class FrontEndTest : public SequencedEngineTest {
  protected:
   void SetUp() override {
+    watchdog_.emplace("opening");
     loader_cold_ = &hooked_;
     hooked_.SetHook([this](std::string_view key) { gate_.Hook(key); });
   }
@@ -187,13 +188,16 @@ class FrontEndTest : public SequencedEngineTest {
       Pump(10ms);
       (void)Feed(client);
       const std::string more = Drain(client);
-      if (!more.empty() && watchdog_.has_value()) watchdog_->Tick();
+      if (!more.empty()) Tick();
       out += more;
     }
     return out;
   }
   void Beat(std::string_view where) {
     if (watchdog_.has_value()) watchdog_->Beat(where);
+  }
+  void Tick() {
+    if (watchdog_.has_value()) watchdog_->Tick();
   }
   void Expire(uint64_t client, core::SteadyTime now = core::SteadyClock::now() + 1h) {
     if (auto orphan = pipelines_.at(client)->Expire(now)) orphans_.Adopt(std::move(orphan));
@@ -213,8 +217,13 @@ class FrontEndTest : public SequencedEngineTest {
 
   // Writes `args`, then sends what they wrote to cold and out of hot.
   void Cold(std::vector<std::string> args) {
+    Beat("writing " + args.at(1) + " for cold");
     ASSERT_EQ(Write(std::move(args)).rfind("error", 0), std::string::npos);
-    for (core::ShardId shard = 0; shard < options_.shards; ++shard) DrainToCold(shard);
+    for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
+      Beat("draining shard " + std::to_string(shard) + " to cold");
+      DrainToCold(shard);
+    }
+    Beat("evicting what cold holds");
     EvictDrained();
   }
   bool Member(std::string_view key, std::string_view member) {
@@ -246,7 +255,7 @@ class FrontEndTest : public SequencedEngineTest {
   ColdKeyGate gate_;
   // Outlives the server whose posts it holds, on a failure too.
   HeldPost held_;
-  // A long test's: each reply or step is progress.
+  // Each reply or step is progress.
   std::optional<abyss::testing::ProgressWatchdog> watchdog_;
   abyss::testing::HookedColdStore hooked_{[this]() -> core::ColdStore& { return *cold_; }};
   abyss::testing::EventInbox inbox_;
@@ -264,7 +273,6 @@ class FrontEndTest : public SequencedEngineTest {
 // connection's writes wait to be durable together.
 TEST_F(FrontEndTest, APipelineOfPowerLossSetsSharesFlushes) {
   constexpr int kDepth = 32;
-  watchdog_.emplace("opening");
   Open(Options{.durability = core::Durability::kPowerLoss});
   Connect(1);
   std::string input;
@@ -293,13 +301,16 @@ TEST_F(FrontEndTest, AMissThenASetOnOneConnectionReadsTheOldValue) {
   Cold({"SET", "k", "old"});
   gate_.Hold("k");
   Connect(1);
+  Beat("feeding a GET of the held key, then a SET");
   EXPECT_FALSE(Feed(1, Command({"GET", "k"}) + Command({"SET", "k", "new"})));
   ASSERT_TRUE(gate_.AwaitBlocked(1));
   Pump(20ms);
   EXPECT_EQ(Drain(1), "");
   EXPECT_FALSE(Feed(1)) << "the SET waits behind the pending GET";
+  Beat("awaiting both replies");
   gate_.Release("k");
   EXPECT_EQ(Await(1, Bulk("old").size() + 5), Bulk("old") + "+OK\r\n");
+  Beat("reading the new value");
   EXPECT_TRUE(Feed(1, Command({"GET", "k"})));
   EXPECT_EQ(Await(1, Bulk("new").size()), Bulk("new"));
 }
@@ -311,10 +322,12 @@ TEST_F(FrontEndTest, ASetThenAGetUnderPowerLossReplyInOrderOnceDurable) {
   FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
   Connect(1);
+  Beat("feeding a SET and a GET with the flush held");
   EXPECT_TRUE(Feed(1, Command({"SET", "k", "v"}) + Command({"GET", "k"})));
   EXPECT_EQ(pipelines_.at(1)->InFlight(), 2U);
   Pump(50ms);
   EXPECT_EQ(Drain(1), "") << "neither reply shows the SET before it is durable";
+  Beat("awaiting both replies");
   stall.Release();
   EXPECT_EQ(Await(1, 5 + Bulk("v").size()), "+OK\r\n" + Bulk("v"));
 }
@@ -333,6 +346,7 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
   Connect(1);
   const double gauge = OrphanGauge();
 
+  Beat("orphaning two held loads");
   EXPECT_TRUE(Feed(1, Command({"SADD", "a", "y"})));
   ASSERT_TRUE(gate_.AwaitBlocked(1));
   Expire(1);
@@ -342,10 +356,12 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
   Expire(1);
   EXPECT_EQ(orphans_.size(), 2U) << "one client's two orphans, apart";
   EXPECT_EQ(OrphanGauge(), gauge + 2);
+  Beat("awaiting a third write's wait on a's load");
   EXPECT_TRUE(Feed(1, Command({"SADD", "a", "z"})));
   ASSERT_TRUE(PollUntil([this] { return hot_->LoadWaitersForTesting("a") == 1; }))
       << "the third write waits on the first one's load of its key";
 
+  Beat("releasing a's load");
   gate_.Release("a");
   const std::string timed_out = Err("write timed out loading its keys");
   EXPECT_EQ(Await(1, (2 * timed_out.size()) + 4), timed_out + timed_out + ":1\r\n");
@@ -354,6 +370,7 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
   EXPECT_TRUE(Member("a", "z"));
   EXPECT_FALSE(Member("a", "y")) << "a write abandoned at its deadline applied";
 
+  Beat("releasing b's load");
   gate_.Release("b");
   ASSERT_TRUE(PollUntil([this] {
     Pump();
@@ -370,14 +387,13 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
 // timed-out misses leave two, and the queued ones never read cold.
 TEST_F(FrontEndTest, OrphansAreBoundedByThePoolsThreads) {
   constexpr uint64_t kMisses = 100;
-  abyss::testing::ProgressWatchdog& watchdog = watchdog_.emplace("opening");
   Open(Options{.cold_io_threads = 2});
   Beat("writing the keys");
   for (uint64_t i = 0; i < kMisses; ++i) {
     const std::string key = "m" + std::to_string(i);
     ASSERT_EQ(Write({"SET", key, "v"}).rfind("error", 0), std::string::npos);
     gate_.Hold(key);
-    watchdog.Tick();
+    Tick();
   }
   for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
     Beat("draining shard " + std::to_string(shard) + " to cold");
@@ -389,7 +405,7 @@ TEST_F(FrontEndTest, OrphansAreBoundedByThePoolsThreads) {
   for (uint64_t i = 0; i < kMisses; ++i) {
     Connect(i + 1);
     EXPECT_TRUE(Feed(i + 1, Command({"GET", "m" + std::to_string(i)})));
-    watchdog.Tick();
+    Tick();
   }
   Beat("awaiting the pool's two reads");
   ASSERT_TRUE(gate_.AwaitBlocked(2));
@@ -424,6 +440,7 @@ TEST_F(FrontEndTest, ASyncPipelinesPendingDeadlineReplies) {
   const double exceeded = ColdDeadlinesExceeded();
   abyss::testing::SyncPipeline sync(resp::GlobalRegistry(), resp::ConnectionState{.client_id = 77},
                                     resp::PipelineDependencies{.dispatcher = engine_.get()});
+  Beat("dispatching a read held past its deadline");
   std::thread releaser([this, exceeded] {
     (void)gate_.AwaitBlocked(1);
     (void)PollUntil([exceeded] { return ColdDeadlinesExceeded() > exceeded; });
@@ -445,17 +462,21 @@ TEST_F(FrontEndTest, AHeldColdReadDoesNotDelayAHotReadOnTheSameReactor) {
   Cold({"SET", "cold", "c"});
   ASSERT_EQ(Write({"SET", "hot", "h"}), "OK");
   gate_.Hold("cold");
+  Beat("starting the server");
   StartServer(/*reactors=*/1);
   component_test::SyncRedisClient held;
   component_test::SyncRedisClient other;
   ASSERT_TRUE(held.Connect(server_->BoundPort()));
   ASSERT_TRUE(other.Connect(server_->BoundPort()));
+  Beat("holding a cold read");
   ASSERT_TRUE(held.SendRaw(Command({"GET", "cold"})));
   ASSERT_TRUE(gate_.AwaitBlocked(1));
 
+  Beat("reading the hot key");
   EXPECT_EQ(other.Command({"GET", "hot"}), Bulk("h"));
   EXPECT_EQ(gate_.Calls("cold"), 1) << "the cold read is still held";
 
+  Beat("awaiting the cold reply");
   gate_.Release("cold");
   EXPECT_EQ(held.ReadReply(), Bulk("c"));
 }
@@ -467,10 +488,12 @@ TEST_F(FrontEndTest, AClosedConnectionsPipelineTakesAPostAlreadyTaken) {
   Open(Options{.durability = core::Durability::kPowerLoss});
   FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
+  Beat("starting the server");
   StartServer();
   server_->SetInboxPostHookForTesting(held_.Hook());
   component_test::SyncRedisClient client;
   ASSERT_TRUE(client.Connect(server_->BoundPort()));
+  Beat("awaiting the SET's sequencing");
   ASSERT_TRUE(client.SendRaw(Command({"SET", "k", "v"})));
   ASSERT_TRUE(PollUntil([this] {
     return queue_->DurableEnd(ShardOf("k"), core::Durability::kProcessCrash).value_or(0) > 1;
@@ -478,12 +501,14 @@ TEST_F(FrontEndTest, AClosedConnectionsPipelineTakesAPostAlreadyTaken) {
   const double orphans = OrphanGauge();
   const double late = LateCompletions();
 
+  Beat("closing with its durable post held");
   held_.Arm();
   stall.Release();
   ASSERT_TRUE(held_.entered.Wait());
   client.Close();
   ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }))
       << "the closed connection's pipeline, owed the held post, is kept";
+  Beat("releasing the post");
   held_.release.Open();
   EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; })) << "it never settled";
   EXPECT_EQ(LateCompletions(), late) << "the post found no one";
@@ -493,7 +518,6 @@ TEST_F(FrontEndTest, AClosedConnectionsPipelineTakesAPostAlreadyTaken) {
 // with the orphans; the engine's stop fails its wait, which lands on
 // the orphaned pipeline through the reactor still running.
 TEST_F(FrontEndTest, TheEnginesStopFailsAWaitAClosedConnectionLeft) {
-  watchdog_.emplace("opening");
   Open(Options{.segment_size_bytes = size_t{16} << 10U});
   StartServer();
   queue_->PauseSegmentPreparerForTesting(0, true);
@@ -545,6 +569,7 @@ TEST_F(FrontEndTest, TheServersStopGivesUpPendingWritesSoNoneIsLogged) {
   Cold({"SET", "r", "v"});
   gate_.Hold("k");
   gate_.Hold("r");
+  Beat("starting the server");
   StartServer();
   component_test::SyncRedisClient loading;
   component_test::SyncRedisClient joining;
@@ -552,6 +577,7 @@ TEST_F(FrontEndTest, TheServersStopGivesUpPendingWritesSoNoneIsLogged) {
   ASSERT_TRUE(loading.Connect(server_->BoundPort()));
   ASSERT_TRUE(joining.Connect(server_->BoundPort()));
   ASSERT_TRUE(reading.Connect(server_->BoundPort()));
+  Beat("holding a load, a write on it and a cold read");
   ASSERT_TRUE(loading.SendRaw(Command({"SADD", "k", "y1"})));
   ASSERT_TRUE(gate_.AwaitBlocked(1));
   ASSERT_TRUE(joining.SendRaw(Command({"SADD", "k", "y2"})));
@@ -564,6 +590,7 @@ TEST_F(FrontEndTest, TheServersStopGivesUpPendingWritesSoNoneIsLogged) {
   const double timed_out = Abandoned(metrics::AbandonReason::kDeadline);
   const double exceeded = ColdDeadlinesExceeded();
 
+  Beat("closing the connections");
   server_->StopAccepting();
   server_->ForceClose();
   EXPECT_EQ(Abandoned(metrics::AbandonReason::kShutdown), given_up + 3);
@@ -574,6 +601,7 @@ TEST_F(FrontEndTest, TheServersStopGivesUpPendingWritesSoNoneIsLogged) {
 
   // The engine's stop: the held reads land as the pool stops, and the
   // late posts of the commands they were for only clean up.
+  Beat("stopping the engine");
   gate_.ReleaseAll();
   io_pool_->Shutdown();
   EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; }));
@@ -582,6 +610,7 @@ TEST_F(FrontEndTest, TheServersStopGivesUpPendingWritesSoNoneIsLogged) {
   hot_->FailLoadWaits();
   server_->Join();
 
+  Beat("restarting");
   ASSERT_TRUE(Restart().has_value());
   EXPECT_EQ(Members("k"), std::vector<std::string>{"x"});
   for (const core::QueueEntry& entry : Logged(ShardOf("k"))) {
@@ -599,22 +628,26 @@ TEST_F(FrontEndTest, TheReactorsOutlastANotifierHeldThroughTheEnginesStop) {
   Open(Options{.durability = core::Durability::kPowerLoss});
   FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
+  Beat("starting the server");
   StartServer();
   server_->SetInboxPostHookForTesting(held_.Hook());
   component_test::SyncRedisClient client;
   ASSERT_TRUE(client.Connect(server_->BoundPort()));
+  Beat("awaiting the SET's sequencing");
   ASSERT_TRUE(client.SendRaw(Command({"SET", "k", "v"})));
   ASSERT_TRUE(PollUntil([this] {
     return queue_->DurableEnd(ShardOf("k"), core::Durability::kProcessCrash).value_or(0) > 1;
   }));
   const double orphans = OrphanGauge();
   const double late = LateCompletions();
+  Beat("closing with its durable post held");
   held_.Arm();
   stall.Release();
   ASSERT_TRUE(held_.entered.Wait());
   client.Close();
   ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }));
 
+  Beat("stopping the engine under the held post");
   abyss::testing::Latch stopping;
   abyss::testing::Latch checked;
   std::thread stopper([this, &stopping, &checked] {
@@ -636,6 +669,7 @@ TEST_F(FrontEndTest, TheReactorsOutlastANotifierHeldThroughTheEnginesStop) {
     });
   });
   EXPECT_TRUE(stopping.Wait());
+  Beat("releasing the post");
   held_.release.Open();
   EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; }))
       << "the held post never reached the orphaned pipeline";
