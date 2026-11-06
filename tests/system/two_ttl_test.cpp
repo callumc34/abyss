@@ -115,7 +115,6 @@ class TwoTtlSystemTest : public IsolatedDataServerTest {
     TestServer::Config c;
     c.shard_count = 1;
     c.config_yaml = std::string(kTwoTtlConfig);
-    c.ready_timeout = 10s;
     return c;
   }
 

@@ -17,7 +17,10 @@ class TestServer {
  public:
   struct Config {
     uint32_t shard_count = 4;
-    std::chrono::milliseconds ready_timeout{5000};
+    // A bound for a server still starting, not a stall detector: the
+    // suite's per-test watchdog catches a stall. Recovery on a slow
+    // runner's disk can take seconds.
+    std::chrono::milliseconds ready_timeout{60000};
 
     std::string config_yaml;
   };

@@ -99,7 +99,6 @@ class RemoveResurrectionTest : public IsolatedDataServerTest {
     TestServer::Config c;
     c.shard_count = 1;
     c.config_yaml = std::string(kFastTieringConfig);
-    c.ready_timeout = 10s;
     return c;
   }
 };

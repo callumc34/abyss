@@ -217,7 +217,6 @@ class MetricsCatalogueTest : public IsolatedDataServerTest {
     TestServer::Config c;
     c.shard_count = 2;
     c.config_yaml = std::string(kSmokeConfig);
-    c.ready_timeout = 10s;
     return c;
   }
 };
