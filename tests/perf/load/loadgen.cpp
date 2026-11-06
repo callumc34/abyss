@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -34,6 +35,32 @@ namespace {
 
 constexpr std::string_view kCmdGet = "GET";
 constexpr std::string_view kCmdSet = "SET";
+// No key and no engine work: the front end's own ceiling.
+constexpr std::string_view kCmdPing = "PING";
+
+enum class Op : uint8_t { kGet, kSet, kPing };
+
+Op OpOf(std::string_view name) {
+  if (name == kCmdSet) return Op::kSet;
+  if (name == kCmdGet) return Op::kGet;
+  return Op::kPing;
+}
+
+// Every value loadgen writes is `value`, so a GET answers with it or
+// with nil.
+bool Answers(Op op, const redisReply& reply, std::string_view value) {
+  const std::string_view str =
+      reply.str != nullptr ? std::string_view{reply.str, reply.len} : std::string_view{};
+  switch (op) {
+    case Op::kSet:
+      return reply.type == REDIS_REPLY_STATUS && str == "OK";
+    case Op::kPing:
+      return reply.type == REDIS_REPLY_STATUS && str == "PONG";
+    case Op::kGet:
+      return reply.type == REDIS_REPLY_NIL || (reply.type == REDIS_REPLY_STRING && str == value);
+  }
+  return false;
+}
 
 std::string KeyFor(uint64_t idx) {
   std::array<char, 32> buf{};
@@ -176,7 +203,8 @@ abyss::perf::ServerIdentity IdentifyServer(redisContext* ctx) {
 }
 
 // One hiredis connection driven through append/flush/read so several
-// requests can be in flight.
+// requests can be in flight. Each reply is checked against the request
+// it answers, oldest first, so a reply out of order fails as an error.
 class HiredisConnection final : public abyss::perf::PipelinedConnection {
  public:
   using Clock = std::chrono::steady_clock;
@@ -184,16 +212,26 @@ class HiredisConnection final : public abyss::perf::PipelinedConnection {
   HiredisConnection(redisContext* ctx, const std::string& value, std::atomic<uint64_t>& failures)
       : ctx_(ctx), value_(value), failures_(failures) {}
 
-  // The mix holds only GET and SET; the caller rejects anything else.
+  // The mix holds only GET, SET and PING; the caller rejects the rest.
   bool Send(std::string_view op_name, uint64_t key_index) override {
-    const bool set = op_name == kCmdSet;
+    const Op op = OpOf(op_name);
     const auto key = KeyFor(key_index);
-    std::array<const char*, 3> argv{set ? "SET" : "GET", key.c_str(), value_.c_str()};
-    const std::array<size_t, 3> lens{3, key.size(), value_.size()};
-    const int args = set ? 3 : 2;
+    std::array<const char*, 3> argv{op == Op::kSet ? "SET" : "GET", key.c_str(), value_.c_str()};
+    std::array<size_t, 3> lens{3, key.size(), value_.size()};
+    int args = op == Op::kSet ? 3 : 2;
+    if (op == Op::kPing) {
+      argv[0] = "PING";
+      lens[0] = kCmdPing.size();
+      args = 1;
+    }
     if (redisAppendCommandArgv(ctx_, args, argv.data(), lens.data()) != REDIS_OK) return Fail();
+    sent_.push_back(op);
     return true;
   }
+
+  uint64_t answered() const { return answered_.load(std::memory_order_relaxed); }
+  uint64_t refused() const { return refused_.load(std::memory_order_relaxed); }
+  uint64_t mismatched() const { return mismatched_.load(std::memory_order_relaxed); }
 
   bool Flush() override {
     int done = 0;
@@ -215,9 +253,21 @@ class HiredisConnection final : public abyss::perf::PipelinedConnection {
       }
     }
     auto* parsed = static_cast<redisReply*>(reply);
+    const Op op = sent_.front();
+    sent_.pop_front();
     const bool error = parsed->type == REDIS_REPLY_ERROR;
+    const bool answers = error || Answers(op, *parsed, value_);
+    if (!answers && mismatched_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      std::cerr << "loadgen: a reply does not answer its request (reply type " << parsed->type
+                << ")\n";
+    }
     freeReplyObject(parsed);
-    return error ? Await::kError : Await::kReply;
+    if (error || !answers) {
+      refused_.fetch_add(1, std::memory_order_relaxed);
+      return Await::kError;
+    }
+    answered_.fetch_add(1, std::memory_order_relaxed);
+    return Await::kReply;
   }
 
  private:
@@ -250,6 +300,11 @@ class HiredisConnection final : public abyss::perf::PipelinedConnection {
   redisContext* ctx_;
   const std::string& value_;
   std::atomic<uint64_t>& failures_;
+  std::deque<Op> sent_;
+  // Written by the connection's worker, read by the report.
+  std::atomic<uint64_t> answered_{0};
+  std::atomic<uint64_t> refused_{0};
+  std::atomic<uint64_t> mismatched_{0};
 };
 
 constexpr int kExitOpErrors = 4;
@@ -271,6 +326,7 @@ int main(int argc, char** argv) {
   bool sweep = false;
   double sweep_p99_bound_us = 0.0;
   int64_t sweep_step_seconds = 0;
+  std::string per_connection_path;
 
   app.add_option("--workload", workload_path, "Workload YAML path")->required();
   app.add_option("--server", endpoint_str, "Redis endpoint host:port");
@@ -278,6 +334,8 @@ int main(int argc, char** argv) {
                  "Server metrics endpoint (empty to disable scraping)");
   app.add_option("--output", output_path, "JSON report path (omit for stdout)");
   app.add_option("--hgrm-dir", hgrm_dir, "Per-op .hgrm output directory");
+  app.add_option("--per-connection-out", per_connection_path,
+                 "CSV of each connection's answered and refused requests in the measured window");
   app.add_flag("--gate", gate, "Exit non-zero if any target fails");
   app.add_option("--run-id", run_id, "Run identifier override");
   app.add_flag("--skip-preload", skip_preload, "Skip workload preload phase");
@@ -297,8 +355,8 @@ int main(int argc, char** argv) {
   }
   auto workload = std::move(*workload_or);
   for (const auto& [name, weight] : workload.mix.weights) {
-    if (name != kCmdGet && name != kCmdSet) {
-      std::cerr << "unsupported op in mix: " << name << " (GET and SET only)\n";
+    if (name != kCmdGet && name != kCmdSet && name != kCmdPing) {
+      std::cerr << "unsupported op in mix: " << name << " (GET, SET and PING only)\n";
       return 2;
     }
   }
@@ -380,6 +438,13 @@ int main(int argc, char** argv) {
     transports.push_back(std::make_unique<HiredisConnection>(ctx, value_str, connection_failures));
     pipelined.push_back(transports.back().get());
   }
+  // Each connection's counts when the measured window opened.
+  std::vector<std::pair<uint64_t, uint64_t>> at_start(transports.size());
+  cfg.at_measure_start = [&] {
+    for (size_t i = 0; i < transports.size(); ++i) {
+      at_start[i] = {transports[i]->answered(), transports[i]->refused()};
+    }
+  };
   const auto run_at = [&](uint64_t rate_ops) {
     cfg.target_rate_ops = rate_ops;
     return abyss::perf::RunPipelinedLoop(cfg, workload.pipeline_depth, workload.arrival, pipelined);
@@ -507,6 +572,27 @@ int main(int argc, char** argv) {
     }
   }
   abyss::perf::WriteSummary(report, std::cerr);
+
+  uint64_t answered = 0;
+  uint64_t mismatched = 0;
+  for (const auto& transport : transports) {
+    answered += transport->answered();
+    mismatched += transport->mismatched();
+  }
+  std::cerr << "loadgen: " << answered << " replies answered their requests in order, "
+            << mismatched << " did not\n";
+  if (!per_connection_path.empty()) {
+    std::ofstream out{per_connection_path};
+    if (!out.is_open()) {
+      std::cerr << "failed to open per-connection output: " << per_connection_path << '\n';
+      return 1;
+    }
+    out << "connection,answered,refused\n";
+    for (size_t i = 0; i < transports.size(); ++i) {
+      out << i << ',' << transports[i]->answered() - at_start[i].first << ','
+          << transports[i]->refused() - at_start[i].second << '\n';
+    }
+  }
 
   // A sweep fails a step on error replies; a broken connection fails
   // the run.

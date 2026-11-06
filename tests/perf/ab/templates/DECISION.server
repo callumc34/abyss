@@ -1,0 +1,52 @@
+<Title>: server-level A/B. DECISION, written before round 0 (the pilot) and before round 1.
+
+Copy this file to <run-dir>/DECISION and replace every <...> before the first counted
+round. decide.py reads only the `key = value` lines; the rest is the record of what was
+decided and why. Never change a value after round 1 has started: record an amendment
+below, with its time and the reason, before the round it first applies to.
+
+Binaries: A = abyss-server from <commit> (<what it is>); B = abyss-server from <commit>.
+One loadgen, from <commit>, drives both. sha256 and build parity are in PROVENANCE.
+
+Rounds: round 0 is a pilot that validates the scripts; no decision uses it. Rounds
+alternate, A first in odd rounds and B first in even ones (run_server_ab.sh, order.txt).
+
+experiment = server
+rounds = 1-10
+
+The quiet() gate before every loadgen run (hol-scan follows hol-alone ungated): wait up to
+quiet.compiler_wait_s for no compiler, then up to quiet.load_wait_s for a one-minute load
+under quiet.load_max, and start regardless; each run's .load file keeps the host's state.
+
+quiet.load_max = <1.0>
+quiet.load_wait_s = <600>
+quiet.compiler_wait_s = <600>
+
+Workloads: run_server_ab.sh and the run directory's srv-*.yaml and wl/*.yaml. Every
+workload runs on a fresh server and an empty data directory.
+
+Estimator: per round, B/A of each arm's statistic; over rounds, the geometric mean. Means
+are decoded from loadgen's HdrHistogram (hdr.py), p50 and p99 are loadgen's.
+
+Gates (each must hold):
+  depth one costs nothing: for d1-pc and d1-pl separately, geomean B/A of p50 and of mean
+  gate.d1.p50_max = 1.05
+  gate.d1.mean_max = 1.05
+  pipelining: geomean over rounds of B's d32-pl / d1-pl writes/s
+  gate.pipelining.min = 10
+  the mechanism: B's WAL flushes per acknowledged write at d32-pl, in every round
+  gate.flushes_per_write.max = 0.25
+  the client is not the bottleneck: B's d32-pl SET/s over its ping32 PING/s, every round
+  gate.client_share.max = 0.5
+  pipelining never hurts: B's d32-pc / d1-pc writes/s, geomean and every round
+  gate.pc_ratio.min = 1.0
+  head-of-line: B's hot GET p99 with cold scans / alone, every round; valid only if the
+  scans read cold (cold hits and pool scans rise during hol-scan)
+  gate.hol_ratio.max = 2.0
+  order: no error and no mismatched reply in any depth-32 run, and every SET..GET order
+  check clean (fixed; no threshold)
+
+Reported, not gated: depth-32 throughput B/A, the mix's GET/s per arm, server lock hold
+means, server and loadgen CPU, start loads.
+
+Amendments:

@@ -1,0 +1,1 @@
+--durability power_loss --workers 64 --target-rate-ops 5000 --duration 60 --warmup 5 --flush-samples 100 --quiet-threshold-s 5

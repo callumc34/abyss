@@ -1,0 +1,21 @@
+<Title>: A/A control for <the A/B it calibrates>. DECISION, written before its first run.
+
+Copy this file to <run-dir>/DECISION and replace every <...> before the first run. Both
+arms are one binary: <probe>, sha256 <...> (PROVENANCE). It runs exactly as the A/B it
+calibrates (the same wl/<workload>.args, quiet() and nice), in the same session, rounds
+alternating as the A/B's do. It is diagnostic: it never re-decides the A/B, it says only
+whether the A/B's mean gate can inform on this host.
+
+experiment = aa
+rounds = 1-6
+workloads = w1
+
+quiet.load_max = <as the A/B>
+quiet.load_wait_s = <as the A/B>
+quiet.compiler_wait_s = <as the A/B>
+
+Reported: per workload, the geomean of the per-round mean ratio and of the p50 ratio, each
+round's ratio, acks over 10 ms per run, and the spread (the geomean's distance from 1 plus
+twice its standard error). With the line below, decide.py also says whether the spread is
+within it; the A/B's DECISION holds the limit that binds.
+aa.spread_max = 1.025

@@ -1,0 +1,58 @@
+<Title>: write-probe A/B. DECISION, written before round 1.
+
+Copy this file to <run-dir>/DECISION and replace every <...> before the first counted
+round. decide.py reads only the `key = value` lines; the rest is the record of what was
+decided and why. Never change a value after round 1 has started: record an amendment
+below, with its time and the reason, before the round it first applies to.
+
+Binaries: A = abyss_write_probe from <commit>; B = abyss_write_probe from <commit>.
+sha256 and build parity are in PROVENANCE.
+
+Rounds alternate, A first in odd rounds and B first in even ones (order.txt).
+
+experiment = probe
+rounds = 1-12
+workloads = w1 w2 hold pl1
+
+quiet() before every probe run, as in DECISION.server:
+quiet.load_max = <1.0>
+quiet.load_wait_s = <600>
+quiet.compiler_wait_s = <600>
+
+Workloads (flags in the run directory's wl/<workload>.args):
+  w1    process_crash, 1 worker, open loop 5,000/s, 60 s after 5 s
+  w2    power_loss, 64 workers, open loop 5,000/s, 60 s after 5 s
+  hold  lock hold with readers: process_crash, 8 workers, 50/50 writes and reads,
+        zipf 0.99, open loop 20,000/s, 60 s after 5 s
+  pl1   lock hold at power_loss, 1 worker, closed loop, 60 s after 5 s
+
+Estimator: per round, B/A of each arm's statistic; over rounds, the geometric mean.
+write_ack means are decoded from the probe's HdrHistogram (hdr.py); lock holds are the
+probe's server_histograms abyss_sequencer_lock_hold_seconds (mean_us, and the p50
+bucket bound), sampled on about one write in 64.
+
+Gates (each must hold; a workload with no gate line is reported only):
+gate.w1.p50_max = 1.05
+gate.w1.mean_max = 1.05
+gate.w2.p50_max = 1.05
+gate.w2.mean_max = 1.05
+gate.hold.lock_hold_mean_max = 1.05
+gate.hold.lock_hold_p50_max = 1.05
+gate.pl1.lock_hold_mean_max = 1.05
+gate.pl1.lock_hold_p50_max = 1.05
+
+A/A calibration: the mean gate of each workload aa.calibrates names is decided only
+against an A/A control of that workload, run in the same session (run_probe_aa.sh,
+DECISION.aa), whose spread is within aa.spread_max: decide.py <run-dir> --aa
+<aa-run-dir>. The spread is the A/A geomean's distance from 1 plus twice its standard
+error, as a ratio; the limit is well inside the 1.05 gate.
+aa.calibrates = w1
+aa.spread_max = 1.025
+Without such a control the gate is NOT DECIDED: W1's mean is set by rare stalls, and two
+copies of one binary can differ by more than the gate.
+
+Diagnostics (not gated): per-arm medians; the mean of acks <= 1 ms; acks over 10 ms per
+run; WAL flush means; a paired p99 ratio with a sign test; lock-hold stage means. If B's
+W1 p99 is worse in at least 9 of 12 rounds, root-cause it before deciding.
+
+Amendments:

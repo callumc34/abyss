@@ -1,0 +1,35 @@
+# run_server_ab.sh writes this to <run-dir>/srv-hol.yaml, with the AB_* words replaced.
+profile: embedded
+hot:
+  backend: builtin_hashmap
+  # The scan hashes are never filled, so every HGETALL reads cold.
+  fill_max_fraction: 0.0001
+  eviction_overrides:
+    - prefix: "scan:"
+      eviction_seconds: 2
+cold:
+  backend: builtin_rocksdb
+  data_path: AB_DATA_DIR/cold
+queue:
+  backend: builtin_wal
+  wal_path: AB_DATA_DIR/wal
+  durability: process_crash
+cold_consumer:
+  quiet_threshold_seconds: 1
+net:
+  bind: 127.0.0.1
+  port: AB_RESP_PORT
+  # One reactor: the GET connection and the scan connection share it.
+  io_threads: 1
+metrics:
+  enabled: true
+  bind: 127.0.0.1
+  port: AB_METRICS_PORT
+admin:
+  enabled: true
+  bind: 127.0.0.1
+  port: AB_ADMIN_PORT
+log:
+  level: info
+  format: text
+  sink: stderr

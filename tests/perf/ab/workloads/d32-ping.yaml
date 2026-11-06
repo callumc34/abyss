@@ -1,0 +1,17 @@
+name: ab-d32-ping
+description: tests/perf/ab server A/B
+duration_seconds: 10
+warmup_seconds: 2
+workers: 1
+connections_per_worker: 1
+pipeline_depth: 32
+target_rate_ops: 0
+key_count: 100000
+key_distribution:
+  kind: uniform
+  seed: 1
+value_size_bytes: 64
+mix:
+  PING: 1.0
+preload:
+  enabled: false

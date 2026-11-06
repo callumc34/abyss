@@ -318,8 +318,7 @@ Result<std::unique_ptr<WritePath>> BuildWritePath(const abyss::config::Config& c
           .command_timeout = config.engine.command_timeout,
       });
   wp->io_pool = std::make_unique<abyss::engine::IoPool>(abyss::engine::IoPoolConfig{
-      .threads = abyss::engine::ColdIoThreads(config.engine.cold_io_threads,
-                                              std::thread::hardware_concurrency()),
+      .threads = abyss::engine::ColdIoThreads(config.engine.cold_io_threads),
   });
   wp->reads =
       std::make_unique<abyss::engine::ReadPath>(*wp->hot_store, *wp->loader, *wp->io_pool,

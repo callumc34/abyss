@@ -1,0 +1,1 @@
+--durability process_crash --target-rate-ops 20000 --mix write_ack=0.5,read=0.5 --zipf-theta 0.99 --duration 60 --warmup 5 --quiet-threshold-s 5 --flush-samples 20 --workers 8 --distribution zipfian --large-fraction 0

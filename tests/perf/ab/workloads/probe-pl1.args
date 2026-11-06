@@ -1,0 +1,1 @@
+--durability power_loss --workers 1 --duration 60 --warmup 5 --quiet-threshold-s 5 --flush-samples 20

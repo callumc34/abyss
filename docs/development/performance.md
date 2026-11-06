@@ -224,6 +224,7 @@ Write targets are not written into workloads, because they depend on the durabil
 | `--sweep` | no | Find the highest sustained open-loop rate (W3); see below. |
 | `--sweep-p99-bound-us` | with `--sweep` | Latency bound each sweep step must meet, normally the W2 bound from a write-probe calibration on the same volume. |
 | `--sweep-step-seconds` | no | Override the workload's duration for each sweep step. |
+| `--per-connection-out` | no | CSV of each connection's answered and refused requests over the measured window, for fairness across connections. |
 
 **Server identity.** The load generator identifies the server it measured. It reads `HELLO` and, where needed, `INFO server`, so Abyss, Valkey, Redis and Dragonfly are told apart. It records the result as `server: {kind, version}`, and the server's durability settings as `config` (best effort via `CONFIG GET`). The same binary can therefore produce the comparative baselines in ADP-013 §Comparative baselines. Pass `--metrics-url ""` for servers without a `/metrics` endpoint. A failed scrape is reported on stderr and records no snapshot.
 
@@ -233,7 +234,7 @@ Write targets are not written into workloads, because they depend on the durabil
 - With `arrival: burst`, each slot sends `pipeline_depth` requests together, the way a pipelining client behaves. `target_rate_ops` stays in requests per second, so bursts are spaced `pipeline_depth / rate` apart.
 - Every request is measured from its slot's intended send time, so waiting for a full window or a slow earlier reply is charged to it.
 
-**Errors.** Error replies are counted per operation and never recorded as latency. Any error makes the load generator exit 4, after writing the report.
+**Errors and order.** Error replies are counted per operation and never recorded as latency. Each reply is also checked against the request it answers, oldest first: `SET` must get `OK`, `PING` must get `PONG`, and `GET` the workload's value or nil. A reply that does not answer its request counts as an error, and the run's last line gives how many replies answered in order and how many did not. Replies of one kind are alike, so this catches a reply out of order only between different commands; the order checks in [Asynchronous execution](#asynchronous-execution-measurements-macos-indicative) chain each write to the one before it. Any error makes the load generator exit 4, after writing the report.
 
 **Sweeping W3.**
 - `--sweep` starts at the workload's rate and doubles it until a step fails, then bisects until the bracket is within 5%.
@@ -257,7 +258,7 @@ Write targets are not written into workloads, because they depend on the durabil
 
 Offered rates are split across connections exactly: the remainder goes one request/s at a time to the first connections, and a connection whose share is zero stays idle. The load generator does not wait for server readiness: start it against a server whose `/ready` already returns 200.
 
-Loadgen supports `GET` and `SET` operations, and rejects a workload whose mix names anything else; expanding command coverage is tracked separately.
+Loadgen supports `GET`, `SET` and `PING`, and rejects a workload whose mix names anything else; expanding command coverage is tracked separately. `PING` touches no key and no engine state, so a `PING` run at the same depth and connections is the front end's and the client's own ceiling.
 
 ## Workload YAML
 
@@ -840,6 +841,220 @@ $B --benchmark_filter=BM_HotReadScaling
 ```
 
 **W3 and W1-L** go over TCP against `abyss-server`, as under [Running the load generator](#running-the-load-generator): `write_throughput.yaml` with `--sweep` for W3, and `write_loopback_pipelined.yaml` beside Valkey in the same run for W1-L.
+
+## Asynchronous execution measurements (macOS, indicative)
+
+These measure the asynchronous execution of #161: reactors that never wait on durability or cold I/O, and pipelined writes on one connection that share WAL flushes. Every number is **macOS and indicative**. The authoritative Linux numbers await a decision on the hardware they run on; the commands are in [To reproduce on Linux](#to-reproduce-phase-3-on-linux).
+
+- **Host.** Apple M4 Pro (10 performance and 4 efficiency cores), 24 GB, internal SSD with APFS, macOS 26.6.2. The host carried a virtual machine at about 0.8 of a core, a terminal, endpoint agents and other sessions throughout, so its one-minute load sat near 3 with nothing of ours running. Each run waited up to 10 minutes for no compiler to be running (none ran during any measured run), then up to 2 minutes for a one-minute load under 3, and started regardless after that; every table gives its runs' load range. The measurement session ran at nice 5: G1's ten rounds, G2 and its A/A control ran at nice 10 (zsh's `BG_NICE` added 5 to their background job), both binaries alike, and the stall diagnostics at 10 and 5, the measurements M1 to M6 at 5. That is lower priority than the virtual machine and the rest of the desktop, and it bears on the rarest stalls (see [G2](#engine-no-regression-g2)).
+- **Binaries.** A is the build before the asynchronous front end: the server from 6a158d6 (the engine asynchronous, the front end synchronous at depth one) and the write probe from a1de4f6. B is the Phase 3 head, 320b6e8. Both are the `bench` preset (Release, `-O3`), Apple clang 21, built against one vcpkg tree: A was configured with B's `vcpkg_installed`, so RocksDB and every other dependency are the same objects, and the resolved compile and link flags were checked equal. One load generator, built from B, drove both servers.
+- **Method.** Each A/B wrote its estimator, thresholds, rounds and workloads to a `DECISION` file, and its binaries' sha256, commits and flags to a `PROVENANCE` file, before its first counted round. Rounds alternate AB and BA. The estimator is per round B/A, then the geometric mean over rounds. Every workload starts a fresh server on an empty data directory. Run directories are kept with the job's notes (`runs-3-4/`); the scripts, generalised, are in [`tests/perf/ab`](../../tests/perf/ab/README.md).
+- **Load robustness.** Beside each verdict, the gate was recomputed without rounds whose start load was above 6. No gated run started above 6, so no verdict changes.
+
+### Pipelining and depth one (G1)
+
+One connection, closed loop, `SET` of 64-byte values over 100,000 keys, 20 s after 5 s of warmup; ten rounds. Medians over the rounds, with the range of per-round B/A ratios. Start loads 1.85–14.83, median 2.88 (the 90/10 runs raised it to 4.5–12 by their end).
+
+| Workload | A | B | B/A, geomean (rounds) | Gate |
+|---|---|---|---|---|
+| Depth 1, `process_crash`: p50 / mean | 25.1 / 29.3 µs | 25.2 / 29.4 µs | **1.035 / 1.036** (0.985–1.434 / 0.962–1.431) | ≤ 1.05: pass |
+| Depth 1, `power_loss`: p50 / mean | 4.03 / 4.58 ms | 4.04 / 4.54 ms | **1.001 / 0.989** (0.996–1.006 / 0.947–1.023) | ≤ 1.05: pass |
+| Depth 32, `power_loss`: writes/s | 229 | **3,887** | **17.1** (16.4–18.9) | reported |
+| Depth 32 against depth 1, `power_loss`, writes/s | 1.04× | **17.7×** (17.1–18.4) | — | B ≥ 10×: pass |
+| WAL flushes per acknowledged write, `power_loss`, depth 1 / 32 | 1.00 / 1.00 | 1.00 / **0.063** | — | B at 32 ≤ 0.25: pass |
+| Depth 32, `process_crash`: writes/s | 152,700 | 156,300 | **0.982** (0.840–1.050) | reported |
+| Depth 32 against depth 1, `process_crash` | 4.5× | 4.30× (3.39–4.69) | — | B ≥ 1×: pass |
+| `PING`, depth 32: requests/s | 275,900 | 277,500 | 1.005 | ceiling |
+
+- **Pipelining shares flushes.** At `power_loss` a depth-1 write waits for a flush of its own, about 4 ms on this SSD's `F_FULLFSYNC`, so one connection gets about 220 writes/s whatever the front end. At depth 32, A still runs one write at a time (1.04×), while B lets the 32 share flushes: 0.063 flushes per write, two flushes for each batch of 32 (the one in flight when the batch lands, then its own), and 17.7× the throughput.
+- **The price.** When nothing waits, at depth 32 under `process_crash`, B is 0.982 of A: the asynchronous front end costs about 2% there. That is what the 17× under `power_loss` costs.
+- **Depth one costs nothing within the gate.** Under `process_crash` the paired p50 is 1.035, which passes with 1.5 points of margin and includes round 3, where B ran 1.43× slower than A in both p50 and mean; the other nine rounds are 0.985–1.018 (p50) and 0.962–1.041 (mean). Under `power_loss` the flush dominates, and B/A is 1.001.
+- **The client is not the bottleneck.** `PING` at depth 32, which touches no key and no engine state, ran at about 277,000/s with the load generator's one thread at 0.99 of a core: that is the client's ceiling. B's depth-32 `SET` under `power_loss` used at most 1.5% of it; under `process_crash` it reached 41–58%, so that row is partly the client's limit.
+- **Order.** Every depth-32 run, 63.8 million `SET`s in all, had no error reply and no reply out of order by the load generator's check (each reply must answer the request at the head of its pipeline). After each depth-32 `power_loss` run, 6,400 `SET order v<i> GET` in batches of 32 each had to return `v<i-1>`, which chains every write to the one before it: all 20 checks were clean.
+
+### Reads under writes
+
+`mixed_read_under_writes.yaml`'s shape (90/10 `GET`/`SET`, Zipf 0.99 over 100,000 keys preloaded by `MSET`, 64-byte values, 64 connections at depth 1), closed loop, 20 s after 5 s, ten rounds:
+
+| Durability | A `GET`/s | B `GET`/s | B/A (rounds) | `GET` p99, A / B | Load generator |
+|---|---|---|---|---|---|
+| `power_loss` | 12,100 (11,900–12,200) | **36,100** (35,800–36,400) | **2.99** (2.96–3.03) | 16.3 / 7.5 ms | 0.2–0.5 cores |
+| `process_crash` | 114,000 | 114,800 | 1.006 | 0.77 / 0.77 ms | 1.7 cores, over its 1.4-core threshold |
+
+At `power_loss` a connection's `GET`s no longer wait behind another connection's durable `SET` on the same reactor, so `GET` throughput triples. #161's 18,000 `GET`s/s was a different measurement, memtier under `fsync_none` (today's `process_crash`); under `process_crash` both binaries reach about 114,000/s here, with the load generator over its CPU threshold, so that row is a lower bound on the server.
+
+### Head-of-line
+
+One reactor (`net.io_threads: 1`), `process_crash`. One connection reads 100 hot string keys, open loop at 5,000 `GET`s/s, 20 s after 3 s; then the same while memtier runs `HGETALL` back to back on a second connection over 200 cold hashes of 2,000 one-byte fields (never filled into hot, `fill_max_fraction` 0.0001), each about 215 µs on the cold I/O pool and a 34 KiB reply. Ten rounds:
+
+| | p50 alone → with scans | p99 alone → with scans | p99 ratio, geomean (rounds) |
+|---|---|---|---|
+| A | 30.3 → 221.8 µs | 128 → 591 µs | **6.35** (4.11–52.9) |
+| B | 30.0 → 30.3 µs | 137 → 157 µs | **1.14** (0.75–1.33) |
+
+B's gate, at most 2× in every round, passes. A's reactor waits out each cold scan, so the hot `GET`s queue behind it; B's reactor hands the scan to the pool and keeps serving, and what remains is writing the scans' replies.
+
+### Engine no-regression (G2)
+
+The write probe, A built from a1de4f6 and B from 320b6e8, twelve rounds. The probe drives the engine through a synchronous test connection, not the reactors, so this checks that the engine's write path did not regress. Start loads 1.77–4.00.
+
+| Workload | Measure | A | B | B/A, geomean (rounds) | Gate |
+|---|---|---|---|---|---|
+| W1: `process_crash`, 1 worker, 5,000/s, 60 s | p50 | 5.89 µs | 5.89 µs | 1.008 (0.967–1.083) | ≤ 1.05: pass |
+| | mean | 21.8 µs | 23.1 µs | **1.056** (0.669–1.411) | ≤ 1.05: **fail** |
+| W2: `power_loss`, 64 workers, 5,000/s, 60 s | p50 / mean | 6.02 / 6.11 ms | 6.04 / 6.11 ms | 0.998 / 0.996 | ≤ 1.05: pass |
+| Lock hold, `process_crash`, 8 workers, 50/50 at 20,000/s | mean / p50 bucket | 9.97 µs / ≤2.5 | 10.12 µs / ≤2.5 | 1.009 / 1.000 | ≤ 1.05: pass |
+| Lock hold, `power_loss`, 1 worker, closed loop | mean / p50 bucket | 29.0 µs / ≤25 | 31.3 µs / ≤25 | 0.943 / 1.000 | ≤ 1.05: pass |
+
+The lock hold under `power_loss` at depth one was added to the gates before round 1, after G1's server runs showed B's mean hold at 23.4 µs against A's 21.9 µs there (medians of per-run means, about 1.065). Paired per round, B/A is 0.943, inside the gate; G1's median of medians was the less reliable estimator. It rests on about 200 sampled holds a run, so its per-round ratios range from 0.31 to 1.97. Holds run longer under `power_loss` (29–31 µs against 10 µs), plausibly because each write follows a flush onto the page it left clean, as the `reserve` stalls below suggest; that was not measured separately.
+
+**W1's mean: missed, unresolvable on this host, no B-side cause.** This is neither a pass nor a waiver. The p50s match (1.008), and so does the mean of the acknowledgements under 1 ms (0.999), but the mean B/A is 1.056, above the 1.05 gate, with per-round ratios from 0.67 to 1.41. At 5,000 writes/s one write that stalls 12 ms holds up the next sixty, so a run's mean is set by its few stalls of 10 ms or more: B had them in six of the twelve rounds and A in three. No gated run started above a load of 6, so the load-robustness view changes nothing, and both binaries ran at nice 10 (see **Host**). Diagnostic builds of both probes (never committed) then timed every write's sequencer stages, wall time and thread-CPU time.
+
+Writes that stalled 2 ms or more, by the stage that held the time, over 12 runs of each probe (6 at nice 10, 6 at nice 5), about 3.6 million writes each:
+
+| Stage | A: ≥ 2 / 5 / 10 ms | A: longest | B: ≥ 2 / 5 / 10 ms | B: longest |
+|---|---|---|---|---|
+| `reserve` | 472 / 62 / 3 | 10.6 ms | 390 / 59 / 2 | 13.7 ms |
+| `apply` | 203 / 30 / 2 | 13.3 ms | 149 / 20 / 1 | 10.0 ms |
+| `complete` | 5 / 0 / 0 | 2.4 ms | 4 / 1 / 0 | 6.4 ms |
+| any other | 3 / 0 / 0 | 2.8 ms | 1 / 1 / 0 | 6.2 ms |
+
+- **Blocked, not working.** In every write that took 2 ms or more the time was inside `reserve` or `apply`, and the thread was on the CPU for about 1.3–1.9% of it, with one or two page faults in the process meanwhile. `complete` takes about as long per write as `apply` but stalled about 40 times less often, so this is not random descheduling. `reserve` is the stall the [W1](#w1-a-write-at-process_crash-target-p99--20-µs) section describes (#197): a frame stored into the WAL's mapping, plausibly into a page the flush is writing back. Why `apply`, which writes hot's own memory, blocks is not established.
+- **A shows the same stages and tail as B:** five stalls of 10 ms or more against B's three. The code of those stages did not change between a1de4f6 and 320b6e8; the only change on the probe's write path is one `bool` reset per write.
+- Running at nice 5 instead of 10 did not remove them, so they are not only scheduling priority.
+- In these 24 diagnostic runs B's mean was the lower, 24.3 µs against 27.2 (means of the runs' means).
+- **A/A control.** G2's probe A against itself, six rounds run as G2's were: the mean ratio's geomean is **0.893**, with rounds from 0.675 to 1.275 (a typical round 24% off 1), while the p50 ratio is 1.002. Two copies of one binary differ by more than the gate allows, in either direction, so the W1 mean gate sits below this host's noise floor.
+
+No stage of B shows a tail that A's does not: the W1 mean on this host measures when rare stalls shared by both binaries happen to land. The stall is #197's, now P1: it sits inside `reserve` and `apply`, under the hot shard lock, so on a server it holds up every writer on that shard, which a one-worker probe cannot show. The hold run's `entries` stage, about 40 ns slower in B in every round, is code layout: its code is unchanged, and `HoldAllocTest` counts the same allocations in both builds (14 under the hold, 23 a write). **The authoritative W1 mean moves to the Linux run**, under an A/A-calibrated rule: an A/A control in the same session first, and the A/B mean gated only if the A/A spread sits well inside 5%.
+
+### Startup and recovery (M1)
+
+The server from 320b6e8, `process_crash`, 64 shards, one log, 128 MiB segments. Each case was written once, then restarted five times after `SIGTERM` and five after `SIGKILL`; phases come from the server log's timestamps. Load 2.8–4.1.
+
+| WAL | Start | Segments grown | Checkpoint opened → WAL recovered | Hot replay | Start → ready |
+|---|---|---|---|---|---|
+| none (fresh) | first | 3 | 297 ms (to WAL opened) | — | 425 ms |
+| 3 frames | after `SIGTERM` / `SIGKILL` | 1 each time | 102 / 88 ms (86–108) | 5 ms | 165 / 150 ms |
+| 1,048,576 frames of 1 KiB (1.1 GB, 9 segments) | after `SIGTERM` / `SIGKILL` | 1 each time | 492 / 459 ms (438–506) | 386–407 ms | 916 / 908 ms |
+
+- **A fixed cost on every start.** Opening the WAL prepares the active segment and two spares before the server is ready. A segment the free pool cannot supply is grown: 128 MiB of zeros written, then flushed with the volume's durable sync (`F_FULLFSYNC` here, `FlushFileBuffers` on Windows). A fresh WAL grows three, and every restart grows exactly one (`abyss_wal_segments_grown_total` read 1 after each of the 20 restarts). A 1 ms `sample` of a restart put 47 ms in that segment's sync and 9 ms in writing its zeros. That is about 90 ms of each restart here, whatever the WAL holds.
+- **Recovery scales with data.** With 1.1 GB of log, the open takes about 370–400 ms more than with 3 frames, and hot's replay another 390 ms: about 0.8 s a GiB, against the fixed 90 ms.
+- **On CI the fixed cost is seconds.** From failed system-test logs (the only ones that keep server output): Windows takes a median 887 ms and up to 3.7 s from checkpoint opened to WAL recovered with 3 frames, and a median 2.8 s (up to 4.8 s) to open a fresh WAL; Linux takes 0.74 s to open a fresh WAL. On Windows 2 frames and 1,002 frames take the same time, so it is the segment, not the data. This is pre-existing, not from Phase 3, and filed as an issue (P2): grow segments only in the background preparer, reuse spares across restarts, and measure `fdatasync` per fill mode on Linux before changing how a segment is filled.
+- **Why a restart cannot reuse the spare it left.** A frame counts as written when its commit word carries the segment's generation, the low 32 bits of its ordinal, so a file may only ever take an ordinal above every one it held; a crash can leave frames of a segment's own generation past a hole. The previous run's spare for ordinal *n* is therefore unusable as ordinal *n*, and the restart grows a new file instead.
+
+### Admission under sustained overload (M3)
+
+A diagnostic build of 320b6e8 (never committed) that adds unsampled admission-wait histograms. `process_crash` with the smallest durability window (1 MiB or 10 ms unflushed), 64 connections each closed-loop `SET`ting 32 KiB values, 30 s after 5 s, three runs. Load 2.6–5.2.
+
+- **Every write waits.** 1.02 admission waits per write, at 3,550–3,640 writes/s (about 115 MB/s), with the WAL flushing every 4.6 ms on average.
+- **The one path that loses its FIFO place.** A write that passes admission and is then refused at `Reserve`, because the window filled in between, re-registers behind every waiter (a waiter woken and re-blocked keeps its place). It happened to 2.0–2.1% of writes, 1.03 times each. From the refusal to passing admission again took 15.1–15.4 ms on average, against 16.0–16.4 ms for a write's first wait; both have their p99 at or under 50 ms and their longest in the 50–100 ms bucket.
+- **No connection starves.** No write timed out. Over the measured window each run's connections completed between 1,595 and 1,812 writes (the slowest within 2% of the median), Jain's index 0.998 in all three runs. Clients saw p50 16.4 ms, p99 41–44 ms and at most 94–119 ms.
+
+Losing the FIFO place on a refusal is acceptable by the pre-registered rule: no connection starved, and the refused writes waited no longer than first-time waiters.
+
+### Cold I/O threads (M4)
+
+The diagnostic build of 320b6e8, whose `ABYSS_DIAG_DIRECT_READS` switch sets RocksDB's `use_direct_reads` (`F_NOCACHE` on macOS) so that a cold read goes to the SSD rather than the page cache. 1,000,000 keys of 256 B (about 290 MB uncompressed, against RocksDB's 32 MB block cache), all evicted from hot and never filled back, so every `GET` reads cold. 64 connections, closed loop, 20 s after 5 s; each point twice. Load 2.6–6.3. `GET`s/s, then p99:
+
+| `cold_io_threads` | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| Direct reads (the device), `GET`/s | 22,900 / 21,900 | 41,900 / 44,300 | 73,800 / 69,400 | **79,300 / 81,200** | 65,700 / 69,200 |
+| Direct reads, p99 | 4.7 / 5.8 ms | 3.4 / 2.6 ms | 1.6 / 2.4 ms | 1.6 / 1.6 ms | 8.6 / 7.5 ms |
+| Pool run time per read, direct | 86–90 µs | 90–94 µs | 106–113 µs | 138–140 µs | 147–174 µs |
+| Page cache warm, `GET`/s | 97,400 / 97,000 | 93,900 / 92,000 | 93,200 / 86,300 | 93,300 / 93,600 | 85,700 / 86,700 |
+| Page cache warm, p99 | 0.9 / 1.1 ms | 0.8 / 1.3 ms | 1.0 / 1.8 ms | 2.5 / 2.8 ms | 3.4 / 3.1 ms |
+
+- **With reads on the device, the pool sizes the device's queue.** Each read blocks for about 90–170 µs, so throughput rises with threads until the SSD's queue saturates: 4 threads (the previous default on any host with 4 or more CPUs) reach 42,000–44,000/s, 8 reach 69,000–74,000/s, 16 reach 79,000–81,000/s, and 32 fall back with a p99 of 7.5–8.6 ms.
+- **With the page cache warm, threads are CPU.** A read takes 15–28 µs of a pool thread, two threads already serve 97,000/s, and more threads only add contention: the p99 grows from 1 ms at 2 to 3 ms at 32.
+- **The default is now 16.** The rule pre-registered for this sweep takes the smallest thread count reaching at least 90% of the best direct-read point in both repetitions, if it beats 4 threads by 1.25× with no worse p99. It chose 16: 1.89× and 1.83× the 4-thread point, with a p99 of 1.6 ms against 3.4 and 2.6 ms. 8 reached 91% of the best in its first repetition and 85% in its second, which started at a load of 6.3. The default is a flat 16 with no CPU term, since the pool sizes the device's queue ([Cold I/O sizing](../operations/deployment.md#cold-io-sizing)), so the scan lane is up to 15 concurrent scans with a thread left for point reads. Network block devices (EBS, Persistent Disk), with longer per-read latency, may want 16–32; tune by `abyss_engine_io_wait_seconds`, whose rising tail means reads queue for a thread, and by the read p99.
+
+Under TSan the cold-read pool's own costs do not show: the 49 pool and read-path tests of CI run 42175772316 took 38 s under TSan against 34 s in the plain Linux job.
+
+### Idle memory per connection (M6)
+
+The server from 320b6e8, 1,000 connections, bytes allocated in every malloc zone (`heap(1)`; the resident set is dominated by the WAL's mapped segments and cannot show this). Two runs each, identical to the byte; load 2.5–4.4:
+
+| | `PING` bursts | `SET` bursts |
+|---|---|---|
+| A fresh idle connection | 19,113 B | 19,113 B |
+| Added by one 1,024-deep burst, still held 15 s later | 40,912 B | about 86,500 B |
+
+The in-flight ring shrinks back as designed: 1,024 slots at 3-3a's estimate of 464 B would be about 475 KB, and nothing of that size stays. What stays is the connection's read and write buffers, which keep their peak capacity until the connection closes (a 32 KiB or 64 KiB read buffer, an 8–10 KiB block and twelve 512-byte blocks per connection). That is pre-existing and filed as an issue: by the same code, one 64 MiB value leaves a 64 MiB read buffer on its connection.
+
+### Inbox and wait-list contention (M2)
+
+The server from 320b6e8 under two loads, each twice: the M3 admission overload (each flush's release wakes up to 64 admission waiters, whose wakes post to reactor inboxes) and 64 connections pipelining 32 `SET`s each at `power_loss` (each flush completes about two thousand durable waits, 184,000 writes/s). A 10 s `sample` at 1 ms of every server thread, 20 s into each run; load 2.9–3.3 at the start, up to 7.9 by the end of the pipelined runs. Each thread contributes about 10,000 samples in that window:
+
+| Load | Samples in `Inbox::Post` | … waiting on its mutex | Waiting on `Inbox::Take`'s mutex | Waiting on a `WaitList` mutex |
+|---|---|---|---|---|
+| Admission overload | 125 / 132 | 1 / 2 | 0 / 0 | 1 / 3 |
+| `power_loss`, 64 × 32 | 923 / 927 | 4 / 0 | 7 / 8 | 0 / 0 |
+
+Mutex waits under `Inbox::Post`, `Inbox::Take` and the wait lists are under 0.1% of the samples of the threads that post or take, far below the 1% the plan set for batching, so neither the posts (S3) nor the wait-list notifies are batched.
+
+### To reproduce Phase 3 on Linux
+
+The A/B gates run with the scripts in [`tests/perf/ab`](../../tests/perf/ab/README.md). Its README gives the whole sequence: building A against B's dependency tree, preparing the run directory, writing DECISION and PROVENANCE before round 1, the `quiet()` gate, the A/A control, and deciding. Workloads, server configs and probe flags are the scripts' defaults, which a run directory copies when it is prepared, and the templates hold this section's gates. On the Linux host of [To reproduce on Linux](#to-reproduce-on-linux), with `DATA_DIR` on the NVMe device under test:
+
+```bash
+AB=tests/perf/ab
+# B is this tree; A is built as the README says, from 6a158d6 (G1's server) and a1de4f6 (G2's probe).
+SA=/tmp/abyss-6a158d6/build/bench/apps/abyss-server/abyss-server
+SB=build/bench/apps/abyss-server/abyss-server
+PA=/tmp/abyss-a1de4f6/build/bench/tests/perf/probe/abyss_write_probe
+PB=build/bench/tests/perf/probe/abyss_write_probe
+LG=build/bench/tests/perf/load/abyss_loadgen
+export ABYSS_PERF_AUTHORITATIVE=1 DATA_DIR=/mnt/nvme/ab
+mkdir -p g1 g2 g2aa
+
+# G1: prepare; write g1/DECISION (templates/DECISION.server) and g1/PROVENANCE; a pilot, then ten rounds.
+$AB/run_server_ab.sh g1 $SA $SB $LG > g1/sha256.txt
+$AB/run_server_ab.sh g1 $SA $SB $LG 0
+$AB/run_server_ab.sh g1 $SA $SB $LG 1 2 3 4 5 6 7 8 9 10
+python3 -I $AB/decide.py g1
+
+# G2 and its A/A control in one session (templates/DECISION.probe and DECISION.aa).
+$AB/run_probe_aa.sh g2aa $PA > g2aa/sha256.txt
+$AB/run_probe_ab.sh g2 $PA $PB > g2/sha256.txt
+$AB/run_probe_aa.sh g2aa $PA 1 2 3 4 5 6
+$AB/run_probe_ab.sh g2 $PA $PB 1 2 3 4 5 6 7 8 9 10 11 12
+python3 -I $AB/decide.py g2aa
+python3 -I $AB/decide.py g2 --aa g2aa
+```
+
+Run on the macOS runs' data, `decide.py` reproduces this section's verdicts: every G1 gate passes, and G2 fails only W1's mean.
+
+**W1's mean is A/A-calibrated.** It is gated only if the A/A control's spread (its geomean's distance from 1 plus twice its standard error) is within `aa.spread_max`, 1.025 in the template; otherwise `decide.py` reports it as not decided. On macOS the spread was 1.37.
+
+**Stall attribution.** If the W1 mean misses, the attribution uses the diagnostic build `tests/perf/ab/slow-ack-ring.320b6e8.patch`. It applies only to 320b6e8; its built-in successor is #207.
+- `ABYSS_DIAG_UNSAMPLED=1` times every write's stages.
+- `ABYSS_DIAG_SLOW_OUT=<csv>` makes the probe write out each write over 2 ms, with its thread CPU time, and each write whose stages took 1 ms or more.
+- On Linux add `--count-faults` (per-thread there) and an off-CPU profile of the writer.
+
+**M1, startup and recovery.** G1's prepared `g1/srv-pc.yaml`; write once, then restart five times after each signal, and read the phases from the server log and `abyss_wal_segments_grown_total`:
+
+```bash
+for case in "3 64" "1048576 1024"; do
+  rm -rf $DATA_DIR; $SB -c g1/srv-pc.yaml --no-banner & SPID=$!
+  until curl -sf http://127.0.0.1:16380/ready >/dev/null; do sleep 0.2; done
+  python3 -I $AB/resp_setup.py 16379 preload $case; kill -TERM $SPID; wait $SPID
+  for sig in TERM KILL; do for r in 1 2 3 4 5; do
+    $SB -c g1/srv-pc.yaml --no-banner 2> m1-$sig-$r.log & SPID=$!
+    until curl -sf http://127.0.0.1:16380/ready >/dev/null; do sleep 0.1; done
+    curl -s http://127.0.0.1:16390/metrics | grep -E '^abyss_wal_(segments_grown_total|free_segments)'
+    kill -$sig $SPID; wait $SPID
+  done; done
+done
+grep -E 'offset checkpoint opened|WAL log recovered|WAL opened|hot replay complete|server ready' m1-*.log
+```
+
+**M3, admission under overload** (the diagnostic build for the requeue histograms): `g1/srv-pc.yaml` plus `queue: {durability_window_bytes: 1048576, durability_window_ms: 10}`; workload 8×8 connections, depth 1, closed loop, `SET` of 32,768-byte values over 10,000 keys, 30 s after 5 s; `--per-connection-out` gives each connection's completed writes for Jain's index.
+
+**M4, cold I/O threads** (the diagnostic build; direct reads need `ABYSS_DIAG_DIRECT_READS=1`, which sets RocksDB `use_direct_reads`): for each of 2, 4, 8, 16 and 32 `engine.cold_io_threads`, `hot: {eviction_tick_ms: 50, fill_max_fraction: 0.000001, eviction_overrides: [{prefix: "k", eviction_seconds: 2}]}` and `cold_consumer: {quiet_threshold_seconds: 1}`; preload 1,000,000 keys of 256 B, wait until `abyss_evicted_total` reaches 1,000,000, then 8×8 connections of uniform `GET`s, closed loop, 20 s after 5 s. On Linux also drop the page cache (`echo 3 > /proc/sys/vm/drop_caches`) before each point for the page-cache-cold case, and record the device.
+
+**M6, idle connection memory**: `idle_conns.py 16379 <server pid> 1000 1024 PING|SET` against `g1/srv-pc.yaml`, with `ulimit -n` above 2,000; it prints the server's RSS before connecting, with 1,000 idle connections, after each runs a 1,024-deep burst, and 5 s and 15 s later.
+
+**M2, inbox contention**: during the M3 overload and during 8×8 connections of depth-32 `SET`s at `power_loss`, profile the server for 10 s (`perf record -g -p <pid> -- sleep 10`, the macOS runs used `sample`) and count samples waiting on a mutex under `Inbox::Post`, `Inbox::Take` and `WaitList`.
 
 ## Adding workloads
 

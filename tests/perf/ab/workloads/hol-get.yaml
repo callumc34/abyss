@@ -1,0 +1,17 @@
+name: ab-hol-get
+description: tests/perf/ab server A/B
+duration_seconds: 20
+warmup_seconds: 3
+workers: 1
+connections_per_worker: 1
+pipeline_depth: 1
+target_rate_ops: 5000
+key_count: 100
+key_distribution:
+  kind: uniform
+  seed: 7
+value_size_bytes: 64
+mix:
+  GET: 1.0
+preload:
+  enabled: false

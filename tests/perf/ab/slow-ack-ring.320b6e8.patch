@@ -1,0 +1,186 @@
+W1 slow-ack diagnostic: an artefact of the Phase 3 W1 stall attribution,
+not a maintained tool. It applies only to 320b6e8 (git apply), and its
+probe and sequencer edits are what that attribution ran. See README.md;
+the built-in capability is issue #207.
+
+diff --git a/include/abyss/engine/diag_slow.h b/include/abyss/engine/diag_slow.h
+new file mode 100644
+index 0000000..b4c078f
+--- /dev/null
++++ b/include/abyss/engine/diag_slow.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++// DIAG (3-4 W1 root cause, never committed).
++#include <array>
++#include <cstdint>
++#include <vector>
++
++namespace abyss::engine {
++
++struct DiagSlowWrite {
++  int64_t at_ns = 0;
++  std::array<int64_t, 9> stage_ns{};
++};
++
++std::vector<DiagSlowWrite> DiagSlowWrites();
++
++}  // namespace abyss::engine
+diff --git a/src/engine/sequencer.cpp b/src/engine/sequencer.cpp
+index bdfff2e..1bbe6b6 100644
+--- a/src/engine/sequencer.cpp
++++ b/src/engine/sequencer.cpp
+@@ -1,5 +1,10 @@
+ #include "abyss/engine/sequencer.h"
+
++#include <cstdlib>
++#include <mutex>
++
++#include "abyss/engine/diag_slow.h"
++
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
+@@ -95,7 +100,15 @@ bool IsValueArg(const core::RespCommand& cmd, size_t i) {
+ // One write in 64 on average is timed, picked at random per thread: a
+ // fixed stride could line up with frames on a page, and no writer
+ // touches a shared cache line to decide.
++bool DiagUnsampled() {
++  static const bool on = std::getenv("ABYSS_DIAG_UNSAMPLED") != nullptr;
++  return on;
++}
++std::mutex g_diag_mu;
++std::vector<DiagSlowWrite> g_diag_slow;
++
+ bool Sampled() {
++  if (DiagUnsampled()) return true;
+   thread_local uint64_t t_state = 0;
+   if (t_state == 0) {
+     uint64_t seed =
+@@ -176,6 +189,20 @@ class Sequencer::Phases {
+       sequencer_.phase_seconds_.at(i).Observe(
+           std::chrono::duration<double>(times_.spent.at(i)).count());
+     }
++    if (!DiagUnsampled()) return;
++    std::chrono::steady_clock::duration total{};
++    for (const auto d : times_.spent) total += d;
++    if (total < std::chrono::milliseconds{1}) return;
++    DiagSlowWrite slow;
++    slow.at_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                     std::chrono::steady_clock::now().time_since_epoch())
++                     .count();
++    for (size_t i = 0; i < times_.spent.size() && i < slow.stage_ns.size(); ++i) {
++      slow.stage_ns.at(i) =
++          std::chrono::duration_cast<std::chrono::nanoseconds>(times_.spent.at(i)).count();
++    }
++    const std::scoped_lock lock(g_diag_mu);
++    if (g_diag_slow.size() < 1000000) g_diag_slow.push_back(slow);
+   }
+
+  private:
+@@ -1026,4 +1053,9 @@ SequencerStats Sequencer::Snapshot() const {
+   return stats;
+ }
+
++std::vector<DiagSlowWrite> DiagSlowWrites() {
++  const std::scoped_lock lock(g_diag_mu);
++  return g_diag_slow;
++}
++
+ }  // namespace abyss::engine
+diff --git a/tests/perf/probe/write_probe.cpp b/tests/perf/probe/write_probe.cpp
+index b78c906..b0f61bc 100644
+--- a/tests/perf/probe/write_probe.cpp
++++ b/tests/perf/probe/write_probe.cpp
+@@ -1,4 +1,10 @@
+ #include <sys/resource.h>
++#include <time.h>
++
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <sys/resource.h>
+
+ #include <CLI/CLI.hpp>
+ #include <algorithm>
+@@ -30,6 +36,7 @@
+ #include "abyss/core/eviction_policy.h"
+ #include "abyss/core/ops.h"
+ #include "abyss/core/resp_types.h"
++#include "abyss/engine/diag_slow.h"
+ #include "abyss/core/result.h"
+ #include "abyss/core/shard_router.h"
+ #include "abyss/engine/io_pool.h"
+@@ -717,7 +724,46 @@ int main(int argc, char** argv) {
+     connections.push_back(std::make_unique<Connection>(*wp.engine));
+   }
+   std::atomic<bool> measuring{false};
++  // DIAG (3-4, never committed): each write's wall and thread CPU.
++  const char* diag_out = std::getenv("ABYSS_DIAG_SLOW_OUT");
++  struct DiagClient {
++    int64_t at_ns, wall_ns, cpu_ns;
++    long minflt, majflt, nvcsw, nivcsw;
++  };
++  std::mutex diag_mu;
++  std::vector<DiagClient> diag_client;
++  const auto thread_cpu_ns = [] {
++    timespec ts{};
++    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++    return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
++  };
++  const auto steady_ns = [] {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++  };
++  int64_t diag_measure_ns = 0;
+   abyss::perf::OpFn op_fn = [&](int worker_id, std::string_view op_name, uint64_t key_index) {
++    if (diag_out != nullptr && op_name == kOpWrite) {
++      auto& drng = rngs[static_cast<size_t>(worker_id)];
++      Connection& dconn = *connections[static_cast<size_t>(worker_id)];
++      rusage r0{};
++      getrusage(RUSAGE_SELF, &r0);
++      const int64_t c0 = thread_cpu_ns();
++      const int64_t w0 = steady_ns();
++      const bool ok = Write(dconn, shape.Write(key_index, drng));
++      const int64_t w1 = steady_ns();
++      const int64_t c1 = thread_cpu_ns();
++      if (w1 - w0 >= 2000000) {
++        rusage r1{};
++        getrusage(RUSAGE_SELF, &r1);
++        const std::scoped_lock lock(diag_mu);
++        diag_client.push_back({w0, w1 - w0, c1 - c0, r1.ru_minflt - r0.ru_minflt,
++                               r1.ru_majflt - r0.ru_majflt, r1.ru_nvcsw - r0.ru_nvcsw,
++                               r1.ru_nivcsw - r0.ru_nivcsw});
++      }
++      return ok;
++    }
+     auto& rng = rngs[static_cast<size_t>(worker_id)];
+     Connection& connection = *connections[static_cast<size_t>(worker_id)];
+     if (op_name == kOpRead) return Read(connection, shape.Read(key_index, rng));
+@@ -745,8 +791,25 @@ int main(int argc, char** argv) {
+     scrape_start = abyss::metrics::Registry::Instance().Scrape();
+     cold_start = wp.cold_pool->Snapshot();
+     measuring.store(true, std::memory_order_relaxed);
++    diag_measure_ns = steady_ns();
+   };
+   auto result = abyss::perf::RunLoop(run_config, op_fn);
++  if (diag_out != nullptr) {
++    std::ofstream out{diag_out};
++    out << "kind,at_ns,wall_ns,cpu_ns,minflt,majflt,nvcsw,nivcsw,admit,lock_wait,decide,load,"
++           "entries,reserve,apply,complete,durable\n";
++    out << "measure_start," << diag_measure_ns << ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
++    out << "measure_end," << steady_ns() << ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
++    for (const auto& c : diag_client) {
++      out << "client," << c.at_ns << ',' << c.wall_ns << ',' << c.cpu_ns << ',' << c.minflt
++          << ',' << c.majflt << ',' << c.nvcsw << ',' << c.nivcsw << ",0,0,0,0,0,0,0,0,0\n";
++    }
++    for (const auto& w : abyss::engine::DiagSlowWrites()) {
++      out << "seq," << w.at_ns << ",0,0,0,0,0,0";
++      for (const auto ns : w.stage_ns) out << ',' << ns;
++      out << '\n';
++    }
++  }
+   const std::string scrape_end = abyss::metrics::Registry::Instance().Scrape();
+   const auto cold_end = wp.cold_pool->Snapshot();
+   gate->Open();

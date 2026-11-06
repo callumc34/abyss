@@ -1,0 +1,19 @@
+name: ab-mix
+description: tests/perf/ab server A/B
+duration_seconds: 20
+warmup_seconds: 5
+workers: 8
+connections_per_worker: 8
+pipeline_depth: 1
+target_rate_ops: 0
+key_count: 100000
+key_distribution:
+  kind: zipfian
+  theta: 0.99
+  seed: 21
+value_size_bytes: 64
+mix:
+  GET: 0.9
+  SET: 0.1
+preload:
+  enabled: false
