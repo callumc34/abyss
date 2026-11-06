@@ -60,8 +60,11 @@ struct IoPoolConfig {
   size_t background_capacity = 1024;
 };
 
-// engine.cold_io_threads resolved: 0 is min(4, max(2, hardware)).
-uint32_t ColdIoThreads(uint32_t configured, uint32_t hardware);
+// engine.cold_io_threads' default: the device's queue depth, not CPUs.
+inline constexpr uint32_t kDefaultColdIoThreads = 16;
+
+// engine.cold_io_threads resolved: 0 is the default.
+uint32_t ColdIoThreads(uint32_t configured);
 
 // Threads for cold reads, which block in pread: a write's loads, a
 // read miss's answer and cache fills. The foreground queue (loads and

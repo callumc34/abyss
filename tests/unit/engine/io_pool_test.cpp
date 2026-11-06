@@ -118,12 +118,11 @@ uint64_t Runs(IoKind kind) {
   return metrics::testing::GetHistogramCount(metrics::names::kEngineIoRunSeconds, kind).value_or(0);
 }
 
-TEST(ColdIoThreadsTest, ZeroResolvesBetweenTwoAndFour) {
-  EXPECT_EQ(ColdIoThreads(0, 0), 2U);
-  EXPECT_EQ(ColdIoThreads(0, 1), 2U);
-  EXPECT_EQ(ColdIoThreads(0, 3), 3U);
-  EXPECT_EQ(ColdIoThreads(0, 64), 4U);
-  EXPECT_EQ(ColdIoThreads(8, 64), 8U);
+TEST(ColdIoThreadsTest, ZeroResolvesToSixteenAndAnythingElseStands) {
+  EXPECT_EQ(ColdIoThreads(0), 16U);
+  EXPECT_EQ(ColdIoThreads(2), 2U);
+  EXPECT_EQ(ColdIoThreads(8), 8U);
+  EXPECT_EQ(ColdIoThreads(64), 64U);
 }
 
 TEST(IoPoolTest, AJobDequeuedPastItsDeadlineNeverRuns) {

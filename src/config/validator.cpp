@@ -351,10 +351,11 @@ core::Result<void> ValidateEngine(const EngineConfig& e) {
   // Scans may hold all but one thread, so one would leave point reads
   // none; pool threads block in pread, so a second costs nothing.
   if (e.cold_io_threads == 1) {
-    return std::unexpected(InvalidArg("engine.cold_io_threads",
-                                      "must be 0 (auto) or at least 2: scans may hold all but one "
-                                      "thread, and pool threads block in pread, so 2 cost nothing "
-                                      "even on a 1-CPU pod"));
+    return std::unexpected(
+        InvalidArg("engine.cold_io_threads",
+                   "must be 0 (the default, 16) or at least 2: scans may hold all but one "
+                   "thread, and pool threads block in pread, so 2 cost nothing "
+                   "even on a 1-CPU pod"));
   }
   if (e.cold_io_threads > 64) {
     return std::unexpected(InvalidArg("engine.cold_io_threads", "must be <= 64"));

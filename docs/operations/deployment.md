@@ -185,7 +185,7 @@ cold_consumer:
 
 engine:
   command_timeout_ms: 5000            # a command's whole budget: a write's waits, a read's cold read
-  cold_io_threads: 0                  # cold read threads; 0 = min(4, max(2, CPUs)), else 2..64
+  cold_io_threads: 16                 # cold read threads, 2..64 (0 also means 16); see Cold I/O sizing
 
 recovery:
   replay_parallelism: 4               # workers the one recovery scan replays shards on
@@ -265,6 +265,14 @@ The parser is strict: an unknown section or key fails the load, naming it. [`con
 - Recovery replay stays within the same per-shard limit, apart from at most one scan batch's growth, and fails rather than pass twice the limit on any shard.
 
 **Cache fills.** `hot.fill_max_fraction` (default 0.0625, in (0, 1]) is the largest key a read miss may fill into hot, as a share of a shard's budget. With the defaults a shard's budget is 64 MiB, so no fill is over 4 MiB.
+
+### Cold I/O sizing
+
+`engine.cold_io_threads` (default 16; 2 to 64, and 0 also means 16) is the number of cold reads, key loads and cache fills in flight at once. Each thread blocks in `pread`, so the count sets the cold device's queue depth, not CPU use, and does not depend on the host's CPUs.
+- **Why 16.** Measured on macOS NVMe with direct reads (RocksDB's `use_direct_reads`, so every `GET` reached the device), at 2, 4, 8, 16 and 32 threads, each twice ([performance.md](../development/performance.md#cold-io-threads-m4)). The rule set before the runs takes the smallest count that reaches at least 90% of the best `GET`s/s in both repetitions, and it chose 16: 79,000–81,000/s with a p99 of 1.6 ms, against 42,000–44,000/s at 4 threads. 32 threads fell back to 66,000–69,000/s with a p99 of 7.5–8.6 ms. With the page cache warm, every count served 86,000–97,000/s, so the device's queue, not CPU, sets the default.
+- **Network block devices** (EBS, Persistent Disk), with longer per-read latency, may want 16–32.
+- **Tuning.** `abyss_engine_io_wait_seconds` is the time a cold read queued for a thread: a rising tail means too few threads for the device. Raise the count while the cold read p99 improves; once `abyss_engine_io_run_seconds` and the p99 rise instead, the device is saturated and more threads only lengthen its queue.
+- **Scans.** A read that loads a whole key (`HGETALL`, `SMEMBERS`, `ZRANGE` and the like) runs on at most all threads but one, so at the default up to 15 scans run at once and a point read always has a thread.
 
 ### External Profile
 

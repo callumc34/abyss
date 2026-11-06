@@ -23,8 +23,8 @@
   - `durable`: waiting for the configured durability class, or for the fence of a write that logged nothing.
 
   `lock_hold` is `decide` through `apply` of one hold. A stage a write did not pass is not recorded for it.
-- `abyss_engine_io_wait_seconds` — time a cold I/O job (a write's own loads, a read miss's answer, or a cache fill) waited in the cold I/O pool's queue, from enqueue to its start, or to its expiry when it is dequeued past its command's deadline and never runs. A rising tail means the cold volume, or `engine.cold_io_threads`, is not keeping up.
-- `abyss_engine_io_run_seconds{kind="point|scan|load|fill"}` — time a cold I/O job ran on the pool: a read's point read or probe, a read that loads a whole key (at most `engine.cold_io_threads` − 1 of these run at once, so point reads always have a thread), a write's own loads, or a cache fill.
+- `abyss_engine_io_wait_seconds` — time a cold I/O job (a write's own loads, a read miss's answer, or a cache fill) waited in the cold I/O pool's queue, from enqueue to its start, or to its expiry when it is dequeued past its command's deadline and never runs. A rising tail means reads queue for a thread: raise `engine.cold_io_threads` (default 16) while the cold read p99 improves, or the cold volume is not keeping up ([deployment.md](deployment.md#cold-io-sizing)).
+- `abyss_engine_io_run_seconds{kind="point|scan|load|fill"}` — time a cold I/O job ran on the pool: a read's point read or probe, a read that loads a whole key (at most `engine.cold_io_threads` − 1 of these run at once, 15 at the default, so point reads always have a thread), a write's own loads, or a cache fill.
 
 ### RESP Frontend
 

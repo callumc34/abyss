@@ -395,7 +395,7 @@ TEST(ConfigValidate, CommandTimeoutLoadsAndValidates) {
   auto defaults = Config::ParseFromYaml("engine: {}\n");
   ASSERT_TRUE(defaults.has_value()) << defaults.error().message();
   EXPECT_EQ(defaults->engine.command_timeout, std::chrono::milliseconds{5000});
-  EXPECT_EQ(defaults->engine.cold_io_threads, 0U);
+  EXPECT_EQ(defaults->engine.cold_io_threads, 16U);
 
   auto set = Config::ParseFromYaml("engine:\n  command_timeout_ms: 750\n");
   ASSERT_TRUE(set.has_value()) << set.error().message();
@@ -416,7 +416,7 @@ TEST(ConfigValidate, TheOldWriteTimeoutKeyNamesItsReplacement) {
       << cfg.error().message();
 }
 
-TEST(ConfigValidate, ColdIoThreadsAreAutoOrTwoToSixtyFour) {
+TEST(ConfigValidate, ColdIoThreadsAreZeroForTheDefaultOrTwoToSixtyFour) {
   for (const uint32_t ok : {0U, 2U, 3U, 64U}) {
     auto cfg = Config::ParseFromYaml("engine:\n  cold_io_threads: " + std::to_string(ok) + "\n");
     ASSERT_TRUE(cfg.has_value()) << ok << ": " << cfg.error().message();

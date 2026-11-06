@@ -99,8 +99,9 @@ engine:
   # wait, a read's cold read and its wait for what it saw to be durable.
   command_timeout_ms: 5000
   # Threads for cold reads, key loads and cache fills, which block in
-  # pread. 0 = auto: min(4, max(2, CPUs)); otherwise 2..64.
-  cold_io_threads: 0
+  # pread, so they size the cold device's queue, not CPUs: 2..64, and
+  # 0 also means 16. See deployment.md, Cold I/O sizing.
+  cold_io_threads: 16
 
 recovery:
   # Workers the one recovery Scan replays shards on.

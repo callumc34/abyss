@@ -1,6 +1,5 @@
 #include "abyss/engine/io_pool.h"
 
-#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -27,9 +26,8 @@ core::Error Stopped() {
 
 }  // namespace
 
-uint32_t ColdIoThreads(uint32_t configured, uint32_t hardware) {
-  if (configured != 0) return configured;
-  return std::min<uint32_t>(4, std::max<uint32_t>(2, hardware));
+uint32_t ColdIoThreads(uint32_t configured) {
+  return configured != 0 ? configured : kDefaultColdIoThreads;
 }
 
 void IoPool::Fifo::Push(IoJob& job) {

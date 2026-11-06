@@ -146,9 +146,9 @@ struct EngineConfig {
   // A command's whole budget. A write's admission, loads, backpressure
   // and durable wait; a read's cold read and its wait for what it saw.
   std::chrono::milliseconds command_timeout{5000};
-  // Threads for cold reads, which block in pread. 0 = auto:
-  // min(4, max(2, hardware_concurrency)).
-  uint32_t cold_io_threads = 0;
+  // Threads for cold reads, which block in pread: sized by the cold
+  // device's queue depth, not by CPUs. 0 also means 16.
+  uint32_t cold_io_threads = 16;
 };
 
 struct MetricsConfig {

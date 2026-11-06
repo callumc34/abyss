@@ -213,8 +213,7 @@ bool Server::Initialize() {
                                               .command_timeout = config_.engine.command_timeout,
                                           });
   io_pool_ = std::make_unique<engine::IoPool>(engine::IoPoolConfig{
-      .threads = engine::ColdIoThreads(config_.engine.cold_io_threads,
-                                       std::thread::hardware_concurrency()),
+      .threads = engine::ColdIoThreads(config_.engine.cold_io_threads),
   });
   read_path_ =
       std::make_unique<engine::ReadPath>(*hot_store_, *loader_, *io_pool_,

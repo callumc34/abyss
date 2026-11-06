@@ -58,7 +58,7 @@ Abyss acknowledges a write when it reaches the durability class set by `queue.du
 > **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Cold consumers will become a pool sized to cores (#177). The list below describes current behaviour.
 
 - **RESP I/O threads** (reactors; a pool sized to core count) — accept connections, parse commands and run each one through the tiering engine until it must wait: a read, or a write's sequencer step (decide, reserve, apply to hot, publish). A command that must wait, for a cold read, a key load, WAL or memory capacity, or durability, registers and returns, and resumes on its reactor when the thread that ends the wait posts back. A reactor never blocks on durability or cold I/O.
-- **Cold I/O threads** (`engine.cold_io_threads`, default `min(4, max(2, CPUs))`) — cold reads, key loads and cache fills, which block in `pread`.
+- **Cold I/O threads** (`engine.cold_io_threads`, default 16, sized by the cold device's queue depth rather than CPUs) — cold reads, key loads and cache fills, which block in `pread`.
 - **Cold consumer threads** (one per shard) — tail the queue into the compaction buffer, flush to cold.
 - **WAL threads** — one segment-preparer thread and one flusher thread per log.
 - **Background threads** — WAL segment cleanup, hot eviction and tombstone reclamation, cold store compaction, TTL expiry scanning.
