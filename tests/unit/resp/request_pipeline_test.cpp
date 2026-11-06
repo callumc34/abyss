@@ -202,10 +202,14 @@ TEST(RequestPipelineTest, AnErrorQuotingClientBytesIsOneFrame) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
                            {.dispatcher = &dispatcher});
   const std::vector<std::pair<core::RespCommand, std::string>> cases = {
-      {{.args = {"NO\r\n+OK", "x\r\n-ERR y"}},
-       "ERR unknown command 'NO  +OK', with args beginning with: 'x  -ERR y'"},
-      {{.args = {"CLIENT", "no\r\n:1"}},
-       "ERR Unknown CLIENT subcommand or wrong number of arguments for 'no  :1'"},
+      {
+          {.args = {"NO\r\n+OK", "x\r\n-ERR y"}},
+          "ERR unknown command 'NO  +OK', with args beginning with: 'x  -ERR y'",
+      },
+      {
+          {.args = {"CLIENT", "no\r\n:1"}},
+          "ERR Unknown CLIENT subcommand or wrong number of arguments for 'no  :1'",
+      },
       {{.args = {"PEXPIRE", "k", "10", "NX\n$1"}}, "ERR Unsupported option NX $1"},
   };
   for (const auto& [cmd, text] : cases) {
@@ -226,11 +230,11 @@ TEST(RequestPipelineTest, AClientNameWithASpaceOrNewlineIsRefusedAndNotStored) {
   RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
   const std::string refused =
       "ERR Client names cannot contain spaces, newlines or special characters.";
-  for (const std::string name : {"a\r\nb", "a b",
-                                 "a\x01"
-                                 "b"}) {
-    for (const auto& cmd : {core::RespCommand{.args = {"CLIENT", "SETNAME", name}},
-                            core::RespCommand{.args = {"HELLO", "2", "SETNAME", name}}}) {
+  for (const std::string name : {"a\r\nb", "a b", "a\001b"}) {
+    for (const auto& cmd : {
+             core::RespCommand{.args = {"CLIENT", "SETNAME", name}},
+             core::RespCommand{.args = {"HELLO", "2", "SETNAME", name}},
+         }) {
       std::vector<uint8_t> output;
       Process(pipeline, Serializer::SerializeCommand(cmd), output);
       const auto reply = Parser::Parse(output);

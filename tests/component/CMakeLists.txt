@@ -82,6 +82,11 @@ if(ABYSS_WITH_ROCKSDB)
   abyss_set_test_timeout(property_crash "${CMAKE_CURRENT_SOURCE_DIR}" 60
     CrashTest.PowerLossRecoversAPrefixThatExplainsEveryReply
     CrashTest.ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame)
+  # No CI history yet: well under a second locally, so the floor is
+  # twice the sanitizers' 30 s stall limit, for the watchdog to fire
+  # first.
+  abyss_set_test_timeout(property_litmus "${CMAKE_CURRENT_SOURCE_DIR}" 60
+    MessagePassingTest.ALaterWriteNeverShowsBeforeItsConnectionsEarlierOne)
   if(NOT WIN32)
     abyss_set_test_timeout(property_short "${CMAKE_CURRENT_SOURCE_DIR}" 30
       CrashTest.KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply)

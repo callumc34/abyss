@@ -54,8 +54,10 @@ class Harness {
             abyss::resp::GlobalRegistry(), abyss::resp::ConnectionState{.client_id = 1},
             abyss::resp::PipelineDependencies{.dispatcher = &engine_},
             abyss::resp::PipelineHost{.sink = &inbox_},
-            abyss::resp::PipelineLimits{.max_inflight = 1 + tape_.Below(8),
-                                        .reply_bytes = 64 + (tape_.Below(16) * 64)})) {}
+            abyss::resp::PipelineLimits{
+                .max_inflight = 1 + tape_.Below(8),
+                .reply_bytes = 64 + (tape_.Below(16) * 64),
+            })) {}
 
   Harness(const Harness&) = delete;
   Harness& operator=(const Harness&) = delete;

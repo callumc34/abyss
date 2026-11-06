@@ -111,10 +111,12 @@ class FakeEngine final : public core::CommandDispatcher {
     const size_t at = tape_.Below(owed_.size());
     const core::Completion to = owed_[at];
     owed_.erase(owed_.begin() + static_cast<std::ptrdiff_t>(at));
-    const core::CompletionEvent event{.client_id = to.client_id,
-                                      .slot_seq = to.slot_seq,
-                                      .kind = core::CompletionKind::kResume,
-                                      .result = {}};
+    const core::CompletionEvent event{
+        .client_id = to.client_id,
+        .slot_seq = to.slot_seq,
+        .kind = core::CompletionKind::kResume,
+        .result = {},
+    };
     inbox_.Post(std::span(&event, 1));
   }
   void ReleaseOne() { queue_.ReleaseParked(static_cast<core::ShardId>(tape_.Below(kShards))); }

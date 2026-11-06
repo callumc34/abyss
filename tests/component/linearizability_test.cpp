@@ -14,7 +14,11 @@
 // The check: within a connection, each op takes effect after the one
 // before it; across connections, each group is linearizable, with
 // real-time order and nothing more. ECHOs in the stream check that
-// replies leave in command order.
+// replies leave in command order. Across groups, message passing: a
+// reader that sees a connection's write to one key, then reads a key
+// that connection wrote before, sees that write or a later one. Every
+// value is written once, so a read names the write it saw. Some
+// batches are message-passing shapes on two keys of their own.
 //
 // The fake wall clock is frozen for each burst of operations and moved
 // only with every client joined, past TTLs, so a burst's first touches
@@ -77,6 +81,7 @@
 #include "abyss/resp/serializer.h"
 #include "event_inbox.h"
 #include "linearizability.h"
+#include "on_exit.h"
 #include "property_harness.h"
 
 namespace abyss::engine {
@@ -87,6 +92,8 @@ using abyss::testing::HistoryOp;
 constexpr int kGroups = 6;
 constexpr int kGroupKeys = 3;
 constexpr int kBursts = 5;
+// Per command slot of a pipelined batch: a message-passing shape.
+constexpr double kMessagePassing = 0.2;
 
 struct Record {
   int client = 0;
@@ -120,6 +127,9 @@ struct Outcome {
   uint64_t late = 0;
   bool ok = true;
   std::string failure;
+  // Message passing across groups: the pairs judged, and what broke.
+  uint64_t cross_pairs = 0;
+  std::string cross_failure;
 };
 
 // Loads held on the I/O pool once read, so commands really pass their
@@ -225,10 +235,11 @@ class PipelinedClient {
       : pipeline_(std::make_unique<resp::RequestPipeline>(
             resp::GlobalRegistry(), resp::ConnectionState{.client_id = client_id},
             resp::PipelineDependencies{.dispatcher = &dispatcher},
-            resp::PipelineHost{.sink = &inbox_,
-                               .abandoned_deadline = metrics::Registry::Instance().Counter(
-                                   metrics::names::kNetCommandsAbandonedTotal,
-                                   metrics::AbandonReason::kDeadline)})) {}
+            resp::PipelineHost{
+                .sink = &inbox_,
+                .abandoned_deadline = metrics::Registry::Instance().Counter(
+                    metrics::names::kNetCommandsAbandonedTotal, metrics::AbandonReason::kDeadline),
+            })) {}
 
   // Runs `batch`, sent as one write, until every command has replied
   // and nothing of it is owed a post. False on a reply it cannot parse.
@@ -317,6 +328,242 @@ struct State {
 
 constexpr std::string_view kNoOpReply = "<no-op>";
 
+// ---- message passing across groups
+
+// The keys a write other than FLUSHDB may change.
+std::vector<std::string_view> ChangedKeys(std::string_view name,
+                                          const std::vector<std::string>& args) {
+  std::vector<std::string_view> keys;
+  if (name == "MSET" || name == "MSETNX") {
+    for (size_t i = 1; i < args.size(); i += 2) keys.emplace_back(args[i]);
+  } else if (name == "DEL" || name == "UNLINK") {
+    for (size_t i = 1; i < args.size(); ++i) keys.emplace_back(args[i]);
+  } else if (name == "RENAMENX" || name == "COPY") {
+    keys = {args.at(1), args.at(2)};
+  } else {
+    keys.emplace_back(args.at(1));
+  }
+  return keys;
+}
+
+// The string values a write names, each with its key.
+std::vector<std::pair<std::string_view, std::string_view>> NamedValues(
+    std::string_view name, const std::vector<std::string>& args) {
+  std::vector<std::pair<std::string_view, std::string_view>> values;
+  if (name == "SET" || name == "SETNX") {
+    values.emplace_back(args.at(1), args.at(2));
+  } else if (name == "MSET" || name == "MSETNX") {
+    for (size_t i = 1; i + 1 < args.size(); i += 2) values.emplace_back(args[i], args[i + 1]);
+  }
+  return values;
+}
+
+struct SureWrite {
+  std::string_view value;
+  // Its key may expire once the clock moves.
+  bool ttl = false;
+};
+
+// The value `record` left at `key` for certain, by its reply.
+std::optional<SureWrite> SureValue(const Record& record, std::string_view name,
+                                   std::string_view key) {
+  const core::RespValue& reply = record.reply;
+  if (Classify(reply, true) != ReplyKind::kDefinite || reply.IsError()) return std::nullopt;
+  const bool ok = reply.IsSimpleString() && reply.AsString() == "OK";
+  const bool one = reply.IsInteger() && reply.AsInteger() == 1;
+  SureWrite sure;
+  if (name == "SET") {
+    bool conditional = false;
+    bool get = false;
+    for (size_t i = 3; i < record.args.size(); ++i) {
+      const std::string flag = core::AsciiUpper(record.args[i]);
+      if (flag == "NX" || flag == "XX") conditional = true;
+      if (flag == "GET") get = true;
+      if (flag == "KEEPTTL") sure.ttl = true;
+      if (flag == "EX" || flag == "PX" || flag == "EXAT" || flag == "PXAT") {
+        sure.ttl = true;
+        ++i;
+      }
+    }
+    // A conditional SET with GET replies the old value either way.
+    if (conditional && (get || !ok)) return std::nullopt;
+  } else if (name == "SETNX" || name == "MSETNX") {
+    if (!one) return std::nullopt;
+  } else if (name != "MSET" || !ok) {
+    return std::nullopt;
+  }
+  bool named = false;
+  for (const auto& [k, v] : NamedValues(name, record.args)) {
+    if (k != key) continue;
+    sure.value = v;
+    named = true;
+  }
+  if (!named) return std::nullopt;
+  return sure;
+}
+
+std::string Describe(const Record& record) {
+  std::string text = "t" + std::to_string(record.client) + "." + std::to_string(record.order);
+  for (const auto& arg : record.args) text += " " + arg;
+  return text + " [" + std::to_string(record.call) + ", " + std::to_string(record.ret) + "]";
+}
+
+struct CrossKey {
+  uint64_t pairs = 0;
+  uint64_t broken = 0;
+  std::string first;
+};
+
+// A client W writes w1 to key a, then w2 to key b in another group; a
+// reader R reads b and sees w2, then reads a. w1 took effect before
+// w2, which did before R's first read, which did before its second:
+// that read must see w1 or what came after it. Judged only where
+// nothing else explains the read: an older value back at a needs a
+// COPY or RENAMENX onto it between w1 and the read, an absence any
+// other write to a or an expiry, and a value that reached a key from
+// another names no write to it.
+CrossKey CheckCrossKeyOrder(const std::vector<Record>& records,
+                            const std::vector<std::vector<std::string>>& groups) {
+  CrossKey result;
+  std::map<std::string_view, size_t> group_of;
+  for (size_t g = 0; g < groups.size(); ++g) {
+    for (const auto& key : groups[g]) group_of[key] = g;
+  }
+  std::vector<std::string> names(records.size());
+  // Each value to the write that named it and the key it named it for;
+  // a value named twice names neither.
+  std::map<std::string_view, std::pair<size_t, std::string_view>> origin;
+  std::set<std::string_view> twice;
+  // Per key, the writes that may change it; FLUSHDB changes every key.
+  std::map<std::string_view, std::vector<size_t>> changes;
+  std::vector<size_t> flushes;
+  struct Read {
+    uint64_t order;
+    size_t record;
+    const core::RespValue* value;
+  };
+  // Per client and key: its writes and its reads.
+  using ClientKey = std::pair<int, std::string_view>;
+  std::map<ClientKey, std::vector<size_t>> writes;
+  std::map<ClientKey, std::vector<Read>> reads;
+  for (size_t i = 0; i < records.size(); ++i) {
+    const Record& record = records[i];
+    names[i] = core::AsciiUpper(record.args.at(0));
+    const std::string& name = names[i];
+    if (name == "FLUSHDB") {
+      flushes.push_back(i);
+      for (const auto& [key, group] : group_of) writes[{record.client, key}].push_back(i);
+      continue;
+    }
+    if (IsWrite(name)) {
+      for (const std::string_view key : ChangedKeys(name, record.args)) {
+        changes[key].push_back(i);
+        writes[{record.client, key}].push_back(i);
+      }
+      for (const auto& [key, value] : NamedValues(name, record.args)) {
+        if (!origin.emplace(value, std::pair{i, key}).second) twice.insert(value);
+      }
+      continue;
+    }
+    if (Classify(record.reply, false) != ReplyKind::kDefinite) continue;
+    if (name == "GET") {
+      reads[{record.client, record.args.at(1)}].push_back(
+          {.order = record.order, .record = i, .value = &record.reply});
+    } else if (name == "MGET" && record.reply.IsArray() &&
+               record.reply.AsArray().size() + 1 == record.args.size()) {
+      for (size_t k = 1; k < record.args.size(); ++k) {
+        reads[{record.client, record.args[k]}].push_back(
+            {.order = record.order, .record = i, .value = &record.reply.AsArray()[k - 1]});
+      }
+    }
+  }
+  for (const std::string_view value : twice) origin.erase(value);
+  const auto order_of = [&records](size_t i) { return records[i].order; };
+  for (auto& [key, list] : writes) std::ranges::stable_sort(list, {}, order_of);
+  for (auto& [key, list] : reads) std::ranges::stable_sort(list, {}, &Read::order);
+  // Where `value` was written straight to `key`: the write.
+  const auto written = [&origin](const core::RespValue& value,
+                                 std::string_view key) -> std::optional<size_t> {
+    if (!value.IsBulkString()) return std::nullopt;
+    const auto it = origin.find(value.AsString());
+    if (it == origin.end() || it->second.second != key) return std::nullopt;
+    return it->second.first;
+  };
+
+  const std::vector<size_t> none;
+  for (const auto& [reader_key, list] : reads) {
+    const auto& [reader, b] = reader_key;
+    const auto b_group = group_of.find(b);
+    if (b_group == group_of.end()) continue;
+    for (const Read& r1 : list) {
+      const auto w2 = written(*r1.value, b);
+      if (!w2.has_value()) continue;
+      const Record& second = records[*w2];
+      for (const auto& [a, a_group] : group_of) {
+        if (a_group == b_group->second) continue;
+        const auto own = writes.find({second.client, a});
+        if (own == writes.end()) continue;
+        const auto after = std::ranges::lower_bound(own->second, second.order, {}, order_of);
+        if (after == own->second.begin()) continue;
+        const size_t w1 = *std::prev(after);
+        const auto sure = SureValue(records[w1], names[w1], a);
+        if (!sure.has_value()) continue;
+        const auto theirs = reads.find({reader, a});
+        if (theirs == reads.end()) continue;
+        const auto r2 = std::ranges::upper_bound(theirs->second, r1.order, {}, &Read::order);
+        if (r2 == theirs->second.end()) continue;
+        const Record& first = records[w1];
+        const Record& later = records[r2->record];
+        // Whether `y` can take effect between w1 and r2.
+        const auto between = [&](size_t y) {
+          const Record& op = records[y];
+          if (y == w1 || (op.client == first.client && op.order < first.order) ||
+              (op.client == later.client && op.order > later.order)) {
+            return false;
+          }
+          return op.ret > first.call && op.call < later.ret;
+        };
+        const auto changed = changes.find(a);
+        const std::vector<size_t>& on_a = changed == changes.end() ? none : changed->second;
+        bool explained = false;
+        if (r2->value->IsBulkString()) {
+          if (r2->value->AsString() == sure->value) {
+            ++result.pairs;
+            continue;
+          }
+          const auto x = written(*r2->value, a);
+          if (!x.has_value()) continue;
+          const Record& older = records[*x];
+          const bool before =
+              (older.client == first.client && older.order < first.order) || older.ret < first.call;
+          if (!before) {
+            ++result.pairs;
+            continue;
+          }
+          explained = std::ranges::any_of(on_a, [&](size_t y) {
+            return (names[y] == "COPY" || names[y] == "RENAMENX") && records[y].args.at(2) == a &&
+                   between(y);
+          });
+        } else if (r2->value->IsNull()) {
+          explained = (sure->ttl && later.at_ms != first.at_ms) ||
+                      std::ranges::any_of(on_a, between) || std::ranges::any_of(flushes, between);
+        } else {
+          continue;
+        }
+        if (explained) continue;
+        ++result.pairs;
+        ++result.broken;
+        if (result.first.empty()) {
+          result.first = Describe(records[r1.record]) + " saw " + std::string(b) + " from " +
+                         Describe(second) + ", then " + Describe(later) + " saw " + std::string(a) +
+                         " = " + RedisModel::Render(*r2->value) + ", before " + Describe(first);
+        }
+      }
+    }
+  }
+  return result;
+}
+
 // Splits the history by key group and checks each group; `groups`
 // names every key. MGET is split per key, FLUSHDB goes to every group.
 // `tick` marks progress at each state the search explores.
@@ -346,14 +593,16 @@ Outcome CheckRecords(const std::vector<Record>& records,
       fail("an unexpected error:" + args + " -> " + record.reply.AsString());
       continue;
     }
-    HistoryOp op{.client = record.client,
-                 .call = record.call,
-                 .ret = record.ret,
-                 .args = record.args,
-                 .reply = RedisModel::Canonical(name, record.reply),
-                 .at_ms = record.at_ms,
-                 .indeterminate = kind == ReplyKind::kIndeterminate,
-                 .order = record.order};
+    HistoryOp op{
+        .client = record.client,
+        .call = record.call,
+        .ret = record.ret,
+        .args = record.args,
+        .reply = RedisModel::Canonical(name, record.reply),
+        .at_ms = record.at_ms,
+        .indeterminate = kind == ReplyKind::kIndeterminate,
+        .order = record.order,
+    };
     if (kind == ReplyKind::kIndeterminate) {
       ++outcome.indeterminate[std::string(ErrorMessage(record.reply))];
     }
@@ -434,6 +683,12 @@ Outcome CheckRecords(const std::vector<Record>& records,
     }
     fail(dump.str());
   }
+  const CrossKey cross = CheckCrossKeyOrder(records, groups);
+  outcome.cross_pairs = cross.pairs;
+  if (cross.broken > 0) {
+    outcome.cross_failure = std::to_string(cross.broken) + " of " + std::to_string(cross.pairs) +
+                            " pairs; the first: " + cross.first;
+  }
   return outcome;
 }
 
@@ -478,9 +733,9 @@ class LinearizabilityTest : public PropertyHarness {
                                .count();
     OpenAt(swarm.options, opened_ms - (opened_ms % 1000));
     PickGroups();
-    for (const auto& group : groups_) {
+    for (int g = 0; g < kGroups; ++g) {
       std::set<core::ShardId> shards;
-      for (const auto& key : group) shards.insert(ShardOf(key));
+      for (const auto& key : groups_.at(g)) shards.insert(ShardOf(key));
       EXPECT_GE(shards.size(), 2U) << "a group on one shard tests no cross-shard write";
     }
     Rng rng(seed);
@@ -532,8 +787,13 @@ class LinearizabilityTest : public PropertyHarness {
               if (mine.Chance(0.05)) {
                 batch.push_back(
                     {"ECHO", "e" + std::to_string(t) + "." + std::to_string(place + d)});
+              } else if (d + 1 < depth && mine.Chance(kMessagePassing)) {
+                for (auto& command : MessagePassing(mine, t, place + d)) {
+                  batch.push_back(std::move(command));
+                }
+                ++d;
               } else {
-                batch.push_back(Generate(mine, t));
+                batch.push_back(Generate(mine, t, place + d));
               }
             }
             issued += static_cast<int>(depth);
@@ -553,13 +813,15 @@ class LinearizabilityTest : public PropertyHarness {
                 }
                 continue;
               }
-              local.push_back(Record{.client = t,
-                                     .call = replied.call[i],
-                                     .ret = replied.ret[i],
-                                     .args = std::move(batch[i]),
-                                     .reply = std::move(replied.replies[i]),
-                                     .at_ms = now_ms_,
-                                     .order = place + i});
+              local.push_back(Record{
+                  .client = t,
+                  .call = replied.call[i],
+                  .ret = replied.ret[i],
+                  .args = std::move(batch[i]),
+                  .reply = std::move(replied.replies[i]),
+                  .at_ms = now_ms_,
+                  .order = place + i,
+              });
             }
             place += batch.size();
           }
@@ -590,7 +852,8 @@ class LinearizabilityTest : public PropertyHarness {
     std::cout << "[linearizability] seed=" << seed << ": " << outcome.abandoned
               << " abandoned at their deadline (" << outcome.orphaned << " with work still out), "
               << outcome.held << " loads held (" << outcome.hold_bounds << " to the bound), "
-              << outcome.late << " late events\n"
+              << outcome.late << " late events, " << outcome.cross_pairs
+              << " cross-group pairs judged\n"
               << std::flush;
     if (!misordered.empty()) {
       outcome.ok = false;
@@ -627,6 +890,12 @@ class LinearizabilityTest : public PropertyHarness {
       ADD_FAILURE() << "seed " << seed << " (" << swarm.text << "): " << outcome.failure
                     << "\nreplay: " << replay;
     }
+    if (!outcome.cross_failure.empty()) {
+      outcome.ok = false;
+      ADD_FAILURE() << "seed " << seed << " (" << swarm.text
+                    << "): a read missed a write its writer made before one it saw: "
+                    << outcome.cross_failure << "\nreplay: " << replay;
+    }
     CloseAll();
     return outcome;
   }
@@ -647,16 +916,41 @@ class LinearizabilityTest : public PropertyHarness {
         groups_[g].push_back(std::move(key));
       }
     }
+    // Message passing's two keys, each a group of its own, on two
+    // shards.
+    const std::string a = "mpa";
+    std::string b = "mpb0";
+    for (int n = 1; ShardOf(b) == ShardOf(a); ++n) b = "mpb" + std::to_string(n);
+    groups_.push_back({a});
+    groups_.push_back({b});
   }
 
   // ---- the generator: one group per command
 
-  std::vector<std::string> Generate(Rng& rng, int thread) {
+  // Unique: a client's place in its commands, and a count within one.
+  static std::string Value(int thread, uint64_t place, int n) {
+    return "t" + std::to_string(thread) + "." + std::to_string(place) + "." + std::to_string(n);
+  }
+
+  // A writer's SET of a, its old value asked for so it may load, then
+  // SET of b; or a reader's GET of b, then of a.
+  std::vector<std::vector<std::string>> MessagePassing(Rng& rng, int thread, uint64_t place) {
+    const std::string& a = groups_.at(kGroups).front();
+    const std::string& b = groups_.at(kGroups + 1).front();
+    if (rng.Chance(0.5)) {
+      return {
+          {"SET", a, Value(thread, place, 0), "GET"},
+          {"SET", b, Value(thread, place + 1, 0)},
+      };
+    }
+    return {{"GET", b}, {"GET", a}};
+  }
+
+  std::vector<std::string> Generate(Rng& rng, int thread, uint64_t place) {
     const auto& group = groups_.at(rng.Below(kGroups));
     const auto key = [&] { return group.at(rng.Below(group.size())); };
-    const auto value = [&] {
-      return "t" + std::to_string(thread) + "." + std::to_string(rng.Next() % 100000);
-    };
+    int n = 0;
+    const auto value = [&] { return Value(thread, place, n++); };
     const auto member = [&] { return "m" + std::to_string(rng.Below(5)); };
     const auto num = [](int64_t n) { return std::to_string(n); };
     const uint64_t roll = rng.Below(1000);
@@ -811,6 +1105,7 @@ void Add(Outcome& total, const Outcome& outcome) {
   total.held += outcome.held;
   total.hold_bounds += outcome.hold_bounds;
   total.late += outcome.late;
+  total.cross_pairs += outcome.cross_pairs;
   for (const auto& [text, count] : outcome.indeterminate) total.indeterminate[text] += count;
 }
 
@@ -820,7 +1115,7 @@ void Report(const std::string& tier, uint64_t seeds, const Outcome& total,
             << total.concurrent << " overlapping another on their group), " << total.no_ops
             << " no-ops, " << total.abandoned << " abandoned (" << total.orphaned
             << " with work still out), " << total.held << " loads held, " << total.explored
-            << " states searched, "
+            << " states searched, " << total.cross_pairs << " cross-group pairs judged, "
             << std::chrono::duration_cast<std::chrono::milliseconds>(took).count() << " ms\n";
   for (const auto& [text, count] : total.indeterminate) {
     std::cout << "[linearizability]   timed out after logging: " << count << " x " << text << '\n';
@@ -851,9 +1146,10 @@ TEST_F(LinearizabilityTest, ConcurrentClientsAreLinearizablePerKeyGroup) {
   Report("bounded tier", seeds.size(), total, std::chrono::steady_clock::now() - started);
   // Clients that ran one at a time overlap almost nothing; on a loaded
   // machine about half still overlap. A reduced build's few ops vary
-  // too much to judge.
+  // too much to judge, and judge only a few cross-group pairs.
   if (!HasFailure() && kReducedDivisor == 1) {
     EXPECT_GE(total.concurrent * 4, total.ops) << "too few ops overlapped to test concurrency";
+    EXPECT_GT(total.cross_pairs, 0U) << "no read judged a connection's order across groups";
   }
   // Else the check that an abandoned command never applies went
   // untested.
@@ -879,17 +1175,133 @@ TEST_F(LinearizabilityTest, LongTier) {
   Report("long tier", run, total, std::chrono::steady_clock::now() - started);
 }
 
+// ---- the litmus: message passing through one connection's pipeline
+
+// W pipelines SET a then SET b, a's write held at its load; meanwhile
+// R reads b and must never see it. Released, both show, a no later
+// than b. a and b sit on two logs, which order nothing between them.
+class MessagePassingTest : public PropertyHarness {};
+
+TEST_F(MessagePassingTest, ALaterWriteNeverShowsBeforeItsConnectionsEarlierOne) {
+  Options options;
+  options.shards = 4;
+  options.log_count = 2;
+  // One I/O thread holds a's load, the other serves R's.
+  options.cold_io_threads = 2;
+  // Past any run: a deadline would end the hold early.
+  options.command_timeout = std::chrono::seconds(60);
+  OpenAt(options, 1'700'000'000'000);
+  const std::string a = KeyOn(0, 0, "a");
+  const std::string b = KeyOn(1, 0, "b");
+  ASSERT_NE(queue_->LogOf(ShardOf(a)), queue_->LogOf(ShardOf(b)));
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool held = false;
+  bool fed = false;
+  bool released = false;
+  hooked_.SetAfterHook([&](std::string_view key) {
+    if (key != a) return;
+    std::unique_lock lock(mu);
+    held = true;
+    cv.notify_all();
+    cv.wait(lock, [&released] { return released; });
+  });
+  const auto release = [&] {
+    const std::scoped_lock lock(mu);
+    released = true;
+    cv.notify_all();
+  };
+  const PipelinedClient::Expired never = [](std::span<const std::vector<std::string>>) {};
+  std::atomic<uint64_t> clock{1};
+  std::atomic<bool> written{false};
+  PipelinedClient::Done w_replies;
+  std::thread writer([&] {
+    PipelinedClient w(*engine_, 1);
+    // GET makes SET read a, so it loads a from cold, where it is held.
+    (void)w.Run({{"SET", a, "1", "GET"}, {"SET", b, "1"}}, clock, w_replies, never, [&] {
+      const std::scoped_lock lock(mu);
+      fed = true;
+      cv.notify_all();
+    });
+    written = true;
+  });
+  const abyss::testing::OnExit finish([&] {
+    release();
+    writer.join();
+    hooked_.SetAfterHook(nullptr);
+  });
+  {
+    std::unique_lock lock(mu);
+    // A backstop: W's first feed and a's load take microseconds.
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return held && fed; }))
+        << "a's load held " << held << ", W fed " << fed;
+  }
+
+  PipelinedClient r(*engine_, 2);
+  const auto get = [&](const std::string& key) {
+    PipelinedClient::Done done;
+    if (!r.Run({{"GET", key}}, clock, done, never, [this] { Heartbeat(); })) {
+      return core::RespValue::Error(core::ErrorPrefix::kErr, "unparsable reply");
+    }
+    return std::move(done.replies.at(0));
+  };
+  const auto shows = [](const core::RespValue& value) {
+    return value.IsBulkString() && value.AsString() == "1";
+  };
+  constexpr int kHeldReads = 16;
+  for (int i = 0; i < kHeldReads; ++i) {
+    const core::RespValue seen = get(b);
+    if (!seen.IsNull()) {
+      ADD_FAILURE() << "read " << i << " saw " << b << " = " << RedisModel::Render(seen)
+                    << " while the write to " << a << " before it was held";
+      break;
+    }
+  }
+
+  release();
+  // Until W has both replies, and once more: b then a, so a shows no
+  // later than b.
+  const auto bound = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  for (bool last = false; !last;) {
+    last = written.load();
+    const core::RespValue seen_b = get(b);
+    const core::RespValue seen_a = get(a);
+    if (shows(seen_b) && !shows(seen_a)) {
+      ADD_FAILURE() << "saw " << b << " = 1, then " << a << " = " << RedisModel::Render(seen_a);
+      break;
+    }
+    if (last) {
+      EXPECT_TRUE(shows(seen_a) && shows(seen_b))
+          << "after both writes replied: " << a << " = " << RedisModel::Render(seen_a) << ", " << b
+          << " = " << RedisModel::Render(seen_b);
+    }
+    if (!last && std::chrono::steady_clock::now() > bound) {
+      ADD_FAILURE() << "W never had both replies";
+      break;
+    }
+  }
+  if (written.load()) {
+    ASSERT_EQ(w_replies.replies.size(), 2U);
+    EXPECT_TRUE(w_replies.replies[0].IsNull()) << RedisModel::Render(w_replies.replies[0]);
+    EXPECT_TRUE(w_replies.replies[1].IsSimpleString() && w_replies.replies[1].AsString() == "OK")
+        << RedisModel::Render(w_replies.replies[1]);
+  }
+}
+
 // ---- the checker, end to end over records, with no engine
 
 Record At(int client, uint64_t call, uint64_t ret, std::vector<std::string> args,
           core::RespValue reply, int64_t at_ms = 0, uint64_t order = 0) {
-  return {.client = client,
-          .call = call,
-          .ret = ret,
-          .args = std::move(args),
-          .reply = std::move(reply),
-          .at_ms = at_ms,
-          .order = order};
+  return {
+      .client = client,
+      .call = call,
+      .ret = ret,
+      .args = std::move(args),
+      .reply = std::move(reply),
+      .at_ms = at_ms,
+      .order = order,
+  };
 }
 
 core::RespValue Ok() { return core::RespValue::SimpleString("OK"); }
@@ -1007,6 +1419,39 @@ TEST(LinearizabilityCheckerTest, AnExhaustedSearchFails) {
   const Outcome exhausted = CheckRecords(history, AB(), 1);
   EXPECT_FALSE(exhausted.ok);
   EXPECT_TRUE(exhausted.failure.contains("budget")) << exhausted.failure;
+}
+
+// Message passing across groups, each alone linearizable: W sets a,
+// then b; R sees b, then a read of a must see W's write or a later one.
+TEST(LinearizabilityCheckerTest, AReadMissingAnEarlierWriteOfAWriteItsReaderSawFails) {
+  const std::vector<std::vector<std::string>> two = {{"a"}, {"b"}};
+  std::vector<Record> history = {
+      At(0, 3, 20, {"SET", "a", "x"}, Ok(), 0, 0),
+      At(0, 3, 21, {"SET", "b", "y"}, Ok(), 0, 1),
+      At(1, 4, 5, {"GET", "b"}, Bulk("y"), 0, 0),
+      At(1, 6, 7, {"GET", "a"}, core::RespValue::Null(), 0, 1),
+  };
+  const Outcome missed = CheckRecords(history, two, 1000);
+  EXPECT_TRUE(missed.ok) << missed.failure;
+  EXPECT_EQ(missed.cross_pairs, 1U);
+  EXPECT_TRUE(missed.cross_failure.contains("GET a")) << missed.cross_failure;
+  history[3].reply = Bulk("x");
+  const Outcome seen = CheckRecords(history, two, 1000);
+  EXPECT_EQ(seen.cross_pairs, 1U);
+  EXPECT_TRUE(seen.cross_failure.empty()) << seen.cross_failure;
+  // A value written to a before W's write began.
+  history.push_back(At(2, 1, 2, {"SET", "a", "old"}, Ok(), 0, 0));
+  history[3].reply = Bulk("old");
+  const Outcome stale = CheckRecords(history, two, 1000);
+  EXPECT_TRUE(stale.ok) << stale.failure;
+  EXPECT_FALSE(stale.cross_failure.empty());
+  // A DEL of a that may fall between W's write and R's read explains a
+  // miss: no pair is judged.
+  history[3].reply = core::RespValue::Null();
+  history.push_back(At(2, 6, 8, {"DEL", "a"}, core::RespValue::Integer(1), 0, 1));
+  const Outcome deleted = CheckRecords(history, two, 1000);
+  EXPECT_EQ(deleted.cross_pairs, 0U);
+  EXPECT_TRUE(deleted.cross_failure.empty()) << deleted.cross_failure;
 }
 
 }  // namespace

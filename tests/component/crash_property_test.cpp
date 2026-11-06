@@ -945,7 +945,7 @@ class CrashTest : public PropertyHarness {
     options.shards = 4;
     options.log_count = logs;
     options.durability = core::Durability::kPowerLoss;
-    options.segment_size_bytes = size_t{64} << 10;
+    options.segment_size_bytes = size_t{64} << 10U;
     options.command_timeout = std::chrono::milliseconds(1000);
     options.run = "pipe" + std::to_string(seed) + "-" + std::to_string(logs) + "-";
     const std::string at =
