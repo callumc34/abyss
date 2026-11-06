@@ -50,6 +50,7 @@
 #include "event_inbox.h"
 #include "hooked_cold_store.h"
 #include "latch.h"
+#include "progress_watchdog.h"
 #include "sequenced_engine_fixture.h"
 #include "sync_pipeline.h"
 #include "sync_redis_client.h"
@@ -132,6 +133,7 @@ class FrontEndTest : public SequencedEngineTest {
     hooked_.SetHook([this](std::string_view key) { gate_.Hook(key); });
   }
   void TearDown() override {
+    watchdog_.reset();
     // A post still held would never land.
     held_.release.Open();
     gate_.ReleaseAll();
@@ -184,9 +186,14 @@ class FrontEndTest : public SequencedEngineTest {
     while (out.size() < want && core::SteadyClock::now() < until) {
       Pump(10ms);
       (void)Feed(client);
-      out += Drain(client);
+      const std::string more = Drain(client);
+      if (!more.empty() && watchdog_.has_value()) watchdog_->Tick();
+      out += more;
     }
     return out;
+  }
+  void Beat(std::string_view where) {
+    if (watchdog_.has_value()) watchdog_->Beat(where);
   }
   void Expire(uint64_t client, core::SteadyTime now = core::SteadyClock::now() + 1h) {
     if (auto orphan = pipelines_.at(client)->Expire(now)) orphans_.Adopt(std::move(orphan));
@@ -239,6 +246,8 @@ class FrontEndTest : public SequencedEngineTest {
   ColdKeyGate gate_;
   // Outlives the server whose posts it holds, on a failure too.
   HeldPost held_;
+  // A long test's: each reply or step is progress.
+  std::optional<abyss::testing::ProgressWatchdog> watchdog_;
   abyss::testing::HookedColdStore hooked_{[this]() -> core::ColdStore& { return *cold_; }};
   abyss::testing::EventInbox inbox_;
   resp::Orphans orphans_{metrics::Registry::Instance().Gauge(metrics::names::kNetOrphans)};
@@ -255,6 +264,7 @@ class FrontEndTest : public SequencedEngineTest {
 // connection's writes wait to be durable together.
 TEST_F(FrontEndTest, APipelineOfPowerLossSetsSharesFlushes) {
   constexpr int kDepth = 32;
+  watchdog_.emplace("opening");
   Open(Options{.durability = core::Durability::kPowerLoss});
   Connect(1);
   std::string input;
@@ -265,7 +275,9 @@ TEST_F(FrontEndTest, APipelineOfPowerLossSetsSharesFlushes) {
   }
   const uint64_t before =
       metrics::testing::GetHistogramCount(metrics::names::kWalFlushDurationSeconds).value_or(0);
+  Beat("feeding the pipeline");
   EXPECT_TRUE(Feed(1, input)) << "a sequenced write lets the next dispatch";
+  Beat("awaiting the pipeline's replies");
   EXPECT_EQ(Await(1, expected.size()), expected);
   const uint64_t flushes =
       metrics::testing::GetHistogramCount(metrics::names::kWalFlushDurationSeconds).value_or(0) -
@@ -358,29 +370,41 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
 // timed-out misses leave two, and the queued ones never read cold.
 TEST_F(FrontEndTest, OrphansAreBoundedByThePoolsThreads) {
   constexpr uint64_t kMisses = 100;
+  abyss::testing::ProgressWatchdog& watchdog = watchdog_.emplace("opening");
   Open(Options{.cold_io_threads = 2});
+  Beat("writing the keys");
   for (uint64_t i = 0; i < kMisses; ++i) {
     const std::string key = "m" + std::to_string(i);
     ASSERT_EQ(Write({"SET", key, "v"}).rfind("error", 0), std::string::npos);
     gate_.Hold(key);
+    watchdog.Tick();
   }
-  for (core::ShardId shard = 0; shard < options_.shards; ++shard) DrainToCold(shard);
+  for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
+    Beat("draining shard " + std::to_string(shard) + " to cold");
+    DrainToCold(shard);
+  }
   EvictDrained();
 
+  Beat("dispatching the misses");
   for (uint64_t i = 0; i < kMisses; ++i) {
     Connect(i + 1);
     EXPECT_TRUE(Feed(i + 1, Command({"GET", "m" + std::to_string(i)})));
+    watchdog.Tick();
   }
+  Beat("awaiting the pool's two reads");
   ASSERT_TRUE(gate_.AwaitBlocked(2));
+  Beat("timing out the misses");
   for (uint64_t i = 0; i < kMisses; ++i) Expire(i + 1);
   EXPECT_LE(orphans_.size(), 2U);
   RecordProperty("orphans", std::to_string(orphans_.size()));
 
+  Beat("settling the orphans");
   gate_.ReleaseAll();
   ASSERT_TRUE(PollUntil([this] {
     Pump();
     return orphans_.empty();
   }));
+  Beat("awaiting the pool");
   io_pool_->WaitIdleForTesting();
   int reads = 0;
   for (uint64_t i = 0; i < kMisses; ++i) reads += gate_.Calls("m" + std::to_string(i));
@@ -469,6 +493,7 @@ TEST_F(FrontEndTest, AClosedConnectionsPipelineTakesAPostAlreadyTaken) {
 // with the orphans; the engine's stop fails its wait, which lands on
 // the orphaned pipeline through the reactor still running.
 TEST_F(FrontEndTest, TheEnginesStopFailsAWaitAClosedConnectionLeft) {
+  watchdog_.emplace("opening");
   Open(Options{.segment_size_bytes = size_t{16} << 10U});
   StartServer();
   queue_->PauseSegmentPreparerForTesting(0, true);
@@ -478,6 +503,7 @@ TEST_F(FrontEndTest, TheEnginesStopFailsAWaitAClosedConnectionLeft) {
   std::string waiting;
   for (int i = 0; i < 200 && waiting.empty(); ++i) {
     const std::string key = "w" + std::to_string(i);
+    Beat("writing " + key + " until the spares run out");
     ASSERT_TRUE(client.SendRaw(Command({"SET", key, value})));
     // It replies, or it waits for a spare that never comes.
     std::string reply;
@@ -493,10 +519,12 @@ TEST_F(FrontEndTest, TheEnginesStopFailsAWaitAClosedConnectionLeft) {
     }
   }
   ASSERT_FALSE(waiting.empty()) << "the spares never ran out";
+  Beat("closing the client");
   const double orphans = OrphanGauge();
   client.Close();
   ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }))
       << "its write runs on with the orphans";
+  Beat("stopping");
 
   server_->StopAccepting();
   server_->ForceClose();
@@ -651,6 +679,7 @@ TEST(FrontEndShutdownDeathTest, DISABLED_StuckJobChild) {
 // From the stop's start, the parent waits no longer than the timeout
 // and a margin: a stop that never ends fails here, not at ctest's.
 TEST(FrontEndShutdownDeathTest, AStuckJobEndsTheProcessWithinTheTimeout) {
+  abyss::testing::ProgressWatchdog watchdog("spawning the child");
   const abyss::testing::TempDir dir("stuck-stop");
   std::string self = ::testing::internal::GetArgvs().front();
   std::string filter = "--gtest_filter=FrontEndShutdownDeathTest.DISABLED_StuckJobChild";
@@ -679,9 +708,12 @@ TEST(FrontEndShutdownDeathTest, AStuckJobEndsTheProcessWithinTheTimeout) {
     done = waitpid(pid, &status, WNOHANG);
     return done != 0;
   };
-  // The child's start-up, which sanitizers slow, is not the stop's.
+  // The child's start-up, which sanitizers slow, is not the stop's;
+  // the watchdog bounds it.
+  watchdog.Beat("awaiting the child's stop");
   const bool started =
       PollUntil([&] { return std::filesystem::exists(dir.Sub("stopping")) || reap(); }, 120s);
+  watchdog.Beat("awaiting the child's exit");
   const bool exited = done != 0 || PollUntil(reap, kStuckStopTimeout + 2s);
   if (!exited) {
     ::kill(pid, SIGKILL);

@@ -26,6 +26,7 @@
 #include "cold_gate.h"
 #include "hooked_cold_store.h"
 #include "on_exit.h"
+#include "progress_watchdog.h"
 #include "sync_redis_client.h"
 #include "temp_dir.h"
 
@@ -117,6 +118,8 @@ config::Config ServerConfig(const abyss::testing::TempDir& dir) {
 // connections, then let go as the engine stops. The stop ends clean,
 // with no orphan left.
 TEST(ServerShutdownTest, AStopWithWorkOfEveryKindInFlightEndsClean) {
+  // Declared first, so it also watches the stop and the teardown.
+  abyss::testing::ProgressWatchdog watchdog("initializing");
   const abyss::testing::TempDir dir("server-stop");
   engine::ColdKeyGate gate;
   std::unique_ptr<abyss::testing::HookedColdStore> hooked;
@@ -144,6 +147,7 @@ TEST(ServerShutdownTest, AStopWithWorkOfEveryKindInFlightEndsClean) {
     gate.ReleaseAll();
     flushes.Release();
   });
+  watchdog.Beat("recovering");
   ASSERT_TRUE(PollUntil([&server] { return server.IsServing(); }));
   const uint16_t port = server.RespBoundPort();
   const double orphans = OrphanGauge();
@@ -159,15 +163,18 @@ TEST(ServerShutdownTest, AStopWithWorkOfEveryKindInFlightEndsClean) {
   ASSERT_TRUE(pending.Connect(port));
   ASSERT_TRUE(sequenced.Connect(port));
 
+  watchdog.Beat("timing out a cold read");
   ASSERT_TRUE(timed_out.SendRaw(Command({"GET", "gone"})));
   ASSERT_TRUE(gate.AwaitBlocked(1));
   EXPECT_EQ(timed_out.ReadReply(30s), "-ERR read timed out loading its key\r\n");
   ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }))
       << "its task waits, orphaned, for its cold read";
 
+  watchdog.Beat("holding a cold read");
   ASSERT_TRUE(pending.SendRaw(Command({"GET", "pending"})));
   ASSERT_TRUE(gate.AwaitBlocked(2));
 
+  watchdog.Beat("sequencing a power_loss write");
   server.QueueForTesting().SetFlushHookForTesting(flushes.Hook());
   ASSERT_TRUE(sequenced.SendRaw(Command({"SET", "k", "v"})));
   const core::ShardId shard = core::ComputeShard("k", kShards);
@@ -176,12 +183,15 @@ TEST(ServerShutdownTest, AStopWithWorkOfEveryKindInFlightEndsClean) {
            1;
   })) << "the SET never sequenced";
 
+  watchdog.Beat("closing the connections");
   stop.store(true);
   ASSERT_TRUE(PollUntil([closed] { return ClosedAtShutdown() == closed + 3; }))
       << "the stop never closed the connections";
+  watchdog.Beat("stopping the engine");
   gate.ReleaseAll();
   flushes.Release();
   runner.join();
+  watchdog.Beat("tearing down");
 
   ASSERT_TRUE(ran.has_value()) << ran.error().message();
   EXPECT_EQ(server.Lifecycle(), Server::LifecycleState::kStopped);

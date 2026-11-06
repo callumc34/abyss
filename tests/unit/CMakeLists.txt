@@ -342,3 +342,10 @@ abyss_set_test_timeout(log_stress "${CMAKE_CURRENT_SOURCE_DIR}" 120
   LogStressTest.ReclaimRacesAppendersAndReaders
   LogStressTest.StaleBytesShapedLikeCommitWordsNeverMoveP
   LogStressTest.AHeldHoleOutlastsSeveralRingsOfCompletions)
+
+# No CI history yet: twice the sanitizers' 30 s stall limit, for each
+# test's watchdog to fire first; 3x their local time is under a second.
+abyss_set_test_timeout(connection_serve "${CMAKE_CURRENT_SOURCE_DIR}" 60
+  ConnectionAsyncTest.InputLeftAtTheSlotCapRunsOnceItsPassFreesTheSlots
+  ConnectionAsyncTest.FiveThousandSetsWrittenAtOnceAllReplyAtTheDefaultCap
+  ConnectionAsyncTest.InputLeftAtTheReplyByteLimitRunsOnceItsPassWritesThem)

@@ -27,6 +27,7 @@
 #include "event_inbox.h"
 #include "fake_poller.h"
 #include "mock_queue.h"
+#include "progress_watchdog.h"
 #include "scripted_dispatcher.h"
 #include "socket_pair.h"
 
@@ -124,14 +125,17 @@ class ConnectionAsyncTest : public ::testing::Test {
   }
   // The reactor's part for a connection whose engine replies at once:
   // an event only for the interest it has armed. Armed for nothing
-  // with replies still owed, it has stalled, as nothing would run it.
+  // with replies still owed, it has stalled, as nothing would run it;
+  // armed but making no progress, its watchdog fires.
   std::string Serve(Connection& conn, const std::string& input, size_t want) {
+    abyss::testing::ProgressWatchdog watchdog("serving " + std::to_string(want) + " bytes");
     size_t sent = 0;
     std::string got;
-    const auto until = std::chrono::steady_clock::now() + 10s;
-    while (std::chrono::steady_clock::now() < until) {
+    for (;;) {
+      const size_t progress = sent + got.size();
       sent += SendSome(std::string_view(input).substr(sent));
       got += ReceiveSome();
+      if (sent + got.size() > progress) watchdog.Tick();
       if (got.size() >= want || conn.IsClosed()) break;
       const bool read = ReadArmed();
       const bool write = WriteArmed();

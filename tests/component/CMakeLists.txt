@@ -86,6 +86,19 @@ if(ABYSS_WITH_ROCKSDB)
       CrashTest.KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply)
   endif()
   abyss_set_test_timeout(property_short "${CMAKE_CURRENT_SOURCE_DIR}" 30 ${_abyss_property_short})
+  # No CI history yet: 3x their local time is under 10 s, so the floor
+  # is twice the sanitizers' 30 s stall limit, for the watchdog to fire
+  # first.
+  set(_abyss_front_end_long
+    FrontEndTest.APipelineOfPowerLossSetsSharesFlushes
+    FrontEndTest.OrphansAreBoundedByThePoolsThreads
+    FrontEndTest.TheEnginesStopFailsAWaitAClosedConnectionLeft
+    ServerShutdownTest.AStopWithWorkOfEveryKindInFlightEndsClean)
+  if(NOT WIN32)
+    list(APPEND _abyss_front_end_long
+      FrontEndShutdownDeathTest.AStuckJobEndsTheProcessWithinTheTimeout)
+  endif()
+  abyss_set_test_timeout(front_end_long "${CMAKE_CURRENT_SOURCE_DIR}" 60 ${_abyss_front_end_long})
 endif()
 
 # A million keys in one shard; its own binary so it can carry its own label.
