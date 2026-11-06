@@ -373,6 +373,10 @@ def decide_probe(run, d, v, aa_run):
                     v.undecided(name, f"{detail}; the A/A-calibrated rule needs an A/A "
                                       f"control of {w} (--aa)")
                     continue
+                if len(aa["mean"]) * 2 < len(rows):
+                    v.undecided(name, f"{detail}; the A/A control has {len(aa['mean'])} "
+                                      f"rounds, fewer than half the A/B's {len(rows)}")
+                    continue
                 spread = aa["spread"]
                 if spread > limit:
                     v.undecided(name, f"{detail}; A/A spread {spread:.4f} > {limit:g}")

@@ -44,8 +44,11 @@ gate.pl1.lock_hold_p50_max = 1.05
 A/A calibration: the mean gate of each workload aa.calibrates names is decided only
 against an A/A control of that workload, run in the same session (run_probe_aa.sh,
 DECISION.aa), whose spread is within aa.spread_max: decide.py <run-dir> --aa
-<aa-run-dir>. The spread is the A/A geomean's distance from 1 plus twice its standard
-error, as a ratio; the limit is well inside the 1.05 gate.
+<aa-run-dir>. The A/A runs in the same session as the A/B, interleaved with it, with at
+least half the A/B's round count (decide.py refuses fewer). The spread is
+exp(|mean(log r)| + 2 * SE), where r is each A/A round's mean ratio and SE is the standard
+error of the mean of the per-round log(r): bias plus a ~95% half-width, as a ratio. So
+1.025 means a 2.5% bound, well inside the 1.05 gate.
 aa.calibrates = w1
 aa.spread_max = 1.025
 Without such a control the gate is NOT DECIDED: W1's mean is set by rare stalls, and two

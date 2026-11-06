@@ -15,7 +15,8 @@ quiet.load_wait_s = <as the A/B>
 quiet.compiler_wait_s = <as the A/B>
 
 Reported: per workload, the geomean of the per-round mean ratio and of the p50 ratio, each
-round's ratio, acks over 10 ms per run, and the spread (the geomean's distance from 1 plus
-twice its standard error). With the line below, decide.py also says whether the spread is
+round's ratio, acks over 10 ms per run, and the spread: exp(|mean(log r)| + 2 * SE), with
+r each round's ratio and SE the standard error of the mean of the per-round log(r). Run it
+in the same session as the A/B, interleaved, with at least half the A/B's round count. With the line below, decide.py also says whether the spread is
 within it; the A/B's DECISION holds the limit that binds.
 aa.spread_max = 1.025

@@ -118,7 +118,8 @@ The rule, from Phase 3's W1 ruling:
 In the probe template:
 - `aa.calibrates` names the workloads whose mean gate this applies to (W1);
 - `aa.spread_max` (1.025) is the limit;
-- the spread is the A/A geomean's distance from 1 plus twice its standard error, as a ratio: roughly what the A/B estimator reads when nothing differs.
+- the spread is exp(|mean(log r)| + 2·SE), where r is each A/A round's mean ratio and SE is the standard error of the mean of the per-round log(r). That's bias plus a ~95% half-width, as a ratio: roughly what the A/B estimator reads when nothing differs. 1.025 is a 2.5% bound;
+- the A/A runs in the same session as the A/B, interleaved with it, with at least half the A/B's round count. decide.py refuses a smaller control.
 
 `decide.py <run> --aa <aa-run>` gates such a mean only if the A/A spread is within the limit, and otherwise prints `NOT DECIDED`. The macOS A/A's spread was 1.37.
 
