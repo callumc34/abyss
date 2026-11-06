@@ -354,7 +354,9 @@ Per-connection state (frontend-local, not a queue concern):
 - `HELLO 2` → same payload, confirms protocol negotiation.
 - `HELLO 3` → `NOPROTO unsupported protocol version`.
 - `HELLO 2 AUTH <user> <pass>` → Phase 1 ignores AUTH arguments (future: verify credentials).
-- `HELLO 2 SETNAME <name>` → sets `client_name`.
+- `HELLO 2 SETNAME <name>` → sets `client_name`, but only once every option has parsed; a failed `HELLO` leaves the name unchanged.
+
+A client name may hold only printable ASCII without spaces (`!` to `~`). `CLIENT SETNAME` and `HELLO … SETNAME` refuse any other name with Redis's error and store nothing, because `CLIENT LIST` and `INFO` echo names back. Error replies that quote client bytes, such as an unknown command or subcommand, map CR and LF to spaces, so a client can never split or forge a reply frame (#204).
 
 `CLIENT ID` reads from connection state; never a queue concern. `CLIENT SETNAME` / `CLIENT GETNAME` operate on connection state. All handshake commands are classed stateless — the engine is not involved.
 
