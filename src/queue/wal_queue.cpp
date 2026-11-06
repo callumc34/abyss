@@ -677,7 +677,7 @@ core::Result<Reservation> WalQueue::Reserve(std::span<const ShardEntries> parts)
                                            std::to_string(frame_space_) + " bytes"});
   }
   // Re-checked without waiting: the caller holds its hot shard locks.
-  if (auto admitted = window_.Admit(log, core::SteadyTime{}); !admitted) {
+  if (auto admitted = window_.Admit(log); !admitted) {
     return std::unexpected(admitted.error());
   }
   const ShardStream::LogParts group{.streams = streams, .parts = parts, .sizes = sizes};
@@ -712,7 +712,7 @@ core::Result<Reservation> WalQueue::ReserveFlush(std::span<const ShardEntries> p
   groups.reserve(config_.log_count);
   for (uint32_t log = 0; log < config_.log_count; ++log) {
     if (by_log[log].empty()) continue;
-    if (auto admitted = window_.Admit(log, core::SteadyTime{}); !admitted) {
+    if (auto admitted = window_.Admit(log); !admitted) {
       return std::unexpected(admitted.error());
     }
     groups.push_back(

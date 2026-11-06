@@ -96,16 +96,14 @@ class Log {
 
   // Reserves `size` bytes (a FrameSize). kUnavailable, with no state
   // changed, when the frame needs a segment that is not ready yet: wait
-  // with WaitForSpare outside any lock and retry.
+  // with WhenSpare outside any lock and retry.
   core::Result<Reservation> Reserve(uint32_t size);
   // Whether Reserve(size) would succeed now. Exact only while no one
   // else can reserve, as when every stream of the log is locked.
   bool CanReserve(uint32_t size) const;
-  // False at the deadline, or once the log is shutting down.
-  bool WaitForSpare(core::SteadyTime deadline);
-  // WaitForSpare for a waiter that registers itself, counted when
-  // `first`: outcomes as WaitList::Register's, kUnavailable once the
-  // log is shutting down.
+  // Waits for a spare segment, for a waiter that registers itself,
+  // counted when `first`: outcomes as WaitList::Register's,
+  // kUnavailable once the log is shutting down.
   std::optional<core::Result<void>> WhenSpare(core::Waiter& waiter, bool first);
   bool CancelSpare(core::Waiter& waiter) noexcept;
   void FinishSpare(core::Waiter& waiter) noexcept;
@@ -186,7 +184,8 @@ class Log {
 
   void Shutdown();
 
-  // WaitForSpare's waiters, and a hook it runs before it registers.
+  // WhenSpare's waiters, and a hook a first WhenSpare runs before it
+  // registers.
   std::size_t SpareWaitersForTesting() const noexcept;
   void SetSpareWaitHookForTesting(std::function<void()> hook);
   // AwaitFilled's parked waiters, and a hook each runs just before it

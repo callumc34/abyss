@@ -51,12 +51,6 @@ class Loader {
   enum class Source : uint8_t { kBuffer, kCold };
 
   using Shared = std::shared_ptr<const hot::LoadResult>;
-  // Load, reading members only when the key holds `type`: a key of
-  // another type is LoadedExists, unless removals may have emptied it.
-  // Concurrent calls for one key and type share one load, and its
-  // result or error; once it completes, the next call loads afresh.
-  core::Result<Shared> LoadAs(core::ShardId shard, std::string_view key, core::KeyType type,
-                              core::SteadyTime deadline, Source* source = nullptr) const;
 
  private:
   struct Flight {
@@ -124,8 +118,12 @@ class Loader {
     std::atomic<State> state_{State::kIdle};
   };
 
-  // LoadAs that never waits for another's load: the result, or nullopt
-  // when `join` joined a load of the key already in flight.
+  // Load, reading members only when the key holds `type`: a key of
+  // another type is LoadedExists, unless removals may have emptied it.
+  // Concurrent calls for one key and type share one load, and its
+  // result or error; once it completes, the next call loads afresh. It
+  // never waits for another's load: the result, or nullopt when `join`
+  // joined a load of the key already in flight.
   std::optional<core::Result<Shared>> LoadAsOrJoin(core::ShardId shard, std::string_view key,
                                                    core::KeyType type, core::SteadyTime deadline,
                                                    Source* source, FlightJoin& join,
@@ -148,7 +146,7 @@ class Loader {
     // The flush floor makes the key absent.
     kFlushed,
     // Another's load holds the key's placeholder: a miss, which buffer
-    // and cold answer (LoadAs) with no wait. Nothing is filled.
+    // and cold answer (LoadAsOrJoin) with no wait. Nothing is filled.
     kPending,
     // Not installed, and `result` holds what was read: a write overtook
     // the load, the shard is over its backpressure limit, the key is too
@@ -208,13 +206,11 @@ class Loader {
   // Loads in flight on `shard`, and the joiners still waiting on them.
   std::size_t FlightsForTesting(core::ShardId shard) const;
   std::size_t JoinersForTesting(core::ShardId shard) const;
-  // Runs in a join between its registration and its wait.
-  void SetJoinHookForTesting(std::function<void()> hook) { join_hook_ = std::move(hook); }
   // Runs in a leader between taking its joiners and landing them.
   void SetLandHookForTesting(std::function<void()> hook) { land_hook_ = std::move(hook); }
 
  private:
-  // LoadAs, unshared.
+  // LoadAsOrJoin's load, unshared.
   core::Result<hot::LoadResult> LoadTyped(core::ShardId shard, std::string_view key,
                                           core::KeyType type, core::SteadyTime deadline,
                                           Source* source) const;
@@ -234,24 +230,21 @@ class Loader {
                                                         core::KeyType type, std::string_view member,
                                                         core::SteadyTime deadline) const;
 
-  // What a call that finds another's load in flight does: wait for it,
-  // join it without waiting (`async`), or leave it.
-  enum class JoinMode : uint8_t { kWait, kAsync, kNever };
-  // LoadAs, as the leader of a load in flight or a joiner of one. A
-  // leader passing `owned` gets its result there, and lends joiners a
-  // copy only when there are some. nullopt: not loaded here, another's
-  // load being in flight (kAsync, kNever).
+  // LoadAsOrJoin and Install, as the leader of a load in flight or a
+  // joiner of one. A call that finds another's load in flight joins it
+  // through `join` without waiting, or with none leaves it. A leader
+  // passing `owned` gets its result there, and lends joiners a copy
+  // only when there are some. nullopt: not loaded here, another's load
+  // being in flight.
   std::optional<core::Result<Shared>> Fly(core::ShardId shard, std::string_view key,
                                           core::KeyType type, core::SteadyTime deadline,
                                           Source* source, std::optional<hot::LoadResult>* owned,
-                                          JoinMode mode, FlightJoin* async = nullptr) const;
+                                          FlightJoin* join) const;
 
-  // A call waiting on another's load, on its stack.
-  class Joiner;
   struct Pending {
     JoinLink* joiners = nullptr;
   };
-  // Loads in flight, per shard: LoadAs's and Install's.
+  // Loads in flight, per shard: LoadAsOrJoin's and Install's.
   struct Flights {
     mutable std::mutex mu;
     // By key, type and the drain horizon the leader started at.
@@ -266,7 +259,6 @@ class Loader {
   core::WallClockFn wall_clock_;
   std::vector<std::unique_ptr<Flights>> flights_;
   mutable std::atomic<uint64_t> joins_{0};
-  std::function<void()> join_hook_;
   std::function<void()> land_hook_;
 };
 

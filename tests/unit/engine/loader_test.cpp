@@ -33,6 +33,7 @@
 #include "abyss/engine/decide.h"
 #include "abyss/hot/sharded_hot_store.h"
 #include "abyss/hot/single_shard_store.h"
+#include "blocking_load.h"
 #include "decide_fixture.h"
 #include "event_inbox.h"
 #include "latch.h"
@@ -473,11 +474,13 @@ TEST_F(LoaderTest, ConcurrentLoadsShareOneColdReadAndItsError) {
       .WillOnce(Return(LoadAsResult{core::LoadedAs{
           core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}}));
   const abyss::testing::OnExit unblock([&] { release.Open(); });
-  auto leader = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto leader = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(entered.Wait());
-  auto waiter = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto waiter = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(JoinedBy(loader_, 1)) << "the waiter never joined the load";
   release.Open();
   const auto led = leader.get();
@@ -486,7 +489,7 @@ TEST_F(LoaderTest, ConcurrentLoadsShareOneColdReadAndItsError) {
   ASSERT_FALSE(waited.has_value()) << "the waiter loaded on its own";
   EXPECT_EQ(waited.error().code(), core::ErrorCode::kUnavailable);
 
-  auto again = loader_.LoadAs(0, "k", KeyType::kSet, Deadline());
+  auto again = abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
   ASSERT_TRUE(again.has_value()) << "a completed load is not reused";
   EXPECT_NE(std::get_if<hot::LoadedFull>(again.value().get()), nullptr);
 }
@@ -501,8 +504,8 @@ bool Landed(const Loader& loader) {
   return true;
 }
 
-// The leader lands between a joiner's registration and its wait: the
-// joiner still takes the leader's result, at once.
+// The leader lands between a join and its arming: the joiner still
+// takes the leader's result, at once, with no post.
 TEST_F(LoaderTest, ALandingBeforeTheJoinerWaitsIsNotLost) {
   abyss::testing::Latch entered;
   abyss::testing::Latch release;
@@ -514,15 +517,15 @@ TEST_F(LoaderTest, ALandingBeforeTheJoinerWaitsIsNotLost) {
             core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
       });
   const abyss::testing::OnExit unblock([&] { release.Open(); });
-  auto leader = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto leader = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(entered.Wait());
-  loader_.SetJoinHookForTesting([&] {
+  const auto start = core::SteadyClock::now();
+  auto joined = abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline(), nullptr, [&] {
     release.Open();
     EXPECT_TRUE(Landed(loader_));
   });
-  const auto start = core::SteadyClock::now();
-  auto joined = loader_.LoadAs(0, "k", KeyType::kSet, Deadline());
   EXPECT_LT(core::SteadyClock::now() - start, 5s) << "the landing was lost";
   ASSERT_TRUE(joined.has_value()) << joined.error().message();
   EXPECT_NE(std::get_if<hot::LoadedFull>(joined.value().get()), nullptr);
@@ -542,11 +545,13 @@ TEST_F(LoaderTest, JoinersThatTimeOutLeaveNoneBehind) {
         return LoadAsResult{std::optional<core::LoadedAs>{}};
       });
   const abyss::testing::OnExit unblock([&] { release.Open(); });
-  auto leader = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto leader = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(entered.Wait());
   for (int i = 0; i < 200; ++i) {
-    const auto joined = loader_.LoadAs(0, "k", KeyType::kSet, core::SteadyClock::now() + 5ms);
+    const auto joined =
+        abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, core::SteadyClock::now() + 5ms);
     ASSERT_FALSE(joined.has_value()) << "retry " << i;
     ASSERT_EQ(joined.error().code(), core::ErrorCode::kTimeout) << "retry " << i;
     ASSERT_EQ(loader_.JoinersForTesting(0), 0U) << "retry " << i;
@@ -574,8 +579,9 @@ TEST_F(LoaderTest, ALeaderThatThrowsLandsItsJoiners) {
   auto leader = std::async(std::launch::async,
                            [&] { return loader_.Install("k", KeyType::kSet, Deadline()); });
   ASSERT_TRUE(entered.Wait());
-  auto joiner = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto joiner = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(JoinedBy(loader_, 1)) << "the joiner never joined the load";
   release.Open();
   EXPECT_THROW(std::ignore = leader.get(), std::bad_alloc);
@@ -617,15 +623,16 @@ TEST_F(LoaderTest, AJoinerTakenAsItTimesOutTakesTheLanding) {
     std::this_thread::sleep_for(100ms);
   });
   const abyss::testing::OnExit unblock([&] { release.Open(); });
-  auto leader = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
-  ASSERT_TRUE(entered.Wait());
-  loader_.SetJoinHookForTesting([&] {
-    release.Open();
-    EXPECT_TRUE(taken.Wait());
+  auto leader = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
   });
+  ASSERT_TRUE(entered.Wait());
   // Already past: the joiner's wait ends at once, unlanded.
-  auto joined = loader_.LoadAs(0, "k", KeyType::kSet, core::SteadyClock::now());
+  auto joined = abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, core::SteadyClock::now(),
+                                       nullptr, [&] {
+                                         release.Open();
+                                         EXPECT_TRUE(taken.Wait());
+                                       });
   ASSERT_TRUE(joined.has_value()) << joined.error().message();
   EXPECT_NE(std::get_if<hot::LoadedFull>(joined.value().get()), nullptr);
   EXPECT_EQ(loader_.JoinsForTesting(), 1U);
@@ -653,8 +660,9 @@ TEST_F(LoaderTest, AnAsyncJoinTakesTheLeadersReadWithoutWaiting) {
   Loader::FlightJoin armed;
   Loader::FlightJoin landed;
   Loader::FlightJoin cancelled;
-  auto leader = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto leader = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(entered.Wait());
   for (Loader::FlightJoin* join : {&armed, &landed, &cancelled}) {
     EXPECT_FALSE(loader_.LoadAsOrJoin(0, "k", KeyType::kSet, Deadline(), nullptr, *join, completion)
@@ -697,8 +705,9 @@ TEST_F(LoaderTest, AnInstallFindingAReadsLoadInFlightLeavesIt) {
             core::ColdKeyState{.type = KeyType::kSet, .value = core::StringSet{"a"}}}};
       });
   const abyss::testing::OnExit unblock([&] { release.Open(); });
-  auto leader = std::async(std::launch::async,
-                           [&] { return loader_.LoadAs(0, "k", KeyType::kSet, Deadline()); });
+  auto leader = std::async(std::launch::async, [&] {
+    return abyss::testing::LoadAs(loader_, 0, "k", KeyType::kSet, Deadline());
+  });
   ASSERT_TRUE(entered.Wait());
   auto filled = loader_.Install("k", KeyType::kSet, Deadline());
   ASSERT_TRUE(filled.has_value()) << filled.error().message();

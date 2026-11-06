@@ -35,6 +35,7 @@
 #include "latch.h"
 #include "on_exit.h"
 #include "queue_append.h"
+#include "queue_waits.h"
 #include "temp_dir.h"
 
 namespace abyss::queue {
@@ -578,7 +579,7 @@ TEST_F(WalQueueStreamsTest, AFrameWithSeqZeroIsCorruption) {
     const auto size = static_cast<uint32_t>(bytes.size());
     auto reserved = (*log)->Reserve(size);
     if (!reserved.has_value() && reserved.error().code() == core::ErrorCode::kUnavailable) {
-      ASSERT_TRUE((*log)->WaitForSpare(std::chrono::steady_clock::now() + 5s));
+      ASSERT_TRUE(testing::WaitForSpare(**log, std::chrono::steady_clock::now() + 5s));
       reserved = (*log)->Reserve(size);
     }
     ASSERT_TRUE(reserved.has_value()) << reserved.error().message();

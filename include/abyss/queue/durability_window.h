@@ -54,18 +54,18 @@ class DurabilityWindow {
   LogAge& age(std::size_t log) noexcept { return logs_[log].age; }
   const LogAge& age(std::size_t log) const noexcept { return logs_[log].age; }
 
-  // Waits for room on log `log` until `deadline`. An empty window
-  // always admits. kResourceExhausted at the deadline; kUnavailable on
-  // Shutdown. A deadline already past checks once, uncounted.
-  core::Result<void> Admit(std::size_t log, Clock::time_point deadline);
-  // Admit's lock-free check, which its waiters make again.
+  // Room on log `log` now, never waiting; an empty window always
+  // admits. Otherwise kResourceExhausted, uncounted: at Reserve a full
+  // window means wait for admission and decide again, not a rejection.
+  core::Result<void> Admit(std::size_t log) const;
+  // Admit's lock-free check, which admission waiters make again.
   bool Admissible(std::size_t log) const noexcept;
-  // Log `log`'s Admit waiters, for one that registers itself. Its
-  // condition is stopped() || Admissible(log).
+  // Log `log`'s admission waiters. Their condition is
+  // stopped() || Admissible(log).
   core::WaitList& admission(std::size_t log) noexcept { return logs_[log].admission; }
-  // Admit's wait for a waiter that registers itself: counted when
-  // `first`; outcomes as WaitList::Register's, kUnavailable once
-  // stopped.
+  // Waits for room on log `log`, for a waiter that registers itself:
+  // counted when `first`; outcomes as WaitList::Register's,
+  // kUnavailable once stopped.
   std::optional<core::Result<void>> WhenAdmissible(std::size_t log, core::Waiter& waiter,
                                                    bool first);
   // For a waiter WhenAdmissible linked, as WaitList's.
@@ -75,7 +75,7 @@ class DurabilityWindow {
   void FinishAdmission(std::size_t log, core::Waiter& waiter) noexcept {
     admission(log).Finish(waiter);
   }
-  // Admit's error at its deadline, counted as a rejection.
+  // An admission wait's error at its deadline, counted as a rejection.
   core::Error Rejected(std::size_t log);
   bool stopped() const noexcept { return stopped_.load(std::memory_order_seq_cst); }
 
@@ -91,8 +91,7 @@ class DurabilityWindow {
     return unflushed_bytes_.load(std::memory_order_acquire);
   }
 
-  // Runs in Admit, and a first WhenAdmissible, between the check and
-  // the wait.
+  // Runs in a first WhenAdmissible, before it registers.
   void SetAdmitHookForTesting(std::function<void()> hook) { admit_hook_ = std::move(hook); }
 
  private:

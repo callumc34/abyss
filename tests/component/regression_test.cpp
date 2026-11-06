@@ -27,6 +27,7 @@
 #include "abyss/core/types.h"
 #include "abyss/engine/loader.h"
 #include "abyss/hot/single_shard_store.h"
+#include "blocking_load.h"
 #include "cold_read.h"
 #include "hooked_cold_store.h"
 #include "on_exit.h"
@@ -273,8 +274,8 @@ TEST_F(CrossShardConditionalTest, Issue194AnEvictedKeyReadsTheMsetnxFromItsBuffe
   ASSERT_EQ(ColdGet("b"), "0") << "cold was meant to be behind";
 
   auto source = Loader::Source::kCold;
-  auto loaded =
-      loader_->LoadAs(b, "b", core::KeyType::kString, core::SteadyClock::now() + 5s, &source);
+  auto loaded = abyss::testing::LoadAs(*loader_, b, "b", core::KeyType::kString,
+                                       core::SteadyClock::now() + 5s, &source);
   ASSERT_TRUE(loaded.has_value()) << loaded.error().message();
   const auto* full = std::get_if<hot::LoadedFull>(loaded->get());
   ASSERT_NE(full, nullptr);

@@ -13,6 +13,7 @@
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/types.h"
+#include "blocking_wait.h"
 #include "cold_drain_wait.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"

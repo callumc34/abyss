@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <mutex>
 #include <span>
@@ -306,38 +305,6 @@ bool DeltaRemoved(const CompactedState& delta, KeyType type, const std::string& 
 
 }  // namespace
 
-// On the joining call's stack. The leader unlinks every joiner under
-// the flights' lock, then lands the flight on each outside it. Land
-// notifies under mu_, and the joiner is destroyed only after relocking
-// mu_ and seeing the flight, so no leader is still inside cv_ by then.
-class Loader::Joiner final : public JoinLink {
- public:
-  // A Flight copy throws only on allocation, and an OOM while landing
-  // may terminate.
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  void Land(const Flight& flight) noexcept override {
-    const std::scoped_lock lock(mu_);
-    flight_ = flight;
-    cv_.notify_one();
-  }
-
-  bool WaitUntil(core::SteadyTime deadline) {
-    std::unique_lock lock(mu_);
-    return cv_.wait_until(lock, deadline, [this] { return flight_.has_value(); });
-  }
-
-  Flight Take() {
-    std::unique_lock lock(mu_);
-    cv_.wait(lock, [this] { return flight_.has_value(); });
-    return std::move(flight_).value_or(Flight{});
-  }
-
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::optional<Flight> flight_;
-};
-
 Loader::FlightJoin::~FlightJoin() {
   const State state = state_.load(std::memory_order_acquire);
   const bool settled = state == State::kIdle || state == State::kLanded;
@@ -398,23 +365,13 @@ core::Result<hot::LoadResult> Loader::Load(core::ShardId shard, std::string_view
   return MergeLoad(std::move(base), changes);
 }
 
-core::Result<Loader::Shared> Loader::LoadAs(core::ShardId shard, std::string_view key, KeyType type,
-                                            core::SteadyTime deadline, Source* source) const {
-  auto flown = Fly(shard, key, type, deadline, source, nullptr, JoinMode::kWait);
-  // A call that waits always loads, or takes another's load.
-  if (!flown.has_value()) {
-    return std::unexpected(core::Error{core::ErrorCode::kInternal, "a waiting load did not load"});
-  }
-  return *std::move(flown);
-}
-
 std::optional<core::Result<Loader::Shared>> Loader::LoadAsOrJoin(
     core::ShardId shard, std::string_view key, KeyType type, core::SteadyTime deadline,
     Source* source, FlightJoin& join, core::Completion completion) const {
   ABYSS_DCHECK(join.state_.load(std::memory_order_acquire) == FlightJoin::State::kIdle,
                "a flight join reused before it was reset");
   join.completion_ = completion;
-  return Fly(shard, key, type, deadline, source, nullptr, JoinMode::kAsync, &join);
+  return Fly(shard, key, type, deadline, source, nullptr, &join);
 }
 
 // NOLINTNEXTLINE(bugprone-exception-escape): a failed lock may terminate.
@@ -428,7 +385,7 @@ std::optional<core::Result<Loader::Shared>> Loader::Fly(core::ShardId shard, std
                                                         KeyType type, core::SteadyTime deadline,
                                                         Source* source,
                                                         std::optional<hot::LoadResult>* owned,
-                                                        JoinMode mode, FlightJoin* async) const {
+                                                        FlightJoin* join) const {
   Flights& flights = *flights_.at(shard);
   // A flight is joined only at the drain horizon its leader read before
   // its buffer snapshot. A write after that snapshot can leave hot only
@@ -437,24 +394,19 @@ std::optional<core::Result<Loader::Shared>> Loader::Fly(core::ShardId shard, std
   // and loads afresh: no flight hands out state older than a write
   // that was resident when the caller missed.
   FlightId id{std::string(key), type, hot_.Drained(shard)};
-  Joiner joiner;
-  JoinLink* link = nullptr;
-  if (mode == JoinMode::kWait) link = &joiner;
-  if (mode == JoinMode::kAsync) link = async;
   bool leader = false;
   {
     const std::scoped_lock lock(flights.mu);
     auto [it, started] = flights.loading.try_emplace(id);
     if (started) {
       leader = true;
-    } else if (link != nullptr) {
-      if (async != nullptr) {
-        async->shard_ = shard;
-        async->id_ = id;
-        async->state_.store(FlightJoin::State::kJoined, std::memory_order_release);
-      }
+    } else if (join != nullptr) {
+      join->shard_ = shard;
+      join->id_ = id;
+      join->state_.store(FlightJoin::State::kJoined, std::memory_order_release);
       // Found and joined in one hold of the lock the leader lands under.
       JoinLink*& head = it->second.joiners;
+      JoinLink* const link = join;
       link->prev = nullptr;
       link->next = head;
       if (head != nullptr) head->prev = link;
@@ -463,21 +415,11 @@ std::optional<core::Result<Loader::Shared>> Loader::Fly(core::ShardId shard, std
       ++joins_;
     }
   }
-  if (!leader) {
-    // Joined without waiting, or left to the leader.
-    if (mode != JoinMode::kWait) return std::nullopt;
-    if (join_hook_) join_hook_();
-    if (!joiner.WaitUntil(deadline) && Unjoin(flights, id, joiner)) {
-      return std::unexpected(
-          core::Error{core::ErrorCode::kTimeout, "timed out awaiting another load of the key"});
-    }
-    Flight flight = joiner.Take();
-    if (source != nullptr) *source = flight.source;
-    return std::move(flight.result);
-  }
+  // Joined without waiting, or left to the leader.
+  if (!leader) return std::nullopt;
 
   // Every joiner lands once, however the leader leaves: one unwinding
-  // lands them kInternal, as Take() has no deadline.
+  // lands them kInternal, as a join the leader took waits for it.
   class Landing {
    public:
     Landing(Flights& flights, const FlightId& id) : flights_(&flights), id_(&id) {}
@@ -689,8 +631,8 @@ core::Result<Loader::Filled> Loader::Install(std::string_view key, KeyType type,
   Source source = Source::kBuffer;
   std::optional<hot::LoadResult> owned;
   // Another's load in flight is left to it: the caller reads through
-  // LoadAs, which shares it.
-  auto flying = Fly(shard, key, type, deadline, &source, &owned, JoinMode::kNever);
+  // LoadAsOrJoin, which shares it.
+  auto flying = Fly(shard, key, type, deadline, &source, &owned, nullptr);
   if (!flying.has_value()) return Filled{.fill = Fill::kPending};
   auto& flown = *flying;
   if (!flown.has_value()) return std::unexpected(flown.error());

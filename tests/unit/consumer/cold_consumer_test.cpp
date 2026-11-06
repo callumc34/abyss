@@ -21,13 +21,12 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/resp_types.h"
-#include "abyss/core/seq_waiters.h"
+#include "blocking_wait.h"
 #include "buffer_read.h"
 #include "cold_drain_wait.h"
 #include "fatal_capture.h"
 #include "mock_cold_store.h"
 #include "mock_queue.h"
-#include "recording_sink.h"
 #include "test_clock.h"
 
 namespace abyss::consumer {
@@ -50,6 +49,29 @@ core::QueueEntry MakeWriteEntry(core::SequenceId seq, std::initializer_list<std:
           core::entry::Write{.cmd = core::RespCommand{.args = std::vector<std::string>(cmd_args)}},
   };
 }
+
+// A backpressure room waiter: counts its wakes and keeps the last.
+class RoomWaiter final : public core::Waiter {
+ public:
+  void Wake(core::Result<void> result) noexcept override {
+    const std::scoped_lock lock(mu_);
+    last_ = std::move(result);
+    ++wakes_;
+  }
+  int wakes() const {
+    const std::scoped_lock lock(mu_);
+    return wakes_;
+  }
+  core::Result<void> last() const {
+    const std::scoped_lock lock(mu_);
+    return last_;
+  }
+
+ private:
+  mutable std::mutex mu_;
+  int wakes_ = 0;
+  core::Result<void> last_;
+};
 
 // A power-durable end the test moves. AwaitDurable records each seq and
 // answers at once; with `catch_up` set, the wait itself advances the end.
@@ -345,14 +367,10 @@ TEST_F(ColdConsumerTest, IdleBackoffIsInterruptedByAWaiterOnADrain) {
   EXPECT_TRUE(drained) << "the wait expired while the consumer slept out its idle backoff";
 }
 
-// A test's wait for a far drained seq sits on the drained seq's own
-// waiters, so the backpressure waiter linked after it is the one a
-// drain that frees room wakes.
+// A test's wait for a far drained seq polls the drained seq and links
+// no waiter, so a backpressure waiter is the one a drain that frees
+// room wakes.
 TEST_F(ColdConsumerTest, AFarDrainWaitHoldsUpNoBackpressureWaiter) {
-  struct CountingWaiter final : core::Waiter {
-    void Wake(core::Result<void> /*result*/) noexcept override { wakes.fetch_add(1); }
-    std::atomic<int> wakes{0};
-  };
   auto c = MakeConsumer();
   std::atomic<core::SequenceId> next{1};
   EXPECT_CALL(queue_, Read(kShard, _, _, _, _))
@@ -365,20 +383,15 @@ TEST_F(ColdConsumerTest, AFarDrainWaitHoldsUpNoBackpressureWaiter) {
           });
 
   auto far = std::async(std::launch::async, [&c] { return testing::WaitDrained(*c, 100, 300ms); });
-  const auto waiting = [&c] { return c->DrainedWaitersForTesting() + c->RoomWaitersForTesting(); };
-  const auto until = std::chrono::steady_clock::now() + 5s;
-  while (waiting() == 0 && std::chrono::steady_clock::now() < until) {
-    std::this_thread::sleep_for(1ms);
-  }
-  ASSERT_EQ(waiting(), 1U);
-
-  CountingWaiter room;
+  RoomWaiter room;
   ASSERT_FALSE(c->WhenDrainedPast(c->LatestDrainedSeq(), room).has_value());
   c->Drain();
-  EXPECT_EQ(room.wakes.load(), 1) << "the far wait took the drain's wake";
+  EXPECT_EQ(room.wakes(), 1) << "the far wait took the drain's wake";
   c->FinishDrainWait(room);
+  while (far.wait_for(1ms) != std::future_status::ready) {
+    ASSERT_EQ(c->RoomWaitersForTesting(), 0U) << "the far wait is on the room list";
+  }
   EXPECT_TRUE(testing::TimedOut(far.get()));
-  EXPECT_EQ(waiting(), 0U);
 }
 
 // --- XERR-6: a missing parser is a capability gap, not poison -----------------
@@ -1533,8 +1546,8 @@ TEST_F(ColdConsumerTest, AReplayBatchGivesUpOnAWipeThatKeepsFailing) {
   EXPECT_FALSE(testing::BufferRead(c->Buffer(), "b").has_value());
 }
 
-// What a failing batch drained before its Flush wakes its waiters, on
-// each way it fails.
+// What a failing batch drained before its Flush wakes the room waiters,
+// on each way it fails.
 TEST_F(ColdConsumerTest, AReplayBatchThatFailsWakesWhatItDrained) {
   ColdConsumer::Config cfg;
   cfg.drain_grace = 20ms;
@@ -1542,9 +1555,8 @@ TEST_F(ColdConsumerTest, AReplayBatchThatFailsWakesWhatItDrained) {
   auto c = MakeConsumer(cfg);
   ASSERT_EQ(c->BeginReplay().value(), kFirst);
   EXPECT_CALL(cold_, Wipe(kShard)).WillRepeatedly(WipeFails);
-  testing::RecordingSink sink;
-  core::SeqWaiterNode through_first(kFirst - 1, sink.For(kFirst));
-  ASSERT_FALSE(c->WhenDrained(through_first).has_value());
+  RoomWaiter room;
+  ASSERT_FALSE(c->WhenDrainedPast(kFirst - 1, room).has_value());
   const std::vector<core::QueueEntry> batch{
       MakeWriteEntry(kFirst, {"SET", "a", "v"}),
       MakeFlushEntry(kFirst + 1),
@@ -1555,9 +1567,10 @@ TEST_F(ColdConsumerTest, AReplayBatchThatFailsWakesWhatItDrained) {
   ASSERT_FALSE(applied.has_value());
   EXPECT_EQ(applied.error().code(), core::ErrorCode::kTimeout);
   ASSERT_EQ(c->LatestDrainedSeq(), kFirst);
-  ASSERT_EQ(sink.Events().size(), 1U) << "a drained seq's waiter was not woken";
-  EXPECT_TRUE(sink.Events().front().result.has_value());
-  EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
+  ASSERT_EQ(room.wakes(), 1) << "a drained seq's waiter was not woken";
+  EXPECT_TRUE(room.last().has_value());
+  c->FinishDrainWait(room);
+  EXPECT_EQ(c->RoomWaitersForTesting(), 0U);
 }
 
 TEST_F(ColdConsumerTest, ACancelledReplayBatchWakesWhatItDrained) {
@@ -1570,9 +1583,8 @@ TEST_F(ColdConsumerTest, ACancelledReplayBatchWakesWhatItDrained) {
     cancel.store(true);
     return WipeFails(shard);
   });
-  testing::RecordingSink sink;
-  core::SeqWaiterNode through_first(kFirst - 1, sink.For(kFirst));
-  ASSERT_FALSE(c->WhenDrained(through_first).has_value());
+  RoomWaiter room;
+  ASSERT_FALSE(c->WhenDrainedPast(kFirst - 1, room).has_value());
   const std::vector<core::QueueEntry> batch{
       MakeWriteEntry(kFirst, {"SET", "a", "v"}),
       MakeFlushEntry(kFirst + 1),
@@ -1581,8 +1593,9 @@ TEST_F(ColdConsumerTest, ACancelledReplayBatchWakesWhatItDrained) {
   auto applied = c->ApplyReplayBatch(batch, cancel);
   ASSERT_FALSE(applied.has_value());
   EXPECT_EQ(applied.error().code(), core::ErrorCode::kUnavailable);
-  ASSERT_EQ(sink.Events().size(), 1U) << "a drained seq's waiter was not woken";
-  EXPECT_TRUE(sink.Events().front().result.has_value());
+  ASSERT_EQ(room.wakes(), 1) << "a drained seq's waiter was not woken";
+  EXPECT_TRUE(room.last().has_value());
+  c->FinishDrainWait(room);
 }
 
 TEST_F(ColdConsumerTest, ACancelStopsAWipeRetry) {
@@ -1680,35 +1693,7 @@ TEST_F(ColdConsumerTest, OldestUnflushedAgeTracksNextOldestAfterFlush) {
   EXPECT_EQ(c->Snapshot().oldest_unflushed_age, 24000ms);
 }
 
-// --- Drained-seq waits ---------------------------------------------------------
-
-// Read hands out seqs 1..3 once, then nothing.
-void ServeThree(NiceMock<testing::MockQueue>& queue) {
-  std::vector<core::QueueEntry> entries;
-  for (core::SequenceId seq = 1; seq <= 3; ++seq) {
-    entries.push_back(MakeWriteEntry(seq, {"SET", "k" + std::to_string(seq), "v"}));
-  }
-  EXPECT_CALL(queue, Read(kShard, _, _, _, _))
-      .WillOnce(Return(entries))
-      .WillRepeatedly(Return(std::vector<core::QueueEntry>{}));
-}
-
-TEST_F(ColdConsumerTest, ARegisteredNodeIsPostedOnceTheDrainPassesIt) {
-  ServeThree(queue_);
-  auto c = MakeConsumer();
-  testing::RecordingSink sink;
-  core::SeqWaiterNode through_three(2, sink.For(2));
-  core::SeqWaiterNode through_four(3, sink.For(3));
-  ASSERT_FALSE(c->WhenDrained(through_three).has_value());
-  ASSERT_FALSE(c->WhenDrained(through_four).has_value());
-  EXPECT_EQ(c->DrainWithBatch(16), 3U);
-  ASSERT_TRUE(sink.WaitFor(1));
-  ASSERT_EQ(sink.Events().size(), 1U);
-  EXPECT_EQ(sink.Events().front().slot_seq, 2U);
-  EXPECT_TRUE(sink.Events().front().result.has_value());
-  EXPECT_TRUE(c->CancelDrained(through_four));
-  EXPECT_EQ(c->DrainedWaitersForTesting(), 0U);
-}
+// --- Drain waits ---------------------------------------------------------------
 
 TEST_F(ColdConsumerTest, RetriesOnTimeoutLeaveNoDrainWaiters) {
   auto c = MakeConsumer();
@@ -1718,21 +1703,20 @@ TEST_F(ColdConsumerTest, RetriesOnTimeoutLeaveNoDrainWaiters) {
   }
 }
 
-TEST_F(ColdConsumerTest, StoppingFailsDrainedWaitsNowAndLater) {
+TEST_F(ColdConsumerTest, StoppingFailsDrainWaitsNowAndLater) {
   auto c = MakeConsumer();
-  testing::RecordingSink sink;
-  core::SeqWaiterNode node(10, sink.For(1));
-  ASSERT_FALSE(c->WhenDrained(node).has_value());
+  RoomWaiter room;
+  ASSERT_FALSE(c->WhenDrainedPast(10, room).has_value());
   c->Stop();
-  ASSERT_TRUE(sink.WaitFor(1));
-  const auto event = sink.Events().front();
-  ASSERT_FALSE(event.result.has_value());
-  EXPECT_EQ(event.result.error().code(), core::ErrorCode::kUnavailable);
-  const auto start = std::chrono::steady_clock::now();
-  const auto later = testing::WaitDrained(*c, 11, 10s);
-  ASSERT_FALSE(later.has_value());
-  EXPECT_EQ(later.error().code(), core::ErrorCode::kUnavailable);
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+  ASSERT_EQ(room.wakes(), 1);
+  ASSERT_FALSE(room.last().has_value());
+  EXPECT_EQ(room.last().error().code(), core::ErrorCode::kUnavailable);
+  c->FinishDrainWait(room);
+  RoomWaiter later;
+  const auto refused = c->WhenDrainedPast(11, later);
+  ASSERT_TRUE(refused.has_value()) << "linked after the stop";
+  ASSERT_FALSE(refused->has_value());
+  EXPECT_EQ(refused->error().code(), core::ErrorCode::kUnavailable);
 }
 
 }  // namespace

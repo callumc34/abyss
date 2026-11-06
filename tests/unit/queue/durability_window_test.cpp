@@ -13,6 +13,7 @@
 #include "abyss/core/wait_list.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
+#include "queue_waits.h"
 
 namespace abyss::queue {
 namespace {
@@ -42,8 +43,9 @@ class DurabilityWindowTest : public ::testing::Test {
   }
 
   std::future<core::Result<void>> AdmitAsync(Clock::duration wait = 5s, std::size_t log = 0) {
-    return std::async(std::launch::async,
-                      [this, wait, log] { return window_->Admit(log, Clock::now() + wait); });
+    return std::async(std::launch::async, [this, wait, log] {
+      return testing::AwaitAdmission(*window_, log, Clock::now() + wait);
+    });
   }
 
   // Bounded: until `log` has `count` waiters.
@@ -69,14 +71,14 @@ class DurabilityWindowTest : public ::testing::Test {
 TEST_F(DurabilityWindowTest, EmptyWindowAlwaysAdmits) {
   // Even with a stale age: nothing is unflushed, so nothing can drain.
   SetAge(age(), Clock::now() - 1h);
-  EXPECT_TRUE(window_->Admit(0, Clock::now()).has_value());
+  EXPECT_TRUE(window_->Admit(0).has_value());
   EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kWalBackpressureWaitsTotal), 0.0);
 }
 
 TEST_F(DurabilityWindowTest, AdmitsBelowBothBounds) {
   window_->Add(kMaxBytes - 1);
   age().Start(Clock::now());
-  EXPECT_TRUE(window_->Admit(0, Clock::now()).has_value());
+  EXPECT_TRUE(window_->Admit(0).has_value());
 }
 
 TEST_F(DurabilityWindowTest, BlocksOverTheByteBoundUntilARelease) {
@@ -108,8 +110,8 @@ TEST_F(DurabilityWindowTest, BlocksOverTheAgeBoundUntilAFlush) {
 TEST_F(DurabilityWindowTest, OtherLogsAgeDoesNotBlock) {
   SetAge(window_->age(1), Clock::now() - (2 * kMaxAge));
   window_->Add(1);
-  EXPECT_TRUE(window_->Admit(0, Clock::now()).has_value());
-  EXPECT_FALSE(window_->Admit(1, Clock::now()).has_value());
+  EXPECT_TRUE(window_->Admit(0).has_value());
+  EXPECT_FALSE(window_->Admit(1).has_value());
 }
 
 // Log 0's age holds more waiters than two wakes reach. A release on
@@ -192,7 +194,7 @@ TEST_F(DurabilityWindowTest, ARegisteredWaiterWaitsOnItsOwnLog) {
 TEST_F(DurabilityWindowTest, RejectsAtTheDeadline) {
   window_->Add(kMaxBytes);
   const auto start = Clock::now();
-  auto rejected = window_->Admit(0, start + 30ms);
+  auto rejected = testing::AwaitAdmission(*window_, 0, start + 30ms);
   EXPECT_GE(Clock::now() - start, 30ms);
   ASSERT_FALSE(rejected.has_value());
   EXPECT_EQ(rejected.error().code(), core::ErrorCode::kResourceExhausted);
@@ -205,12 +207,12 @@ TEST_F(DurabilityWindowTest, RejectsAtTheDeadline) {
             1.0);
 }
 
-// A best-effort append passes a deadline already past: it must neither
-// wait nor count as client backpressure.
-TEST_F(DurabilityWindowTest, PastDeadlineChecksWithoutWaitingOrCounting) {
+// Reserve's re-check of a full window: it neither waits nor counts as
+// client backpressure, as the write waits for admission and decides
+// again.
+TEST_F(DurabilityWindowTest, AdmitChecksWithoutWaitingOrCounting) {
   window_->Add(kMaxBytes);
-  const auto start = Clock::now();
-  auto admitted = window_->Admit(0, start);
+  auto admitted = window_->Admit(0);
   ASSERT_FALSE(admitted.has_value());
   EXPECT_EQ(admitted.error().code(), core::ErrorCode::kResourceExhausted);
   EXPECT_EQ(metrics::testing::GetCounterValue(metrics::names::kWalBackpressureWaitsTotal), 0.0);
@@ -234,27 +236,27 @@ TEST_F(DurabilityWindowTest, ALaterAdmitAfterShutdownFailsAtOnce) {
   window_->Add(kMaxBytes);
   window_->Shutdown();
   const auto start = Clock::now();
-  auto result = window_->Admit(0, start + 10s);
+  auto result = testing::AwaitAdmission(*window_, 0, start + 10s);
   EXPECT_LT(Clock::now() - start, 1s);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), core::ErrorCode::kUnavailable);
   EXPECT_EQ(window_->admission(0).size(), 0U);
 }
 
-// A release that lands between Admit's check and its registration is
+// A release that lands between the check and the registration is
 // seen by the registration's own re-check.
 TEST_F(DurabilityWindowTest, AReleaseBetweenTheCheckAndTheWaitIsNotLost) {
   window_->Add(kMaxBytes);
   window_->SetAdmitHookForTesting([this] { window_->Release(kMaxBytes); });
   const auto start = Clock::now();
-  auto admitted = window_->Admit(0, start + 10s);
+  auto admitted = testing::AwaitAdmission(*window_, 0, start + 10s);
   EXPECT_LT(Clock::now() - start, 5s) << "the release in the window was lost";
   EXPECT_TRUE(admitted.has_value());
   EXPECT_EQ(window_->admission(0).size(), 0U);
 }
 
 // One release, then each admitted waiter hands off to the next: every
-// blocked Admit gets in, where notify_all would have woken them all.
+// blocked admission gets in, where notify_all would have woken them all.
 TEST_F(DurabilityWindowTest, OneReleaseAdmitsEveryBlockedWaiter) {
   constexpr std::size_t kWaiters = 130;
   window_->Add(kMaxBytes);
@@ -275,7 +277,7 @@ TEST_F(DurabilityWindowTest, OneReleaseAdmitsEveryBlockedWaiter) {
 TEST_F(DurabilityWindowTest, RetriesOnTimeoutLeaveNoWaiters) {
   window_->Add(kMaxBytes);
   for (int i = 0; i < 200; ++i) {
-    auto admitted = window_->Admit(0, Clock::now() + 5ms);
+    auto admitted = testing::AwaitAdmission(*window_, 0, Clock::now() + 5ms);
     ASSERT_FALSE(admitted.has_value());
     ASSERT_EQ(admitted.error().code(), core::ErrorCode::kResourceExhausted);
     ASSERT_EQ(window_->admission(0).size(), 0U) << "retry " << i;

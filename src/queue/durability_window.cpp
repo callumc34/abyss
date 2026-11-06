@@ -67,23 +67,10 @@ bool DurabilityWindow::Admissible(std::size_t log, Clock::time_point now) const 
   return bytes < max_bytes_ && age(log).Age(now) < max_age_;
 }
 
-core::Result<void> DurabilityWindow::Admit(std::size_t log, Clock::time_point deadline) {
+core::Result<void> DurabilityWindow::Admit(std::size_t log) const {
   if (Admissible(log)) return {};
-  // A caller that cannot wait (a best-effort append) is not backpressure.
-  if (deadline <= Clock::now()) {
-    return std::unexpected(
-        core::Error{core::ErrorCode::kResourceExhausted, "WAL durability window full"});
-  }
-  waits_.Increment();
-  if (admit_hook_) admit_hook_();
-  auto admitted =
-      admission(log).Await([this, log] { return stopped() || Admissible(log); }, deadline);
-  if (stopped()) {
-    return std::unexpected(core::Error{core::ErrorCode::kUnavailable, "queue shutting down"});
-  }
-  if (admitted.has_value()) return {};
-  if (admitted.error().code() != core::ErrorCode::kTimeout) return admitted;
-  return std::unexpected(Rejected(log));
+  return std::unexpected(
+      core::Error{core::ErrorCode::kResourceExhausted, "WAL durability window full"});
 }
 
 std::optional<core::Result<void>> DurabilityWindow::WhenAdmissible(std::size_t log,

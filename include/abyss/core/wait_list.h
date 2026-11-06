@@ -4,7 +4,6 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -144,16 +143,6 @@ class WaitList {
   // For shutdown: wakes every waiter with `error`, and every later
   // Register returns it.
   void FailAll(const Error& error);
-
-  // The blocking wrapper: ok once `condition` holds, kTimeout, or
-  // FailAll's error. A woken caller whose condition holds hands off,
-  // so it strands no one where notify_all would have woken them. A
-  // wake collected just past the deadline is still re-checked, so it
-  // can return ok then.
-  Result<void> Await(const std::function<bool()>& condition, SteadyTime deadline);
-  Result<void> Await(const std::function<bool()>& condition, Duration timeout) {
-    return Await(condition, SteadyClock::now() + timeout);
-  }
 
   size_t size() const noexcept { return count_.load(std::memory_order_relaxed); }
 

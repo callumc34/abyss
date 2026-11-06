@@ -1,26 +1,33 @@
 #pragma once
 
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "abyss/consumer/cold_consumer.h"
 #include "abyss/consumer/cold_consumer_pool.h"
 #include "abyss/core/result.h"
-#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
-#include "blocking_wait.h"
 
 namespace abyss::testing {
 
-// ok once `consumer` has drained through `through`; kTimeout with no
-// node left registered; kUnavailable once it stopped. A seq wait on
-// the drained seq's own waiters, never on backpressure's room list,
-// whose one-at-a-time wakes a far target here would hold up.
+inline constexpr core::Duration kDrainPollStep{1};
+
+// ok once `consumer` has drained through `through`; kTimeout at the
+// deadline. A poll that asks the loop to drain at every step, so it
+// links no waiter: none on backpressure's room list, whose one-at-a-
+// time wakes a far target here would hold up.
 inline core::Result<void> WaitDrained(consumer::ColdConsumer& consumer, core::SequenceId through,
                                       core::Duration timeout) {
-  if (through < core::kFirstSeq) return {};
-  return AwaitNode(
-      through - 1, timeout, [&](core::SeqWaiterNode& node) { return consumer.WhenDrained(node); },
-      [&](core::SeqWaiterNode& node) { return consumer.CancelDrained(node); });
+  const core::SteadyTime deadline = core::SteadyClock::now() + timeout;
+  for (;;) {
+    if (consumer.LatestDrainedSeq() >= through) return {};
+    if (core::SteadyClock::now() >= deadline) {
+      return std::unexpected(core::Error{core::ErrorCode::kTimeout, "drain wait timed out"});
+    }
+    consumer.RequestDrain();
+    std::this_thread::sleep_for(kDrainPollStep);
+  }
 }
 
 inline core::Result<void> WaitDrained(consumer::ColdConsumerPool& pool, core::ShardId shard,

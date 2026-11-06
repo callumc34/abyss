@@ -19,6 +19,7 @@
 
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "blocking_wait.h"
 
 namespace abyss::core {
 namespace {
@@ -332,7 +333,7 @@ TEST(WaitListTest, FailAllWakesEveryWaiterAndRefusesLaterOnes) {
     ASSERT_FALSE(list.Register(waiters.back(), never).has_value());
   }
   Result<void> blocked;
-  std::thread thread([&] { blocked = list.Await(never, 10s); });
+  std::thread thread([&] { blocked = testing::AwaitList(list, never, 10s); });
   ASSERT_TRUE(Eventually([&] { return list.size() == 131; }));
 
   list.FailAll(Stopped());
@@ -348,16 +349,16 @@ TEST(WaitListTest, FailAllWakesEveryWaiterAndRefusesLaterOnes) {
   ASSERT_TRUE(refused.has_value() && !refused->has_value());
   // NOLINTNEXTLINE(bugprone-unchecked-optional-access): ASSERT_TRUE above guards.
   EXPECT_EQ(refused->error().message(), Stopped().message());
-  const auto awaited = list.Await(never, 10s);
+  const auto awaited = testing::AwaitList(list, never, 10s);
   ASSERT_FALSE(awaited.has_value());
   EXPECT_EQ(awaited.error().code(), ErrorCode::kUnavailable);
 }
 
-TEST(WaitListTest, AwaitReturnsOnceTheConditionHolds) {
+TEST(WaitListTest, ABlockingWaitReturnsOnceTheConditionHolds) {
   WaitList list;
   std::atomic<bool> room{false};
   Result<void> result = std::unexpected(Error{ErrorCode::kInternal, "unset"});
-  std::thread thread([&] { result = list.Await([&] { return room.load(); }, 10s); });
+  std::thread thread([&] { result = testing::AwaitList(list, [&] { return room.load(); }, 10s); });
   ASSERT_TRUE(Eventually([&] { return list.size() == 1; }));
   list.Notify();  // A wake whose condition fails re-blocks.
   ASSERT_TRUE(Eventually([&] { return list.size() == 1; }));
@@ -489,7 +490,8 @@ TEST(WaitListTest, BlockingAwaitHandsOffSoOneNotifyWakesEveryCaller) {
   threads.reserve(kHerd);
   for (size_t i = 0; i < kHerd; ++i) {
     threads.emplace_back([&] {
-      if (list.Await([&] { return room.load(); }, 20s).has_value()) admitted.fetch_add(1);
+      if (testing::AwaitList(list, [&] { return room.load(); }, 20s).has_value())
+        admitted.fetch_add(1);
     });
   }
   ASSERT_TRUE(Eventually([&] { return list.size() == kHerd; }));
@@ -520,7 +522,7 @@ TEST(WaitListTest, PublishRacingRegistrationNeverLosesAWake) {
   for (uint64_t round = 0; round < kRounds; ++round) {
     sync.arrive_and_wait();
     if (lost.load()) break;
-    if (!list.Await([&] { return generation.load() > round; }, 2s).has_value()) {
+    if (!testing::AwaitList(list, [&] { return generation.load() > round; }, 2s).has_value()) {
       ADD_FAILURE() << "round " << round << " lost its wake";
       lost.store(true);
     }
@@ -540,7 +542,7 @@ TEST(WaitListTest, BlockingWaitWhoseCancelLostWaitsForTheWake) {
   std::atomic<bool> returned{false};
   Result<void> result = std::unexpected(Error{ErrorCode::kInternal, "unset"});
   std::thread blocked([&] {
-    result = list.Await([&] { return room.load(); }, 50ms);
+    result = testing::AwaitList(list, [&] { return room.load(); }, 50ms);
     returned.store(true);
   });
   ASSERT_TRUE(Eventually([&] { return list.size() == 2; }));
@@ -587,7 +589,7 @@ HeldWake RunHeldWake(bool room_kept) {
   HeldWake out;
   std::atomic<bool> a_returned{false};
   std::thread a([&] {
-    out.a = list.Await(has_room, 50ms);
+    out.a = testing::AwaitList(list, has_room, 50ms);
     a_returned.store(true);
   });
   EXPECT_TRUE(Eventually([&] { return list.size() == WaitList::kWakeBatch; }));
@@ -649,7 +651,8 @@ TEST(WaitListTest, NotifierRacingTimingOutWaitsNeverOutlivesTheWaiter) {
   });
   for (uint64_t round = 0; round < kRounds; ++round) {
     sync.arrive_and_wait();
-    const auto result = list.Await([&] { return generation.load() > round; }, Duration(round % 2));
+    const auto result =
+        testing::AwaitList(list, [&] { return generation.load() > round; }, Duration(round % 2));
     if (!result.has_value()) {
       EXPECT_EQ(result.error().code(), ErrorCode::kTimeout);
     }
@@ -662,7 +665,7 @@ TEST(WaitListTest, NotifierRacingTimingOutWaitsNeverOutlivesTheWaiter) {
 TEST(WaitListTest, RetriedTimeoutsLeaveTheListEmpty) {
   WaitList list;
   for (int i = 0; i < 200; ++i) {
-    const auto result = list.Await([] { return false; }, 5ms);
+    const auto result = testing::AwaitList(list, [] { return false; }, 5ms);
     ASSERT_FALSE(result.has_value());
     ASSERT_EQ(result.error().code(), ErrorCode::kTimeout);
     ASSERT_EQ(list.size(), 0U);

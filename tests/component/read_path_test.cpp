@@ -40,6 +40,7 @@
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
 #include "blocking_driver.h"
+#include "blocking_load.h"
 #include "latch.h"
 #include "mock_queue.h"
 #include "on_exit.h"
@@ -683,7 +684,8 @@ TEST_F(ReadPathTest, AMissAfterADrainedWriteStartsItsOwnLoad) {
   cold_.HoldLoads();
   const abyss::testing::OnExit release([this] { cold_.release.Open(); });
   auto stale = std::async(std::launch::async, [&] {
-    return loader_.LoadAs(shard, "k", core::KeyType::kString, core::SteadyClock::now() + 10s);
+    return abyss::testing::LoadAs(loader_, shard, "k", core::KeyType::kString,
+                                  core::SteadyClock::now() + 10s);
   });
   // Held in its cold read, past its buffer snapshot.
   ASSERT_TRUE(cold_.entered.Wait());
@@ -699,7 +701,8 @@ TEST_F(ReadPathTest, AMissAfterADrainedWriteStartsItsOwnLoad) {
   auto read = std::async(std::launch::async, [this] { return Describe(Read({"GET", "k"})); });
   ASSERT_EQ(read.wait_for(10s), std::future_status::ready) << "joined the stale load";
   EXPECT_EQ(read.get(), "$v2") << "through Install";
-  auto loaded = loader_.LoadAs(shard, "k", core::KeyType::kString, core::SteadyClock::now() + 1s);
+  auto loaded = abyss::testing::LoadAs(loader_, shard, "k", core::KeyType::kString,
+                                       core::SteadyClock::now() + 1s);
   ASSERT_TRUE(loaded.has_value());
   const auto* full = std::get_if<hot::LoadedFull>(loaded.value().get());
   ASSERT_NE(full, nullptr);

@@ -5,7 +5,7 @@
 **Supersedes:** ADP-001 §Group Commit and §Offset persistence, ADP-011 in full (the resolver, the `Conditional`/`Resolved` entry pair, block-and-scan and the consumer RPC)
 **Amends:** ADP-001 §Interface, ADP-002 §Hot Consumer (now §Applying Writes and §Residency) and §Eviction, ADP-004 §Consumer Thread Loop, ADP-005 §TCP server implementation and §Write Acknowledgement, ADP-006 §Write Path, §Read Path, §Cold Hit Promotion (now §Cache Fill) and §Broadcast Write Path, ADP-007 §Recovery Process, ADP-008 §Resharding, ADP-009 §Read semantics, ADP-013 §Three substrates, `requirements.md` §Design Principles, §Performance Targets, §Durability Guarantees, §Concurrency Model and §Consumer Coordination
 
-Delivery is phased (§Delivery) and tracked by epic #172. Each amended document keeps describing current behaviour, under a banner pointing here, until the phase that changes that behaviour lands and rewrites the section. Phases 0, 1 and 2 have landed: the sections below describe them as current behaviour, and the documents they amend have been rewritten to match. Phase 3 is next. Phase 2 completes with stage 6, which adds the three-way property test (§Delivery). Asynchronous request execution (Phase 3, #161) and the later rows are still to come, and their sections say so.
+Delivery is phased (§Delivery) and tracked by epic #172. Each amended document keeps describing current behaviour, under a banner pointing here, until the phase that changes that behaviour lands and rewrites the section. Phases 0, 1, 2 and 3 have landed: the sections below describe them as current behaviour, and the documents they amend have been rewritten to match. Phase 2 completes with stage 6, which adds the three-way property test (§Delivery). Pooled cold workers (#177) and the later rows are still to come.
 
 ## Context
 
@@ -60,7 +60,7 @@ A configuration that still names a removed setting fails to load. The error name
   - Committed offsets are gated the same way.
   - Gating absorption itself would make every hot eviction, and with it memory backpressure on writes, wait for a device flush, because hot evicts only what cold has absorbed (ADP-004 §Persisting at the power-durable log).
   - What is absorbed but not yet persistable is bounded by the durability window below.
-- **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. It is set by `queue.durability_window_bytes` (default 64 MiB, volume-wide) and `queue.durability_window_ms` (default 1000, the age of a log's oldest unflushed frame); an append over either bound waits, then is rejected after the write timeout. Both bounds are soft, because they gate admission. Concurrent appends can each pass the check before the others' bytes count, so the byte bound can be overshot by up to one reservation (a command's whole batch) per concurrent appender, and a slow flush lets admitted data age past the time bound.
+- **The window of acknowledged-but-not-power-durable data is bounded** in bytes and time. If the device cannot keep up, writes are backpressured and a durability-lag metric reports it. The window never grows silently. It is set by `queue.durability_window_bytes` (default 64 MiB, volume-wide) and `queue.durability_window_ms` (default 1000, the age of a log's oldest unflushed frame); an append over either bound waits, then is rejected at the command timeout (`engine.command_timeout_ms`). Both bounds are soft, because they gate admission. Concurrent appends can each pass the check before the others' bytes count, so the byte bound can be overshot by up to one reservation (a command's whole batch) per concurrent appender, and a slow flush lets admitted data age past the time bound.
 
 Two consequences follow from the persistence cap, and both are accepted:
 - Cold applies a Flush's wipe only once the Flush is power-durable, in every class. FLUSHDB's reply does not wait for it: hot's flush floor answers reads as absent until the wipe lands (§Residency invariant).
@@ -197,20 +197,38 @@ No reply, to a read or a write, reflects a write that a failure in the configure
 - A read copies its answer under the shared lock, with the highest latest sequence number among the keys it touched, then unlocks and waits. Copying first gives a valid linearisation point and cannot starve on a key written continuously.
 - A write with effects is covered by its own durable wait, because its frames follow everything it observed in the same log. A decision with no effect (`SETNX` returning 0, for example) waits on what it observed.
 - Under `process_crash`, the watermark is the published end, so the wait fires only for frames still being filled or published.
-- The wait matters under `power_loss`.
-- The wait blocks the calling thread until asynchronous execution lands (§Asynchronous request execution).
+- The wait matters under `power_loss`, where the watermark is the end of what completed fdatasyncs cover.
+- The wait holds no thread. The command is sequenced: its answer waits in its connection's slot, the connection dispatches its next command, and the thread that moves the watermark past it posts to the connection's reactor: the publisher under `process_crash`; under `power_loss` the WAL's flusher, or the publisher when the flush got there first. A wait still open at the command's deadline replies with an error instead of the answer, so no reply shows the write early.
 
 ### Asynchronous request execution
 
-This section is still to come (#161). Until it lands, the calling reactor thread blocks on a command's durable wait, its fence and its cold reads.
+**Reactors never wait on durability, cold reads or capacity.** A command runs on its connection's reactor until it must wait. It then registers for the event it needs and returns, and the thread that produces the event posts a completion to the reactor's inbox, where the command resumes. A command waits:
+- before a write is applied, for WAL admission, a spare segment, hot memory backpressure, its own key loads, or another caller's load of one of its keys. Nothing of the write is applied yet, so a resumed write decides again from the start;
+- on a read miss, for its cold read, or for another read's load of the same key, whose result it shares;
+- once answered, for durability at the class: a write's own frames, or what a read observed (§Read visibility).
 
-**Reactors never wait on durability or on cold reads.** Completions are delivered back to the reactor.
+Every wait follows one protocol. The waiter registers, then re-checks its condition; the notifier publishes its state, then looks for waiters, so no wake is lost. A capacity waiter whose condition holds when woken wakes the next, so one release strands no one. A waiter that gives up is unlinked under its list's lock.
 
-**Ordering.** Each command on a connection is sequenced before the next one on that connection is dispatched, which keeps Redis pipeline order. Replies are written in command order. Concurrent and pipelined writes therefore share flushes.
+**Ordering.** A command on a connection is dispatched only once the one before it has reached its linearisation point: a write applied and published, a read's answer taken. That keeps Redis pipeline order.
+- A command waiting on a cold read, a load or a capacity holds back the commands behind it on its own connection, and no other connection.
+- A command waiting only for durability holds back nothing. The next command dispatches, so the durable waits of concurrent and pipelined writes overlap and share flushes.
+- Replies are written in command order.
+- Linearisation order holds at any `queue.log_count`. With several logs, writes to different logs become durable independently, so the writes that survive a power loss form a per-connection prefix only at `log_count = 1` ([ADP-005](005-resp-frontend.md) invariant 11). Acknowledged writes are never lost at their class.
 
-**Backpressure.** A per-connection in-flight limit applies, alongside the existing write-buffer thresholds.
+**Deadlines.** `engine.command_timeout_ms` is a command's whole budget from dispatch, and the reactor times each connection's oldest command.
+- A command not yet applied or answered at its deadline is given up. Its error names its wait, and it is never applied. What it left registered is cancelled; an event already on its way is taken on the reactor, which keeps what the command still owns as an orphan until it lands.
+- A sequenced command at its deadline gets the durable-wait timeout error. A write stays applied, and becomes durable at its class when the flush catches up.
+- A shutdown gives pending commands up the same way, and counts them apart from timeouts ([ADP-005](005-resp-frontend.md) §Shutdown).
 
-**Cold I/O.** Cold reads and key loads run on a small I/O pool and complete asynchronously.
+**Backpressure.** Each connection has an in-flight limit, `net.max_inflight_commands`, alongside its write-buffer thresholds, and replies held for durability count against `net.write_backpressure_bytes`. At either limit the connection stops reading; nothing is shed or answered with an error ([ADP-005](005-resp-frontend.md) §Trade-offs).
+
+**Cold I/O.** Cold reads, key loads and cache fills run on a pool of `engine.cold_io_threads` threads, never on a reactor. Loads and misses are taken oldest first. Scans take at most all threads but one, so a point read always has one. Fills run from a bounded background queue only while no foreground job waits. A command whose deadline passes cancels its job if it is still queued, and a job a thread takes after its deadline fails without running.
+
+**Where a reactor still waits.** Only briefly, and boundedly:
+- for a hot shard lock, or the compaction buffer's lock, that another thread holds;
+- in Complete, which fills a reservation's frames and publishes them in sequence order. When an earlier reservation in the same log is still being filled, or an earlier frame of the shard is still being published, Complete spins, then yields, then parks until it is done. The park is bounded, because it waits only on earlier reservations in the same log, whose fillers never wait on later ones. `abyss_wal_fill_wait_seconds` and `abyss_wal_publish_wait_seconds` report it. A large value filling ahead in the same log holds it longest; the blob lane (#162) removes that.
+
+**Shutdown is gated.** Connections stop dispatching, get the shutdown grace, then close. The engine stops while the reactors go on taking its events, so cleanup always runs on a reactor, and the reactors stop last. `net.shutdown_timeout_seconds` bounds the stop; [ADP-005](005-resp-frontend.md) §Shutdown gives the order.
 
 ### Execution resources
 

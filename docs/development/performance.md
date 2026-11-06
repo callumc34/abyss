@@ -85,7 +85,9 @@ Common flags across all probes:
 
 ### The write probe
 
-`abyss_write_probe` drives the real in-process engine: the sequencer, the read path, the hot store, the WAL and the cold consumer pool, built as the server builds them, minus RESP and TCP. Each `write_ack` is a write (a `SET` in the fixed shape) validated the way the RESP pipeline does it, and its latency runs until the write is acknowledged. A `read` is a point read through the read path.
+`abyss_write_probe` drives the real in-process engine: the sequencer, the read path, the hot store, the WAL, the cold I/O pool and the cold consumer pool, built as the server builds them, minus RESP, TCP and the reactors. Each `write_ack` is a write (a `SET` in the fixed shape) validated the way the RESP pipeline does it, and its latency runs until the write is acknowledged. A `read` is a point read through the read path.
+
+Each worker is one connection at pipeline depth 1. It dispatches a command through the engine's asynchronous dispatch on its own thread, and when the command must wait (for durability, a cold read or a capacity) it waits on its own thread for the engine to post the result back, then runs the resumed command there, as a reactor would. So a worker models one connection running one command at a time, not a reactor serving many. The front end (parsing, reactors, their completion inboxes, per-connection pipelining and replies held for durability) is not in the probe: `abyss_loadgen` measures it, against the full server.
 
 Before measuring, the probe calibrates the device. It runs `--flush-samples` iterations of a 4 KiB write followed by the WAL's own durable flush primitive on a scratch file in the WAL directory, timing the flush only. The result is reported as the `device_flush` operation, and the write target is derived from it:
 
@@ -108,7 +110,7 @@ Point `--wal-path` at the volume under test for authoritative runs. Both `--wal-
 | `--flush-concurrency` | `--shards` | Files flushed in parallel for the `device_flush_concurrent` calibration |
 | `--prefill-entries` | 0 | Entries appended and drained before measuring, so the run starts with a retained log behind the head |
 | `--quiet-threshold-s` | server default | Cold consumer quiet window |
-| `--workers` | min(hardware threads, 16) | Concurrent writers. Each one blocks in the engine's write dispatch, as a reactor thread does, so this models reactors, not connections. |
+| `--workers` | min(hardware threads, 16) | Concurrent writers, each one connection at pipeline depth 1. A worker waits on its own thread for each command's result, so this models connections, not reactors. |
 | `--hot-max-memory-bytes` | server default | Hot store memory budget |
 | `--fill-doorkeeper` | server default (`true`) | Fill hot from a read only on a key's second miss |
 | `--mix` | `write_ack=1` | `write_ack`, plus optionally `read`: a point read of the same key distribution through the engine's read path |
@@ -146,7 +148,7 @@ With `--shape trace`, prefill creates each of the first `--prefill-entries` keys
 - `driver` separates the two reasons a slot is sent late (below).
 - The server's metrics snapshotter is not started; it takes shard locks once a second and is otherwise absent from this measurement.
 
-**Driver lag and backlog.** Open loop measures each operation from its intended send time, so a late send is charged to the operations it delays (coordinated omission). A worker runs one operation at a time, and in the write probe it runs the engine inline, so a slot can be late for two reasons. If the worker's previous operation was still running when the slot fell due, the slot waited on the system under test: that is `driver.backlog_us`, from the intended send time to when the previous operation ended. Otherwise the scheduler sent it late: that is `driver.send_lag_us`, and only it decides `driver.lagging`. A run with backlog is valid data; its latencies already carry the wait. The pipelined load generator splits the same way, counting a slot as backlog when the window was full at its intended time. `driver.overloaded` compares the workers' CPU with a threshold; in the write probe the workers run the engine, so it is the engine's CPU, not only the driver's.
+**Driver lag and backlog.** Open loop measures each operation from its intended send time, so a late send is charged to the operations it delays (coordinated omission). A worker runs one operation at a time, and in the write probe it runs the engine's work on its own thread, so a slot can be late for two reasons. If the worker's previous operation was still running when the slot fell due, the slot waited on the system under test: that is `driver.backlog_us`, from the intended send time to when the previous operation ended. Otherwise the scheduler sent it late: that is `driver.send_lag_us`, and only it decides `driver.lagging`. A run with backlog is valid data; its latencies already carry the wait. The pipelined load generator splits the same way, counting a slot as backlog when the window was full at its intended time. `driver.overloaded` compares the workers' CPU with a threshold; in the write probe the workers run the engine, so it is the engine's CPU, not only the driver's.
 
 **Exit codes.**
 - 2: a usage error, a non-empty directory, or `--gate` without a rate.
@@ -243,7 +245,7 @@ Write targets are not written into workloads, because they depend on the durabil
 
 **Driver lag and load.** Open-loop runs record a send-lag histogram (actual send minus intended send).
 - If send-lag p99 exceeds 50 µs, or 10% of any per-op target, the run is flagged `lagging` and a warning is printed. Treat its latencies as including driver delay.
-- Driver CPU is the sum of the worker or connection threads' CPU time over the measured window. In the write probe those threads also execute the engine work inline, as reactor threads do.
+- Driver CPU is the sum of the worker or connection threads' CPU time over the measured window. In the write probe those threads also run the engine's work for their commands, as reactor threads do; the WAL flushers and the cold I/O pool run on their own threads.
 - If driver CPU per wall-second exceeds max(1 core, 10% of hardware threads), the run is flagged `overloaded`. The driver is then competing with the server for cores: pin it to separate cores or run it on another host. The driver's CPU affinity is recorded on Linux.
 
 **Waiting for a scheduled send.** Open-loop waits sleep, then spin briefly before each scheduled send.
@@ -380,7 +382,7 @@ The targets in `requirements.md` are assigned to substrates by ADP-013:
 
 The definitions behind each ID are in [requirements.md](../design/requirements.md) §Performance Targets.
 
-When the probe and loadgen numbers disagree for the same target, the gap is the cost of the RESP+TCP path plus client-side scheduling — both real and worth knowing.
+When the probe and loadgen numbers disagree for the same target, the gap is the cost of the front end (RESP, TCP, the reactors and their completion inboxes) plus client-side scheduling — both real and worth knowing. Pipelining's effect, durable waits overlapping on one connection, shows only in loadgen runs with `pipeline_depth` above 1.
 
 ## Sequenced write path measurements (macOS, indicative)
 

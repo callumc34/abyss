@@ -24,6 +24,7 @@
 #include "abyss/queue/log.h"
 #include "binary_io.h"
 #include "progress_watchdog.h"
+#include "queue_waits.h"
 #include "segment_header_v2.h"
 #include "temp_dir.h"
 
@@ -70,7 +71,7 @@ Log::Reservation AppendFrame(Log& log, std::span<const std::byte> bytes) {
       return *reservation;
     }
     EXPECT_EQ(reservation.error().code(), core::ErrorCode::kUnavailable);
-    if (!log.WaitForSpare(std::chrono::steady_clock::now() + 10s)) {
+    if (!testing::WaitForSpare(log, std::chrono::steady_clock::now() + 10s)) {
       ADD_FAILURE() << "no spare segment within 10s";
       return {};
     }
@@ -95,7 +96,7 @@ Log::Reservation ReserveAndCommit(Log& log, std::span<const std::byte> bytes) {
       log.Commit(*reservation, bytes);
       return *reservation;
     }
-    if (!log.WaitForSpare(std::chrono::steady_clock::now() + 10s)) {
+    if (!testing::WaitForSpare(log, std::chrono::steady_clock::now() + 10s)) {
       ADD_FAILURE() << "no spare segment within 10s";
       return {};
     }
@@ -307,7 +308,7 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
           }
           EXPECT_EQ(reservation.error().code(), core::ErrorCode::kUnavailable);
           mark(t, Step::kSpare);
-          if (!log.WaitForSpare(std::chrono::steady_clock::now() + 10s)) {
+          if (!testing::WaitForSpare(log, std::chrono::steady_clock::now() + 10s)) {
             ADD_FAILURE() << "no spare segment within 10s";
             return;
           }

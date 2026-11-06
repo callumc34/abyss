@@ -2,9 +2,9 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-10-09
+**Updated:** 2026-11-06
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** Conditional writes are ordinary sequenced writes that log their decided effects; §Command Classification and Dispatch, §Multi-Key Commands and §Write Acknowledgement describe that. Dispatch will become asynchronous (#161): reactors will never wait on durability or cold reads, each command will be sequenced before the next on its connection, and replies will keep command order. §TCP server implementation's head-of-line trade-off describes current behaviour until then.
+> **Amended by [ADP-015](015-write-path-and-durability.md).** Conditional writes are ordinary sequenced writes that log their decided effects; §Command Classification and Dispatch, §Multi-Key Commands and §Write Acknowledgement describe that. Dispatch is asynchronous (#161): a reactor never waits on durability, cold reads or a capacity wait, each command reaches its linearisation point before the next on its connection is dispatched, and replies keep command order. §Write Acknowledgement, §Connection Handling, §Configuration and §Invariants describe it.
 
 > **§CLUSTER Commands refined by [ADP-014](014-slot-routing-and-topology.md).** `CLUSTER KEYSLOT` still returns the `CRC16` wire slot unchanged. `CLUSTER SLOTS`/`SHARDS` now advertise slot ranges grouped by their owning shard (resolved through slot-to-shard mapping) rather than a single full-range stub; in single-pod the ranges still cover the whole slot space, partitioned disjointly by shard. The `MOVED` path (gated behind multi-pod) computes its target from slot ownership, so a redirect always names the pod whose shard owns the key. Invariant 8's "only the slot-to-pod mapping differs between phases" is upgraded: that mapping is now explicit, slot-derived, and tested, not coincidental.
 
@@ -276,7 +276,7 @@ When the hot store does not hold the key — typical after eviction — multi-fi
 
 #### Why read-modify-write commands cannot be plain writes
 
-These were briefly advertised as unconditional writes with no typed op behind them, so the frontend accepted them, durably logged them, and only then failed at apply. The fix is not to add parsers — it is that the unconditional write path is the wrong home for them.
+These were briefly advertised as unconditional writes with no typed op behind them, so the frontend accepted them, logged them, and only then failed at apply. The fix is not to add parsers — it is that the unconditional write path is the wrong home for them.
 
 Every one of these commands computes its result from the key's current value. The compaction buffer that feeds the cold tier absorbs and emits *typed ops*, never raw commands, and it holds only what it has seen in the current window — the key may be cold-resident, in which case the buffer cannot know the value at all. A statement-form increment therefore cannot be absorbed: N increments cannot collapse into one op without evaluating them, and cold would have to perform its own read-modify-write to apply what it was given. Two tiers independently re-deriving a value from a statement is precisely the divergence invariant 3 exists to prevent.
 
@@ -404,15 +404,20 @@ Multi-key reads are not atomic: `MGET` and multi-key `EXISTS` read each shard in
 A write is acknowledged to the client only after two things have happened:
 
 1. The sequencer has decided it against the key's complete state, reserved its log frames, applied its effects to hot and published them, under the shard lock ([ADP-015](015-write-path-and-durability.md) §Sequenced write path).
-2. Its frames have reached the configured durability class: published under `process_crash`, or covered by a completed fdatasync under `power_loss` ([ADP-001](001-queue-wal.md) §Durability classes and group commit).
+2. Its frames have reached the configured durability class ([ADP-001](001-queue-wal.md) §Durability classes and group commit). Under `process_crash` that is publication to the page cache, which survives a process crash. Under `power_loss` it is a completed fdatasync covering them, which survives a power loss.
 
 The reply is the one the sequencer decided: `+OK`, nil, the prior value for `SET … GET`, an integer for `SETNX` or a count, or an error such as `WRONGTYPE`. Conditional and unconditional writes take the same path. A decision with no effect (`SETNX` on a present key) logs nothing, and its reply waits only until what it observed is durable at the class.
 
 The queue is the sole write path — there is no dual write. Hot is applied in the same critical section that sequences the write, so there is no consumer to wait for.
 
-**Timeout:** `engine.command_timeout_ms`, default 5s, bounds a write's admission, loads, memory backpressure and durable wait. A write that runs out of time before its reservation is rejected having applied nothing. One that runs out on its durable wait returns a Redis error, but it is already in the queue and applied to hot, and becomes durable when the flush catches up.
+**Waiting never holds the reactor.** A write that must wait before it is applied, for WAL admission, a spare segment, hot memory backpressure, a load of its keys or another caller's load of one, registers to be woken and returns to its connection's reactor. Nothing of it is applied yet, so when it is resumed it decides again from the start. Once applied and published the write is sequenced: its reply waits in its connection's slot until its frames reach the class, and the connection dispatches its next command meanwhile, so pipelined writes share flushes. A durable wait is a registration as well: the thread that moves the durable end past the write, under `power_loss` usually the WAL's flusher, posts the result back to the reactor.
 
-See [ADP-006](006-read-write-paths.md) for read and write path details, and [ADP-015](015-write-path-and-durability.md) for the sequencer and decide-then-log.
+**Timeout:** `engine.command_timeout_ms`, default 5 s, is a command's whole budget from dispatch: a write's waits before it is applied and its durable wait, a read's cold read and its wait for what it saw to be durable. Each connection's reactor times its oldest command.
+- A command that runs out of time before it is applied or answered is given up and never applied. Its error names what it was waiting for.
+- A write that runs out on its durable wait gets an error, but it is already in the queue and applied to hot, and it becomes durable at its class when the flush catches up.
+- [Failure Modes](../../operations/failure-modes.md) §Command Errors lists every error text a client can see.
+
+See [ADP-006](006-read-write-paths.md) for read and write path details, and [ADP-015](015-write-path-and-durability.md) for the sequencer, decide-then-log and §Asynchronous request execution.
 
 ### Loading State
 
@@ -422,21 +427,49 @@ The `LOADING` gate is a frontend-level check before dispatch. It lifts automatic
 
 ### Connection Handling
 
-- Async I/O via `io_uring` (Linux) with `epoll` fallback. macOS uses `kqueue` via the abstraction layer for development parity.
-- Max concurrent connections: configurable, default 1024.
-- Idle timeout: configurable, default 300s.
-- **Pipelining** — the parser is incremental: it returns one command plus bytes-consumed per invocation, and the caller loops until no progress. Pipelined requests are processed sequentially per connection; responses are written in arrival order. No special pipeline buffering is required beyond the per-connection socket buffer.
+- **Readiness-based I/O** on non-blocking sockets, behind one poller interface: edge-triggered `epoll` on Linux, `kqueue` on macOS and the BSDs, and `WSAPoll` on Windows. There is no `io_uring` backend (§Trade-offs).
+- **Connections:** at most `net.max_connections` (default 1024) at once. A connection idle for `net.idle_timeout_seconds` (default 300) is closed; one with a command in flight is never idle.
+- **Pipelining.** The parser is incremental: it returns one command plus bytes-consumed per invocation, and the caller loops until no progress. A connection dispatches its commands in arrival order, and each reaches its linearisation point before the next is dispatched (§Invariants).
+  - A command that must wait first (a cold read, a load, WAL admission, a spare segment, hot memory backpressure) holds back the commands behind it on its own connection, and only those.
+  - A write that is applied and waits only for durability holds back nothing: the next command dispatches, and the durable waits of a pipeline overlap.
+  - Replies are written in command order. A reply that is ready waits until every earlier one on its connection has been written.
+- **In-flight limit.** A connection holds at most `net.max_inflight_commands` (default 1024) commands in flight: dispatched and not yet written, or written and still owed a durable post. At that limit, or once its unwritten replies, counting those held for commands waiting to be durable, reach `net.write_backpressure_bytes`, it stops dispatching and stops reading its socket (§Trade-offs).
 
 #### TCP server implementation
 
-Implementation-level commentary on the listener that drives the per-connection `RequestPipeline`. The interface contract above is unchanged; this section records the choices a reviewer should expect to see in `include/abyss/net/`.
+Implementation-level commentary on the listener that drives each connection's request pipeline. This section records the choices a reviewer should expect to see in the net and resp layers.
 
-- **Concurrency.** A pool of reactor threads, sized by the `net.io_threads` config (default `min(hardware_concurrency, 16)`). Each reactor owns a `Poller` (epoll on Linux, kqueue on macOS) and a sticky set of connections — connections do not migrate across reactors after accept. The shared `CommandDispatcher` (the tiering engine) handles the cross-reactor synchronisation. Phase 4 shared-nothing per-core (#59-#63) tightens reactor count to shard count and removes the shared dispatcher.
-- **Head-of-line trade-off.** The request pipeline's dispatch is synchronous from the reactor's view. A slow dispatch (a `power_loss` flush stall, durability-window or hot-memory backpressure, a key load or cold-store p99 spike) blocks one reactor's other connections for the duration of that call, but not the other reactors. Operators tune `net.io_threads` to bound the blast radius of a single slow dispatch.
-- **Back-pressure.** Per-connection write buffer with three thresholds: `write_backpressure_bytes` (default 4 MiB) pauses reading on the connection; `write_resume_bytes` (default 1 MiB) re-enables it; `write_hard_limit_bytes` (default 16 MiB) closes the connection. TCP's own receive-window flow control then propagates the pressure back to the client. The pause/resume transitions are fd-level — the reactor disarms `kReadable` on the offending connection without affecting siblings.
-- **Shutdown grace.** `RequestStop` is non-blocking: it flips a flag and wakes every reactor. Each reactor disarms its listener registration (acceptor only), then continues to drain in-flight responses for `net.shutdown_grace_seconds` (default 30, aligned with Kubernetes' `terminationGracePeriodSeconds`). On expiry the reactor force-closes remaining connections with `reason=server_shutdown`. `Join` waits for every reactor to exit; the split mirrors the per-shard `RequestStop`/`Join` pattern from #94 — never call a blocking join inside a stop loop.
-- **Idle reaper.** A wall-clock-cheap sweep on every Poll-Wait cycle (default 1 s) closes connections whose `last_activity` is older than `idle_timeout`. Activity refers to either successful recv or successful send, so a client paused on back-pressure but still receiving the server's drain is not idle.
-- **Phase 4 migration path.** The `Poller` interface stays as the kernel-abstraction boundary; an `IoUringPoller` becomes a third backend without touching reactor or connection code. The reactor pool collapses to one reactor per shard, the connection-to-reactor binding moves from round-robin to key-hash, and the shared dispatcher decomposes into per-shard state — none of which require changes to the surface defined in this ADP.
+- **Reactors.** A pool of reactor threads, sized by `net.io_threads` (default `min(hardware_concurrency, 16)`). Each reactor owns a poller and the connections handed to it at accept. A connection, the engine work its commands start and anything left over when it closes stay on that reactor for their whole life. The tiering engine is shared: a command runs on its connection's reactor until it must wait, and is resumed there.
+- **Completion inbox.** Each reactor has an inbox, into which the threads that finish a wait post an event: the WAL's publishers and flushers for durability, the cold I/O pool for a read or a load, and whichever thread releases a capacity a command waits for. An event either resumes a waiting command or delivers a durable result to a sequenced one. A post wakes the reactor's poller at most once per loop iteration. Events are routed by connection id and command slot, and connection ids are never reused, so a late event never reaches another command.
+- **Cold I/O pool.** Cold reads block in `pread`, so they run on `engine.cold_io_threads` threads (default `min(4, max(2, hardware_concurrency))`), never on a reactor. Loads and read misses share one foreground queue, taken oldest first. Scans take at most all threads but one, so a point read always has a thread. Cache fills wait in a bounded background queue that runs only while the foreground queue is empty. A job whose command's deadline has passed by the time a thread takes it fails without running.
+- **Head-of-line trade-off.** A reactor never waits on durability, cold I/O or a capacity wait. What it still does inline is bounded work: parsing and serialising, deciding, reserving and applying under the shard lock, a short wait for a shard lock another reactor holds, filling frames, and in Complete a brief park while an earlier reservation in the same log is still being filled or published ([ADP-015](015-write-path-and-durability.md) §Asynchronous request execution). Within a connection a waiting command holds back the commands behind it, because command order is Redis's contract. Across connections nothing waits on it, so a cold read held in the pool does not delay a hot `GET` on another connection of the same reactor. Waiting moves to the cold I/O pool's queue instead: a pool that cannot keep up shows as deadlines passing in the queue ([Failure Modes](../../operations/failure-modes.md)).
+- **Timers.** Every command on a connection has the same timeout, so its oldest has the earliest deadline. Each connection keeps one timer, at that deadline, in its reactor's hashed timing wheel (1 ms ticks). The poll timeout is the next due timer or the idle reaper's tick. At expiry:
+  - a command not yet applied or answered is given up with its wait's timeout error and is never applied; engine work it still has outstanding finishes as cleanup on the reactor;
+  - a sequenced write gets the durable-wait timeout error, and stays applied.
+- **Back-pressure.** Per-connection write buffer with three thresholds:
+  - `write_backpressure_bytes` (default 4 MiB), with held replies counted, stops dispatching and pauses reading;
+  - `write_resume_bytes` (default 1 MiB) resumes it, once fewer than half of `net.max_inflight_commands` are in flight;
+  - `write_hard_limit_bytes` (default 16 MiB) closes the connection.
+
+  TCP's own receive-window flow control then propagates the pressure back to the client. Pausing is per connection: the reactor drops its read interest without affecting siblings. On resume the connection first dispatches the input it already buffered, then reads again: an edge-triggered poller reports no new event for bytes already read.
+- **Closing never waits for the engine.** When a client disconnects, a command still waiting runs on to its outcome or its deadline, unheard, so a write may still be applied. A sequenced write's durable wait is dropped, and unwritten replies and undispatched input go with the socket. Whatever the engine still owes the closed connection is kept on its reactor's orphan list until it lands (`abyss_net_orphans`), and an event for nothing live or orphaned is dropped and counted (`abyss_net_late_completions_total`).
+- **`QUIT` and protocol errors** stop dispatch. The connection closes once every earlier command has replied and its output has drained.
+- **Idle reaper.** A sweep on every poll cycle (`net.reaper_tick_ms`, default 1 s) closes connections whose last activity is older than `idle_timeout`. Activity is a successful recv or send, so a client paused on back-pressure but still receiving the server's drain is not idle. A connection with a command in flight is never reaped.
+- **Phase 4 migration path.** The poller interface stays the kernel-abstraction boundary; an `io_uring` poller would be a fourth backend without touching reactor or connection code. The reactor pool collapses to one reactor per shard, the connection-to-reactor binding moves from round-robin to key-hash, and the shared engine decomposes into per-shard state — none of which require changes to the surface defined in this ADP.
+
+#### Shutdown
+
+On SIGTERM the server stops in this order:
+
+1. **Readiness first.** The server enters draining, so `/ready` stops passing (503, then its listener closes) and Kubernetes takes the pod out of Service endpoints before the data plane stops.
+2. **Accepting stops.** The RESP listener is disarmed, and every connection stops reading and dispatching.
+3. **Grace.** Commands already dispatched get up to `net.shutdown_grace_seconds` (default 30) to finish and have their replies written. The engine runs normally meanwhile.
+4. **Force close.** Then every connection is closed (`reason=server_shutdown`).
+5. **Unread pipelined input is dropped.** Commands the server had not yet read or dispatched go with the socket, unanswered, as after a crash; clients retry them elsewhere.
+6. **Pending commands are given up.** A command not yet linearised is abandoned with `kUnavailable` (`command abandoned: server shutting down`) and never applied, and counted as `abyss_net_commands_abandoned_total{reason="shutdown"}`, not as a timeout. Its connection is already closed, so no client sees that error.
+7. **Sequenced writes stay applied, but their replies are lost.** Under `process_crash` such a write was published, and so durable at its class, before it was sequenced. Under `power_loss` it is power-durable only if the WAL's final flush covers it. The engine's stop makes that flush over everything filled, so only an exit at the shutdown timeout, before the flush, leaves it short.
+8. **The rest of the stop is bounded.** The engine then stops while the reactors go on taking its events: the cold I/O pool fails its queued jobs and joins the running ones, the cold consumers drain within `cold_consumer.drain_grace_seconds`, offsets persist, the WAL makes its final flush and stops, and every waiter fails. Each reactor drains its inbox until it is empty and stops. All of this runs under `net.shutdown_timeout_seconds` (default 60; the validator requires at least `cold_consumer.drain_grace_seconds` + `engine.command_timeout_ms` + 5 s). Past it the process logs CRITICAL `shutdown timed out; exiting without cleanup` with the stuck jobs and orphans, and exits with status 70 without running destructors.
+9. **The pod's budget covers both.** `terminationGracePeriodSeconds` must be at least `net.shutdown_grace_seconds` + `net.shutdown_timeout_seconds` plus a margin for the process to exit, or Kubernetes kills it first ([Deployment](../../operations/deployment.md) §Shutdown).
 
 ### Configuration
 
@@ -446,10 +479,17 @@ net:
   port: 6379
   max_connections: 1024
   idle_timeout_seconds: 300
-  io_threads: 0            # 0 = min(hardware_concurrency, 16)
+  io_threads: 0                       # reactors; 0 = min(hardware_concurrency, 16)
+  write_backpressure_bytes: 4194304   # unwritten and held replies: stop reading
+  write_resume_bytes: 1048576         # resume, with under half the in-flight cap
+  write_hard_limit_bytes: 16777216    # close
+  max_inflight_commands: 1024         # per connection, 1..65536
+  shutdown_grace_seconds: 30          # in-flight commands finish
+  shutdown_timeout_seconds: 60        # the rest of the stop; past it, exit 70
 
 engine:
-  command_timeout_ms: 5000   # a command's whole budget, durable wait included
+  command_timeout_ms: 5000            # a command's whole budget, durable wait included
+  cold_io_threads: 0                  # cold read pool; 0 = min(4, max(2, CPUs)), else 2..64
 ```
 
 ## Invariants
@@ -457,19 +497,23 @@ engine:
 1. Every write command is routed through the queue. There is no path that writes directly to a store.
 2. Unknown command names are rejected at the frontend with `ERR unknown command` and never touch the queue.
 3. A write the sequencer rejects when deciding it (a type mismatch, an unsupported form) logs nothing; only decided effects reach the queue.
-4. A write is not acknowledged until the sequencer has applied it to hot and its log frames have reached the configured durability class.
-5. A write that times out on its durable wait returns an error to the client, but it is not discarded: it is already in the queue and applied to hot.
+4. A write is not acknowledged until the sequencer has applied it to hot and its log frames have reached the configured durability class: published under `process_crash`, so it survives a process crash, or fdatasynced under `power_loss`, so it survives a power loss.
+5. A write that times out on its durable wait returns an error to the client, but it is not discarded: it is already in the queue and applied to hot, and becomes durable at its class when the flush catches up. A command that times out, or is given up at shutdown, before it is applied is never applied.
 6. RESP2 is the only protocol. `HELLO 3` is rejected with `NOPROTO`. RESP3-specific types are not emitted on the wire.
 7. `RespValue` simple strings and bulk strings are distinct types. Error values are constructed via the prefix-enum helper, never hand-formatted.
 8. Slot computation (`CRC16(key) mod 16384`, honouring `{hashtag}`) is phase-invariant. Only the slot-to-pod mapping changes between phases.
 9. During recovery, data-plane commands return `LOADING`; the narrow admin set remains available.
 10. Inline protocol is supported alongside RESP arrays; both produce the same `RespCommand`.
+11. **Commands on a connection keep their order.** Each command on a connection reaches its linearisation point (a write applied to hot and published, a read's answer taken) before the next command on that connection is dispatched, and replies are written in command order. That holds at any `queue.log_count`. Acknowledged writes are never lost at their class (invariant 4); the caveat below concerns unacknowledged writes only. With `queue.log_count` above 1, pipelined writes to different logs become durable independently, so a power loss can keep a later unacknowledged write and lose an earlier one. The writes on a connection that survive a power loss therefore form a prefix of its writes only at `log_count = 1`, as Redis Cluster promises no order across slots.
+12. A reactor thread never waits on durability, cold I/O or a capacity wait, and closing a connection never waits for the engine. A shutdown applies no command it had not linearised, and one that overruns `net.shutdown_timeout_seconds` exits with status 70.
 
 ## Trade-offs
 
 **Why RESP2 and not RESP3?** RESP2 is universally supported. Every Redis client library speaks it. RESP3 adds features (client-side caching hints, attribute types) Abyss does not need in Phase 1. RESP3 support can be added later without breaking existing clients.
 
-**Why `io_uring` with `epoll` fallback?** `io_uring` offers the best async I/O performance on modern Linux kernels. `epoll` is the fallback for older kernels and environments where `io_uring` is unavailable (some container runtimes restrict it).
+**Why readiness polling (`epoll`, `kqueue`, `WSAPoll`) and not `io_uring`?** A reactor's time does not go on socket system calls: cold reads, which block in `pread`, run on the cold I/O pool, and durability waits on the WAL's flushers. Readiness polling on non-blocking sockets works the same way on Linux, macOS and Windows behind one interface. `io_uring` would save system calls per read and write, but the default seccomp profiles of Docker 25 and containerd 2.0 block it, so it would need a runtime probe and a fallback anyway. It stays a possible fourth backend, taken up only if profiles show the socket calls dominate.
+
+**Why does a waiting command hold back its own connection, and no other?** Redis runs a connection's pipelined commands one after another, each seeing the effects of those before it, and clients rely on that: a `GET` sent after a `SET` on the same connection must see it. Abyss keeps that order by dispatching a command only once the one before it has reached its linearisation point. Commands on different connections have no order to keep, so a command waiting on a cold read, a load or a capacity holds back only its own connection, and a write waiting only for durability holds back nothing, so pipelined writes share flushes. The cost is that a pipeline stalls behind a cold miss at its head for as long as the read takes, up to `engine.command_timeout_ms`. Dispatching independent commands past it would need per-key dependency tracking in the frontend.
 
 **Why split `kString` into `kSimpleString` and `kBulkString`?** RESP2 wire format treats them differently (`+OK\r\n` vs `$2\r\nOK\r\n`). Collapsing them forces the serializer to guess, which produces wrong output for clients that distinguish simple-string protocol constants from binary-safe bulk values. The split is a one-line type change with zero runtime cost; the value is correctness.
 

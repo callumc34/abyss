@@ -95,6 +95,16 @@ core::Result<void> AwaitWaiter(const When& when, const Cancel& cancel, const Fin
   }
 }
 
+// AwaitWaiter on `list` itself, until `condition` holds.
+template <typename Condition>
+core::Result<void> AwaitList(core::WaitList& list, const Condition& condition,
+                             core::Duration timeout) {
+  return AwaitWaiter(
+      [&](core::Waiter& waiter, bool /*first*/) { return list.Register(waiter, condition); },
+      [&](core::Waiter& waiter) { return list.Cancel(waiter); },
+      [&](core::Waiter& waiter) { list.Finish(waiter); }, core::SteadyClock::now() + timeout);
+}
+
 // A wait for an owner's end to pass `seq`, as SeqWaiters' protocol has
 // it: `when(node)` registers and `cancel(node)` unlinks. ok, kTimeout
 // with no node left linked, or the error that fails every waiter.

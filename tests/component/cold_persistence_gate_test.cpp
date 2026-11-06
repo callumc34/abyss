@@ -623,9 +623,10 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   ASSERT_TRUE(stall_.AwaitEntered(1));
   const core::SequenceId y = Append(2, next_entry(2, 'w'));
   const core::SequenceId batch_first = kFirst + written[0].size();
+  constexpr size_t kBatch = 5;
   std::vector<core::QueueEntry> batch_entries;
-  batch_entries.reserve(5);
-  for (int i = 0; i < 5; ++i) batch_entries.push_back(next_entry(0, 'w'));
+  batch_entries.reserve(kBatch);
+  for (size_t i = 0; i < kBatch; ++i) batch_entries.push_back(next_entry(0, 'w'));
   auto in_batch = std::make_shared<testing::Latch>();
   auto finish_batch = std::make_shared<testing::Latch>();
   // Released before the batch's future is waited on.
@@ -642,7 +643,7 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
   ASSERT_TRUE(in_batch->Wait());
   // Committed is not yet filled: another committer may still be folding
   // the frame in, and a flush only reaches the filled prefix.
-  const uint64_t first_filled = queue_->ReservedTailForTesting(0) - (4 * frame_bytes);
+  const uint64_t first_filled = queue_->ReservedTailForTesting(0) - ((kBatch - 1) * frame_bytes);
   const auto fill_by = std::chrono::steady_clock::now() + 10s;
   while (queue_->FilledPrefixForTesting(0) < first_filled &&
          std::chrono::steady_clock::now() < fill_by) {

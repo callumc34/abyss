@@ -22,7 +22,7 @@ spec:
   replicas: 1
   template:
     spec:
-      # At least net.shutdown_grace_seconds + net.shutdown_timeout_seconds.
+      # net.shutdown_grace_seconds + net.shutdown_timeout_seconds + a margin.
       terminationGracePeriodSeconds: 100
       containers:
         - name: abyss
@@ -97,9 +97,17 @@ Multi-pod deployment uses a StatefulSet with one pod per shard group, fronted by
 
 ### Shutdown
 
-On SIGTERM, `/ready` returns 503, the RESP listener stops accepting, and every connection stops reading and dispatching. Commands already dispatched get `net.shutdown_grace_seconds` to finish and be written. Then the connections close: a command still pending is given up and never applied (`abyss_net_commands_abandoned_total{reason="shutdown"}`), and pipelined commands the server had not yet read are dropped with the socket. Clients see the connection close with those commands unanswered, as after a crash, and retry them elsewhere. The engine then stops, its cold drain bounded by `cold_consumer.drain_grace_seconds`, all within `net.shutdown_timeout_seconds`; past it the process logs what is stuck at CRITICAL and exits with status 70.
+On SIGTERM the server stops in this order ([ADP-005](../design/proposals/005-resp-frontend.md) §Shutdown):
 
-Budget the pod for both: `net.shutdown_grace_seconds` + `net.shutdown_timeout_seconds` must not exceed `terminationGracePeriodSeconds`, or Kubernetes kills the process before it can finish. The defaults, 30 s and 60 s, need at least 90 s, against Kubernetes' default of 30 s.
+1. `/ready` stops passing: it returns 503, then the admin listener closes, so Kubernetes takes the pod out of Service endpoints.
+2. The RESP listener stops accepting, and every connection stops reading and dispatching.
+3. Commands already dispatched get `net.shutdown_grace_seconds` to finish and have their replies written.
+4. Then every connection closes.
+5. Pipelined commands the server had not yet read or dispatched are dropped with the socket, unanswered, as after a crash. Clients retry them elsewhere.
+6. A command still pending, not yet linearised, is given up and never applied (`abyss_net_commands_abandoned_total{reason="shutdown"}`).
+7. A write already applied and waiting only for durability stays applied, but its reply is lost. Under `process_crash` it was already durable at its class, published before its reply was held; under `power_loss` it is power-durable once the final WAL flush, part of the engine's stop, covers it.
+8. The engine stops, its cold drain bounded by `cold_consumer.drain_grace_seconds`, and the WAL makes its final flush. All of this must finish within `net.shutdown_timeout_seconds`; past it the process logs CRITICAL `shutdown timed out; exiting without cleanup`, naming what is stuck, and exits with status 70.
+9. Budget the pod for both phases: `terminationGracePeriodSeconds` must be at least `net.shutdown_grace_seconds` + `net.shutdown_timeout_seconds` plus a margin for the process to exit, or Kubernetes kills it before it can finish. The defaults, 30 s and 60 s, need more than 90 s, against Kubernetes' default of 30 s; the StatefulSet above uses 100.
 
 ## Configuration Reference
 

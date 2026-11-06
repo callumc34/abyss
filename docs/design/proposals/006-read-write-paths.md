@@ -2,9 +2,9 @@
 
 **Status:** Accepted
 **Created:** 2026-04-09
-**Updated:** 2026-10-09
+**Updated:** 2026-11-06
 
-> **Amended by [ADP-015](015-write-path-and-durability.md).** A write is decided, reserved in the log and applied to hot under the shard lock, then published and acknowledged at the configured durability class. A read that misses hot never waits, and a cold hit fills hot directly; promotion through the queue and the read-consistency wait are removed. FLUSHDB acknowledges on its Flush frames' own durability. The sections below describe this. The calling reactor thread still blocks on durability until asynchronous execution lands (ADP-015 §Asynchronous request execution).
+> **Amended by [ADP-015](015-write-path-and-durability.md).** A write is decided, reserved in the log and applied to hot under the shard lock, then published and acknowledged at the configured durability class. A read that misses hot never waits for the cold consumer, and a cold hit fills hot directly; promotion through the queue and the read-consistency wait are removed. FLUSHDB acknowledges on its Flush frames' own durability. No reactor thread waits on durability or on a cold read: a command that must wait registers and is resumed when its event is posted back (ADP-015 §Asynchronous request execution). The sections below describe this.
 
 ## Context
 
@@ -15,7 +15,7 @@ The read and write paths are the core data flows through Abyss. The write path e
 ### Write Path
 
 ```
-Client ──▶ RESP Frontend ──▶ Sequencer (on the calling thread)
+Client ──▶ RESP Frontend ──▶ Sequencer (on the connection's reactor)
                                │
                                ├─ 1. Wait, holding no lock: WAL admission,
                                │     memory backpressure, key loads
@@ -55,7 +55,7 @@ A decision with no effect (`SET NX` on a present key, for example) logs nothing 
 
 **After apply, a write cannot be undone.** A write whose durable wait passes `engine.command_timeout_ms` replies with an error saying it is applied and may yet become durable. A failed flush or publish terminates the process ([ADP-015](015-write-path-and-durability.md) §Fail-stop after apply).
 
-The queue is the sole write path. There is no dual write, and nothing but the sequencer, and recovery's replay of the log, applies hot. The consumer RPC promise registry through which a hot consumer and the resolver used to fulfil writes is removed: the sequencer has the reply when it unlocks, and waits only on the queue's durable future.
+The queue is the sole write path. There is no dual write, and nothing but the sequencer, and recovery's replay of the log, applies hot. The consumer RPC promise registry through which a hot consumer and the resolver used to fulfil writes is removed: the sequencer has the reply when it unlocks, and the reply waits only for its frames to reach the class, which the queue posts back to the reactor.
 
 ### Read Path
 
@@ -87,7 +87,7 @@ Read command arrives
 
 **Access stamps.** A hot hit on a live key stamps its access time, which extends its eviction deadline. Metadata reads (`EXISTS`, `TYPE`, `TTL`, `PTTL`) do not count as use, as in Redis, and a read answered by a tombstone stamps nothing.
 
-**Buffer first, then cold.** A miss reads the key's compacted delta in the buffer, then cold, and merges them: adds, removes, overwrites and a whole-key delete over cold's base. The buffer keeps a flushed entry readable until its cold write lands, so "buffer miss, then cold" is never stale. Cold reads are loads: cold answers no command itself, and the engine answers the read from what was loaded, judging TTL by the wall clock. Point reads and probes get ADP-003's 5 ms cold deadline, and whole-key loads (a scan or a full collection) 50 ms. A whole-key load that misses its deadline is an error, never a truncated answer (`abyss_cold_read_deadline_exceeded_total`).
+**Buffer first, then cold.** A miss reads the key's compacted delta in the buffer, then cold, and merges them: adds, removes, overwrites and a whole-key delete over cold's base. The buffer keeps a flushed entry readable until its cold write lands, so "buffer miss, then cold" is never stale. Cold reads are loads: cold answers no command itself, and the engine answers the read from what was loaded, judging TTL by the wall clock. Cold reads run on the cold I/O pool, never on a reactor, and are bounded by the command's own deadline (`engine.command_timeout_ms`), which the store enforces inside each read. A read that misses it, point read or whole-key load, is an error, never a truncated answer (`abyss_cold_read_deadline_exceeded_total{kind}`).
 
 **The fence.** A hot hit copies its answer under the shared lock with the highest latest seq of the keys it touched, unlocks, and waits until that seq is durable at the acknowledgement class before replying. The sequencer applies a write before it publishes the frame, so without the fence a reply could show a write a failure in the class could lose. Under `process_crash` the durable end is the published end, so the wait fires only while a frame is still being filled or published; under `power_loss` it waits for the flush. A miss answered by the flush floor fences on the Flush. A write with effects is covered by its own durable wait, because its frames follow everything it observed in the same log. A write with no effect fences on what it observed. Copying first gives a valid linearisation point and cannot starve on a key written continuously.
 
@@ -191,7 +191,7 @@ Conditional writes are validated the same way, and the log carries their decided
 
 **Why a doorkeeper on fills?** A scan of keys read once would otherwise push the working set out of hot. Filling on the second miss within a window admits keys that are read again, as TinyLFU does.
 
-**Why block the write on durability at the configured class and on apply?** The client expects that after receiving OK, a subsequent read returns the written value. The sequencer applies the write to hot before replying, so a read after the reply sees it; and the fence keeps any reply from showing a write before it reaches the class.
+**Why hold the write's reply until it is applied and durable at the configured class?** The client expects that after receiving OK, a subsequent read returns the written value. The sequencer applies the write to hot before replying, so a read after the reply sees it; and the fence keeps any reply from showing a write before it reaches the class.
 
 **Why decide under the lock rather than in a separate resolver?** The resolver decided against a cache and cold, off the write path, and logged a `Conditional` and later a `Resolved`; the effect then landed at the `Resolved` position, after writes it had not seen (#167). Deciding under the shard lock against hot's complete state logs each decision once, at its own position ([ADP-015](015-write-path-and-durability.md) §Sequenced write path).
 

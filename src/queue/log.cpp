@@ -1358,17 +1358,6 @@ bool Log::CanReserve(uint32_t size) const {
   return impl.published_end.load(std::memory_order_acquire) > (fits ? ordinal : ordinal + 1);
 }
 
-bool Log::WaitForSpare(core::SteadyTime deadline) {
-  Impl& impl = *impl_;
-  impl.spare_waits.Increment();
-  if (impl.spare_wait_hook) impl.spare_wait_hook();
-  if (!impl.spare_waiters.Await([&impl] { return impl.SpareReady(); }, deadline).has_value()) {
-    return false;
-  }
-  const std::scoped_lock lock(impl.mu);
-  return !impl.stopping;
-}
-
 std::optional<core::Result<void>> Log::WhenSpare(core::Waiter& waiter, bool first) {
   Impl& impl = *impl_;
   if (first) {

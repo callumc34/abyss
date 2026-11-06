@@ -8,6 +8,8 @@ These are the invariants that all components must uphold. They are not guideline
 
 **No reply, to a read or a write, reflects a write that a failure in the configured durability class can lose.** In particular, a write is acknowledged only after its queue entry reaches the configured durability class and its effect is applied to hot. If the process fails before then, the client never saw OK and can retry. See [ADP-015](proposals/015-write-path-and-durability.md) §Durability classes and §Read visibility.
 
+**Commands on a connection keep their order.** Each command on a connection reaches its linearisation point before the next one on that connection is dispatched, and replies are written in command order, as Redis pipelines expect. A write waiting only for durability holds back nothing, so pipelined writes share flushes. Linearisation order holds whatever `queue.log_count` is. Acknowledged writes are never lost at their class. With `queue.log_count` above 1, though, writes to different logs become durable independently, so a power loss can lose an earlier unacknowledged write and keep a later one: the writes of a connection that survive form a prefix of them only at `log_count = 1`. See [ADP-005](proposals/005-resp-frontend.md) §Invariants.
+
 **Cold lag is decoupled from writes.** The cold consumer reads from the queue at its own pace and deliberately lags to accumulate writes for compaction. Its lag reaches the write path only through bounded, observable memory backpressure: hot cannot evict a key that cold has not drained. It never causes unbounded memory growth. Hot is not a queue consumer: the per-shard sequencer applies each write to hot as it logs it ([ADP-015](proposals/015-write-path-and-durability.md) §Sequenced write path).
 
 **Recovery is pure queue replay.** The cold store is never read during recovery. Hot and cold rebuild their state entirely from the queue: one scan of each log feeds the cold consumer and the hot replayer, which apply the logged effects and re-decide nothing. This eliminates consistency concerns between the queue and the stores.
@@ -53,14 +55,15 @@ Abyss acknowledges a write when it reaches the durability class set by `queue.du
 
 ### Phase 1 Threading
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Reactors will stop waiting on durability and cold reads (#161), and cold consumers will become a pool sized to cores (#177). The list below describes current behaviour.
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Cold consumers will become a pool sized to cores (#177). The list below describes current behaviour.
 
-- **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands and run each one through the tiering engine on the calling thread: a read, or a write's sequencer step (decide, reserve, apply to hot, publish) followed by its durable wait.
+- **RESP I/O threads** (reactors; a pool sized to core count) — accept connections, parse commands and run each one through the tiering engine until it must wait: a read, or a write's sequencer step (decide, reserve, apply to hot, publish). A command that must wait, for a cold read, a key load, WAL or memory capacity, or durability, registers and returns, and resumes on its reactor when the thread that ends the wait posts back. A reactor never blocks on durability or cold I/O.
+- **Cold I/O threads** (`engine.cold_io_threads`, default `min(4, max(2, CPUs))`) — cold reads, key loads and cache fills, which block in `pread`.
 - **Cold consumer threads** (one per shard) — tail the queue into the compaction buffer, flush to cold.
 - **WAL threads** — one segment-preparer thread and one flusher thread per log.
 - **Background threads** — WAL segment cleanup, hot eviction and tombstone reclamation, cold store compaction, TTL expiry scanning.
 
-There is no hot consumer or resolver thread: the sequencer applies each write to hot on the calling thread, and decides conditional writes there too. At startup, recovery's scan workers (`recovery.replay_parallelism`) rebuild hot through the hot replayer before any client is served.
+There is no hot consumer or resolver thread: the sequencer applies each write to hot on the reactor, and decides conditional writes there too. At startup, recovery's scan workers (`recovery.replay_parallelism`) rebuild hot through the hot replayer before any client is served.
 
 ### Lock Discipline
 

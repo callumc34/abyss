@@ -36,6 +36,7 @@
 #include "crc32c.h"
 #include "latch.h"
 #include "on_exit.h"
+#include "queue_waits.h"
 #include "segment_header_v2.h"
 #include "temp_dir.h"
 
@@ -182,7 +183,7 @@ class LogTest : public ::testing::Test {
     const auto bytes = Frame(shard, seq, size, appended_at);
     auto reservation = log.Reserve(static_cast<uint32_t>(size));
     if (!reservation.has_value() && reservation.error().code() == core::ErrorCode::kUnavailable) {
-      EXPECT_TRUE(log.WaitForSpare(std::chrono::steady_clock::now() + 5s));
+      EXPECT_TRUE(testing::WaitForSpare(log, std::chrono::steady_clock::now() + 5s));
       reservation = log.Reserve(static_cast<uint32_t>(size));
     }
     EXPECT_TRUE(reservation.has_value()) << reservation.error().message();
@@ -386,10 +387,10 @@ TEST_F(LogTest, NoSpareIsUnavailableUntilThePreparerResumes) {
   EXPECT_EQ(reservation.error().code(), core::ErrorCode::kUnavailable);
   EXPECT_EQ(log->ReservedTail(), tail);
   EXPECT_EQ(log->FilledPrefix(), filled);
-  EXPECT_FALSE(log->WaitForSpare(std::chrono::steady_clock::now() + 50ms));
+  EXPECT_FALSE(testing::WaitForSpare(*log, std::chrono::steady_clock::now() + 50ms));
 
   log->ResumePreparerForTesting();
-  EXPECT_TRUE(log->WaitForSpare(std::chrono::steady_clock::now() + 5s));
+  EXPECT_TRUE(testing::WaitForSpare(*log, std::chrono::steady_clock::now() + 5s));
   reservation = log->Reserve(20000);
   ASSERT_TRUE(reservation.has_value()) << reservation.error().message();
   EXPECT_EQ(reservation->pos, 3 * kSpace);
@@ -439,7 +440,7 @@ TEST_F(LogTest, ASpareBetweenTheCheckAndTheWaitIsNotLost) {
     EXPECT_TRUE(Eventually([&log] { return log->spare_count() > 0; }));
   });
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_TRUE(log->WaitForSpare(start + 10s));
+  EXPECT_TRUE(testing::WaitForSpare(*log, start + 10s));
   EXPECT_LT(std::chrono::steady_clock::now() - start, 5s) << "the spare was lost";
   EXPECT_EQ(log->SpareWaitersForTesting(), 0U);
 }
@@ -449,11 +450,12 @@ TEST_F(LogTest, RetriesOnTimeoutLeaveNoSpareWaiters) {
   ASSERT_NE(log, nullptr);
   ASSERT_NO_FATAL_FAILURE(SpendTheSpares(*log));
   for (int i = 0; i < 200; ++i) {
-    ASSERT_FALSE(log->WaitForSpare(std::chrono::steady_clock::now() + 5ms)) << "retry " << i;
+    ASSERT_FALSE(testing::WaitForSpare(*log, std::chrono::steady_clock::now() + 5ms))
+        << "retry " << i;
     ASSERT_EQ(log->SpareWaitersForTesting(), 0U) << "retry " << i;
   }
   log->ResumePreparerForTesting();
-  EXPECT_TRUE(log->WaitForSpare(std::chrono::steady_clock::now() + 5s));
+  EXPECT_TRUE(testing::WaitForSpare(*log, std::chrono::steady_clock::now() + 5s));
 }
 
 TEST_F(LogTest, ShutdownFailsSpareWaitsNowAndLater) {
@@ -461,14 +463,14 @@ TEST_F(LogTest, ShutdownFailsSpareWaitsNowAndLater) {
   ASSERT_NE(log, nullptr);
   ASSERT_NO_FATAL_FAILURE(SpendTheSpares(*log));
   auto waiting = std::async(std::launch::async, [&log] {
-    return log->WaitForSpare(std::chrono::steady_clock::now() + 20s);
+    return testing::WaitForSpare(*log, std::chrono::steady_clock::now() + 20s);
   });
   ASSERT_TRUE(Eventually([&log] { return log->SpareWaitersForTesting() == 1; }));
   log->Shutdown();
   ASSERT_EQ(waiting.wait_for(5s), std::future_status::ready);
   EXPECT_FALSE(waiting.get());
   const auto start = std::chrono::steady_clock::now();
-  EXPECT_FALSE(log->WaitForSpare(start + 10s));
+  EXPECT_FALSE(testing::WaitForSpare(*log, start + 10s));
   EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
 }
 

@@ -139,15 +139,16 @@ Mix of embedded and external. For example: the in-process hot store with a NATS 
 
 ### Phase 1: Single-Pod, Multithreaded
 
-> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Reactors will stop waiting on durability and cold reads (#161), and cold consumers will become a pool sized to cores (#177). The model below describes current behaviour until then.
+> **Changing under [ADP-015](proposals/015-write-path-and-durability.md).** Cold consumers will become a pool sized to cores (#177). The model below describes current behaviour until then.
 
 Phase 1 uses a conventional multithreaded model within a single pod:
 
-- **RESP I/O threads** (pool, sized to core count) — accept connections, parse commands and run each one through the tiering engine on the calling thread: a read, or a write's sequencer step (decide, reserve, apply to hot, publish) followed by its durable wait.
+- **RESP I/O threads** (reactors; a pool sized to core count) — accept connections, parse commands and run each one through the tiering engine until it must wait: a read, or a write's sequencer step (decide, reserve, apply to hot, publish). A command that must wait, for a cold read, a key load, WAL or memory capacity, or durability, registers and returns; it resumes on its reactor when the thread that ends the wait posts back. A reactor never blocks on durability or cold I/O ([ADP-015](proposals/015-write-path-and-durability.md) §Asynchronous request execution). A connection's commands each reach their linearisation point before the next is dispatched, and its replies are written in command order.
+- **Cold I/O threads** (`engine.cold_io_threads`, default `min(4, max(2, CPUs))`) — cold reads, key loads and cache fills, which block in `pread`.
 - **Cold consumer threads** (one per shard) — tail the queue into the compaction buffer, flush to cold.
 - **Background threads** — the WAL flusher and segment preparer, WAL segment cleanup, hot eviction and tombstone reclamation, cold store compaction, TTL expiry scanning.
 
-There is no hot consumer or resolver thread: the sequencer applies each write to hot as it logs it, on the calling thread. At startup, recovery's scan rebuilds hot through the hot replayer before any client is served.
+There is no hot consumer or resolver thread: the sequencer applies each write to hot as it logs it, on the reactor. At startup, recovery's scan rebuilds hot through the hot replayer before any client is served.
 
 Hot store access is protected by a sharded lock scheme (lock striping by shard, where the shard is derived from the key's CRC16 slot — see [ADP-014](proposals/014-slot-routing-and-topology.md)). Reads take a shard's lock shared; the sequencer takes it exclusively to decide, reserve and apply a write, and loads of non-resident keys run off the lock under per-key load tokens. The compaction buffer uses a `shared_mutex` (concurrent reads from I/O threads, exclusive writes from cold consumer).
 

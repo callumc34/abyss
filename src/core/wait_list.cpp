@@ -1,47 +1,11 @@
 #include "abyss/core/wait_list.h"
 
 #include <array>
-#include <condition_variable>
 #include <utility>
 
 #include "abyss/core/fatal.h"
 
 namespace abyss::core {
-namespace {
-
-// A blocking caller's waiter, on its stack. Wake notifies under mu_,
-// and the caller destroys it only after relocking mu_ and seeing done_,
-// so no notifier is still inside cv_ by then.
-class BlockingWaiter final : public Waiter {
- public:
-  void Wake(Result<void> result) noexcept override {
-    const std::scoped_lock lock(mu_);
-    result_ = std::move(result);
-    done_ = true;
-    cv_.notify_one();
-  }
-
-  bool WaitUntil(SteadyTime deadline) {
-    std::unique_lock lock(mu_);
-    return cv_.wait_until(lock, deadline, [this] ABYSS_REQUIRES(mu_) { return done_; });
-  }
-
-  // Waits for the wake, then rearms for the next registration.
-  Result<void> Take() {
-    std::unique_lock lock(mu_);
-    cv_.wait(lock, [this] ABYSS_REQUIRES(mu_) { return done_; });
-    done_ = false;
-    return std::exchange(result_, {});
-  }
-
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  Result<void> result_ ABYSS_GUARDED_BY(mu_);
-  bool done_ ABYSS_GUARDED_BY(mu_) = false;
-};
-
-}  // namespace
 
 Waiter::~Waiter() {
   if (linked_) Fatal("Waiter destroyed while linked");
@@ -79,23 +43,6 @@ void WaitList::FailAll(const Error& error) {
   std::array<Waiter*, kWakeBatch> woken{};
   while (const size_t n = PopFront(woken, /*ok=*/false)) {
     for (Waiter* waiter : std::span(woken).first(n)) waiter->Wake(std::unexpected(error));
-  }
-}
-
-Result<void> WaitList::Await(const std::function<bool()>& condition, SteadyTime deadline) {
-  BlockingWaiter waiter;
-  while (true) {
-    // A woken pass hands off inside Register.
-    if (auto ready = Register(waiter, condition)) return *std::move(ready);
-    // A lost Cancel means a wake is on its way, and the waiter must
-    // outlive it.
-    if (!waiter.WaitUntil(deadline) && Cancel(waiter)) {
-      return std::unexpected(Error{ErrorCode::kTimeout, "wait timed out"});
-    }
-    if (Result<void> wake = waiter.Take(); !wake.has_value()) {
-      Finish(waiter);
-      return wake;
-    }
   }
 }
 

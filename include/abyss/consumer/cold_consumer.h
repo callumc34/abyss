@@ -20,7 +20,6 @@
 #include "abyss/core/queue.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/core/result.h"
-#include "abyss/core/seq_waiters.h"
 #include "abyss/core/types.h"
 #include "abyss/core/wait_list.h"
 #include "abyss/metrics/consumer_metrics.h"
@@ -180,11 +179,9 @@ class ColdConsumer {
   // The shard's log clock (CompactionBuffer::LogClockMs). Any thread.
   uint64_t LogClockMs() const { return buffer_.LogClockMs(); }
 
-  // Registers `node`, posted once the drained seq passes its seq:
-  // SeqWaiters::Register. WhenDrained also asks the loop to drain now.
-  std::optional<core::Result<void>> WhenDrained(core::SeqWaiterNode& node);
-  bool CancelDrained(core::SeqWaiterNode& node) noexcept { return drained_waiters_.Cancel(node); }
-  std::size_t DrainedWaitersForTesting() const noexcept { return drained_waiters_.size(); }
+  // Asks the loop to drain now rather than finish its idle backoff,
+  // which may be an order of magnitude longer than a waiter's deadline.
+  void RequestDrain();
   // CompactionBufferRouter::WhenDrainedPast on this shard.
   std::optional<core::Result<void>> WhenDrainedPast(core::SequenceId past, core::Waiter& waiter);
   bool CancelDrainWait(core::Waiter& waiter) noexcept { return room_waiters_.Cancel(waiter); }
@@ -269,7 +266,6 @@ class ColdConsumer {
   // graceful-drain commit is durable-gated even when fewer than the cadence
   // threshold of batches flushed.
   void TryAdvanceCommit(bool force_checkpoint = false);
-  void RequestDrain();
   void NotifyDrained() noexcept;
 
   core::Queue& queue_;
@@ -327,10 +323,6 @@ class ColdConsumer {
   std::chrono::steady_clock::time_point last_checkpoint_at_{};
   std::atomic<uint64_t> flushes_applied_{0};
 
-  // Waiters on latest_drained_seq_, an inclusive end: ready once it
-  // passes a node's seq, so drained through seq + 1. A per-seq wait,
-  // woken in seq order, has no head for a small request to pass.
-  core::SeqWaiters drained_waiters_;
   // Waiters for room in hot: each advance wakes the front one, which
   // evicts again and hands on if that left the shard under its limit.
   // Waking them all would herd them on the shard's exclusive lock.
