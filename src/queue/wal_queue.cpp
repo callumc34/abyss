@@ -449,6 +449,14 @@ void WalQueue::SetFlushHookForTesting(const FlushHook& hook) {
   }
 }
 
+uint64_t WalQueue::FilledPrefixForTesting(uint32_t log) const {
+  return logs_.at(log)->log->FilledPrefix();
+}
+
+uint64_t WalQueue::ReservedTailForTesting(uint32_t log) const {
+  return logs_.at(log)->log->ReservedTail();
+}
+
 DurableExtent WalQueue::DurableExtentForTesting(uint32_t log) const {
   const LogPosition durable = logs_.at(log)->log->DurablePrefix();
   const uint64_t ordinal = durable / frame_space_;

@@ -167,6 +167,9 @@ class WalQueue : public core::Queue, public SegmentRegistry {
   // A blocking hook stalls flushes; an error is a fatal flush failure.
   void SetFlushHookForTesting(const FlushHook& hook);
   DurableExtent DurableExtentForTesting(uint32_t log) const;
+  // `log`'s filled prefix and reserved tail.
+  uint64_t FilledPrefixForTesting(uint32_t log) const;
+  uint64_t ReservedTailForTesting(uint32_t log) const;
   // The data syncs `log`'s flushes have run.
   uint64_t SyncCountForTesting(uint32_t log) const;
   // Close without the final flush, as a power loss at teardown would.

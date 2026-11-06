@@ -640,6 +640,16 @@ TEST_P(ColdPowerLossTest, StaleFramesPastTheDurableEndAreNeverReplayed) {
     return testing::AppendBatch(*queue_, 0, batch_entries);
   });
   ASSERT_TRUE(in_batch->Wait());
+  // Committed is not yet filled: another committer may still be folding
+  // the frame in, and a flush only reaches the filled prefix.
+  const uint64_t first_filled = queue_->ReservedTailForTesting(0) - (4 * frame_bytes);
+  const auto fill_by = std::chrono::steady_clock::now() + 10s;
+  while (queue_->FilledPrefixForTesting(0) < first_filled &&
+         std::chrono::steady_clock::now() < fill_by) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_GE(queue_->FilledPrefixForTesting(0), first_filled)
+      << "the batch's first frame never filled";
   stall_.Allow(2);
   ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(1, x));
   ASSERT_NO_FATAL_FAILURE(AwaitPowerDurable(2, y));
