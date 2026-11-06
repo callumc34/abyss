@@ -136,8 +136,9 @@ struct NetConfig {
   // exits nonzero.
   std::chrono::seconds shutdown_timeout{60};
   std::chrono::milliseconds reaper_tick{1000};
-  // Commands a connection has dispatched and not yet written; reading
-  // pauses at the cap.
+  // Commands a connection has in flight, dispatched and not yet written
+  // or written and still owed a durable post; reading pauses at the cap.
+  // At most 65536, at 464 B a slot.
   uint32_t max_inflight_commands = 1024;
 };
 

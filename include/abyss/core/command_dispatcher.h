@@ -50,6 +50,10 @@ struct Outcome {
   Result<RespValue> reply;
 };
 
+// Why a pending command is given up: its deadline passed, or the
+// server is stopping and its connection is gone.
+enum class AbandonReason : uint8_t { kDeadline, kShutdown };
+
 // One command in flight, the caller's: where its events go, its
 // deadline, which Dispatch sets, and its durable wait once sequenced.
 // Reused for later commands once replied and quiescent.
@@ -78,10 +82,10 @@ class Task {
   // its wait. Once abandoned, it only cleans up, and its outcome is
   // to be ignored.
   virtual Outcome Run(Slot& slot, Result<void> wake) = 0;
-  // At the deadline of a kPending command: its timeout reply. It will
-  // never apply, but stays busy until a wake or a job already on its
-  // way arrives through Run.
-  virtual Result<RespValue> Abandon(Slot& slot) = 0;
+  // A kPending command given up for `reason`: its reply, a timeout's
+  // at the deadline. It will never apply, but stays busy until a wake
+  // or a job already on its way arrives through Run.
+  virtual Result<RespValue> Abandon(Slot& slot, AbandonReason reason) = 0;
   // Linked on no wait list, owed no wake, and with no job or load
   // placeholder outstanding: safe to reuse or free.
   virtual bool Quiescent() const = 0;

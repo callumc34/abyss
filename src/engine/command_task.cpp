@@ -14,6 +14,11 @@ core::Error ReadTimedOut() {
   return core::Error{core::ErrorCode::kTimeout, "read timed out loading its key"};
 }
 
+// Not a timeout, and counted as none.
+core::Error ShuttingDown() {
+  return core::Error{core::ErrorCode::kUnavailable, "command abandoned: server shutting down"};
+}
+
 }  // namespace
 
 core::Outcome Fenced(core::Queue& queue, core::Slot& slot, core::Result<core::RespValue> reply,
@@ -101,34 +106,38 @@ core::Outcome CommandTask::Run(core::Slot& slot, core::Result<void> wake) {
   return Answered(slot);
 }
 
-core::Result<core::RespValue> CommandTask::Abandon(core::Slot& /*slot*/) {
+core::Result<core::RespValue> CommandTask::Abandon(core::Slot& /*slot*/,
+                                                   core::AbandonReason reason) {
   ABYSS_DCHECK(owner_ == std::this_thread::get_id(), "a task abandoned off its owner's thread");
   const bool pending = mode_ != Mode::kIdle && !abandoned_;
   ABYSS_DCHECK(pending, "a task abandoned while not pending");
+  const bool shutdown = reason == core::AbandonReason::kShutdown;
   // A job still queued is taken back: it never runs and never posts,
   // and what it would have released is released here, off the pool's
   // lock. One a thread has taken lands, and its post finds this.
   const bool cancelled = job_ && pool_.Cancel(io_);
   if (cancelled) {
     job_ = false;
-    io_.Unrun(ReadTimedOut());
+    io_.Unrun(shutdown ? ShuttingDown() : ReadTimedOut());
   }
   // Armed on another's load: left, unless it has begun to land.
   if (armed_ && reads_.CancelJoin(flight_)) {
     armed_ = false;
     flight_.Reset();
   }
+  // Replied counts only a timeout's reply as a deadline exceeded.
   core::Result<core::RespValue> reply;
   if (mode_ == Mode::kWrite) {
-    reply = sequencer_.Abandon(write_);
+    reply = sequencer_.Abandon(write_, reason);
     // Its loads ended unrun: the attempt that ends its wait runs now.
     if (cancelled) (void)sequencer_.Attempt(write_);
   } else if (mode_ == Mode::kMiss && op_.has_value()) {
-    reply = reads_.Failed(*op_, ReadTimedOut());
+    reply = reads_.Failed(*op_, shutdown ? ShuttingDown() : ReadTimedOut());
     reads_.Replied(ReadPath::KindOf(*op_), reply);
   } else {
-    reply =
-        std::unexpected(core::Error{core::ErrorCode::kTimeout, "read timed out loading its keys"});
+    reply = std::unexpected(
+        shutdown ? ShuttingDown()
+                 : core::Error{core::ErrorCode::kTimeout, "read timed out loading its keys"});
     reads_.Replied(metrics::IoKind::kPoint, reply);
   }
   const bool owes = cancelled && !Quiescent();

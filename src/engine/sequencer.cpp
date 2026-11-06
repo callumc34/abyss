@@ -60,6 +60,11 @@ core::Result<core::RespValue> TimedOut(RedecideReason reason) {
   return std::unexpected(core::Error{core::ErrorCode::kTimeout, "write timed out"});
 }
 
+// A write given up at shutdown: no timeout, and counted as none.
+core::Error ShuttingDown() {
+  return core::Error{core::ErrorCode::kUnavailable, "command abandoned: server shutting down"};
+}
+
 core::Error SpareTimedOut(bool flush) {
   return core::Error{core::ErrorCode::kTimeout,
                      flush ? "flush timed out waiting for a spare WAL segment"
@@ -265,15 +270,17 @@ std::optional<core::Result<core::RespValue>> Sequencer::Sequence(PendingWrite& w
   return wait.Ready();
 }
 
-core::Result<core::RespValue> Sequencer::Abandon(PendingWrite& write) {
+core::Result<core::RespValue> Sequencer::Abandon(PendingWrite& write, core::AbandonReason reason) {
   ABYSS_DCHECK(write.owner_ == std::this_thread::get_id(),
                "a write abandoned off its owner's thread");
   const bool waiting = write.waiting_ && !write.abandoned_;
   ABYSS_DCHECK(waiting, "a write abandoned while not waiting");
   ABYSS_DCHECK(!write.wake_.has_value(), "a write abandoned with its wake in hand");
+  write.shutdown_ = reason == core::AbandonReason::kShutdown;
   // Its load job owns what the loads touch until it posts.
   if (write.wait_reason_ == WaitReason::kLoads) {
     write.abandoned_ = true;
+    if (write.shutdown_) return std::unexpected(ShuttingDown());
     return TimedOut(RedecideReason::kLoad);
   }
   bool cancelled = false;
@@ -941,6 +948,7 @@ void Sequencer::EndWait(PendingWrite& write, const std::optional<core::Result<vo
 
 core::Result<core::RespValue> Sequencer::TimeoutOf(PendingWrite& write,
                                                    const std::optional<core::Result<void>>& wake) {
+  if (write.shutdown_) return std::unexpected(ShuttingDown());
   const bool failed = wake.has_value() && !wake->has_value();
   switch (write.wait_reason_) {
     case WaitReason::kAdmission:

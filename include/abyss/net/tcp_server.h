@@ -77,8 +77,11 @@ class TcpServer {
   // checks it has no orphans, and stops. Joins them.
   void Join();
 
-  // All of it, for a server with no engine to stop on the way: orphans
-  // are waited for, up to the grace, before the reactors stop.
+  // All of it, only for a server with no engine to stop on the way,
+  // whose commands owe nothing once answered: orphans are waited for,
+  // up to the grace, and the reactors then stop with none left, or
+  // fail their check. A server over the async engine stops with
+  // Shutdown, which stops the engine before the reactors.
   void Stop();
   // The server's: StopAccepting, Quiesce for the grace, ForceClose, then
   // the engine's stop and Join. Past shutdown_timeout from ForceClose,

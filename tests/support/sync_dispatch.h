@@ -47,7 +47,8 @@ class SyncConnection {
       std::optional<core::CompletionEvent> event =
           inbox_.Take(reply.has_value() ? std::nullopt : std::optional(slot_.deadline));
       if (!event.has_value()) {
-        reply = pending ? task_->Abandon(slot_) : slot_.durable.Expire();
+        reply = pending ? task_->Abandon(slot_, core::AbandonReason::kDeadline)
+                        : slot_.durable.Expire();
         continue;
       }
       if (event->client_id != client_id_ || event->slot_seq != seq_) continue;

@@ -127,6 +127,7 @@ constexpr auto kConditional = std::to_array<std::string_view>({
     "abyss_net_backpressure_exited_total",
     "abyss_net_orphans",
     "abyss_net_late_completions_total",
+    "abyss_net_commands_abandoned_total",
     // Errors and faults.
     "abyss_resp_parse_errors_total",
     "abyss_queue_offset_persist_failures_total",

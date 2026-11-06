@@ -95,7 +95,8 @@ class SequencerWaitTest : public SequencedEngineTest {
   // clock. A wake its notifier had already taken still comes, and only
   // cleans up.
   Step Expired(PendingWrite& write) {
-    core::Result<core::RespValue> reply = sequencer_->Abandon(write);
+    core::Result<core::RespValue> reply =
+        sequencer_->Abandon(write, core::AbandonReason::kDeadline);
     if (!write.Quiescent() && sink_.WaitFor(seen_ + 1)) {
       write.Woken(sink_.Events().at(seen_++).result);
       (void)sequencer_->Attempt(write);

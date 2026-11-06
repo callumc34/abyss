@@ -111,11 +111,15 @@ void Reactor::Run() {
     if (server_.engine_done_.load(std::memory_order_acquire)) break;
   }
 
-  // Nothing posts once the engine is done: one more take lands the
-  // last of it, and whatever its connections left owed is settled.
-  DrainInbox();
-  ForceCloseAll();
-  SweepClosed();
+  // Nothing else posts once the engine is done, but what lands here
+  // may post again from this thread, as a stopped pool fails a job:
+  // take until a take finds nothing.
+  bool took = true;
+  while (took) {
+    took = DrainInbox();
+    ForceCloseAll();
+    SweepClosed();
+  }
   inbox_.Close();
   ABYSS_DCHECK(orphans_.empty(), "a reactor stopped with orphans still owed a post");
   force_closed_.store(true, std::memory_order_release);
@@ -134,8 +138,9 @@ std::chrono::milliseconds Reactor::PollTimeout(std::chrono::milliseconds reaper_
   return std::min(std::chrono::ceil<std::chrono::milliseconds>(until), reaper_tick);
 }
 
-void Reactor::DrainInbox() {
+bool Reactor::DrainInbox() {
   inbox_.Take(events_);
+  if (events_.empty()) return false;
   for (const core::CompletionEvent& event : events_) {
     const auto it = connections_.find(event.client_id);
     Connection* const conn = it != connections_.end() ? it->second.get() : nullptr;
@@ -148,6 +153,7 @@ void Reactor::DrainInbox() {
   events_.clear();
   for (Connection* const conn : touched_) conn->Pump();
   touched_.clear();
+  return true;
 }
 
 void Reactor::DrainHandoff() {
@@ -157,11 +163,17 @@ void Reactor::DrainHandoff() {
     drained.swap(handoff_queue_);
   }
 
+  const resp::PipelineHost host{
+      .sink = &inbox_,
+      .timers = &timers_,
+      .abandoned_deadline = server_.metrics_.abandoned_deadline,
+      .abandoned_shutdown = server_.metrics_.abandoned_shutdown,
+  };
   for (auto& entry : drained) {
     auto conn = std::make_unique<Connection>(
         std::move(entry.fd), entry.remote_ipv4, entry.remote_port, entry.client_id, *poller_,
         server_.registry_, server_.deps_, server_.config_.connection, server_.metrics_,
-        server_.clock_, resp::PipelineHost{.sink = &inbox_, .timers = &timers_});
+        server_.clock_, host);
 
     if (auto r = conn->Arm(); !r) {
       ABYSS_LOG_WARN("arm failed; dropping connection", {"client_id", entry.client_id},

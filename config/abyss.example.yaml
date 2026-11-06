@@ -109,7 +109,16 @@ net:
   write_backpressure_bytes: 4194304   # 4 MiB — pause reading
   write_resume_bytes: 1048576         # 1 MiB — resume reading
   write_hard_limit_bytes: 16777216    # 16 MiB — close
+  # Commands a connection has in flight, dispatched and not yet written
+  # or written and still owed a durable post; reading pauses at the cap.
+  # 1..65536, at 464 B a slot.
+  max_inflight_commands: 1024
+  # SIGTERM: in-flight commands get the grace; then connections close and
+  # the engine stops within the timeout, past which the process exits 70.
+  # The timeout must be >= drain_grace_seconds + command_timeout_ms + 5 s,
+  # and grace + timeout <= the pod's terminationGracePeriodSeconds.
   shutdown_grace_seconds: 30
+  shutdown_timeout_seconds: 60
   reaper_tick_ms: 1000
 
 metrics:

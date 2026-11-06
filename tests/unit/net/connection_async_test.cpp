@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#ifndef _WIN32
+#include <sys/socket.h>
+#endif
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +103,47 @@ class ConnectionAsyncTest : public ::testing::Test {
     if (conn_ != nullptr && !conn_->IsClosed()) conn_->Pump();
   }
   bool ReadArmed() const { return Has(poller_.LastInterest(), EventKind::kReadable); }
+  bool WriteArmed() const { return Has(poller_.LastInterest(), EventKind::kWritable); }
+
+  // The peer's: sends what the socket takes, and reads what has come.
+  size_t SendSome(std::string_view data) {
+    if (data.empty()) return 0;
+    const auto n = pnet::Send(pair_.Write(), data.data(), data.size(), 0);
+    if (n > 0) return static_cast<size_t>(n);
+    EXPECT_TRUE(pnet::IsWouldBlock(pnet::LastError())) << pnet::LastErrorString();
+    return 0;
+  }
+  std::string ReceiveSome() {
+    std::string got;
+    char buf[4096];  // NOLINT(modernize-avoid-c-arrays)
+    for (;;) {
+      const auto n = pnet::Recv(pair_.Write(), buf, sizeof(buf), 0);
+      if (n <= 0) return got;
+      got.append(buf, static_cast<size_t>(n));
+    }
+  }
+  // The reactor's part for a connection whose engine replies at once:
+  // an event only for the interest it has armed. Armed for nothing
+  // with replies still owed, it has stalled, as nothing would run it.
+  std::string Serve(Connection& conn, const std::string& input, size_t want) {
+    size_t sent = 0;
+    std::string got;
+    const auto until = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < until) {
+      sent += SendSome(std::string_view(input).substr(sent));
+      got += ReceiveSome();
+      if (got.size() >= want || conn.IsClosed()) break;
+      const bool read = ReadArmed();
+      const bool write = WriteArmed();
+      if (!read && !write) {
+        ADD_FAILURE() << "armed for nothing at " << got.size() << " of " << want << " bytes";
+        break;
+      }
+      if (read) conn.OnReadable();
+      if (write) conn.OnWritable();
+    }
+    return got;
+  }
 
   static constexpr uint64_t kClient = 9;
 
@@ -151,6 +196,57 @@ TEST_F(ConnectionAsyncTest, TheSlotCapPausesReadingUntilHalfIsFree) {
   Deliver();
   EXPECT_EQ(Received(16), Bulk("s2") + Bulk("s3"));
   EXPECT_FALSE(conn.ReadingPaused());
+  EXPECT_TRUE(ReadArmed());
+}
+
+// The cap stops the feed with input left. The pass that writes the
+// replies filling it feeds the rest, as no event comes for bytes
+// already read.
+TEST_F(ConnectionAsyncTest, InputLeftAtTheSlotCapRunsOnceItsPassFreesTheSlots) {
+  Connection& conn = Open({.max_inflight_commands = 2});
+  const std::string pong = "+PONG\r\n";
+  EXPECT_EQ(Serve(conn, Command({"PING"}) + Command({"PING"}) + Command({"PING"}), 3 * pong.size()),
+            pong + pong + pong);
+  EXPECT_TRUE(ReadArmed());
+}
+
+// With room in the socket for all of them, the 5000 arrive in one
+// read: the cap stops the feed at 1024 with the rest buffered.
+TEST_F(ConnectionAsyncTest, FiveThousandSetsWrittenAtOnceAllReplyAtTheDefaultCap) {
+  constexpr size_t kCommands = 5000;
+#ifndef _WIN32
+  for (const Socket end : {pair_.Read(), pair_.Write()}) {
+    constexpr int kBytes = 1024 * 1024;
+    ASSERT_EQ(::setsockopt(end, SOL_SOCKET, SO_RCVBUF, &kBytes, sizeof(kBytes)), 0);
+    ASSERT_EQ(::setsockopt(end, SOL_SOCKET, SO_SNDBUF, &kBytes, sizeof(kBytes)), 0);
+  }
+#endif
+  Connection& conn = Open();
+  std::string input;
+  std::string expected;
+  for (size_t i = 0; i < kCommands; ++i) {
+    const std::string key = "r" + std::to_string(i);
+    input += Command({"SET", key, "v"});
+    expected += Bulk(key);
+  }
+#ifndef _WIN32
+  ASSERT_EQ(SendSome(input), input.size()) << "the socket takes them all at once";
+  input.clear();
+#endif
+  EXPECT_EQ(Serve(conn, input, expected.size()), expected);
+  EXPECT_EQ(dispatcher_.dispatched.size(), kCommands);
+}
+
+TEST_F(ConnectionAsyncTest, InputLeftAtTheReplyByteLimitRunsOnceItsPassWritesThem) {
+  constexpr int kPings = 20;
+  Connection& conn = Open({.write_backpressure_bytes = 64, .write_resume_bytes = 32});
+  std::string input;
+  std::string expected;
+  for (int i = 0; i < kPings; ++i) {
+    input += Command({"PING"});
+    expected += "+PONG\r\n";
+  }
+  EXPECT_EQ(Serve(conn, input, expected.size()), expected);
   EXPECT_TRUE(ReadArmed());
 }
 

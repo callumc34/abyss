@@ -333,7 +333,7 @@ TEST_F(SequencerAttemptTest, AWakeRacingTheDeadlineLosesTheCancelAndIsNeverAppli
   std::thread notifier([this] { queue_.SetAdmissible(true); });
   ASSERT_TRUE(gated.entered.Wait());
   // The deadline's timer: Abandon reads no clock.
-  const auto reply = sequencer_->Abandon(write);
+  const auto reply = sequencer_->Abandon(write, core::AbandonReason::kDeadline);
   ASSERT_FALSE(reply.has_value());
   EXPECT_EQ(reply.error().code(), core::ErrorCode::kResourceExhausted);
   EXPECT_FALSE(write.Quiescent()) << "the notifier had it, so its wake is owed";
@@ -353,7 +353,7 @@ TEST_F(SequencerAttemptTest, AnExpiredWaitIsCancelledAndRepliesWithItsTimeout) {
   auto write = Write({"SET", "k", "v"}, 10s);
   ASSERT_EQ(Attempt(*write).kind, Step::Kind::kWait);
   // The deadline's timer: Abandon reads no clock.
-  const auto reply = sequencer_->Abandon(*write);
+  const auto reply = sequencer_->Abandon(*write, core::AbandonReason::kDeadline);
   EXPECT_TRUE(write->Quiescent()) << "cancelled: nothing is owed";
   EXPECT_EQ(queue_.AdmissionWaiters(), 0U);
   ASSERT_FALSE(reply.has_value());

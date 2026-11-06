@@ -143,6 +143,7 @@ Recovery is one scan of the log that feeds each shard's cold consumer and the ho
 - `abyss_net_backpressure_entered_total` / `abyss_net_backpressure_exited_total` (counters) — back-pressure transitions
 - `abyss_net_orphans` (gauge) — what connections left owed an engine event: tasks their deadline abandoned while a cold read or a wake of theirs was still out, and closed connections' pipelines with commands still in flight. Each goes once its last event lands; a steady rise means events are being lost
 - `abyss_net_late_completions_total` (counter) — engine events that named no live or orphaned command, and were dropped
+- `abyss_net_commands_abandoned_total{reason}` (counter) — pending commands given up; `reason` ∈ `deadline | shutdown`. A `shutdown` abandon is a command whose connection the server closed as it stopped: it never applies, and counts as no timeout
 
 ## Health Endpoints
 

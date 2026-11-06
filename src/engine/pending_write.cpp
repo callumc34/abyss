@@ -75,6 +75,7 @@ void PendingWrite::Reset(FlushAll /*flush*/, core::Completion completion,
   wake_.reset();
   expired_ = false;
   abandoned_ = false;
+  shutdown_ = false;
   admit_next_ = 0;
   refusal_.reset();
   spare_next_ = 0;

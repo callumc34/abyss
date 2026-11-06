@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "abyss/consumer/compaction_buffer_router.h"
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/completion.h"
 #include "abyss/core/durable_wait.h"
 #include "abyss/core/predicate.h"
@@ -70,12 +71,13 @@ class Sequencer final : private core::DurableWait::Timer {
   std::optional<core::Result<core::RespValue>> Sequence(PendingWrite& write,
                                                         core::DurableWait& wait,
                                                         core::Completion completion);
-  // At its deadline, for a write that returned kWait: its timeout
-  // reply, and it is never applied. Its wait is cancelled if it can be;
-  // otherwise its wake or its loads are on their way, and the Attempt
-  // they run only cleans up: FinishWait's hand-off, and installs of the
-  // loads it took whose tokens still allow them.
-  core::Result<core::RespValue> Abandon(PendingWrite& write);
+  // Given up for `reason`, a write that returned kWait: its reply, a
+  // timeout's at the deadline, and it is never applied. Its wait is
+  // cancelled if it can be; otherwise its wake or its loads are on
+  // their way, and the Attempt they run only cleans up: FinishWait's
+  // hand-off, and installs of the loads it took whose tokens still
+  // allow them. Given up at shutdown, it counts as no rejection.
+  core::Result<core::RespValue> Abandon(PendingWrite& write, core::AbandonReason reason);
 
   SequencerStats Snapshot() const;
   const SequencerConfig& config() const { return config_; }

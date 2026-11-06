@@ -170,7 +170,8 @@ class DispatchTest : public SequencedEngineTest {
       std::optional<core::CompletionEvent> event =
           conn.inbox.Take(reply.has_value() ? std::nullopt : std::optional(conn.slot.deadline));
       if (!event.has_value()) {
-        reply = pending ? conn.task->Abandon(conn.slot) : conn.slot.durable.Expire();
+        reply = pending ? conn.task->Abandon(conn.slot, core::AbandonReason::kDeadline)
+                        : conn.slot.durable.Expire();
         continue;
       }
       if (event->slot_seq != conn.seq) continue;
@@ -526,7 +527,7 @@ TEST_F(DispatchTest, ADeadlineWhileALoadRunsInstallsItAndFreesTheKey) {
   ASSERT_EQ(hot_->LoadWaitersForTesting("s"), 1U) << "the next write waits on the key";
 
   // The deadline, as the connection's timer would fire it.
-  const auto reply = late.task->Abandon(late.slot);
+  const auto reply = late.task->Abandon(late.slot, core::AbandonReason::kDeadline);
   EXPECT_EQ(Text(reply), "error: write timed out loading its keys");
   EXPECT_FALSE(late.Quiescent()) << "its load job is still running";
 
@@ -581,7 +582,7 @@ TEST_F(DispatchTest, ALoadCompletionRacingAbandonNeverApplies) {
       gate_->release.Open();
     });
     std::this_thread::sleep_for(200us);
-    const auto reply = conn.task->Abandon(conn.slot);
+    const auto reply = conn.task->Abandon(conn.slot, core::AbandonReason::kDeadline);
     releaser.join();
     EXPECT_EQ(Text(reply), "error: write timed out loading its keys");
     std::optional<core::CompletionEvent> event = conn.inbox.Take(core::SteadyClock::now() + 10s);
@@ -663,7 +664,8 @@ TEST_F(DispatchTest, AbandonTakesBackAQueuedLoadJobAndFreesItsKey) {
   }
   for (int i = 0; i < kWrites; ++i) {
     Conn& conn = *abandoned[static_cast<size_t>(i)];
-    EXPECT_EQ(Text(conn.task->Abandon(conn.slot)), "error: write timed out loading its keys");
+    EXPECT_EQ(Text(conn.task->Abandon(conn.slot, core::AbandonReason::kDeadline)),
+              "error: write timed out loading its keys");
     EXPECT_TRUE(conn.Quiescent()) << "its job was still queued, so nothing is owed";
     EXPECT_EQ(hot_->LoadWaitersForTesting("q" + std::to_string(i)), 0U) << "the key stayed held";
   }
@@ -756,7 +758,7 @@ TEST_F(DispatchTest, AnAbandonRacingTheLandingLeavesNoJoiner) {
       gate_->release.Open();
     });
     std::this_thread::sleep_for(150us);
-    EXPECT_FALSE(joiner.task->Abandon(joiner.slot).has_value());
+    EXPECT_FALSE(joiner.task->Abandon(joiner.slot, core::AbandonReason::kDeadline).has_value());
     releaser.join();
     EXPECT_EQ(Text(Finish(leader, std::move(led))), "v");
     Drain(joiner);
@@ -982,7 +984,7 @@ TEST_F(DispatchTest, AResumedTaskChecksForAbandonmentFirst) {
   // Their load ends, so the wake is posted before the abandon.
   hot_->AbortLoad("s", theirs.token);
   while (conn.inbox.Pending() == 0) std::this_thread::sleep_for(1ms);
-  EXPECT_EQ(Text(conn.task->Abandon(conn.slot)),
+  EXPECT_EQ(Text(conn.task->Abandon(conn.slot, core::AbandonReason::kDeadline)),
             "error: write timed out awaiting a load of its key");
   std::optional<core::CompletionEvent> event = conn.inbox.Take(core::SteadyClock::now() + 1s);
   ASSERT_TRUE(event.has_value());

@@ -8,8 +8,7 @@
 namespace abyss::core {
 
 enum class CompletionKind : uint8_t {
-  kSequenced,
-  kReplied,
+  // A sequenced command's durable wait advanced.
   kDurable,
   // A parked task's wait ended: run it again on its owner's thread.
   kResume,

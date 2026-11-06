@@ -41,7 +41,8 @@ constexpr size_t kMapReserveBytesPerKey = 256;
 constexpr std::chrono::milliseconds kStopPollInterval{100};
 }  // namespace
 
-Server::Server(config::Config config) : config_(std::move(config)) {
+Server::Server(config::Config config, ServerTestHooks hooks)
+    : config_(std::move(config)), hooks_(std::move(hooks)) {
   lifecycle_gauge_ = metrics::Registry::Instance().Gauge(metrics::names::kServerLifecycleState);
   Transition(LifecycleState::kInitializing);
 }
@@ -203,7 +204,9 @@ bool Server::Initialize() {
       },
       *eviction_policy_);
 
-  loader_ = std::make_unique<engine::Loader>(*hot_store_, *cold_pool_, *cold_store_);
+  loader_ = std::make_unique<engine::Loader>(
+      *hot_store_, *cold_pool_,
+      hooks_.loader_cold ? hooks_.loader_cold(*cold_store_) : *cold_store_);
   sequencer_ =
       std::make_unique<engine::Sequencer>(*hot_store_, *queue_, *loader_, *cold_pool_,
                                           engine::SequencerConfig{
@@ -248,8 +251,6 @@ bool Server::Initialize() {
   // Server::Run asserts ONLY after recovery completes AND the cold
   // consumers are live. This closes the ENGINE-1 window where the gate
   // lifted on coordinator completion alone, before the pools had started.
-  // The gate is also re-asserted in kDraining (>kServing is false) so
-  // shutdown stops accepting data writes.
   loading_ = std::make_unique<LoadingStateImpl>([this] { return !IsServing(); });
   resp_metrics_ = std::make_unique<resp::RespMetrics>(resp::GlobalRegistry());
 
@@ -572,10 +573,8 @@ void Server::Shutdown() {
 
   ABYSS_LOG_INFO("shutdown starting");
 
-  // kDraining re-asserts the LOADING gate and flips /ready to 503 (both derive
-  // from lifecycle_ != kServing) so K8s pulls the pod from Service endpoints
-  // before we tear down the data plane. Admin liveness keeps responding via the
-  // http servers below until they're stopped.
+  // kDraining flips /ready to 503 so K8s pulls the pod from Service
+  // endpoints before we tear down the data plane.
   if (admin_http_) admin_http_->Stop();
   if (metrics_http_) metrics_http_->Stop();
 

@@ -4,13 +4,25 @@
 
 #ifdef ABYSS_HAVE_ROCKSDB
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -26,6 +38,7 @@
 #include "abyss/core/ops.h"
 #include "abyss/core/types.h"
 #include "abyss/engine/io_pool.h"
+#include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
 #include "abyss/metrics/testing.h"
 #include "abyss/net/tcp_server.h"
@@ -40,6 +53,11 @@
 #include "sequenced_engine_fixture.h"
 #include "sync_pipeline.h"
 #include "sync_redis_client.h"
+#include "temp_dir.h"
+
+#ifndef _WIN32
+extern char** environ;  // NOLINT(readability-redundant-declaration)
+#endif
 
 namespace abyss::engine {
 namespace {
@@ -54,6 +72,22 @@ std::string Bulk(const std::string& value) {
   return "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
 }
 std::string Err(std::string_view text) { return "-ERR " + std::string(text) + "\r\n"; }
+
+double OrphanGauge() {
+  return metrics::testing::GetGaugeValue(metrics::names::kNetOrphans).value_or(0);
+}
+double LateCompletions() {
+  return metrics::testing::GetCounterValue(metrics::names::kNetLateCompletionsTotal).value_or(0);
+}
+double Abandoned(metrics::AbandonReason reason) {
+  return metrics::testing::GetCounterValue(metrics::names::kNetCommandsAbandonedTotal, reason)
+      .value_or(0);
+}
+double ColdDeadlinesExceeded() {
+  return metrics::testing::GetCounterValue(metrics::names::kColdReadDeadlineExceededTotal,
+                                           metrics::IoKind::kPoint)
+      .value_or(0);
+}
 
 template <typename Done>
 bool PollUntil(const Done& done, std::chrono::milliseconds budget = 10s) {
@@ -98,6 +132,8 @@ class FrontEndTest : public SequencedEngineTest {
     hooked_.SetHook([this](std::string_view key) { gate_.Hook(key); });
   }
   void TearDown() override {
+    // A post still held would never land.
+    held_.release.Open();
     gate_.ReleaseAll();
     if (server_ != nullptr) server_->Stop();
     server_.reset();
@@ -190,24 +226,22 @@ class FrontEndTest : public SequencedEngineTest {
         config, resp::GlobalRegistry(), resp::PipelineDependencies{.dispatcher = engine_.get()});
     ASSERT_TRUE(server_->Start().has_value());
   }
-  // As the server's: every waiter fails and every poster is joined;
-  // the engine's objects stay.
+  // The engine's stop over this fixture's parts: every waiter fails and
+  // every poster is joined; the objects stay.
   void StopEngine() {
     io_pool_->Shutdown();
     pool_->Stop(0ms);
     queue_->Shutdown();
     hot_->FailLoadWaits();
   }
-  net::EngineStop EngineStop() {
-    return net::EngineStop{.stop = [this] { StopEngine(); },
-                           .running_jobs = [this] { return io_pool_->RunningJobs(); }};
-  }
 
   // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
   ColdKeyGate gate_;
+  // Outlives the server whose posts it holds, on a failure too.
+  HeldPost held_;
   abyss::testing::HookedColdStore hooked_{[this]() -> core::ColdStore& { return *cold_; }};
   abyss::testing::EventInbox inbox_;
-  resp::Orphans orphans_;
+  resp::Orphans orphans_{metrics::Registry::Instance().Gauge(metrics::names::kNetOrphans)};
   std::map<uint64_t, std::unique_ptr<resp::RequestPipeline>> pipelines_;
   std::map<uint64_t, std::string> input_;
   int dropped_ = 0;
@@ -285,6 +319,7 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
   gate_.Hold("a");
   gate_.Hold("b");
   Connect(1);
+  const double gauge = OrphanGauge();
 
   EXPECT_TRUE(Feed(1, Command({"SADD", "a", "y"})));
   ASSERT_TRUE(gate_.AwaitBlocked(1));
@@ -294,6 +329,7 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
   ASSERT_TRUE(gate_.AwaitBlocked(2));
   Expire(1);
   EXPECT_EQ(orphans_.size(), 2U) << "one client's two orphans, apart";
+  EXPECT_EQ(OrphanGauge(), gauge + 2);
   EXPECT_TRUE(Feed(1, Command({"SADD", "a", "z"})));
   ASSERT_TRUE(PollUntil([this] { return hot_->LoadWaitersForTesting("a") == 1; }))
       << "the third write waits on the first one's load of its key";
@@ -314,6 +350,7 @@ TEST_F(FrontEndTest, LateLoadsReachTheirOwnOrphansAndInstall) {
   EXPECT_TRUE(Member("b", "x"));
   EXPECT_FALSE(Member("b", "y"));
   EXPECT_EQ(dropped_, 0);
+  EXPECT_EQ(OrphanGauge(), gauge);
 }
 
 // Abandon takes back a cold read still queued, so only reads a thread
@@ -355,15 +392,17 @@ TEST_F(FrontEndTest, OrphansAreBoundedByThePoolsThreads) {
 
 // The successor of the pipeline's private blocking loop, which tests
 // drive: a pending deadline replies, and the late post still lands.
+// The read is held until its deadline has given it up.
 TEST_F(FrontEndTest, ASyncPipelinesPendingDeadlineReplies) {
   Open(Options{.command_timeout = 100ms, .cold_io_threads = 2});
   Cold({"SET", "k", "v"});
   gate_.Hold("k");
+  const double exceeded = ColdDeadlinesExceeded();
   abyss::testing::SyncPipeline sync(resp::GlobalRegistry(), resp::ConnectionState{.client_id = 77},
                                     resp::PipelineDependencies{.dispatcher = engine_.get()});
-  std::thread releaser([this] {
+  std::thread releaser([this, exceeded] {
     (void)gate_.AwaitBlocked(1);
-    std::this_thread::sleep_for(300ms);
+    (void)PollUntil([exceeded] { return ColdDeadlinesExceeded() > exceeded; });
     gate_.ReleaseAll();
   });
   const core::RespValue reply = sync.Dispatch(core::RespCommand{.args = {"GET", "k"}});
@@ -376,7 +415,7 @@ TEST_F(FrontEndTest, ASyncPipelinesPendingDeadlineReplies) {
 // --- Through the TCP server ---
 
 // A cold read held on one connection leaves the reactor free for a
-// hot read on another.
+// hot read on another: the hot reply comes while the cold one is held.
 TEST_F(FrontEndTest, AHeldColdReadDoesNotDelayAHotReadOnTheSameReactor) {
   Open(Options{.cold_io_threads = 2});
   Cold({"SET", "cold", "c"});
@@ -390,44 +429,46 @@ TEST_F(FrontEndTest, AHeldColdReadDoesNotDelayAHotReadOnTheSameReactor) {
   ASSERT_TRUE(held.SendRaw(Command({"GET", "cold"})));
   ASSERT_TRUE(gate_.AwaitBlocked(1));
 
-  const auto start = std::chrono::steady_clock::now();
   EXPECT_EQ(other.Command({"GET", "hot"}), Bulk("h"));
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
-  EXPECT_TRUE(held.ReadSome(1, 50ms).empty()) << "the cold read is still held";
+  EXPECT_EQ(gate_.Calls("cold"), 1) << "the cold read is still held";
 
   gate_.Release("cold");
   EXPECT_EQ(held.ReadReply(), Bulk("c"));
 }
 
 // The connection closes while the committer has taken its slot's node
-// and not yet posted: the orphaned pipeline takes the late kDurable.
+// and not yet posted: its pipeline is orphaned, takes the late kDurable
+// and settles.
 TEST_F(FrontEndTest, AClosedConnectionsPipelineTakesAPostAlreadyTaken) {
   Open(Options{.durability = core::Durability::kPowerLoss});
   FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
   StartServer();
-  HeldPost held;
-  server_->SetInboxPostHookForTesting(held.Hook());
+  server_->SetInboxPostHookForTesting(held_.Hook());
   component_test::SyncRedisClient client;
   ASSERT_TRUE(client.Connect(server_->BoundPort()));
   ASSERT_TRUE(client.SendRaw(Command({"SET", "k", "v"})));
   ASSERT_TRUE(PollUntil([this] {
     return queue_->DurableEnd(ShardOf("k"), core::Durability::kProcessCrash).value_or(0) > 1;
   })) << "the SET never sequenced";
+  const double orphans = OrphanGauge();
+  const double late = LateCompletions();
 
-  held.Arm();
+  held_.Arm();
   stall.Release();
-  ASSERT_TRUE(held.entered.Wait());
+  ASSERT_TRUE(held_.entered.Wait());
   client.Close();
-  ASSERT_TRUE(PollUntil([this] { return server_->Orphans() == 1; }));
-  held.release.Open();
-  EXPECT_TRUE(PollUntil([this] { return server_->Orphans() == 0; }));
+  ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }))
+      << "the closed connection's pipeline, owed the held post, is kept";
+  held_.release.Open();
+  EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; })) << "it never settled";
+  EXPECT_EQ(LateCompletions(), late) << "the post found no one";
 }
 
-// A write waiting on a spare segment when the server stops: its
-// connection is closed, and the engine's stop fails the wait, which
-// lands on the orphaned pipeline through the reactor still running.
-TEST_F(FrontEndTest, ShutdownFailsRegisteredWaitersThroughTheOrphans) {
+// A write waiting on a spare segment when its client goes runs on,
+// with the orphans; the engine's stop fails its wait, which lands on
+// the orphaned pipeline through the reactor still running.
+TEST_F(FrontEndTest, TheEnginesStopFailsAWaitAClosedConnectionLeft) {
   Open(Options{.segment_size_bytes = size_t{16} << 10U});
   StartServer();
   queue_->PauseSegmentPreparerForTesting(0, true);
@@ -438,80 +479,222 @@ TEST_F(FrontEndTest, ShutdownFailsRegisteredWaitersThroughTheOrphans) {
   for (int i = 0; i < 200 && waiting.empty(); ++i) {
     const std::string key = "w" + std::to_string(i);
     ASSERT_TRUE(client.SendRaw(Command({"SET", key, value})));
-    const std::string reply = client.ReadSome(5, 300ms);
-    if (reply.empty()) {
+    // It replies, or it waits for a spare that never comes.
+    std::string reply;
+    ASSERT_TRUE(PollUntil([this, &client, &reply] {
+      if (queue_->SpareWaitersForTesting(0) > 0) return true;
+      reply += client.ReadSome(5 - reply.size(), 1ms);
+      return reply.size() == 5;
+    }));
+    if (queue_->SpareWaitersForTesting(0) > 0) {
       waiting = key;
     } else {
       ASSERT_EQ(reply, "+OK\r\n");
     }
   }
   ASSERT_FALSE(waiting.empty()) << "the spares never ran out";
+  const double orphans = OrphanGauge();
+  client.Close();
+  ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }))
+      << "its write runs on with the orphans";
 
   server_->StopAccepting();
-  EXPECT_FALSE(server_->Quiesce(100ms)) << "its write is still in flight";
   server_->ForceClose();
-  ASSERT_TRUE(PollUntil([this] { return server_->Orphans() == 1; }));
+  EXPECT_EQ(queue_->SpareWaitersForTesting(0), 1U) << "a client's close gives up nothing";
   StopEngine();
-  EXPECT_TRUE(PollUntil([this] { return server_->Orphans() == 0; }));
+  EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; }));
   server_->Join();
   EXPECT_FALSE(Resident(waiting)) << "a write failed at the stop applied";
 }
 
-// The engine's stop runs while a notifier holds an event it has taken:
-// the reactors keep taking events until the engine is done, so it
-// lands and is cleaned up, and they stop with no orphan left.
+// The server's stop gives up the commands pending on the connections
+// it closes, starting no more engine work for them and counting none as
+// a timeout: a write whose load lands as the engine stops, one waiting
+// on that load, and a cold read, are never applied or logged.
+TEST_F(FrontEndTest, TheServersStopGivesUpPendingWritesSoNoneIsLogged) {
+  Open(Options{.cold_io_threads = 2});
+  Cold({"SADD", "k", "x"});
+  Cold({"SET", "r", "v"});
+  gate_.Hold("k");
+  gate_.Hold("r");
+  StartServer();
+  component_test::SyncRedisClient loading;
+  component_test::SyncRedisClient joining;
+  component_test::SyncRedisClient reading;
+  ASSERT_TRUE(loading.Connect(server_->BoundPort()));
+  ASSERT_TRUE(joining.Connect(server_->BoundPort()));
+  ASSERT_TRUE(reading.Connect(server_->BoundPort()));
+  ASSERT_TRUE(loading.SendRaw(Command({"SADD", "k", "y1"})));
+  ASSERT_TRUE(gate_.AwaitBlocked(1));
+  ASSERT_TRUE(joining.SendRaw(Command({"SADD", "k", "y2"})));
+  ASSERT_TRUE(PollUntil([this] { return hot_->LoadWaitersForTesting("k") == 1; }))
+      << "the second write waits on the first one's load";
+  ASSERT_TRUE(reading.SendRaw(Command({"GET", "r"})));
+  ASSERT_TRUE(gate_.AwaitBlocked(2));
+  const double orphans = OrphanGauge();
+  const double given_up = Abandoned(metrics::AbandonReason::kShutdown);
+  const double timed_out = Abandoned(metrics::AbandonReason::kDeadline);
+  const double exceeded = ColdDeadlinesExceeded();
+
+  server_->StopAccepting();
+  server_->ForceClose();
+  EXPECT_EQ(Abandoned(metrics::AbandonReason::kShutdown), given_up + 3);
+  EXPECT_EQ(Abandoned(metrics::AbandonReason::kDeadline), timed_out);
+  EXPECT_EQ(ColdDeadlinesExceeded(), exceeded) << "a read given up at the stop timed out";
+  EXPECT_EQ(hot_->LoadWaitersForTesting("k"), 0U) << "the waiting write's wait was taken back";
+  EXPECT_EQ(OrphanGauge(), orphans + 2) << "only the cold reads still running are owed";
+
+  // The engine's stop: the held reads land as the pool stops, and the
+  // late posts of the commands they were for only clean up.
+  gate_.ReleaseAll();
+  io_pool_->Shutdown();
+  EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; }));
+  pool_->Stop(0ms);
+  queue_->Shutdown();
+  hot_->FailLoadWaits();
+  server_->Join();
+
+  ASSERT_TRUE(Restart().has_value());
+  EXPECT_EQ(Members("k"), std::vector<std::string>{"x"});
+  for (const core::QueueEntry& entry : Logged(ShardOf("k"))) {
+    const std::vector<std::string> args = ArgsOf(entry);
+    EXPECT_EQ(
+        std::count(args.begin(), args.end(), "y1") + std::count(args.begin(), args.end(), "y2"), 0)
+        << "a write given up at the stop was logged";
+  }
+}
+
+// The engine's stop runs while a notifier holds an event it has taken.
+// The reactors keep taking events until the engine is done, so it lands
+// and is cleaned up, which is checked before the reactors may stop.
 TEST_F(FrontEndTest, TheReactorsOutlastANotifierHeldThroughTheEnginesStop) {
   Open(Options{.durability = core::Durability::kPowerLoss});
   FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
   StartServer();
-  HeldPost held;
-  server_->SetInboxPostHookForTesting(held.Hook());
+  server_->SetInboxPostHookForTesting(held_.Hook());
   component_test::SyncRedisClient client;
   ASSERT_TRUE(client.Connect(server_->BoundPort()));
   ASSERT_TRUE(client.SendRaw(Command({"SET", "k", "v"})));
   ASSERT_TRUE(PollUntil([this] {
     return queue_->DurableEnd(ShardOf("k"), core::Durability::kProcessCrash).value_or(0) > 1;
   }));
-  held.Arm();
+  const double orphans = OrphanGauge();
+  const double late = LateCompletions();
+  held_.Arm();
   stall.Release();
-  ASSERT_TRUE(held.entered.Wait());
+  ASSERT_TRUE(held_.entered.Wait());
   client.Close();
-  ASSERT_TRUE(PollUntil([this] { return server_->Orphans() == 1; }));
+  ASSERT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans + 1; }));
 
-  std::thread stopper([this] { server_->Shutdown(EngineStop()); });
-  // The stop is now joining the committer that holds the post.
-  std::this_thread::sleep_for(100ms);
-  held.release.Open();
+  abyss::testing::Latch stopping;
+  abyss::testing::Latch checked;
+  std::thread stopper([this, &stopping, &checked] {
+    server_->Shutdown(net::EngineStop{
+        .stop =
+            [this, &stopping, &checked] {
+              io_pool_->Shutdown();
+              pool_->Stop(0ms);
+              // Next, the log's stop joins the committer the post
+              // holds.
+              stopping.Open();
+              queue_->Shutdown();
+              hot_->FailLoadWaits();
+              // The reactors are told the engine is done only after
+              // this.
+              (void)checked.Wait(30s);
+            },
+        .running_jobs = [this] { return io_pool_->RunningJobs(); },
+    });
+  });
+  EXPECT_TRUE(stopping.Wait());
+  held_.release.Open();
+  EXPECT_TRUE(PollUntil([orphans] { return OrphanGauge() == orphans; }))
+      << "the held post never reached the orphaned pipeline";
+  EXPECT_EQ(LateCompletions(), late) << "the held post was dropped";
+  checked.Open();
   stopper.join();
-  EXPECT_EQ(metrics::testing::GetGaugeValue(metrics::names::kNetOrphans).value_or(-1), 0.0);
+  EXPECT_EQ(OrphanGauge(), orphans);
 }
 
 // --- The stop's timeout ---
 
 #ifndef _WIN32
+constexpr auto kStuckStopTimeout = 300ms;
+constexpr const char* kStuckStopDirEnv = "ABYSS_STUCK_STOP_DIR";
+
+// The child half of the test below, which runs it in a process of its
+// own: a stop whose engine never finishes, as a cold read stuck for
+// good. It marks when the stop begins.
+TEST(FrontEndShutdownDeathTest, DISABLED_StuckJobChild) {
+  const char* dir = std::getenv(kStuckStopDirEnv);
+  if (dir == nullptr) GTEST_SKIP() << "run by AStuckJobEndsTheProcessWithinTheTimeout";
+  IoPool pool(IoPoolConfig{.threads = 2});
+  PoolBlocker stuck;
+  pool.Submit(stuck, metrics::IoKind::kPoint, core::SteadyClock::now() + 1h);
+  (void)stuck.started.Wait();
+  net::TcpServerConfig config;
+  config.bind = "127.0.0.1";
+  config.port = 0;
+  config.io_threads = 1;
+  config.shutdown_timeout = kStuckStopTimeout;
+  net::TcpServer server(config, resp::GlobalRegistry(), resp::PipelineDependencies{});
+  if (!server.Start().has_value()) std::_Exit(1);
+  std::ofstream(std::filesystem::path(dir) / "stopping") << "stopping\n";
+  server.Shutdown(net::EngineStop{
+      .stop = [&pool] { pool.Shutdown(); },
+      .running_jobs = [&pool] { return pool.RunningJobs(); },
+  });
+  std::_Exit(0);
+}
+
+// From the stop's start, the parent waits no longer than the timeout
+// and a margin: a stop that never ends fails here, not at ctest's.
 TEST(FrontEndShutdownDeathTest, AStuckJobEndsTheProcessWithinTheTimeout) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  const auto start = std::chrono::steady_clock::now();
-  EXPECT_EXIT(
-      {
-        IoPool pool(IoPoolConfig{.threads = 2});
-        PoolBlocker stuck;
-        pool.Submit(stuck, metrics::IoKind::kPoint, core::SteadyClock::now() + 1h);
-        (void)stuck.started.Wait();
-        net::TcpServerConfig config;
-        config.bind = "127.0.0.1";
-        config.port = 0;
-        config.io_threads = 1;
-        config.shutdown_timeout = 300ms;
-        net::TcpServer server(config, resp::GlobalRegistry(), resp::PipelineDependencies{});
-        if (!server.Start().has_value()) std::_Exit(1);
-        server.Shutdown(net::EngineStop{.stop = [&pool] { pool.Shutdown(); },
-                                        .running_jobs = [&pool] { return pool.RunningJobs(); }});
-        std::_Exit(0);
-      },
-      ::testing::ExitedWithCode(net::kShutdownTimeoutExitCode), "shutdown timed out");
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 10s);
+  const abyss::testing::TempDir dir("stuck-stop");
+  std::string self = ::testing::internal::GetArgvs().front();
+  std::string filter = "--gtest_filter=FrontEndShutdownDeathTest.DISABLED_StuckJobChild";
+  std::string disabled = "--gtest_also_run_disabled_tests";
+  std::string env = std::string(kStuckStopDirEnv) + "=" + dir.String();
+  const std::string err = dir.Sub("stderr").string();
+  std::vector<char*> argv = {self.data(), filter.data(), disabled.data(), nullptr};
+  std::vector<char*> envp;
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic): environ's own shape.
+  for (char** e = environ; *e != nullptr; ++e) envp.push_back(*e);
+  envp.push_back(env.data());
+  envp.push_back(nullptr);
+  posix_spawn_file_actions_t actions{};
+  ASSERT_EQ(posix_spawn_file_actions_init(&actions), 0);
+  ASSERT_EQ(posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err.c_str(),
+                                             O_WRONLY | O_CREAT | O_TRUNC, 0644),
+            0);
+  pid_t pid = 0;
+  const int spawned = posix_spawnp(&pid, self.c_str(), &actions, nullptr, argv.data(), envp.data());
+  posix_spawn_file_actions_destroy(&actions);
+  ASSERT_EQ(spawned, 0) << "spawn failed";
+
+  int status = 0;
+  pid_t done = 0;
+  const auto reap = [&] {
+    done = waitpid(pid, &status, WNOHANG);
+    return done != 0;
+  };
+  // The child's start-up, which sanitizers slow, is not the stop's.
+  const bool started =
+      PollUntil([&] { return std::filesystem::exists(dir.Sub("stopping")) || reap(); }, 120s);
+  const bool exited = done != 0 || PollUntil(reap, kStuckStopTimeout + 2s);
+  if (!exited) {
+    ::kill(pid, SIGKILL);
+    (void)waitpid(pid, &status, 0);
+  }
+  ASSERT_TRUE(started) << "the child never began its stop";
+  ASSERT_TRUE(exited) << "the stop outlived its timeout";
+  ASSERT_EQ(done, pid);
+  ASSERT_TRUE(WIFEXITED(status)) << "status " << status;
+  EXPECT_EQ(WEXITSTATUS(status), net::kShutdownTimeoutExitCode);
+  std::ifstream in(err);
+  const std::string logged((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_NE(logged.find("shutdown timed out"), std::string::npos) << logged;
 }
 #endif
 

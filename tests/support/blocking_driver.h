@@ -53,7 +53,8 @@ inline core::Result<core::RespValue> DriveWrite(engine::Sequencer& sequencer,
     }
     std::optional<core::CompletionEvent> event = inbox.Take(write.deadline());
     if (!event.has_value()) {
-      core::Result<core::RespValue> reply = sequencer.Abandon(write);
+      core::Result<core::RespValue> reply =
+          sequencer.Abandon(write, core::AbandonReason::kDeadline);
       if (!write.Quiescent()) {
         write.Woken(inbox.Take(std::nullopt).value().result);
         (void)sequencer.Attempt(write);

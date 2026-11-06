@@ -15,6 +15,7 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/timer_wheel.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/metrics.h"
 #include "abyss/metrics/names.h"
 #include "abyss/resp/command_registry.h"
 
@@ -44,10 +45,13 @@ struct PipelineDependencies {
 };
 
 // The reactor's, which its pipelines share: where the engine's events
-// for them go, and the wheel their deadlines are kept on.
+// for them go, the wheel their deadlines are kept on, and the counts
+// of pending commands given up.
 struct PipelineHost {
   core::CompletionSink* sink = nullptr;
   core::TimerWheel* timers = nullptr;
+  metrics::CounterHandle abandoned_deadline;
+  metrics::CounterHandle abandoned_shutdown;
 };
 
 struct PipelineLimits {
@@ -110,10 +114,14 @@ class RequestPipeline {
   std::optional<core::SteadyTime> NextDeadline() const;
   // Dispatches nothing more: the server is stopping.
   void StopDispatch();
-  // The connection has gone. A pending command runs on to its outcome
-  // or its deadline, and every reply is dropped; only events land.
-  void Close();
+  // The connection has gone, and every reply is dropped; only events
+  // land. A pending command runs on to its outcome or its deadline,
+  // unless the server is stopping: then it is given up at once, and
+  // what is still out of it lands as cleanup.
+  void Close(bool shutdown = false);
 
+  // Whether Feed may dispatch now, with `unwritten` bytes unwritten.
+  bool CanDispatch(size_t unwritten) const;
   // No task busy and no slot owed a post: safe to free.
   bool Quiescent() const;
   // Dispatched and not yet written.
@@ -138,7 +146,6 @@ class RequestPipeline {
     std::string_view cmd_name;
   };
 
-  bool CanDispatch(size_t unwritten) const;
   Entry& Acquire();
   void Grow();
   void Reclaim();
@@ -150,6 +157,9 @@ class RequestPipeline {
   std::optional<Immediate> DispatchResolved(Entry& entry, const ResolvedCommand& resolved,
                                             core::RespCommand cmd);
   void Submit(Entry& entry, core::Request request, std::string_view what);
+  // Gives up the pending `entry`: its task, if still busy and the
+  // connection open, to be kept until it settles.
+  std::unique_ptr<OrphanTask> Abandon(Entry& entry, core::AbandonReason reason);
   void Settle(Entry& entry, core::Outcome outcome);
   // An engine reply for `entry`.
   void Reply(Entry& entry, core::Result<core::RespValue> result);

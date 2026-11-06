@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "abyss/admin/health_handler.h"
@@ -34,6 +35,12 @@
 
 namespace abyss::server {
 
+// Seams for a server run inside a test process; none in production.
+struct ServerTestHooks {
+  // Given the server's cold store, what its loader reads cold through.
+  std::function<core::ColdStore&(core::ColdStore&)> loader_cold;
+};
+
 class Server {
  public:
   // The single source of truth for the process lifecycle. The client-visible
@@ -46,11 +53,11 @@ class Server {
     kInitializing = 0,  // signal handling armed, topology validated, stores opening
     kRecovering = 1,    // pure queue replay; LOADING asserted, /ready 503
     kServing = 2,       // pools live + recovery done; LOADING lifted in one edge
-    kDraining = 3,      // graceful SIGTERM drain in progress; LOADING re-asserted
+    kDraining = 3,      // graceful SIGTERM drain in progress; /ready 503
     kStopped = 4,       // teardown complete
   };
 
-  explicit Server(config::Config config);
+  explicit Server(config::Config config, ServerTestHooks hooks = {});
   ~Server();
 
   Server(const Server&) = delete;
@@ -73,6 +80,12 @@ class Server {
   uint16_t MetricsBoundPort() const noexcept {
     return metrics_http_ != nullptr ? metrics_http_->BoundPort() : 0;
   }
+  // Once serving.
+  uint16_t RespBoundPort() const noexcept {
+    return tcp_server_ != nullptr ? tcp_server_->BoundPort() : 0;
+  }
+  // Once initialized.
+  queue::WalQueue& QueueForTesting() { return *queue_; }
 
   // POSIX: file descriptor. Windows: HANDLE reinterpreted as intptr_t.
   void set_ready_fd(intptr_t fd) { ready_fd_ = fd; }
@@ -85,6 +98,7 @@ class Server {
   void Transition(LifecycleState next);
 
   config::Config config_;
+  ServerTestHooks hooks_;
 
   // Component graph. Declaration order = construction order.
   // Destruction is reverse — dependents destroyed before their dependencies.

@@ -172,6 +172,8 @@ class PendingWrite final : public core::Waiter {
   // Past its deadline with its wake or loads still on the way: its
   // timeout reply is given, and the Attempt they run only cleans up.
   bool abandoned_ = false;
+  // Given up at shutdown rather than at its deadline.
+  bool shutdown_ = false;
 
   size_t admit_next_ = 0;
   // A refused Reserve's error, the reply if the spare wait fails early.

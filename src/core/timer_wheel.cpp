@@ -40,6 +40,7 @@ TimerWheel::~TimerWheel() {
 }
 
 void TimerWheel::Schedule(TimerNode& node, SteadyTime deadline) {
+  OnOwner();
   const bool ours = node.wheel_ == nullptr || node.wheel_ == this;
   ABYSS_DCHECK(ours, "a timer armed on another wheel");
   const uint64_t tick = std::max(CeilTick(deadline), current_ + 1);
@@ -52,10 +53,12 @@ void TimerWheel::Schedule(TimerNode& node, SteadyTime deadline) {
 }
 
 void TimerWheel::Cancel(TimerNode& node) noexcept {
+  OnOwner();
   if (node.wheel_ == this) Unlink(node);
 }
 
 void TimerWheel::Expire(SteadyTime now, std::vector<uint64_t>& out) {
+  OnOwner();
   const uint64_t target = FloorTick(now);
   if (target <= current_) return;
   const uint64_t visits = std::min<uint64_t>(target - current_, buckets_.size());
@@ -74,6 +77,7 @@ void TimerWheel::Expire(SteadyTime now, std::vector<uint64_t>& out) {
 }
 
 std::optional<SteadyTime> TimerWheel::NextDue() const {
+  OnOwner();
   if (size_ == 0) return std::nullopt;
   const size_t n = buckets_.size();
   const size_t start = (current_ + 1) % n;
@@ -112,6 +116,12 @@ uint64_t TimerWheel::CeilTick(SteadyTime time) const {
 uint64_t TimerWheel::FloorTick(SteadyTime time) const {
   if (time <= origin_) return 0;
   return static_cast<uint64_t>((time - origin_).count() / tick_.count());
+}
+
+void TimerWheel::OnOwner() const noexcept {
+  const std::thread::id self = std::this_thread::get_id();
+  if (owner_ == std::thread::id{}) owner_ = self;
+  ABYSS_DCHECK(owner_ == self, "a timer wheel used off its owner's thread");
 }
 
 void TimerWheel::Link(TimerNode& node, uint64_t tick) {

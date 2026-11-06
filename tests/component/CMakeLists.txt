@@ -17,6 +17,7 @@ add_executable(abyss_component_tests
   sequencer_wait_test.cpp
   dispatch_test.cpp
   front_end_test.cpp
+  server_shutdown_test.cpp
   net/sync_redis_client.cpp
 )
 
@@ -25,6 +26,7 @@ target_include_directories(abyss_component_tests PRIVATE
 )
 
 target_link_libraries(abyss_component_tests PRIVATE
+  abyss_server_core
   abyss::engine
   abyss::net
   abyss::resp
@@ -114,6 +116,7 @@ target_include_directories(abyss_component_net_tests PRIVATE
 
 target_link_libraries(abyss_component_net_tests PRIVATE
   abyss::net
+  abyss::test_support
   GTest::gtest_main
 )
 

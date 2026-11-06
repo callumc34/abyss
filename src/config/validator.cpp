@@ -47,6 +47,9 @@ constexpr std::chrono::milliseconds kMaxCheckpointMinInterval{60000};
 // Below the floor the offset fsync dominates the disk; above the ceiling a
 // crash replays, and retention trails, by more than a minute of commits.
 constexpr std::chrono::milliseconds kMinOffsetFsyncInterval{10};
+constexpr uint32_t kMaxInflightCommands = uint32_t{1} << 16U;
+// What a stop needs past its cold drain and a command's deadline.
+constexpr std::chrono::milliseconds kShutdownMargin{5000};
 constexpr std::chrono::milliseconds kMaxOffsetFsyncInterval{60000};
 // Below the floor the window admits too little to batch a flush; above
 // the ceiling a power loss under process_crash loses more than operators
@@ -402,21 +405,26 @@ core::Result<void> ValidateNet(const NetConfig& n) {
   if (n.max_inflight_commands < 1) {
     return std::unexpected(InvalidArg("net.max_inflight_commands", "must be >= 1"));
   }
+  // A full ring holds 464 B a slot: 30 MiB a connection at the bound.
+  if (n.max_inflight_commands > kMaxInflightCommands) {
+    return std::unexpected(InvalidArg("net.max_inflight_commands",
+                                      "must be <= " + std::to_string(kMaxInflightCommands)));
+  }
   return {};
 }
 
-// The stop's timeout covers the cold drain and a cold read still
-// running to its command deadline; shorter, a clean stop would exit
-// as stuck.
+// The stop's timeout covers the cold drain, a cold read still running
+// to its command deadline, and a margin for the rest of the stop;
+// shorter, a clean stop would exit as stuck.
 core::Result<void> ValidateShutdownTimeout(const Config& c) {
   const auto needed =
       std::chrono::duration_cast<std::chrono::milliseconds>(c.cold_consumer.drain_grace) +
-      c.engine.command_timeout;
-  if (c.net.shutdown_timeout <= needed) {
-    return std::unexpected(
-        InvalidArg("net.shutdown_timeout_seconds",
-                   "must be > cold_consumer.drain_grace_seconds + engine.command_timeout_ms (" +
-                       std::to_string(needed.count()) + " ms)"));
+      c.engine.command_timeout + kShutdownMargin;
+  if (c.net.shutdown_timeout < needed) {
+    return std::unexpected(InvalidArg(
+        "net.shutdown_timeout_seconds",
+        "must be >= cold_consumer.drain_grace_seconds + engine.command_timeout_ms + 5 s (" +
+            std::to_string(needed.count()) + " ms)"));
   }
   return {};
 }

@@ -54,7 +54,7 @@ class CommandTask final : public core::Task {
   core::Outcome FanOut(core::Slot& slot, core::MultiKeyKind kind, core::RespCommand cmd);
 
   core::Outcome Run(core::Slot& slot, core::Result<void> wake) override;
-  core::Result<core::RespValue> Abandon(core::Slot& slot) override;
+  core::Result<core::RespValue> Abandon(core::Slot& slot, core::AbandonReason reason) override;
   bool Quiescent() const override { return !job_ && !armed_ && write_.Quiescent(); }
 
  private:
@@ -113,7 +113,7 @@ class CommandTask final : public core::Task {
   bool job_ = false;
   // Armed on a load in flight, whose landing posts.
   bool armed_ = false;
-  // Past its deadline: replied, and only its late post is to come.
+  // Given up: replied, and only its late post is to come.
   bool abandoned_ = false;
   Job io_{*this};
 };

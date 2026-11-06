@@ -13,6 +13,9 @@
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
 #include "abyss/core/types.h"
+#include "abyss/metrics/metrics.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 #include "abyss/resp/command_registry.h"
 #include "abyss/resp/orphans.h"
 #include "abyss/resp/request_pipeline.h"
@@ -38,6 +41,9 @@ std::string Bulk(const std::string& value) {
 }
 std::span<const uint8_t> Bytes(const std::string& s) {
   return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+double OrphanGauge() {
+  return metrics::testing::GetGaugeValue(metrics::names::kNetOrphans).value_or(0);
 }
 
 // One reactor's worth, by hand: the connection's pipeline, the sink its
@@ -81,7 +87,7 @@ class AsyncPipelineTest : public ::testing::Test {
   ::testing::NiceMock<abyss::testing::MockQueue> queue_;
   abyss::testing::ScriptedDispatcher dispatcher_{queue_};
   abyss::testing::EventInbox inbox_;
-  Orphans orphans_;
+  Orphans orphans_{metrics::Registry::Instance().Gauge(metrics::names::kNetOrphans)};
   std::string input_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
 };
@@ -270,6 +276,7 @@ TEST_F(AsyncPipelineTest, AStaleEventForAReclaimedSlotIsDropped) {
 // slot's late event.
 TEST_F(AsyncPipelineTest, OrphansAreKeyedByClientAndSlot) {
   dispatcher_.cancel_fails = true;
+  const double gauge = OrphanGauge();
   auto pipeline = Make();
   input_ = Set("p1");
   (void)Feed(*pipeline);
@@ -280,6 +287,7 @@ TEST_F(AsyncPipelineTest, OrphansAreKeyedByClientAndSlot) {
   input_ = Set("p3");
   (void)Feed(*pipeline);
   EXPECT_EQ(orphans_.size(), 2U);
+  EXPECT_EQ(OrphanGauge(), gauge + 2);
 
   dispatcher_.Wake(kClient, 2);
   EXPECT_EQ(Deliver(pipeline.get()), 0);
@@ -289,12 +297,58 @@ TEST_F(AsyncPipelineTest, OrphansAreKeyedByClientAndSlot) {
   EXPECT_EQ(Deliver(pipeline.get()), 0);
   EXPECT_EQ(dispatcher_.cleanups["p1"], 1);
   EXPECT_TRUE(orphans_.empty());
-  EXPECT_EQ(dispatcher_.applied["p3"], 0) << "the live task is untouched";
+  EXPECT_EQ(OrphanGauge(), gauge);
+  EXPECT_EQ(dispatcher_.applied["p3"], 0) << "the live task took an orphan's wake";
+  EXPECT_EQ(dispatcher_.cleanups["p3"], 0);
 
   dispatcher_.Wake(kClient, 3);
   EXPECT_EQ(Deliver(pipeline.get()), 0);
+  EXPECT_EQ(dispatcher_.applied["p3"], 1) << "the live task gets its own wake, once";
   EXPECT_EQ(Drain(*pipeline), "-ERR " + dispatcher_.timeout_text + "\r\n-ERR " +
                                   dispatcher_.timeout_text + "\r\n" + Bulk("p3"));
+}
+
+// One client can leave both: a task its deadline gave up, and then its
+// pipeline, closed with a command still pending. Each takes its own.
+TEST_F(AsyncPipelineTest, OneClientsOrphanedTaskAndPipelineEachTakeTheirOwn) {
+  dispatcher_.cancel_fails = true;
+  auto pipeline = Make();
+  input_ = Set("p1");
+  (void)Feed(*pipeline);
+  Expire(*pipeline, Later());
+  input_ = Set("p2");
+  (void)Feed(*pipeline);
+  pipeline->Close();
+  orphans_.Adopt(std::move(pipeline));
+  EXPECT_EQ(orphans_.size(), 2U);
+
+  dispatcher_.Wake(kClient, 2);
+  EXPECT_EQ(Deliver(nullptr), 0);
+  EXPECT_EQ(dispatcher_.applied["p2"], 1) << "a client's close lets its command run on";
+  EXPECT_EQ(dispatcher_.cleanups["p1"], 0);
+  EXPECT_EQ(orphans_.size(), 1U);
+  dispatcher_.Wake(kClient, 1);
+  EXPECT_EQ(Deliver(nullptr), 0);
+  EXPECT_EQ(dispatcher_.cleanups["p1"], 1);
+  EXPECT_EQ(dispatcher_.applied["p1"], 0);
+  EXPECT_TRUE(orphans_.empty());
+}
+
+// The server's stop gives up a closed pipeline's pending command: it
+// is never applied, and its late wake only cleans up.
+TEST_F(AsyncPipelineTest, AShutdownCloseGivesUpThePendingCommand) {
+  dispatcher_.cancel_fails = true;
+  auto pipeline = Make();
+  input_ = Set("s1") + Set("p1");
+  (void)Feed(*pipeline);
+  pipeline->Close(/*shutdown=*/true);
+  EXPECT_EQ(dispatcher_.abandons, std::vector<core::AbandonReason>{core::AbandonReason::kShutdown});
+  orphans_.Adopt(std::move(pipeline));
+  dispatcher_.WakeLast();
+  EXPECT_EQ(Deliver(nullptr), 0);
+  EXPECT_EQ(dispatcher_.applied["p1"], 0);
+  EXPECT_EQ(dispatcher_.cleanups["p1"], 1);
+  EXPECT_TRUE(orphans_.empty());
 }
 
 // A closed connection's pending command runs on to its outcome; its
@@ -330,6 +384,36 @@ TEST_F(AsyncPipelineTest, AClosedPipelinesDeadlineEndsItsPendingCommand) {
 }
 
 // --- The ring ---
+
+// A slot whose durable wait timed out while a notifier held its node
+// is still owed that post: written, it counts against the cap, and the
+// ring wraps onto it only once the post lands.
+TEST_F(AsyncPipelineTest, ASlotOwedAPostIsReusedOnlyOnceItLands) {
+  auto pipeline = Make({.max_inflight = 2});
+  input_ = Set("s1");
+  (void)Feed(*pipeline);
+  EXPECT_CALL(queue_, CancelDurable(1, ::testing::_, ::testing::_))
+      .WillOnce(::testing::Return(false))
+      .RetiresOnSaturation();
+  Expire(*pipeline, Later());
+  EXPECT_EQ(Drain(*pipeline),
+            "-ERR write durable wait exceeded server timeout; the write is applied and may yet "
+            "become durable\r\n");
+  EXPECT_EQ(pipeline->InFlight(), 0U);
+  EXPECT_EQ(pipeline->Slots(), 1U) << "written, and still owed its post";
+
+  input_ = Get("r1") + Get("r2") + Get("r3");
+  EXPECT_TRUE(Feed(*pipeline).blocked);
+  EXPECT_EQ(Drain(*pipeline), Bulk("r1"));
+  EXPECT_TRUE(Feed(*pipeline).blocked) << "the next slot is the one still owed";
+  EXPECT_EQ(dispatcher_.dispatched, (std::vector<std::string>{"s1", "r1"}));
+
+  queue_.ReleaseParked(1);
+  EXPECT_EQ(Deliver(pipeline.get()), 0);
+  EXPECT_FALSE(Feed(*pipeline).blocked);
+  EXPECT_EQ(Drain(*pipeline), Bulk("r2") + Bulk("r3"));
+  EXPECT_TRUE(pipeline->Quiescent());
+}
 
 TEST_F(AsyncPipelineTest, TheRingGrowsToTheCapAndGivesItBackWhenEmpty) {
   constexpr size_t kCap = 1024;

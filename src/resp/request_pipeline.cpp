@@ -146,9 +146,6 @@ bool RequestPipeline::OnEvent(const core::CompletionEvent& event) {
       }
       break;
     }
-    case core::CompletionKind::kSequenced:
-    case core::CompletionKind::kReplied:
-      return false;
   }
   Reclaim();
   SyncTimer();
@@ -167,18 +164,7 @@ std::unique_ptr<OrphanTask> RequestPipeline::Expire(core::SteadyTime now) {
       Reply(entry, entry.slot.durable.Expire());
       continue;
     }
-    // Never applied from here: what is still out of it lands as cleanup.
-    core::Result<RespValue> reply = task_->Abandon(entry.slot);
-    if (!TaskBusy()) {
-      task_seq_ = 0;
-    } else if (!closed_) {
-      orphan = std::make_unique<OrphanTask>();
-      orphan->slot.completion = entry.slot.completion;
-      orphan->slot.deadline = entry.slot.deadline;
-      orphan->task = std::move(task_);
-      task_seq_ = 0;
-    }
-    Reply(entry, std::move(reply));
+    orphan = Abandon(entry, core::AbandonReason::kDeadline);
   }
   Reclaim();
   SyncTimer();
@@ -197,13 +183,17 @@ std::optional<core::SteadyTime> RequestPipeline::NextDeadline() const {
 
 void RequestPipeline::StopDispatch() { stopped_ = true; }
 
-void RequestPipeline::Close() {
+void RequestPipeline::Close(bool shutdown) {
   if (closed_) return;
   closed_ = true;
   for (uint64_t pos = drain_; pos < tail_; ++pos) {
     Entry& entry = At(pos);
-    // It runs on to its outcome or its deadline, which nothing hears.
-    if (entry.state == Entry::State::kPending) continue;
+    if (entry.state == Entry::State::kPending) {
+      // Otherwise it runs on to its outcome or its deadline, which
+      // nothing hears.
+      if (shutdown) (void)Abandon(entry, core::AbandonReason::kShutdown);
+      continue;
+    }
     if (entry.state == Entry::State::kSequenced) entry.slot.durable.Abandon();
     Release(entry);
   }
@@ -429,6 +419,28 @@ void RequestPipeline::Submit(Entry& entry, core::Request request, std::string_vi
       core::Completion{.sink = host_.sink, .client_id = state_.client_id, .slot_seq = entry.seq};
   core::Outcome outcome = deps_.dispatcher->Dispatch(std::move(request), entry.slot, task_);
   Settle(entry, std::move(outcome));
+}
+
+// Never applied from here: what is still out of it lands as cleanup.
+std::unique_ptr<OrphanTask> RequestPipeline::Abandon(Entry& entry, core::AbandonReason reason) {
+  core::Result<RespValue> reply = task_->Abandon(entry.slot, reason);
+  if (reason == core::AbandonReason::kShutdown) {
+    host_.abandoned_shutdown.Increment();
+  } else {
+    host_.abandoned_deadline.Increment();
+  }
+  std::unique_ptr<OrphanTask> orphan;
+  if (!TaskBusy()) {
+    task_seq_ = 0;
+  } else if (!closed_) {
+    orphan = std::make_unique<OrphanTask>();
+    orphan->slot.completion = entry.slot.completion;
+    orphan->slot.deadline = entry.slot.deadline;
+    orphan->task = std::move(task_);
+    task_seq_ = 0;
+  }
+  Reply(entry, std::move(reply));
+  return orphan;
 }
 
 void RequestPipeline::Settle(Entry& entry, core::Outcome outcome) {

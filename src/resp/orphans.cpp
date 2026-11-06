@@ -24,7 +24,7 @@ void Orphans::Adopt(std::unique_ptr<OrphanTask> task) {
                 .slot_seq = task->slot.completion.slot_seq};
   const bool adopted = tasks_.try_emplace(key, std::move(task)).second;
   ABYSS_DCHECK(adopted, "a slot orphaned twice");
-  gauge_.Increment();
+  if (adopted) gauge_.Increment();
 }
 
 void Orphans::Adopt(std::unique_ptr<RequestPipeline> pipeline) {
@@ -34,7 +34,7 @@ void Orphans::Adopt(std::unique_ptr<RequestPipeline> pipeline) {
   const uint64_t client_id = pipeline->client_id();
   const bool adopted = pipelines_.try_emplace(client_id, std::move(pipeline)).second;
   ABYSS_DCHECK(adopted, "a client's pipeline orphaned twice");
-  gauge_.Increment();
+  if (adopted) gauge_.Increment();
 }
 
 bool Orphans::Route(const core::CompletionEvent& event, RequestPipeline* live) {

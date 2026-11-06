@@ -603,7 +603,7 @@ TEST(ConfigValidate, RejectsZeroReaperTick) {
   EXPECT_NE(cfg.error().message().find("net.reaper_tick_ms"), std::string::npos);
 }
 
-TEST(ConfigValidate, MaxInflightCommandsLoadsAndIsAtLeastOne) {
+TEST(ConfigValidate, MaxInflightCommandsLoadsAndIsBounded) {
   auto defaults = Config::ParseFromYaml("net: {}\n");
   ASSERT_TRUE(defaults.has_value()) << defaults.error().message();
   EXPECT_EQ(defaults->net.max_inflight_commands, 1024U);
@@ -616,21 +616,28 @@ TEST(ConfigValidate, MaxInflightCommandsLoadsAndIsAtLeastOne) {
   ASSERT_FALSE(zero.has_value());
   EXPECT_NE(zero.error().message().find("net.max_inflight_commands"), std::string::npos)
       << zero.error().message();
+
+  auto most = Config::ParseFromYaml("net:\n  max_inflight_commands: 65536\n");
+  ASSERT_TRUE(most.has_value()) << most.error().message();
+  auto past = Config::ParseFromYaml("net:\n  max_inflight_commands: 65537\n");
+  ASSERT_FALSE(past.has_value());
+  EXPECT_NE(past.error().message().find("net.max_inflight_commands"), std::string::npos)
+      << past.error().message();
 }
 
-// It bounds a stop that includes the cold drain and a cold read
-// running to its command deadline.
+// It bounds a stop that includes the cold drain, a cold read running
+// to its command deadline, and a margin of 5 s.
 TEST(ConfigValidate, ShutdownTimeoutOutlastsTheDrainAndACommand) {
   auto defaults = Config::ParseFromYaml("net: {}\n");
   ASSERT_TRUE(defaults.has_value()) << defaults.error().message();
   EXPECT_EQ(defaults->net.shutdown_timeout, std::chrono::seconds{60});
 
-  auto set = Config::ParseFromYaml("net:\n  shutdown_timeout_seconds: 21\n");
+  auto set = Config::ParseFromYaml("net:\n  shutdown_timeout_seconds: 25\n");
   ASSERT_TRUE(set.has_value()) << set.error().message();
-  EXPECT_EQ(set->net.shutdown_timeout, std::chrono::seconds{21});
+  EXPECT_EQ(set->net.shutdown_timeout, std::chrono::seconds{25});
 
   auto short_of = Config::ParseFromYaml(
-      "net:\n  shutdown_timeout_seconds: 20\n"
+      "net:\n  shutdown_timeout_seconds: 24\n"
       "cold_consumer:\n  drain_grace_seconds: 15\n"
       "engine:\n  command_timeout_ms: 5000\n");
   ASSERT_FALSE(short_of.has_value());

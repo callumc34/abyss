@@ -22,6 +22,8 @@ spec:
   replicas: 1
   template:
     spec:
+      # At least net.shutdown_grace_seconds + net.shutdown_timeout_seconds.
+      terminationGracePeriodSeconds: 100
       containers:
         - name: abyss
           image: abyss:latest
@@ -92,6 +94,12 @@ Multi-pod deployment uses a StatefulSet with one pod per shard group, fronted by
 **Readiness:** HTTP check on `/ready`. Returns 200 only after recovery is complete. During recovery, the pod returns 503 and the RESP port returns `LOADING` errors.
 
 **Startup:** Same as readiness, but with a higher failure threshold (60 attempts at 10s intervals = 10 minutes). Recovery may take significant time for large queues.
+
+### Shutdown
+
+On SIGTERM, `/ready` returns 503, the RESP listener stops accepting, and every connection stops reading and dispatching. Commands already dispatched get `net.shutdown_grace_seconds` to finish and be written. Then the connections close: a command still pending is given up and never applied (`abyss_net_commands_abandoned_total{reason="shutdown"}`), and pipelined commands the server had not yet read are dropped with the socket. Clients see the connection close with those commands unanswered, as after a crash, and retry them elsewhere. The engine then stops, its cold drain bounded by `cold_consumer.drain_grace_seconds`, all within `net.shutdown_timeout_seconds`; past it the process logs what is stuck at CRITICAL and exits with status 70.
+
+Budget the pod for both: `net.shutdown_grace_seconds` + `net.shutdown_timeout_seconds` must not exceed `terminationGracePeriodSeconds`, or Kubernetes kills the process before it can finish. The defaults, 30 s and 60 s, need at least 90 s, against Kubernetes' default of 30 s.
 
 ## Configuration Reference
 
@@ -180,7 +188,9 @@ net:
   max_connections: 1024
   idle_timeout_seconds: 300
   io_threads: 0                       # 0 = auto: min(hardware_concurrency, 16)
-  shutdown_grace_seconds: 30
+  max_inflight_commands: 1024         # per connection, 1..65536; reading pauses at the cap
+  shutdown_grace_seconds: 30          # in-flight commands finish before connections close
+  shutdown_timeout_seconds: 60        # the rest of the stop; past it, exit 70
 
 metrics:
   enabled: true

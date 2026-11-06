@@ -59,6 +59,10 @@ NetMetrics NetMetrics::Register() {
       .backpressure_exited = reg.Counter(metrics::names::kNetBackpressureExitedTotal),
       .late_completions = reg.Counter(metrics::names::kNetLateCompletionsTotal),
       .orphans = reg.Gauge(metrics::names::kNetOrphans),
+      .abandoned_deadline = reg.Counter(metrics::names::kNetCommandsAbandonedTotal,
+                                        metrics::AbandonReason::kDeadline),
+      .abandoned_shutdown = reg.Counter(metrics::names::kNetCommandsAbandonedTotal,
+                                        metrics::AbandonReason::kShutdown),
       .connections_closed_client =
           reg.Counter(metrics::names::kNetConnectionsClosedTotal, metrics::CloseReason::kClient),
       .connections_closed_idle =
@@ -169,8 +173,9 @@ void Connection::Close(metrics::CloseReason reason) {
     pnet::ShutdownBoth(fd_.Get());
   }
   fd_.Reset();
-  // Never waits for the engine: what it still owes posts lands as cleanup.
-  if (pipeline_ != nullptr) pipeline_->Close();
+  // Never waits for the engine: what it still owes posts lands as
+  // cleanup. A server stopping starts no more engine work for it.
+  if (pipeline_ != nullptr) pipeline_->Close(reason == metrics::CloseReason::kServerShutdown);
 
   ABYSS_LOG_DEBUG("client closed", {"client_id", client_id_},
                   {"reason", metrics::ToStringView(reason)},
@@ -217,12 +222,12 @@ void Connection::StopDispatch() {
 // socket is read without waiting for an event; and what is buffered is
 // dispatched before reading is re-armed.
 void Connection::Pump() {
-  bool read_to_cap = false;
   for (;;) {
     if (closed_) return;
+    const bool full = read_buf_.size() >= config_.max_read_buffer_bytes;
     const auto fed = Feed();
     if (closed_) return;
-    if (read_to_cap && fed.consumed == 0 && !fed.blocked && !pending_close_.has_value()) {
+    if (full && fed.consumed == 0 && !fed.blocked && !pending_close_.has_value()) {
       // A single command fills the entire read buffer yet cannot be framed:
       // it can never be consumed, so close now rather than wait for an edge
       // that will never arrive.
@@ -237,12 +242,17 @@ void Connection::Pump() {
     if (EnforceWriteHardLimit()) return;
     UpdateBackpressure();
     if (closed_) return;
+    // What was just written may free what blocked the feed, and nothing
+    // else would run it again: no event is owed for buffered input.
+    if (feed_blocked_ && !read_buf_.empty() && pipeline_->CanDispatch(WriteBufferBytes())) {
+      continue;
+    }
     const bool allowed = ReadAllowed();
     // Blocked or paused, it read nothing for a while: try the socket.
     if (allowed && !read_allowed_) socket_drained_ = false;
     read_allowed_ = allowed;
     if (!allowed || socket_drained_) break;
-    read_to_cap = ReadSocket();
+    ReadSocket();
   }
   if (pending_close_.has_value() && pipeline_->InFlight() == 0 && !HasPendingWrites()) {
     Close(*pending_close_);
@@ -270,10 +280,10 @@ resp::RequestPipeline::FeedResult Connection::Feed() {
   return fed;
 }
 
-bool Connection::ReadSocket() {
+void Connection::ReadSocket() {
   while (true) {
     const size_t old_size = read_buf_.size();
-    if (old_size >= config_.max_read_buffer_bytes) return true;
+    if (old_size >= config_.max_read_buffer_bytes) return;
     const size_t want = std::min(kRecvChunkBytes, config_.max_read_buffer_bytes - old_size);
     read_buf_.resize(old_size + want);
 
@@ -288,18 +298,18 @@ bool Connection::ReadSocket() {
     read_buf_.resize(old_size);
     if (n == 0) {
       Close(metrics::CloseReason::kClient);
-      return false;
+      return;
     }
     const int err = pnet::LastError();
     if (pnet::IsInterrupted(err)) continue;
     if (pnet::IsWouldBlock(err)) {
       socket_drained_ = true;
-      return false;
+      return;
     }
     ABYSS_LOG_DEBUG("recv error", {"client_id", client_id_},
                     {"err", std::string_view{pnet::ErrorString(err)}});
     Close(metrics::CloseReason::kClient);
-    return false;
+    return;
   }
 }
 

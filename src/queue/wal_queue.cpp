@@ -475,6 +475,10 @@ void WalQueue::StopStreamsForTesting() {
   for (auto& stream : streams_) stream->Shutdown();
 }
 
+std::size_t WalQueue::SpareWaitersForTesting(uint32_t log) const {
+  return logs_.at(log)->log->SpareWaitersForTesting();
+}
+
 void WalQueue::PauseSegmentPreparerForTesting(uint32_t log, bool paused) {
   Log& target = *logs_.at(log)->log;
   if (paused) {

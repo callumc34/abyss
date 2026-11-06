@@ -205,7 +205,8 @@ class BusyTaskDispatcher : public core::CommandDispatcher {
     core::Outcome Run(core::Slot& /*slot*/, core::Result<void> /*wake*/) override {
       return {.reply = core::RespValue::Null()};
     }
-    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/) override {
+    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/,
+                                          core::AbandonReason /*reason*/) override {
       return std::unexpected(core::Error{core::ErrorCode::kTimeout, "abandoned"});
     }
     bool Quiescent() const override { return !busy; }

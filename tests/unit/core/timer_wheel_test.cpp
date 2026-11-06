@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "abyss/core/types.h"
@@ -104,6 +105,20 @@ TEST_F(TimerWheelTest, NextDueWrapsRoundTheWheel) {
   wheel_.Schedule(node, origin_ + 9ms);
   EXPECT_EQ(wheel_.NextDue(), std::optional<SteadyTime>(origin_ + 9ms));
 }
+
+#ifndef NDEBUG
+TEST(TimerWheelDeathTest, AWheelUsedOffItsThreadIsCaught) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        TimerWheel wheel(1ms, 8);
+        TimerNode node(1);
+        wheel.Schedule(node, SteadyClock::now() + 1s);
+        std::thread([&wheel, &node] { wheel.Cancel(node); }).join();
+      },
+      "a timer wheel used off its owner's thread");
+}
+#endif
 
 }  // namespace
 }  // namespace abyss::core

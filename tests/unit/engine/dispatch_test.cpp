@@ -189,7 +189,7 @@ TEST_P(HandOffTest, AnAbandonAfterTheNotifierTookTheWakeHandsItOn) {
 
   std::thread notifier([this] { MakeRoomForOne(); });
   ASSERT_TRUE(gated.entered.Wait());
-  const auto reply = first.task->Abandon(first.slot);
+  const auto reply = first.task->Abandon(first.slot, core::AbandonReason::kDeadline);
   EXPECT_TRUE(!reply.has_value() || reply->IsError()) << "the abandoned write replied ok";
   EXPECT_FALSE(first.task->Quiescent()) << "its wake was taken, so it is owed";
 

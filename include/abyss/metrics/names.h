@@ -167,6 +167,19 @@ constexpr std::string_view ToStringView(CloseReason r) noexcept {
   return {};
 }
 
+// Why a pending command was given up.
+enum class AbandonReason : uint8_t { kDeadline, kShutdown };
+
+constexpr std::string_view ToStringView(AbandonReason r) noexcept {
+  switch (r) {
+    case AbandonReason::kDeadline:
+      return "deadline";
+    case AbandonReason::kShutdown:
+      return "shutdown";
+  }
+  return {};
+}
+
 enum class RejectReason : uint8_t {
   kMaxConnections,
   kBindFamily,
@@ -379,6 +392,10 @@ struct LabelKeyOf<RejectReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
 template <>
+struct LabelKeyOf<AbandonReason> {
+  static constexpr LabelKey value = LabelKey::kReason;
+};
+template <>
 struct LabelKeyOf<RedecideReason> {
   static constexpr LabelKey value = LabelKey::kReason;
 };
@@ -431,6 +448,7 @@ inline std::string ToLabelString(FlushReason r) { return std::string(ToStringVie
 inline std::string ToLabelString(BackoffReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(CloseReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RejectReason r) { return std::string(ToStringView(r)); }
+inline std::string ToLabelString(AbandonReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(RedecideReason r) { return std::string(ToStringView(r)); }
 inline std::string ToLabelString(FillOutcome o) { return std::string(ToStringView(o)); }
 inline std::string ToLabelString(MaintenancePass p) { return std::string(ToStringView(p)); }
@@ -971,6 +989,11 @@ inline constexpr CounterDesc<> kNetBackpressureExitedTotal{
 inline constexpr CounterDesc<> kNetLateCompletionsTotal{
     .name = "abyss_net_late_completions_total",
     .help = "Engine events that named no live or orphaned command, dropped.",
+};
+
+inline constexpr CounterDesc<AbandonReason> kNetCommandsAbandonedTotal{
+    .name = "abyss_net_commands_abandoned_total",
+    .help = "Pending commands given up, at their deadline or when the server stopped.",
 };
 
 inline constexpr GaugeDesc<> kNetOrphans{

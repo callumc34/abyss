@@ -85,7 +85,8 @@ class Reactor {
 
  private:
   void Run();
-  void DrainInbox();
+  // False if the take found nothing.
+  bool DrainInbox();
   void DrainHandoff();
   void ProcessEvents(std::span<const Event> events);
   void RunTimers(core::SteadyTime now);

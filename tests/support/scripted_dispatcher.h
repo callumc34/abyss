@@ -28,7 +28,7 @@ namespace abyss::testing {
 // command's Abandon replies `timeout_text`; with `cancel_fails` its
 // wake is already on its way, and its task stays busy until it lands.
 // Counts, by key, the commands applied and the late wakes that only
-// cleaned up.
+// cleaned up, and keeps each abandon's reason.
 class ScriptedDispatcher : public core::CommandDispatcher {
  public:
   explicit ScriptedDispatcher(::testing::NiceMock<MockQueue>& queue) : queue_(queue) {
@@ -71,6 +71,7 @@ class ScriptedDispatcher : public core::CommandDispatcher {
   std::vector<std::string> dispatched;
   std::map<std::string, int> applied;
   std::map<std::string, int> cleanups;
+  std::vector<core::AbandonReason> abandons;
   bool cancel_fails = false;
   std::string timeout_text = "write timed out waiting for admission";
   std::chrono::milliseconds timeout{10000};
@@ -97,7 +98,9 @@ class ScriptedDispatcher : public core::CommandDispatcher {
       if (key_.starts_with("ps")) return owner_.Sequence(slot, key_);
       return {.reply = core::RespValue::BulkString(key_)};
     }
-    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/) override {
+    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/,
+                                          core::AbandonReason reason) override {
+      owner_.abandons.push_back(reason);
       if (owner_.cancel_fails) {
         abandoned_ = true;
       } else {

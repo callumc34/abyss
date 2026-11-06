@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "abyss/core/types.h"
@@ -43,7 +44,7 @@ class TimerNode {
 // the tick its deadline falls in, whatever the round. Schedule and
 // Cancel are O(1); Expire visits only the buckets of the ticks passed.
 // A timer never fires before its deadline, and at most one tick after
-// it once Expire is called. One thread.
+// it once Expire is called. One thread, the first to use it.
 class TimerWheel {
  public:
   using Tick = std::chrono::steady_clock::duration;
@@ -73,6 +74,7 @@ class TimerWheel {
   uint64_t FloorTick(SteadyTime time) const;
   void Link(TimerNode& node, uint64_t tick);
   void Unlink(TimerNode& node) noexcept;
+  void OnOwner() const noexcept;
 
   const Tick tick_;
   const SteadyTime origin_;
@@ -82,6 +84,7 @@ class TimerWheel {
   // The last tick Expire processed.
   uint64_t current_ = 0;
   size_t size_ = 0;
+  mutable std::thread::id owner_;
 };
 
 }  // namespace abyss::core

@@ -28,6 +28,8 @@ struct NetMetrics {
   metrics::CounterHandle backpressure_exited;
   metrics::CounterHandle late_completions;
   metrics::GaugeHandle orphans;
+  metrics::CounterHandle abandoned_deadline;
+  metrics::CounterHandle abandoned_shutdown;
 
   metrics::CounterHandle Closed(metrics::CloseReason r) const noexcept;
   metrics::CounterHandle Rejected(metrics::RejectReason r) const noexcept;
@@ -51,7 +53,8 @@ struct ConnectionConfig {
   size_t write_resume_bytes = 1048576;
   size_t write_hard_limit_bytes = 16777216;
   std::chrono::seconds idle_timeout{300};
-  // Commands dispatched and not yet written; reading pauses at the cap.
+  // Commands in flight, dispatched and not yet written or written and
+  // still owed a durable post; reading pauses at the cap.
   size_t max_inflight_commands = 1024;
 };
 
@@ -114,9 +117,8 @@ class Connection {
  private:
   // Parses and dispatches what is buffered.
   resp::RequestPipeline::FeedResult Feed();
-  // Reads until the socket would block or the buffer is at its cap:
-  // true at the cap.
-  bool ReadSocket();
+  // Reads until the socket would block or the buffer is at its cap.
+  void ReadSocket();
   bool ReadAllowed() const noexcept;
   void TryDrainWrite();
   void UpdateBackpressure();

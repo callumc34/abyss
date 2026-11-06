@@ -11,17 +11,25 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <initializer_list>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "abyss/core/command_dispatcher.h"
+#include "abyss/core/completion.h"
 #include "abyss/core/resp_types.h"
 #include "abyss/core/result.h"
+#include "abyss/metrics/names.h"
+#include "abyss/metrics/testing.h"
 #include "abyss/platform/net.h"
 #include "abyss/resp/command_registry.h"
+#include "latch.h"
 #include "sync_redis_client.h"
 
 namespace abyss::net {
@@ -52,6 +60,121 @@ class StubDispatcher : public core::CommandDispatcher {
     return {.reply = core::RespValue::SimpleString("OK")};
   }
 };
+
+// "again" pends until its kResume, and its first resume posts one
+// more from the thread running it, as a stopped pool fails at once the
+// job a resumed task submits. "hold" keeps its reactor until released.
+// Anything else replies at once.
+class ResumeAgainDispatcher : public core::CommandDispatcher {
+ public:
+  core::Outcome Dispatch(core::Request request, core::Slot& slot,
+                         std::unique_ptr<core::Task>& task) override {
+    const std::string key = request.cmd.args.size() > 1 ? request.cmd.args[1] : std::string();
+    slot.deadline = core::SteadyClock::now() + std::chrono::hours{1};
+    if (key == "hold") {
+      holding.Open();
+      (void)release.Wait(std::chrono::seconds{30});
+    } else if (key == "again") {
+      if (task == nullptr) task = std::make_unique<Again>(*this);
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): made here.
+      static_cast<Again&>(*task).Begin();
+      {
+        const std::scoped_lock lock(mu_);
+        pending_ = slot.completion;
+      }
+      pended.Open();
+      return {.kind = core::Outcome::Kind::kPending};
+    }
+    return {.reply = core::RespValue::BulkString(key)};
+  }
+
+  // The pending command's kResume, from the caller's thread.
+  void Wake() {
+    core::Completion completion;
+    {
+      const std::scoped_lock lock(mu_);
+      completion = pending_;
+    }
+    Resume(completion);
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-non-private-member-variables-in-classes)
+  abyss::testing::Latch holding;
+  abyss::testing::Latch release;
+  abyss::testing::Latch pended;
+  std::atomic<int> runs{0};
+  // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+
+ private:
+  class Again final : public core::Task {
+   public:
+    explicit Again(ResumeAgainDispatcher& owner) : owner_(owner) {}
+
+    void Begin() {
+      busy_ = true;
+      posted_ = false;
+    }
+    core::Outcome Run(core::Slot& slot, core::Result<void> /*wake*/) override {
+      owner_.runs.fetch_add(1);
+      if (!std::exchange(posted_, true)) {
+        Resume(slot.completion);
+        return {.kind = core::Outcome::Kind::kPending};
+      }
+      busy_ = false;
+      return {.reply = core::RespValue::BulkString("again")};
+    }
+    core::Result<core::RespValue> Abandon(core::Slot& /*slot*/,
+                                          core::AbandonReason /*reason*/) override {
+      return std::unexpected(core::Error{core::ErrorCode::kTimeout, "abandoned"});
+    }
+    bool Quiescent() const override { return !busy_; }
+
+   private:
+    ResumeAgainDispatcher& owner_;
+    bool busy_ = false;
+    bool posted_ = false;
+  };
+
+  static void Resume(const core::Completion& completion) {
+    const core::CompletionEvent event{
+        .client_id = completion.client_id,
+        .slot_seq = completion.slot_seq,
+        .kind = core::CompletionKind::kResume,
+        .result = {},
+    };
+    completion.sink->Post(std::span(&event, 1));
+  }
+
+  std::mutex mu_;
+  core::Completion pending_;
+};
+
+std::string Resp(std::initializer_list<std::string_view> args) {
+  std::string out = "*" + std::to_string(args.size()) + "\r\n";
+  for (const std::string_view arg : args) {
+    out += "$" + std::to_string(arg.size()) + "\r\n";
+    out += arg;
+    out += "\r\n";
+  }
+  return out;
+}
+
+double OrphanGauge() {
+  return metrics::testing::GetGaugeValue(metrics::names::kNetOrphans).value_or(0);
+}
+double LateCompletions() {
+  return metrics::testing::GetCounterValue(metrics::names::kNetLateCompletionsTotal).value_or(0);
+}
+
+template <typename Done>
+bool PollUntil(const Done& done, std::chrono::milliseconds budget = std::chrono::seconds{10}) {
+  const auto until = std::chrono::steady_clock::now() + budget;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= until) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
 
 TcpServerConfig DefaultTestConfig() {
   TcpServerConfig c;
@@ -309,6 +432,66 @@ TEST_F(TcpServerComponentTest, IdleConnectionsClosedByReaper) {
   std::this_thread::sleep_for(std::chrono::milliseconds{1500});
   EXPECT_TRUE(client.ReadSome(16, std::chrono::milliseconds{500}).empty());
 
+  server.Stop();
+}
+
+// The final drain takes a kResume whose task, resumed, posts again from
+// the reactor's thread, as a stopped pool fails what it submits: the
+// reactor takes that one too, and stops with no orphan left.
+TEST_F(TcpServerComponentTest, TheFinalDrainTakesWhatItsOwnEventsPost) {
+  TcpServerConfig cfg = DefaultTestConfig();
+  cfg.io_threads = 1;
+  ResumeAgainDispatcher dispatcher;
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
+  ASSERT_TRUE(server.Start().has_value());
+  const double before = OrphanGauge();
+
+  component_test::SyncRedisClient gone;
+  ASSERT_TRUE(gone.Connect(server.BoundPort()));
+  ASSERT_TRUE(gone.SendRaw(Resp({"GET", "again"})));
+  ASSERT_TRUE(dispatcher.pended.Wait());
+  gone.Close();
+  ASSERT_TRUE(PollUntil([before] { return OrphanGauge() == before + 1; }))
+      << "its pipeline, still owed a post, is orphaned";
+
+  // The reactor is held mid-pass, past its take: the wake waits in its
+  // inbox, and the engine is done before the pass ends.
+  component_test::SyncRedisClient holder;
+  ASSERT_TRUE(holder.Connect(server.BoundPort()));
+  ASSERT_TRUE(holder.SendRaw(Resp({"GET", "hold"})));
+  ASSERT_TRUE(dispatcher.holding.Wait());
+  dispatcher.Wake();
+  server.RequestStop();
+  dispatcher.release.Open();
+  server.Join();
+
+  EXPECT_EQ(dispatcher.runs.load(), 2) << "the post its first resume made was never taken";
+  EXPECT_EQ(OrphanGauge(), before);
+}
+
+// A kResume for a command already answered, its slot reclaimed, names
+// nothing owed: the reactor drops it and counts it.
+TEST_F(TcpServerComponentTest, AnEventNamingNothingOwedIsDroppedAndCounted) {
+  TcpServerConfig cfg = DefaultTestConfig();
+  cfg.io_threads = 1;
+  ResumeAgainDispatcher dispatcher;
+  TcpServer server(cfg, resp::GlobalRegistry(),
+                   resp::PipelineDependencies{.dispatcher = &dispatcher});
+  ASSERT_TRUE(server.Start().has_value());
+  component_test::SyncRedisClient client;
+  ASSERT_TRUE(client.Connect(server.BoundPort()));
+  ASSERT_TRUE(client.SendRaw(Resp({"GET", "again"})));
+  ASSERT_TRUE(dispatcher.pended.Wait());
+  dispatcher.Wake();
+  EXPECT_EQ(client.ReadReply(), "$5\r\nagain\r\n");
+  const double late = LateCompletions();
+
+  dispatcher.Wake();
+  EXPECT_TRUE(PollUntil([late] { return LateCompletions() == late + 1; }));
+  EXPECT_EQ(dispatcher.runs.load(), 2) << "a stale event ran the task";
+  EXPECT_EQ(client.Command({"PING"}), "+PONG\r\n");
+  EXPECT_EQ(LateCompletions(), late + 1);
   server.Stop();
 }
 
