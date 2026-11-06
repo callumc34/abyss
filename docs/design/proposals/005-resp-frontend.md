@@ -505,7 +505,7 @@ engine:
 9. During recovery, data-plane commands return `LOADING`; the narrow admin set remains available.
 10. Inline protocol is supported alongside RESP arrays; both produce the same `RespCommand`.
 11. **Commands on a connection keep their order.** Each command on a connection reaches its linearisation point (a write applied to hot and published, a read's answer taken) before the next command on that connection is dispatched, and replies are written in command order. That holds at any `queue.log_count`. Acknowledged writes are never lost at their class (invariant 4); the caveat below concerns unacknowledged writes only. With `queue.log_count` above 1, pipelined writes to different logs become durable independently, so a power loss can keep a later unacknowledged write and lose an earlier one. The writes on a connection that survive a power loss therefore form a prefix of its writes only at `log_count = 1`, as Redis Cluster promises no order across slots.
-12. A reactor thread never waits on durability, cold I/O or a capacity wait, and closing a connection never waits for the engine. A shutdown applies no command it had not linearised, and one that overruns `net.shutdown_timeout_seconds` exits with status 70.
+12. A reactor thread never waits on a flush, cold I/O or a capacity wait. Its only waits are the shard or buffer locks and the bounded park in Complete on earlier reservations in the same log (ADP-015 §Where a reactor still waits). Closing a connection never waits for the engine. A shutdown applies no command it had not linearised, and one that overruns `net.shutdown_timeout_seconds` exits with status 70.
 
 ## Trade-offs
 
