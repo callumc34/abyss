@@ -24,6 +24,17 @@ inline std::string AsciiLower(std::string_view s) {
   return out;
 }
 
+// A client's bytes made fit to quote in an error or status reply, a
+// line that ends at the first CRLF: CR and LF become spaces, as Redis
+// maps them.
+inline std::string OneLine(std::string_view s) {
+  std::string out(s);
+  for (char& c : out) {
+    if (c == '\r' || c == '\n') c = ' ';
+  }
+  return out;
+}
+
 inline bool AsciiEqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {

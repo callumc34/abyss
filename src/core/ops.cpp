@@ -11,6 +11,7 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "abyss/core/ascii.h"
 #include "abyss/core/types.h"
 
 namespace abyss::core::ops {
@@ -393,7 +394,7 @@ Result<WriteOp> ParseExpire(const RespCommand& cmd, uint64_t wall_now_ms, const 
   for (size_t i = 3; i < cmd.args.size(); ++i) {
     const auto opt = AsciiUpper(cmd.args[i]);
     if (opt != "NX" && opt != "XX" && opt != "GT" && opt != "LT") {
-      return std::unexpected(SyntaxError("Unsupported option " + std::string(cmd.args[i])));
+      return std::unexpected(SyntaxError("Unsupported option " + OneLine(cmd.args[i])));
     }
   }
   auto ttl = ParseTtl(cmd.args[2], spec, wall_now_ms);

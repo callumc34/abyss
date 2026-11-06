@@ -36,6 +36,15 @@ using metrics::RequestStatus;
 constexpr size_t kFirstSlots = 4;
 constexpr size_t kKeptSlots = 16;
 
+constexpr std::string_view kBadClientName =
+    "Client names cannot contain spaces, newlines or special characters.";
+
+// Redis's rule, as CLIENT LIST splits its fields on spaces: no byte
+// outside '!'..'~'. An empty name clears it.
+bool ValidClientName(std::string_view name) {
+  return std::ranges::all_of(name, [](char c) { return c >= '!' && c <= '~'; });
+}
+
 ErrorPrefix MapErrorCode(core::ErrorCode code) {
   switch (code) {
     case core::ErrorCode::kWrongType:
@@ -619,6 +628,8 @@ RequestPipeline::Immediate RequestPipeline::HandleHello(const CommandSpec& spec,
     }
     negotiated = 2;
 
+    // Applied only once every option has parsed.
+    std::optional<std::string_view> name;
     // AUTH args are accepted and discarded until AUTH/ACL is implemented.
     for (size_t i = 2; i < cmd.ArgCount(); ++i) {
       if (core::AsciiEqualsIgnoreCase(cmd.args[i], "AUTH")) {
@@ -631,12 +642,16 @@ RequestPipeline::Immediate RequestPipeline::HandleHello(const CommandSpec& spec,
           return record_response(
               RespValue::Error(ErrorPrefix::kErr, "syntax error in HELLO SETNAME"));
         }
-        state_.client_name = cmd.args[i + 1];
+        name = cmd.args[i + 1];
+        if (!ValidClientName(*name)) {
+          return record_response(RespValue::Error(ErrorPrefix::kErr, std::string(kBadClientName)));
+        }
         ++i;
       } else {
         return record_response(RespValue::Error(ErrorPrefix::kErr, "syntax error"));
       }
     }
+    if (name.has_value()) state_.client_name = *name;
   }
 
   state_.protocol_version = negotiated;
@@ -679,6 +694,9 @@ RespValue RequestPipeline::HandleClient(std::string_view subcommand, const RespC
     return RespValue::BulkString(state_.client_name);
   }
   if (subcommand == "SETNAME") {
+    if (!ValidClientName(cmd.args[2])) {
+      return RespValue::Error(ErrorPrefix::kErr, std::string(kBadClientName));
+    }
     state_.client_name = cmd.args[2];
     return RespValue::SimpleString("OK");
   }
@@ -710,11 +728,11 @@ RespValue RequestPipeline::MakeLoading() {
 
 RespValue RequestPipeline::MakeUnknownCommand(std::string_view name, std::string_view first_arg) {
   std::string message = "unknown command '";
-  message.append(name);
+  message.append(core::OneLine(name));
   message.append("'");
   if (!first_arg.empty()) {
     message.append(", with args beginning with: '");
-    message.append(first_arg);
+    message.append(core::OneLine(first_arg));
     message.append("'");
   } else {
     message.append(", with args beginning with: ");
@@ -739,7 +757,7 @@ RespValue RequestPipeline::MakeUnknownSubcommand(const CommandSpec& parent,
   std::string message = "Unknown ";
   message.append(parent.name);
   message.append(" subcommand or wrong number of arguments for '");
-  message.append(raw_sub);
+  message.append(core::OneLine(raw_sub));
   message.push_back('\'');
   return RespValue::Error(ErrorPrefix::kErr, std::move(message));
 }

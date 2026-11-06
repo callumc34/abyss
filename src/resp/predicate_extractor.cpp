@@ -3,6 +3,8 @@
 #include <string>
 #include <string_view>
 
+#include "abyss/core/ascii.h"
+
 namespace abyss::resp {
 
 namespace {
@@ -114,7 +116,7 @@ core::Result<core::PredicateFlags> ExtractExpireFlags(const core::RespCommand& c
       flags |= core::PredicateFlags::kExpireLt;
       lt = true;
     } else {
-      return std::unexpected(SyntaxError("Unsupported option " + std::string(cmd.args[i])));
+      return std::unexpected(SyntaxError("Unsupported option " + core::OneLine(cmd.args[i])));
     }
   }
   if (nx && (xx || gt || lt)) {

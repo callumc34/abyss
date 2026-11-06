@@ -33,6 +33,7 @@
 #include <iterator>
 #include <latch>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -49,10 +50,16 @@
 #endif
 
 #include "abyss/core/ascii.h"
+#include "abyss/core/command_dispatcher.h"
 #include "abyss/core/queue_entry.h"
 #include "abyss/platform/fs.h"
 #include "abyss/platform/mapped_file.h"
+#include "abyss/resp/orphans.h"
+#include "abyss/resp/parser.h"
+#include "abyss/resp/request_pipeline.h"
+#include "abyss/resp/serializer.h"
 #include "crash_harness.h"
+#include "event_inbox.h"
 #include "property_harness.h"
 #include "sync_pipeline.h"
 #include "wal_power_loss.h"
@@ -166,6 +173,70 @@ Versions VersionsOf(const std::vector<std::vector<core::QueueEntry>>& log) {
   }
   return versions;
 }
+
+// One connection writing pipelines of random depth without waiting
+// for their replies, up to a window unanswered, driven on its thread
+// as its reactor would drive it. Replies arrive in command order.
+class PipelinedWriter {
+ public:
+  explicit PipelinedWriter(core::CommandDispatcher& dispatcher)
+      : pipeline_(std::make_unique<resp::RequestPipeline>(
+            resp::GlobalRegistry(), resp::ConnectionState{.client_id = 1},
+            resp::PipelineDependencies{.dispatcher = &dispatcher},
+            resp::PipelineHost{.sink = &inbox_})) {}
+
+  void Send(const std::vector<std::string>& args) {
+    const std::vector<uint8_t> bytes =
+        resp::Serializer::SerializeCommand(core::RespCommand{.args = args});
+    input_.insert(input_.end(), bytes.begin(), bytes.end());
+    ++sent_;
+  }
+
+  // Feeds and writes what it can, hands each reply to `reply` in order,
+  // then takes one event, waiting at most `wait`, or passes a deadline.
+  void Pump(std::chrono::milliseconds wait, const std::function<void(core::RespValue)>& reply) {
+    if (fed_ < input_.size() && pipeline_->CanDispatch(0)) {
+      fed_ += pipeline_->Feed(std::span(input_).subspan(fed_), 0).consumed;
+    }
+    pipeline_->Drain(output_);
+    for (;;) {
+      auto parsed = resp::Parser::Parse(std::span(output_).subspan(parsed_));
+      if (!parsed.has_value()) break;
+      parsed_ += parsed->bytes_consumed;
+      ++replied_;
+      reply(std::move(parsed->value));
+    }
+    core::SteadyTime until = core::SteadyClock::now() + wait;
+    if (const auto deadline = pipeline_->NextDeadline()) until = std::min(until, *deadline);
+    if (auto event = inbox_.Take(until)) {
+      (void)orphans_.Route(*event, pipeline_.get());
+    } else if (auto orphan = pipeline_->Expire(core::SteadyClock::now())) {
+      orphans_.Adopt(std::move(orphan));
+    }
+  }
+
+  // Nothing more is dispatched; what is sent and not yet never runs.
+  void Stop() { pipeline_->StopDispatch(); }
+
+  uint64_t sent() const { return sent_; }
+  uint64_t dispatched() const { return replied_ + pipeline_->InFlight(); }
+  uint64_t Unanswered() const { return sent_ - replied_; }
+  bool Settled() const {
+    return pipeline_->InFlight() == 0 && pipeline_->Quiescent() && orphans_.empty();
+  }
+
+ private:
+  // Declared in the order they must outlive one another.
+  abyss::testing::EventInbox inbox_;
+  resp::Orphans orphans_;
+  std::unique_ptr<resp::RequestPipeline> pipeline_;
+  std::vector<uint8_t> input_;
+  size_t fed_ = 0;
+  std::vector<uint8_t> output_;
+  size_t parsed_ = 0;
+  uint64_t sent_ = 0;
+  uint64_t replied_ = 0;
+};
 
 class CrashTest : public PropertyHarness {
  protected:
@@ -851,6 +922,145 @@ class CrashTest : public PropertyHarness {
     return run;
   }
 
+  struct PipelinedRun {
+    uint64_t written = 0;
+    uint64_t acknowledged = 0;
+    uint64_t survived = 0;
+    // Survivors past the connection's first lost write.
+    uint64_t past_a_loss = 0;
+    bool ok = true;
+  };
+
+  // One connection pipelines SETs of distinct keys at power_loss over
+  // `logs` logs while flushes stall and resume, then flushes stop with
+  // a window of writes unanswered, and the power fails. Every write
+  // acknowledged survives. One log holds the connection's writes in its
+  // order and recovers a prefix of it, so the survivors are a prefix of
+  // the connection's order; over two, a later write may survive an
+  // earlier one, unacknowledged both (S5), and only the count shows it.
+  PipelinedRun PipelinedPowerLoss(uint64_t seed, uint32_t logs) {
+    constexpr uint64_t kWindow = 512;
+    Rng rng(seed);
+    Options options;
+    options.shards = 4;
+    options.log_count = logs;
+    options.durability = core::Durability::kPowerLoss;
+    options.segment_size_bytes = size_t{64} << 10;
+    options.command_timeout = std::chrono::milliseconds(1000);
+    options.run = "pipe" + std::to_string(seed) + "-" + std::to_string(logs) + "-";
+    const std::string at =
+        "pipelined power loss seed " + std::to_string(seed) + " logs " + std::to_string(logs);
+    Progress(at + " open");
+    OpenAt(options, 1'700'000'000'000);
+    queue_->SetFlushHookForTesting(GateHook());
+    const auto key = [](uint64_t i) { return "w" + std::to_string(i); };
+    const auto value = [](uint64_t i) { return "v" + std::to_string(i); };
+
+    std::atomic<bool> crashed{false};
+    // Dispatched and not acknowledged: past the durable end.
+    std::atomic<uint64_t> unflushed{0};
+    std::vector<bool> acked;
+    uint64_t written = 0;
+    std::thread client([&] {
+      Rng mine(seed * 7919);
+      PipelinedWriter writer(*engine_);
+      uint64_t oks = 0;
+      // Told after the power loss: not told at all.
+      const auto heard = [&](const core::RespValue& reply) {
+        const bool ok = reply.IsSimpleString() && reply.AsString() == "OK";
+        if (ok) ++oks;
+        acked.push_back(ok && !crashed.load());
+      };
+      while (!crashed.load()) {
+        if (writer.Unanswered() < kWindow) {
+          for (auto depth = mine.Between(1, 32); depth > 0; --depth) {
+            writer.Send({"SET", key(writer.sent()), value(writer.sent())});
+          }
+        }
+        writer.Pump(std::chrono::milliseconds(1), heard);
+        unflushed = writer.dispatched() - oks;
+        Heartbeat();
+      }
+      // What is dispatched lands or times out; the rest never runs.
+      writer.Stop();
+      written = writer.sent();
+      while (!writer.Settled()) {
+        writer.Pump(std::chrono::milliseconds(10), heard);
+        Heartbeat();
+      }
+    });
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(rng.Between(50, 150));
+    while (std::chrono::steady_clock::now() < until) {
+      Gate(rng.Chance(0.6));
+      std::this_thread::sleep_for(std::chrono::microseconds(rng.Between(200, 3000)));
+    }
+    // Flushes stop; the power fails once half a window is dispatched
+    // and unacknowledged, whatever the host's speed.
+    Gate(true);
+    Progress(at + " unflushed");
+    const auto bound = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (unflushed.load() < kWindow / 2 && std::chrono::steady_clock::now() < bound) {
+      Heartbeat();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(unflushed.load(), kWindow / 2) << at << ": the window never filled";
+    crashed = true;
+    client.join();
+
+    std::vector<queue::DurableExtent> extents;
+    extents.reserve(logs);
+    for (uint32_t log = 0; log < logs; ++log) {
+      extents.push_back(queue_->DurableExtentForTesting(log));
+    }
+    queue_->SkipFinalFlushForTesting();
+    Gate(false);
+    Progress(at + " power loss");
+    CloseAll();
+    for (uint32_t log = 0; log < logs; ++log) {
+      abyss::testing::SimulatePowerLossDropping(extents[log], seed + log, {.keep_page = 0.3});
+    }
+    auto restarted = RestartAt();
+    if (!restarted.has_value()) {
+      ADD_FAILURE() << at << ": recovery failed: " << restarted.error().message();
+      return {.ok = false};
+    }
+    Progress(at + " check");
+    PipelinedRun run{.written = written};
+    std::optional<uint64_t> first_lost;
+    std::vector<std::string> wrong;
+    for (uint64_t i = 0; i < written; ++i) {
+      const core::RespValue got = Run({"GET", key(i)});
+      const bool kept = got.IsBulkString() && got.AsString() == value(i);
+      if (!kept && !got.IsNull()) wrong.push_back(key(i) + " holds " + RedisModel::Render(got));
+      const bool told = i < acked.size() && acked[i];
+      if (told) ++run.acknowledged;
+      if (told && !kept) wrong.push_back(key(i) + " was acknowledged, and lost");
+      if (kept) {
+        ++run.survived;
+        if (first_lost.has_value()) ++run.past_a_loss;
+      } else if (!first_lost.has_value()) {
+        first_lost = i;
+      }
+      if (i % 64 == 0) Heartbeat();
+    }
+    if (!wrong.empty()) {
+      run.ok = false;
+      ADD_FAILURE() << at << ": " << wrong.size() << " wrong, first: " << wrong.front();
+    }
+    if (logs == 1 && run.past_a_loss > 0) {
+      run.ok = false;
+      ADD_FAILURE() << at << ": " << run.past_a_loss << " writes survived the connection's write "
+                    << key(first_lost.value_or(0)) << ", which was lost: not a prefix of its order";
+    }
+    std::cout << "[crash] " << at << ": " << run.written << " written, " << run.acknowledged
+              << " acknowledged, " << run.survived << " survived, " << run.past_a_loss
+              << " past the first loss\n"
+              << std::flush;
+    CloseAll();
+    return run;
+  }
+
   static void Add(Tally& total, const Tally& run) {
     total.calls += run.calls;
     total.acknowledged += run.acknowledged;
@@ -937,6 +1147,40 @@ TEST_F(CrashTest, PowerLossRecoversAPrefixThatExplainsEveryReply) {
     EXPECT_GT(total.recycled, 0U) << "no lost page of a recycled segment reverted";
   }
 #endif
+}
+
+// S5: at one log a pipelining connection's survivors are a prefix of
+// its order; at two only its acknowledged writes are sure to survive.
+TEST_F(CrashTest, APipelinedConnectionRecoversAPrefixOfItsWritesAtOneLog) {
+  // Each power loss cuts the connection's writes once.
+  std::vector<uint64_t> one_log = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::vector<uint64_t> two_logs = {1, 2};
+  if (kReducedDivisor > 1) {
+    one_log = {1, 2, 3};
+    two_logs = {1};
+  }
+  if (const auto only = EnvNumber("ABYSS_CRASH_SEED")) one_log = two_logs = {*only};
+  uint64_t lost = 0;
+  uint64_t acknowledged = 0;
+  for (const uint64_t seed : one_log) {
+    const PipelinedRun run = PipelinedPowerLoss(seed, 1);
+    if (!run.ok) return;
+    lost += run.written - run.survived;
+    acknowledged += run.acknowledged;
+  }
+  uint64_t past_a_loss = 0;
+  for (const uint64_t seed : two_logs) {
+    const PipelinedRun run = PipelinedPowerLoss(seed, 2);
+    if (!run.ok) return;
+    past_a_loss += run.past_a_loss;
+  }
+  std::cout << "[crash] pipelined: at one log " << lost << " unacknowledged writes lost, "
+            << acknowledged << " acknowledged kept; at two logs " << past_a_loss
+            << " survived an earlier loss\n"
+            << std::flush;
+  // Else no power loss cut into the connection's writes.
+  EXPECT_GT(lost, 0U);
+  EXPECT_GT(acknowledged, 0U);
 }
 
 #ifndef _WIN32

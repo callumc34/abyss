@@ -531,5 +531,14 @@ TEST(ParseReadOpTest, ErrorsAreAscii) {
             "value is not an integer or out of range");
 }
 
+// An error line quoting a client's option ends at the first CRLF, so
+// CR and LF in it become spaces.
+TEST(ParseWriteOpTest, AnOptionQuotedInAnErrorKeepsToOneLine) {
+  const RespCommand cmd{{"PEXPIRE", "k", "10", "NX\r\n:1"}};
+  const auto op = ParseWriteOp("PEXPIRE", cmd);
+  ASSERT_FALSE(op.has_value());
+  EXPECT_EQ(op.error().message(), "Unsupported option NX  :1");
+}
+
 }  // namespace
 }  // namespace abyss::core::ops

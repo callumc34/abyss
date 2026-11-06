@@ -358,14 +358,18 @@ Reply RedisClient::Command(std::initializer_list<std::string> args) {
   return ReadReply();
 }
 
-std::vector<Reply> RedisClient::Pipeline(const std::vector<std::vector<std::string>>& commands) {
-  if (!IsConnected()) return {Reply::Error("not connected")};
-
+bool RedisClient::Send(const std::vector<std::vector<std::string>>& commands) {
+  if (!IsConnected()) return false;
   std::string encoded;
   for (const auto& cmd : commands) {
     encoded += Encode(cmd);
   }
-  if (!SendEncoded(encoded)) return {Reply::Error("send failed")};
+  return SendEncoded(encoded);
+}
+
+std::vector<Reply> RedisClient::Pipeline(const std::vector<std::vector<std::string>>& commands) {
+  if (!IsConnected()) return {Reply::Error("not connected")};
+  if (!Send(commands)) return {Reply::Error("send failed")};
 
   std::vector<Reply> replies;
   replies.reserve(commands.size());

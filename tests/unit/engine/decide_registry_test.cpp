@@ -46,5 +46,12 @@ TEST(DecideRegistryTest, DecideKnowsEveryRegistryWriteAtItsArity) {
   EXPECT_GT(writes, 0U);
 }
 
+// A name quoted in an error line keeps to one line: CR and LF become
+// spaces.
+TEST(DecideRegistryTest, AnUnknownWriteQuotedInAnErrorKeepsToOneLine) {
+  const Decision d = testing::DecideOn(testing::Keys{}, {"NO\r\nSUCH", "k"});
+  EXPECT_EQ(MessageOf(d), "unsupported write command 'NO  SUCH'");
+}
+
 }  // namespace
 }  // namespace abyss::engine

@@ -68,5 +68,11 @@ TEST(PredicateExtractorTest, ExpireRejectsAnUnknownOption) {
   EXPECT_EQ(ErrorOf(ExtractExpireFlags(cmd)), "Unsupported option bogus");
 }
 
+// Quoted in an error line, a client's CR and LF become spaces.
+TEST(PredicateExtractorTest, AnOptionQuotedInAnErrorKeepsToOneLine) {
+  const RespCommand cmd{{"EXPIRE", "k", "10", "bo\r\n+gus"}};
+  EXPECT_EQ(ErrorOf(ExtractExpireFlags(cmd)), "Unsupported option bo  +gus");
+}
+
 }  // namespace
 }  // namespace abyss::resp

@@ -62,6 +62,10 @@ class RedisClient {
 
   Reply Command(std::initializer_list<std::string> args);
   std::vector<Reply> Pipeline(const std::vector<std::vector<std::string>>& commands);
+  // Sends `commands` in one write and reads nothing; one thread may
+  // send while another reads.
+  bool Send(const std::vector<std::vector<std::string>>& commands);
+  Reply Read() { return ReadReply(); }
 
  private:
   bool SendEncoded(const std::string& data);

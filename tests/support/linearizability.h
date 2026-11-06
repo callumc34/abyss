@@ -3,11 +3,15 @@
 // A Wing-Gong linearizability check with Lowe's memoisation, as
 // Porcupine runs it, over one partition of a history. P-compositional
 // use: partition by independent object (here, a group of keys no
-// command crosses) and check each partition alone.
+// command crosses) and check each partition alone. A pipelining
+// client's ops overlap one another, so each also follows its client's
+// earlier ops: program order, on top of real-time order.
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -27,6 +31,9 @@ struct HistoryOp {
   // Its outcome is unknown (a timeout after it was logged): it took
   // effect at one point inside [call, ret], or not at all.
   bool indeterminate = false;
+  // Its place in its client's program order: it takes effect after
+  // every op of its client with a lower one. Equal places are unordered.
+  uint64_t order = 0;
 };
 
 struct LinearizabilityResult {
@@ -128,6 +135,32 @@ LinearizabilityResult CheckLinearizable(const std::vector<HistoryOp>& ops, State
 
   std::vector<uint64_t> linearized((n + 63) / 64, 0);
   const auto flip = [&linearized](size_t op) { linearized[op / 64] ^= uint64_t{1} << (op % 64); };
+  const auto placed_op = [&linearized](size_t op) {
+    return ((linearized[op / 64] >> (op % 64)) & 1U) != 0;
+  };
+  // Each op's program-order predecessors: its client's ops at the
+  // highest place below its own.
+  std::vector<std::vector<size_t>> after(n);
+  std::map<int, std::vector<size_t>> by_client;
+  for (size_t i = 0; i < n; ++i) by_client[ops[i].client].push_back(i);
+  for (auto& client : by_client) {
+    std::vector<size_t>& list = client.second;
+    std::ranges::stable_sort(list, {}, [&ops](size_t i) { return ops[i].order; });
+    // [prior_begin, prior_end): the run of places just below the
+    // current one.
+    size_t run_begin = 0;
+    size_t prior_begin = 0;
+    size_t prior_end = 0;
+    for (size_t k = 0; k < list.size(); ++k) {
+      if (k > 0 && ops[list[k]].order != ops[list[k - 1]].order) {
+        prior_begin = run_begin;
+        prior_end = k;
+        run_begin = k;
+      }
+      after[list[k]].assign(list.begin() + static_cast<ptrdiff_t>(prior_begin),
+                            list.begin() + static_cast<ptrdiff_t>(prior_end));
+    }
+  }
   std::unordered_set<Key, linearizability_internal::KeyHash> cache;
   struct Placed {
     size_t entry;
@@ -153,6 +186,12 @@ LinearizabilityResult CheckLinearizable(const std::vector<HistoryOp>& ops, State
       return result;
     }
     if (events[entry].call) {
+      if (!std::ranges::all_of(after[events[entry].op], placed_op)) {
+        // Its client's earlier ops come first.
+        first_option = 0;
+        entry = events[entry].next;
+        continue;
+      }
       const HistoryOp& op = ops[events[entry].op];
       const int options = op.indeterminate ? 2 : 1;
       bool placed = false;

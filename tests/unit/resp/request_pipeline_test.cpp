@@ -194,6 +194,62 @@ TEST(RequestPipelineTest, UnknownCommandReturnsErr) {
   EXPECT_NE(response.AsString().find("unknown command 'LPUSH'"), std::string::npos);
 }
 
+// A reply quoting a client's bytes is one frame: an error or status
+// line ends at the first CRLF, so CR and LF in what it quotes become
+// spaces, as Redis maps them.
+TEST(RequestPipelineTest, AnErrorQuotingClientBytesIsOneFrame) {
+  StubDispatcher dispatcher;
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}},
+                           {.dispatcher = &dispatcher});
+  const std::vector<std::pair<core::RespCommand, std::string>> cases = {
+      {{.args = {"NO\r\n+OK", "x\r\n-ERR y"}},
+       "ERR unknown command 'NO  +OK', with args beginning with: 'x  -ERR y'"},
+      {{.args = {"CLIENT", "no\r\n:1"}},
+       "ERR Unknown CLIENT subcommand or wrong number of arguments for 'no  :1'"},
+      {{.args = {"PEXPIRE", "k", "10", "NX\n$1"}}, "ERR Unsupported option NX $1"},
+  };
+  for (const auto& [cmd, text] : cases) {
+    std::vector<uint8_t> output;
+    Process(pipeline, Serializer::SerializeCommand(cmd), output);
+    const auto reply = Parser::Parse(output);
+    ASSERT_TRUE(reply.has_value()) << cmd.args[0];
+    EXPECT_EQ(reply->bytes_consumed, output.size()) << "more than one frame for " << cmd.args[0];
+    ASSERT_TRUE(reply->value.IsError()) << cmd.args[0];
+    EXPECT_EQ(reply->value.AsString(), text);
+  }
+}
+
+// A client name splits CLIENT LIST's fields, so one holding a space,
+// a newline or another byte outside '!'..'~' is refused in one frame,
+// with Redis's text, and never stored; nor is a HELLO's that fails.
+TEST(RequestPipelineTest, AClientNameWithASpaceOrNewlineIsRefusedAndNotStored) {
+  RequestPipeline pipeline(GlobalRegistry(), {.client_id = 1, .client_name = {}});
+  const std::string refused =
+      "ERR Client names cannot contain spaces, newlines or special characters.";
+  for (const std::string name : {"a\r\nb", "a b",
+                                 "a\x01"
+                                 "b"}) {
+    for (const auto& cmd : {core::RespCommand{.args = {"CLIENT", "SETNAME", name}},
+                            core::RespCommand{.args = {"HELLO", "2", "SETNAME", name}}}) {
+      std::vector<uint8_t> output;
+      Process(pipeline, Serializer::SerializeCommand(cmd), output);
+      const auto reply = Parser::Parse(output);
+      ASSERT_TRUE(reply.has_value()) << cmd.args[0];
+      EXPECT_EQ(reply->bytes_consumed, output.size()) << "more than one frame for " << cmd.args[0];
+      ASSERT_TRUE(reply->value.IsError()) << cmd.args[0];
+      EXPECT_EQ(reply->value.AsString(), refused);
+      EXPECT_TRUE(Dispatch(pipeline, {.args = {"CLIENT", "GETNAME"}}).IsNull())
+          << cmd.args[0] << " stored a refused name";
+    }
+  }
+  const auto bogus = Dispatch(pipeline, {.args = {"HELLO", "2", "SETNAME", "bob", "BOGUS"}});
+  EXPECT_TRUE(bogus.IsError());
+  EXPECT_TRUE(Dispatch(pipeline, {.args = {"CLIENT", "GETNAME"}}).IsNull())
+      << "a failed HELLO stored its name";
+  EXPECT_TRUE(Dispatch(pipeline, {.args = {"CLIENT", "SETNAME", "a-b"}}).IsSimpleString());
+  EXPECT_EQ(Dispatch(pipeline, {.args = {"CLIENT", "GETNAME"}}).AsString(), "a-b");
+}
+
 // Its first command replies at once; its second pends, and before that
 // command's own kResume it posts one naming the first command's slot.
 // Its task stays busy once asked to, as a task whose post is lost

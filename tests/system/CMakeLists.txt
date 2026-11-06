@@ -27,6 +27,7 @@ add_executable(abyss_system_tests
   durability_test.cpp
   lifecycle_test.cpp
   operational_test.cpp
+  pipelining_test.cpp
   health_test.cpp
   metrics_catalogue_test.cpp
   two_ttl_test.cpp

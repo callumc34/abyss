@@ -76,16 +76,16 @@ endif()
 # runs to date (docs/development/testing.md, P6).
 if(ABYSS_WITH_ROCKSDB)
   abyss_set_test_timeout(property_long "${CMAKE_CURRENT_SOURCE_DIR}" 120
-    DifferentialTest.SeededStreamsAgreeWithTheModelInEveryTier)
+    DifferentialTest.SeededStreamsAgreeWithTheModelInEveryTier
+    LinearizabilityTest.ConcurrentClientsAreLinearizablePerKeyGroup
+    CrashTest.APipelinedConnectionRecoversAPrefixOfItsWritesAtOneLog)
   abyss_set_test_timeout(property_crash "${CMAKE_CURRENT_SOURCE_DIR}" 60
     CrashTest.PowerLossRecoversAPrefixThatExplainsEveryReply
     CrashTest.ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame)
-  set(_abyss_property_short LinearizabilityTest.ConcurrentClientsAreLinearizablePerKeyGroup)
   if(NOT WIN32)
-    list(APPEND _abyss_property_short
+    abyss_set_test_timeout(property_short "${CMAKE_CURRENT_SOURCE_DIR}" 30
       CrashTest.KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply)
   endif()
-  abyss_set_test_timeout(property_short "${CMAKE_CURRENT_SOURCE_DIR}" 30 ${_abyss_property_short})
   # No CI history yet: 3x their local time is under 10 s, so the floor
   # is twice the sanitizers' 30 s stall limit, for the watchdog to fire
   # first.

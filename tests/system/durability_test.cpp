@@ -1,4 +1,8 @@
 #include <chrono>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "http_client.h"
 #include "server_fixture.h"
@@ -271,6 +275,103 @@ TEST_F(DurabilityTestFixture, FlushdbSurvivesKill) {
   ASSERT_TRUE(post.IsBulk());
   EXPECT_EQ(post.String(), "y") << "post-FLUSHDB write should survive replay";
 }
+
+// One log, under each durability class: a SIGKILL is a process crash,
+// which every acknowledged write survives at either class.
+class PipelinedKillTest : public IsolatedDataServerTest,
+                          public ::testing::WithParamInterface<std::string_view> {
+ protected:
+  TestServer::Config MakeServerConfig() const override {
+    TestServer::Config config;
+    config.config_yaml = R"yaml(
+queue:
+  wal_path: "${DATA_DIR}/wal"
+  log_count: 1
+  durability: )yaml" + std::string(GetParam()) +
+                         R"yaml(
+cold:
+  data_path: "${DATA_DIR}/cold"
+)yaml";
+    return config;
+  }
+};
+
+// Rounds of 32 pipelined SETs on one connection, each answering with
+// its key's old value, so the replies show their order. The last round
+// is cut by SIGKILL with most of it unanswered. Every acknowledged
+// write survives, and what survives of the connection's writes is a
+// prefix of their order (one log keeps them in it).
+TEST_P(PipelinedKillTest, AcknowledgedWritesSurviveAndTheSurvivorsAreAPrefix) {
+  constexpr int kDepth = 32;
+  constexpr int kRounds = 8;
+  constexpr int kReadBeforeKill = 8;
+  const auto key = [](int round, int i) {
+    return "pk" + std::to_string(round) + "." + std::to_string(i);
+  };
+  const auto old_value = [](int round, int i) {
+    return "old" + std::to_string(round) + "." + std::to_string(i);
+  };
+  const auto new_value = [](int round, int i) {
+    return "new" + std::to_string(round) + "." + std::to_string(i);
+  };
+
+  std::vector<std::vector<std::string>> seeds;
+  seeds.reserve(static_cast<size_t>(kRounds) * kDepth);
+  for (int round = 0; round < kRounds; ++round) {
+    for (int i = 0; i < kDepth; ++i) seeds.push_back({"SET", key(round, i), old_value(round, i)});
+  }
+  const auto seeded = Client().Pipeline(seeds);
+  ASSERT_EQ(seeded.size(), seeds.size());
+  for (const auto& reply : seeded) ASSERT_TRUE(reply.IsOk()) << reply;
+
+  int acknowledged = 0;
+  for (int round = 0; round < kRounds; ++round) {
+    std::vector<std::vector<std::string>> writes;
+    writes.reserve(kDepth);
+    for (int i = 0; i < kDepth; ++i) {
+      writes.push_back({"SET", key(round, i), new_value(round, i), "GET"});
+    }
+    ASSERT_TRUE(Client().Send(writes));
+    const int read = round + 1 < kRounds ? kDepth : kReadBeforeKill;
+    for (int i = 0; i < read; ++i) {
+      const Reply reply = Client().Read();
+      ASSERT_TRUE(reply.IsBulk() && reply.String() == old_value(round, i))
+          << "round " << round << " reply " << i << " out of order or failed: " << reply;
+      ++acknowledged;
+    }
+  }
+
+  KillAndRestartServer();
+
+  int survived = 0;
+  int first_lost = -1;
+  std::vector<std::string> wrong;
+  for (int round = 0; round < kRounds; ++round) {
+    for (int i = 0; i < kDepth; ++i) {
+      const int at = (round * kDepth) + i;
+      const Reply got = Client().Command({"GET", key(round, i)});
+      if (got.IsBulk() && got.String() == new_value(round, i)) {
+        if (first_lost >= 0) wrong.push_back(key(round, i) + " survived a lost earlier write");
+        ++survived;
+      } else if (got.IsBulk() && got.String() == old_value(round, i)) {
+        if (first_lost < 0) first_lost = at;
+        if (at < acknowledged) wrong.push_back(key(round, i) + " acknowledged, then lost");
+      } else {
+        wrong.push_back(key(round, i) + " holds " + got.String());
+      }
+    }
+  }
+  EXPECT_GE(survived, acknowledged);
+  EXPECT_TRUE(wrong.empty()) << wrong.size() << " wrong, first: " << wrong.front();
+  std::cout << "[pipelined kill] " << GetParam() << ": " << acknowledged << " acknowledged, "
+            << survived << " of " << (kRounds * kDepth) << " survived\n";
+}
+
+INSTANTIATE_TEST_SUITE_P(Durability, PipelinedKillTest,
+                         ::testing::Values("process_crash", "power_loss"),
+                         [](const ::testing::TestParamInfo<std::string_view>& info) {
+                           return std::string(info.param);
+                         });
 
 }  // namespace
 }  // namespace abyss::system_test

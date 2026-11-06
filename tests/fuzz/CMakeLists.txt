@@ -23,6 +23,16 @@ endif()
 # feedback signal and degrades to uniform random input generation.
 target_compile_options(abyss_compiler_options INTERFACE -fsanitize=fuzzer-no-link)
 
+# The stream harnesses' fake async engine holds durable waits on the
+# tests' MockQueue.
+find_package(GTest CONFIG REQUIRED)
+add_library(abyss_fuzz_fake_engine INTERFACE)
+target_include_directories(abyss_fuzz_fake_engine INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/tests/support
+)
+target_link_libraries(abyss_fuzz_fake_engine INTERFACE abyss::queue GTest::gmock)
+
 add_executable(fuzz_resp_parser resp_parser_fuzz.cpp)
 target_link_libraries(fuzz_resp_parser PRIVATE
   abyss::resp
@@ -35,6 +45,7 @@ target_compile_options(fuzz_resp_parser PRIVATE -fsanitize=fuzzer)
 add_executable(fuzz_resp_stream resp_stream_fuzz.cpp)
 target_link_libraries(fuzz_resp_stream PRIVATE
   abyss::resp
+  abyss_fuzz_fake_engine
   -fsanitize=fuzzer
 )
 target_compile_options(fuzz_resp_stream PRIVATE -fsanitize=fuzzer)
@@ -70,6 +81,7 @@ target_link_libraries(fuzz_make_corpus PRIVATE abyss::queue)
 add_executable(fuzz_net_connection net/connection_fuzz.cpp)
 target_link_libraries(fuzz_net_connection PRIVATE
   abyss::net
+  abyss_fuzz_fake_engine
   -fsanitize=fuzzer
 )
 target_compile_options(fuzz_net_connection PRIVATE -fsanitize=fuzzer)

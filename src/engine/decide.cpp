@@ -658,7 +658,7 @@ core::Result<const Command*> Recognise(const core::RespCommand& cmd) {
   const std::string name = core::AsciiUpper(cmd.args[0]);
   const Command* command = FindCommand(name);
   if (command == nullptr) {
-    return std::unexpected(Syntax("unsupported write command '" + name + "'"));
+    return std::unexpected(Syntax("unsupported write command '" + core::OneLine(name) + "'"));
   }
   if (!ArityHolds(*command, cmd.args.size())) {
     return std::unexpected(
@@ -738,7 +738,7 @@ Decision Decide(core::RespCommand& cmd, PredicateFlags flags, uint64_t now_ms,
     case Kind::kCopy:
       return decider.Copy();
   }
-  return Fail(Syntax("unsupported write command '" + name + "'"));
+  return Fail(Syntax("unsupported write command '" + core::OneLine(name) + "'"));
 }
 
 void Restore(Decision&& decision, core::RespCommand& cmd) {
