@@ -223,14 +223,15 @@ std::string DescribePairs(const core::Result<core::RespValue>& reply) {
 }
 
 // Every read's deadline, as every write's: generous, so a slow runner
-// never times a read out.
-constexpr std::chrono::milliseconds kCommandTimeout = 2s;
+// never times a read out, nor one joined to a load a test holds.
+constexpr std::chrono::milliseconds kCommandTimeout = 10s;
 
 class ReadPathFixture : public ::testing::Test {
  protected:
-  explicit ReadPathFixture(ReadPathConfig config = {.fill_doorkeeper = false},
-                           uint32_t io_threads = 2)
-      : pool_(IoPoolConfig{.threads = io_threads}) {
+  explicit ReadPathFixture(
+      ReadPathConfig config = {.fill_doorkeeper = false}, uint32_t io_threads = 2,
+      size_t negative_max_entries = hot::ShardedHotStoreConfig{}.negative_max_entries)
+      : negative_max_entries_(negative_max_entries), pool_(IoPoolConfig{.threads = io_threads}) {
     config.wall_clock = clock_.WallFn();
     reads_ = std::make_unique<ReadPath>(hot_, loader_, pool_, config);
   }
@@ -294,9 +295,11 @@ class ReadPathFixture : public ::testing::Test {
   consumer::CompactionBuffer buffer_{clock_.SteadyFn()};
   OneBufferRouter router_{buffer_};
   ::testing::NiceMock<abyss::testing::MockQueue> queue_;
+  size_t negative_max_entries_;
   hot::ShardedHotStore hot_{hot::ShardedHotStoreConfig{
       .max_memory_bytes = size_t{64} << 20,
       .shard_count = kShards,
+      .negative_max_entries = negative_max_entries_,
       .drained = [this](core::ShardId) { return drained_.load(); },
       .steady_clock = clock_.SteadyFn(),
       .wall_clock = clock_.WallFn(),
@@ -607,12 +610,9 @@ TEST_F(ReadPathTest, AMissNeverWaitsForColdToDrain) {
   // Nothing has drained: under the old path a miss waited here.
   drained_ = 0;
   Cold({ops::StringSet{.key = "k", .value = "v"}});
-  const auto start = core::SteadyClock::now();
   EXPECT_EQ(Describe(Read({"GET", "k"})), "$v");
-  const auto elapsed = core::SteadyClock::now() - start;
   EXPECT_EQ(router_.drain_waits.load(), 0);
   EXPECT_LE(cold_.LastBudget(), kCommandTimeout) << "the command's deadline";
-  EXPECT_LT(elapsed, 1s);
 }
 
 double Fills(metrics::FillOutcome outcome) {
@@ -919,15 +919,21 @@ TEST_F(ReadPathDoorkeeperTest, AScanOfMissingKeysLeavesNoNegativeEntries) {
   EXPECT_EQ(hot_.Stats()->negative_entries, 1U) << "the second miss is cached";
 }
 
-TEST_F(ReadPathTest, NegativeEntriesAreBoundedByTheirOwnCap) {
-  const size_t cap = hot::ShardedHotStoreConfig{}.negative_max_entries;
-  for (size_t i = 0; i < cap + 1000; ++i) {
+// A small cap, so a short loop overruns every shard's share of it.
+class ReadPathNegativeCapTest : public ReadPathFixture {
+ protected:
+  static constexpr size_t kCap = 256;
+  ReadPathNegativeCapTest() : ReadPathFixture({.fill_doorkeeper = false}, 2, kCap) {}
+};
+
+TEST_F(ReadPathNegativeCapTest, NegativeEntriesAreBoundedByTheirOwnCap) {
+  for (size_t i = 0; i < kCap + 1000; ++i) {
     EXPECT_EQ(Describe(Read({"GET", "missing" + std::to_string(i)})), "nil");
   }
   const auto stats = hot_.Stats();
   ASSERT_TRUE(stats.has_value());
   EXPECT_GT(stats->negative_entries, 0U);
-  EXPECT_LE(stats->negative_entries, cap);
+  EXPECT_LE(stats->negative_entries, kCap);
 }
 
 }  // namespace

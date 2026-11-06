@@ -62,6 +62,22 @@ else()
   abyss_discover_tests(abyss_property_tests "component")
 endif()
 
+# Backstops behind each stream's progress watchdog, from the slowest CI
+# runs to date (docs/development/testing.md, P6).
+if(ABYSS_WITH_ROCKSDB)
+  abyss_set_test_timeout(property_long "${CMAKE_CURRENT_SOURCE_DIR}" 120
+    DifferentialTest.SeededStreamsAgreeWithTheModelInEveryTier)
+  abyss_set_test_timeout(property_crash "${CMAKE_CURRENT_SOURCE_DIR}" 60
+    CrashTest.PowerLossRecoversAPrefixThatExplainsEveryReply
+    CrashTest.ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame)
+  set(_abyss_property_short LinearizabilityTest.ConcurrentClientsAreLinearizablePerKeyGroup)
+  if(NOT WIN32)
+    list(APPEND _abyss_property_short
+      CrashTest.KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply)
+  endif()
+  abyss_set_test_timeout(property_short "${CMAKE_CURRENT_SOURCE_DIR}" 30 ${_abyss_property_short})
+endif()
+
 # A million keys in one shard; its own binary so it can carry its own label.
 add_executable(abyss_hot_hold_cap_tests
   hot_hold_cap_test.cpp

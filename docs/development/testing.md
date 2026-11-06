@@ -38,6 +38,8 @@ Micro-benchmarks are not run via ctest. Build with the `bench` preset and run th
 
 **P5 — Tier determines isolation.** The tier a test belongs to is determined by what it exercises, not where it's convenient to put it. A test that needs a RocksDB directory is integration, not unit. A test that binds a socket is system.
 
+**P6 — Long tests detect stalls by progress, not wall clock.** A long test beats a `ProgressWatchdog` (`tests/support/progress_watchdog.h`) at every phase and step; with no progress for 10 s (30 s under TSan and ASan) it prints a `WATCHDOG:` line, the test's state and every thread's stack, then aborts. The system suite's listener gives each test 100 s. ctest TIMEOUT is a backstop of at least 2× the slowest degraded CI run. In-test timing assertions use deterministic holds (blocker jobs, gates, latches) or a generous bound against an explicit hold, never a slow or fast build's speed.
+
 ## Tiers
 
 | Tier | Exercises | Dependencies | Isolation | Target runtime |

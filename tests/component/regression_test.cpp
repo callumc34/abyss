@@ -29,6 +29,7 @@
 #include "abyss/hot/single_shard_store.h"
 #include "cold_read.h"
 #include "hooked_cold_store.h"
+#include "on_exit.h"
 #include "sequenced_engine_fixture.h"
 
 namespace abyss::engine {
@@ -332,6 +333,9 @@ TEST_F(CrossShardConditionalTest, Issue195ConditionalsSeeAKeyOnlyColdHolds) {
     return cold_reads[key];
   };
   loader_cold_ = &counted;
+  // Closed before the store and its hook's state go, however the test
+  // ends: a late fill still reads through them.
+  const abyss::testing::OnExit close([this] { CloseAll(); });
   Open(Options{.stub_memory_fraction = 0.0});
   const std::vector<std::string> strings = {"setnx",  "msetnx",   "set-nx",
                                             "set-xx", "renamenx", "copy"};

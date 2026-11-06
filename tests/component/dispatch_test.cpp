@@ -148,6 +148,12 @@ class DispatchTest : public SequencedEngineTest {
     after_gate_->release.Open();
     SequencedEngineTest::TearDown();
   }
+  // A fresh gate once the pool is idle: a pool thread's hook reads
+  // gate_, so it never meets the swap.
+  void NewGate() {
+    io_pool_->WaitIdleForTesting();
+    gate_ = std::make_unique<ColdGate>();
+  }
 
   core::Outcome Dispatch(Conn& conn, core::Request request) {
     conn.slot.completion =
@@ -514,7 +520,7 @@ TEST_F(DispatchTest, ADeadlineWhileALoadRunsInstallsItAndFreesTheKey) {
   Conn next(2);
   std::string next_reply;
   std::thread waiter([&] { next_reply = Run(next, WriteReq({"SADD", "s", "c"})); });
-  for (int i = 0; i < 1000 && hot_->LoadWaitersForTesting("s") == 0; ++i) {
+  for (int i = 0; i < 10'000 && hot_->LoadWaitersForTesting("s") == 0; ++i) {
     std::this_thread::sleep_for(1ms);
   }
   ASSERT_EQ(hot_->LoadWaitersForTesting("s"), 1U) << "the next write waits on the key";
@@ -544,7 +550,7 @@ TEST_F(DispatchTest, ADeadlineWhileALoadRunsInstallsItAndFreesTheKey) {
 // and the deadline passes in between: the attempt it runs only cleans
 // up. Then the same race, released at random around the abandon.
 TEST_F(DispatchTest, ALoadCompletionRacingAbandonNeverApplies) {
-  Open(Options{.command_timeout = 200ms});
+  Open(Options{.command_timeout = 1s});
   Cold({"SADD", "s", "a"});
   {
     Conn conn(1);
@@ -556,6 +562,9 @@ TEST_F(DispatchTest, ALoadCompletionRacingAbandonNeverApplies) {
     EXPECT_TRUE(Member("s", "a"));
     EXPECT_FALSE(Member("s", "b"));
   }
+  // Each round abandons by hand, so none needs a short deadline.
+  options_.command_timeout = 5s;
+  Rewire();
   // Seeded, so a failing schedule repeats.
   std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed)
   for (int round = 0; round < 20; ++round) {
@@ -581,7 +590,7 @@ TEST_F(DispatchTest, ALoadCompletionRacingAbandonNeverApplies) {
     (void)conn.task->Run(conn.slot, std::move(event->result));
     EXPECT_TRUE(conn.Quiescent());
     EXPECT_FALSE(Member(key, "b")) << "round " << round;
-    gate_ = std::make_unique<ColdGate>();
+    NewGate();
   }
   EXPECT_EQ(Logged(ShardOf("s")).size() + Logged(ShardOf("r0")).size() > 0, true);
 }
@@ -590,7 +599,7 @@ TEST_F(DispatchTest, ALoadCompletionRacingAbandonNeverApplies) {
 // ends its placeholder: a write waiting on the key goes on at once,
 // though the abandoned write's connection has not yet seen its post.
 TEST_F(DispatchTest, AnExpiredLoadJobFreesTheKeyAtOnce) {
-  Open(Options{.command_timeout = 1s});
+  Open(Options{.command_timeout = 2s});
   Cold({"SADD", "s", "a"});
   Blocker first;
   Blocker second;
@@ -602,25 +611,20 @@ TEST_F(DispatchTest, AnExpiredLoadJobFreesTheKeyAtOnce) {
   Conn expired(1);
   core::Outcome load = Dispatch(expired, WriteReq({"SADD", "s", "b"}));
   ASSERT_EQ(load.kind, Kind::kPending) << "its load job is queued behind the blockers";
-  std::this_thread::sleep_for(500ms);
+  std::this_thread::sleep_until(expired.slot.deadline + 5ms);
   Conn next(2);
-  std::atomic<bool> done{false};
   std::string next_reply;
-  std::thread waiter([&] {
-    next_reply = Run(next, WriteReq({"SADD", "s", "c"}));
-    done = true;
-  });
-  std::this_thread::sleep_until(expired.slot.deadline + 50ms);
-  first.release.Open();
-  const auto freed = core::SteadyClock::now();
-  // Before the expired write's own connection takes its post.
-  while (!done && core::SteadyClock::now() < next.slot.deadline - 100ms) {
+  std::thread waiter([&] { next_reply = Run(next, WriteReq({"SADD", "s", "c"})); });
+  for (int i = 0; i < 10'000 && hot_->LoadWaitersForTesting("s") == 0; ++i) {
     std::this_thread::sleep_for(1ms);
   }
-  ASSERT_TRUE(done) << "the key stayed held after its load expired";
-  EXPECT_LT(core::SteadyClock::now() - freed, 300ms);
+  EXPECT_EQ(hot_->LoadWaitersForTesting("s"), 1U) << "the next write waits on the key";
+  first.release.Open();
+  // The expired write's connection takes nothing until after: the next
+  // write goes on with the key freed by the expired job alone.
   waiter.join();
-  EXPECT_EQ(next_reply, ":1") << "it loaded the key itself";
+  EXPECT_EQ(next_reply, ":1") << "the key stayed held after its load expired";
+  EXPECT_EQ(expired.inbox.Pending(), 1U) << "its post waits for its connection";
 
   EXPECT_EQ(Text(Finish(expired, std::move(load))), "error: write timed out loading its keys");
   EXPECT_FALSE(Member("s", "b"));
@@ -701,15 +705,15 @@ TEST_F(DispatchTest, AJoinOfALoadInFlightNeverHoldsAPoolThread) {
     ASSERT_EQ(joined.back().kind, Kind::kPending);
   }
   const core::ShardId shard = ShardOf("fk");
-  for (int i = 0; i < 2000 && loader_->JoinersForTesting(shard) < kJoiners; ++i) {
+  for (int i = 0; i < 10'000 && loader_->JoinersForTesting(shard) < kJoiners; ++i) {
     std::this_thread::sleep_for(1ms);
   }
   ASSERT_EQ(loader_->JoinersForTesting(shard), static_cast<size_t>(kJoiners));
 
+  // K's read is held until after: a joiner holding the other thread
+  // would leave J's read queued past its deadline.
   Conn other(2);
-  const auto start = core::SteadyClock::now();
-  EXPECT_EQ(Run(other, Get("fj")), "w");
-  EXPECT_LT(core::SteadyClock::now() - start, 1s) << "a joiner held the other pool thread";
+  EXPECT_EQ(Run(other, Get("fj")), "w") << "a joiner held the other pool thread";
   EXPECT_EQ(gate_->Calls(), 1) << "K's read was not still held";
 
   gate_->release.Open();
@@ -731,7 +735,7 @@ TEST_F(DispatchTest, AnAbandonRacingTheLandingLeavesNoJoiner) {
   for (int round = 0; round < 20; ++round) {
     const std::string key = "fr" + std::to_string(round);
     Cold({"SET", key, "v"});
-    gate_ = std::make_unique<ColdGate>();
+    NewGate();
     gate_->Hold(key);
     Conn leader(100 + round);
     core::Outcome led = Dispatch(leader, Get(key));
@@ -811,8 +815,11 @@ TEST_F(DispatchTest, AFanOutsFencesFoldToOnePerShard) {
 // A fan-out that fails without reading its keys shows no state, so it
 // does not wait on the fences it gathered: its error replies at once.
 TEST_F(DispatchTest, AFanOutsErrorSkipsItsFences) {
-  Open(Options{.durability = core::Durability::kPowerLoss, .command_timeout = 300ms});
+  Open(Options{.durability = core::Durability::kPowerLoss});
   ASSERT_NO_FATAL_FAILURE(Cold({"SET", "fc", "1"}));
+  // Only the fan-out is to pass its deadline, not the setup's fsyncs.
+  options_.command_timeout = 300ms;
+  Rewire();
   const FlushStall stall;
   queue_->SetFlushHookForTesting(stall.Hook());
   Conn writer(1);
@@ -846,7 +853,7 @@ TEST_F(DispatchTest, AFanOutsErrorSkipsItsFences) {
 // A fill queued behind foreground work past the deadline of the read
 // that admitted it never runs, and counts as expired.
 TEST_F(DispatchTest, AFillPastItsDeadlineInTheQueueExpires) {
-  Open(Options{.fill_doorkeeper = false, .command_timeout = 300ms, .cold_io_threads = 2});
+  Open(Options{.fill_doorkeeper = false, .command_timeout = 1s, .cold_io_threads = 2});
   Cold({"HSET", "eh", "f", "1"});
   const auto expired = [] {
     return metrics::testing::GetCounterValue(metrics::names::kHotFillsTotal,
@@ -857,12 +864,16 @@ TEST_F(DispatchTest, AFillPastItsDeadlineInTheQueueExpires) {
   Blocker held;
   io_pool_->Submit(held, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
   ASSERT_TRUE(held.started.Wait());
+  // The miss queues its fill after its read: holding the read until
+  // a blocker is queued behind it leaves the fill no free thread.
+  gate_->Hold("eh");
   Conn conn(1);
   core::Outcome miss = Dispatch(conn, Req(core::Request::Kind::kRead, "HGET", {"HGET", "eh", "f"}));
   ASSERT_EQ(miss.kind, Kind::kPending);
-  // Behind the miss on the one free thread, ahead of its fill.
+  ASSERT_TRUE(gate_->entered.Wait());
   Blocker after;
   io_pool_->Submit(after, metrics::IoKind::kPoint, core::SteadyClock::now() + 30s);
+  gate_->release.Open();
   EXPECT_EQ(Text(Finish(conn, std::move(miss))), "1");
   ASSERT_TRUE(after.started.Wait());
   std::this_thread::sleep_until(conn.slot.deadline + 20ms);
@@ -896,7 +907,7 @@ TEST_F(DispatchTest, ShutdownFreesTheKeysOfQueuedLoadJobs) {
   ASSERT_EQ(hot_->LoadWaitersForTesting("ss"), 1U);
 
   std::thread stopper([this] { io_pool_->Shutdown(); });
-  for (int i = 0; i < 2000 && hot_->LoadWaitersForTesting("ss") > 0; ++i) {
+  for (int i = 0; i < 10'000 && hot_->LoadWaitersForTesting("ss") > 0; ++i) {
     std::this_thread::sleep_for(1ms);
   }
   EXPECT_EQ(hot_->LoadWaitersForTesting("ss"), 0U) << "the failed job held its key";

@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -24,6 +23,7 @@
 #include "abyss/queue/frame.h"
 #include "abyss/queue/log.h"
 #include "binary_io.h"
+#include "progress_watchdog.h"
 #include "segment_header_v2.h"
 #include "temp_dir.h"
 
@@ -77,6 +77,16 @@ Log::Reservation AppendFrame(Log& log, std::span<const std::byte> bytes) {
   }
 }
 
+// The log's progress and parked waiters, for a stalled test's dump.
+std::string LogState(const Log& log) {
+  return "filled " + std::to_string(log.FilledPrefix()) + " reserved " +
+         std::to_string(log.ReservedTail()) + " durable " + std::to_string(log.DurablePrefix()) +
+         " spares " + std::to_string(log.spare_count()) + " free " +
+         std::to_string(log.free_count()) + " spare waiters " +
+         std::to_string(log.SpareWaitersForTesting()) + " fill parked " +
+         std::to_string(log.FillParkedForTesting());
+}
+
 // Reserves until a spare is ready and commits, without waiting for P.
 Log::Reservation ReserveAndCommit(Log& log, std::span<const std::byte> bytes) {
   for (;;) {
@@ -102,6 +112,8 @@ TEST(LogStressTest, ConcurrentAppendersAndAFlusherAgree) {
   std::atomic<int> done{0};
   std::vector<std::vector<Log::Reservation>> reserved(kThreads);
   std::vector<std::pair<core::ShardId, core::SequenceId>> flushed;
+  std::optional<testing::ProgressWatchdog> watchdog;
+  watchdog.emplace("appending", [&log] { return LogState(log); });
   std::thread flusher([&] {
     for (;;) {
       const bool finished = done.load(std::memory_order_acquire) == kThreads;
@@ -125,12 +137,14 @@ TEST(LogStressTest, ConcurrentAppendersAndAFlusherAgree) {
         const auto bytes = Frame(static_cast<core::ShardId>(t), static_cast<core::SequenceId>(seq),
                                  kWriteFrameOverhead + (8 * words(rng)));
         reserved[t].push_back(AppendFrame(log, bytes));
+        watchdog->Tick();
       }
       done.fetch_add(1, std::memory_order_release);
     });
   }
   for (auto& writer : writers) writer.join();
   flusher.join();
+  watchdog.reset();
 
   EXPECT_EQ(log.FilledPrefix(), log.ReservedTail());
   EXPECT_EQ(log.DurablePrefix(), log.FilledPrefix());
@@ -210,28 +224,16 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
   constexpr int kFlusher = kWriters;
   constexpr int kReader = kWriters + 1;
 
-  // Before ctest's timeout: a hang reports every thread's wait.
-  std::atomic<bool> finished{false};
-  std::thread watchdog([&] {
-    const auto until = std::chrono::steady_clock::now() + 20s;
-    while (!finished.load() && std::chrono::steady_clock::now() < until) {
-      std::this_thread::sleep_for(10ms);
-    }
-    if (finished.load()) return;
-    std::string state = "hung: filled " + std::to_string(log.FilledPrefix()) + " reserved " +
-                        std::to_string(log.ReservedTail()) + " durable " +
-                        std::to_string(log.DurablePrefix()) + " spares " +
-                        std::to_string(log.spare_count()) + " free " +
-                        std::to_string(log.free_count());
+  // A stall names every thread's wait.
+  testing::ProgressWatchdog watchdog("racing", [&] {
+    std::string state = LogState(log);
     for (int t = 0; t < kWriters; ++t) {
       state += "; writer " + std::to_string(t) + " at " +
                StepName(steps.at(static_cast<std::size_t>(t)).load()) + " after " +
                std::to_string(appended.at(static_cast<std::size_t>(t)).load());
     }
-    state += std::string("; flusher at ") + StepName(steps.at(kFlusher).load()) + "; reader at " +
-             StepName(steps.at(kReader).load());
-    std::cerr << state << "\n" << std::flush;
-    ADD_FAILURE() << state;
+    return state + "; flusher at " + StepName(steps.at(kFlusher).load()) + "; reader at " +
+           StepName(steps.at(kReader).load());
   });
 
   std::thread flusher([&] {
@@ -311,6 +313,7 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
           }
         }
         appended.at(static_cast<std::size_t>(t)).fetch_add(1);
+        watchdog.Tick();
       }
       mark(t, Step::kDone);
       done.fetch_add(1, std::memory_order_release);
@@ -319,8 +322,6 @@ TEST(LogStressTest, ReclaimRacesAppendersAndReaders) {
   for (auto& writer : writers) writer.join();
   flusher.join();
   reader.join();
-  finished.store(true);
-  watchdog.join();
   EXPECT_EQ(log.FilledPrefix(), log.ReservedTail());
   EXPECT_LE(log.free_count(), 2U);
 }
@@ -367,6 +368,7 @@ TEST(LogStressTest, StaleBytesShapedLikeCommitWordsNeverMoveP) {
   constexpr int kFrames = 400;
   std::atomic<int> done{0};
   std::vector<std::pair<core::ShardId, core::SequenceId>> flushed;
+  testing::ProgressWatchdog watchdog("appending", [&log] { return LogState(log); });
   std::thread flusher([&] {
     for (;;) {
       const bool finished = done.load(std::memory_order_acquire) == kWriters;
@@ -390,6 +392,7 @@ TEST(LogStressTest, StaleBytesShapedLikeCommitWordsNeverMoveP) {
       for (int seq = 0; seq < kFrames; ++seq) {
         AppendFrame(log, Frame(shard, static_cast<core::SequenceId>(seq),
                                kWriteFrameOverhead + (8 * words(rng))));
+        watchdog.Tick();
       }
       done.fetch_add(1, std::memory_order_release);
     });
@@ -434,6 +437,7 @@ TEST(LogStressTest, AHeldHoleOutlastsSeveralRingsOfCompletions) {
   constexpr int kWriters = 4;
   constexpr int kFrames = 1500;
   constexpr std::size_t kSmall = 64;
+  testing::ProgressWatchdog watchdog("appending", [&log] { return LogState(log); });
   std::vector<std::thread> writers;
   writers.reserve(kWriters);
   for (int t = 0; t < kWriters; ++t) {
@@ -441,12 +445,14 @@ TEST(LogStressTest, AHeldHoleOutlastsSeveralRingsOfCompletions) {
       for (int seq = 0; seq < kFrames; ++seq) {
         ReserveAndCommit(log, Frame(static_cast<core::ShardId>(t + 1),
                                     static_cast<core::SequenceId>(seq), kSmall));
+        watchdog.Tick();
       }
     });
   }
   // Wait until every writer is stuck behind a full ring.
   LogPosition tail = 0;
   for (int stable = 0; stable < 5;) {
+    watchdog.Beat("waiting for the ring to fill");
     std::this_thread::sleep_for(10ms);
     const LogPosition now = log.ReservedTail();
     stable = now == tail ? stable + 1 : 0;
@@ -457,6 +463,7 @@ TEST(LogStressTest, AHeldHoleOutlastsSeveralRingsOfCompletions) {
   EXPECT_LT(queued, static_cast<uint64_t>(kWriters * kFrames)) << "and held the writers";
   EXPECT_EQ(log.FilledPrefix(), hole->pos);
 
+  watchdog.Beat("draining the ring");
   log.ResumeCombinerForTesting();
   for (auto& writer : writers) writer.join();
   EXPECT_EQ(log.FilledPrefix(), hole->pos);

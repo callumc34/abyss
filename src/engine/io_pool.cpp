@@ -176,6 +176,11 @@ size_t IoPool::QueuedForTesting(metrics::IoQueue queue) const {
   return points_.size + scans_.size;
 }
 
+size_t IoPool::RunningForTesting() const {
+  const std::scoped_lock lock(mu_);
+  return running_;
+}
+
 void IoPool::WaitIdleForTesting() {
   std::unique_lock lock(mu_);
   idle_.wait(lock, [this] ABYSS_REQUIRES(mu_) {

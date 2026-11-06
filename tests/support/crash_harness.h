@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -61,6 +62,8 @@ struct VictimSpec {
   // Written by the victim, relative to `dir`, once it is ready to be killed.
   std::string ready_file_name = "victim.ready";
   std::chrono::milliseconds ready_deadline{30000};
+  // Called at each poll while waiting for ready.
+  std::function<void()> on_poll;
 };
 
 struct CrashOutcome {
@@ -154,6 +157,7 @@ inline CrashOutcome SpawnAndKillVictim(const VictimSpec& spec) {
   const auto ready_path = spec.dir / spec.ready_file_name;
   const auto deadline = std::chrono::steady_clock::now() + spec.ready_deadline;
   while (std::chrono::steady_clock::now() < deadline) {
+    if (spec.on_poll) spec.on_poll();
     if (std::filesystem::exists(ready_path)) {
       outcome.reached_ready = true;
       break;

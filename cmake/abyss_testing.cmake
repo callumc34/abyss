@@ -29,13 +29,15 @@ macro(abyss_discover_slow_tests target labels)
   _abyss_discover_tests_impl(${target} "${labels}\;slow" ${ABYSS_TEST_TIMEOUT_SLOW})
 endmacro()
 
-# A whole suite as one test, which sanitizers slow several times over.
+# A whole suite as one test. Its TIMEOUT is a backstop behind each
+# test's own watchdog: at least twice the slowest degraded CI run, which
+# sanitizers and Windows' slowed disks make several times longer.
 macro(abyss_add_binary_test target labels)
   add_test(NAME ${target} COMMAND ${target})
-  if(ABYSS_SANITIZER_ACTIVE)
+  if(ABYSS_SANITIZER_ACTIVE OR WIN32)
     set(_abyss_binary_timeout 900)
   else()
-    set(_abyss_binary_timeout ${ABYSS_TEST_TIMEOUT_SLOW})
+    set(_abyss_binary_timeout 600)
   endif()
   set_tests_properties(${target} PROPERTIES
     LABELS "${labels}"
@@ -50,6 +52,18 @@ function(abyss_mark_slow_tests tag dir)
   foreach(_test IN LISTS ARGN)
     string(APPEND _content
       "set_tests_properties(${_test} PROPERTIES TIMEOUT ${ABYSS_TEST_TIMEOUT_SLOW})\n")
+  endforeach()
+  file(WRITE "${_overrides_file}" "${_content}")
+  set_property(DIRECTORY "${dir}" APPEND PROPERTY TEST_INCLUDE_FILES "${_overrides_file}")
+endfunction()
+
+# A TIMEOUT for the named discovered tests: a backstop behind their own
+# progress watchdog, at least twice their slowest degraded CI run.
+function(abyss_set_test_timeout tag dir timeout)
+  set(_overrides_file "${CMAKE_BINARY_DIR}/abyss_timeout_${tag}_overrides.cmake")
+  set(_content "")
+  foreach(_test IN LISTS ARGN)
+    string(APPEND _content "set_tests_properties(${_test} PROPERTIES TIMEOUT ${timeout})\n")
   endforeach()
   file(WRITE "${_overrides_file}" "${_content}")
   set_property(DIRECTORY "${dir}" APPEND PROPERTY TEST_INCLUDE_FILES "${_overrides_file}")

@@ -95,6 +95,7 @@ class IoPool {
 
   uint32_t threads() const { return config_.threads; }
   size_t QueuedForTesting(metrics::IoQueue queue) const;
+  size_t RunningForTesting() const;
   // Until no job is queued or running.
   void WaitIdleForTesting();
 

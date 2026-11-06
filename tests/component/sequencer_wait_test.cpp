@@ -10,7 +10,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -92,10 +91,10 @@ class SequencerWaitTest : public SequencedEngineTest {
     }
     return replies;
   }
-  // Abandons a wait at its deadline. A wake its notifier had already
-  // taken still comes, and only cleans up.
+  // Abandons a wait as its deadline's timer would; Abandon reads no
+  // clock. A wake its notifier had already taken still comes, and only
+  // cleans up.
   Step Expired(PendingWrite& write) {
-    std::this_thread::sleep_until(write.deadline() + 5ms);
     core::Result<core::RespValue> reply = sequencer_->Abandon(write);
     if (!write.Quiescent() && sink_.WaitFor(seen_ + 1)) {
       write.Woken(sink_.Events().at(seen_++).result);
@@ -157,7 +156,7 @@ TEST_F(SequencerWaitTest, AnAdmissionTimeoutLeavesNoTraceAcrossARestart) {
   queue_->SetFlushHookForTesting(stall.Hook());
   const std::string value(1000, 'x');
   auto [waited, write] =
-      FillWindow([&](int i) { return Pending({"SET", KeyOn(0, i), value}, 100ms); }, *sequencer_);
+      FillWindow([&](int i) { return Pending({"SET", KeyOn(0, i), value}, 10s); }, *sequencer_);
   ASSERT_NE(write, nullptr);
 
   const Step step = Expired(*write);
@@ -216,7 +215,7 @@ TEST_F(SequencerWaitTest, ASpareTimeoutLeavesNoTraceAcrossARestart) {
   queue_->PauseSegmentPreparerForTesting(0, true);
   const std::string value(2048, 's');
   auto [waited, write] =
-      UseUpSpares([&](int i) { return Pending({"SET", KeyOn(1, i), value}, 100ms); }, *sequencer_);
+      UseUpSpares([&](int i) { return Pending({"SET", KeyOn(1, i), value}, 10s); }, *sequencer_);
   ASSERT_NE(write, nullptr);
 
   const Step step = Expired(*write);
@@ -280,7 +279,7 @@ TEST_F(SequencerBackpressureWaitTest, AWaitResumesOnceColdDrains) {
 }
 
 TEST_F(SequencerBackpressureWaitTest, ATimeoutLeavesNoTraceAcrossARestart) {
-  const int waited = FillUntilAWait(300ms);
+  const int waited = FillUntilAWait(10s);
   ASSERT_GE(waited, 0);
   PendingWrite& write = *writes_.back();
   steps_.back() = Expired(write);

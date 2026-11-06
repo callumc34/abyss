@@ -33,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <latch>
 #include <map>
@@ -89,8 +90,10 @@ constexpr std::string_view kNoOpReply = "<no-op>";
 
 // Splits the history by key group and checks each group; `groups`
 // names every key. MGET is split per key, FLUSHDB goes to every group.
+// `tick` marks progress at each state the search explores.
 Outcome CheckRecords(const std::vector<Record>& records,
-                     const std::vector<std::vector<std::string>>& groups, uint64_t max_explored) {
+                     const std::vector<std::vector<std::string>>& groups, uint64_t max_explored,
+                     const std::function<void()>& tick = {}) {
   Outcome outcome;
   std::map<std::string, size_t> group_of;
   for (size_t g = 0; g < groups.size(); ++g) {
@@ -160,7 +163,8 @@ Outcome CheckRecords(const std::vector<Record>& records,
     }
   }
 
-  const auto step = [](State& state, const HistoryOp& op) {
+  const auto step = [&tick](State& state, const HistoryOp& op) {
+    if (tick) tick();
     if (op.at_ms < state.now) return false;
     state.now = op.at_ms;
     if (op.reply == kNoOpReply) return true;
@@ -233,6 +237,7 @@ class LinearizabilityTest : public PropertyHarness {
     std::atomic<uint64_t> clock{1};
     const int per_burst = std::max(1, ops_per_thread / kBursts);
     for (int burst = 0; burst < kBursts; ++burst) {
+      Progress("seed " + std::to_string(seed) + " burst " + std::to_string(burst));
       std::atomic<bool> done{false};
       std::thread drainer([this, &done, seed, burst] { Drain(done, (seed * 31) + burst); });
       std::thread maintainer([this, &done, seed, burst] { Maintain(done, (seed * 37) + burst); });
@@ -252,6 +257,7 @@ class LinearizabilityTest : public PropertyHarness {
             record.reply = pipeline.Dispatch(core::RespCommand{.args = record.args});
             record.ret = clock.fetch_add(1);
             local.push_back(std::move(record));
+            Heartbeat();
           }
           const std::scoped_lock lock(records_mu);
           for (auto& record : local) records.push_back(std::move(record));
@@ -266,7 +272,8 @@ class LinearizabilityTest : public PropertyHarness {
       now_ms_ += rng.Chance(0.5) ? rng.Between(0, 50) : rng.Between(500, 2500);
     }
     hooked_.SetHook(nullptr);
-    Outcome outcome = CheckRecords(records, groups_, max_explored);
+    Progress("seed " + std::to_string(seed) + " check");
+    Outcome outcome = CheckRecords(records, groups_, max_explored, [this] { Heartbeat(); });
     // A few timeouts and refusals are expected on a loaded machine;
     // many are not, or a server refusing most ops would pass.
     uint64_t indeterminate = 0;

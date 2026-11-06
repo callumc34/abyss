@@ -328,11 +328,11 @@ TEST_F(SequencerAttemptTest, AWakeRacingTheDeadlineLosesTheCancelAndIsNeverAppli
   GatedSink gated;
   queue_.SetAdmissible(false);
   PendingWrite write(core::RespCommand{.args = {"SET", "k", "v"}}, core::PredicateFlags::kNone,
-                     core::Completion{.sink = &gated}, core::SteadyClock::now() + 20ms);
+                     core::Completion{.sink = &gated}, core::SteadyClock::now() + 10s);
   ASSERT_EQ(Attempt(write).kind, Step::Kind::kWait);
   std::thread notifier([this] { queue_.SetAdmissible(true); });
   ASSERT_TRUE(gated.entered.Wait());
-  std::this_thread::sleep_until(write.deadline() + 5ms);
+  // The deadline's timer: Abandon reads no clock.
   const auto reply = sequencer_->Abandon(write);
   ASSERT_FALSE(reply.has_value());
   EXPECT_EQ(reply.error().code(), core::ErrorCode::kResourceExhausted);
@@ -350,9 +350,9 @@ TEST_F(SequencerAttemptTest, AWakeRacingTheDeadlineLosesTheCancelAndIsNeverAppli
 
 TEST_F(SequencerAttemptTest, AnExpiredWaitIsCancelledAndRepliesWithItsTimeout) {
   queue_.SetAdmissible(false);
-  auto write = Write({"SET", "k", "v"}, 10ms);
+  auto write = Write({"SET", "k", "v"}, 10s);
   ASSERT_EQ(Attempt(*write).kind, Step::Kind::kWait);
-  std::this_thread::sleep_until(write->deadline() + 1ms);
+  // The deadline's timer: Abandon reads no clock.
   const auto reply = sequencer_->Abandon(*write);
   EXPECT_TRUE(write->Quiescent()) << "cancelled: nothing is owed";
   EXPECT_EQ(queue_.AdmissionWaiters(), 0U);

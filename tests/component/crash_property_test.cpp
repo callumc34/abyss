@@ -309,6 +309,7 @@ class CrashTest : public PropertyHarness {
   void Drain(const std::atomic<bool>& stop, uint64_t seed) {
     Rng rng(seed);
     while (!stop.load()) {
+      Heartbeat();
       const bool recycling = recycling_.load();
       Tail();
       for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
@@ -364,7 +365,10 @@ class CrashTest : public PropertyHarness {
     std::cout << "[crash] power loss seed=" << seed << " shards=" << options.shards
               << " durability=" << core::DurabilityName(options.durability) << '\n'
               << std::flush;
+    const std::string at = "power loss seed " + std::to_string(seed);
+    Progress(at + " open");
     OpenAt(options, 1'700'000'000'000);
+    Progress(at + " clients");
     full_log_.assign(options.shards, {});
     positions_.clear();
     last_position_ = 0;
@@ -407,6 +411,7 @@ class CrashTest : public PropertyHarness {
           call.call = clock.fetch_add(1);
           const core::RespValue reply = pipeline.Dispatch(core::RespCommand{.args = ArgsOf(call)});
           call.ret = clock.fetch_add(1);
+          Heartbeat();
           // Told after the power loss: not told at all.
           if (crashed.load()) break;
           call.reply = Text(reply, Writes(call.op));
@@ -437,9 +442,12 @@ class CrashTest : public PropertyHarness {
     if (seed % 3 == 0 && options.durability == core::Durability::kPowerLoss &&
         InodeOf(dir_.Sub(options_.run + "wal")).has_value()) {
       recycling_ = true;
+      Progress(at + " recycling");
       const auto driven = std::chrono::steady_clock::now();
       while (!recycled_.load() &&
              std::chrono::steady_clock::now() < driven + std::chrono::seconds(30)) {
+        // A bounded wait: its own deadline judges it.
+        Heartbeat();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
       recycling_ = false;
@@ -460,6 +468,7 @@ class CrashTest : public PropertyHarness {
     drainer.join();
 
     // The log as the clients left it, then what the device kept.
+    Progress(at + " tail");
     Tail();
     // Cold catches up with all that was published, as a consumer that
     // kept up would: at process_crash that runs past the power-durable
@@ -469,6 +478,7 @@ class CrashTest : public PropertyHarness {
       const core::SequenceId end =
           queue_->DurableEnd(shard, queue_->AckDurability()).value_or(core::kFirstSeq);
       while (consumer.LatestDrainedSeq() + 1 < end && consumer.DrainWithBatch(4096) > 0) {
+        Heartbeat();
       }
       (void)consumer.FlushUnscheduled();
     }
@@ -480,6 +490,7 @@ class CrashTest : public PropertyHarness {
     const queue::DurableExtent extent = queue_->DurableExtentForTesting(0);
     queue_->SkipFinalFlushForTesting();
     Gate(false);
+    Progress(at + " power loss");
     CloseAll();
     uint64_t recycled = 0;
     abyss::testing::SimulatePowerLossDropping(
@@ -503,6 +514,7 @@ class CrashTest : public PropertyHarness {
                     << "\nreplay: ABYSS_CRASH_SEED=" << seed;
       return {.ok = false};
     }
+    Progress(at + " check");
     Tally run = Check(seed, calls, before, options_.durability == core::Durability::kPowerLoss);
     run.recycled = recycled;
     run.cold_absorbed = cold_absorbed;
@@ -522,6 +534,7 @@ class CrashTest : public PropertyHarness {
     options.segment_size_bytes = size_t{16} << 10;
     options.command_timeout = std::chrono::milliseconds(300);
     options.run = "edge-";
+    Progress("edge crash");
     OpenAt(options, 1'700'000'000'000);
     full_log_.assign(options.shards, {});
     positions_.clear();
@@ -1016,6 +1029,7 @@ TEST_F(CrashTest, KillNineVictim) {
         const std::string reply =
             Text(pipeline.Dispatch(core::RespCommand{.args = ArgsOf(call)}), Writes(call.op));
         slot.ret = clock.fetch_add(1);
+        Heartbeat();
         slot.reply_len = static_cast<uint8_t>(std::min(reply.size(), slot.reply.size()));
         std::copy_n(reply.begin(), slot.reply_len, slot.reply.begin());
         Journal::Publish(slot, 2);
@@ -1049,11 +1063,15 @@ TEST_F(CrashTest, KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply) {
       std::ofstream out(dir / "seed");
       out << seed;
     }
-    const auto outcome =
-        abyss::testing::SpawnAndKillVictim({.gtest_filter = "CrashTest.KillNineVictim",
-                                            .dir_env_var = kVictimEnv,
-                                            .dir = dir,
-                                            .ready_deadline = std::chrono::seconds(10)});
+    const std::string at = "kill -9 seed " + std::to_string(seed);
+    Progress(at + " victim");
+    const auto outcome = abyss::testing::SpawnAndKillVictim({
+        .gtest_filter = "CrashTest.KillNineVictim",
+        .dir_env_var = kVictimEnv,
+        .dir = dir,
+        .ready_deadline = std::chrono::seconds(10),
+        .on_poll = [this] { Heartbeat(); },
+    });
     ASSERT_TRUE(outcome.error.empty()) << outcome.error;
     ASSERT_TRUE(outcome.reached_ready);
     ASSERT_TRUE(outcome.died_by_signal);
@@ -1081,8 +1099,10 @@ TEST_F(CrashTest, KillNineAtProcessCrashRecoversEveryAckAndExplainsEveryReply) {
     std::cout << "[crash] kill -9 seed=" << seed << ": " << calls.size() << " replied, "
               << in_flight << " in flight" << '\n'
               << std::flush;
+    Progress(at + " recover");
     auto recovered = RecoverAt(KillOptions(seed, dir), kKillStartMs);
     ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+    Progress(at + " check");
     const Tally run = Check(seed, calls, WholeLog(), /*acks_survive=*/true);
     Add(total, run);
     CloseAll();
@@ -1129,6 +1149,7 @@ TEST_F(CrashTest, ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame) {
   uint64_t cuts = 0;
   for (auto& batch : batches) {
     options.run = "batch-" + batch.name + "-";
+    Progress(batch.name + " write");
     OpenAt(options, 1'700'000'000'000);
     for (uint32_t shard = 0; shard < kShards; ++shard) {
       if (batch.name == "MSET") batch.args.insert(batch.args.end(), {key(shard), "new"});
@@ -1164,6 +1185,7 @@ TEST_F(CrashTest, ACrossShardBatchRecoversWholeOrNotAtAllAtEveryFrame) {
       SCOPED_TRACE(batch.name + " cut at " + std::to_string(cut) + " of [" +
                    std::to_string(starts.front()) + ", " + std::to_string(end) + ")");
       ++cuts;
+      Progress(batch.name + " cut at " + std::to_string(cut));
       CloseAll();
       fs::remove_all(wal);
       fs::remove_all(dir_.Sub(options.run + "cold"));

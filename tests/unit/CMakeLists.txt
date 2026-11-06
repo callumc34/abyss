@@ -163,6 +163,8 @@ target_link_libraries(abyss_config_tests PRIVATE
 
 add_executable(abyss_support_tests
   support/temp_dir_test.cpp
+  support/hooked_cold_store_test.cpp
+  support/progress_watchdog_test.cpp
 )
 
 target_link_libraries(abyss_support_tests PRIVATE
@@ -326,3 +328,11 @@ abyss_discover_tests(abyss_engine_tests   "unit\;unit-engine")
 abyss_discover_tests(abyss_sequencer_alloc_tests "unit\;unit-engine")
 abyss_discover_tests(abyss_branding_tests "unit\;unit-branding")
 abyss_discover_tests(abyss_platform_tests "unit\;unit-platform")
+
+# A backstop behind each stress test's progress watchdog: over twice
+# the slowest CI run to date (docs/development/testing.md, P6).
+abyss_set_test_timeout(log_stress "${CMAKE_CURRENT_SOURCE_DIR}" 120
+  LogStressTest.ConcurrentAppendersAndAFlusherAgree
+  LogStressTest.ReclaimRacesAppendersAndReaders
+  LogStressTest.StaleBytesShapedLikeCommitWordsNeverMoveP
+  LogStressTest.AHeldHoleOutlastsSeveralRingsOfCompletions)

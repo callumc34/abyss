@@ -22,6 +22,7 @@
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "abyss/resp/command_registry.h"
 #include "abyss/resp/request_pipeline.h"
 #include "hooked_cold_store.h"
+#include "progress_watchdog.h"
 #include "redis_model.h"
 #include "sequenced_engine_fixture.h"
 
@@ -233,15 +235,40 @@ class PropertyHarness : public SequencedEngineTest {
   PropertyHarness& operator=(PropertyHarness&&) = delete;
 
  protected:
+  void SetUp() override {
+    SequencedEngineTest::SetUp();
+    watchdog_.emplace(::testing::UnitTest::GetInstance()->current_test_info()->name(),
+                      [this] { return IoPoolState() + StallState(); });
+  }
+
   // A failing test's stores stay on disk, renamed, for a post-mortem.
   void TearDown() override {
+    Progress("tear down");
     CloseAll();
+    watchdog_.reset();
     if (!HasFailure()) return;
     const auto kept = dir_.Path().string() + "-kept";
     std::error_code ec;
     std::filesystem::rename(dir_.Path(), kept, ec);
     if (!ec) std::cout << "[property] kept the failing test's stores at " << kept << '\n';
   }
+
+  // Progress for the stall watchdog: `where` names the test's step,
+  // such as its seed and step; each open or restart phase adds to it.
+  void Progress(std::string where) {
+    progress_ = std::move(where);
+    if (watchdog_.has_value()) watchdog_->Beat(progress_);
+  }
+  void Phase(std::string_view phase) override {
+    if (watchdog_.has_value()) watchdog_->Beat(progress_ + " " + std::string(phase));
+  }
+  // Progress at the last place named, from any thread.
+  void Heartbeat() {
+    if (watchdog_.has_value()) watchdog_->Tick();
+  }
+  // What a stall's dump adds, from the watchdog's thread: it must not
+  // wait on what a stalled thread holds.
+  virtual std::string StallState() { return {}; }
 
   // Opens with every clock on now_ms_.
   void OpenAt(Options options, int64_t start_ms) {
@@ -483,6 +510,10 @@ class PropertyHarness : public SequencedEngineTest {
   abyss::testing::HookedColdStore hooked_{[this]() -> core::ColdStore& { return *cold_; }};
   std::unique_ptr<resp::RequestPipeline> pipeline_;
   // NOLINTEND(cppcoreguidelines-non-private-member-variables-in-classes)
+
+ private:
+  std::string progress_ = "start";
+  std::optional<abyss::testing::ProgressWatchdog> watchdog_;
 };
 
 }  // namespace abyss::engine

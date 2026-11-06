@@ -30,6 +30,7 @@ add_executable(abyss_system_tests
   health_test.cpp
   metrics_catalogue_test.cpp
   two_ttl_test.cpp
+  test_watchdog.cpp
 )
 
 target_link_libraries(abyss_system_tests PRIVATE

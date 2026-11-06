@@ -1,6 +1,9 @@
 #pragma once
 
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -8,13 +11,16 @@
 #include <vector>
 
 #include "abyss/core/cold_store.h"
+#include "on_exit.h"
 
 namespace abyss::testing {
 
 // Forwards to a cold store, running a hook before each load, and one
 // after it has read: a test interleaves evictions, flushes or writes
-// with a load in flight. Set them only while no load runs: the hooks
-// are not synchronised.
+// with a load in flight. A hook may be set while loads run: setting
+// one returns once no call of the hook it replaced is still running,
+// so none runs after. A hook must therefore never wait on a thread
+// that sets one, nor set one itself.
 class HookedColdStore : public core::ColdStore {
  public:
   using Hook = std::function<void(std::string_view key)>;
@@ -23,8 +29,8 @@ class HookedColdStore : public core::ColdStore {
   // reopened beneath the wrapper.
   explicit HookedColdStore(std::function<core::ColdStore&()> cold) : cold_(std::move(cold)) {}
 
-  void SetHook(Hook hook) { hook_ = std::move(hook); }
-  void SetAfterHook(Hook hook) { after_ = std::move(hook); }
+  void SetHook(Hook hook) { Set(before_, std::move(hook)); }
+  void SetAfterHook(Hook hook) { Set(after_, std::move(hook)); }
 
   core::Result<void> ApplyBatch(std::span<const core::ops::WriteOp> ops,
                                 core::SequenceId highest_wal_seq) override {
@@ -41,21 +47,21 @@ class HookedColdStore : public core::ColdStore {
 
   core::Result<std::optional<core::ColdKeyState>> LoadKey(std::string_view key,
                                                           core::SteadyTime deadline) override {
-    Call(hook_, key);
+    Call(before_, key);
     auto loaded = cold_().LoadKey(key, deadline);
     Call(after_, key);
     return loaded;
   }
   core::Result<std::optional<core::LoadedAs>> LoadKeyAs(std::string_view key, core::KeyType type,
                                                         core::SteadyTime deadline) override {
-    Call(hook_, key);
+    Call(before_, key);
     auto loaded = cold_().LoadKeyAs(key, type, deadline);
     Call(after_, key);
     return loaded;
   }
   core::Result<std::optional<core::KeyMeta>> ProbeKey(std::string_view key,
                                                       core::SteadyTime deadline) override {
-    Call(hook_, key);
+    Call(before_, key);
     auto loaded = cold_().ProbeKey(key, deadline);
     Call(after_, key);
     return loaded;
@@ -63,33 +69,61 @@ class HookedColdStore : public core::ColdStore {
   core::Result<std::vector<std::optional<core::MemberValue>>> LoadMembers(
       std::string_view key, core::KeyType type, std::span<const std::string_view> members,
       core::SteadyTime deadline) override {
-    Call(hook_, key);
+    Call(before_, key);
     auto loaded = cold_().LoadMembers(key, type, members, deadline);
     Call(after_, key);
     return loaded;
   }
 
  private:
+  struct Slot {
+    Hook hook;
+    uint64_t generation = 0;
+    // Calls running the current hook, and those running one replaced.
+    uint64_t running = 0;
+    uint64_t replaced = 0;
+  };
+
+  void Set(Slot& slot, Hook hook) {
+    std::unique_lock lock(mu_);
+    slot.hook.swap(hook);
+    ++slot.generation;
+    slot.replaced += std::exchange(slot.running, 0);
+    returned_.wait(lock, [&slot] { return slot.replaced == 0; });
+  }
+
   // Not re-entered on a thread: what a hook does loads nothing
-  // through it.
-  static void Call(const Hook& hook, std::string_view key) {
+  // through it. Run unlocked, so a hook may block.
+  void Call(Slot& slot, std::string_view key) {
     thread_local bool in_hook = false;
-    if (!hook || in_hook) return;
-    struct Guard {
-      bool& flag;
-      explicit Guard(bool& f) : flag(f) { flag = true; }
-      Guard(const Guard&) = delete;
-      Guard& operator=(const Guard&) = delete;
-      Guard(Guard&&) = delete;
-      Guard& operator=(Guard&&) = delete;
-      ~Guard() { flag = false; }
-    } guard(in_hook);
+    if (in_hook) return;
+    Hook hook;
+    uint64_t generation = 0;
+    {
+      const std::scoped_lock lock(mu_);
+      if (!slot.hook) return;
+      hook = slot.hook;
+      generation = slot.generation;
+      ++slot.running;
+    }
+    in_hook = true;
+    const OnExit done([&] {
+      in_hook = false;
+      const std::scoped_lock lock(mu_);
+      --(generation == slot.generation ? slot.running : slot.replaced);
+      // Under mu_: a setter that sees no call left may destroy the
+      // store as soon as it relocks.
+      returned_.notify_all();
+    });
     hook(key);
+    hook = nullptr;
   }
 
   std::function<core::ColdStore&()> cold_;
-  Hook hook_;
-  Hook after_;
+  std::mutex mu_;
+  std::condition_variable returned_;
+  Slot before_;
+  Slot after_;
 };
 
 }  // namespace abyss::testing

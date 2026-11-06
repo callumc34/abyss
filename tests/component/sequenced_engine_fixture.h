@@ -41,6 +41,7 @@
 #include "abyss/engine/sequencer.h"
 #include "abyss/engine/tiering_engine.h"
 #include "abyss/hot/sharded_hot_store.h"
+#include "abyss/metrics/names.h"
 #include "abyss/queue/wal_queue.h"
 #include "blocking_driver.h"
 #include "cold_read.h"
@@ -123,9 +124,26 @@ class SequencedEngineTest : public ::testing::Test {
  protected:
   void Open(Options options = {}) {
     options_ = std::move(options);
+    Phase("open");
     OpenStores();
     hot_ = NewHot();
     Rewire();
+    Phase("opened");
+  }
+
+  // Where an open or restart is: a fixture that watches for stalls
+  // takes each as progress.
+  virtual void Phase(std::string_view /*phase*/) {}
+
+  // The I/O pool's depths, read from another thread for a stall dump.
+  std::string IoPoolState() {
+    const std::scoped_lock lock(io_pool_mu_);
+    if (io_pool_ == nullptr) return "io pool closed";
+    return "io pool queued " +
+           std::to_string(io_pool_->QueuedForTesting(metrics::IoQueue::kForeground)) +
+           " background " +
+           std::to_string(io_pool_->QueuedForTesting(metrics::IoQueue::kBackground)) + " running " +
+           std::to_string(io_pool_->RunningForTesting());
   }
 
   // As a process restart: everything but the files goes, then recovery
@@ -133,7 +151,9 @@ class SequencedEngineTest : public ::testing::Test {
   // With `sample_peak`, hot's memory is polled while recovery runs,
   // and its highest reading kept in peak_hot_bytes_.
   core::Result<void> Restart(Clocks clocks = {}, bool sample_peak = false) {
+    Phase("restart close");
     CloseAll();
+    Phase("restart open");
     OpenStores();
     if (!queue_ || !cold_ || !pool_) {
       return std::unexpected(core::Error{core::ErrorCode::kInternal, "the stores did not open"});
@@ -160,11 +180,14 @@ class SequencedEngineTest : public ::testing::Test {
         }
       });
     }
+    Phase("restart recover");
     auto recovered = coordinator.Run(cancel);
     done = true;
     if (sampler.joinable()) sampler.join();
     skipped_ = coordinator.Replayer().Skipped();
+    Phase("restart rewire");
     Rewire();
+    Phase("restarted");
     return recovered;
   }
 
@@ -221,7 +244,7 @@ class SequencedEngineTest : public ::testing::Test {
   // The loader, sequencer and engine over hot_.
   void Rewire() {
     // Its queued fills read through the old read path: they fail unrun.
-    io_pool_.reset();
+    SetIoPool(nullptr);
     engine_.reset();
     reads_.reset();
     sequencer_.reset();
@@ -231,10 +254,10 @@ class SequencedEngineTest : public ::testing::Test {
     sequencer_ = std::make_unique<Sequencer>(
         *hot_, *queue_, *loader_, *pool_,
         SequencerConfig{.command_timeout = options_.command_timeout, .wall_clock = wall});
-    io_pool_ = std::make_unique<IoPool>(IoPoolConfig{
+    SetIoPool(std::make_unique<IoPool>(IoPoolConfig{
         .threads = options_.cold_io_threads,
         .background_capacity = options_.io_background_capacity,
-    });
+    }));
     reads_ =
         std::make_unique<ReadPath>(*hot_, *loader_, *io_pool_,
                                    ReadPathConfig{.fill_doorkeeper = options_.fill_doorkeeper,
@@ -245,7 +268,7 @@ class SequencedEngineTest : public ::testing::Test {
   }
 
   void CloseAll() {
-    io_pool_.reset();
+    SetIoPool(nullptr);
     dispatch_.reset();
     engine_.reset();
     reads_.reset();
@@ -259,6 +282,16 @@ class SequencedEngineTest : public ::testing::Test {
   }
 
   void TearDown() override { CloseAll(); }
+
+  // Under io_pool_mu_ for IoPoolState; the old pool joins its threads
+  // outside it.
+  void SetIoPool(std::unique_ptr<IoPool> pool) {
+    std::unique_ptr<IoPool> old;
+    {
+      const std::scoped_lock lock(io_pool_mu_);
+      old = std::exchange(io_pool_, std::move(pool));
+    }
+  }
 
   std::string Write(std::vector<std::string> args, Flags flags = Flags::kNone) {
     auto reply = abyss::testing::RunToCompletion(*sequencer_,
@@ -366,6 +399,8 @@ class SequencedEngineTest : public ::testing::Test {
   std::unique_ptr<consumer::ColdConsumerPool> pool_;
   std::unique_ptr<Loader> loader_;
   std::unique_ptr<Sequencer> sequencer_;
+  // Set through SetIoPool alone.
+  std::mutex io_pool_mu_;
   std::unique_ptr<IoPool> io_pool_;
   std::unique_ptr<ReadPath> reads_;
   std::unique_ptr<TieringEngine> engine_;

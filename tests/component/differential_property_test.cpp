@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -131,6 +132,12 @@ bool Blind(const std::vector<std::string>& args) {
 
 class DifferentialTest : public PropertyHarness {
  protected:
+  // Unbuffered: a run killed at its timeout still shows how far it got.
+  void SetUp() override {
+    PropertyHarness::SetUp();
+    std::cout << std::unitbuf;
+  }
+
   // One seed's stream; false once it has failed.
   bool RunSeed(uint64_t seed, int ops, Counts& counts) {
     Swarm swarm = SwarmFor(seed);
@@ -161,6 +168,7 @@ class DifferentialTest : public PropertyHarness {
 
     for (int step = 0; step < ops && !failed_; ++step) {
       step_ = step;
+      Progress("seed " + std::to_string(seed) + " step " + std::to_string(step));
       if (step == ops / 4) CrossShardMsetnxThenInvertedReplay();
       // Once a stream: cold takes everything and retention drops it, a
       // few dozen writes follow, then a restart replays only those, so
@@ -190,6 +198,7 @@ class DifferentialTest : public PropertyHarness {
     if (!failed_ && reads_ >= kReadsToJudge && reads_timed_out_ * 100 > reads_) {
       Fail(std::to_string(reads_timed_out_) + " of " + std::to_string(reads_) + " reads timed out");
     }
+    Progress("seed " + std::to_string(seed) + " finish");
     if (!failed_) Finish();
     HookLoads(false);
     CloseAll();
@@ -443,6 +452,7 @@ class DifferentialTest : public PropertyHarness {
 
   void Command(const std::vector<std::string>& args) {
     const std::string name = core::AsciiUpper(args.at(0));
+    Phase("command " + name);
     const bool write = IsWrite(name);
     const std::vector<std::string> keys = KeysOf(args);
     // Relieved: every involved shard drained before the write, so only
@@ -471,7 +481,9 @@ class DifferentialTest : public PropertyHarness {
     }
     const core::RespValue reply = Run(args);
     {
-      const std::scoped_lock lock(hook_mu_);
+      // A load's action still running lands inside the window.
+      std::unique_lock lock(hook_mu_);
+      acted_.wait(lock, [this] { return !acting_; });
       outer_ = nullptr;
       outer_keys_ = nullptr;
     }
@@ -509,6 +521,7 @@ class DifferentialTest : public PropertyHarness {
     // A read that ran out of the command deadline on cold had no effect.
     if (!write && reply.IsError() && LoadTimedOut(ErrorMessage(reply))) {
       ++reads_timed_out_;
+      for (const auto& nested : nested_) (void)model_.Execute(nested, now_ms_);
       return;
     }
     for (const auto& key : keys) {
@@ -712,38 +725,60 @@ class DifferentialTest : public PropertyHarness {
 
   // Only between a command's start and reply, on a load of one of its
   // keys: its own load, or a fill of the key queued by an earlier read.
+  // Decided under hook_mu_ and acted on without it: the engine may wait
+  // on another load, whose firing skips while this one acts.
   void OnLoad(std::string_view key) {
-    const std::scoped_lock lock(hook_mu_);
-    if (outer_ == nullptr || std::ranges::find(*outer_keys_, key) == outer_keys_->end()) return;
-    loaded_.insert(std::string(key));
-    switch (hook_rng_.Below(12)) {
-      case 0:
-      case 1: {
+    enum class Act : uint8_t { kEvict, kFlush, kWrite };
+    Act act = Act::kEvict;
+    std::vector<std::string> nested;
+    {
+      const std::scoped_lock lock(hook_mu_);
+      if (outer_ == nullptr || std::ranges::find(*outer_keys_, key) == outer_keys_->end()) return;
+      loaded_.insert(std::string(key));
+      if (acting_) return;
+      switch (hook_rng_.Below(12)) {
+        case 0:
+        case 1:
+          act = Act::kEvict;
+          break;
+        case 2:
+          act = Act::kFlush;
+          break;
+        case 3:
+        case 4: {
+          // Only a blind write: anything else waits on this load. None
+          // in a blind write's window: it waits on no load, so the two
+          // would land in either order.
+          const std::string outer = core::AsciiUpper(outer_->at(0));
+          if (outer == "MGET" || outer == "EXISTS" || Blind(*outer_)) return;
+          act = Act::kWrite;
+          nested = {"SET", std::string(key), "n" + std::to_string(++counter_)};
+          break;
+        }
+        default:
+          return;
+      }
+      acting_ = true;
+    }
+    const core::ShardId shard = ShardOf(key);
+    bool evicted = false;
+    std::string failure;
+    std::vector<core::SequenceId> ends;
+    switch (act) {
+      case Act::kEvict: {
         if (trace_) std::cout << "[trace]   evict during load of " << key << "\n";
-        const core::ShardId shard = ShardOf(key);
         const uint64_t before = hot_->Memory(shard).used_bytes;
         hot_->EvictExpired(core::SteadyClock::now() + std::chrono::hours{1'000'000});
-        if (hot_->Memory(shard).used_bytes < before) ++counts_.at(kEvictionDuringLoad);
+        evicted = hot_->Memory(shard).used_bytes < before;
         break;
       }
-      case 2: {
+      case Act::kFlush:
         if (trace_) std::cout << "[trace]   cold flush during load of " << key << "\n";
-        const core::ShardId shard = ShardOf(key);
         Absorb(shard);
         FlushCold(shard);
-        ++counts_.at(kFlushMidLoad);
         break;
-      }
-      case 3:
-      case 4: {
-        // Only a blind write: anything else waits on this load. None
-        // in a blind write's window: it waits on no load, so the two
-        // would land in either order.
-        const std::string outer = core::AsciiUpper(outer_->at(0));
-        if (outer == "MGET" || outer == "EXISTS" || Blind(*outer_)) break;
-        std::vector<std::string> nested = {"SET", std::string(key),
-                                           "n" + std::to_string(++counter_)};
-        Absorb(ShardOf(key));
+      case Act::kWrite: {
+        Absorb(shard);
         // The engine directly: the pipeline is mid-dispatch.
         auto result = dispatch_->DispatchWrite("SET", core::RespCommand{.args = nested},
                                                core::PredicateFlags::kNone);
@@ -752,22 +787,42 @@ class DifferentialTest : public PropertyHarness {
                 ? *std::move(result)
                 : core::RespValue::Error(core::ErrorPrefix::kErr, result.error().message());
         if (RedisModel::Render(reply) != "+OK") {
-          Fail("blind write " + Join(nested) + " during a load: " + RedisModel::Render(reply) +
-               " " + MemoryOf(ShardOf(key)));
-          break;
+          failure = "blind write " + Join(nested) + " during a load: " + RedisModel::Render(reply) +
+                    " " + MemoryOf(shard);
+        } else {
+          ends = Ends();
         }
-        nested_on_loaded_ = true;
-        ends_before_outer_ = Ends();
-        Journal('N', nested);
-        nested_.push_back(std::move(nested));
         break;
       }
-      default:
-        break;
     }
+    {
+      const std::scoped_lock lock(hook_mu_);
+      if (act == Act::kEvict && evicted) ++counts_.at(kEvictionDuringLoad);
+      if (act == Act::kFlush) ++counts_.at(kFlushMidLoad);
+      if (!failure.empty()) {
+        Fail(failure);
+      } else if (act == Act::kWrite) {
+        nested_on_loaded_ = true;
+        ends_before_outer_ = std::move(ends);
+        Journal('N', nested);
+        nested_.push_back(std::move(nested));
+      }
+      acting_ = false;
+    }
+    acted_.notify_all();
   }
 
-  // The hook is unsynchronised: set it with no load running.
+  // The load hook's window, for a stall's dump; it never waits on a
+  // stalled thread for hook_mu_.
+  std::string StallState() override {
+    const std::unique_lock lock(hook_mu_, std::try_to_lock);
+    if (!lock.owns_lock()) return "; hook state held";
+    std::string state = outer_ == nullptr ? "; no command open" : "; open on " + Join(*outer_);
+    if (acting_) state += ", a load acting";
+    return state;
+  }
+
+  // Waits out loads in flight: none runs the old hook after.
   void HookLoads(bool on) {
     if (io_pool_ != nullptr) io_pool_->WaitIdleForTesting();
     if (on) {
@@ -839,6 +894,7 @@ class DifferentialTest : public PropertyHarness {
   // persisted, so retention reclaims the segments they cover.
   void Settle() {
     for (core::ShardId s = 0; s < options_.shards; ++s) {
+      Phase("settle shard " + std::to_string(s));
       Absorb(s);
       FlushCold(s);
     }
@@ -978,6 +1034,7 @@ class DifferentialTest : public PropertyHarness {
     for (int i = 0; i < kKeys; ++i) keys.insert("k" + std::to_string(i));
     for (const auto& [key, value] : model_.data()) keys.insert(key);
     for (const auto& key : keys) {
+      Phase("check " + key);
       if (const auto seen = CheckKey(key); seen.mismatch.has_value()) {
         Fail(when + ": " + *seen.mismatch);
         return;
@@ -994,6 +1051,7 @@ class DifferentialTest : public PropertyHarness {
     for (const auto& [key, value] : model_.data()) keys.insert(key);
     const int64_t now = now_ms_;
     for (const auto& key : keys) {
+      Phase("finish read " + key);
       for (const auto& read :
            {std::vector<std::string>{"TYPE", key}, std::vector<std::string>{"PTTL", key},
             FullRead(key, model_.Find(key, now))}) {
@@ -1008,9 +1066,13 @@ class DifferentialTest : public PropertyHarness {
       }
     }
     // Everything into cold, then RocksDB alone.
-    for (core::ShardId shard = 0; shard < options_.shards; ++shard) DrainToCold(shard);
+    for (core::ShardId shard = 0; shard < options_.shards; ++shard) {
+      Phase("finish drain shard " + std::to_string(shard));
+      DrainToCold(shard);
+    }
     const std::string cold_path = dir_.Sub(options_.run + "cold").string();
     const uint32_t shards = options_.shards;
+    Phase("finish close");
     CloseAll();
     auto cold = cold::backends::RocksdbStore::Create(cold::backends::RocksdbConfig{
         .data_path = cold_path,
@@ -1019,6 +1081,7 @@ class DifferentialTest : public PropertyHarness {
     });
     ASSERT_TRUE(cold.has_value()) << cold.error().message();
     for (const auto& key : keys) {
+      Phase("finish cold " + key);
       const RedisModel::Value* want = model_.Find(key, now);
       auto loaded = (*cold)->LoadKey(key, core::SteadyClock::now() + std::chrono::seconds(30));
       if (!loaded.has_value()) {
@@ -1122,9 +1185,12 @@ class DifferentialTest : public PropertyHarness {
   uint64_t reads_timed_out_ = 0;
   std::deque<std::string> history_;
   std::deque<std::map<core::ShardId, std::pair<core::SequenceId, core::SequenceId>>> batches_;
-  // The load hook's state, which it holds hook_mu_ over: a command sets
-  // outer_ to open its window, and reads the rest once it is closed.
+  // The load hook's state, under hook_mu_: a command sets outer_ to
+  // open its window, and reads the rest once it is closed. acting_
+  // marks the one load acting, which the close waits out.
   std::mutex hook_mu_;
+  std::condition_variable acted_;
+  bool acting_ = false;
   const std::vector<std::string>* outer_ = nullptr;
   const std::vector<std::string>* outer_keys_ = nullptr;
   std::vector<std::vector<std::string>> nested_;
