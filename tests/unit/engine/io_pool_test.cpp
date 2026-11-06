@@ -85,6 +85,18 @@ core::SteadyTime Later() { return core::SteadyClock::now() + 10s; }
 
 // Holds a pool thread until opened.
 struct Blocker {
+  Blocker() = default;
+  Blocker(const Blocker&) = delete;
+  Blocker& operator=(const Blocker&) = delete;
+  Blocker(Blocker&&) = delete;
+  Blocker& operator=(Blocker&&) = delete;
+  // A pool thread may still be in the job as the test ends: release it
+  // and wait until it is done, so nothing it touches is freed under it.
+  ~Blocker() {
+    release.Open();
+    (void)outcome->Wait();
+  }
+
   testing::Latch started;
   testing::Latch release;
   std::shared_ptr<Outcome> outcome = std::make_shared<Outcome>();
